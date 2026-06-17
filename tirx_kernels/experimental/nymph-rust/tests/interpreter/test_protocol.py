@@ -264,7 +264,7 @@ def test_protocol_skipped_bulk_write_invalidates_prior_scalar_cell():
 
 
 def test_protocol_gemm_trace_runs_without_payload_inputs():
-    cfg = Fp16Bf16GemmConfig(k=16, block_k=16, launch_shape=(2,))
+    cfg = Fp16Bf16GemmConfig(k=16, blk_k=16, launch_shape=(2,))
     kernel = build_fp16_bf16_gemm(cfg)
 
     report = nr.check_protocol(kernel, include_events=True)
