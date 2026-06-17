@@ -8,6 +8,7 @@
 //! - `stmt`   — the big Stmt enum (~41 variants)
 //! - `kernel` — Kernel (owns the tensor/mbar tables)
 
+pub mod codegen;
 pub mod dtype;
 pub mod kernel;
 pub mod mbar;
@@ -18,6 +19,7 @@ pub mod tensor;
 pub mod validate;
 
 // Re-export everything so callers can write `nymph::ir::Tensor` etc.
+pub use codegen::*;
 pub use dtype::*;
 pub use kernel::*;
 pub use mbar::*;
