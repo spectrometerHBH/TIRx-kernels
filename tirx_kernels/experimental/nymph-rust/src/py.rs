@@ -2545,6 +2545,12 @@ impl PyKernel {
     }
 }
 
+/// Lower a kernel to a TVMScript (`tvm.script.tirx`) source string.
+#[pyfunction]
+fn kernel_to_tirx_source(kernel: &PyKernel) -> PyResult<String> {
+    crate::ir::kernel_to_tirx_source(&kernel.0).map_err(PyValueError::new_err)
+}
+
 // ===========================================================================
 // module registration
 // ===========================================================================
@@ -2652,6 +2658,8 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(interpret, m)?)?;
     m.add_function(wrap_pyfunction!(trace, m)?)?;
     m.add_function(wrap_pyfunction!(check_protocol, m)?)?;
+    // the Rust -> TVMScript codegen entry point
+    m.add_function(wrap_pyfunction!(kernel_to_tirx_source, m)?)?;
 
     // chunk 7 — builder compatibility: the GMEM-scalar dtype map (used at runtime
     // by scalar_def) and the names the builder imports but only uses in lazy

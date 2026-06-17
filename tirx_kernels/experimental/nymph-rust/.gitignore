@@ -2,3 +2,5 @@
 /target
 # Extracted Python extension (built by maturin, unzipped here for PYTHONPATH import).
 /_pybuild
+# Locally-built extension symlink (target/release/libnymph_rs.so) for direct PYTHONPATH import.
+/python/nymph_rs/nymph_rs*.so
