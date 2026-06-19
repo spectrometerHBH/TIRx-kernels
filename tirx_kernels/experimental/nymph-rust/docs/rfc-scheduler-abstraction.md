@@ -20,15 +20,16 @@ matters:
 
 | | **functional** | **concurrent** |
 |---|---|---|
-| example | `grid_stride` | `clc`, atomic-steal-with-broadcast |
+| example | `grid_stride` | CLC (`clc_try_cancel`/`query_cancel`), atomic-steal-with-broadcast |
 | what it is | a pure index formula `tile = f(cluster, i)` | a real warp with state |
 | needs a warp / SMEM / mbar? | no | **yes** — issues an async fetch, waits, broadcasts to consumers, prefetches |
 | encapsulable as a black box? | **yes** — inlined, invisible | **no** — it occupies a warp, the consumers engage its protocol |
-| IR form | a policy string | a **`SchedulerImpl`** region |
+| IR form | `policy="grid_stride"` | `policy="custom"` + a hand-written **`SchedulerImpl`** region |
 
-A functional scheduler hides completely. A concurrent one **cannot** — "`policy="clc"`"
-instantiates a real scheduler warp into your kernel (it costs a warp, SMEM, and
-mbarriers that the consumers wait on). Both are in v1.
+A functional scheduler hides completely. A concurrent one **cannot** — you write its
+scheduler warp out in the IR (`policy="custom"`): a real warp, SMEM, and mbarriers that the
+consumers wait on, all explicit. There is no policy string that conjures one; codegen only
+translates what you wrote.
 
 For either kind, nymph **trusts** the fetch/allocation — "each tile once / terminates" is
 a formula (grid_stride), atomic semantics, or a hardware guarantee — and spends its
@@ -43,13 +44,22 @@ TaskSpace(grid, fields)              e.g. grid=(num_m_tiles, num_n_tiles),
 
 Scheduler(space, policy, scope=cluster)
     policy: "grid_stride"                       functional: inlined formula, no warp
-          | "clc" | "atomic_steal"              concurrent: a library-provided SchedulerImpl
-          | "custom"                           concurrent: your own SchedulerImpl
-                                               (the region is wired separately via
-                                               `scheduler_impl(sched)`, not passed into the policy)
+          | "custom"                           concurrent: YOU write the SchedulerImpl
+                                               and consumer protocol out in nymph IR (a
+                                               real scheduler warp using the hardware
+                                               primitives, e.g. clc_try_cancel /
+                                               clc_query_cancel for CLC). The region is
+                                               wired via `scheduler_impl(sched)`.
     scope:  identifies the participants that share one task stream; default is all roles
             in one cluster using this scheduler. (Same scheduler + same scope => same
             task-field sequence to every participating role.)
+
+There is NO `policy="clc"` / `policy="atomic_steal"`: a concurrent scheduler is never a
+library macro that codegen expands. Codegen is a pure 1:1 IR translator and must never
+synthesize a scheduler warp, mailbox, or handshake. If you want CLC, you write CLC out in
+the IR (the `clc_try_cancel` / `clc_query_cancel` leaf ops + your own mbar handshake) under
+`policy="custom"`, and codegen translates each op verbatim — exactly mirroring the
+canonical TIRx kernel's hand-written CLC scheduler.
 
 ForEachTask(sched) -> token          functional consumer side:
                                      `with k.for_each_task(grid_stride_sched) as t:`
@@ -67,8 +77,10 @@ loop { ...; break_if(cond) }   explicit scheduler-protocol loops used by the sch
                 role and by consumer roles that read its broadcast.
 ```
 
-`policy="clc"` instantiates the library's CLC `SchedulerImpl` — you do not hand-write the
-warp, but it is structurally present in your kernel.
+`policy="custom"` means you hand-write the `SchedulerImpl` (the scheduler warp) and the
+consumer protocol out in the IR. For CLC that is the `clc_try_cancel` / `clc_query_cancel`
+leaf ops plus your own mbar handshake — structurally present in your kernel because you put
+it there, not because a policy string conjured it.
 
 ## 4. Control flow
 
@@ -139,9 +151,11 @@ tasks `{0, 2}`.
 Checker: HB check on the `a_full`/`a_empty` handshake; declared `C[m_idx, n_idx]` formula
 injective. Nothing about the scheduler.
 
-## 7. Example 2 — CLC (concurrent, a `SchedulerImpl`)
+## 7. Example 2 — CLC (concurrent, `policy="custom"`, written out)
 
-`policy="clc"` instantiates the library's CLC scheduler warp. Written out, it is:
+CLC is written out explicitly in the IR (no library macro). The real kernel uses the
+hardware `clc_try_cancel` / `clc_query_cancel` leaf ops (codegen → `T.ptx.clc_*`); the
+sketch below shows the same shape with a software handle for illustration:
 
 ```python
 task_smem  = k.tensor(SMEM, dtype=I32, shape=(2, 1))   # double-buffered flat task index; -1 means done
@@ -210,20 +224,20 @@ One run; the scheduler warp executes for real, `sched_next` returns the canonica
 
 ## 8. Codegen
 
-nymph does not codegen, but the same IR is lowered elsewhere, so a policy must have a
-**code form**, not only a trusted contract:
+Codegen is a **pure 1:1 IR translator**. It maps each nymph op to its TIRx form and
+**never synthesizes a scheduler** — no warp, no mailbox, no handshake is auto-inserted.
 
 | policy | codegen emits |
 |---|---|
 | `grid_stride` (functional) | the inline index formula in the consumer loop — no warp |
-| `clc` / `atomic_steal` (concurrent) | the **real scheduler warp** — i.e. the library's `SchedulerImpl` (the `try_cancel`/atomic + broadcast), plus explicit consumer protocol loops |
-| `Custom` | your `SchedulerImpl`, as written |
+| `custom` (concurrent) | nothing of its own: it translates the `SchedulerImpl` body and every leaf op inside it verbatim — `clc_try_cancel` → `T.ptx.clc_try_cancel`, `clc_query_cancel` → `T.ptx.clc_query_cancel`, the `mbarrier_*` handshake, the `loop`/`break_if` — exactly as you wrote them |
 
-So a concurrent policy is a **macro that instantiates a `SchedulerImpl`**, not a contract
-that hides one: the warp is in the codegen'd kernel and in the simulated IR alike. The
-payoff of having one IR for both: a library author can run the CLC `SchedulerImpl`
-through nymph, confirm its broadcast handshake is deadlock-free, and only then ship it as
-a trusted policy — so "trust" rests on a nymph check, not on faith.
+A concurrent scheduler is whatever you wrote out in the IR; codegen reproduces it
+primitive-for-primitive (so the emitted TIRx matches the canonical kernel's hand-written CLC,
+down to the `UGETNEXTWORKID.BROADCAST` SASS). The payoff of one IR for both sim and codegen:
+you run your hand-written CLC `SchedulerImpl` through nymph, confirm its broadcast handshake
+is deadlock-free under the checker, and the SAME IR lowers to TIRx unchanged — "trust" rests
+on a nymph check of the code you wrote, not on a library macro or on faith.
 
 ## 9. Non-goals
 

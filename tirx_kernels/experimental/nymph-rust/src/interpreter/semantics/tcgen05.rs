@@ -770,9 +770,9 @@ fn execute_mma<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResu
             ),
             _ => unreachable!(),
         };
-    ctx.check_full_warp_cohort(
+    ctx.check_full_warp_or_elected_cohort(
         "tcgen05_mma_mask",
-        "tcgen05_mma must be issued by one or more full warps",
+        "tcgen05_mma must be issued by full warps or a single elected lane",
     )?;
 
     // The accumulator CTA(s): cta_group=2's even CTA computes the whole pair; odd is a no-op.

@@ -18,6 +18,10 @@ pub struct InterpreterState {
     pub tmem_collectives: HashMap<TmemCollectiveKey, TmemCollective>,
     pub cp_async_bulk_groups: HashMap<usize, i64>,
     pub scheduler_next_cursors: HashMap<(u32, usize), usize>,
+    /// CLC handle slot: `clc_try_cancel` (the canonical oracle) writes the next work
+    /// id here, keyed by `(scheduler_id, cluster_id)`; `clc_query_cancel` reads it, so
+    /// the scheduler and every worker querying the same handle observe the same id.
+    pub clc_handle_values: HashMap<(u32, usize), i64>,
 }
 
 impl InterpreterState {

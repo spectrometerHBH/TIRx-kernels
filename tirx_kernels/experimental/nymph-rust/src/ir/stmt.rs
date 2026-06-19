@@ -312,6 +312,17 @@ pub enum Stmt {
         var: Var,
         value: ScalarValue,
     },
+    /// Warp shuffle/broadcast that DEFINES a scalar: `var` gets the value of `src`
+    /// evaluated on lane `src_lane` of each warp, broadcast to all lanes (a faithful
+    /// `__shfl_sync`). First-class so the value-sim verifies it — broadcasting a value
+    /// that ISN'T warp-uniform changes it, which surfaces as a value mismatch. Used to
+    /// promote warp-uniform SMEM reads (the scheduler mailbox) to a form the CUDA
+    /// compiler proves uniform → the index/address chain lowers to the uniform datapath.
+    ShuffleSync {
+        var: Var,
+        src: ScalarValue,
+        src_lane: ScalarValue,
+    },
     StoreScalar {
         dst: TensorSlice,
         value: ScalarValue,
@@ -346,6 +357,11 @@ pub enum Stmt {
         stop: ScalarValue,
         step: ScalarValue,
         body: Vec<Stmt>,
+        /// Emit as `T.unroll(N)` instead of `T.serial(N)` — a compile-time-unrolled loop
+        /// (the TVMScript parser substitutes a constant loop var per iteration, so it keeps
+        /// the same SASS as a manual unroll) but written as a `for` in the source, matching
+        /// canon's `for i in T.unroll(N)` for fixed-count loops (mbarrier inits, etc.).
+        unroll: bool,
     },
     ForEachTask {
         scheduler: Arc<Scheduler>,
@@ -359,6 +375,33 @@ pub enum Stmt {
     SchedNext {
         scheduler: Arc<Scheduler>,
         var: Var,
+    },
+    /// CLC (Cluster Launch Control) async work-steal issue: hardware
+    /// `clusterlaunchcontrol.try_cancel` writes a 16B response into `handle` and
+    /// completes-tx `mbar` (multicast to both cluster CTAs). Written out EXPLICITLY
+    /// in the kernel's `policy="custom"` scheduler — codegen translates it 1:1 and
+    /// never synthesizes it. In sim it (1) runs the canonical round-robin oracle —
+    /// the trusted seam, §7 of the scheduler RFC — and stores the resulting work id
+    /// into a per-cluster handle slot, and (2) completes-tx the signalled mbar (like
+    /// a TMA landing) so the handshake the checker validates is real. The paired
+    /// `ClcQueryCancel` reads the slot, so the scheduler and every worker that query
+    /// the same handle observe the same id.
+    ClcTryCancel {
+        scheduler: Arc<Scheduler>,
+        handle: Arc<Tensor>,
+        mbar: MBarRef,
+        stage: Option<ScalarValue>,
+        cta_group: u8,
+    },
+    /// CLC decode of the response `handle`: DEFINES `var` by reading the per-cluster
+    /// handle slot the paired `ClcTryCancel` filled — the cancelled cluster's first
+    /// `ctaid.x` (= task * cta_group), or `0xFFFFFFFF` (→ -1 as int32) when drained.
+    /// Codegen translates 1:1 to `T.ptx.clc_query_cancel`; `scheduler` is sim-only
+    /// metadata (keys the slot read).
+    ClcQueryCancel {
+        scheduler: Arc<Scheduler>,
+        var: Var,
+        handle: Arc<Tensor>,
     },
     Loop {
         body: Vec<Stmt>,
@@ -604,6 +647,18 @@ pub enum Stmt {
     },
     WarpSync,
     ClusterSync,
+    /// Split cluster barrier — ARRIVE side. A non-blocking collective arrival
+    /// (`barrier.cluster.arrive`, aligned) issued once at CTA scope after the
+    /// prologue init. Paired with per-role `ClusterBarrierWait`s: decouples the
+    /// cluster-barrier latency from each role's local setup, and idle warps skip the
+    /// wait. Modeled faithfully (unlike a codegen-synthesized split of the fused
+    /// `ClusterSync`) so the protocol checker verifies every role waits before any
+    /// cross-CTA (peer mbarrier) access.
+    ClusterBarrierArrive,
+    /// Split cluster barrier — WAIT side. Blocks the calling role until all threads
+    /// of the cluster have executed `ClusterBarrierArrive`. Allowed inside a role
+    /// (unlike `ClusterSync`).
+    ClusterBarrierWait,
 }
 
 impl Stmt {

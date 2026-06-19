@@ -15,6 +15,7 @@ pub enum StmtKind {
     TmemDealloc,
     ScalarDef,
     ScalarStore,
+    ShuffleSync,
     StoreScalar,
     MBarDef,
     KernelInit,
@@ -67,6 +68,10 @@ pub enum StmtKind {
     WgSync,
     WarpSync,
     ClusterSync,
+    ClusterBarrierArrive,
+    ClusterBarrierWait,
+    ClcTryCancel,
+    ClcQueryCancel,
 }
 
 pub fn stmt_kind(stmt: &Stmt) -> StmtKind {
@@ -76,6 +81,7 @@ pub fn stmt_kind(stmt: &Stmt) -> StmtKind {
         Stmt::TmemDealloc { .. } => StmtKind::TmemDealloc,
         Stmt::ScalarDef { .. } => StmtKind::ScalarDef,
         Stmt::ScalarStore { .. } => StmtKind::ScalarStore,
+        Stmt::ShuffleSync { .. } => StmtKind::ShuffleSync,
         Stmt::StoreScalar { .. } => StmtKind::StoreScalar,
         Stmt::MBarDef { .. } => StmtKind::MBarDef,
         Stmt::KernelInit { .. } => StmtKind::KernelInit,
@@ -128,13 +134,17 @@ pub fn stmt_kind(stmt: &Stmt) -> StmtKind {
         Stmt::WgSync { .. } => StmtKind::WgSync,
         Stmt::WarpSync => StmtKind::WarpSync,
         Stmt::ClusterSync => StmtKind::ClusterSync,
+        Stmt::ClusterBarrierArrive => StmtKind::ClusterBarrierArrive,
+        Stmt::ClusterBarrierWait => StmtKind::ClusterBarrierWait,
+        Stmt::ClcTryCancel { .. } => StmtKind::ClcTryCancel,
+        Stmt::ClcQueryCancel { .. } => StmtKind::ClcQueryCancel,
     }
 }
 
 impl StmtKind {
-    /// `ClusterSync` is the last variant; the enum is fieldless so `as usize`
+    /// `ClcQueryCancel` is the last variant; the enum is fieldless so `as usize`
     /// gives a contiguous 0..COUNT index — used to dispatch via a flat array.
-    pub const COUNT: usize = StmtKind::ClusterSync as usize + 1;
+    pub const COUNT: usize = StmtKind::ClcQueryCancel as usize + 1;
     #[inline]
     pub fn index(self) -> usize {
         self as usize

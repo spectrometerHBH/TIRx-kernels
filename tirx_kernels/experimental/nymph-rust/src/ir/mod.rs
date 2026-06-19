@@ -97,6 +97,7 @@ mod tests {
                 start: ScalarValue::Int(0),
                 stop: ScalarValue::Int(16),
                 step: ScalarValue::Int(1),
+                unroll: false,
                 body: vec![Stmt::RegStore {
                     dst: a_slice.clone(),
                     src: a_slice.clone(),
