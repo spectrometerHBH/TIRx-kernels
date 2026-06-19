@@ -21,6 +21,106 @@ use std::sync::Arc;
 pub fn register(reg: &mut StmtExecutorRegistry) {
     reg.register(StmtKind::TmaLoad, execute_tma_load);
     reg.register(StmtKind::TmaStore, execute_tma_store);
+    reg.register(StmtKind::ClcTryCancel, execute_clc_try_cancel);
+}
+
+/// The CLC `try_cancel` response handle is a 16B (uint4) cell.
+const CLC_HANDLE_BYTES: i64 = 16;
+
+/// `clusterlaunchcontrol.try_cancel` (CLC async work-steal issue), written out in
+/// the kernel's custom scheduler. In sim it does two things: (1) runs the canonical
+/// round-robin oracle — the trusted seam — computing this cluster's next task and
+/// storing the raw ctaid (`task * cta_group`, or -1 drained) into the per-cluster
+/// handle slot the paired `ClcQueryCancel` reads; and (2) completes-tx the signalled
+/// mbar on every CTA of the cluster (the hardware multicasts the 16B handle), exactly
+/// like a TMA landing, so the kernel's `sched_arr` handshake is real for the checker.
+fn execute_clc_try_cancel<'a, 'k>(
+    ctx: &mut CohortContext<'a, 'k>,
+    stmt: &'k Stmt,
+) -> IResult<StepStatus> {
+    let (scheduler, mbar, stage, cta_group) = match stmt {
+        Stmt::ClcTryCancel {
+            scheduler,
+            mbar,
+            stage,
+            cta_group,
+            ..
+        } => (scheduler, mbar, stage, *cta_group),
+        _ => unreachable!(),
+    };
+    if cta_group != 1 && cta_group != 2 {
+        return Err(InterpreterError::new(
+            "invalid_clc_cta_group",
+            "clc_try_cancel cta_group must be 1 or 2",
+        ));
+    }
+    // --- canonical round-robin oracle (the trusted seam) ---
+    let total_tasks = scheduler.space.task_count().ok_or_else(|| {
+        InterpreterError::new("invalid_scheduler", "task space size overflows usize")
+    })?;
+    let cluster_cta = ctx.cluster_cta_count();
+    let cluster_count = ctx.kernel.launch_cta_count() / cluster_cta;
+    if cluster_count == 0 {
+        return Err(InterpreterError::new(
+            "invalid_scheduler",
+            "cluster count must be positive",
+        ));
+    }
+    let cluster_id = ctx.stream.cluster_id;
+    // The cursor starts at 1: cursor 0 is the cluster's own launch tile (= cluster_id),
+    // which the worker processes via init, NOT via a steal. `try_cancel` (this op)
+    // returns the *stolen* tiles cluster_id + 1*cc, + 2*cc, ... — exactly the hardware
+    // semantics (query_cancel never returns the launcher's own tile).
+    let cur = *ctx
+        .state
+        .scheduler_next_cursors
+        .entry((scheduler.id, cluster_id))
+        .or_insert(1);
+    let offset = cur
+        .checked_mul(cluster_count)
+        .ok_or_else(|| InterpreterError::new("invalid_scheduler", "task index overflows usize"))?;
+    let task = cluster_id
+        .checked_add(offset)
+        .ok_or_else(|| InterpreterError::new("invalid_scheduler", "task index overflows usize"))?;
+    let drained = task >= total_tasks;
+    if !drained {
+        *ctx.state
+            .scheduler_next_cursors
+            .get_mut(&(scheduler.id, cluster_id))
+            .expect("cursor just inserted") += 1;
+    }
+    let raw_value: i64 = if drained {
+        -1
+    } else {
+        i64::try_from(task * cluster_cta)
+            .map_err(|_| InterpreterError::new("invalid_scheduler", "ctaid does not fit in i64"))?
+    };
+    ctx.state
+        .clc_handle_values
+        .insert((scheduler.id, cluster_id), raw_value);
+    if ctx.trace_mode() {
+        let task_id = if drained {
+            -1
+        } else {
+            i64::try_from(task).map_err(|_| {
+                InterpreterError::new("invalid_scheduler", "task does not fit in i64")
+            })?
+        };
+        ctx.emit(TraceEventKind::SchedulerNext {
+            scheduler_id: scheduler.id,
+            cta_id: ctx.stream.cta_id,
+            task_id,
+            scope: ctx.access_scope(),
+        })?;
+    }
+    // --- complete-tx the signalled mbar on every CTA of the cluster ---
+    let base = uniform_mbar_target(ctx, mbar, stage.as_ref())?;
+    let mut targets = Vec::with_capacity(cta_group as usize);
+    for c in 0..cta_group as usize {
+        targets.push(retarget_mbar(base, c));
+    }
+    let wakes = apply_mbar_complete_tx(ctx, &targets, CLC_HANDLE_BYTES)?;
+    Ok(StepStatus::advance_wake(wakes))
 }
 
 fn dtype_bytes(d: DType) -> i64 {

@@ -68,6 +68,9 @@ pub enum FenceKind {
     Memory,
     AsyncProxy,
     View,
+    /// `fence.mbarrier_init` — seals the mbarrier-init epoch (makes the inits visible to the
+    /// async engines) before any role touches a barrier. Emitted once in the prologue.
+    MbarrierInit,
 }
 
 /// `FenceScope` — the memory hierarchy level a fence orders. `Cta`/`Cluster` are the

@@ -16,6 +16,46 @@ pub fn register(reg: &mut StmtExecutorRegistry) {
     reg.register(StmtKind::ScalarDef, execute_scalar_def);
     reg.register(StmtKind::ScalarStore, execute_scalar_store);
     reg.register(StmtKind::StoreScalar, execute_store_scalar);
+    reg.register(StmtKind::ShuffleSync, execute_shuffle_sync);
+}
+
+/// Warp shuffle/broadcast: `var` = `src` evaluated on lane `src_lane` of each warp,
+/// broadcast to all lanes (a faithful `__shfl_sync`). If `src` is warp-uniform the
+/// broadcast is a no-op (every lane already holds the same value); if it is NOT, the
+/// broadcast changes it — and because this runs in the value model, the resulting
+/// mismatch is caught. The shuffle is per warp (the 32-lane `__shfl_sync` width), so
+/// the source value is taken from the same (cta, warp).
+fn execute_shuffle_sync<'a, 'k>(
+    ctx: &mut CohortContext<'a, 'k>,
+    stmt: &'k Stmt,
+) -> IResult<StepStatus> {
+    let (var, src, src_lane) = match stmt {
+        Stmt::ShuffleSync { var, src, src_lane } => (var, src, src_lane),
+        _ => unreachable!(),
+    };
+    let var_id = var.id.0;
+    let per_thread = ctx.eval_scalar_vec(src)?.to_vec();
+    let lanes = ctx.eval_scalar_vec(src_lane)?.to_vec();
+    let mut by_lane: std::collections::HashMap<(usize, usize, usize), i64> =
+        std::collections::HashMap::new();
+    for (i, t) in ctx.cohort.iter().enumerate() {
+        by_lane.insert((t.cta_id, t.warp_id, t.lane_id), per_thread[i]);
+    }
+    let mut out = Vec::with_capacity(ctx.cohort.len());
+    for (i, t) in ctx.cohort.iter().enumerate() {
+        let sl = lanes[i].max(0) as usize;
+        let v = by_lane
+            .get(&(t.cta_id, t.warp_id, sl))
+            .copied()
+            .ok_or_else(|| {
+                InterpreterError::new(
+                    "shuffle_sync_lane_missing",
+                    "shuffle_sync source lane is not in the executing warp cohort",
+                )
+            })?;
+        out.push(v);
+    }
+    Ok(scalar_commit(ctx, var_id, &out))
 }
 
 fn execute_scalar_def<'a, 'k>(

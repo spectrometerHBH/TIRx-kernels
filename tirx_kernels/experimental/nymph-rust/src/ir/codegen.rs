@@ -62,6 +62,12 @@ enum Scope {
     Warp,
     /// Inside a single-warpgroup role branch (`if wg_id == w:`).
     Warpgroup,
+    /// Inside an ELECTED role branch (`if warp_id == w: if elect_sync():` ...): the
+    /// WHOLE role body already runs on one thread, so single-issue ops emit with NO
+    /// further per-op guard (canon's `if elect_sync(): while ...:` scheduler/loader/MMA
+    /// loops). Matches canon's thread model exactly — one issuing thread runs the loop,
+    /// its mbar waits + the CLC handshake, rather than 32 threads with per-op guards.
+    Elected,
 }
 
 impl Scope {
@@ -72,11 +78,32 @@ impl Scope {
     /// The predicate electing the single thread that issues a single-issue async op
     /// (one `mbarrier`/`TMA`/`MMA`/`commit`). One thread per warp inside a warp role;
     /// one thread per warpgroup inside a warpgroup role. At function scope (e.g. the
-    /// kernel_init warp==0 block, which is a warp-granularity guard) lane 0 is right.
+    /// kernel_init warp==0 block, which is a warp-granularity guard) one lane suffices.
+    ///
+    /// Warp / function scope elect ONE lane PER WARP — semantically `lane_id == 0`, but
+    /// emitted as `T.ptx.elect_sync()`, the hardware `elect.sync` warp instruction (one
+    /// elected lane per warp, the active leader). This is exactly the canonical kernels'
+    /// guard (`if T.ptx.elect_sync():` around the loader / MMA single-issue loops). It
+    /// avoids the `T.lane_id([32])` -> `threadIdx.x % 32 == 0` lowering: TVM inlines that
+    /// `%32` at EVERY guard site (~64 in the 1024 prologue/loops), and the predicated
+    /// branch also drives up CBU divergence. `elect.sync` is a single uniform instruction
+    /// with no modulo and no per-site recompute.
+    ///
+    /// Warpgroup scope MUST stay `tid_in_wg == 0`: a warpgroup spans 4 warps, so
+    /// `elect.sync` would elect one lane PER WARP = 4 issuing threads in the group and
+    /// over-issue every single-issue op (4× mbarrier arrive -> corrupted phase / deadlock
+    /// once a slot is reused). `tid_in_wg == 0` is the single warpgroup-wide thread 0.
+    ///
+    /// This split is purely SCOPE-driven (a generic property of the enclosing role's
+    /// thread granularity), not keyed on any kernel/shape — every kernel's warp-scope
+    /// single-issue guard lowers to `elect.sync`, every warpgroup-scope one to thread 0.
     fn issue_guard(self) -> &'static str {
         match self {
             Scope::Warpgroup => "tid_in_wg == 0",
-            Scope::Warp | Scope::Function => "lane_id == 0",
+            Scope::Warp | Scope::Function => "T.ptx.elect_sync()",
+            // Already inside the role-wide elect; a single-issue op needs no extra guard.
+            // (Returned for completeness; `emit_guarded` skips the guard for Elected.)
+            Scope::Elected => "True",
         }
     }
 }
@@ -549,12 +576,18 @@ fn as_int(sv: &ScalarValue) -> Option<i64> {
     }
 }
 
-/// Collapse codegen-level instruction-granularity runs into the single coalesced
-/// op TIRx wants. The nymph IR emits ops at hardware-instruction granularity (k=16
-/// MMA sub-slices, 8-col TMEM reads) because that's the value-model's unit; TIRx's
-/// `gemm_async` / `wg.copy_async` take the *full* operand and tile internally. A
-/// 16-wide (32-byte) sub-slice of a 128B-swizzle atom, or an 8-col tcgen05.ld,
-/// hits `cudaErrorIllegalInstruction`. These passes recover the full-operand form.
+/// Collapse the MMA's value-model granularity into the single coalesced op TIRx
+/// wants. The nymph IR emits MMA at the value-model's k=16 sub-slice unit, but
+/// TIRx's `gemm_async` takes the *full* BLK_K operand and tiles internally (a
+/// 16-wide / 32-byte sub-slice of a 128B-swizzle atom hits
+/// `cudaErrorIllegalInstruction`); `try_collapse_mma_run` recovers the full-operand
+/// form. This is a value/protocol-neutral source-form merge — same atoms, no fence
+/// or accumulation change.
+///
+/// NOTE: the epilogue tmem->reg fence structure (one `wait_ld` per EPI_N / NOL band)
+/// is expressed in the IR itself and verified by the protocol checker — it is NOT
+/// recovered here. The per-8-col `tcgen05.ld` atoms are emitted 1:1 (they are legal
+/// and run bit-exact); the IR, not codegen, owns the fence granularity.
 ///
 /// Applied to every statement list (a body) before emission. General over K and
 /// over the column width — not hardcoded to the bootstrap's K=64 / N=128.
@@ -567,16 +600,6 @@ fn collapse_body(stmts: &[Stmt]) -> Vec<Stmt> {
             i += consumed;
             continue;
         }
-        if let Some((collapsed, consumed)) = try_collapse_epilogue_run(&stmts[i..]) {
-            out.extend(collapsed);
-            i += consumed;
-            continue;
-        }
-        if let Some((collapsed, consumed)) = try_collapse_drain_run(&stmts[i..]) {
-            out.extend(collapsed);
-            i += consumed;
-            continue;
-        }
         // NOTE: the reg->smem store run is intentionally NOT collapsed. The canonical
         // epilogue stores reg->smem in 8-element (128-bit) sub-slices so the copy
         // dispatches to STSM; a wider `Tx.wg.copy` drops to STS.128 or, when the
@@ -586,86 +609,6 @@ fn collapse_body(stmts: &[Stmt]) -> Vec<Stmt> {
         i += 1;
     }
     out
-}
-
-/// No-overlap epilogue DRAIN: a run of `(Tcgen05Ld, Tcgen05WaitLd, RegCvt)` triples
-/// that read consecutive `num`-wide TMEM column bands into the SAME small f32 frag,
-/// then cast each into consecutive bands of the SAME wide output reg. There is no
-/// `RegStore` between them (the store happens later in the smem-staged path), so the
-/// `try_collapse_epilogue_run` quadruple matcher does not fire. Collapse to ONE wide
-/// `(Ld, WaitLd, Cvt)` over the full band — mirrors the canonical no-overlap
-/// load+cast loop, fused to a single wide `wg.copy_async` + `wg.cast`.
-fn try_collapse_drain_run(stmts: &[Stmt]) -> Option<(Vec<Stmt>, usize)> {
-    // (ld_num, ld_col, cvt_dst_off) of a leading triple, if shaped like a drain step.
-    let triple = |s: &[Stmt]| -> Option<(u32, i64, i64)> {
-        if s.len() < 3 {
-            return None;
-        }
-        let Stmt::Tcgen05Ld { num, col, .. } = &s[0] else {
-            return None;
-        };
-        let Stmt::Tcgen05WaitLd = &s[1] else {
-            return None;
-        };
-        let Stmt::RegCvt { dst, .. } = &s[2] else {
-            return None;
-        };
-        // A drain Cvt writes the WIDE output reg (its dst is a band of a >num-wide
-        // fragment); the quadruple epilogue collapse handles the store-fused case.
-        let dst_off = as_int(dst.offsets.first()?)?;
-        Some((*num, as_int(col)?, dst_off))
-    };
-
-    let first = triple(stmts)?;
-    let step = first.0 as i64;
-    // tcgen05.ld (32x32b) caps a single read at 128 columns; widen only up to that so
-    // the collapsed `wg.copy_async` stays a legal single instruction. Larger bands
-    // (mma_n=256) are split into successive ≤128-wide drains by re-entry.
-    let max_cols: i64 = 128;
-    let max_steps = (max_cols / step).max(1) as usize;
-    let mut count = 1usize;
-    let mut next_col = first.1 + step;
-    let mut next_dst_off = first.2 + step;
-    let mut idx = 3;
-    while idx + 3 <= stmts.len() && count < max_steps {
-        if let Some((num, col, dst_off)) = triple(&stmts[idx..]) {
-            if num as i64 == step && col == next_col && dst_off == next_dst_off {
-                count += 1;
-                next_col += step;
-                next_dst_off += step;
-                idx += 3;
-                continue;
-            }
-        }
-        break;
-    }
-    if count < 2 {
-        return None;
-    }
-
-    let total = (step * count as i64) as u32;
-    let mut ld = stmts[0].clone();
-    let mut cvt = stmts[2].clone();
-    // The f32 read fragment is filled from column 0 (its declared width is `total`);
-    // the cast writes the matching band of the wide output reg at the FIRST triple's
-    // output offset (not 0 — a 256-wide band drains as two 128-wide groups).
-    if let Stmt::Tcgen05Ld { dst, num, .. } = &mut ld {
-        *num = total;
-        dst.offsets[0] = ScalarValue::Int(0);
-        if let Some(sh) = dst.shape.first_mut() {
-            *sh = ScalarValue::Int(total as i64);
-        }
-    }
-    if let Stmt::RegCvt { dst, src, .. } = &mut cvt {
-        if let Some(sh) = dst.shape.first_mut() {
-            *sh = ScalarValue::Int(total as i64);
-        }
-        src.offsets[0] = ScalarValue::Int(0);
-        if let Some(sh) = src.shape.first_mut() {
-            *sh = ScalarValue::Int(total as i64);
-        }
-    }
-    Some((vec![ld, Stmt::Tcgen05WaitLd, cvt], count * 3))
 }
 
 /// No-overlap epilogue STORE: a run of `RegStore` (SMEM dst) writing consecutive
@@ -853,95 +796,6 @@ fn try_collapse_mma_run(stmts: &[Stmt]) -> Option<(Stmt, usize)> {
         sf_byte: *sf_byte,
     };
     Some((collapsed, count))
-}
-
-/// Suspect 2: a run of `(Tcgen05Ld, Tcgen05WaitLd, RegCvt, RegStore)` quadruples
-/// where each ld reads consecutive `num`-wide column bands of the same TMEM accum
-/// into the same fragment, casts, and stores to consecutive C columns. Collapse to
-/// ONE wide quadruple over the full column band (mirrors the template's single
-/// full-width `wg.copy_async` + `wait.ld` + `wg.cast` + `Tx.copy`). Returns
-/// (collapsed_stmts, num_consumed) or None.
-fn try_collapse_epilogue_run(stmts: &[Stmt]) -> Option<(Vec<Stmt>, usize)> {
-    // Identify the quadruple shape from the first 4 stmts.
-    let quad = |s: &[Stmt]| -> Option<(u32, i64, i64)> {
-        // Returns (ld_num, ld_col, store_col0).
-        if s.len() < 4 {
-            return None;
-        }
-        let Stmt::Tcgen05Ld { num, col, .. } = &s[0] else {
-            return None;
-        };
-        let Stmt::Tcgen05WaitLd = &s[1] else {
-            return None;
-        };
-        let Stmt::RegCvt { .. } = &s[2] else {
-            return None;
-        };
-        let Stmt::RegStore { dst, .. } = &s[3] else {
-            return None;
-        };
-        let col_i = as_int(col)?;
-        let store_col0 = as_int(dst.offsets.get(1)?)?;
-        Some((*num, col_i, store_col0))
-    };
-
-    let first = quad(stmts)?;
-    let step = first.0 as i64;
-
-    // Walk consecutive quadruples; require contiguous, equal-width column advance.
-    let mut count = 1usize;
-    let mut next_ld_col = first.1 + step;
-    let mut next_store_col = first.2 + step;
-    let mut idx = 4;
-    while idx + 4 <= stmts.len() {
-        if let Some((num, ld_col, store_col0)) = quad(&stmts[idx..]) {
-            if num as i64 == step && ld_col == next_ld_col && store_col0 == next_store_col {
-                count += 1;
-                next_ld_col += step;
-                next_store_col += step;
-                idx += 4;
-                continue;
-            }
-        }
-        break;
-    }
-
-    if count < 2 {
-        return None;
-    }
-
-    let total_width = (step * count as i64) as u32;
-    // Clone the first quadruple and widen it to the full band.
-    let mut ld = stmts[0].clone();
-    let mut cvt = stmts[2].clone();
-    let mut store = stmts[3].clone();
-
-    if let Stmt::Tcgen05Ld { dst, num, .. } = &mut ld {
-        *num = total_width;
-        // Widen the dst reg fragment slice to the full width.
-        if let Some(sh) = dst.shape.first_mut() {
-            *sh = ScalarValue::Int(total_width as i64);
-        }
-    }
-    if let Stmt::RegCvt { dst, src, .. } = &mut cvt {
-        if let Some(sh) = dst.shape.first_mut() {
-            *sh = ScalarValue::Int(total_width as i64);
-        }
-        if let Some(sh) = src.shape.first_mut() {
-            *sh = ScalarValue::Int(total_width as i64);
-        }
-    }
-    if let Stmt::RegStore { dst, src } = &mut store {
-        // Store dst: widen the column extent to the full band.
-        if dst.shape.len() == 2 {
-            dst.shape[1] = ScalarValue::Int(total_width as i64);
-        }
-        if let Some(sh) = src.shape.first_mut() {
-            *sh = ScalarValue::Int(total_width as i64);
-        }
-    }
-
-    Some((vec![ld, Stmt::Tcgen05WaitLd, cvt, store], count * 4))
 }
 
 /// Build the naming context: A/B/C for args by position; SMEM/TMEM/REG/mbar by role.
@@ -1194,7 +1048,13 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
     let mut scalar_names: HashMap<u32, String> = HashMap::new();
     fn walk_scalar_defs(stmts: &[Stmt], scalar_names: &mut HashMap<u32, String>) {
         for s in stmts {
-            if let Stmt::ScalarDef { var, .. } = s {
+            let defined = match s {
+                Stmt::ScalarDef { var, .. }
+                | Stmt::ShuffleSync { var, .. }
+                | Stmt::ClcQueryCancel { var, .. } => Some(var),
+                _ => None,
+            };
+            if let Some(var) = defined {
                 scalar_names
                     .entry(var.id.0)
                     .or_insert_with(|| format!("s{}", var.id.0));
@@ -1375,21 +1235,67 @@ fn is_nonneg(sv: &ScalarValue) -> bool {
     }
 }
 
+/// If `sv` is a positive power-of-two literal `2^k` (k >= 1), return `k`. Drives the
+/// strength-reduction of `% 2^k` -> `& (2^k - 1)` and `// 2^k` -> `>> k` (Lever 3).
+fn as_pow2_shift(sv: &ScalarValue) -> Option<u32> {
+    match sv {
+        ScalarValue::Int(i) if *i > 1 && (*i as u64).is_power_of_two() => {
+            Some((*i as u64).trailing_zeros())
+        }
+        _ => None,
+    }
+}
+
+/// A positive-integer-literal divisor, returned as the value (for the truncdiv/truncmod
+/// path). `None` for non-literal or non-positive divisors (those keep floordiv/floormod).
+fn positive_int_divisor(sv: &ScalarValue) -> Option<i64> {
+    match sv {
+        ScalarValue::Int(i) if *i > 0 => Some(*i),
+        _ => None,
+    }
+}
+
 fn emit_expr(e: &ScalarExpr, ctx: &Ctx, parent_prec: u8) -> String {
     let prec = op_prec(e.op);
-    // Pipeline-phase parity rewrite: `x % 2` -> `x & 1` for non-negative `x`. The two
-    // are numerically identical when `x >= 0`, but the TIRx -> CUDA arithmetic
-    // simplifier mis-folds `floormod(floordiv(linear, c), 2)` to a constant 0 for
-    // some affine offsets (e.g. the MMA `smem_full` wait at pipe_depth=5, k_tiles=8),
-    // which silently corrupts the parity and deadlocks the SMEM ring at partial stage
-    // reuse (k_tiles/2 < pipe_depth < k_tiles). `& 1` is left intact by the simplifier.
-    if e.op == ScalarOp::Mod && matches!(&e.args[1], ScalarValue::Int(2)) && is_nonneg(&e.args[0]) {
-        // `&` binds looser than `% // * + -` in Python, so parenthesize the operand
-        // and wrap the whole `& 1` for any parent that binds tighter than bitand.
-        let s = format!("({}) & 1", emit_scalar_prec(&e.args[0], ctx, 0));
-        // Bitand is looser than every arithmetic/relational parent we emit into; wrap
-        // unless we're already at statement level (parent_prec == 0).
-        return if parent_prec > 0 { format!("({s})") } else { s };
+    // ---- Non-negative div/mod strength reduction (generic, driven by `is_nonneg`) ----
+    // The nymph IR's ring/slot/phase indices and the L2-swizzle coords are all built
+    // from non-negative loop counters and scope ids, so `is_nonneg(dividend)` holds.
+    // TVM lowers a SIGNED `floordiv`/`floormod` (what Python `//`/`%` parse to) with a
+    // sign-correction tail: `floormod(x,d)` -> `(x % d) + (d & ((x % d) >> 31))` and
+    // `floordiv(x,d)` -> `(x / d) + ((x % d) >> 31)`. For a provably non-negative `x`
+    // every correction term is 0, so it is pure wasted integer ALU recomputed at each
+    // index (the L2 `% 5`//5` is recomputed per task per role). Two rewrites, both gated
+    // ONLY on the generic `is_nonneg` + a positive-literal divisor (no kernel/shape key):
+    //
+    //   * divisor == 2^k  -> bit ops: `% 2^k` => `(x) & (2^k - 1)`, `// 2^k` => `(x) >> k`.
+    //     No div/mod instruction at all. (Generalizes the prior `% 2 -> & 1`, which also
+    //     dodged a TIRx->CUDA simplifier bug that mis-folds `floormod(floordiv(..),2)` to
+    //     0; bit ops are left intact by the simplifier, so that rationale still holds.)
+    //   * other positive literal (e.g. 5) -> `T.truncdiv` / `T.truncmod`: numerically
+    //     identical to floordiv/floormod for non-negative `x`, but lowers to a plain
+    //     `/` / `%` with NO sign-correction tail.
+    //
+    // `&`, `>>` bind looser than `% // * + -` in Python: parenthesize the dividend and
+    // wrap the whole result for any parent binding tighter than bitand/shift.
+    if (e.op == ScalarOp::Mod || e.op == ScalarOp::FloorDiv) && is_nonneg(&e.args[0]) {
+        if let Some(k) = as_pow2_shift(&e.args[1]) {
+            let lhs = emit_scalar_prec(&e.args[0], ctx, 0);
+            let s = if e.op == ScalarOp::Mod {
+                format!("({lhs}) & {mask}", mask = (1u64 << k) - 1)
+            } else {
+                format!("({lhs}) >> {k}")
+            };
+            return if parent_prec > 0 { format!("({s})") } else { s };
+        }
+        if let Some(d) = positive_int_divisor(&e.args[1]) {
+            let fname = if e.op == ScalarOp::Mod {
+                "T.truncmod"
+            } else {
+                "T.truncdiv"
+            };
+            // A function call is atomic — no surrounding parens needed for any parent.
+            return format!("{fname}({}, {d})", emit_scalar_prec(&e.args[0], ctx, 0));
+        }
     }
     let s = match e.op {
         ScalarOp::Neg => format!("-{}", emit_scalar_prec(&e.args[0], ctx, prec)),
@@ -1636,19 +1542,72 @@ fn emit_body(
                 }
                 j += 1;
             }
-            if emitted_any {
+            if emitted_any && scope.is_function() {
+                // Fence + cta_sync ONLY at function (prologue) scope, where the mbarrier-init
+                // visibility ordering across the whole CTA needs it. In ROLE scope (the hot
+                // MMA / loader / epilogue loops) the mbarrier handshake alone orders the async
+                // engines (TMA→smem_full→MMA, MMA→tmem_full→epilogue) — exactly as the canonical
+                // kernel does, which emits ZERO `tcgen05.fence.after_thread_sync()` after its
+                // loop waits. Emitting one per wait over-fenced the hot loop: the FENCE/MEMBAR
+                // serialized MMA issue and left the tensor core idle (~1.7% lower tensor-active),
+                // the exact bench gap. The mbarrier acquire already makes the produced SMEM/TMEM
+                // visible to the consuming async op, so the per-wait fence is redundant here.
                 out.push_str(&format!("{p}T.ptx.tcgen05.fence.after_thread_sync()\n"));
-                if scope.is_function() {
-                    out.push_str(&format!("{p}T.cuda.cta_sync()\n"));
-                }
+                out.push_str(&format!("{p}T.cuda.cta_sync()\n"));
             }
             i = j;
             continue;
         }
-        emit_stmt(out, &collapsed[i], indent, ctx, scope)?;
+        // Single-issue guard coalescing (Lever 2): a maximal run of adjacent stmts that
+        // each emit as `if {guard}: <body>` under the SAME single-issue guard is emitted
+        // under ONE `if {guard}:` block, with every body indented inside it. The prologue
+        // mbarrier inits are ~18 such adjacent stmts; one shared guard collapses 18
+        // `elect.sync` + 18 predicated branches into 1. This is a generic peephole keyed
+        // ONLY on guard-string identity (a structural property of the emitted stream), not
+        // on any kernel/shape/op — every run of same-guard single-issue ops coalesces.
+        if let Some(guard) = single_issue_guard(&collapsed[i], scope, ctx) {
+            let mut j = i;
+            while j < collapsed.len()
+                && single_issue_guard(&collapsed[j], scope, ctx) == Some(guard)
+            {
+                j += 1;
+            }
+            if j - i >= 2 {
+                out.push_str(&format!("{p}if {guard}:\n"));
+                for s in &collapsed[i..j] {
+                    emit_stmt(out, s, indent + 1, ctx, scope, true)?;
+                }
+                i = j;
+                continue;
+            }
+        }
+        emit_stmt(out, &collapsed[i], indent, ctx, scope, false)?;
         i += 1;
     }
     Ok(())
+}
+
+/// The single-issue guard string for a stmt that emits as `if {guard}: <one body>` under
+/// `scope`, or `None` if the stmt is not a coalescable single-issue op. Drives the Lever-2
+/// run coalescing in `emit_body`. The leader-routed `arrive.expect_tx` (extra `cbx == 0`
+/// nesting) and warpgroup-collective stores are NOT coalescable here (they return `None`),
+/// so they keep their own emission path. Generic: the guard comes from `scope.issue_guard`,
+/// the same string every single-issue op uses.
+fn single_issue_guard(stmt: &Stmt, scope: Scope, ctx: &Ctx) -> Option<&'static str> {
+    use Stmt::*;
+    match stmt {
+        // The leader expect_tx nests under `cbx == 0` first — not a plain single guard.
+        MBarrierArriveExpectTx { mbar, .. } if ctx.tma_leader_mbar == Some(mbar.mbar.id) => None,
+        MBarrierInit { .. }
+        | MBarrierArriveExpectTx { .. }
+        | MBarrierExpectTx { .. }
+        | MBarrierArrive { .. }
+        | StoreScalar { .. }
+        | TmaLoad { .. }
+        | Tcgen05Mma { .. }
+        | Tcgen05Commit { .. } => Some(scope.issue_guard()),
+        _ => None,
+    }
 }
 
 fn emit_stmt(
@@ -1657,9 +1616,28 @@ fn emit_stmt(
     indent: usize,
     ctx: &Ctx,
     scope: Scope,
+    // When true, the caller already opened the single-issue `if {guard}:` block (Lever-2
+    // coalescing) and `indent` is the inner level: the single-issue guarded arms emit ONLY
+    // their inner body, skipping their own `if {guard}:`. False = standalone emission
+    // (each guarded arm opens its own guard, the original behaviour).
+    bare: bool,
 ) -> Result<(), String> {
     use Stmt::*;
     let p = pad(indent);
+    // Emit a single-issue guarded op's body. Standalone (`bare == false`): open the
+    // `if {guard}:` here and indent the body once. Coalesced (`bare == true`): the caller
+    // already opened the shared guard at `indent - 1`, so emit the body at `indent` with no
+    // guard. `body` is the inner line(s) WITHOUT leading indent or trailing newline.
+    let emit_guarded = |out: &mut String, body: &str| {
+        if bare || scope == Scope::Elected {
+            // Coalesced under a shared guard, or the whole role is already elected — emit
+            // the single-issue body directly with no per-op `if guard:`.
+            out.push_str(&format!("{p}{body}\n"));
+        } else {
+            out.push_str(&format!("{p}if {}:\n", scope.issue_guard()));
+            out.push_str(&format!("{p}    {body}\n"));
+        }
+    };
     match stmt {
         // ---- definitions handled in the header; skip in the body walk ----
         TensorDef { .. } | MBarDef { .. } => Ok(()),
@@ -1704,18 +1682,24 @@ fn emit_stmt(
                     .tmem_alloc_cols
                     .map(|c| c as usize)
                     .unwrap_or(base.shape[1]);
+                // allocated_addr=0 (not tmem_addr[0], the SMEM-stored alloc result): the
+                // single tcgen05.alloc always bases at TMEM column 0, so the view address is
+                // a compile-time constant — exactly canon's form. Using tmem_addr[0] makes
+                // every tcgen05_ld re-load the base from SMEM (LDS) + add the column (VIADD)
+                // + convert to uniform (R2UR); pinning it to 0 cuts that epilogue address
+                // math (VIADD/LOP3/LDS) roughly in half.
                 out.push_str(&format!(
-                    "{p}tmem = T.decl_buffer(({d0}, {d1}), \"{dt}\", scope=\"tmem\", allocated_addr=tmem_addr[0], layout=TileLayout(S[({d0}, {d1}) : (1 @ TLane, 1 @ TCol)]))\n",
+                    "{p}tmem = T.decl_buffer(({d0}, {d1}), \"{dt}\", scope=\"tmem\", allocated_addr=0, layout=TileLayout(S[({d0}, {d1}) : (1 @ TLane, 1 @ TCol)]))\n",
                     d0 = base.shape[0],
                     d1 = cols,
                     dt = dtype_str(base.dtype),
                 ));
             }
-            // After kernel_init we emit the init fence / sync sequence (one time).
-            out.push_str(&format!("{p}T.ptx.fence.mbarrier_init()\n"));
-            out.push_str(&format!("{p}T.ptx.fence.proxy_async(\"shared::cta\")\n"));
-            out.push_str(&format!("{p}T.cuda.cta_sync()\n"));
-            out.push_str(&format!("{p}T.cuda.cluster_sync()\n"));
+            // KernelInit emits ONLY the warp-0 body (tmem alloc + mbarrier inits). The entire
+            // prologue sync — the `fence.mbarrier_init` epoch seal AND the cross-CTA barrier
+            // (cluster_barrier_arrive for overlap, or proxy_async + cluster_sync for no-overlap)
+            // — is written EXPLICITLY in the nymph IR right after kernel_init. codegen never
+            // fabricates a sync here and has no overlap/no-overlap knowledge.
             Ok(())
         }
         KernelFinalize { body, warp, .. } => {
@@ -1731,7 +1715,8 @@ fn emit_stmt(
             body,
             warp,
             warpgroup,
-            ..
+            elected,
+            maxnreg,
         } => {
             // The role's thread scope drives the single-issue guard: a warp role
             // elects `lane_id == 0` (1 thread), a warpgroup role `tid_in_wg == 0`
@@ -1745,9 +1730,46 @@ fn emit_stmt(
                 return Err("codegen: role without warp/warpgroup".to_string());
             };
             out.push_str(&format!("{p}if {guard}:\n"));
-            // A role is a single-warp / single-warpgroup branch: suppress CTA-wide
-            // cta_sync inside it (not all CTA threads arrive).
-            emit_body(out, body, indent + 1, ctx, body_scope)?;
+            if let Some(n) = maxnreg {
+                // Per-warpgroup register budget (canon's `setmaxnreg(False, 56)` for the
+                // producer warpgroup, `(True, 224)` for the consumer): rebalances registers
+                // so the compute-heavy consumer gets more and the producer fewer, raising
+                // occupancy. Warpgroup-aligned — emitted by the whole group at the role
+                // start. inc when the budget rises above the 128-reg default, else dec.
+                let inc = if *n > 128 { "True" } else { "False" };
+                out.push_str(&format!("{p}    T.ptx.setmaxnreg({inc}, {n})\n"));
+            }
+            // A role is a single-warp / single-warpgroup branch. For the OVERLAP split
+            // barrier the role body begins (after its local setup) with an explicit
+            // `ClusterBarrierWait` IR stmt — emitted 1:1 by its own arm, no longer
+            // synthesized here. Idle warps own no role and never reach a wait.
+            if *elected {
+                // ELECTED role: the WHOLE body runs on one thread — `if <guard>:` then a
+                // single role-wide elect, matching canon's `if elect_sync(): while ...:`
+                // scheduler/loader/MMA loops. Inside, single-issue ops drop their per-op
+                // guard (Scope::Elected). One issuing thread runs the loop + its mbar waits
+                // (no 32-thread spin, no per-op elect), so the timing matches canon.
+                //
+                // EXCEPT a LEADING `ClusterBarrierWait`: `barrier.cluster.wait` is a
+                // WARP-COLLECTIVE op and DEADLOCKS if only the elected lane waits — canon
+                // emits it by ALL threads of the warp, BEFORE `if elect_sync()`. So peel any
+                // leading cluster-barrier waits and emit them at warp scope (outside the
+                // elect), then run the rest of the body single-issue. (Verified: the
+                // elect-only wait hung the overlap path on 1024/2048; all-thread wait runs.)
+                let n_lead = body
+                    .iter()
+                    .take_while(|s| matches!(s, Stmt::ClusterBarrierWait))
+                    .count();
+                for _ in 0..n_lead {
+                    out.push_str(&format!(
+                        "{p}    T.ptx.barrier.cluster.wait(acquire=True, aligned=False)\n"
+                    ));
+                }
+                out.push_str(&format!("{p}    if {}:\n", body_scope.issue_guard()));
+                emit_body(out, &body[n_lead..], indent + 2, ctx, Scope::Elected)?;
+            } else {
+                emit_body(out, body, indent + 1, ctx, body_scope)?;
+            }
             Ok(())
         }
         If { cond, then_body } => {
@@ -1761,15 +1783,34 @@ fn emit_stmt(
             stop,
             step,
             body,
+            unroll,
         } => {
             let name = var_name(ctx, var);
             let start_s = emit_scalar(start, ctx);
             let stop_s = emit_scalar(stop, ctx);
             let step_s = emit_scalar(step, ctx);
+            // `unroll`: emit `T.unroll(N)` — a compile-time-unrolled `for` (same SASS as a
+            // manual unroll, but written as a loop in the source, matching canon's
+            // `for i in T.unroll(N)` for fixed-count loops). Only valid for start=0, step=1.
+            if *unroll {
+                out.push_str(&format!("{p}for {name} in T.unroll({stop_s}):\n"));
+                emit_body(out, body, indent + 1, ctx, scope)?;
+                return Ok(());
+            }
+            // Emit `T.serial(...)`, NOT Python `range(...)`: T.serial is the rolled serial
+            // loop with a single UNIFORM loop-induction var (one hardware counter per
+            // warp), which is what keeps the ring index / operand-descriptor address math
+            // in uniform registers (UIADD3/UMOV) — matching canon's `for k in T.serial(N)`.
+            // A bare `range(...)` would be fully unrolled by the TVMScript parser, defeating
+            // the roll (and re-exploding the 16384 compile). step must be 1 for T.serial.
             let range = if step_s == "1" {
-                format!("range({start_s}, {stop_s})")
+                if start_s == "0" {
+                    format!("T.serial({stop_s})")
+                } else {
+                    format!("T.serial({start_s}, {stop_s})")
+                }
             } else {
-                format!("range({start_s}, {stop_s}, {step_s})")
+                format!("T.serial({start_s}, {stop_s}, {step_s})")
             };
             out.push_str(&format!("{p}for {name} in {range}:\n"));
             emit_body(out, body, indent + 1, ctx, scope)?;
@@ -1779,6 +1820,13 @@ fn emit_stmt(
         Loop { body } => {
             out.push_str(&format!("{p}while True:\n"));
             emit_body(out, body, indent + 1, ctx, scope)?;
+            Ok(())
+        }
+        // `scheduler_impl` is a sim/checker marker for the trusted scheduler region;
+        // it carries no code of its own, so codegen emits its body transparently
+        // (same indent + scope) — the CLC primitives inside translate 1:1.
+        SchedulerImpl { body, .. } => {
+            emit_body(out, body, indent, ctx, scope)?;
             Ok(())
         }
         BreakIf { cond } => {
@@ -1805,6 +1853,70 @@ fn emit_stmt(
             out.push_str(&format!("{p}{name}[0] = {init}\n", name = name));
             Ok(())
         }
+        ShuffleSync { var, src, src_lane } => {
+            let name = ctx
+                .scalar_names
+                .get(&var.id.0)
+                .ok_or_else(|| format!("codegen: no name for scalar var {}", var.id.0))?
+                .clone();
+            out.push_str(&format!("{p}{name} = T.alloc_local(1, \"int32\")\n"));
+            // Warp broadcast (lane `src_lane` -> all lanes of the warp). The result is
+            // compiler-provably uniform, so the index/address chain derived from it
+            // lowers to the uniform datapath instead of vector + R2UR.
+            out.push_str(&format!(
+                "{p}{name}[0] = T.cuda.__shfl_sync(0xffffffff, {src}, {lane}, 32)\n",
+                src = emit_scalar(src, ctx),
+                lane = emit_scalar(src_lane, ctx),
+            ));
+            Ok(())
+        }
+        // CLC async work-steal issue: 1:1 to `clusterlaunchcontrol.try_cancel`. The
+        // 16B response lands in `handle`; the second arg is the mbar it completes-tx
+        // (the kernel's own `sched_arr` full barrier). Single-issue (the role's elect
+        // guard), exactly like canon's `if T.ptx.elect_sync(): clc_try_cancel(...)`.
+        ClcTryCancel {
+            handle, mbar, stage, ..
+        } => {
+            let handle_name = ctx.tensor_name(handle.id)?;
+            // Both args are `T.address_of(buf[i])` — exactly canon's
+            // `clc_try_cancel(T.address_of(clc_handle[0]), T.address_of(sched_arr.full.buf[0]))`.
+            // The mbar arg must be `address_of(name[slot])`, NOT `name.ptr_to([slot])`:
+            // try_cancel writes the completion to that raw address, and the buffer-pointer
+            // form lowers differently (wrong target → multi-tile fault).
+            let mbar_name = ctx
+                .mbar_names
+                .get(&mbar.mbar.id)
+                .cloned()
+                .ok_or_else(|| format!("codegen: no name for mbar {}", mbar.mbar.id))?;
+            let slot = stage
+                .as_ref()
+                .map(|s| emit_scalar(s, ctx))
+                .unwrap_or_else(|| "0".to_string());
+            emit_guarded(
+                out,
+                &format!(
+                    "T.ptx.clc_try_cancel(T.address_of({handle_name}[0]), T.address_of({mbar_name}[{slot}]))"
+                ),
+            );
+            Ok(())
+        }
+        // CLC handle decode: 1:1 to `clusterlaunchcontrol.query_cancel`, DEFINING the
+        // scalar (the cancelled cluster's first ctaid.x, or 0xFFFFFFFF -> -1 as int32).
+        // Unguarded — every thread of the cohort reads the same handle and gets the
+        // same value (a pure uniform decode), like `ShuffleSync`.
+        ClcQueryCancel { var, handle, .. } => {
+            let name = ctx
+                .scalar_names
+                .get(&var.id.0)
+                .ok_or_else(|| format!("codegen: no name for scalar var {}", var.id.0))?
+                .clone();
+            let handle_name = ctx.tensor_name(handle.id)?;
+            out.push_str(&format!("{p}{name} = T.alloc_local(1, \"int32\")\n"));
+            out.push_str(&format!(
+                "{p}{name}[0] = T.ptx.clc_query_cancel(T.address_of({handle_name}[0]))\n"
+            ));
+            Ok(())
+        }
         ScalarStore { var, value } => {
             let name = ctx
                 .scalar_names
@@ -1822,18 +1934,14 @@ fn emit_stmt(
         // 32 redundant STS to the same address.
         StoreScalar { dst, value } => {
             let dst_s = emit_scalar_addr(dst, ctx)?;
-            out.push_str(&format!("{p}if {}:\n", scope.issue_guard()));
-            out.push_str(&format!("{p}    {dst_s} = {}\n", emit_scalar(value, ctx)));
+            emit_guarded(out, &format!("{dst_s} = {}", emit_scalar(value, ctx)));
             Ok(())
         }
 
         // ---- mbarrier (every op carries an optional `stage` -> slot index) ----
         MBarrierInit { mbar, count, stage } => {
             let slot_ptr = mbar_slot_ptr(mbar, stage, ctx)?;
-            out.push_str(&format!("{p}if {}:\n", scope.issue_guard()));
-            out.push_str(&format!(
-                "{p}    T.ptx.mbarrier.init({slot_ptr}, {count})\n"
-            ));
+            emit_guarded(out, &format!("T.ptx.mbarrier.init({slot_ptr}, {count})"));
             Ok(())
         }
         MBarrierArriveExpectTx { mbar, bytes, stage } => {
@@ -1848,28 +1956,28 @@ fn emit_stmt(
                     .map(|s| emit_scalar(s, ctx))
                     .unwrap_or_else(|| "0".to_string());
                 let total_bytes = *bytes as u64 * ctx.cta_group as u64;
+                // Nest the CTA selector and the single-issue guard as separate `if`s
+                // rather than `(cbx == 0) and (guard)`: the warp/function guard is now
+                // `T.ptx.elect_sync()`, which returns a uint32 (not bool), and `tirx.And`
+                // requires both operands be bool. `cbx == 0` is warp-uniform, so nesting
+                // is equivalent (all lanes take the same branch, then elect one).
+                out.push_str(&format!("{p}if cbx == 0:\n"));
+                out.push_str(&format!("{p}    if {}:\n", scope.issue_guard()));
                 out.push_str(&format!(
-                    "{p}if (cbx == 0) and ({}):\n",
-                    scope.issue_guard()
-                ));
-                out.push_str(&format!(
-                    "{p}    T.ptx.mbarrier.arrive.expect_tx({view}.ptr_to([{slot}]), {total_bytes})\n"
+                    "{p}        T.ptx.mbarrier.arrive.expect_tx({view}.ptr_to([{slot}]), {total_bytes})\n"
                 ));
                 return Ok(());
             }
             let slot_ptr = mbar_slot_ptr(mbar, stage, ctx)?;
-            out.push_str(&format!("{p}if {}:\n", scope.issue_guard()));
-            out.push_str(&format!(
-                "{p}    T.ptx.mbarrier.arrive.expect_tx({slot_ptr}, {bytes})\n"
-            ));
+            emit_guarded(
+                out,
+                &format!("T.ptx.mbarrier.arrive.expect_tx({slot_ptr}, {bytes})"),
+            );
             Ok(())
         }
         MBarrierExpectTx { mbar, bytes, stage } => {
             let slot_ptr = mbar_slot_ptr(mbar, stage, ctx)?;
-            out.push_str(&format!("{p}if {}:\n", scope.issue_guard()));
-            out.push_str(&format!(
-                "{p}    T.ptx.mbarrier.expect_tx({slot_ptr}, {bytes})\n"
-            ));
+            emit_guarded(out, &format!("T.ptx.mbarrier.expect_tx({slot_ptr}, {bytes})"));
             Ok(())
         }
         MBarrierArrive { mbar, count, stage } => {
@@ -1890,8 +1998,7 @@ fn emit_stmt(
             // arrival corrupts the barrier phase. It is latent on a single task (the
             // reused mailbox/tmem slot is never re-waited) but deadlocks the moment a
             // slot is reused across tasks (pair_tasks > broadcast/tmem stages).
-            out.push_str(&format!("{p}if {}:\n", scope.issue_guard()));
-            if let Some(remote) = &mbar.remote_coord {
+            let body = if let Some(remote) = &mbar.remote_coord {
                 // Use the LOCAL barrier name (not the peer reinterpret view).
                 let local_name = ctx
                     .mbar_names
@@ -1902,24 +2009,23 @@ fn emit_stmt(
                     .as_ref()
                     .map(|s| emit_scalar(s, ctx))
                     .unwrap_or_else(|| "0".to_string());
-                out.push_str(&format!(
-                    "{p}    T.ptx.mbarrier.arrive({local_name}.ptr_to([{slot}]), cta_id={cta}, pred=True)\n",
+                format!(
+                    "T.ptx.mbarrier.arrive({local_name}.ptr_to([{slot}]), cta_id={cta}, pred=True)",
                     cta = emit_scalar(remote, ctx),
-                ));
+                )
             } else {
                 let slot_ptr = mbar_slot_ptr(mbar, stage, ctx)?;
                 let cnt = as_int(count).unwrap_or(1);
                 if cnt == 1 {
-                    out.push_str(&format!("{p}    T.ptx.mbarrier.arrive({slot_ptr})\n"));
+                    format!("T.ptx.mbarrier.arrive({slot_ptr})")
                 } else {
                     // A local arrive with an explicit count>1 has no implicit form;
                     // none occur in this kernel. Emit the count via the cluster form on
                     // the local CTA (cta_id read from the runtime scope).
-                    out.push_str(&format!(
-                        "{p}    T.ptx.mbarrier.arrive({slot_ptr}, cta_id=cbx, pred=True, count={cnt})\n"
-                    ));
+                    format!("T.ptx.mbarrier.arrive({slot_ptr}, cta_id=cbx, pred=True, count={cnt})")
                 }
-            }
+            };
+            emit_guarded(out, &body);
             Ok(())
         }
         MBarrierWait { mbar, phase, stage } => {
@@ -1937,7 +2043,12 @@ fn emit_stmt(
             out.push_str(&format!(
                 "{p}T.ptx.mbarrier.try_wait({slot_ptr}, {phase_s})\n"
             ));
-            out.push_str(&format!("{p}T.ptx.tcgen05.fence.after_thread_sync()\n"));
+            // NO `tcgen05.fence.after_thread_sync()` here: the canonical kernel emits
+            // ZERO such fences after its mbar waits (it orders tcgen05 via the mbar
+            // handshake itself + a proxy_async fence only in the epilogue). Emitting one
+            // after every wait over-fences the hot loop (perf) and — critically — delays
+            // the scheduler's `expect_tx` relative to the async CLC multicast tx, which
+            // races the tx ahead and faults the peer CTA's barrier.
             Ok(())
         }
 
@@ -1970,11 +2081,17 @@ fn emit_stmt(
             // integer index so the operand rank matches the 2D GMEM region.
             let dst_s = emit_smem_tile(dst, ctx)?;
             let src_s = emit_gmem_region(src, coords, gmem_extents(gmem_shape, shape), ctx)?;
-            out.push_str(&format!("{p}if {}:\n", scope.issue_guard()));
-            out.push_str(&format!(
-                "{p}    Tx.copy_async({dst_s}, {src_s}, dispatch=\"tma\", mbar={mbar_name}.ptr_to([{mbar_slot}]), cta_group={cg})\n",
-                cg = ctx.cta_group,
-            ));
+            // `prefetch_tensormap=True`: the canonical prefetches the A/B tensormaps at
+            // entry (a `warp_id_in_cta==0`-guarded `prefetch.tensormap`, synthesized by
+            // the TMA dispatch from this config flag). On the latency-bound small shapes
+            // this hides the first descriptor fetch behind the prologue.
+            emit_guarded(
+                out,
+                &format!(
+                    "Tx.copy_async({dst_s}, {src_s}, dispatch=\"tma\", mbar={mbar_name}.ptr_to([{mbar_slot}]), cta_group={cg}, prefetch_tensormap=True)",
+                    cg = ctx.cta_group,
+                ),
+            );
             Ok(())
         }
 
@@ -1989,11 +2106,13 @@ fn emit_stmt(
             let a_s = emit_smem_tile(a, ctx)?;
             let b_s = emit_smem_tile(b, ctx)?;
             let accum_s = if *accum { "True" } else { "False" };
-            out.push_str(&format!("{p}if {}:\n", scope.issue_guard()));
-            out.push_str(&format!(
-                "{p}    Tx.gemm_async({dst_s}, {a_s}, {b_s}, accum={accum_s}, dispatch=\"tcgen05\", cta_group={cg})\n",
-                cg = ctx.cta_group,
-            ));
+            emit_guarded(
+                out,
+                &format!(
+                    "Tx.gemm_async({dst_s}, {a_s}, {b_s}, accum={accum_s}, dispatch=\"tcgen05\", cta_group={cg})",
+                    cg = ctx.cta_group,
+                ),
+            );
             Ok(())
         }
         Tcgen05Commit {
@@ -2004,11 +2123,13 @@ fn emit_stmt(
         } => {
             let slot_ptr = mbar_slot_ptr(mbar, stage, ctx)?;
             let mask = multicast_cta_mask.unwrap_or(0);
-            out.push_str(&format!("{p}if {}:\n", scope.issue_guard()));
-            out.push_str(&format!(
-                "{p}    T.ptx.tcgen05.commit({slot_ptr}, cta_group={cg}, cta_mask={mask})\n",
-                cg = ctx.cta_group,
-            ));
+            emit_guarded(
+                out,
+                &format!(
+                    "T.ptx.tcgen05.commit({slot_ptr}, cta_group={cg}, cta_mask={mask})",
+                    cg = ctx.cta_group,
+                ),
+            );
             Ok(())
         }
 
@@ -2023,8 +2144,13 @@ fn emit_stmt(
             let width = *num as usize;
             let _ = emit_scalar(row, ctx); // row is the lane axis, captured by the view
             let col_s = emit_scalar(col, ctx);
+            // Read this atom into its sub-slice of the (wide) read fragment: the
+            // epilogue issues a whole band's atoms into distinct slices, THEN a
+            // single wait_ld (matching the canonical fence structure). A legacy
+            // single-atom drain passes offset 0, so this is unchanged for it.
             let zero = ScalarValue::Int(0);
-            let frag_s = emit_reg_view_slice(out, &p, &dst.tensor, &zero, width, ctx)?;
+            let dst_off = dst.offsets.first().unwrap_or(&zero);
+            let frag_s = emit_reg_view_slice(out, &p, &dst.tensor, dst_off, width, ctx)?;
             out.push_str(&format!(
                 "{p}Tx.wg.copy_async({frag_s}, tmem[:, {col_s}:{col_s} + {width}])\n"
             ));
@@ -2095,8 +2221,9 @@ fn emit_stmt(
             let src_s = emit_smem_tile(src, ctx)?;
             let dst_s = emit_gmem_region(dst, coords, gmem_extents(gmem_shape, shape), ctx)?;
             out.push_str(&format!("{p}if tid_in_wg == 0:\n"));
+            // Prefetch the D (store) tensormap too, matching the canonical epilogue store.
             out.push_str(&format!(
-                "{p}    Tx.copy_async({dst_s}, {src_s}, dispatch=\"tma\")\n"
+                "{p}    Tx.copy_async({dst_s}, {src_s}, dispatch=\"tma\", prefetch_tensormap=True)\n"
             ));
             Ok(())
         }
@@ -2115,9 +2242,33 @@ fn emit_stmt(
         // The epilogue's async-proxy fence makes the warpgroup's reg->smem writes
         // visible to the TMA proxy before the store. The init fences are synthesized
         // in KernelInit, so the only `Fence` stmts in the IR are these epilogue ones.
+        // Emit it SINGLE-THREAD (`if tid_in_wg == 0`), like canon's `if (warp_id==0)&
+        // (lane_id==0): fence.proxy_async`. Canon's own comment: "an all-128-thread fence
+        // was the dominant stall" — the preceding warpgroup_sync already makes the reg->smem
+        // writes CTA-visible, so only the single TMA-issuing thread needs the proxy fence.
+        // (The kernel orders the wg_sync BEFORE this fence so the writes are visible first.)
         Fence { kind, .. } => {
-            if matches!(kind, super::dtype::FenceKind::AsyncProxy) {
-                out.push_str(&format!("{p}T.ptx.fence.proxy_async(\"shared::cta\")\n"));
+            use super::dtype::FenceKind;
+            match kind {
+                // `fence.mbarrier_init` — the prologue init-epoch fence (all threads).
+                FenceKind::MbarrierInit => {
+                    out.push_str(&format!("{p}T.ptx.fence.mbarrier_init()\n"));
+                }
+                // Scope-aware, like cta_sync: at FUNCTION scope (the prologue, where all CTA
+                // threads converge) emit the proxy fence for ALL threads; inside a single-
+                // warp/warpgroup ROLE (the epilogue) emit it single-thread (`if tid_in_wg==0`)
+                // — canon's "an all-128-thread fence was the dominant stall", the preceding
+                // wg_sync already made the writes visible. Generic on the emit scope, no
+                // overlap/no-overlap knowledge.
+                FenceKind::AsyncProxy => {
+                    if scope.is_function() {
+                        out.push_str(&format!("{p}T.ptx.fence.proxy_async(\"shared::cta\")\n"));
+                    } else {
+                        out.push_str(&format!("{p}if tid_in_wg == 0:\n"));
+                        out.push_str(&format!("{p}    T.ptx.fence.proxy_async(\"shared::cta\")\n"));
+                    }
+                }
+                FenceKind::Memory | FenceKind::View => {}
             }
             Ok(())
         }
@@ -2131,6 +2282,34 @@ fn emit_stmt(
         }
         ClusterSync => {
             out.push_str(&format!("{p}T.cuda.cluster_sync()\n"));
+            Ok(())
+        }
+        ClusterBarrierArrive => {
+            // Split cluster barrier, collective non-blocking arrival (all threads).
+            out.push_str(&format!(
+                "{p}T.ptx.barrier.cluster.arrive(sem=\"relaxed\", aligned=True)\n"
+            ));
+            Ok(())
+        }
+        ClusterBarrierWait => {
+            // Split cluster barrier, per-role wait. `barrier.cluster.wait` is WARP-COLLECTIVE:
+            // ALL threads of the role's warp(group) must execute it. If only the elected lane
+            // waits, the overlap path DEADLOCKS on hardware (verified on 1024/2048) while the
+            // protocol checker still passes (it models the wait as collective regardless of the
+            // codegen elect context). The elected-Role arm hoists a leading ClusterBarrierWait
+            // out of the elect to warp scope; reaching here under `Scope::Elected` means that
+            // hoist was bypassed — fail LOUDLY instead of emitting a silently-hanging kernel.
+            if matches!(scope, Scope::Elected) {
+                return Err(
+                    "codegen: ClusterBarrierWait under elect scope would emit a single-thread \
+                     barrier.cluster.wait (hardware deadlock). It must be hoisted to warp scope \
+                     (all threads of the warp), like canon's pre-elect cluster.wait."
+                        .to_string(),
+                );
+            }
+            out.push_str(&format!(
+                "{p}T.ptx.barrier.cluster.wait(acquire=True, aligned=False)\n"
+            ));
             Ok(())
         }
         WarpSync => Ok(()),
