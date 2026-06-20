@@ -126,7 +126,9 @@ GEMM_CONFIGS = {
         "l2_group_size": 8,
         "overlap_epilogue": True,
         "pipe_depth": 5,
-        "wb_pipe_depth": 4,
+        # wb_pipe_depth=8 (EPI_N=32, not 64): the wider 64-col writeback fragment spilled
+        # under the overlap path's 255-reg ceiling (216 B); the 32-col tile fits in registers.
+        "wb_pipe_depth": 8,
     },
     4096: {
         "mma_n": 256,
@@ -334,12 +336,13 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
     # band at a time (Dreg/Dreg_16b both EPI_N); no-overlap stages the f32 read in
     # NOL=16 sub-bands (Dreg=NOL) but accumulates the whole MMA_N cast row
     # (Dreg_16b=MMA_N) so the accumulator can be freed before any store.
-    if r.overlap:
-        accum_frag = k.tensor(space=MemorySpace.REG, dtype=DType.F32, shape=(r.epi_n,))
-        out_wide = k.tensor(space=MemorySpace.REG, dtype=config.dtype, shape=(r.epi_n,))
-    else:
-        accum_frag = k.tensor(space=MemorySpace.REG, dtype=DType.F32, shape=(NOL,))
-        out_wide = k.tensor(space=MemorySpace.REG, dtype=config.dtype, shape=(r.mma_n,))
+    # NOTE: these REG fragments are declared INSIDE the epilogue task loop (below), NOT
+    # here at function scope — canon declares its `r_local_ptr[256]`/`local_32b_ptr[16]`
+    # inside the `while(1)` task loop, so ptxas sees them as loop-local (fresh each task)
+    # and promotes them to registers; a function-scope array is whole-kernel-lived and
+    # stays in LOCAL memory (the LDL/STL spill, ~12x canon's). Verified via the nvrtc CUDA C.
+    _frag_f32_width = r.epi_n if r.overlap else NOL
+    _frag_out_width = r.epi_n if r.overlap else r.mma_n
 
     smem_full = k.mbar(kind=MBarKind.TMA, stages=r.pipe_depth)
     smem_empty = k.mbar(kind=MBarKind.TCGEN05, stages=r.pipe_depth)
@@ -494,7 +497,12 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
             task_id,
             local_iter,
         ):
-            m_idx, n_idx = work_coords(task_id)
+            # Hoist the per-task tile coords into registers ONCE per task (canon's
+            # `buffer_5`/`buffer_6`), instead of re-deriving the L2-raster expression
+            # `(task>>6)*4 + (task&63)&3` inline in every TMA address (3x/k-tile here).
+            m_idx_e, n_idx_e = work_coords(task_id)
+            m_idx = k.scalar(initial=m_idx_e, dtype=ScalarDType.I32)
+            n_idx = k.scalar(initial=n_idx_e, dtype=ScalarDType.I32)
             b_n = (n_idx * CTA_GROUP + cta_rank) * r.blk_n
             with k.for_loop(stop=r.k_tiles) as kt:
                 k.mbarrier_wait(smem_empty, stage=ld_stage, phase=(ld_phase + 1) % 2)
@@ -612,7 +620,15 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
                 task_id,
                 local_iter,
             ):
-                m_idx, n_idx = work_coords(task_id)
+                # The writeback fragments are declared FRESH per wb-tile inside the epilogue
+                # readback loops below (canon's loop-local Dreg/Dreg_16b) so ptxas promotes them
+                # to registers; a task- or function-scope fragment held across the store
+                # warpgroup-syncs spills to local memory (measured: 489K LDL -> 0).
+                # Hoist tile coords once/task (canon's `cur_m`/`cur_n`) — the epilogue
+                # store address re-derives the same L2-raster expression ×8 otherwise.
+                m_idx_e, n_idx_e = work_coords(task_id)
+                m_idx = k.scalar(initial=m_idx_e, dtype=ScalarDType.I32)
+                n_idx = k.scalar(initial=n_idx_e, dtype=ScalarDType.I32)
                 if r.overlap:
                     slot = local_iter % r.tmem_slots
                     tmem_full_phase = (local_iter // r.tmem_slots) % 2
@@ -636,6 +652,12 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
                     # atoms into a wide fragment, then ONE wait_ld + ONE wide cast (the
                     # per-atom wait used before over-fenced and serialized the reads).
                     for ot in range(r.wb_pipe_depth):
+                        # Fresh per-wb-tile cast fragment (canon's loop-local Dreg_16b): reusing
+                        # one across the wb tiles has WAR deps that keep it in local memory
+                        # (spill); a fresh single-use one promotes to registers.
+                        out_wide = k.tensor(
+                            space=MemorySpace.REG, dtype=config.dtype, shape=(r.epi_n,)
+                        )
                         store_iter = local_iter * r.wb_pipe_depth + ot
                         with k.if_(store_iter >= r.num_d_tiles):
                             k.cp_async_bulk_wait_group_read(r.num_d_tiles - 1)
@@ -646,28 +668,30 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
                         # so each d_smem store address is a literal instead of a runtime local_iter
                         # expression that ptxas spills (the IMAD*2 + STL/LDL storm of SMEM addrs).
                         db = _ring_index(local_iter, ot, r.wb_pipe_depth, r.num_d_tiles)[0]
-                        # Read the EPI_N band in canon's wider tcgen05.ld (cap 32 — raw .x64 @
-                        # 2048's EPI_N=64 overflows the 255-reg ceiling): 1024 -> 1x32, 2048 ->
-                        # 2x32. canon reads the whole EPI_N via one `wg.copy_async`.
+                        # Read the EPI_N band in read_w=32 chunks (raw .x64 @ 2048's EPI_N=64
+                        # overflows the 255-reg ceiling), each into a FRESH small f32 fragment
+                        # that is cast and freed before the next chunk — so the live f32
+                        # footprint is read_w (not the whole EPI_N), which keeps it in registers.
                         read_w = min(r.epi_n, 32)
                         for kc in range(r.epi_n // read_w):
+                            chunk_frag = k.tensor(
+                                space=MemorySpace.REG, dtype=DType.F32, shape=(read_w,)
+                            )
                             col = tmem_col0 + ot * r.epi_n + kc * read_w
                             k.tcgen05_ld(
-                                TensorSlice(
-                                    tensor=accum_frag,
-                                    offsets=(kc * read_w,),
-                                    shape=(read_w,),
-                                ),
+                                TensorSlice(tensor=chunk_frag, offsets=(0,), shape=(read_w,)),
                                 accum,
                                 num=read_w,
                                 row=0,
                                 col=col,
                             )
-                        k.tcgen05_wait_ld()
-                        k.reg_cvt(
-                            TensorSlice(tensor=out_wide, offsets=(0,), shape=(r.epi_n,)),
-                            TensorSlice(tensor=accum_frag, offsets=(0,), shape=(r.epi_n,)),
-                        )
+                            k.tcgen05_wait_ld()
+                            k.reg_cvt(
+                                TensorSlice(
+                                    tensor=out_wide, offsets=(kc * read_w,), shape=(read_w,)
+                                ),
+                                TensorSlice(tensor=chunk_frag, offsets=(0,), shape=(read_w,)),
+                            )
                         for kc in range(r.epi_n // TMEM_LD_SIZE):
                             k.reg_store(
                                 TensorSlice(
@@ -700,48 +724,39 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
                         )
                         k.cp_async_bulk_commit_group()
                 else:
-                    # No-overlap: drain the whole accumulator into registers, free it,
-                    # then stream the store tiles. Stage the tmem->reg f32 read in
-                    # NOL=16-col bands (canonical's `NOL`): all atoms of a band, then ONE
-                    # wait_ld + cast, so the f32 footprint stays 16 (avoids reg spill) and
-                    # the fence granularity matches the canonical (one wait per 16 cols).
-                    for kb in range(r.mma_n // NOL):
-                        # Read the whole NOL=16-col band in ONE tcgen05.ld (LDTM.x16), like
-                        # canon's `Tx.wg.copy_async(Dreg[NOL], tmem[NOL])`. Splitting into
-                        # 2x LDTM.x8 (TMEM_LD_SIZE) doubled the in-flight tcgen05.ld count, so
-                        # ptxas clustered all of them and spilled the f32 readback (LDL/STL);
-                        # one x16 load per band halves the in-flight loads and matches canon.
-                        # Read the whole NOL=16-col band in ONE tcgen05.ld (LDTM.x16), like
-                        # canon's `Tx.wg.copy_async(Dreg[NOL], tmem[NOL])` (a fresh per-band
-                        # fragment was tried — identical spill, so the shared frag is kept).
-                        col = tmem_col0 + kb * NOL
-                        k.tcgen05_ld(
-                            TensorSlice(
-                                tensor=accum_frag,
-                                offsets=(0,),
-                                shape=(NOL,),
-                            ),
-                            accum,
-                            num=NOL,
-                            row=0,
-                            col=col,
-                        )
-                        k.tcgen05_wait_ld()
-                        k.reg_cvt(
-                            TensorSlice(tensor=out_wide, offsets=(kb * NOL,), shape=(NOL,)),
-                            TensorSlice(tensor=accum_frag, offsets=(0,), shape=(NOL,)),
-                        )
-                    k.mbarrier_arrive(tmem_empty_leader, stage=slot)
+                    # No-overlap: interleave read+cast+store PER wb tile so the live writeback
+                    # fragment is just ONE EPI_N tile (16 regs), not the whole MMA_N=256 row
+                    # (128 regs). A 256-wide fragment held live across all 8 store warpgroup-syncs
+                    # is what ptxas spills (measured: 60 LDL/STL bracketing the bar.sync vs canon's
+                    # 2). The f32 read frag is a FRESH per-band single-use array (canon's loop-local
+                    # `Dreg`) so it promotes to registers. tmem_empty is arrived AFTER the last
+                    # read (loop end) — every TMEM band must be read before the slot is freed.
+                    bands_per_tile = r.epi_n // NOL
                     for ot in range(r.wb_pipe_depth):
+                        out_tile = k.tensor(
+                            space=MemorySpace.REG, dtype=config.dtype, shape=(r.epi_n,)
+                        )
+                        for sub in range(bands_per_tile):
+                            band_frag = k.tensor(
+                                space=MemorySpace.REG, dtype=DType.F32, shape=(NOL,)
+                            )
+                            col = tmem_col0 + (ot * bands_per_tile + sub) * NOL
+                            k.tcgen05_ld(
+                                TensorSlice(tensor=band_frag, offsets=(0,), shape=(NOL,)),
+                                accum,
+                                num=NOL,
+                                row=0,
+                                col=col,
+                            )
+                            k.tcgen05_wait_ld()
+                            k.reg_cvt(
+                                TensorSlice(tensor=out_tile, offsets=(sub * NOL,), shape=(NOL,)),
+                                TensorSlice(tensor=band_frag, offsets=(0,), shape=(NOL,)),
+                            )
                         store_iter = local_iter * r.wb_pipe_depth + ot
                         with k.if_(store_iter >= r.num_d_tiles):
                             k.cp_async_bulk_wait_group_read(r.num_d_tiles - 1)
                             k.wg_sync(barrier_id=wg_bar)
-                        # Fold the D-smem buffer index the same way the SMEM ring does:
-                        # db = (local_iter*wb_pipe_depth + ot) % num_d_tiles collapses to the
-                        # compile-time constant ot % num_d_tiles when num_d_tiles | wb_pipe_depth,
-                        # so each d_smem store address is a literal instead of a runtime local_iter
-                        # expression that ptxas spills (the IMAD*2 + STL/LDL storm of SMEM addrs).
                         db = _ring_index(local_iter, ot, r.wb_pipe_depth, r.num_d_tiles)[0]
                         for kc in range(r.epi_n // TMEM_LD_SIZE):
                             k.reg_store(
@@ -751,8 +766,8 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
                                     shape=(1, 1, TMEM_LD_SIZE),
                                 ),
                                 TensorSlice(
-                                    tensor=out_wide,
-                                    offsets=(ot * r.epi_n + kc * TMEM_LD_SIZE,),
+                                    tensor=out_tile,
+                                    offsets=(kc * TMEM_LD_SIZE,),
                                     shape=(TMEM_LD_SIZE,),
                                 ),
                             )
@@ -772,6 +787,7 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
                             gmem_shape=(BLK_M, r.epi_n),
                         )
                         k.cp_async_bulk_commit_group()
+                    k.mbarrier_arrive(tmem_empty_leader, stage=slot)
             # Drain in-flight TMA stores once after the persistent loop (TIRx
             # drains before the tmem teardown). A per-task drain would leave the
             # NEXT task's pacing wait_group with no committed group to release on.

@@ -472,31 +472,11 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
     }
 
     // ---- REG fragments (epilogue) ----
-    // Each is a warpgroup-collective `(128, width)` register tile (`T.wg_reg_tile`):
-    // the 128 threads of the warpgroup own one row each. This is the form the
-    // wg-collective ops (`wg.copy_async` / `wg.cast` / `wg.copy`) consume and that
-    // tolerates partial-column slices — a hand-rolled `alloc_local(width).view(...)`
-    // lowers fine for a full `[:, :]` op but a partial `[:, c0:c1]` slice hits
-    // "direct BufferStore on a thread-axis layout" in LowerTIRxCleanup. The width is
-    // the collapsed band (`reg_widths`), falling back to the IR-declared shape.
-    for t in collect_tensors(k) {
-        if t.space == MemorySpace::Reg {
-            let name = ctx.tensor_name(t.id)?;
-            let n = ctx
-                .reg_widths
-                .get(&t.id)
-                .copied()
-                .filter(|w| *w > 0)
-                .unwrap_or_else(|| t.shape.first().copied().unwrap_or(0));
-            out.push_str(&format!(
-                "{p}{name} = T.wg_reg_tile({n}, dtype=\"{dt}\")\n",
-                p = pad(ind),
-                name = name,
-                n = n,
-                dt = dtype_str(t.dtype),
-            ));
-        }
-    }
+    // Each is a warpgroup-collective `(128, width)` register tile (`T.wg_reg_tile`): the 128
+    // threads of the warpgroup own one row each. These are emitted INLINE at their TensorDef
+    // site (inside the epilogue task loop), NOT hoisted here — see the TensorDef arm in
+    // emit_stmt: a function-scope tile is whole-kernel-lived and ptxas spills it to local
+    // memory, while a loop-local declaration (like canon's) promotes to registers.
     out.push('\n');
 
     // ---- walk the body ----
@@ -1166,12 +1146,12 @@ fn var_name(ctx: &Ctx, v: &Var) -> String {
         .unwrap_or_else(|| format!("v{}", v.id.0))
 }
 
-/// The Python expression that *reads* a var: a scalar cell reads as `NAME[0]`;
-/// a loop var reads as its plain name.
+/// The Python expression that *reads* a var: a scalar reads as its plain `NAME`
+/// (an SSA `T.int32` register var, like canon's `sa_stage`), a loop var likewise.
 fn var_ref(ctx: &Ctx, v: &Var) -> String {
     if v.binding == VarBinding::Scalar {
         if let Some(name) = ctx.scalar_names.get(&v.id.0) {
-            return format!("{name}[0]");
+            return name.clone();
         }
     }
     var_name(ctx, v)
@@ -1639,6 +1619,25 @@ fn emit_stmt(
         }
     };
     match stmt {
+        // ---- REG fragments: emit INLINE at the TensorDef site (canon's loop-local
+        // `T.alloc_local(...)`), NOT hoisted to function scope. A function-scope register
+        // tile is whole-kernel-lived and ptxas keeps it in LOCAL memory (the LDL/STL spill);
+        // declared inside the consuming loop it is task-local and promotes to registers. ----
+        TensorDef { tensor } if tensor.space == MemorySpace::Reg => {
+            let name = ctx.tensor_name(tensor.id)?.to_string();
+            let width = ctx
+                .reg_widths
+                .get(&tensor.id)
+                .copied()
+                .filter(|w| *w > 0)
+                .unwrap_or_else(|| tensor.shape.first().copied().unwrap_or(0));
+            out.push_str(&format!(
+                "{p}{name} = T.wg_reg_tile({width}, dtype=\"{dt}\")\n",
+                p = pad(indent),
+                dt = dtype_str(tensor.dtype),
+            ));
+            Ok(())
+        }
         // ---- definitions handled in the header; skip in the body walk ----
         TensorDef { .. } | MBarDef { .. } => Ok(()),
 
@@ -1841,16 +1840,16 @@ fn emit_stmt(
                 .scalar_names
                 .get(&var.id.0)
                 .ok_or_else(|| format!("codegen: no name for scalar var {}", var.id.0))?;
-            out.push_str(&format!(
-                "{p}{name} = T.alloc_local(1, \"int32\")\n",
-                name = name
-            ));
             let init = match initial {
                 ScalarInitial::Value(v) => emit_scalar(v, ctx),
                 // Mailbox load: read the 1-element SMEM slice (drops to a scalar load).
                 ScalarInitial::Tensor(ts) => emit_scalar_load(ts, ctx)?,
             };
-            out.push_str(&format!("{p}{name}[0] = {init}\n", name = name));
+            // Emit an SSA `T.int32` register var (canon's `sa_stage: T.int32 = …`), NOT a
+            // `T.alloc_local(1)` cell. The local-array form can defeat ptxas's uniform-register
+            // analysis (the warp-uniform counters lower to VECTOR regs + R2UR + LDL/STL spill);
+            // a plain typed var lowers to a uniform register (UIADD3) like canon.
+            out.push_str(&format!("{p}{name}: T.int32 = {init}\n", name = name));
             Ok(())
         }
         ShuffleSync { var, src, src_lane } => {
@@ -1859,12 +1858,11 @@ fn emit_stmt(
                 .get(&var.id.0)
                 .ok_or_else(|| format!("codegen: no name for scalar var {}", var.id.0))?
                 .clone();
-            out.push_str(&format!("{p}{name} = T.alloc_local(1, \"int32\")\n"));
             // Warp broadcast (lane `src_lane` -> all lanes of the warp). The result is
             // compiler-provably uniform, so the index/address chain derived from it
             // lowers to the uniform datapath instead of vector + R2UR.
             out.push_str(&format!(
-                "{p}{name}[0] = T.cuda.__shfl_sync(0xffffffff, {src}, {lane}, 32)\n",
+                "{p}{name}: T.int32 = T.cuda.__shfl_sync(0xffffffff, {src}, {lane}, 32)\n",
                 src = emit_scalar(src, ctx),
                 lane = emit_scalar(src_lane, ctx),
             ));
@@ -1911,9 +1909,8 @@ fn emit_stmt(
                 .ok_or_else(|| format!("codegen: no name for scalar var {}", var.id.0))?
                 .clone();
             let handle_name = ctx.tensor_name(handle.id)?;
-            out.push_str(&format!("{p}{name} = T.alloc_local(1, \"int32\")\n"));
             out.push_str(&format!(
-                "{p}{name}[0] = T.ptx.clc_query_cancel(T.address_of({handle_name}[0]))\n"
+                "{p}{name}: T.int32 = T.ptx.clc_query_cancel(T.address_of({handle_name}[0]))\n"
             ));
             Ok(())
         }
@@ -1922,8 +1919,9 @@ fn emit_stmt(
                 .scalar_names
                 .get(&var.id.0)
                 .ok_or_else(|| format!("codegen: no name for scalar var {}", var.id.0))?;
+            // Reassign the SSA register var (canon's `sa_stage = …`), no `[0]` cell index.
             out.push_str(&format!(
-                "{p}{name}[0] = {}\n",
+                "{p}{name} = {}\n",
                 emit_scalar(value, ctx),
                 name = name
             ));
