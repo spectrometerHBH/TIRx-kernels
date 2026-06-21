@@ -186,10 +186,10 @@ fn check_mma_shape(m: u32, n: u32, k: u32, cta_group: u8) -> R {
     check_positive(m, "tcgen05_mma m")?;
     check_positive(n, "tcgen05_mma n")?;
     check_positive(k, "tcgen05_mma k")?;
-    if k != 16 && k != 32 && k != 64 {
-        return bail(
-            "tcgen05_mma k must be 16 (dense f16/bf16), 32 (block-scaled f8), or 64 (block-scaled fp4)",
-        );
+    // 16 dense f16/bf16; 32 block-scaled f8; 64 the nvfp4 MMA-K instruction; 128/256 a
+    // full block-scaled k-tile issued as one gemm_async (canon issues one per k-tile).
+    if k != 16 && k != 32 && k != 64 && k != 128 && k != 256 {
+        return bail("tcgen05_mma k must be 16, 32, 64, 128, or 256");
     }
     match cta_group {
         1 => {
@@ -838,7 +838,7 @@ fn validate_stmt(s: &Stmt) -> R {
             sfa,
             sfb,
             sf_byte,
-            sf_block,
+            sf_e4m3,
             a_fp4,
             b_fp4,
             ..
@@ -856,42 +856,37 @@ fn validate_stmt(s: &Stmt) -> R {
             {
                 return bail("tcgen05_mma operands must be SMEM or TMEM");
             }
-            // fp4 (e2m1) operands are stored packed 2-per-byte as u8; the others
-            // are one element per container slot.
-            let want_dtype = |dt: DType, fp4: bool| -> bool {
-                if fp4 {
-                    dt == DType::U8
-                } else {
-                    matches!(dt, DType::F16 | DType::Bf16 | DType::F8E4M3)
-                }
-            };
             // A TMEM operand may be the f32 accumulator read directly as the MMA
             // operand (e.g. the GDN state S, kept in TMEM); the value model reads
             // every operand as logical f32, so an f32 TMEM operand is exact.
             let tmem_f32 = |sl: &TensorSlice| {
                 sl.tensor.space == MemorySpace::Tmem && sl.tensor.dtype == DType::F32
             };
-            let ok_dtype = |sl: &TensorSlice, fp4: bool| want_dtype(sl.tensor.dtype, fp4) || tmem_f32(sl);
-            if !ok_dtype(a, *a_fp4) || !ok_dtype(b, *b_fp4) {
-                return bail(
-                    "tcgen05_mma operand dtype must be f16, bf16, f8e4m3, packed u8 (fp4), or an f32 TMEM operand",
-                );
-            }
-            // Operand dtypes must match, EXCEPT a bf16/f16 operand paired with an
-            // f32 TMEM operand (both materialize to f32 in value mode).
-            if a.tensor.dtype != b.tensor.dtype && !tmem_f32(a) && !tmem_f32(b) {
-                return bail("tcgen05_mma a and b operand dtype must match");
-            }
-            // instruction K per format: f16/bf16 = 16, f8e4m3 = 32, fp4 = 64.
-            let want_k = if *a_fp4 {
-                64
-            } else if a.tensor.dtype == DType::F8E4M3 {
-                32
+            if *a_fp4 || *b_fp4 {
+                // NVFP4: operands are e2m1 fp4 packed 2-per-u8; both must be fp4.
+                if !*a_fp4 || !*b_fp4 {
+                    return bail("tcgen05_mma a_fp4 and b_fp4 must be set together");
+                }
+                if a.tensor.dtype != DType::U8 || b.tensor.dtype != DType::U8 {
+                    return bail("tcgen05_mma fp4 operands must be u8 (2 packed e2m1 per byte)");
+                }
             } else {
-                16
-            };
-            if *k != want_k {
-                return bail("tcgen05_mma k does not match the operand format (16/32/64)");
+                // Operands are f16/bf16/f8e4m3 one-per-slot, OR an f32 TMEM operand
+                // (e.g. the GDN state S read directly out of TMEM).
+                let ok_dtype = |sl: &TensorSlice| {
+                    matches!(sl.tensor.dtype, DType::F16 | DType::Bf16 | DType::F8E4M3)
+                        || tmem_f32(sl)
+                };
+                if !ok_dtype(a) || !ok_dtype(b) {
+                    return bail(
+                        "tcgen05_mma operand dtype must be f16, bf16, f8e4m3, or an f32 TMEM operand",
+                    );
+                }
+                // Operand dtypes must match, EXCEPT a bf16/f16 operand paired with an
+                // f32 TMEM operand (both materialize to f32 in value mode).
+                if a.tensor.dtype != b.tensor.dtype && !tmem_f32(a) && !tmem_f32(b) {
+                    return bail("tcgen05_mma a and b operand dtype must match");
+                }
             }
             if dst.tensor.dtype != DType::F32 {
                 return bail("tcgen05_mma dst dtype must be f32");
@@ -900,47 +895,38 @@ fn validate_stmt(s: &Stmt) -> R {
             let a_rows = if *cta_group == 1 { *m } else { m / 2 };
             let b_rows = if *cta_group == 1 { *n } else { n / 2 };
             check_slice_covers(dst, &[dst_rows as usize, *n as usize], "tcgen05_mma dst")?;
-            // fp4 operands occupy k/2 packed bytes along the inner dim.
-            let a_k = if *a_fp4 {
-                (*k / 2) as usize
-            } else {
-                *k as usize
-            };
-            let b_k = if *b_fp4 {
-                (*k / 2) as usize
-            } else {
-                *k as usize
-            };
+            // fp4 operands are packed 2-per-byte, so the K (contraction) extent in the
+            // SMEM tile is k/2 bytes, not k elements.
+            let a_kdim = if *a_fp4 { (*k / 2) as usize } else { *k as usize };
+            let b_kdim = if *b_fp4 { (*k / 2) as usize } else { *k as usize };
             let a_shape = if *trans_a {
-                [a_k, a_rows as usize]
+                [a_kdim, a_rows as usize]
             } else {
-                [a_rows as usize, a_k]
+                [a_rows as usize, a_kdim]
             };
             let b_shape = if *trans_b {
-                [b_k, b_rows as usize]
+                [b_kdim, b_rows as usize]
             } else {
-                [b_rows as usize, b_k]
+                [b_rows as usize, b_kdim]
             };
             check_slice_covers_trailing(a, &a_shape, "tcgen05_mma a")?;
             check_slice_covers_trailing(b, &b_shape, "tcgen05_mma b")?;
-            let block_scaled = a.tensor.dtype == DType::F8E4M3 || *a_fp4;
             match (sfa, sfb) {
                 (None, None) => {
-                    if block_scaled {
-                        return bail("tcgen05_mma block-scaled operands require sfa/sfb vectors");
+                    if a.tensor.dtype == DType::F8E4M3 {
+                        return bail("tcgen05_mma f8e4m3 operands require sfa/sfb scale vectors");
                     }
                 }
                 (Some(sfa), Some(sfb)) => {
-                    if !block_scaled {
-                        return bail("tcgen05_mma sfa/sfb require f8e4m3 or fp4 operands");
+                    // UE8M0 path requires f8e4m3 operands; NVFP4 (sf_e4m3) uses fp4 operands.
+                    if !*sf_e4m3 && a.tensor.dtype != DType::F8E4M3 {
+                        return bail("tcgen05_mma sfa/sfb require f8e4m3 operands");
+                    }
+                    if *sf_e4m3 && !*a_fp4 {
+                        return bail("tcgen05_mma sf_e4m3 (NVFP4) requires fp4 operands");
                     }
                     if *sf_byte >= 4 {
                         return bail("tcgen05_mma sf_byte must be in 0..4");
-                    }
-                    if *a_fp4 && (*sf_block == 0 || *k % *sf_block != 0 || *k / *sf_block > 4) {
-                        return bail(
-                            "tcgen05_mma fp4 sf_block must divide k into at most 4 blocks per issue",
-                        );
                     }
                     for (sf, rows, label) in [
                         (sfa, a_rows as usize, "tcgen05_mma sfa"),
@@ -950,9 +936,13 @@ fn validate_stmt(s: &Stmt) -> R {
                         if sf.tensor.space != MemorySpace::Tmem {
                             return bail(format!("{label} must be TMEM"));
                         }
-                        if sf.tensor.dtype != DType::U32 {
+                        // UE8M0 packs 4 exponent bytes per u32 cell; NVFP4 holds e4m3 bytes.
+                        let want = if *sf_e4m3 { DType::F8E4M3 } else { DType::U32 };
+                        if sf.tensor.dtype != want {
                             return bail(format!(
-                                "{label} dtype must be u32 (4 packed UE8M0 bytes)"
+                                "{label} dtype must be {} ({})",
+                                if *sf_e4m3 { "e4m3" } else { "u32" },
+                                if *sf_e4m3 { "nvfp4 scales" } else { "4 packed UE8M0 bytes" }
                             ));
                         }
                         let Some(shape) = static_slice_shape(sf) else {
@@ -983,12 +973,10 @@ fn validate_stmt(s: &Stmt) -> R {
             if src.tensor.space != MemorySpace::Smem {
                 return bail("tcgen05_cp src must be SMEM");
             }
-            // SF cells are u32 (dev's nvfp4 packs 4 e4m3 bytes per cell) OR e4m3 directly
-            // (the canon-matching nvfp4 cp's e4m3 scales SMEM->TMEM). Accept both (IR union).
-            if !matches!(dst.tensor.dtype, DType::U32 | DType::F8E4M3)
-                || !matches!(src.tensor.dtype, DType::U32 | DType::F8E4M3)
-            {
-                return bail("tcgen05_cp moves packed u32 or e4m3 scale cells");
+            // UE8M0 path packs scale bytes as u32 cells; NVFP4 moves e4m3 scale bytes.
+            let ok_sf = |d: DType| matches!(d, DType::U32 | DType::F8E4M3);
+            if !ok_sf(dst.tensor.dtype) || !ok_sf(src.tensor.dtype) {
+                return bail("tcgen05_cp moves u32 (UE8M0) or e4m3 (nvfp4) scale cells");
             }
             let (Some(dst_shape), Some(src_shape)) =
                 (static_slice_shape(dst), static_slice_shape(src))
