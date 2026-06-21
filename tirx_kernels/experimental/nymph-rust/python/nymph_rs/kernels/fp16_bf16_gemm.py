@@ -140,18 +140,26 @@ GEMM_CONFIGS = {
     },
     8192: {
         "mma_n": 256,
-        "blk_k": 64,
+        # blk_k=128/pipe_depth=2 (not 64/4 — same SMEM footprint, 128*2 == 64*4): at 8192's
+        # ~90% tensor-active the MMA is fed-bound, and the wider-K / fewer-stages ring issues
+        # half as many TMA round-trips per K-step, keeping the tensor core fed. Lifts 8192 from
+        # ~0.982 to ~1.007 (numerically identical to canon, 0 spill). 4096 (65% active, not
+        # fed-bound) prefers the shallower-K form, so this is 8192-up only.
+        "blk_k": 128,
         "l2_group_size": 8,
         "overlap_epilogue": False,
-        "pipe_depth": 4,
+        "pipe_depth": 2,
         "wb_pipe_depth": 8,
     },
     16384: {
         "mma_n": 256,
-        "blk_k": 64,
+        # blk_k=128/pipe_depth=2 (same SMEM as 64/4): fed-bound at ~96% tensor-active, the
+        # wider-K ring keeps the tensor core fed — 1.000 -> 1.007 (min 0.989 -> 0.997). Same
+        # lever as 8192.
+        "blk_k": 128,
         "l2_group_size": 8,
         "overlap_epilogue": False,
-        "pipe_depth": 4,
+        "pipe_depth": 2,
         "wb_pipe_depth": 8,
     },
 }
