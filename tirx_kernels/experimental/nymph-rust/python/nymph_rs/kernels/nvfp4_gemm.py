@@ -364,7 +364,11 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                     seq = local_iter * k_tiles + t
                     stage = seq % SMEM_DEPTH
                     occ = seq // SMEM_DEPTH
-                    k.mbarrier_wait(smem_full, stage=stage, phase=occ % 2)
+                    # The consumer waits the FLIPPED phase the loader's TMA arrive sets
+                    # (same convention as the loader's smem_empty wait) — phase=occ%2 lets
+                    # the cp/gemm read the SMEM tile before the load completes (a race the
+                    # protocol checker flagged: tma_load_access_before_mbar_wait).
+                    k.mbarrier_wait(smem_full, stage=stage, phase=(occ + 1) % 2)
                     k.tcgen05_cp(
                         TensorSlice(tensor=sfa_tmem, offsets=(0, 0), shape=(128, SF_CTA_K)),
                         TensorSlice(tensor=sfa_smem, offsets=(stage, 0, 0), shape=(1, blk_m, SF_CTA_K)),

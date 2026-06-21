@@ -737,17 +737,20 @@ fn shape_str(shape: &crate::ir::LdStShape) -> &'static str {
 // ---- MMA ----
 
 fn execute_mma<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
-    // NVFP4 (e2m1 fp4 operands / e4m3 scales) is not yet modeled in the value simulator
-    // (Phase 4). Fail loudly rather than silently decoding it as the UE8M0 path.
-    if matches!(
-        stmt,
-        Stmt::Tcgen05Mma { sf_e4m3: true, .. }
-            | Stmt::Tcgen05Mma { a_fp4: true, .. }
-            | Stmt::Tcgen05Mma { b_fp4: true, .. }
-    ) {
+    // NVFP4 (e2m1 fp4 operands / e4m3 scales) value compute isn't modeled yet — but the
+    // TRACE/protocol path only needs the access events (which warp reads/writes which
+    // SMEM/TMEM region), so let trace mode run. Bail only in VALUE mode.
+    if !ctx.trace_mode()
+        && matches!(
+            stmt,
+            Stmt::Tcgen05Mma { sf_e4m3: true, .. }
+                | Stmt::Tcgen05Mma { a_fp4: true, .. }
+                | Stmt::Tcgen05Mma { b_fp4: true, .. }
+        )
+    {
         return Err(InterpreterError::new(
             "tcgen05_mma_nvfp4_unsupported",
-            "tcgen05_mma: NVFP4 (e4m3 scale / fp4 operands) not yet supported in the value model",
+            "tcgen05_mma: NVFP4 (e4m3 scale / fp4 operands) value compute not yet supported",
         ));
     }
     let (dst, a_sl, b_sl, m, n, k, accum, trans_a, trans_b, cta_group, sfa, sfb, sf_byte) =
@@ -914,7 +917,10 @@ fn trace_mma(
     let b_r = ctx.eval_slice(b_sl)?;
     let a_eff = trace_mma_effective_shape(&a_r.shape, trans_a, cta_ids.len())?;
     let b_eff = trace_mma_effective_shape(&b_r.shape, trans_b, cta_ids.len())?;
-    if a_eff != (m, k) || b_eff != (n, k) {
+    // NVFP4 fp4 operands are packed 2-per-u8 byte, so the operand's K extent is k/2 bytes.
+    let a_kdim = if a_sl.tensor.dtype == crate::ir::DType::U8 { k / 2 } else { k };
+    let b_kdim = if b_sl.tensor.dtype == crate::ir::DType::U8 { k / 2 } else { k };
+    if a_eff != (m, a_kdim) || b_eff != (n, b_kdim) {
         return Err(InterpreterError::new(
             "tcgen05_mma_shape",
             "tcgen05_mma operand shape does not match m/n/k",
