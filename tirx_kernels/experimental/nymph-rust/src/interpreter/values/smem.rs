@@ -6,7 +6,7 @@
 
 use super::super::diagnostics::{IResult, InterpreterError};
 use super::arrays::ValueArray1;
-use super::dtypes::{decode_e4m3, encode_e4m3, round_bf16_scalar};
+use super::dtypes::{decode_e2m1, decode_e4m3, encode_e4m3, round_bf16_scalar};
 use super::indexing::numel;
 use super::tensors::{flat_with_strides, rect_intra_offsets, row_major_strides};
 use crate::ir::{DType, MemorySpace, Tensor};
@@ -595,6 +595,49 @@ impl SmemScratchpad {
         Ok(true)
     }
 
+    /// Materialize an FP4 (e2m1) matrix operand into `out` as f32. The operand
+    /// is stored packed: a `U8` tensor whose innermost dim is the byte count
+    /// (K/2 bytes for K fp4 elements), exactly mirroring TIRx's
+    /// `uint8[M, K//2]` + `.view("float4_e2m1fn")`. Each byte holds two e2m1
+    /// values — low nibble = element 2i, high nibble = element 2i+1 — so a slice
+    /// of `cols` bytes yields `2*cols` f32 in element order. `slice_shape`'s
+    /// innermost extent is in bytes (the packed K/2), like the SMEM tensor.
+    pub fn append_f32_block_fp4(
+        &self,
+        tensor: &Tensor,
+        offsets: &[usize],
+        slice_shape: &[usize],
+        out: &mut Vec<f32>,
+    ) -> IResult<()> {
+        if tensor.dtype != DType::U8 {
+            return Err(InterpreterError::new(
+                "tcgen05_mma_dtype",
+                "fp4 mma operand must be a packed u8 tensor",
+            ));
+        }
+        if let Some((ranges, cols)) = self.rect_row_ranges(tensor, offsets, slice_shape)? {
+            for range in &ranges {
+                self.check_valid(range.clone())?;
+            }
+            out.reserve(ranges.len() * cols * 2);
+            for range in &ranges {
+                for &byte in &self.bytes[range.clone()] {
+                    out.push(decode_e2m1(byte & 0x0F));
+                    out.push(decode_e2m1(byte >> 4));
+                }
+            }
+            return Ok(());
+        }
+        let indices = block_indices(tensor, offsets, slice_shape)?;
+        out.reserve(indices.len() * 2);
+        for flat in indices {
+            let b = self.read_bytes::<1>(tensor, flat)?[0];
+            out.push(decode_e2m1(b & 0x0F));
+            out.push(decode_e2m1(b >> 4));
+        }
+        Ok(())
+    }
+
     fn try_write_rect_runs(
         &mut self,
         tensor: &Tensor,
@@ -911,5 +954,47 @@ mod tests {
         let pool = SmemScratchpad::new(4);
         let err = pool.read_indices(&t, &[0]).unwrap_err();
         assert_eq!(err.code, "missing_tensor_value");
+    }
+
+    #[test]
+    fn fp4_operand_unpacks_two_e2m1_per_byte_in_element_order() {
+        // packed u8[2, 3]: row 0 bytes [0x21, 0x43, 0x65], row 1 [0x07, 0x12, 0xA9].
+        // byte 0x21 -> low nibble 1 (0.5), high nibble 2 (1.0); etc.
+        let t = smem_tensor(1, DType::U8, vec![2, 3], 0);
+        let mut pool = SmemScratchpad::new(6);
+        let bytes: [u8; 6] = [0x21, 0x43, 0x65, 0x07, 0x12, 0xA9];
+        pool.write_indices(
+            &t,
+            &[0, 1, 2, 3, 4, 5],
+            &ValueArray1::U8(Array1::from(bytes.to_vec())),
+        )
+        .unwrap();
+        // full block: 2 rows x 3 bytes -> 2 x 6 f32
+        let mut out = Vec::new();
+        pool.append_f32_block_fp4(&t, &[0, 0], &[2, 3], &mut out)
+            .unwrap();
+        let d = |n: u8| decode_e2m1(n);
+        assert_eq!(
+            out,
+            vec![
+                d(1),
+                d(2),
+                d(3),
+                d(4),
+                d(5),
+                d(6), // row 0
+                d(7),
+                d(0),
+                d(2),
+                d(1),
+                d(9),
+                d(0xA), // row 1: 0x07,0x12,0xA9
+            ]
+        );
+        // a sub-slice of the second row's last two bytes exercises the offset path
+        let mut sub = Vec::new();
+        pool.append_f32_block_fp4(&t, &[1, 1], &[1, 2], &mut sub)
+            .unwrap();
+        assert_eq!(sub, vec![d(2), d(1), d(9), d(0xA)]);
     }
 }

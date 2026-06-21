@@ -297,37 +297,6 @@ impl<'a, 'k> CohortContext<'a, 'k> {
         }
         Ok(())
     }
-    /// Like `check_full_warp_cohort` but ALSO accepts a single-issuing-lane cohort (one
-    /// lane per warp). The tcgen05 MMA is issued by exactly ONE thread on the hardware
-    /// (the canonical kernel runs its MMA loop under `if T.ptx.elect_sync():`), so a
-    /// 1-lane elected cohort is valid — this lets the MMA role run single-elect and
-    /// collapse the per-op `elect_sync` guards (the ELECT/BRA instruction overhead).
-    pub fn check_full_warp_or_elected_cohort(
-        &self,
-        code: impl Into<String>,
-        message: impl Into<String>,
-    ) -> IResult<()> {
-        let code = code.into();
-        let message = message.into();
-        if self.cohort.is_empty() {
-            return Err(InterpreterError::new(code, message));
-        }
-        let mut lanes_by_warp: HashMap<(usize, usize), u32> = HashMap::new();
-        for thread in &self.cohort {
-            if thread.lane_id >= 32 {
-                return Err(InterpreterError::new(code.clone(), message.clone()));
-            }
-            *lanes_by_warp
-                .entry((thread.cta_id, thread.warp_id))
-                .or_insert(0) |= 1u32 << thread.lane_id;
-        }
-        for lanes in lanes_by_warp.values() {
-            if *lanes != u32::MAX && lanes.count_ones() != 1 {
-                return Err(InterpreterError::new(code.clone(), message.clone()));
-            }
-        }
-        Ok(())
-    }
     pub fn cta_activity(&self, cta_id: usize) -> CtaActivityStatus {
         self.cta_activity
             .get(cta_id)

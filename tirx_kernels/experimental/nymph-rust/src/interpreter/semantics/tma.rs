@@ -8,7 +8,9 @@ use super::super::mbar_ops::{
     retarget_mbar, uniform_mbar_target, MbarTarget,
 };
 use super::super::outcomes::StepStatus;
-use super::super::protocol::{MemoryAccessKind, MemoryProxy, TensorAccessKind, TraceEventKind};
+use super::super::protocol::{
+    MemoryAccessKind, MemoryProxy, ReduceOp, TensorAccessKind, TraceEventKind,
+};
 use super::super::region;
 use super::super::registry::{StmtExecutorRegistry, StmtKind};
 use super::super::values::indexing::numel;
@@ -21,105 +23,101 @@ use std::sync::Arc;
 pub fn register(reg: &mut StmtExecutorRegistry) {
     reg.register(StmtKind::TmaLoad, execute_tma_load);
     reg.register(StmtKind::TmaStore, execute_tma_store);
-    reg.register(StmtKind::ClcTryCancel, execute_clc_try_cancel);
+    reg.register(
+        StmtKind::CpAsyncBulkS2Cluster,
+        execute_cp_async_bulk_s2cluster,
+    );
 }
 
-/// The CLC `try_cancel` response handle is a 16B (uint4) cell.
-const CLC_HANDLE_BYTES: i64 = 16;
-
-/// `clusterlaunchcontrol.try_cancel` (CLC async work-steal issue), written out in
-/// the kernel's custom scheduler. In sim it does two things: (1) runs the canonical
-/// round-robin oracle — the trusted seam — computing this cluster's next task and
-/// storing the raw ctaid (`task * cta_group`, or -1 drained) into the per-cluster
-/// handle slot the paired `ClcQueryCancel` reads; and (2) completes-tx the signalled
-/// mbar on every CTA of the cluster (the hardware multicasts the 16B handle), exactly
-/// like a TMA landing, so the kernel's `sched_arr` handshake is real for the checker.
-fn execute_clc_try_cancel<'a, 'k>(
+/// `cp.async.bulk.shared::cluster` — async bulk SMEM->peer-CTA-SMEM copy. Composes
+/// the TmaStore source-read (local SMEM, async proxy) with the TmaLoad dest-write
+/// (the PEER CTA's SMEM pool, async proxy, TmaLoad access-kind so the
+/// `tma_load_access_before_mbar_wait` check forces the peer to wait the completing
+/// barrier before reading) + a `complete_tx` on the PEER's mbar (mbar.remote_coord).
+/// The peer CTA = the mbar's resolved target, keeping dest and signal consistent.
+fn execute_cp_async_bulk_s2cluster<'a, 'k>(
     ctx: &mut CohortContext<'a, 'k>,
     stmt: &'k Stmt,
 ) -> IResult<StepStatus> {
-    let (scheduler, mbar, stage, cta_group) = match stmt {
-        Stmt::ClcTryCancel {
-            scheduler,
+    let (dst, src, mbar, bytes) = match stmt {
+        Stmt::CpAsyncBulkS2Cluster {
+            dst,
+            src,
             mbar,
-            stage,
-            cta_group,
-            ..
-        } => (scheduler, mbar, stage, *cta_group),
+            bytes,
+        } => (dst, src, mbar, bytes),
         _ => unreachable!(),
     };
-    if cta_group != 1 && cta_group != 2 {
+    let byte_count = ctx.eval_scalar_uniform(bytes, "s2cluster bytes", "divergent_tma_operands")?;
+    if byte_count < 1 {
         return Err(InterpreterError::new(
-            "invalid_clc_cta_group",
-            "clc_try_cancel cta_group must be 1 or 2",
+            "s2cluster_bytes",
+            "cp_async_bulk_s2cluster bytes must be positive",
         ));
     }
-    // --- canonical round-robin oracle (the trusted seam) ---
-    let total_tasks = scheduler.space.task_count().ok_or_else(|| {
-        InterpreterError::new("invalid_scheduler", "task space size overflows usize")
-    })?;
-    let cluster_cta = ctx.cluster_cta_count();
-    let cluster_count = ctx.kernel.launch_cta_count() / cluster_cta;
-    if cluster_count == 0 {
+    if src.tensor.space != MemorySpace::Smem || dst.tensor.space != MemorySpace::Smem {
         return Err(InterpreterError::new(
-            "invalid_scheduler",
-            "cluster count must be positive",
+            "s2cluster_space",
+            "cp_async_bulk_s2cluster src and dst must both be SMEM",
         ));
     }
-    let cluster_id = ctx.stream.cluster_id;
-    // The cursor starts at 1: cursor 0 is the cluster's own launch tile (= cluster_id),
-    // which the worker processes via init, NOT via a steal. `try_cancel` (this op)
-    // returns the *stolen* tiles cluster_id + 1*cc, + 2*cc, ... — exactly the hardware
-    // semantics (query_cancel never returns the launcher's own tile).
-    let cur = *ctx
-        .state
-        .scheduler_next_cursors
-        .entry((scheduler.id, cluster_id))
-        .or_insert(1);
-    let offset = cur
-        .checked_mul(cluster_count)
-        .ok_or_else(|| InterpreterError::new("invalid_scheduler", "task index overflows usize"))?;
-    let task = cluster_id
-        .checked_add(offset)
-        .ok_or_else(|| InterpreterError::new("invalid_scheduler", "task index overflows usize"))?;
-    let drained = task >= total_tasks;
-    if !drained {
-        *ctx.state
-            .scheduler_next_cursors
-            .get_mut(&(scheduler.id, cluster_id))
-            .expect("cursor just inserted") += 1;
-    }
-    let raw_value: i64 = if drained {
-        -1
-    } else {
-        i64::try_from(task * cluster_cta)
-            .map_err(|_| InterpreterError::new("invalid_scheduler", "ctaid does not fit in i64"))?
-    };
-    ctx.state
-        .clc_handle_values
-        .insert((scheduler.id, cluster_id), raw_value);
+    // The peer (destination) CTA is the mbar's target — keeps the SMEM write and the
+    // completion signal on the same CTA.
+    let target = uniform_mbar_target(ctx, mbar, None)?;
+    let peer_in_cluster = target.identity.ctaid_in_cluster;
+    let peer_global = ctx.global_cta_id(peer_in_cluster);
+    let src_offsets = uniform_tuple(ctx, &src.offsets, "s2cluster src offsets")?;
+    let dst_offsets = uniform_tuple(ctx, &dst.offsets, "s2cluster dst offsets")?;
+    let src_shape = uniform_tuple(ctx, &src.shape, "s2cluster src shape")?;
+    let dst_shape = uniform_tuple(ctx, &dst.shape, "s2cluster dst shape")?;
+
     if ctx.trace_mode() {
-        let task_id = if drained {
-            -1
-        } else {
-            i64::try_from(task).map_err(|_| {
-                InterpreterError::new("invalid_scheduler", "task does not fit in i64")
-            })?
-        };
-        ctx.emit(TraceEventKind::SchedulerNext {
-            scheduler_id: scheduler.id,
-            cta_id: ctx.stream.cta_id,
-            task_id,
-            scope: ctx.access_scope(),
+        let scope = ctx.access_scope();
+        // local SMEM source read (the bulk engine reads SMEM via the async proxy)
+        ctx.emit(TraceEventKind::Read {
+            region: region::tensor_region_from_uniform(
+                &src.tensor,
+                ctx.stream.cta_id,
+                &src_offsets,
+                &src_shape,
+            )?,
+            proxy: MemoryProxy::Async,
+            access_kind: MemoryAccessKind::Tensor(TensorAccessKind::TmaStore),
+            scope: scope.clone(),
         })?;
+        // peer-CTA SMEM destination write (attributed to the peer's SMEM pool so the
+        // race checker matches it against the peer's read of that buffer)
+        ctx.emit(TraceEventKind::Write {
+            region: region::tensor_region_from_uniform(
+                &dst.tensor,
+                peer_global,
+                &dst_offsets,
+                &dst_shape,
+            )?,
+            proxy: MemoryProxy::Async,
+            access_kind: MemoryAccessKind::Tensor(TensorAccessKind::TmaLoad),
+            scope,
+        })?;
+        ctx.state
+            .values
+            .smem
+            .pool_for_mut(peer_global, ctx.kernel.smem_size_bytes)
+            .invalidate_block(&dst.tensor, &dst_offsets, &dst_shape)?;
+    } else if ctx.value_mode() {
+        let values = ctx
+            .state
+            .values
+            .smem
+            .pool_for(ctx.stream.cta_id)?
+            .read_block(&src.tensor, &src_offsets, &src_shape)?;
+        ctx.state
+            .values
+            .smem
+            .pool_for_mut(peer_global, ctx.kernel.smem_size_bytes)
+            .write_block(&dst.tensor, &dst_offsets, &dst_shape, &values)?;
     }
-    // --- complete-tx the signalled mbar on every CTA of the cluster ---
-    let base = uniform_mbar_target(ctx, mbar, stage.as_ref())?;
-    let mut targets = Vec::with_capacity(cta_group as usize);
-    for c in 0..cta_group as usize {
-        targets.push(retarget_mbar(base, c));
-    }
-    let wakes = apply_mbar_complete_tx(ctx, &targets, CLC_HANDLE_BYTES)?;
+
+    let wakes = apply_mbar_complete_tx(ctx, &[target], byte_count)?;
     Ok(StepStatus::advance_wake(wakes))
 }
 
@@ -466,14 +464,15 @@ fn execute_tma_store<'a, 'k>(
     ctx: &mut CohortContext<'a, 'k>,
     stmt: &'k Stmt,
 ) -> IResult<StepStatus> {
-    let (dst, src, coords, shape, gmem_shape) = match stmt {
+    let (dst, src, coords, shape, gmem_shape, reduce_add) = match stmt {
         Stmt::TmaStore {
             dst,
             src,
             coords,
             shape,
             gmem_shape,
-        } => (dst, src, coords, shape, gmem_shape),
+            reduce_add,
+        } => (dst, src, coords, shape, gmem_shape, *reduce_add),
         _ => unreachable!(),
     };
     if ctx.trace_mode() {
@@ -498,10 +497,33 @@ fn execute_tma_store<'a, 'k>(
         if let Some(write_region) =
             region::tensor_rect_region_clamped(dst, ctx.stream.cta_id, &coords_r, &dst_shape)?
         {
+            // Reduce-add is a hardware-atomic RMW of the GMEM output (cp.reduce.async.bulk.add,
+            // global scope). Tag both the RMW Read and the Write with TmaReduce so the checker
+            // can tell this is an ATOMIC commutative reduce (not a plain overwrite): two same-op
+            // reduces to one location are race-free. `exact=false` for float (non-associative ->
+            // order-dependent result). The Read-before-Write also keeps consecutive same-stream
+            // reduce-adds an RMW (not a WAW overwrite-before-read hazard).
+            let red_kind = MemoryAccessKind::Tensor(TensorAccessKind::TmaReduce {
+                op: ReduceOp::Add,
+                exact: dst.dtype.is_integer(),
+            });
+            let store_kind = if reduce_add {
+                red_kind
+            } else {
+                MemoryAccessKind::Tensor(TensorAccessKind::TmaStore)
+            };
+            if reduce_add {
+                ctx.emit(TraceEventKind::Read {
+                    region: write_region.clone(),
+                    proxy: MemoryProxy::Generic,
+                    access_kind: red_kind,
+                    scope: scope.clone(),
+                })?;
+            }
             ctx.emit(TraceEventKind::Write {
                 region: write_region,
                 proxy: MemoryProxy::Generic,
-                access_kind: MemoryAccessKind::Tensor(TensorAccessKind::TmaStore),
+                access_kind: store_kind,
                 scope,
             })?;
         }
@@ -523,6 +545,7 @@ fn execute_tma_store<'a, 'k>(
         &src_offsets,
         shape,
         gmem_shape.as_ref(),
+        reduce_add,
     )?;
     Ok(StepStatus::advance())
 }
@@ -553,6 +576,7 @@ fn invalidate_gmem_block(
     inst.invalidate_slice_inplace(offsets, shape)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn store_write(
     ctx: &mut CohortContext,
     dst: &Arc<crate::ir::Tensor>,
@@ -561,6 +585,7 @@ fn store_write(
     src_offsets: &[usize],
     shape: &[usize],
     gmem_shape: Option<&Vec<usize>>,
+    reduce_add: bool,
 ) -> IResult<()> {
     let instance = TensorInstanceKey {
         tensor: Arc::clone(dst),
@@ -582,7 +607,11 @@ fn store_write(
     let dst_shape = tma_tensor_shape(dst, coords, shape, gmem_shape, "tma_store")?;
     let valid = clamp_gmem_box(dst, coords, &dst_shape);
     let copy_result = if valid == dst_shape {
-        inst.write_slice_inplace(coords, &dst_shape, &values)
+        if reduce_add {
+            inst.accumulate_slice_inplace(coords, &dst_shape, &values)
+        } else {
+            inst.write_slice_inplace(coords, &dst_shape, &values)
+        }
     } else if valid.iter().any(|&v| v == 0) {
         Ok(()) // fully out of bounds: the tensormap squashes the whole store
     } else {
@@ -606,7 +635,11 @@ fn store_write(
             sub_row += 1;
             Ok(())
         })?;
-        inst.write_slice_inplace(coords, &valid, &sub)
+        if reduce_add {
+            inst.accumulate_slice_inplace(coords, &valid, &sub)
+        } else {
+            inst.write_slice_inplace(coords, &valid, &sub)
+        }
     };
     ctx.state.values.tensors.by_instance.insert(instance, inst);
     copy_result

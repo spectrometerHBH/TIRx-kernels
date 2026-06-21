@@ -34,6 +34,25 @@ pub enum DType {
     F32,
 }
 
+impl DType {
+    /// Integer/bool types — for which `+` is associative-exact (an atomic add reduction over
+    /// them is order-INdependent). Float types (F8E4M3/F16/Bf16/F32) are non-associative.
+    pub fn is_integer(self) -> bool {
+        matches!(
+            self,
+            DType::Bool
+                | DType::I8
+                | DType::U8
+                | DType::I16
+                | DType::U16
+                | DType::I32
+                | DType::U32
+                | DType::I64
+                | DType::U64
+        )
+    }
+}
+
 /// `Swizzle` — SMEM swizzle width.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Swizzle {
@@ -68,9 +87,6 @@ pub enum FenceKind {
     Memory,
     AsyncProxy,
     View,
-    /// `fence.mbarrier_init` — seals the mbarrier-init epoch (makes the inits visible to the
-    /// async engines) before any role touches a barrier. Emitted once in the prologue.
-    MbarrierInit,
 }
 
 /// `FenceScope` — the memory hierarchy level a fence orders. `Cta`/`Cluster` are the

@@ -8,7 +8,10 @@
 //! - `stmt`   — the big Stmt enum (~41 variants)
 //! - `kernel` — Kernel (owns the tensor/mbar tables)
 
-pub mod codegen;
+// codegen targets the OLD staging IR (ShuffleSync/Clc*/ClusterBarrierWait/ForLoop.unroll/
+// FenceKind::MbarrierInit) which dev's framework doesn't have — temporarily disabled while the
+// dev framework is the base; needs reconciliation to dev's IR before re-enabling the GPU path.
+// pub mod codegen;
 pub mod dtype;
 pub mod kernel;
 pub mod mbar;
@@ -19,7 +22,7 @@ pub mod tensor;
 pub mod validate;
 
 // Re-export everything so callers can write `nymph::ir::Tensor` etc.
-pub use codegen::*;
+// pub use codegen::*;
 pub use dtype::*;
 pub use kernel::*;
 pub use mbar::*;
@@ -97,7 +100,6 @@ mod tests {
                 start: ScalarValue::Int(0),
                 stop: ScalarValue::Int(16),
                 step: ScalarValue::Int(1),
-                unroll: false,
                 body: vec![Stmt::RegStore {
                     dst: a_slice.clone(),
                     src: a_slice.clone(),

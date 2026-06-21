@@ -5,6 +5,7 @@ use super::cooperative::CooperativeValues;
 use super::mbars::MbarValues;
 use super::registers::RegisterValues;
 use super::scalars::ScalarValues;
+use super::semaphores::SemaphoreValues;
 use super::smem::SmemValues;
 use super::tensors::TensorValues;
 use super::tmem::TmemValues;
@@ -18,4 +19,5 @@ pub struct RuntimeValues {
     pub tmem: TmemValues,
     pub mbars: MbarValues,
     pub cooperative: CooperativeValues,
+    pub semaphores: SemaphoreValues,
 }

@@ -954,10 +954,10 @@ fn tmem_logical_box(tensor: &Tensor, offset: &[i64], shape: &[usize]) -> IResult
         }
     };
     let elem_size = dtype_size_bytes(tensor.dtype);
-    if !matches!(elem_size, 1 | 2 | 4) {
+    if !matches!(elem_size, 2 | 4) {
         return Err(InterpreterError::new(
             "unsupported_tmem_dtype",
-            "TMEM trace access supports 8-bit (nvfp4 e4m3 scale), 16-bit, or 32-bit widths",
+            "TMEM trace access supports 16-bit or 32-bit element widths",
         ));
     }
     let byte_start = layout
