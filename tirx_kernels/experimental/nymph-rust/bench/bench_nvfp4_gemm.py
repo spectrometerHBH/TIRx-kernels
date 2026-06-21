@@ -35,12 +35,11 @@ def _compile_nymph(M, N, K, **ov):
 
 
 def _nymph_inputs(M, N, K):
-    rows = (K // CTA_K) * SF_CELLS
+    # nvfp4: a/b packed-fp4 u8 (rows, K//2); sfa/sfb e4m3 scales (rows, K//16); d bf16.
     a = torch.randint(0, 256, (M, K // 2), dtype=torch.uint8, device="cuda")
     b = torch.randint(0, 256, (N, K // 2), dtype=torch.uint8, device="cuda")
-    sfa = torch.randint(0, 2**31, (rows, M), dtype=torch.int32, device="cuda").view(torch.uint32) \
-        if hasattr(torch, "uint32") else torch.randint(0, 2**31, (rows, M), dtype=torch.int32, device="cuda")
-    sfb = torch.randint(0, 2**31, (rows, N), dtype=torch.int32, device="cuda")
+    sfa = torch.randint(0, 256, (M, K // 16), dtype=torch.uint8, device="cuda").view(torch.float8_e4m3fn)
+    sfb = torch.randint(0, 256, (N, K // 16), dtype=torch.uint8, device="cuda").view(torch.float8_e4m3fn)
     d = torch.zeros((M, N), dtype=torch.bfloat16, device="cuda")
     return [a, b, sfa, sfb, d]
 
