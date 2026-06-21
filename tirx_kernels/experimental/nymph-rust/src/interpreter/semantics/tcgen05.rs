@@ -737,6 +737,19 @@ fn shape_str(shape: &crate::ir::LdStShape) -> &'static str {
 // ---- MMA ----
 
 fn execute_mma<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
+    // NVFP4 (e2m1 fp4 operands / e4m3 scales) is not yet modeled in the value simulator
+    // (Phase 4). Fail loudly rather than silently decoding it as the UE8M0 path.
+    if matches!(
+        stmt,
+        Stmt::Tcgen05Mma { sf_e4m3: true, .. }
+            | Stmt::Tcgen05Mma { a_fp4: true, .. }
+            | Stmt::Tcgen05Mma { b_fp4: true, .. }
+    ) {
+        return Err(InterpreterError::new(
+            "tcgen05_mma_nvfp4_unsupported",
+            "tcgen05_mma: NVFP4 (e4m3 scale / fp4 operands) not yet supported in the value model",
+        ));
+    }
     let (dst, a_sl, b_sl, m, n, k, accum, trans_a, trans_b, cta_group, sfa, sfb, sf_byte) =
         match stmt {
             Stmt::Tcgen05Mma {
@@ -753,6 +766,7 @@ fn execute_mma<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResu
                 sfa,
                 sfb,
                 sf_byte,
+                ..
             } => (
                 dst,
                 a,

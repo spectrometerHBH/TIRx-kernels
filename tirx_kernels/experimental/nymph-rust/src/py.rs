@@ -2093,7 +2093,7 @@ fn cp_async_bulk_wait_group_read(n: u8) -> PyStmt {
     PyStmt(ir::Stmt::CpAsyncBulkWaitGroupRead { n })
 }
 #[pyfunction]
-#[pyo3(name = "Tcgen05Mma", signature = (dst, a, b, m, n, k = 16, accum = false, trans_a = false, trans_b = false, cta_group = 1, sfa = None, sfb = None, sf_byte = 0))]
+#[pyo3(name = "Tcgen05Mma", signature = (dst, a, b, m, n, k = 16, accum = false, trans_a = false, trans_b = false, cta_group = 1, sfa = None, sfb = None, sf_byte = 0, sf_e4m3 = false, sf_block = 32, a_fp4 = false, b_fp4 = false))]
 #[allow(clippy::too_many_arguments)]
 fn tcgen05_mma(
     dst: Bound<'_, PyAny>,
@@ -2109,6 +2109,10 @@ fn tcgen05_mma(
     sfa: Option<Bound<'_, PyAny>>,
     sfb: Option<Bound<'_, PyAny>>,
     sf_byte: u8,
+    sf_e4m3: bool,
+    sf_block: u8,
+    a_fp4: bool,
+    b_fp4: bool,
 ) -> PyResult<PyStmt> {
     Ok(PyStmt(ir::Stmt::Tcgen05Mma {
         dst: coerce_slice(&dst)?,
@@ -2124,6 +2128,10 @@ fn tcgen05_mma(
         sfa: sfa.map(|v| coerce_slice(&v)).transpose()?,
         sfb: sfb.map(|v| coerce_slice(&v)).transpose()?,
         sf_byte,
+        sf_e4m3,
+        sf_block,
+        a_fp4,
+        b_fp4,
     }))
 }
 #[pyfunction]
