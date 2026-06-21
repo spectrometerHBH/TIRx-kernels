@@ -186,10 +186,10 @@ fn check_mma_shape(m: u32, n: u32, k: u32, cta_group: u8) -> R {
     check_positive(m, "tcgen05_mma m")?;
     check_positive(n, "tcgen05_mma n")?;
     check_positive(k, "tcgen05_mma k")?;
-    if k != 16 && k != 32 && k != 64 {
-        return bail(
-            "tcgen05_mma k must be 16 (dense f16/bf16), 32 (block-scaled f8), or 64 (nvfp4)",
-        );
+    // 16 dense f16/bf16; 32 block-scaled f8; 64 the nvfp4 MMA-K instruction; 128/256 a
+    // full block-scaled k-tile issued as one gemm_async (canon issues one per k-tile).
+    if k != 16 && k != 32 && k != 64 && k != 128 && k != 256 {
+        return bail("tcgen05_mma k must be 16, 32, 64, 128, or 256");
     }
     match cta_group {
         1 => {
@@ -887,9 +887,13 @@ fn validate_stmt(s: &Stmt) -> R {
                         if sf.tensor.space != MemorySpace::Tmem {
                             return bail(format!("{label} must be TMEM"));
                         }
-                        if sf.tensor.dtype != DType::U32 {
+                        // UE8M0 packs 4 exponent bytes per u32 cell; NVFP4 holds e4m3 bytes.
+                        let want = if *sf_e4m3 { DType::F8E4M3 } else { DType::U32 };
+                        if sf.tensor.dtype != want {
                             return bail(format!(
-                                "{label} dtype must be u32 (4 packed UE8M0 bytes)"
+                                "{label} dtype must be {} ({})",
+                                if *sf_e4m3 { "e4m3" } else { "u32" },
+                                if *sf_e4m3 { "nvfp4 scales" } else { "4 packed UE8M0 bytes" }
                             ));
                         }
                         let Some(shape) = static_slice_shape(sf) else {
@@ -920,8 +924,10 @@ fn validate_stmt(s: &Stmt) -> R {
             if src.tensor.space != MemorySpace::Smem {
                 return bail("tcgen05_cp src must be SMEM");
             }
-            if dst.tensor.dtype != DType::U32 || src.tensor.dtype != DType::U32 {
-                return bail("tcgen05_cp moves packed u32 scale cells");
+            // UE8M0 path packs scale bytes as u32 cells; NVFP4 moves e4m3 scale bytes.
+            let ok_sf = |d: DType| matches!(d, DType::U32 | DType::F8E4M3);
+            if !ok_sf(dst.tensor.dtype) || !ok_sf(src.tensor.dtype) {
+                return bail("tcgen05_cp moves u32 (UE8M0) or e4m3 (nvfp4) scale cells");
             }
             let (Some(dst_shape), Some(src_shape)) =
                 (static_slice_shape(dst), static_slice_shape(src))
