@@ -1512,21 +1512,17 @@ fn accumulate_inplace(
     // one UE8M0 scale per row. Scaling the materialized operand rows commutes
     // bit-for-bit with product scaling.
     //
-    // The B scales differ by datapath. fp8 holds the FULL N-band's B scales in
-    // EVERY CTA's sfb tensor (duplicated), so each acc half reads `n` rows from
-    // its own copy. nvfp4's e4m3 sfb is SPLIT by N across the pair exactly like
-    // the B operand itself (each CTA's sfb_tmem holds its own n_seg=128 rows),
-    // so the full N-band scale vector is the per-CTA halves CONCATENATED in
-    // cta_ids order — matching how `sb` (the B operand) is built below.
+    // The B scales are held FULL-band (duplicated) in every CTA's sfb tensor for
+    // BOTH datapaths: fp8 holds the full N-band's UE8M0 row scales, and nvfp4's
+    // e4m3 sfb holds the full MMA_N-wide band (canon's SFB_N==128 multicast — the
+    // B operand is N-split across the pair, but its scales are not). So each acc
+    // half reads `n` rows (the full band) from its own copy. (A's scales, like A,
+    // ARE split by M across the pair: rows_per_cta rows per CTA.)
     let nblocks = if sf_block == 0 { 1 } else { k / sf_block };
-    let sfb_split = sf_block != 0; // nvfp4 block-scaled: B scales split, not duplicated
     let (sa_scales, sb_scales) = match scales {
         Some((sfa_sl, sfb_sl, sf_byte)) => {
             let byte_base = if sf_block == 0 { sf_byte } else { 0 };
             let mut sa = Vec::with_capacity(cta_ids.len());
-            // The full-N-band B scale vector (concatenated halves) shared by both
-            // acc halves when split; otherwise one per-CTA duplicated copy each.
-            let mut sb_split_full: Vec<f32> = Vec::new();
             let mut sb: Vec<Vec<f32>> = Vec::with_capacity(cta_ids.len());
             for &cta in cta_ids {
                 sa.push(read_scale_blocks(
@@ -1538,19 +1534,9 @@ fn accumulate_inplace(
                     sf_e4m3,
                     cta,
                 )?);
-                if sfb_split {
-                    sb_split_full.extend(read_scale_blocks(
-                        ctx, sfb_sl, byte_base, nblocks, n_seg, sf_e4m3, cta,
-                    )?);
-                } else {
-                    sb.push(read_scale_blocks(
-                        ctx, sfb_sl, byte_base, nblocks, n, sf_e4m3, cta,
-                    )?);
-                }
-            }
-            if sfb_split {
-                // Both acc halves apply the same full-band (split) scale vector.
-                sb = vec![sb_split_full; cta_ids.len()];
+                sb.push(read_scale_blocks(
+                    ctx, sfb_sl, byte_base, nblocks, n, sf_e4m3, cta,
+                )?);
             }
             (sa, sb)
         }

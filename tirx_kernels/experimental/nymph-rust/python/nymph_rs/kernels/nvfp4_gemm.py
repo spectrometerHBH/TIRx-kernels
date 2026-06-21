@@ -9,8 +9,11 @@ ports:
 
 - the cluster datapath: ``CTA_GROUP=2`` with ``CLUSTER_M=2`` — the cluster pair
   takes two adjacent M tiles (A split by M across the pair) and shares one
-  ``MMA_N = CTA_N * CTA_GROUP = 256`` N band (B split by N across the pair). This
-  is the verified ``(m=256, cta_group=2)`` block-scaled MMA;
+  ``MMA_N = CTA_N * CTA_GROUP = 128`` N band (B split by N across the pair, its
+  block scales held full-band in both CTAs). The block-scaled tcgen05 dispatch
+  derives N from the accumulator's MMA_N columns and requires ``SFB_rows >= N``;
+  ``SFB_tmem`` is a fixed 128 rows, so ``MMA_N`` is 128 (canon's runnable
+  ``CTA_N=64`` config), and the per-CTA accumulator is ``(128, MMA_N)``;
 - the role split: one TMA-load warp, one scale-factor permute warp, one MMA warp
   (issuing from the cluster leader only), and one epilogue warpgroup;
 - the pipeline protocol, identical in shape to the fp8 port: ``smem_pipe`` (full
@@ -53,10 +56,16 @@ from ..nymph_rs import (
 )
 
 CTA_M = 128  # per-CTA A tile rows (one M tile)
-CTA_N = 128  # per-CTA B tile rows (this CTA's half of the shared N band)
+CTA_N = 64  # per-CTA B tile rows (this CTA's half of the shared N band)
 CTA_GROUP = 2
 CLUSTER_M = 2
-MMA_N = CTA_N * CTA_GROUP  # 256, the shared N band the pair computes together
+# MMA_N = CTA_N * CTA_GROUP = 128, the shared N band the pair computes together.
+# The block-scaled tcgen05 dispatch derives N from the accumulator's column count
+# and requires SFB_rows >= N; SFB_tmem is a fixed 128 rows, so MMA_N must be <= 128
+# (canon's runnable CTA_N=64 config). With MMA_N=128 the emitted gemm_async is
+# `tmem[:, 0:128]` (N=128), B operand = MMA_N//CTA_GROUP = 64 rows, B_N*cta_group =
+# 64*2 = 128 = N, and SFB rows=128 >= 128 all hold.
+MMA_N = CTA_N * CTA_GROUP  # 128, the shared N band the pair computes together
 MMA_M = 256  # the pair's two M tiles
 CTA_K = 256  # K per pipeline tile
 MMA_K = 64  # block-scaled fp4 MMA instruction K
@@ -141,7 +150,10 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     a_tile_bytes = blk_m * BLK_K_BYTES
     b_tile_bytes = blk_n * BLK_K_BYTES
     sfa_tile_bytes = blk_m * SF_CTA_K  # per k-tile, this CTA's M rows x 16 e4m3 bytes
-    sfb_tile_bytes = blk_n * SF_CTA_K  # per k-tile, this CTA's N-half rows x 16 e4m3 bytes
+    # canon's SFB_N==128 path: the FULL MMA_N-wide N band's scales live in EVERY
+    # CTA (multicast), not split by N like the B operand. SFB_tmem is a fixed 128
+    # rows, so the band is MMA_N=128 rows here.
+    sfb_tile_bytes = MMA_N * SF_CTA_K  # per k-tile, the full N band's rows x 16 e4m3 bytes
     d_tile_bytes = blk_m * EPI_TILE * 2
 
     a_off = 0
@@ -194,7 +206,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     sfb_smem = k.tensor(
         space=MemorySpace.SMEM,
         dtype=DType.F8E4M3,
-        shape=(SMEM_DEPTH, blk_n, SF_CTA_K),
+        shape=(SMEM_DEPTH, MMA_N, SF_CTA_K),
         byte_offset=sfb_off,
     )
     d_smem = k.tensor(
@@ -284,6 +296,17 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
             k.mbarrier_init(tmem_full, count=1, stage=s)
             k.mbarrier_init(tmem_empty, count=cta_group, stage=s)
 
+    # Prologue cross-CTA sync (canon's `T.ptx.fence.mbarrier_init` +
+    # `barrier.cluster.arrive/wait`): seal the mbarrier-init epoch so the inits and
+    # the TMEM alloc are visible to the async engines, then converge every CTA
+    # thread of the cluster before any role touches a peer mbarrier or the shared
+    # TMEM. Written EXPLICITLY here (codegen never fabricates it) — the same
+    # fused no-overlap form the fp16/bf16 port uses. Without it the MMA/epilogue
+    # race the still-pending alloc/init on the peer CTA (illegal tcgen05).
+    k.fence(kind=FenceKind.MBARRIER_INIT)
+    k.fence(kind=FenceKind.ASYNC_PROXY, scope=FenceScope.CTA)
+    k.cluster_sync()
+
     # ---- TMA producer (wg0/warp0) ----
     with k.role(warp=0):
         with k.for_each_task(task_scheduler) as task:
@@ -340,14 +363,17 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                     gmem_shape=(blk_m, SF_CTA_K),
                     mbar_stage=stage,
                 )
+                # SFB: the FULL MMA_N-wide N band (rank-independent sf_n), so both
+                # CTAs hold the same full-band scales (canon's SFB_N==128 multicast).
+                # The B operand is still N-split (b_n), but its scales are not.
                 k.tma_load(
-                    TensorSlice(tensor=sfb_smem, offsets=(stage, 0, 0), shape=(1, blk_n, SF_CTA_K)),
+                    TensorSlice(tensor=sfb_smem, offsets=(stage, 0, 0), shape=(1, MMA_N, SF_CTA_K)),
                     sfb_gmem,
                     mbar=smem_full,
                     bytes=sfb_tile_bytes,
-                    coords=(b_n, sf_k),
-                    shape=(1, blk_n, SF_CTA_K),
-                    gmem_shape=(blk_n, SF_CTA_K),
+                    coords=(sf_n, sf_k),
+                    shape=(1, MMA_N, SF_CTA_K),
+                    gmem_shape=(MMA_N, SF_CTA_K),
                     mbar_stage=stage,
                 )
 
@@ -394,16 +420,17 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                     k.tcgen05_cp(
                         TensorSlice(tensor=sfb_tmem, offsets=(0, 0), shape=(128, sfb_cols)),
                         TensorSlice(
-                            tensor=sfb_smem, offsets=(stage, 0, 0), shape=(1, blk_n, SF_CTA_K)
+                            tensor=sfb_smem, offsets=(stage, 0, 0), shape=(1, MMA_N, SF_CTA_K)
                         ),
                         cta_group=cta_group,
                     )
-                    # canon's cluster gemm: n = MMA_N (the full 256-wide N band the pair
-                    # computes together), m = MMA_M; each CTA supplies its own blk_n=128-row
-                    # B half (b_smem holds it) and the 2-CTA MMA writes the full MMA_N
-                    # accumulator. SFA/SFB full (128, SF_CTA_K). (n=CTA_N with a 64-row B
-                    # half only fills HALF the MMA_N accumulator — the epilogue then reads
-                    # the unwritten upper cols. n=MMA_N matches the fp16/bf16 cluster MMA.)
+                    # canon's cluster gemm: n = MMA_N (the full 128-wide N band the pair
+                    # computes together), m = MMA_M; each CTA supplies its own blk_n=64-row
+                    # B half (b_smem holds it, CTA_N=MMA_N//CTA_GROUP rows) and the 2-CTA MMA
+                    # writes the per-CTA (128, MMA_N) accumulator. The block-scaled tcgen05
+                    # dispatch derives N from the accumulator's MMA_N=128 columns: B_N=64,
+                    # B_N*cta_group=128=N, and SFB rows=128 >= N=128 (the fixed 128-row
+                    # SFB_tmem). SFA/SFB full (128, SF_CTA_K).
                     a_op = TensorSlice(
                         tensor=a_smem, offsets=(stage, 0, 0), shape=(1, blk_m, BLK_K_BYTES)
                     )
@@ -486,6 +513,10 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
         k.cp_async_bulk_wait_group_read(0)
         k.wg_sync(barrier_id=10)
 
+    # Cluster-wide barrier before freeing TMEM (canon's `cluster_sync()` right
+    # before relinquish + dealloc): both CTAs' epilogues finish reading the
+    # accumulator before warp 0 deallocs the shared TMEM region.
+    k.cluster_sync()
     with k.kernel_finalize(warp=0):
         k.tmem_dealloc(tmem_base, n_cols=N_COLS_TMEM, cta_group=cta_group)
 
