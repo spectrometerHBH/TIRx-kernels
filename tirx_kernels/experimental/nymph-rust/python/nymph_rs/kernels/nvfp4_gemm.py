@@ -286,7 +286,9 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
             a_m = m_idx * CTA_M  # this CTA's own M tile
             b_n = n_idx * MMA_N + cta_rank * CTA_N  # this CTA's half of the N band
             sf_n = n_idx * MMA_N  # the FULL N band's B scales (rank-independent)
-            for t in range(k_tiles):
+            # Rolled k-loop (canon's T.serial) — a Python range unrolls in the IR, which
+            # ~doubles the emitted CUDA tcgen05 ops vs canon and breaks multi-k-tile.
+            with k.for_loop(stop=k_tiles) as t:
                 seq = local_iter * k_tiles + t
                 stage = seq % SMEM_DEPTH
                 occ = seq // SMEM_DEPTH
@@ -356,14 +358,13 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                 acc_slice = TensorSlice(
                     tensor=accum, offsets=(0, tmem_idx * MMA_N), shape=(128, CTA_N)
                 )
-                for t in range(k_tiles):
+                def mma_ktile(t, accum_flag):
+                    # one k-tile: wait the staged loads, cp the e4m3 scales SMEM->TMEM,
+                    # issue ONE block-scaled gemm over CTA_K, free the smem stage.
                     seq = local_iter * k_tiles + t
                     stage = seq % SMEM_DEPTH
                     occ = seq // SMEM_DEPTH
                     k.mbarrier_wait(smem_full, stage=stage, phase=occ % 2)
-                    # cp the e4m3 scales SMEM -> TMEM (canon's Tx.copy_async(SFA_tmem,
-                    # SFA_smem[stage], cta_group=2)). SFB's MMA_N rows fold to 128 lanes
-                    # x two SF_CTA_K column groups.
                     k.tcgen05_cp(
                         TensorSlice(tensor=sfa_tmem, offsets=(0, 0), shape=(128, SF_CTA_K)),
                         TensorSlice(tensor=sfa_smem, offsets=(stage, 0, 0), shape=(1, blk_m, SF_CTA_K)),
@@ -374,36 +375,31 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                         TensorSlice(tensor=sfb_smem, offsets=(stage, 0, 0), shape=(1, blk_n, SF_CTA_K)),
                         cta_group=cta_group,
                     )
-                    # ONE block-scaled gemm over the whole CTA_K tile (k = CTA_K). The
-                    # fp4 operands are the full packed-byte tiles; SFA/SFB are the full
-                    # e4m3 cells. Codegen views the u8 operands as float4_e2m1fn and
-                    # passes SFA=/SFB=.
-                    # canon's per-CTA gemm: n = CTA_N (the pair's MMA_N=256 N band is split
-                    # across the 2 CTAs), m = MMA_M, the B operand is n/2 rows. A operand is
-                    # m/2 = CTA_M rows; SFA/SFB are the full (128, SF_CTA_K).
+                    # canon's per-CTA gemm: n = CTA_N (the pair's MMA_N=256 band is split
+                    # across the 2 CTAs), m = MMA_M, B operand n/2 rows, SFA/SFB full (128, SF_CTA_K).
                     a_op = TensorSlice(tensor=a_smem, offsets=(stage, 0, 0), shape=(1, blk_m, BLK_K_BYTES))
                     b_op = TensorSlice(
                         tensor=b_smem, offsets=(stage, 0, 0), shape=(1, CTA_N // CTA_GROUP, BLK_K_BYTES)
                     )
                     k.tcgen05_mma(
-                        acc_slice,
-                        a_op,
-                        b_op,
-                        m=MMA_M,
-                        n=CTA_N,
-                        k=CTA_K,
-                        accum=(t > 0),
+                        acc_slice, a_op, b_op,
+                        m=MMA_M, n=CTA_N, k=CTA_K,
+                        accum=accum_flag,
                         cta_group=cta_group,
                         sfa=TensorSlice(tensor=sfa_tmem, offsets=(0, 0), shape=(128, SF_CTA_K)),
                         sfb=TensorSlice(tensor=sfb_tmem, offsets=(0, 0), shape=(128, sfb_cols)),
-                        sf_e4m3=True,
-                        sf_block=SF_BLOCK,
-                        a_fp4=True,
-                        b_fp4=True,
+                        sf_e4m3=True, sf_block=SF_BLOCK, a_fp4=True, b_fp4=True,
                     )
                     k.tcgen05_commit(
                         smem_empty, stage=stage, cta_group=cta_group, multicast_cta_mask=0b11
                     )
+
+                # Peel the first k-tile (accum=False), roll the rest with accum=True
+                # (canon's `accum=0` then `accum=1`). The rolled loop keeps the emitted
+                # CUDA tcgen05 op count at canon's level (a Python range would unroll it).
+                mma_ktile(0, False)
+                with k.for_loop(stop=k_tiles - 1) as ti:
+                    mma_ktile(ti + 1, True)
                 k.tcgen05_commit(
                     tmem_full, stage=tmem_idx, cta_group=cta_group, multicast_cta_mask=0b11
                 )
