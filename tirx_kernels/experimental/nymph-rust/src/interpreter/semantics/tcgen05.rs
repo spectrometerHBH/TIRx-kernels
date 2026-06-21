@@ -797,9 +797,13 @@ fn execute_mma<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResu
         ),
         _ => unreachable!(),
     };
-    ctx.check_full_warp_cohort(
+    // tcgen05.mma is single-thread-ISSUE (unlike warp-collective mma.sync): a full warp OR
+    // a single elected lane (canon's `if elect_sync(): gemm`) is a valid issuer. The B200
+    // tensor pipe REQUIRES the elected single-lane form — per-op elect guards that reconverge
+    // the warp between consecutive tcgen05 issues stall the async stream (a GPU deadlock).
+    ctx.check_tcgen05_issuer(
         "tcgen05_mma_mask",
-        "tcgen05_mma must be issued by one or more full warps",
+        "tcgen05_mma must be issued by a full warp or a single elected lane",
     )?;
 
     // The accumulator CTA(s): cta_group=2's even CTA computes the whole pair; odd is a no-op.
@@ -1083,9 +1087,16 @@ fn read_scale_blocks(
         }
         let sp = ctx.state.values.tmem.scratchpad_for(cta_id)?;
         let mut out = Vec::with_capacity(rows * nblocks);
+        // Rows ≥ 128 fold into column super-blocks (execute_cp's write folding): logical
+        // row r -> lane = r % 128, col = col0 + (r // 128) * nblocks + b. For SFA (≤128
+        // rows) this is the identity; for a 256-row SFB the second 128-row super-block
+        // reads from the next SF_CTA_K column band. `nblocks` here == the per-row block
+        // count (SF_CTA_K), the same super-block column stride execute_cp wrote with.
         for r in 0..rows {
+            let lane = r % 128;
+            let super_col = col0 + (r / 128) * nblocks;
             for b in 0..nblocks {
-                out.push(decode_e4m3(sp.read_sf_byte(r, col0 + b)?));
+                out.push(decode_e4m3(sp.read_sf_byte(lane, super_col + b)?));
             }
         }
         return Ok(out);
@@ -1223,12 +1234,28 @@ fn execute_cp<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResul
             // cell (lane = row, col = col0 + block), the layout read_scale_blocks
             // reads back. (read_block decodes e4m3 to f32; re-encoding round-trips
             // every finite e4m3 byte exactly.)
+            //
+            // `nblocks` is the SF blocks PER LOGICAL ROW — the src tile's innermost
+            // dim (SF_CTA_K), NOT the dst slice's column count. For a multi-super-block
+            // SFB (canon's 256-row SFB_tmem = `128 * SFB_n_chunks`) the IR cp dst is a
+            // `(128, SF_CTA_K * n_chunks)` slice (validate.rs/cp require dst rows == 128),
+            // so dst.shape[1] over-counts the per-row blocks by n_chunks; the src's last
+            // dim recovers the true SF_CTA_K and row-major-indexes all logical rows.
+            //
+            // Rows ≥ 128 FOLD into column super-blocks (TMEM is physically 128 lanes):
+            // logical row r -> lane = r % 128, and the super-block s = r // 128 shifts the
+            // column by `s * SF_CTA_K`. This mirrors sf_tmem_layout's M_super TCol stride
+            // — canon's 256-row SFB packs its second 128-row half into the next SF_CTA_K
+            // column band (cols col0+16..col0+32), which read_scale_blocks reads back the
+            // same way.
             ValueArray1::F8E4M3(vals) => {
-                let nblocks = dst_r.shape[1];
+                let nblocks = *src_r.shape.last().unwrap_or(&dst_r.shape[1]);
                 for (e, &v) in vals.iter().enumerate() {
                     let row = e / nblocks;
                     let blk = e % nblocks;
-                    sp.write_sf_byte(row, col0 + blk, encode_e4m3(v))?;
+                    let lane = row % 128;
+                    let col = col0 + (row / 128) * nblocks + blk;
+                    sp.write_sf_byte(lane, col, encode_e4m3(v))?;
                 }
             }
             _ => {
