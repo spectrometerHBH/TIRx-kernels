@@ -235,6 +235,12 @@ fn pad(indent: usize) -> String {
 }
 
 /// Entry point: lower a kernel to a TVMScript source string.
+/// Positional arg name: A, B, C, D, E, … (then Arg{i} past the alphabet).
+fn arg_name(i: usize) -> String {
+    const NAMES: [&str; 8] = ["A", "B", "C", "D", "E", "F", "G", "H"];
+    NAMES.get(i).map(|s| s.to_string()).unwrap_or_else(|| format!("Arg{i}"))
+}
+
 pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
     let ctx = build_ctx(k)?;
     let mut out = String::new();
@@ -242,14 +248,12 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
     out.push_str(HEADER_IMPORTS);
     out.push('\n');
 
-    // Argument tensors A/B/C by position.
-    if k.args.len() != 3 {
-        return Err(format!(
-            "codegen: bootstrap expects 3 args (A,B,C), got {}",
-            k.args.len()
-        ));
+    // Argument tensors, named by position (A, B, C, D, …). The fp16/bootstrap GEMM
+    // has 3 (A, B, C-out); the nvfp4 GEMM has 5 (A, B, SFA, SFB, D-out). Names are
+    // cosmetic — TVM matches args positionally.
+    if k.args.is_empty() {
+        return Err("codegen: kernel has no args".to_string());
     }
-    let arg_names = ["A", "B", "C"];
 
     // SMEM tensor layout helper vars (mma_shared_layout(...)) — declared above the
     // prim_func so the parser sees plain Python values. Every f16/bf16 SMEM buffer
@@ -295,7 +299,14 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
 
     // ---- prim_func header ----
     out.push_str("@T.prim_func\n");
-    out.push_str("def main(A_ptr: T.handle, B_ptr: T.handle, C_ptr: T.handle) -> None:\n");
+    let sig = k
+        .args
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("{}_ptr: T.handle", arg_name(i)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    out.push_str(&format!("def main({sig}) -> None:\n"));
     let ind = 1;
     for (i, t) in k.args.iter().enumerate() {
         let dims = t
@@ -307,7 +318,7 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
         out.push_str(&format!(
             "{p}{name} = T.match_buffer({name}_ptr, ({dims}), \"{dt}\")\n",
             p = pad(ind),
-            name = arg_names[i],
+            name = arg_name(i),
             dims = dims,
             dt = dtype_str(t.dtype),
         ));
@@ -681,6 +692,7 @@ fn try_collapse_mma_run(stmts: &[Stmt]) -> Option<(Stmt, usize)> {
         sfa,
         sfb,
         sf_byte,
+        ..
     } = &stmts[0]
     else {
         return None;
@@ -775,6 +787,12 @@ fn try_collapse_mma_run(stmts: &[Stmt]) -> Option<(Stmt, usize)> {
         sfa: None,
         sfb: None,
         sf_byte: *sf_byte,
+        // The collapse only runs on the non-scaled GEMM (bailed above on any SF),
+        // so the NVFP4 flags are always their dense defaults here.
+        sf_e4m3: false,
+        sf_block: 32,
+        a_fp4: false,
+        b_fp4: false,
     };
     Some((collapsed, count))
 }
@@ -783,11 +801,8 @@ fn try_collapse_mma_run(stmts: &[Stmt]) -> Option<(Stmt, usize)> {
 fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
     let mut names: HashMap<u32, String> = HashMap::new();
     let mut tensors: HashMap<u32, Arc<Tensor>> = HashMap::new();
-    let arg_names = ["A", "B", "C"];
     for (i, t) in k.args.iter().enumerate() {
-        if i < arg_names.len() {
-            names.insert(t.id, arg_names[i].to_string());
-        }
+        names.insert(t.id, arg_name(i));
         tensors.insert(t.id, t.clone());
     }
 

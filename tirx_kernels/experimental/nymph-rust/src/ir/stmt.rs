@@ -478,13 +478,24 @@ pub enum Stmt {
         trans_a: bool,
         trans_b: bool,
         cta_group: u8,
-        /// Block-scaled MMA (`kind::mxf8f6f4` + UE8M0 scale vectors): per-row scale
-        /// factors for A and B held in TMEM as packed u32 cells (4 biased-exponent
-        /// bytes each). `sf_byte` selects which packed byte applies to this MMA's
-        /// k-slice; the operand row r dequantizes by 2^(byte - 127).
+        /// Block-scaled MMA. Two flavors, selected by `sf_e4m3`:
+        /// - UE8M0 (`kind::mxf8f6f4`, `sf_e4m3=false`): per-row scale factors held in
+        ///   TMEM as packed u32 cells (4 biased-exponent bytes each); `sf_byte` selects
+        ///   the byte for this k-slice; operand row r dequantizes by 2^(byte - 127).
+        /// - NVFP4 (`kind::mxf4nvf4`, `sf_e4m3=true`): operands are e2m1 fp4 (2 packed
+        ///   per u8 byte, `a_fp4`/`b_fp4`), scales are full e4m3 fp8 at block size
+        ///   `sf_block` (16). The SF u32 cell holds `MMA_K/sf_block` e4m3 bytes, all
+        ///   consumed by one k=MMA_K issue (no `sf_byte` selection).
         sfa: Option<TensorSlice>,
         sfb: Option<TensorSlice>,
         sf_byte: u8,
+        /// SF encoding: false = UE8M0 (pure exponent), true = e4m3 (full fp8) — NVFP4.
+        sf_e4m3: bool,
+        /// Scale block size in K-elements (UE8M0: 32; NVFP4: 16).
+        sf_block: u8,
+        /// Operands are e2m1 fp4 packed 2-per-u8 byte (operand trailing dim is k/2).
+        a_fp4: bool,
+        b_fp4: bool,
     },
     /// `tcgen05.cp` — bulk SMEM -> TMEM copy of packed u32 scale-factor cells.
     /// With `cta_group=2` one leader issue drives both CTAs' datapaths: each CTA

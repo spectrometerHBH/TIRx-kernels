@@ -497,11 +497,20 @@ class IRBuilder:
         sfa: Tensor | TensorSlice | None = None,
         sfb: Tensor | TensorSlice | None = None,
         sf_byte: int = 0,
+        sf_e4m3: bool = False,
+        sf_block: int = 32,
+        a_fp4: bool = False,
+        b_fp4: bool = False,
     ) -> None:
-        """``sfa``/``sfb`` make this a block-scaled MMA (``kind::mxf8f6f4``): each is a
-        (128, cols) u32 TMEM slice of packed UE8M0 scale bytes; operand row r is
-        dequantized by 2^(byte - 127), where ``sf_byte`` picks the packed byte for
-        this MMA's k-slice."""
+        """``sfa``/``sfb`` make this a block-scaled MMA. Two flavors:
+
+        - UE8M0 (``kind::mxf8f6f4``, ``sf_e4m3=False``): each SF is a (128, cols) u32
+          TMEM slice of packed UE8M0 exponent bytes; operand row r is dequantized by
+          2^(byte - 127), ``sf_byte`` picks the packed byte for this k-slice.
+        - NVFP4 (``kind::mxf4nvf4``, ``sf_e4m3=True``): operands are e2m1 fp4 packed
+          2-per-u8 (``a_fp4``/``b_fp4``; the operand trailing dim is k/2), scales are
+          full e4m3 fp8 at block size ``sf_block`` (16). One k=MMA_K issue consumes the
+          ``MMA_K/sf_block`` e4m3 bytes of the SF cell (no ``sf_byte`` selection)."""
         if isinstance(dst, Tensor):
             dst = dst[...]
         if isinstance(a, Tensor):
@@ -526,6 +535,10 @@ class IRBuilder:
             sfa=sfa,
             sfb=sfb,
             sf_byte=sf_byte,
+            sf_e4m3=sf_e4m3,
+            sf_block=sf_block,
+            a_fp4=a_fp4,
+            b_fp4=b_fp4,
         )
         self._append(stmt)
 
