@@ -983,8 +983,12 @@ fn validate_stmt(s: &Stmt) -> R {
             if src.tensor.space != MemorySpace::Smem {
                 return bail("tcgen05_cp src must be SMEM");
             }
-            if dst.tensor.dtype != DType::U32 || src.tensor.dtype != DType::U32 {
-                return bail("tcgen05_cp moves packed u32 scale cells");
+            // SF cells are u32 (dev's nvfp4 packs 4 e4m3 bytes per cell) OR e4m3 directly
+            // (the canon-matching nvfp4 cp's e4m3 scales SMEM->TMEM). Accept both (IR union).
+            if !matches!(dst.tensor.dtype, DType::U32 | DType::F8E4M3)
+                || !matches!(src.tensor.dtype, DType::U32 | DType::F8E4M3)
+            {
+                return bail("tcgen05_cp moves packed u32 or e4m3 scale cells");
             }
             let (Some(dst_shape), Some(src_shape)) =
                 (static_slice_shape(dst), static_slice_shape(src))
