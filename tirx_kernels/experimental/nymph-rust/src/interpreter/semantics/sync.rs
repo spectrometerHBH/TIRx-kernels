@@ -19,6 +19,77 @@ pub fn register(reg: &mut StmtExecutorRegistry) {
     reg.register(StmtKind::NamedBarrier, execute_named_barrier);
     reg.register(StmtKind::WarpSync, execute_sync);
     reg.register(StmtKind::ClusterSync, execute_sync);
+    reg.register(
+        StmtKind::ClusterBarrierArrive,
+        execute_cluster_barrier_arrive,
+    );
+    reg.register(StmtKind::ClusterBarrierWait, execute_cluster_barrier_wait);
+}
+
+/// Split cluster barrier key — one hardware named cluster barrier per cluster, used
+/// once in the prologue (a non-blocking collective arrive + per-role waits). Keyed by
+/// cluster, NOT by stmt_id, so the CTA-scope arrive and the per-role waits (different
+/// stmt_ids) reference the SAME arrival set.
+fn cluster_barrier_key(first: &ThreadId) -> String {
+    format!("cluster_barrier:cluster{}", first.cluster_id)
+}
+
+/// `barrier.cluster.arrive` (aligned): every cluster thread records its arrival and
+/// CONTINUES — non-blocking, unlike the fused `ClusterSync` rendezvous. The matching
+/// per-role `ClusterBarrierWait`s block until the set is complete. Modeled as a
+/// one-shot collective (the prologue issues it exactly once before the role loops);
+/// no trace event is emitted — the checker's Sync witness model is for fused barriers,
+/// and this barrier's *effect* (no peer access before all inits are visible) is
+/// verified by the mbarrier semantics, its liveness by no-progress detection.
+fn execute_cluster_barrier_arrive<'a, 'k>(
+    ctx: &mut CohortContext<'a, 'k>,
+    _stmt: &'k Stmt,
+) -> IResult<StepStatus> {
+    let first = ctx.cohort[0].clone();
+    let expected: HashSet<ThreadId> = cluster_threads(ctx, &first).into_iter().collect();
+    let arriving: HashSet<ThreadId> = ctx.cohort.iter().cloned().collect();
+    if !arriving.is_subset(&expected) {
+        return Err(InterpreterError::new(
+            "invalid_cluster_barrier_scope",
+            "cluster_barrier_arrive cohort is outside the cluster",
+        ));
+    }
+    let key = cluster_barrier_key(&first);
+    let arrived = ctx.state.values.cooperative.syncs.entry(key).or_default();
+    if !arriving.is_disjoint(arrived) {
+        return Err(InterpreterError::new(
+            "cluster_barrier_reentry",
+            "thread re-entered the one-shot cluster barrier arrive",
+        ));
+    }
+    arrived.extend(arriving);
+    Ok(StepStatus::advance())
+}
+
+/// `barrier.cluster.wait` (per role): block until ALL cluster threads have executed
+/// `ClusterBarrierArrive`. A peer CTA that exits/goes missing without arriving makes
+/// the wait unsatisfiable — surfaced as a peer-liveness error (as for `ClusterSync`).
+fn execute_cluster_barrier_wait<'a, 'k>(
+    ctx: &mut CohortContext<'a, 'k>,
+    _stmt: &'k Stmt,
+) -> IResult<StepStatus> {
+    let first = ctx.cohort[0].clone();
+    let expected: HashSet<ThreadId> = cluster_threads(ctx, &first).into_iter().collect();
+    let key = cluster_barrier_key(&first);
+    let arrived: HashSet<ThreadId> = ctx
+        .state
+        .values
+        .cooperative
+        .syncs
+        .get(&key)
+        .cloned()
+        .unwrap_or_default();
+    check_cluster_peer_liveness(ctx, &expected, &arrived)?;
+    if expected.is_subset(&arrived) {
+        Ok(StepStatus::advance())
+    } else {
+        Ok(StepStatus::block(WakeCondition::Polled))
+    }
 }
 
 /// Named barrier across warpgroups — `bar.sync barrier_id, num_warps*32`. Threads

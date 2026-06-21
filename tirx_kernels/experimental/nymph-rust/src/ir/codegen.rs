@@ -2343,6 +2343,23 @@ fn emit_stmt(
             out.push_str(&format!("{p}Tx.wg.cast({dst_s}, {src_s})\n"));
             Ok(())
         }
+        // SF-permute load (nvfp4 dev permute warp): read an SMEM scale-cell band into
+        // a per-lane register fragment, symmetric to the SMEM branch of `RegStore`. The
+        // byte permutation itself is below the value model — codegen only materializes
+        // the buffer read into the fragment via the warpgroup-collective copy (the
+        // matching `RegStore` writes it back). REG-source loads (an alias/copy between
+        // two register tiles) are a structural no-op at the source level.
+        RegLoad { dst, src } => {
+            if src.tensor.space == MemorySpace::Smem {
+                let src_s = emit_smem_wg_store_tile(src, ctx)?;
+                let zero = ScalarValue::Int(0);
+                let dst_off = dst.offsets.first().unwrap_or(&zero);
+                let width = dst.shape.first().and_then(as_int).unwrap_or(0).max(0) as usize;
+                let dst_s = emit_reg_view_slice(out, &p, &dst.tensor, dst_off, width, ctx)?;
+                out.push_str(&format!("{p}Tx.wg.copy({dst_s}, {src_s})\n"));
+            }
+            Ok(())
+        }
         RegStore { dst, src } => {
             // Two store shapes, distinguished by the dst memory space:
             //   * GMEM dst (bootstrap direct epilogue): `Tx.copy(C[row, c0:c1], reg[:])`
@@ -2485,6 +2502,41 @@ fn emit_stmt(
         WgSync { barrier_id } => {
             out.push_str(&format!("{p}T.cuda.warpgroup_sync({barrier_id})\n"));
             Ok(())
+        }
+        // Cross-warpgroup named barrier — `bar.sync barrier_id, num_warps*32`. Unlike
+        // WgSync (per-warpgroup), threads from different roles rendezvous on the shared
+        // `barrier_id` with count-based completion. Canon writes this as
+        // `T.ptx.bar.sync(<barrier_id>, <count>)` (e.g. `named_barrier_sync_8`).
+        NamedBarrier {
+            barrier_id,
+            num_warps,
+        } => {
+            let count = num_warps * 32;
+            out.push_str(&format!("{p}T.ptx.bar.sync({barrier_id}, {count})\n"));
+            Ok(())
+        }
+        // ---- Set B: dev-framework ops belonging to the flash-attention / flash-bwd
+        // datapaths. The GEMM/nvfp4 codegen has no warp-fragment reg-view, GMEM-
+        // semaphore, or DSMEM cluster-copy lowering machinery, and no smoke-test kernel
+        // (nvfp4 / fp16) exercises them. Their correct TVMScript form is non-obvious in
+        // this codegen, so each is an explicit, greppable stub (per the task's allowance)
+        // rather than a silent fall-through. ----
+        WarpMma { .. } => {
+            unimplemented!("codegen: WarpMma not yet supported")
+        }
+        GmemAtomicAdd { .. } => {
+            unimplemented!("codegen: GmemAtomicAdd not yet supported")
+        }
+        GmemWaitEq { .. } => {
+            unimplemented!("codegen: GmemWaitEq not yet supported")
+        }
+        CpAsyncBulkS2Cluster { .. } => {
+            unimplemented!("codegen: CpAsyncBulkS2Cluster not yet supported")
+        }
+        RegUnary { .. } => {
+            // Carries the `Log2`/`Exp2`/`Rcp`/`Neg` RegUnaryOp; applied over flash
+            // reg fragments (no GEMM-codegen reg-view path).
+            unimplemented!("codegen: RegUnary not yet supported")
         }
 
         // NVFP4 epilogue alpha rescale: Tx.wg.mul(frag, frag, alpha). lhs is a reg slice,

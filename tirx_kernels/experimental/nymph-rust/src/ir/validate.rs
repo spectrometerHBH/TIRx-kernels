@@ -539,6 +539,13 @@ fn validate_stmt(s: &Stmt) -> R {
             }
             validate_scalar(value)?;
         }
+        Stmt::ShuffleSync { var, src, src_lane } => {
+            if var.binding != VarBinding::Scalar {
+                return bail("shuffle_sync var binding must be scalar");
+            }
+            validate_scalar(src)?;
+            validate_scalar(src_lane)?;
+        }
         Stmt::StoreScalar { dst, value } => {
             validate_slice(dst, "store_scalar dst")?;
             validate_scalar(value)?;
@@ -620,6 +627,37 @@ fn validate_stmt(s: &Stmt) -> R {
             }
             if var.binding != VarBinding::Task {
                 return bail("sched_next var binding must be task");
+            }
+        }
+        Stmt::ClcTryCancel {
+            scheduler,
+            handle,
+            cta_group,
+            ..
+        } => {
+            validate_scheduler(scheduler)?;
+            if scheduler.policy.is_functional() {
+                return bail("clc_try_cancel requires a concurrent scheduler policy");
+            }
+            if handle.space != MemorySpace::Smem {
+                return bail("clc_try_cancel handle must be SMEM");
+            }
+            check_cta_group(*cta_group, "clc_try_cancel cta_group")?;
+        }
+        Stmt::ClcQueryCancel {
+            scheduler,
+            var,
+            handle,
+        } => {
+            validate_scheduler(scheduler)?;
+            if scheduler.policy.is_functional() {
+                return bail("clc_query_cancel requires a concurrent scheduler policy");
+            }
+            if handle.space != MemorySpace::Smem {
+                return bail("clc_query_cancel handle must be SMEM");
+            }
+            if var.binding != VarBinding::Scalar {
+                return bail("clc_query_cancel var binding must be scalar");
             }
         }
         Stmt::Loop { .. } => {}
@@ -1346,6 +1384,7 @@ fn validate_stmt(s: &Stmt) -> R {
 
         Stmt::Fence { .. } => {}
         Stmt::CtaSync | Stmt::WarpSync | Stmt::ClusterSync => {}
+        Stmt::ClusterBarrierArrive | Stmt::ClusterBarrierWait => {}
         Stmt::WgSync { barrier_id } => {
             if *barrier_id < 1 || *barrier_id > 15 {
                 return bail("wg_sync barrier_id must be an integer in [1, 15]");
@@ -1568,6 +1607,17 @@ fn check_context(
             Stmt::ClusterSync if scope != Scope::Cta => {
                 return bail("cluster_sync must be in CTA scope")
             }
+            // Split cluster barrier: the collective ARRIVE is a CTA-scope prologue op
+            // (all threads, like cluster_sync); the WAIT is per-role, so it is ALLOWED
+            // inside a role (the whole point — idle warps skip it, active roles defer it
+            // past their local setup). The checker verifies a role can't touch peer
+            // state before its wait (premature peer mbarrier access errors).
+            Stmt::ClusterBarrierArrive if inside_role => {
+                return bail("cluster_barrier_arrive cannot be used inside role")
+            }
+            Stmt::ClusterBarrierArrive if scope != Scope::Cta => {
+                return bail("cluster_barrier_arrive must be in CTA scope")
+            }
             Stmt::WgSync { barrier_id } => {
                 if scope != Scope::Warpgroup {
                     return bail("wg_sync must be in warpgroup scope");
@@ -1613,6 +1663,13 @@ fn check_context(
                 collect_vars(value, &mut vars);
                 require_defined(&vars, defined, "scalar_store value")?;
             }
+            Stmt::ShuffleSync { var, src, src_lane } => {
+                let mut vars = Vec::new();
+                collect_vars(src, &mut vars);
+                collect_vars(src_lane, &mut vars);
+                require_defined(&vars, defined, "shuffle_sync src")?;
+                define_var(*var, defined)?;
+            }
             Stmt::StoreScalar { dst, value } => {
                 let mut vars = Vec::new();
                 slice_vars(dst, &mut vars);
@@ -1646,6 +1703,7 @@ fn check_context(
                 stop,
                 step,
                 body,
+                unroll: _,
             } => {
                 let mut vars = Vec::new();
                 collect_vars(start, &mut vars);
@@ -1699,6 +1757,19 @@ fn check_context(
                 if !in_scheduler_impl {
                     return bail("sched_next must be inside scheduler_impl");
                 }
+                define_var(*var, defined)?;
+            }
+            Stmt::ClcTryCancel { stage, .. } => {
+                if !in_scheduler_impl {
+                    return bail("clc_try_cancel must be inside scheduler_impl");
+                }
+                if let Some(s) = stage {
+                    let mut vars = Vec::new();
+                    collect_vars(s, &mut vars);
+                    require_defined(&vars, defined, "clc_try_cancel stage")?;
+                }
+            }
+            Stmt::ClcQueryCancel { var, .. } => {
                 define_var(*var, defined)?;
             }
             Stmt::Loop { body } => {

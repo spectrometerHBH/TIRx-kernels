@@ -836,7 +836,7 @@ py_enum!(PyMBarKind = "MBarKind" => MBarKind {
     TMA => Tma, TCGEN05 => Tcgen05, THREAD => Thread,
 });
 py_enum!(PyFenceKind = "FenceKind" => FenceKind {
-    MEMORY => Memory, ASYNC_PROXY => AsyncProxy, VIEW => View,
+    MEMORY => Memory, ASYNC_PROXY => AsyncProxy, VIEW => View, MBARRIER_INIT => MbarrierInit,
 });
 py_enum!(PyFenceScope = "FenceScope" => FenceScope {
     CTA => Cta, CLUSTER => Cluster, GPU => Gpu,
@@ -1709,7 +1709,9 @@ impl PyStmt {
             | ir::Stmt::ForEachTask { var, .. }
             | ir::Stmt::SchedNext { var, .. }
             | ir::Stmt::ScalarDef { var, .. }
-            | ir::Stmt::ScalarStore { var, .. } => Ok(PyVar(*var)),
+            | ir::Stmt::ScalarStore { var, .. }
+            | ir::Stmt::ShuffleSync { var, .. }
+            | ir::Stmt::ClcQueryCancel { var, .. } => Ok(PyVar(*var)),
             _ => Err(PyAttributeError::new_err("var")),
         }
     }
@@ -1828,6 +1830,19 @@ fn scalar_store(var: PyVar, value: Bound<'_, PyAny>) -> PyResult<PyStmt> {
     }))
 }
 #[pyfunction]
+#[pyo3(name = "ShuffleSync")]
+fn shuffle_sync(
+    var: PyVar,
+    src: Bound<'_, PyAny>,
+    src_lane: Bound<'_, PyAny>,
+) -> PyResult<PyStmt> {
+    Ok(PyStmt(ir::Stmt::ShuffleSync {
+        var: var.0,
+        src: coerce_scalar(&src)?,
+        src_lane: coerce_scalar(&src_lane)?,
+    }))
+}
+#[pyfunction]
 #[pyo3(name = "StoreScalar")]
 fn store_scalar(dst: Bound<'_, PyAny>, value: Bound<'_, PyAny>) -> PyResult<PyStmt> {
     Ok(PyStmt(ir::Stmt::StoreScalar {
@@ -1888,13 +1903,14 @@ fn role(
     }))
 }
 #[pyfunction]
-#[pyo3(name = "ForLoop", signature = (var, start = None, stop = None, step = None, body = None))]
+#[pyo3(name = "ForLoop", signature = (var, start = None, stop = None, step = None, body = None, unroll = false))]
 fn for_loop(
     var: PyVar,
     start: Option<Bound<'_, PyAny>>,
     stop: Option<Bound<'_, PyAny>>,
     step: Option<Bound<'_, PyAny>>,
     body: Option<Bound<'_, PyAny>>,
+    unroll: bool,
 ) -> PyResult<PyStmt> {
     Ok(PyStmt(ir::Stmt::ForLoop {
         var: var.0,
@@ -1902,6 +1918,7 @@ fn for_loop(
         stop: opt_scalar_or(stop, 0)?,
         step: opt_scalar_or(step, 1)?,
         body: opt_body(body)?,
+        unroll,
     }))
 }
 #[pyfunction]
@@ -1931,6 +1948,32 @@ fn sched_next(scheduler: PyScheduler, var: PyVar) -> PyStmt {
     PyStmt(ir::Stmt::SchedNext {
         scheduler: scheduler.0,
         var: var.0,
+    })
+}
+#[pyfunction]
+#[pyo3(name = "ClcTryCancel", signature = (scheduler, handle, mbar, stage = None, cta_group = 2))]
+fn clc_try_cancel(
+    scheduler: PyScheduler,
+    handle: PyTensor,
+    mbar: Bound<'_, PyAny>,
+    stage: Option<Bound<'_, PyAny>>,
+    cta_group: u8,
+) -> PyResult<PyStmt> {
+    Ok(PyStmt(ir::Stmt::ClcTryCancel {
+        scheduler: scheduler.0,
+        handle: handle.0,
+        mbar: coerce_mbar_ref(&mbar)?,
+        stage: coerce_opt_scalar(stage)?,
+        cta_group,
+    }))
+}
+#[pyfunction]
+#[pyo3(name = "ClcQueryCancel")]
+fn clc_query_cancel(scheduler: PyScheduler, var: PyVar, handle: PyTensor) -> PyStmt {
+    PyStmt(ir::Stmt::ClcQueryCancel {
+        scheduler: scheduler.0,
+        var: var.0,
+        handle: handle.0,
     })
 }
 #[pyfunction]
@@ -2575,6 +2618,16 @@ fn warp_sync() -> PyStmt {
 fn cluster_sync() -> PyStmt {
     PyStmt(ir::Stmt::ClusterSync)
 }
+#[pyfunction]
+#[pyo3(name = "ClusterBarrierArrive")]
+fn cluster_barrier_arrive() -> PyStmt {
+    PyStmt(ir::Stmt::ClusterBarrierArrive)
+}
+#[pyfunction]
+#[pyo3(name = "ClusterBarrierWait")]
+fn cluster_barrier_wait() -> PyStmt {
+    PyStmt(ir::Stmt::ClusterBarrierWait)
+}
 
 // ===========================================================================
 // chunk 7 — Kernel
@@ -2665,11 +2718,10 @@ impl PyKernel {
 // TIRx codegen (staging-only): nymph IR -> TVMScript source string
 // ===========================================================================
 
-// codegen temporarily disabled (IR divergence vs dev framework — see src/ir/mod.rs)
-// #[pyfunction]
-// fn kernel_to_tirx_source(kernel: &PyKernel) -> PyResult<String> {
-//     crate::ir::kernel_to_tirx_source(&kernel.0).map_err(PyValueError::new_err)
-// }
+#[pyfunction]
+fn kernel_to_tirx_source(kernel: &PyKernel) -> PyResult<String> {
+    crate::ir::kernel_to_tirx_source(&kernel.0).map_err(PyValueError::new_err)
+}
 
 // ===========================================================================
 // module registration
@@ -2717,6 +2769,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(tmem_dealloc, m)?,
         wrap_pyfunction!(scalar_def, m)?,
         wrap_pyfunction!(scalar_store, m)?,
+        wrap_pyfunction!(shuffle_sync, m)?,
         wrap_pyfunction!(store_scalar, m)?,
         wrap_pyfunction!(mbar_def, m)?,
         wrap_pyfunction!(kernel_init, m)?,
@@ -2726,6 +2779,8 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(for_each_task, m)?,
         wrap_pyfunction!(scheduler_impl, m)?,
         wrap_pyfunction!(sched_next, m)?,
+        wrap_pyfunction!(clc_try_cancel, m)?,
+        wrap_pyfunction!(clc_query_cancel, m)?,
         wrap_pyfunction!(loop_stmt, m)?,
         wrap_pyfunction!(break_if, m)?,
         wrap_pyfunction!(if_stmt, m)?,
@@ -2774,6 +2829,8 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(named_barrier, m)?,
         wrap_pyfunction!(warp_sync, m)?,
         wrap_pyfunction!(cluster_sync, m)?,
+        wrap_pyfunction!(cluster_barrier_arrive, m)?,
+        wrap_pyfunction!(cluster_barrier_wait, m)?,
     ] {
         m.add_function(f)?;
     }
@@ -2783,8 +2840,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(interpret, m)?)?;
     m.add_function(wrap_pyfunction!(trace, m)?)?;
     m.add_function(wrap_pyfunction!(check_protocol, m)?)?;
-    // codegen temporarily disabled (IR divergence vs dev framework)
-    // m.add_function(wrap_pyfunction!(kernel_to_tirx_source, m)?)?;
+    m.add_function(wrap_pyfunction!(kernel_to_tirx_source, m)?)?;
 
     // chunk 7 — builder compatibility: the GMEM-scalar dtype map (used at runtime
     // by scalar_def) and the names the builder imports but only uses in lazy

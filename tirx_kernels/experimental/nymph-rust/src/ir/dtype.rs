@@ -87,6 +87,10 @@ pub enum FenceKind {
     Memory,
     AsyncProxy,
     View,
+    /// `fence.mbarrier_init` — the prologue init-epoch seal that publishes all
+    /// `mbarrier.init`s before any arrive/wait. Modeled as a fence; codegen emits
+    /// `T.ptx.fence.mbarrier_init()`.
+    MbarrierInit,
 }
 
 /// `FenceScope` — the memory hierarchy level a fence orders. `Cta`/`Cluster` are the
