@@ -27,7 +27,7 @@
 use super::dtype::{DType, MemorySpace, ScalarOp, ScopeValueKind, Swizzle, VarBinding};
 use super::kernel::Kernel;
 use super::scalar::{ScalarExpr, ScalarInitial, ScalarValue, Var};
-use super::stmt::Stmt;
+use super::stmt::{RegOperand, Stmt};
 use super::tensor::{Layout, Tensor, TensorSlice};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -872,9 +872,11 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
                         | super::dtype::DType::I64
                         | super::dtype::DType::U64
                 );
-                if is_int {
+                // u8 = packed-fp4 operand ring (NOT the i32/u32 mailbox); give it a
+                // unique ab_smem name so two operands don't collide on "task_smem".
+                if is_int && t.dtype != DType::U8 {
                     "task_smem".to_string()
-                } else if t.layout.is_some() {
+                } else if t.dtype == DType::U8 || t.layout.is_some() {
                     let n = format!("ab_smem{ab_idx}");
                     ab_idx += 1;
                     n
@@ -1763,6 +1765,20 @@ fn emit_stmt(
                     dt = dtype_str(base.dtype),
                 ));
             }
+            // NVFP4 e4m3 scale-factor TMEM (canon's tmem_pool.alloc_sf(..., sf_per_mma=4)).
+            // The TileLayout is fixed for sf_per_mma=4 / (128, 16); allocated_addr is the
+            // IR's TmemLayout col_start (448 / 464).
+            for sf in &ctx.sf_tmems {
+                let name = ctx.tensor_name(sf.id)?;
+                let col = match &sf.layout {
+                    Some(Layout::Tmem(tm)) => tm.col_start,
+                    _ => 0,
+                };
+                out.push_str(&format!(
+                    "{p}{name} = T.decl_buffer((128, {d1}), \"float8_e4m3fn\", scope=\"tmem\", layout=TileLayout(S[(4, 32, 4, 4) : (4 @ TCol, 1 @ TLane, 16 @ TCol, 1 @ TCol)] + R[4:32 @ TLane]), allocated_addr={col})\n",
+                    d1 = sf.shape[1],
+                ));
+            }
             // KernelInit emits ONLY the warp-0 body (tmem alloc + mbarrier inits). The entire
             // prologue sync — the `fence.mbarrier_init` epoch seal AND the cross-CTA barrier
             // (cluster_barrier_arrive for overlap, or proxy_async + cluster_sync for no-overlap)
@@ -1907,12 +1923,19 @@ fn emit_stmt(
                 .space
                 .task_count()
                 .ok_or("codegen: ForEachTask task space size overflow")?;
+            // Grid-stride as a while loop (T.serial has no step): the task var starts at
+            // this cluster's index and strides by the cluster count until the task space
+            // is exhausted. The trip count is runtime, so it cannot unroll.
             out.push_str(&format!(
-                "{p}for {name} in T.serial(cta_id // {cg}, {stop}, {step}):\n",
+                "{p}{name}: T.int32 = cta_id // {cg}\n",
                 cg = ctx.cta_group,
+            ));
+            out.push_str(&format!("{p}while {name} < {stop}:\n"));
+            emit_body(out, body, indent + 1, ctx, scope)?;
+            out.push_str(&format!(
+                "{p}    {name} = {name} + {step}\n",
                 step = ctx.num_clusters,
             ));
-            emit_body(out, body, indent + 1, ctx, scope)?;
             Ok(())
         }
         // The persistent / scheduler `while True:` loop. Break is via `BreakIf`.
@@ -2195,20 +2218,68 @@ fn emit_stmt(
 
         // ---- tcgen05 MMA ----
         Tcgen05Mma {
-            dst, a, b, accum, ..
+            dst, a, b, accum, sfa, sfb, a_fp4, ..
         } => {
             let dst_s = emit_tmem_dst(dst, ctx)?;
             // The A/B operands are staged SMEM tiles: drop the leading ring index so
             // the operand is the 2D `(M, K)` / `(N, K)` MMA tile (canonical
             // `Asmem[stage, warp_id]` / `Bsmem[stage]`).
-            let a_s = emit_smem_tile(a, ctx)?;
-            let b_s = emit_smem_tile(b, ctx)?;
+            let mut a_s = emit_smem_tile(a, ctx)?;
+            let mut b_s = emit_smem_tile(b, ctx)?;
             let accum_s = if *accum { "True" } else { "False" };
+            if let (Some(sfa), Some(sfb)) = (sfa.as_ref(), sfb.as_ref()) {
+                // NVFP4 block-scaled: view the packed-u8 operand BUFFER as e2m1 fp4 (the
+                // last dim doubles: bytes -> fp4 elems), then slice — `.view` is on the
+                // buffer, not a region (canon: A_smem = A_smem_packed.view(...); A_smem[stage]).
+                if *a_fp4 {
+                    let view = |s: &TensorSlice| -> Result<String, String> {
+                        let buf = ctx.tensor_name(s.tensor.id)?;
+                        let stage =
+                            emit_scalar(s.offsets.first().unwrap_or(&ScalarValue::Int(0)), ctx);
+                        let rows = s.shape.get(1).and_then(as_int).unwrap_or(0);
+                        let cols = s.shape.get(2).and_then(as_int).unwrap_or(0) * 2;
+                        Ok(format!(
+                            "{buf}.view(\"float4_e2m1fn\")[{stage}, 0:{rows}, 0:{cols}]"
+                        ))
+                    };
+                    a_s = view(a)?;
+                    b_s = view(b)?;
+                }
+                let sfa_name = ctx.tensor_name(sfa.tensor.id)?;
+                let sfb_name = ctx.tensor_name(sfb.tensor.id)?;
+                emit_guarded(
+                    out,
+                    &format!(
+                        "Tx.gemm_async({dst_s}, {a_s}, {b_s}, SFA={sfa_name}, SFB={sfb_name}, accum={accum_s}, dispatch=\"tcgen05\", cta_group={cg})",
+                        cg = ctx.cta_group,
+                    ),
+                );
+            } else {
+                emit_guarded(
+                    out,
+                    &format!(
+                        "Tx.gemm_async({dst_s}, {a_s}, {b_s}, accum={accum_s}, dispatch=\"tcgen05\", cta_group={cg})",
+                        cg = ctx.cta_group,
+                    ),
+                );
+            }
+            Ok(())
+        }
+        // NVFP4 scale-factor copy SMEM -> e4m3 TMEM (canon's Tx.copy_async(SFA_tmem,
+        // SFA_smem[stage], cta_group=2)). Single-issue, like the MMA/commit.
+        Tcgen05Cp {
+            dst, src, cta_group,
+        } => {
+            let dst_name = ctx.tensor_name(dst.tensor.id)?;
+            let dst_cols = dst.shape.get(1).and_then(as_int).unwrap_or(0);
+            let src_name = ctx.tensor_name(src.tensor.id)?;
+            let stage = emit_scalar(src.offsets.first().unwrap_or(&ScalarValue::Int(0)), ctx);
+            let r = src.shape.get(1).and_then(as_int).unwrap_or(0);
+            let c = src.shape.get(2).and_then(as_int).unwrap_or(0);
             emit_guarded(
                 out,
                 &format!(
-                    "Tx.gemm_async({dst_s}, {a_s}, {b_s}, accum={accum_s}, dispatch=\"tcgen05\", cta_group={cg})",
-                    cg = ctx.cta_group,
+                    "Tx.copy_async({dst_name}[0:128, 0:{dst_cols}], {src_name}[{stage}, 0:{r}, 0:{c}], cta_group={cta_group})"
                 ),
             );
             Ok(())
@@ -2416,6 +2487,28 @@ fn emit_stmt(
             Ok(())
         }
 
+        // NVFP4 epilogue alpha rescale: Tx.wg.mul(frag, frag, alpha). lhs is a reg slice,
+        // rhs the alpha literal (or vice versa).
+        RegMul { dst, lhs, rhs } => {
+            let zero = ScalarValue::Int(0);
+            let reg_op = |op: &RegOperand, out: &mut String| -> Result<String, String> {
+                match op {
+                    RegOperand::Slice(s) => {
+                        let off = s.offsets.first().unwrap_or(&zero);
+                        let w = s.shape.first().and_then(as_int).unwrap_or(0).max(0) as usize;
+                        emit_reg_view_slice(out, &p, &s.tensor, off, w, ctx)
+                    }
+                    RegOperand::Literal(l) => Ok(format!("{}", l.as_f32())),
+                }
+            };
+            let dst_off = dst.offsets.first().unwrap_or(&zero);
+            let dst_w = dst.shape.first().and_then(as_int).unwrap_or(0).max(0) as usize;
+            let dst_s = emit_reg_view_slice(out, &p, &dst.tensor, dst_off, dst_w, ctx)?;
+            let lhs_s = reg_op(lhs, out)?;
+            let rhs_s = reg_op(rhs, out)?;
+            out.push_str(&format!("{p}Tx.wg.mul({dst_s}, {lhs_s}, {rhs_s})\n"));
+            Ok(())
+        }
         other => Err(format!("codegen: unimplemented stmt {other:?}")),
     }
 }
