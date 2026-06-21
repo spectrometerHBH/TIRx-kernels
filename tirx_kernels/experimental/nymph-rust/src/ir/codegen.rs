@@ -120,8 +120,9 @@ struct Ctx {
     mbar_stages: HashMap<u32, u32>,
     /// Loop var id -> emitted Python name.
     var_names: HashMap<u32, String>,
-    /// Scalar var id (binding == Scalar) -> emitted Python name. Scalar vars are
-    /// `T.alloc_local(1, ...)` cells, referenced as `NAME[0]`.
+    /// Scalar var id (binding == Scalar) -> emitted Python name. Scalar vars emit as SSA
+    /// `T.int32` register vars (`NAME: T.int32 = init`; reassigned `NAME = expr`; read as
+    /// `NAME`) — NOT `alloc_local(1)` cells — so ptxas keeps them in uniform registers.
     scalar_names: HashMap<u32, String>,
     /// cta_group for engine dispatch (TMA/MMA/commit), from the kernel cluster size.
     cta_group: u8,
@@ -1430,8 +1431,8 @@ fn emit_scalar_load(s: &TensorSlice, ctx: &Ctx) -> Result<String, String> {
 }
 
 /// A TMEM tensor's *view* (accum) maps to the base `tmem` buffer; emit `tmem[:, lo:hi]`.
-/// We detect a TMEM slice whose tensor is the accum view (shape[0]==128, not the base
-/// 512-col buffer) and rewrite it onto `tmem`.
+/// Purely structural: a 2-D slice (`offsets.len()==2`) whose row offset is `0` spans all
+/// 128 lanes (`:`); the column band comes from `offsets[1]`/`shape[1]`. No shape literal.
 fn emit_tmem_dst(s: &TensorSlice, ctx: &Ctx) -> Result<String, String> {
     // The MMA dst / ld src is `accum[:, 0:N]`; map to `tmem[:, 0:N]`.
     // Row dim spans the whole 128 lanes -> ":"; col dim from offsets/shape.
