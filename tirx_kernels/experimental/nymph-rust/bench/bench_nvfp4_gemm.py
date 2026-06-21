@@ -13,6 +13,7 @@ import tvm
 
 import nymph_rs as nr
 from nymph_rs.kernels import build_nvfp4_gemm, NvFp4GemmConfig
+from nymph_rs.kernels import gemm_config_for
 from tirx_kernels.gemm.nvfp4_gemm import prepare_data, tir_ws_kernel
 from tvm.tirx.bench import bench
 
@@ -22,7 +23,10 @@ SF_CELLS = 4  # CTA_K // SF_BLOCK(16) // 4
 
 
 def _compile_nymph(M, N, K, **ov):
-    cfg = NvFp4GemmConfig(m=M, n=N, k=K, **ov)
+    # Per-shape knob overrides (cta_n / epi_tile / smem_depth), mirroring canon's
+    # TIRX_CONFIGS. Explicit kwargs win over the table.
+    knobs = {**gemm_config_for(M, N, K), **ov}
+    cfg = NvFp4GemmConfig(m=M, n=N, k=K, **knobs)
     src = nr.kernel_to_tirx_source(build_nvfp4_gemm(cfg))
     d = tempfile.mkdtemp(prefix="nvfp4_")
     path = os.path.join(d, "g.py")
