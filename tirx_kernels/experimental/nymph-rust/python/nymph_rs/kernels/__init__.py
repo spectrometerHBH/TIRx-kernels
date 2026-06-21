@@ -10,5 +10,11 @@ from .gdn_prefill import CONFIGS as GDN_PREFILL_CONFIGS
 from .gdn_prefill import VARLEN_CONFIGS as GDN_PREFILL_VARLEN_CONFIGS
 from .gdn_prefill import GdnPrefillConfig, build_gdn_prefill
 from .nvfp4_gemm import CONFIGS as NVFP4_CONFIGS
-from .nvfp4_gemm import NvFp4GemmConfig, build_nvfp4_gemm, nvfp4_task_config
+from .nvfp4_gemm import GEMM_CONFIGS as NVFP4_GEMM_CONFIGS
+from .nvfp4_gemm import (
+    NvFp4GemmConfig,
+    build_nvfp4_gemm,
+    gemm_config_for,
+    nvfp4_task_config,
+)
 from .bootstrap_gemm import build_bootstrap_gemm  # noqa: F401
