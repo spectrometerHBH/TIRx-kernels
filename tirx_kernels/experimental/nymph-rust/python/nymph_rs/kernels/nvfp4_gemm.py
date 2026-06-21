@@ -62,7 +62,8 @@ CTA_K = 256  # K per pipeline tile
 MMA_K = 64  # block-scaled fp4 MMA instruction K
 K_ITERS = CTA_K // MMA_K  # 4 MMA issues per k-tile
 SF_BLOCK = 16  # one e4m3 scale per 16 K-elements
-SF_PER_MMA = MMA_K // SF_BLOCK  # 4 scale blocks per MMA issue (one packed u32 cell)
+SF_PER_MMA = MMA_K // SF_BLOCK  # 4 scale blocks per MMA issue
+SF_CTA_K = CTA_K // SF_BLOCK  # 16 e4m3 scale bytes per row per k-tile (canon SF_CTA_K)
 SF_CELLS = CTA_K // SF_BLOCK // 4  # packed-u32 scale cells per row per k-tile == K_ITERS
 BLK_K_BYTES = CTA_K // 2  # packed fp4 bytes per row per k-tile (2 e2m1 per byte)
 EPI_TILE = 64
@@ -136,11 +137,11 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     _validate_launch_shape(launch_shape, cta_group)
     pair_tasks = total_work // cta_group
 
-    # packed fp4 operand tiles, e4m3 scale cells, bf16 output tile
+    # packed fp4 operand tiles, e4m3 scale bytes (1B each, canon SFA_in layout), bf16 out
     a_tile_bytes = blk_m * BLK_K_BYTES
     b_tile_bytes = blk_n * BLK_K_BYTES
-    sfa_tile_bytes = SF_CELLS * blk_m * U32_BYTES  # per k-tile, this CTA's M rows
-    sfb_tile_bytes = SF_CELLS * MMA_N * U32_BYTES  # per k-tile, the full N band
+    sfa_tile_bytes = blk_m * SF_CTA_K  # per k-tile, this CTA's M rows x 16 e4m3 bytes
+    sfb_tile_bytes = MMA_N * SF_CTA_K  # per k-tile, the full N band x 16 e4m3 bytes
     d_tile_bytes = blk_m * EPI_TILE * 2
 
     a_off = 0
@@ -161,8 +162,10 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     # TIRx A_packed/B_packed storage. Scales are packed e4m3 cells (u32).
     a_gmem = k.arg(space=MemorySpace.GMEM, dtype=DType.U8, shape=(M, K // 2))
     b_gmem = k.arg(space=MemorySpace.GMEM, dtype=DType.U8, shape=(N, K // 2))
-    sfa_gmem = k.arg(space=MemorySpace.GMEM, dtype=DType.U32, shape=(k_tiles * SF_CELLS, M))
-    sfb_gmem = k.arg(space=MemorySpace.GMEM, dtype=DType.U32, shape=(k_tiles * SF_CELLS, N))
+    # Scales are e4m3 (one byte per 16-K block), laid out (rows, K//16) exactly like
+    # canon's SFA_in/SFB_in — the codegen synthesizes sf_smem_layout from the e4m3 dtype.
+    sfa_gmem = k.arg(space=MemorySpace.GMEM, dtype=DType.F8E4M3, shape=(M, K // SF_BLOCK))
+    sfb_gmem = k.arg(space=MemorySpace.GMEM, dtype=DType.F8E4M3, shape=(N, K // SF_BLOCK))
     d_gmem = k.arg(space=MemorySpace.GMEM, dtype=DType.BF16, shape=(M, N))
 
     # Stage-major SMEM rings, indexed by a runtime pipeline stage (the continuous
@@ -179,19 +182,19 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
         shape=(SMEM_DEPTH, blk_n, BLK_K_BYTES),
         byte_offset=b_off,
     )
-    # SF SMEM laid issue-major: [stage, issue (k-block group), row]. The cp flattens
-    # this row-major and places element r at TMEM (lane r%128, col base + r/128),
-    # which is exactly the (row, issue[, N-half]) cell layout the MMA reads back.
+    # SF SMEM: e4m3 (row, SF_CTA_K) per stage, the same (CTA_M, K//16) tile canon's
+    # SFA_smem holds. The codegen gives any e4m3 SMEM buffer canon's sf_smem_layout,
+    # so the TMA lands the bytes in the tcgen05.cp-ready order (no permute warp).
     sfa_smem = k.tensor(
         space=MemorySpace.SMEM,
-        dtype=DType.U32,
-        shape=(SMEM_DEPTH, SF_CELLS, blk_m),
+        dtype=DType.F8E4M3,
+        shape=(SMEM_DEPTH, blk_m, SF_CTA_K),
         byte_offset=sfa_off,
     )
     sfb_smem = k.tensor(
         space=MemorySpace.SMEM,
-        dtype=DType.U32,
-        shape=(SMEM_DEPTH, SF_CELLS, MMA_N),
+        dtype=DType.F8E4M3,
+        shape=(SMEM_DEPTH, MMA_N, SF_CTA_K),
         byte_offset=sfb_off,
     )
     d_smem = k.tensor(
@@ -201,9 +204,11 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
         byte_offset=d_off,
     )
 
-    # TMEM: accumulator (one MMA_N stage) at col 0, then the scale-vector cells.
-    sfa_col0 = ACC_DEPTH * MMA_N
-    sfb_col0 = sfa_col0 + ACC_DEPTH * SF_CELLS
+    # TMEM: accumulator (one MMA_N stage) at col 0; the e4m3 scale vectors at canon's
+    # fixed SF cols (448 / 464). The codegen emits these as `alloc_sf(...,
+    # "float8_e4m3fn", sf_per_mma=4)` (recognized by the e4m3 TMEM dtype).
+    sfa_col0 = 448
+    sfb_col0 = 464
     tmem_base = k.tensor(
         space=MemorySpace.TMEM,
         dtype=DType.F32,
@@ -218,33 +223,26 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     )
     sfa_tmem = k.tensor(
         space=MemorySpace.TMEM,
-        dtype=DType.U32,
-        shape=(128, ACC_DEPTH * SF_CELLS),
+        dtype=DType.F8E4M3,
+        shape=(128, SF_CTA_K),
         layout=TmemLayout(TmemLayoutKind.LANE_128, col_start=sfa_col0),
     )
-    # The full N band's B scales: 256 rows need two TMEM cell-columns per issue
-    # (rows 0..127 and 128..255 via the r/128 column advance).
+    # The full N band's B scales: MMA_N=256 rows fold to the 128 lanes as two
+    # SF_CTA_K column groups (rows 0..127 then 128..255 via the r/128 advance).
     sfb_tmem = k.tensor(
         space=MemorySpace.TMEM,
-        dtype=DType.U32,
-        shape=(128, ACC_DEPTH * SF_CELLS * (MMA_N // 128)),
+        dtype=DType.F8E4M3,
+        shape=(128, SF_CTA_K * (MMA_N // 128)),
         layout=TmemLayout(TmemLayoutKind.LANE_128, col_start=sfb_col0),
     )
 
     accum_frag = k.tensor(space=MemorySpace.REG, dtype=DType.F32, shape=(TMEM_LD_SIZE,))
     out_frag = k.tensor(space=MemorySpace.REG, dtype=DType.BF16, shape=(TMEM_LD_SIZE,))
-    # The permute partitions each SF buffer's columns across the warp's 32 lanes.
-    perm_a_cols = blk_m // 32
-    perm_b_cols = MMA_N // 32
-    sfa_perm_frag = k.tensor(space=MemorySpace.REG, dtype=DType.U32, shape=(SF_CELLS, perm_a_cols))
-    sfb_perm_frag = k.tensor(space=MemorySpace.REG, dtype=DType.U32, shape=(SF_CELLS, perm_b_cols))
 
     smem_full = k.mbar(kind=MBarKind.TMA, stages=SMEM_DEPTH)
     smem_empty = k.mbar(kind=MBarKind.TCGEN05, stages=SMEM_DEPTH)
-    trans_done = k.mbar(kind=MBarKind.THREAD, stages=SMEM_DEPTH)
     tmem_full = k.mbar(kind=MBarKind.TCGEN05, stages=ACC_DEPTH)
     tmem_empty = k.mbar(kind=MBarKind.THREAD, stages=ACC_DEPTH)
-    trans_done_leader = k.mbar_ref(trans_done, remote_coord=0)
     tmem_empty_leader = k.mbar_ref(tmem_empty, remote_coord=0)
 
     cta_id = k.cta_id()
@@ -276,7 +274,6 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
         for s in range(SMEM_DEPTH):
             k.mbarrier_init(smem_full, count=1, stage=s)
             k.mbarrier_init(smem_empty, count=1, stage=s)
-            k.mbarrier_init(trans_done, count=cta_group, stage=s)
         for s in range(ACC_DEPTH):
             k.mbarrier_init(tmem_full, count=1, stage=s)
             k.mbarrier_init(tmem_empty, count=cta_group, stage=s)
@@ -321,62 +318,36 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                     gmem_shape=(blk_n, BLK_K_BYTES),
                     mbar_stage=stage,
                 )
-                # SFA: this CTA's M rows; SFB: the full N band. Both load all
-                # SF_CELLS issue-cells for this k-tile (gmem rows [t*SF_CELLS, +)).
+                # SFA: this CTA's M rows; SFB: the full N band. e4m3 (rows, SF_CTA_K)
+                # straight from the (rows, K//16) GMEM at this k-tile's column band,
+                # exactly canon's SFA_in/SFB_in slice.
+                sf_k = t * SF_CTA_K
                 k.tma_load(
-                    TensorSlice(tensor=sfa_smem, offsets=(stage, 0, 0), shape=(1, SF_CELLS, blk_m)),
+                    TensorSlice(tensor=sfa_smem, offsets=(stage, 0, 0), shape=(1, blk_m, SF_CTA_K)),
                     sfa_gmem,
                     mbar=smem_full,
                     bytes=sfa_tile_bytes,
-                    coords=(t * SF_CELLS, a_m),
-                    shape=(1, SF_CELLS, blk_m),
-                    gmem_shape=(SF_CELLS, blk_m),
+                    coords=(a_m, sf_k),
+                    shape=(1, blk_m, SF_CTA_K),
+                    gmem_shape=(blk_m, SF_CTA_K),
                     mbar_stage=stage,
                 )
                 k.tma_load(
-                    TensorSlice(tensor=sfb_smem, offsets=(stage, 0, 0), shape=(1, SF_CELLS, MMA_N)),
+                    TensorSlice(tensor=sfb_smem, offsets=(stage, 0, 0), shape=(1, MMA_N, SF_CTA_K)),
                     sfb_gmem,
                     mbar=smem_full,
                     bytes=sfb_tile_bytes,
-                    coords=(t * SF_CELLS, sf_n),
-                    shape=(1, SF_CELLS, MMA_N),
-                    gmem_shape=(SF_CELLS, MMA_N),
+                    coords=(sf_n, sf_k),
+                    shape=(1, MMA_N, SF_CTA_K),
+                    gmem_shape=(MMA_N, SF_CTA_K),
                     mbar_stage=stage,
                 )
 
-    # ---- scale-factor permute (wg0/warp2) ----
-    with k.role(warp=2):
-        with k.for_each_task(task_scheduler) as task:
-            local_iter = (task.task_id - task_start) // task_step
-            for t in range(k_tiles):
-                seq = local_iter * k_tiles + t
-                stage = seq % SMEM_DEPTH
-                occ = seq // SMEM_DEPTH
-                k.mbarrier_wait(smem_full, stage=stage, phase=occ % 2)
-                # The warp shuffles the packed scale cells into the cp-required
-                # physical layout, in place. The byte permutation is below the
-                # value model; the read+write of the buffer and the fence are the
-                # protocol-relevant part. Each lane owns a contiguous column band
-                # of every issue-cell row.
-                lane = k.lane_id()
-                sfa_slice = TensorSlice(
-                    tensor=sfa_smem,
-                    offsets=(stage, 0, lane * perm_a_cols),
-                    shape=(1, SF_CELLS, perm_a_cols),
-                )
-                k.reg_load(sfa_perm_frag, sfa_slice)
-                k.reg_store(sfa_slice, sfa_perm_frag)
-                sfb_slice = TensorSlice(
-                    tensor=sfb_smem,
-                    offsets=(stage, 0, lane * perm_b_cols),
-                    shape=(1, SF_CELLS, perm_b_cols),
-                )
-                k.reg_load(sfb_perm_frag, sfb_slice)
-                k.reg_store(sfb_slice, sfb_perm_frag)
-                k.fence(kind=FenceKind.ASYNC_PROXY, scope=FenceScope.CTA)
-                k.mbarrier_arrive(trans_done_leader, stage=stage)
-
     # ---- MMA (wg0/warp1, cluster leader only) ----
+    # No permute warp (canon has none): the TMA lands the e4m3 scales in the
+    # cp-ready layout, the MMA warp copies them SMEM->TMEM and issues ONE
+    # block-scaled gemm over the full CTA_K tile, exactly like canon's execute_mma.
+    sfb_cols = SF_CTA_K * (MMA_N // 128)
     with k.role(warp=1):
         with k.for_each_task(task_scheduler) as task:
             local_iter = (task.task_id - task_start) // task_step
@@ -390,61 +361,42 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                     seq = local_iter * k_tiles + t
                     stage = seq % SMEM_DEPTH
                     occ = seq // SMEM_DEPTH
-                    k.mbarrier_wait(trans_done, stage=stage, phase=occ % 2)
-                    # Copy this k-tile's scale cells SMEM -> TMEM. A: SF_CELLS cells
-                    # over this CTA's M rows. B: SF_CELLS issues x 2 N-halves cells.
+                    k.mbarrier_wait(smem_full, stage=stage, phase=occ % 2)
+                    # cp the e4m3 scales SMEM -> TMEM (canon's Tx.copy_async(SFA_tmem,
+                    # SFA_smem[stage], cta_group=2)). SFB's MMA_N rows fold to 128 lanes
+                    # x two SF_CTA_K column groups.
                     k.tcgen05_cp(
-                        TensorSlice(
-                            tensor=sfa_tmem, offsets=(0, tmem_idx * SF_CELLS), shape=(128, SF_CELLS)
-                        ),
-                        TensorSlice(
-                            tensor=sfa_smem, offsets=(stage, 0, 0), shape=(1, SF_CELLS, blk_m)
-                        ),
+                        TensorSlice(tensor=sfa_tmem, offsets=(0, 0), shape=(128, SF_CTA_K)),
+                        TensorSlice(tensor=sfa_smem, offsets=(stage, 0, 0), shape=(1, blk_m, SF_CTA_K)),
                         cta_group=cta_group,
                     )
                     k.tcgen05_cp(
-                        TensorSlice(
-                            tensor=sfb_tmem,
-                            offsets=(0, tmem_idx * SF_CELLS * (MMA_N // 128)),
-                            shape=(128, SF_CELLS * (MMA_N // 128)),
-                        ),
-                        TensorSlice(
-                            tensor=sfb_smem, offsets=(stage, 0, 0), shape=(1, SF_CELLS, MMA_N)
-                        ),
+                        TensorSlice(tensor=sfb_tmem, offsets=(0, 0), shape=(128, sfb_cols)),
+                        TensorSlice(tensor=sfb_smem, offsets=(stage, 0, 0), shape=(1, MMA_N, SF_CTA_K)),
                         cta_group=cta_group,
                     )
-                    for ki in range(K_ITERS):
-                        kob = ki * (MMA_K // 2)  # packed-fp4 byte offset for this issue
-                        a_op = TensorSlice(
-                            tensor=a_smem, offsets=(stage, 0, kob), shape=(1, blk_m, MMA_K // 2)
-                        )
-                        b_op = TensorSlice(
-                            tensor=b_smem, offsets=(stage, 0, kob), shape=(1, blk_n, MMA_K // 2)
-                        )
-                        sfa_issue = TensorSlice(
-                            tensor=sfa_tmem, offsets=(0, tmem_idx * SF_CELLS + ki), shape=(128, 1)
-                        )
-                        sfb_issue = TensorSlice(
-                            tensor=sfb_tmem,
-                            offsets=(0, tmem_idx * SF_CELLS * (MMA_N // 128) + ki * (MMA_N // 128)),
-                            shape=(128, MMA_N // 128),
-                        )
-                        k.tcgen05_mma(
-                            acc_slice,
-                            a_op,
-                            b_op,
-                            m=MMA_M,
-                            n=MMA_N,
-                            k=MMA_K,
-                            accum=(t > 0 or ki > 0),
-                            cta_group=cta_group,
-                            sfa=sfa_issue,
-                            sfb=sfb_issue,
-                            sf_e4m3=True,
-                            sf_block=SF_BLOCK,
-                            a_fp4=True,
-                            b_fp4=True,
-                        )
+                    # ONE block-scaled gemm over the whole CTA_K tile (k = CTA_K). The
+                    # fp4 operands are the full packed-byte tiles; SFA/SFB are the full
+                    # e4m3 cells. Codegen views the u8 operands as float4_e2m1fn and
+                    # passes SFA=/SFB=.
+                    a_op = TensorSlice(tensor=a_smem, offsets=(stage, 0, 0), shape=(1, blk_m, BLK_K_BYTES))
+                    b_op = TensorSlice(tensor=b_smem, offsets=(stage, 0, 0), shape=(1, blk_n, BLK_K_BYTES))
+                    k.tcgen05_mma(
+                        acc_slice,
+                        a_op,
+                        b_op,
+                        m=MMA_M,
+                        n=MMA_N,
+                        k=CTA_K,
+                        accum=(t > 0),
+                        cta_group=cta_group,
+                        sfa=TensorSlice(tensor=sfa_tmem, offsets=(0, 0), shape=(128, SF_CTA_K)),
+                        sfb=TensorSlice(tensor=sfb_tmem, offsets=(0, 0), shape=(128, sfb_cols)),
+                        sf_e4m3=True,
+                        sf_block=SF_BLOCK,
+                        a_fp4=True,
+                        b_fp4=True,
+                    )
                     k.tcgen05_commit(
                         smem_empty, stage=stage, cta_group=cta_group, multicast_cta_mask=0b11
                     )
