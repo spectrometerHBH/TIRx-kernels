@@ -9,6 +9,10 @@ from typing import Literal
 from .nymph_rs import (
     _SCALAR_GMEM_DTYPES,
     BreakIf,
+    ClcQueryCancel,
+    ClcTryCancel,
+    ClusterBarrierArrive,
+    ClusterBarrierWait,
     ClusterShape,
     ClusterSync,
     CpAsyncBulkCommitGroup,
@@ -65,6 +69,7 @@ from .nymph_rs import (
     SchedulerImpl,
     ScopeValue,
     Shape,
+    ShuffleSync,
     StMatrix,
     WarpMma,
     Stmt,
@@ -223,6 +228,18 @@ class IRBuilder:
 
     def scalar_store(self, var: Var, value: ScalarValue) -> None:
         self._append(ScalarStore(var=var, value=value))
+
+    def shuffle_sync(
+        self, src: ScalarValue, src_lane: ScalarValue = 0, *, dtype: ScalarDType = ScalarDType.I32
+    ) -> Var:
+        """Warp broadcast that DEFINES a scalar: every lane gets the value of ``src``
+        on lane ``src_lane`` (a faithful ``__shfl_sync``). For a warp-uniform ``src``
+        it is value-preserving and makes the result compiler-provably uniform (so the
+        derived index/address math lowers to the uniform datapath). The value model
+        runs the broadcast, so broadcasting a non-uniform value is caught as a mismatch."""
+        var = Var(binding=VarBinding.SCALAR, dtype=dtype)
+        self._append(ShuffleSync(var=var, src=src, src_lane=src_lane))
+        return var
 
     def store_scalar(self, dst: Tensor | TensorSlice, value: ScalarValue) -> None:
         if isinstance(dst, Tensor):
@@ -416,7 +433,12 @@ class IRBuilder:
 
     @contextmanager
     def for_loop(
-        self, *, stop: ScalarValue, start: ScalarValue = 0, step: ScalarValue = 1
+        self,
+        *,
+        stop: ScalarValue,
+        start: ScalarValue = 0,
+        step: ScalarValue = 1,
+        unroll: bool = False,
     ) -> Iterator[Var]:
         var = Var()
         body: list[Stmt] = []
@@ -428,7 +450,9 @@ class IRBuilder:
             raise
         else:
             self._body_stack.pop()
-            self._append(ForLoop(var=var, start=start, stop=stop, step=step, body=tuple(body)))
+            self._append(
+                ForLoop(var=var, start=start, stop=stop, step=step, body=tuple(body), unroll=unroll)
+            )
 
     def task_space(self, *, grid: tuple[int, ...], fields: tuple[str, ...]) -> TaskSpace:
         return TaskSpace(grid=grid, fields=fields)
@@ -474,6 +498,36 @@ class IRBuilder:
         var = Var(binding=VarBinding.TASK)
         self._append(SchedNext(scheduler=scheduler, var=var))
         return TaskToken(var, scheduler.space, has_valid=True)
+
+    def clc_try_cancel(
+        self,
+        scheduler: Scheduler,
+        handle: Tensor,
+        mbar: MBar | MBarRef,
+        *,
+        stage: ScalarValue | None = None,
+        cta_group: int = 2,
+    ) -> None:
+        """CLC async work-steal issue (``clusterlaunchcontrol.try_cancel``): the 16B
+        response lands in ``handle`` and ``mbar`` is completed-tx (multicast to both
+        cluster CTAs). Written explicitly inside ``scheduler_impl``; the canonical task
+        value is read back by the paired ``clc_query_cancel``. Codegen translates 1:1."""
+        self._append(
+            ClcTryCancel(
+                scheduler=scheduler, handle=handle, mbar=mbar, stage=stage, cta_group=cta_group
+            )
+        )
+
+    def clc_query_cancel(
+        self, scheduler: Scheduler, handle: Tensor, *, dtype: ScalarDType = ScalarDType.I32
+    ) -> Var:
+        """CLC handle decode (``clusterlaunchcontrol.query_cancel``) that DEFINES a
+        scalar: the cancelled cluster's first ``ctaid.x`` (= task * cta_group), or -1
+        when drained. Read by the scheduler and every worker that queries the same
+        handle (all observe the same id). Codegen translates 1:1."""
+        var = Var(binding=VarBinding.SCALAR, dtype=dtype)
+        self._append(ClcQueryCancel(scheduler=scheduler, var=var, handle=handle))
+        return var
 
     @contextmanager
     def loop(self) -> Iterator[None]:
@@ -915,6 +969,17 @@ class IRBuilder:
 
     def cluster_sync(self) -> None:
         self._append(ClusterSync())
+
+    def cluster_barrier_arrive(self) -> None:
+        """Split cluster barrier — collective non-blocking arrival (CTA scope, all
+        threads). Pair with per-role ``cluster_barrier_wait``: decouples the
+        cluster-barrier latency from each role's setup; idle warps skip the wait."""
+        self._append(ClusterBarrierArrive())
+
+    def cluster_barrier_wait(self) -> None:
+        """Split cluster barrier — per-role wait. Blocks until all cluster threads have
+        executed ``cluster_barrier_arrive``. Allowed inside a role (unlike cluster_sync)."""
+        self._append(ClusterBarrierWait())
 
     @contextmanager
     def role(
