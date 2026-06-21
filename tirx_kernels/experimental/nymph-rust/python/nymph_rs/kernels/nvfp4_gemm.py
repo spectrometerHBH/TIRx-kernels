@@ -141,7 +141,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     a_tile_bytes = blk_m * BLK_K_BYTES
     b_tile_bytes = blk_n * BLK_K_BYTES
     sfa_tile_bytes = blk_m * SF_CTA_K  # per k-tile, this CTA's M rows x 16 e4m3 bytes
-    sfb_tile_bytes = MMA_N * SF_CTA_K  # per k-tile, the full N band x 16 e4m3 bytes
+    sfb_tile_bytes = blk_n * SF_CTA_K  # per k-tile, this CTA's N-half rows x 16 e4m3 bytes
     d_tile_bytes = blk_m * EPI_TILE * 2
 
     a_off = 0
@@ -194,7 +194,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     sfb_smem = k.tensor(
         space=MemorySpace.SMEM,
         dtype=DType.F8E4M3,
-        shape=(SMEM_DEPTH, MMA_N, SF_CTA_K),
+        shape=(SMEM_DEPTH, blk_n, SF_CTA_K),
         byte_offset=sfb_off,
     )
     d_smem = k.tensor(
@@ -227,12 +227,11 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
         shape=(128, SF_CTA_K),
         layout=TmemLayout(TmemLayoutKind.LANE_128, col_start=sfa_col0),
     )
-    # The full N band's B scales: MMA_N=256 rows fold to the 128 lanes as two
-    # SF_CTA_K column groups (rows 0..127 then 128..255 via the r/128 advance).
+    # This CTA's N-half B scales (128 rows), symmetric with SFA — canon's SFB_tmem.
     sfb_tmem = k.tensor(
         space=MemorySpace.TMEM,
         dtype=DType.F8E4M3,
-        shape=(128, SF_CTA_K * (MMA_N // 128)),
+        shape=(128, SF_CTA_K),
         layout=TmemLayout(TmemLayoutKind.LANE_128, col_start=sfb_col0),
     )
 
@@ -333,13 +332,13 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                     mbar_stage=stage,
                 )
                 k.tma_load(
-                    TensorSlice(tensor=sfb_smem, offsets=(stage, 0, 0), shape=(1, MMA_N, SF_CTA_K)),
+                    TensorSlice(tensor=sfb_smem, offsets=(stage, 0, 0), shape=(1, blk_n, SF_CTA_K)),
                     sfb_gmem,
                     mbar=smem_full,
                     bytes=sfb_tile_bytes,
-                    coords=(sf_n, sf_k),
-                    shape=(1, MMA_N, SF_CTA_K),
-                    gmem_shape=(MMA_N, SF_CTA_K),
+                    coords=(b_n, sf_k),
+                    shape=(1, blk_n, SF_CTA_K),
+                    gmem_shape=(blk_n, SF_CTA_K),
                     mbar_stage=stage,
                 )
 
@@ -347,7 +346,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     # No permute warp (canon has none): the TMA lands the e4m3 scales in the
     # cp-ready layout, the MMA warp copies them SMEM->TMEM and issues ONE
     # block-scaled gemm over the full CTA_K tile, exactly like canon's execute_mma.
-    sfb_cols = SF_CTA_K * (MMA_N // 128)
+    sfb_cols = SF_CTA_K  # this CTA's N-half SF cells (symmetric with SFA)
     with k.role(warp=1):
         with k.for_each_task(task_scheduler) as task:
             local_iter = (task.task_id - task_start) // task_step
@@ -372,7 +371,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                     )
                     k.tcgen05_cp(
                         TensorSlice(tensor=sfb_tmem, offsets=(0, 0), shape=(128, sfb_cols)),
-                        TensorSlice(tensor=sfb_smem, offsets=(stage, 0, 0), shape=(1, MMA_N, SF_CTA_K)),
+                        TensorSlice(tensor=sfb_smem, offsets=(stage, 0, 0), shape=(1, blk_n, SF_CTA_K)),
                         cta_group=cta_group,
                     )
                     # ONE block-scaled gemm over the whole CTA_K tile (k = CTA_K). The

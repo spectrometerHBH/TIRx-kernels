@@ -148,6 +148,9 @@ struct Ctx {
     /// Number of launched clusters (`launch_cta_count / cta_group`) — the grid stride
     /// for a `ForEachTask` grid-stride scheduler loop.
     num_clusters: usize,
+    /// NVFP4 e4m3 scale-factor TMEM tensors (SFA_tmem, SFB_tmem), in declaration order;
+    /// declared via `alloc_sf` right after the `tmem` view in KernelInit.
+    sf_tmems: Vec<Arc<Tensor>>,
 }
 
 impl Ctx {
@@ -1120,6 +1123,10 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
         reg_widths,
         tma_leader_mbar,
         num_clusters: (k.launch_cta_count() / (cta_group as usize).max(1)).max(1),
+        sf_tmems: collect_tensors(k)
+            .into_iter()
+            .filter(|t| t.space == MemorySpace::Tmem && t.dtype == DType::F8E4M3)
+            .collect(),
     })
 }
 
