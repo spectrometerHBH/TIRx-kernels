@@ -144,6 +144,9 @@ struct Ctx {
     /// leader's MMA waits its own LOCAL barrier (which both CTAs fill). This replaces
     /// the illegal peer `try_wait`. None when not cluster mode / no TMA barrier.
     tma_leader_mbar: Option<u32>,
+    /// Number of launched clusters (`launch_cta_count / cta_group`) — the grid stride
+    /// for a `ForEachTask` grid-stride scheduler loop.
+    num_clusters: usize,
 }
 
 impl Ctx {
@@ -1074,6 +1077,7 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
         tmem_alloc_cols,
         reg_widths,
         tma_leader_mbar,
+        num_clusters: (k.launch_cta_count() / (cta_group as usize).max(1)).max(1),
     })
 }
 
@@ -1828,6 +1832,37 @@ fn emit_stmt(
                 format!("T.serial({start_s}, {stop_s}, {step_s})")
             };
             out.push_str(&format!("{p}for {name} in {range}:\n"));
+            emit_body(out, body, indent + 1, ctx, scope)?;
+            Ok(())
+        }
+        // Grid-stride scheduler loop: each launched cluster (cta_id // cta_group) strides
+        // by the cluster count through the task space. The trip count is runtime (the
+        // start is runtime), so T.serial stays rolled — it cannot unroll. The task var
+        // reads as `v{id}` in the body (the per-role `local_iter`/`work_idx` math the
+        // kernel emits decodes it). Only the functional grid_stride policy is lowered;
+        // the work-stealing CLC path is written as explicit clc_* ops, not ForEachTask.
+        ForEachTask {
+            scheduler,
+            var,
+            body,
+        } => {
+            use super::scheduler::SchedulerPolicy;
+            if scheduler.policy != SchedulerPolicy::GridStride {
+                return Err(format!(
+                    "codegen: ForEachTask policy {:?} unsupported (only grid_stride)",
+                    scheduler.policy
+                ));
+            }
+            let name = var_name(ctx, var);
+            let stop = scheduler
+                .space
+                .task_count()
+                .ok_or("codegen: ForEachTask task space size overflow")?;
+            out.push_str(&format!(
+                "{p}for {name} in T.serial(cta_id // {cg}, {stop}, {step}):\n",
+                cg = ctx.cta_group,
+                step = ctx.num_clusters,
+            ));
             emit_body(out, body, indent + 1, ctx, scope)?;
             Ok(())
         }
