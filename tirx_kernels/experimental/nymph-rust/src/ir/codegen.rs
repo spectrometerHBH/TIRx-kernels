@@ -2498,7 +2498,8 @@ fn emit_stmt(
                         let w = s.shape.first().and_then(as_int).unwrap_or(0).max(0) as usize;
                         emit_reg_view_slice(out, &p, &s.tensor, off, w, ctx)
                     }
-                    RegOperand::Literal(l) => Ok(format!("{}", l.as_f32())),
+                    // wg.mul needs a typed scalar (a bare int literal has no .dtype).
+                    RegOperand::Literal(l) => Ok(format!("T.float32({})", l.as_f32())),
                 }
             };
             let dst_off = dst.offsets.first().unwrap_or(&zero);

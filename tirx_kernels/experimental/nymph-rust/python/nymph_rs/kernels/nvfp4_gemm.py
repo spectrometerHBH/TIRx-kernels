@@ -354,7 +354,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                 tmem_idx = local_iter % ACC_DEPTH
                 k.mbarrier_wait(tmem_empty, stage=tmem_idx, phase=(local_iter // ACC_DEPTH + 1) % 2)
                 acc_slice = TensorSlice(
-                    tensor=accum, offsets=(0, tmem_idx * MMA_N), shape=(128, MMA_N)
+                    tensor=accum, offsets=(0, tmem_idx * MMA_N), shape=(128, CTA_N)
                 )
                 for t in range(k_tiles):
                     seq = local_iter * k_tiles + t
@@ -378,14 +378,19 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                     # fp4 operands are the full packed-byte tiles; SFA/SFB are the full
                     # e4m3 cells. Codegen views the u8 operands as float4_e2m1fn and
                     # passes SFA=/SFB=.
+                    # canon's per-CTA gemm: n = CTA_N (the pair's MMA_N=256 N band is split
+                    # across the 2 CTAs), m = MMA_M, the B operand is n/2 rows. A operand is
+                    # m/2 = CTA_M rows; SFA/SFB are the full (128, SF_CTA_K).
                     a_op = TensorSlice(tensor=a_smem, offsets=(stage, 0, 0), shape=(1, blk_m, BLK_K_BYTES))
-                    b_op = TensorSlice(tensor=b_smem, offsets=(stage, 0, 0), shape=(1, blk_n, BLK_K_BYTES))
+                    b_op = TensorSlice(
+                        tensor=b_smem, offsets=(stage, 0, 0), shape=(1, CTA_N // CTA_GROUP, BLK_K_BYTES)
+                    )
                     k.tcgen05_mma(
                         acc_slice,
                         a_op,
                         b_op,
                         m=MMA_M,
-                        n=MMA_N,
+                        n=CTA_N,
                         k=CTA_K,
                         accum=(t > 0),
                         cta_group=cta_group,
