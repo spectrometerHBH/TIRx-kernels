@@ -1203,6 +1203,23 @@ impl PyTmemLayout {
     }
 }
 
+/// `SfSmemLayout` — NVFP4 scale-factor buffer layout.
+#[pyclass(name = "SfSmemLayout")]
+#[derive(Clone)]
+pub struct PySfSmemLayout(pub ir::SfSmemLayout);
+#[pymethods]
+impl PySfSmemLayout {
+    #[new]
+    #[pyo3(signature = (sf_per_mma = 4))]
+    fn new(sf_per_mma: u8) -> Self {
+        PySfSmemLayout(ir::SfSmemLayout { sf_per_mma })
+    }
+    #[getter]
+    fn sf_per_mma(&self) -> u8 {
+        self.0.sf_per_mma
+    }
+}
+
 fn coerce_layout(obj: &Bound<'_, PyAny>) -> PyResult<ir::Layout> {
     if let Ok(l) = obj.extract::<PyTmemLayout>() {
         return Ok(ir::Layout::Tmem(l.0));
@@ -1210,8 +1227,11 @@ fn coerce_layout(obj: &Bound<'_, PyAny>) -> PyResult<ir::Layout> {
     if let Ok(l) = obj.extract::<PySmemSwizzleLayout>() {
         return Ok(ir::Layout::Swizzle(l.0));
     }
+    if let Ok(l) = obj.extract::<PySfSmemLayout>() {
+        return Ok(ir::Layout::SfSmem(l.0));
+    }
     Err(PyTypeError::new_err(
-        "expected a Layout (TmemLayout or SmemSwizzleLayout)",
+        "expected a Layout (TmemLayout, SmemSwizzleLayout, or SfSmemLayout)",
     ))
 }
 
@@ -2642,6 +2662,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // chunk 3 — tensors / slices / layouts
     m.add_class::<PySmemSwizzleLayout>()?;
     m.add_class::<PyTmemLayout>()?;
+    m.add_class::<PySfSmemLayout>()?;
     m.add_class::<PyTensor>()?;
     m.add_class::<PyTensorSlice>()?;
     // chunk 4 — mbarriers
