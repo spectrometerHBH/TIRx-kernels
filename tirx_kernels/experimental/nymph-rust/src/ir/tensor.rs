@@ -19,12 +19,23 @@ use std::sync::Arc;
 pub enum Layout {
     Swizzle(SmemSwizzleLayout),
     Tmem(TmemLayout),
+    /// NVFP4 scale-factor layout: the GMEM/SMEM buffer is laid out so the TMA loads
+    /// the e4m3 scale bytes straight into the `tcgen05.cp`-ready order (canon's
+    /// `sf_smem_layout(rows, sf_k, sf_per_mma)`), replacing an explicit permute warp.
+    SfSmem(SfSmemLayout),
 }
 
 /// `SmemSwizzleLayout`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SmemSwizzleLayout {
     pub swizzle: Swizzle,
+}
+
+/// `SfSmemLayout` — rows/sf_k come from the tensor shape at codegen time; only
+/// `sf_per_mma` (scale blocks per MMA issue, 4 for nvfp4) is carried here.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SfSmemLayout {
+    pub sf_per_mma: u8,
 }
 
 /// `TmemLayout`. `lane_align` is the MMA accumulator d-tmem lane field (0 or 16),
