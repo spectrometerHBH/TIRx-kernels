@@ -17,7 +17,7 @@ use super::super::registry::{StmtExecutorRegistry, StmtKind};
 use super::super::scheduler::CtaActivityStatus;
 use super::super::slice_indexing::ResolvedSlice;
 use super::super::values::arrays::ValueArray1;
-use super::super::values::dtypes::decode_e4m3;
+use super::super::values::dtypes::{decode_e4m3, encode_e4m3};
 use super::super::values::indexing::numel;
 use super::super::values::mbars::{MbarCell, MbarCellKey};
 use super::super::values::tcgen05_datapath::{
@@ -1061,14 +1061,41 @@ fn read_scale_blocks(
             "mma scale slice does not cover the scaled rows",
         ));
     }
+    let layout = tmem_layout_for(&sl.tensor)?;
+    let col0 = layout.col_start + offsets[1];
+    // nvfp4 e4m3 SF datapath: the scale tile is an f8e4m3 (rows, nblocks) TMEM
+    // tensor with one e4m3 byte per (lane = row, col = col0 + block) cell (laid
+    // out by execute_cp's F8E4M3 branch). Read it row-major — `nblocks` is one
+    // scale per 16-K block (k/16), so it is NOT capped at the 4 bytes of a u32
+    // cell the fp8/UE8M0 packed path uses.
+    if sl.tensor.dtype == crate::ir::DType::F8E4M3 {
+        if !e4m3 {
+            return Err(InterpreterError::new(
+                "tcgen05_mma_scale",
+                "f8e4m3 scale tensor requires the e4m3 decode path",
+            ));
+        }
+        if nblocks > shape[1] {
+            return Err(InterpreterError::new(
+                "tcgen05_mma_scale",
+                "mma scale slice does not cover the scaled blocks",
+            ));
+        }
+        let sp = ctx.state.values.tmem.scratchpad_for(cta_id)?;
+        let mut out = Vec::with_capacity(rows * nblocks);
+        for r in 0..rows {
+            for b in 0..nblocks {
+                out.push(decode_e4m3(sp.read_sf_byte(r, col0 + b)?));
+            }
+        }
+        return Ok(out);
+    }
     if byte_base + nblocks > 4 {
         return Err(InterpreterError::new(
             "tcgen05_mma_scale",
             "mma scale block range exceeds the 4 bytes of a packed u32 cell",
         ));
     }
-    let layout = tmem_layout_for(&sl.tensor)?;
-    let col0 = layout.col_start + offsets[1];
     let sp = ctx.state.values.tmem.scratchpad_for(cta_id)?;
     let mut lanes = Vec::with_capacity(rows);
     let mut cols = Vec::with_capacity(rows);
@@ -1179,24 +1206,38 @@ fn execute_cp<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResul
             &src_off,
             &src_r.shape,
         )?;
-        let ValueArray1::U32(_) = &flat else {
-            return Err(InterpreterError::new(
-                "tcgen05_cp_dtype",
-                "tcgen05_cp moves packed u32 scale cells",
-            ));
-        };
-        ctx.state
-            .values
-            .tmem
-            .by_cta
-            .get_mut(&cta)
-            .ok_or_else(|| {
-                InterpreterError::new(
-                    "missing_tmem_scratchpad",
-                    "tcgen05_cp writes a missing TMEM scratchpad",
-                )
-            })?
-            .write_cells(&dst_r.tensor, &lanes, &cols, &flat)?;
+        let sp = ctx.state.values.tmem.by_cta.get_mut(&cta).ok_or_else(|| {
+            InterpreterError::new(
+                "missing_tmem_scratchpad",
+                "tcgen05_cp writes a missing TMEM scratchpad",
+            )
+        })?;
+        match &flat {
+            // fp8/UE8M0 datapath: packed-u32 scale cells (4 e4m3/UE8M0 bytes per
+            // cell), one cell per (lane, col) — the typed write_cells path.
+            ValueArray1::U32(_) => {
+                sp.write_cells(&dst_r.tensor, &lanes, &cols, &flat)?;
+            }
+            // nvfp4 datapath: the SF is an f8e4m3 (rows, K//16) tile — one e4m3
+            // scale byte per 16-K block. Store it row-major as one byte per TMEM
+            // cell (lane = row, col = col0 + block), the layout read_scale_blocks
+            // reads back. (read_block decodes e4m3 to f32; re-encoding round-trips
+            // every finite e4m3 byte exactly.)
+            ValueArray1::F8E4M3(vals) => {
+                let nblocks = dst_r.shape[1];
+                for (e, &v) in vals.iter().enumerate() {
+                    let row = e / nblocks;
+                    let blk = e % nblocks;
+                    sp.write_sf_byte(row, col0 + blk, encode_e4m3(v))?;
+                }
+            }
+            _ => {
+                return Err(InterpreterError::new(
+                    "tcgen05_cp_dtype",
+                    "tcgen05_cp moves packed u32 or e4m3 scale cells",
+                ));
+            }
+        }
     }
     Ok(StepStatus::advance())
 }
@@ -1466,16 +1507,27 @@ fn accumulate_inplace(
             "tcgen05_mma operand shape does not match m/n/k",
         ));
     }
-    // Scale vectors: A's split by M across the pair like A itself; B's duplicated
-    // per CTA, each acc half applying its own copy. Scaling the materialized
-    // operand rows commutes bit-for-bit with product scaling. nvfp4 (sf_block=16)
-    // applies a per-16-column-block scale; fp8 (sf_block=0) one scale per row.
+    // Scale vectors: A's split by M across the pair like A itself. nvfp4
+    // (sf_block=16) applies a per-16-column-block e4m3 scale; fp8 (sf_block=0)
+    // one UE8M0 scale per row. Scaling the materialized operand rows commutes
+    // bit-for-bit with product scaling.
+    //
+    // The B scales differ by datapath. fp8 holds the FULL N-band's B scales in
+    // EVERY CTA's sfb tensor (duplicated), so each acc half reads `n` rows from
+    // its own copy. nvfp4's e4m3 sfb is SPLIT by N across the pair exactly like
+    // the B operand itself (each CTA's sfb_tmem holds its own n_seg=128 rows),
+    // so the full N-band scale vector is the per-CTA halves CONCATENATED in
+    // cta_ids order — matching how `sb` (the B operand) is built below.
     let nblocks = if sf_block == 0 { 1 } else { k / sf_block };
+    let sfb_split = sf_block != 0; // nvfp4 block-scaled: B scales split, not duplicated
     let (sa_scales, sb_scales) = match scales {
         Some((sfa_sl, sfb_sl, sf_byte)) => {
             let byte_base = if sf_block == 0 { sf_byte } else { 0 };
             let mut sa = Vec::with_capacity(cta_ids.len());
-            let mut sb = Vec::with_capacity(cta_ids.len());
+            // The full-N-band B scale vector (concatenated halves) shared by both
+            // acc halves when split; otherwise one per-CTA duplicated copy each.
+            let mut sb_split_full: Vec<f32> = Vec::new();
+            let mut sb: Vec<Vec<f32>> = Vec::with_capacity(cta_ids.len());
             for &cta in cta_ids {
                 sa.push(read_scale_blocks(
                     ctx,
@@ -1486,9 +1538,19 @@ fn accumulate_inplace(
                     sf_e4m3,
                     cta,
                 )?);
-                sb.push(read_scale_blocks(
-                    ctx, sfb_sl, byte_base, nblocks, n, sf_e4m3, cta,
-                )?);
+                if sfb_split {
+                    sb_split_full.extend(read_scale_blocks(
+                        ctx, sfb_sl, byte_base, nblocks, n_seg, sf_e4m3, cta,
+                    )?);
+                } else {
+                    sb.push(read_scale_blocks(
+                        ctx, sfb_sl, byte_base, nblocks, n, sf_e4m3, cta,
+                    )?);
+                }
+            }
+            if sfb_split {
+                // Both acc halves apply the same full-band (split) scale vector.
+                sb = vec![sb_split_full; cta_ids.len()];
             }
             (sa, sb)
         }

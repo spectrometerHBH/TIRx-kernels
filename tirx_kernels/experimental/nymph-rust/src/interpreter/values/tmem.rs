@@ -64,6 +64,30 @@ impl TmemScratchpad {
         Ok(())
     }
 
+    /// Store one raw e4m3 scale byte at a TMEM cell. The nvfp4 block-scale
+    /// datapath holds its e4m3 SF in TMEM as one byte per (lane, col) cell —
+    /// not the packed-u32 4-bytes-per-cell layout the fp8/UE8M0 path uses — so
+    /// `tcgen05.cp` writes and `read_scale_blocks` reads through this raw byte
+    /// accessor (the typed read_cells/write_cells path is U32/F32/F16 only).
+    pub fn write_sf_byte(&mut self, lane: usize, col: usize, byte: u8) -> IResult<()> {
+        self.check_cell(lane, col)?;
+        self.data[[lane, col]] = byte as u32;
+        self.valid[[lane, col]] = true;
+        Ok(())
+    }
+
+    /// Read back a raw e4m3 scale byte written by `write_sf_byte`.
+    pub fn read_sf_byte(&self, lane: usize, col: usize) -> IResult<u8> {
+        self.check_cell(lane, col)?;
+        if !self.valid[[lane, col]] {
+            return Err(InterpreterError::new(
+                "missing_tmem_value",
+                "TMEM scale cell is unwritten",
+            ));
+        }
+        Ok((self.data[[lane, col]] & 0xFF) as u8)
+    }
+
     fn check_supported_dtype(tensor: &Tensor) -> IResult<()> {
         if !matches!(
             tensor.dtype,

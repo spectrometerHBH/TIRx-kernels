@@ -243,6 +243,13 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     tmem_full = k.mbar(kind=MBarKind.TCGEN05, stages=ACC_DEPTH)
     tmem_empty = k.mbar(kind=MBarKind.THREAD, stages=ACC_DEPTH)
     tmem_empty_leader = k.mbar_ref(tmem_empty, remote_coord=0)
+    # The cluster MMA reads the PEER CTA's A/B/SF tiles too (cta_group=2,
+    # multicast_cta_mask=0b11): the leader's tcgen05_cp/tcgen05_mma read
+    # smem:cta1 as well as its own. So the leader must wait the PEER's
+    # smem_full before issuing — exactly like the fp16/bf16 port — or the
+    # peer CTA's TMA load has no happens-before edge to the leader's
+    # operand read (the tcgen05_operand_overwrite_before_drain race).
+    peer_smem_full = k.mbar_ref(smem_full, remote_coord=1)
 
     cta_id = k.cta_id()
     cta_rank = k.ctaid_in_cluster()
@@ -356,43 +363,68 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                 tmem_idx = local_iter % ACC_DEPTH
                 k.mbarrier_wait(tmem_empty, stage=tmem_idx, phase=(local_iter // ACC_DEPTH + 1) % 2)
                 acc_slice = TensorSlice(
-                    tensor=accum, offsets=(0, tmem_idx * MMA_N), shape=(128, CTA_N)
+                    tensor=accum, offsets=(0, tmem_idx * MMA_N), shape=(128, MMA_N)
                 )
+
                 def mma_ktile(t, accum_flag):
                     # one k-tile: wait the staged loads, cp the e4m3 scales SMEM->TMEM,
                     # issue ONE block-scaled gemm over CTA_K, free the smem stage.
                     seq = local_iter * k_tiles + t
                     stage = seq % SMEM_DEPTH
                     occ = seq // SMEM_DEPTH
-                    # The consumer waits the FLIPPED phase the loader's TMA arrive sets
-                    # (same convention as the loader's smem_empty wait) — phase=occ%2 lets
-                    # the cp/gemm read the SMEM tile before the load completes (a race the
-                    # protocol checker flagged: tma_load_access_before_mbar_wait).
-                    k.mbarrier_wait(smem_full, stage=stage, phase=(occ + 1) % 2)
+                    # smem_full starts EMPTY (parity 0) and is flipped 0->1 only when the
+                    # loader's TMA arrive + all four complete-tx land. mbarrier_wait blocks
+                    # while parity == phase and wakes on the flip, so the consumer must wait
+                    # phase=occ%2 (block at the OLD parity until the load completes). The
+                    # flipped (occ+1)%2 passes vacuously on the first occupancy — the cp/gemm
+                    # then read the SF/operand SMEM before the load lands (the
+                    # tcgen05_operand_overwrite_before_drain race the checker flags).
+                    k.mbarrier_wait(smem_full, stage=stage, phase=occ % 2)
+                    # Also wait the PEER CTA's smem_full: the cluster MMA's cp/gemm
+                    # read smem:cta1 too, so the leader must order against the peer's
+                    # TMA load before issuing (else the operand read races it).
+                    k.mbarrier_wait(peer_smem_full, stage=stage, phase=occ % 2)
                     k.tcgen05_cp(
                         TensorSlice(tensor=sfa_tmem, offsets=(0, 0), shape=(128, SF_CTA_K)),
-                        TensorSlice(tensor=sfa_smem, offsets=(stage, 0, 0), shape=(1, blk_m, SF_CTA_K)),
+                        TensorSlice(
+                            tensor=sfa_smem, offsets=(stage, 0, 0), shape=(1, blk_m, SF_CTA_K)
+                        ),
                         cta_group=cta_group,
                     )
                     k.tcgen05_cp(
                         TensorSlice(tensor=sfb_tmem, offsets=(0, 0), shape=(128, sfb_cols)),
-                        TensorSlice(tensor=sfb_smem, offsets=(stage, 0, 0), shape=(1, blk_n, SF_CTA_K)),
+                        TensorSlice(
+                            tensor=sfb_smem, offsets=(stage, 0, 0), shape=(1, blk_n, SF_CTA_K)
+                        ),
                         cta_group=cta_group,
                     )
-                    # canon's per-CTA gemm: n = CTA_N (the pair's MMA_N=256 band is split
-                    # across the 2 CTAs), m = MMA_M, B operand n/2 rows, SFA/SFB full (128, SF_CTA_K).
-                    a_op = TensorSlice(tensor=a_smem, offsets=(stage, 0, 0), shape=(1, blk_m, BLK_K_BYTES))
+                    # canon's cluster gemm: n = MMA_N (the full 256-wide N band the pair
+                    # computes together), m = MMA_M; each CTA supplies its own blk_n=128-row
+                    # B half (b_smem holds it) and the 2-CTA MMA writes the full MMA_N
+                    # accumulator. SFA/SFB full (128, SF_CTA_K). (n=CTA_N with a 64-row B
+                    # half only fills HALF the MMA_N accumulator — the epilogue then reads
+                    # the unwritten upper cols. n=MMA_N matches the fp16/bf16 cluster MMA.)
+                    a_op = TensorSlice(
+                        tensor=a_smem, offsets=(stage, 0, 0), shape=(1, blk_m, BLK_K_BYTES)
+                    )
                     b_op = TensorSlice(
-                        tensor=b_smem, offsets=(stage, 0, 0), shape=(1, CTA_N // CTA_GROUP, BLK_K_BYTES)
+                        tensor=b_smem, offsets=(stage, 0, 0), shape=(1, blk_n, BLK_K_BYTES)
                     )
                     k.tcgen05_mma(
-                        acc_slice, a_op, b_op,
-                        m=MMA_M, n=CTA_N, k=CTA_K,
+                        acc_slice,
+                        a_op,
+                        b_op,
+                        m=MMA_M,
+                        n=MMA_N,
+                        k=CTA_K,
                         accum=accum_flag,
                         cta_group=cta_group,
                         sfa=TensorSlice(tensor=sfa_tmem, offsets=(0, 0), shape=(128, SF_CTA_K)),
                         sfb=TensorSlice(tensor=sfb_tmem, offsets=(0, 0), shape=(128, sfb_cols)),
-                        sf_e4m3=True, sf_block=SF_BLOCK, a_fp4=True, b_fp4=True,
+                        sf_e4m3=True,
+                        sf_block=SF_BLOCK,
+                        a_fp4=True,
+                        b_fp4=True,
                     )
                     k.tcgen05_commit(
                         smem_empty, stage=stage, cta_group=cta_group, multicast_cta_mask=0b11

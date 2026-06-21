@@ -10,9 +10,8 @@ numpy reference bit-for-bit (zero mismatches).
 from __future__ import annotations
 
 import numpy as np
-import pytest
-
 import nymph_rs as nr
+import pytest
 from nymph_rs.kernels import build_nvfp4_gemm, nvfp4_task_config
 from nymph_rs.kernels.nvfp4_gemm import NVFP4_CONFIGS_SUPPORTED, NvFp4GemmConfig
 
@@ -20,33 +19,12 @@ from nymph_rs.kernels.nvfp4_gemm import NVFP4_CONFIGS_SUPPORTED, NvFp4GemmConfig
 _E2M1 = np.array(
     [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6], dtype=np.float32
 )
-_SF_CELLS = 4  # packed-u32 e4m3 scale cells per row per 256-K tile
-
-
-def _e4m3_pow2_byte(p: np.ndarray) -> np.ndarray:
-    """e4m3 byte for the exact value 2^p (normal, zero mantissa): exponent p+7."""
-    return ((p + 7) << 3).astype(np.uint8)
 
 
 def _pack_fp4(codes: np.ndarray) -> np.ndarray:
     """(R, K) e2m1 nibble codes -> (R, K//2) u8: element 2i in the low nibble,
     2i+1 in the high nibble."""
     return (codes[:, 0::2] | (codes[:, 1::2] << 4)).astype(np.uint8)
-
-
-def _pack_sf(byte: np.ndarray, k: int) -> np.ndarray:
-    """(R, K//16) e4m3 scale bytes -> (k_tiles*SF_CELLS, R) u32. Cell (t, ki)
-    packs the four 16-K blocks [16t+4ki, +4) of each row, byte bi = block
-    16t+4ki+bi — the issue-cell layout the MMA reads (one cell per MMA issue)."""
-    rows = byte.shape[0]
-    k_tiles = k // 256
-    out = np.zeros((k_tiles * _SF_CELLS, rows), np.uint32)
-    for t in range(k_tiles):
-        for ki in range(_SF_CELLS):
-            for bi in range(4):
-                blk = 16 * t + 4 * ki + bi
-                out[t * _SF_CELLS + ki, :] |= byte[:, blk].astype(np.uint32) << (8 * bi)
-    return np.ascontiguousarray(out)
 
 
 def _round_bf16(x: np.ndarray) -> np.ndarray:
@@ -56,7 +34,11 @@ def _round_bf16(x: np.ndarray) -> np.ndarray:
 
 
 def _prepare(m: int, n: int, k: int, alpha: float, seed: int = 0):
-    """Self-consistent nvfp4 inputs + the exact bf16 reference."""
+    """Self-consistent nvfp4 inputs + the exact bf16 reference.
+
+    The scale factors are the kernel's ``f8e4m3`` (R, K//16) args, passed as the
+    exact POWER-OF-TWO f32 values (the interpreter coerces an f8e4m3 arg from
+    float32 and rounds to e4m3, so a power of two round-trips bit-exactly)."""
     rng = np.random.default_rng(seed)
     # e2m1 codes spanning small magnitudes and both signs (codes 0..4 and 8..12
     # = {0,.5,1,1.5,2} and negatives) keep every partial sum exact in f32.
@@ -68,23 +50,15 @@ def _prepare(m: int, n: int, k: int, alpha: float, seed: int = 0):
     b_codes = (pos | sgn).astype(np.uint8)
     a_p = rng.integers(-1, 2, size=(m, k // 16))
     b_p = rng.integers(-1, 2, size=(n, k // 16))
-    a_sf_byte = _e4m3_pow2_byte(a_p)
-    b_sf_byte = _e4m3_pow2_byte(b_p)
 
     a = _E2M1[a_codes]
     b = _E2M1[b_codes]
-    a_scale = (2.0**a_p).astype(np.float32)
-    b_scale = (2.0**b_p).astype(np.float32)
+    a_scale = (2.0**a_p).astype(np.float32)  # (M, K//16) f32 powers of two
+    b_scale = (2.0**b_p).astype(np.float32)  # (N, K//16)
     a_s = (a.reshape(m, k // 16, 16) * a_scale[:, :, None]).reshape(m, k).astype(np.float32)
     b_s = (b.reshape(n, k // 16, 16) * b_scale[:, :, None]).reshape(n, k).astype(np.float32)
     ref = _round_bf16(alpha * (a_s @ b_s.T))
-    return (
-        _pack_fp4(a_codes),
-        _pack_fp4(b_codes),
-        _pack_sf(a_sf_byte, k),
-        _pack_sf(b_sf_byte, k),
-        ref,
-    )
+    return _pack_fp4(a_codes), _pack_fp4(b_codes), a_scale, b_scale, ref
 
 
 def test_nvfp4_gemm_protocol_passes_canonical_task_shape():
