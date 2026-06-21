@@ -356,6 +356,32 @@ impl ValueArray1 {
         }
         Ok(())
     }
+
+    /// `dst[dst_start..] += src[src_start..]` over `len` elements — the
+    /// `cp.reduce.async.bulk...add.f32` (TMA reduce-add) value semantics. f32 only
+    /// (the only reduce-add operand width the SM100 bulk-reduce path emits here).
+    pub fn add_run_from(
+        &mut self,
+        dst_start: usize,
+        src: &ValueArray1,
+        src_start: usize,
+        len: usize,
+    ) -> IResult<()> {
+        match (self, src) {
+            (Self::F32(dst), Self::F32(src)) => {
+                let d = dst.as_slice_mut().expect("contiguous data");
+                let s = src.as_slice().expect("contiguous values");
+                for i in 0..len {
+                    d[dst_start + i] += s[src_start + i];
+                }
+                Ok(())
+            }
+            _ => Err(InterpreterError::new(
+                "tensor_value",
+                "tma reduce-add supports only f32 operands",
+            )),
+        }
+    }
 }
 
 impl ValueArray2 {

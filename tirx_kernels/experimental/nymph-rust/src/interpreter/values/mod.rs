@@ -10,6 +10,7 @@ pub mod reg_numerics;
 pub mod registers;
 pub mod runtime;
 pub mod scalars;
+pub mod semaphores;
 pub mod smem;
 pub mod tcgen05_datapath;
 pub mod tensors;

@@ -7,9 +7,24 @@
 use super::diagnostics::Diagnostic;
 use super::protocol::{
     BoxN, FenceEventKind, MbarTargetEvent, MemoryAccessKind, MemoryProxy, PoolId,
-    ProtocolPassSummary, ProtocolReport, ProtocolStatus, Region, RegionBoxes, TensorAccessKind,
-    TmemAsyncKind, TraceEvent, TraceEventKind,
+    ProtocolPassSummary, ProtocolReport, ProtocolStatus, ReduceOp, Region, RegionBoxes, SemKey,
+    TensorAccessKind, TmemAsyncKind, TraceEvent, TraceEventKind,
 };
+
+/// The `(op, exact)` of an atomic commutative reduce access (Read or Write), else `None`.
+fn reduce_access(payload: &TraceEventKind) -> Option<(ReduceOp, bool)> {
+    match payload {
+        TraceEventKind::Read {
+            access_kind: MemoryAccessKind::Tensor(k),
+            ..
+        }
+        | TraceEventKind::Write {
+            access_kind: MemoryAccessKind::Tensor(k),
+            ..
+        } => k.reduce(),
+        _ => None,
+    }
+}
 use super::region::{boxes_overlap, region_covers, regions_overlap, TMEM_LANE_BYTES};
 use super::values::indexing::numel;
 use super::values::smem::dtype_size_bytes;
@@ -188,6 +203,20 @@ impl<'a> CheckerCx<'a> {
             message: message.into(),
             event_idx,
             details,
+        });
+    }
+
+    /// Record a non-fatal warning (does not affect Passed/Inconclusive). Deduped by code so a
+    /// kernel with N commutative reduces emits one `nondeterministic_reduction`, not N.
+    fn warn(&mut self, code: impl Into<String>, message: impl Into<String>) {
+        let code = code.into();
+        if self.warnings.iter().any(|w| w.code == code) {
+            return;
+        }
+        self.warnings.push(super::protocol::ProtocolWarning {
+            code,
+            message: message.into(),
+            details: BTreeMap::new(),
         });
     }
 }
@@ -654,16 +683,17 @@ fn async_group_lifetime_local(cx: &mut CheckerCx<'_>) -> CheckResult {
     };
     // per-STREAM pending store (two CTAs execute the SAME kernel stmt, so the
     // stmt id alone cannot key an in-flight store)
-    let mut pending_store: HashMap<usize, (usize, Option<Region>, Option<Region>)> = HashMap::new();
+    type PendingStore = (usize, Option<Region>, Option<Region>, Option<(ReduceOp, bool)>);
+    let mut pending_store: HashMap<usize, PendingStore> = HashMap::new();
     fn flush_pending(
-        pending: (usize, Option<Region>, Option<Region>),
+        pending: PendingStore,
         stream_id: usize,
         windows: &mut Vec<AsyncSourceWindow>,
         dest_windows: &mut Vec<AsyncSourceWindow>,
         streams: &mut HashMap<usize, StreamGroups>,
         idx: usize,
     ) {
-        let (stmt_id, source, dest) = pending;
+        let (stmt_id, source, dest, reduce) = pending;
         let wi = windows.len();
         windows.push(AsyncSourceWindow {
             stream_id,
@@ -671,6 +701,7 @@ fn async_group_lifetime_local(cx: &mut CheckerCx<'_>) -> CheckResult {
             start_idx: idx,
             close_idx: None,
             regions: source.into_iter().collect(),
+            reduce: None, // source side is never a reduce dest
         });
         dest_windows.push(AsyncSourceWindow {
             stream_id,
@@ -678,6 +709,7 @@ fn async_group_lifetime_local(cx: &mut CheckerCx<'_>) -> CheckResult {
             start_idx: idx,
             close_idx: None,
             regions: dest.into_iter().collect(),
+            reduce,
         });
         streams.entry(stream_id).or_default().pending.push(wi);
     }
@@ -686,7 +718,7 @@ fn async_group_lifetime_local(cx: &mut CheckerCx<'_>) -> CheckResult {
         if let Some(stream_id) = stream_id {
             if pending_store
                 .get(&stream_id)
-                .is_some_and(|(stmt, _, _)| *stmt != event.stmt_id)
+                .is_some_and(|(stmt, _, _, _)| *stmt != event.stmt_id)
             {
                 let pending = pending_store.remove(&stream_id).unwrap();
                 flush_pending(
@@ -738,20 +770,29 @@ fn async_group_lifetime_local(cx: &mut CheckerCx<'_>) -> CheckResult {
                 let entry =
                     pending_store
                         .entry(scope.stream_id)
-                        .or_insert((event.stmt_id, None, None));
+                        .or_insert((event.stmt_id, None, None, None));
                 entry.1 = Some(region.clone());
             }
+            // An async bulk store dest — a plain TMA store OR an atomic reduce
+            // (cp.reduce.async.bulk); both have the same commit/wait-group drain, so both open a
+            // dest window. The reduce kind (if any) rides into the dest window for the
+            // cross-stream reduce-vs-reduce skip.
             TraceEventKind::Write {
                 region,
-                access_kind: MemoryAccessKind::Tensor(TensorAccessKind::TmaStore),
+                access_kind: MemoryAccessKind::Tensor(k),
                 scope,
                 ..
-            } => {
+            } if matches!(
+                k,
+                TensorAccessKind::TmaStore | TensorAccessKind::TmaReduce { .. }
+            ) =>
+            {
                 let entry =
                     pending_store
                         .entry(scope.stream_id)
-                        .or_insert((event.stmt_id, None, None));
+                        .or_insert((event.stmt_id, None, None, None));
                 entry.2 = Some(region.clone());
+                entry.3 = k.reduce();
             }
             TraceEventKind::Write { region, scope, .. } => {
                 check_open(
@@ -810,6 +851,9 @@ fn check_cross_stream_async_windows(
         bounds: ((usize, usize), (usize, usize)),
         starts: Vec<usize>,         // ascending, HB-chained (same stream)
         closes: Vec<Option<usize>>, // non-decreasing; `None` only as a suffix
+        // `Some((op, exact))` iff EVERY window merged here is an atomic reduce of that op
+        // (else `None` — a mixed group is conservatively treated as non-reduce, i.e. flagged).
+        reduce: Option<(ReduceOp, bool)>,
     }
     // Group by (stream, footprint) — NOT by run-length: stage-rotated source
     // buffers alternate footprints (A,B,A,B,…), and consecutive-only grouping
@@ -826,6 +870,9 @@ fn check_cross_stream_async_windows(
             Some(&gi) => {
                 groups[gi].starts.push(window.start_idx);
                 groups[gi].closes.push(window.close_idx);
+                if groups[gi].reduce != window.reduce {
+                    groups[gi].reduce = None; // mixed reduce/non-reduce -> conservative
+                }
             }
             None => {
                 let mut bounds = ((usize::MAX, 0), (usize::MAX, 0));
@@ -843,6 +890,7 @@ fn check_cross_stream_async_windows(
                     bounds,
                     starts: vec![window.start_idx],
                     closes: vec![window.close_idx],
+                    reduce: window.reduce,
                 });
             }
         }
@@ -919,6 +967,33 @@ fn check_cross_stream_async_windows(
                     .partition_point(|&start| !cx.ordering.happens_before(access.event_idx, start));
                 if issued_after <= drained {
                     continue; // every instance is on one safe side
+                }
+                // Commutative-atomic-reduce skip. If the in-flight store window AND the
+                // conflicting access are BOTH atomic reduces of the SAME op, the conflict is
+                // RACE-FREE: hardware atomicity serializes the RMWs and commutativity makes the
+                // order not matter for the value. NOT skipped (still a gap): a plain Read (would
+                // see a partial sum), a plain Write (tears the atomic — e.g. a software
+                // accumulate, which carries no TmaReduce marker), or a different reduce op. A
+                // float reduction is order-dependent -> a non-determinism WARNING, not a race.
+                let (reduce_safe, nondeterministic) = match (
+                    group.reduce,
+                    reduce_access(&cx.event_index.events[access.event_idx].payload),
+                ) {
+                    (Some((op_w, ex_w)), Some((op_a, ex_a))) if op_w == op_a => {
+                        (true, !(ex_w && ex_a))
+                    }
+                    _ => (false, false),
+                };
+                if reduce_safe {
+                    if nondeterministic {
+                        cx.warn(
+                            "nondeterministic_reduction",
+                            "cross-stream atomic reduce-adds to one location are race-free but \
+                             order-dependent (float reduction is not associative): the result is \
+                             not bit-reproducible. Use the deterministic path for reproducibility.",
+                        );
+                    }
+                    continue;
                 }
                 let violation = drained; // first instance proven on neither side
                 let mut details = BTreeMap::new();
@@ -2010,6 +2085,10 @@ struct AsyncSourceWindow {
     start_idx: usize,
     close_idx: Option<usize>,
     regions: Vec<Region>,
+    /// For a DEST window: `Some((op, exact))` if the store is an atomic commutative reduce
+    /// (cp.reduce.async.bulk), else `None`. (`start_idx` points at the flush-trigger event, not
+    /// the store Write, so the reduce kind is captured here at build time.)
+    reduce: Option<(ReduceOp, bool)>,
 }
 
 #[derive(Clone, Debug)]
@@ -2685,6 +2764,8 @@ fn event_kind_name(payload: &TraceEventKind) -> &'static str {
         TraceEventKind::MbarWait { .. } => "mbar_wait",
         TraceEventKind::SyncArrive { .. } => "sync_arrive",
         TraceEventKind::Sync { .. } => "sync",
+        TraceEventKind::SemRelease { .. } => "sem_release",
+        TraceEventKind::SemAcquire { .. } => "sem_acquire",
         TraceEventKind::TmemAlloc { .. } => "tmem_alloc",
         TraceEventKind::TmemDealloc { .. } => "tmem_dealloc",
         TraceEventKind::SchedulerNext { .. } => "scheduler_next",
@@ -2706,6 +2787,8 @@ fn event_scope(payload: &TraceEventKind) -> Option<&super::protocol::AccessScope
         | TraceEventKind::MbarWait { scope, .. }
         | TraceEventKind::SyncArrive { scope, .. }
         | TraceEventKind::Sync { scope, .. }
+        | TraceEventKind::SemRelease { scope, .. }
+        | TraceEventKind::SemAcquire { scope, .. }
         | TraceEventKind::TmemAlloc { scope, .. }
         | TraceEventKind::TmemDealloc { scope, .. }
         | TraceEventKind::SchedulerNext { scope, .. } => Some(scope),
@@ -2736,6 +2819,24 @@ impl OrderingAnalysis {
         let mut stream_clocks = vec![Clock::new(); stream_count];
         let mut mbars: HashMap<MbarKey, MbarCycle> = HashMap::new();
         let mut last_release_clocks: HashMap<MbarKey, Clock> = HashMap::new();
+        // Named-barrier (cross-warpgroup bar.sync) ordering. Unlike mbarriers'
+        // producer/consumer split, a named barrier is a symmetric full barrier:
+        // every participant's pre-barrier events happen-before every participant's
+        // post-barrier events. `nb_arrival` accumulates the join of all arriving
+        // streams' clocks for the open generation; at completion that join becomes
+        // `nb_release`, which each participant joins (acquire) when it passes —
+        // including stragglers that re-emit SyncArrive after completion.
+        let mut nb_arrival: HashMap<(usize, Option<u32>), Clock> = HashMap::new();
+        let mut nb_release: HashMap<(usize, Option<u32>), Clock> = HashMap::new();
+        // GMEM-semaphore value-keyed release/acquire (gmem_atomic_add / gmem_wait_eq).
+        // VALUE-KEYED, not cell-keyed: each `atomic_add(order=release)` publishes this
+        // stream's clock under `(SemKey, post_increment_value)`; each `wait_eq(value)`
+        // joins the release published for THAT SPECIFIC value — i.e. the release of the
+        // atomic_add that PRODUCED the observed counter, exactly as the mbar phase-keyed
+        // lookup does with the counter-value in place of parity. This closes the
+        // cross-CTA HB(producer-of-value.add, waiter.post-wait): CTA t's reduce-add +
+        // drain happens-before CTA t+1's acquire happens-before CTA t+1's reduce-add.
+        let mut sem_releases: HashMap<(SemKey, i64), Clock> = HashMap::new();
         for (idx, event) in events.iter().enumerate() {
             let Some(scope) = event_scope(&event.payload) else {
                 continue;
@@ -2749,6 +2850,25 @@ impl OrderingAnalysis {
                         if let Some(release_clock) = last_release_clocks.get(&key) {
                             join_clock(&mut stream_clocks[stream_id], release_clock);
                         }
+                    }
+                }
+                // acquire: a participant arriving picks up the most recent completed
+                // generation's release clock (so post-barrier events order after every
+                // participant's pre-barrier events).
+                TraceEventKind::SyncArrive {
+                    sync_kind, bar_id, ..
+                } if sync_kind == "named" => {
+                    if let Some(rel) = nb_release.get(&(scope.cta_id, *bar_id)) {
+                        join_clock(&mut stream_clocks[stream_id], rel);
+                    }
+                }
+                // semaphore acquire (gmem_wait_eq): join the release published for the
+                // SPECIFIC observed value (value-keyed) — like MbarWait absorbing the
+                // producer's release clock. Done BEFORE the bump so the post-wait clock
+                // dominates the producer's add (and its drained reduce-add).
+                TraceEventKind::SemAcquire { key, value, .. } => {
+                    if let Some(rel) = sem_releases.get(&(*key, *value)) {
+                        join_clock(&mut stream_clocks[stream_id], rel);
                     }
                 }
                 _ => {}
@@ -2791,6 +2911,39 @@ impl OrderingAnalysis {
                             );
                         }
                     }
+                }
+                // record arrival: this participant's bumped (pre-barrier) clock joins
+                // the open generation's accumulator.
+                TraceEventKind::SyncArrive {
+                    sync_kind, bar_id, ..
+                } if sync_kind == "named" => {
+                    let key = (scope.cta_id, *bar_id);
+                    let acc = nb_arrival.entry(key).or_default();
+                    join_clock(acc, &event_clocks[idx]);
+                }
+                // completion: fold the full arrival join into the completer's clock
+                // and publish it as this generation's release; reset the accumulator.
+                TraceEventKind::Sync {
+                    sync_kind, bar_id, ..
+                } if sync_kind == "named" => {
+                    let key = (scope.cta_id, *bar_id);
+                    if let Some(acc) = nb_arrival.remove(&key) {
+                        join_clock(&mut stream_clocks[stream_id], &acc);
+                        event_clocks[idx] = stream_clocks[stream_id].clone();
+                    }
+                    nb_release.insert(key, stream_clocks[stream_id].clone());
+                }
+                // semaphore release (gmem_atomic_add, order=release): publish this
+                // stream's now-bumped clock under (cell, POST-increment value) — the
+                // value-keyed release a wait_eq on that value will acquire. Relaxed
+                // order publishes nothing (no happens-before edge), mirroring hardware.
+                TraceEventKind::SemRelease {
+                    key,
+                    new_value,
+                    order,
+                    ..
+                } if *order == super::protocol::GmemAtomicOrderEvent::Release => {
+                    sem_releases.insert((*key, *new_value), stream_clocks[stream_id].clone());
                 }
                 _ => {}
             }
@@ -2931,6 +3084,96 @@ mod tests {
                 (col_start * 4, (col_start + n_cols) * 4),
             ])]),
         }
+    }
+
+    // One shared GMEM output tile (the dQaccum cell two CTAs reduce-add into).
+    fn gmem_region(tensor_id: u32, start: usize, end: usize) -> Region {
+        Region {
+            tensor_id,
+            owner: PoolId::Gmem { tensor_id },
+            boxes: RegionBoxes::Boxes(vec![BoxN::new(vec![(start, end)])]),
+        }
+    }
+
+    fn sem_key(flat_coord: usize) -> super::super::protocol::SemKey {
+        super::super::protocol::SemKey {
+            tensor_id: 100,
+            flat_coord,
+        }
+    }
+
+    fn sem_release(new_value: i64, stream: usize) -> TraceEvent {
+        event(
+            0,
+            TraceEventKind::SemRelease {
+                key: sem_key(0),
+                new_value,
+                order: super::super::protocol::GmemAtomicOrderEvent::Release,
+                scope: scope(stream),
+            },
+        )
+    }
+
+    fn sem_acquire(value: i64, stream: usize) -> TraceEvent {
+        event(
+            0,
+            TraceEventKind::SemAcquire {
+                key: sem_key(0),
+                value,
+                scope: scope(stream),
+            },
+        )
+    }
+
+    // A cross-stream TMA reduce-add into the shared dQaccum tile, modeled exactly as
+    // tma.rs emits it: an async-proxy SMEM source Read + a generic RMW Read + the
+    // GMEM dest Write (TmaStore kind), then commit + wait(0) (the drain). The dest
+    // window opens at the Write and closes at the WaitGroup. `stid` is the kernel
+    // stmt id (the window pass keys the pending store by stmt id, so each reduce-add
+    // needs a distinct one).
+    fn reduce_add_events(stream: usize, stid: usize) -> Vec<TraceEvent> {
+        reduce_add_events_x(stream, stid, false) // float (non-associative) by default
+    }
+
+    fn reduce_add_events_x(stream: usize, stid: usize, exact: bool) -> Vec<TraceEvent> {
+        vec![
+            // SMEM source read (async proxy) — opens the source side of the window.
+            event(
+                stid,
+                TraceEventKind::Read {
+                    region: smem_region(stream, 0, 64),
+                    proxy: MemoryProxy::Async,
+                    access_kind: MemoryAccessKind::Tensor(TensorAccessKind::TmaStore),
+                    scope: scope(stream),
+                },
+            ),
+            // GMEM dest write — an ATOMIC reduce (cp.reduce.async.bulk.add). The TmaReduce
+            // marker lets the checker treat two same-op cross-stream reduces as race-free
+            // (exact=false float -> nondeterministic warning; exact=true int -> clean).
+            event(
+                stid,
+                TraceEventKind::Write {
+                    region: gmem_region(7, 0, 64),
+                    proxy: MemoryProxy::Generic,
+                    access_kind: MemoryAccessKind::Tensor(TensorAccessKind::TmaReduce {
+                        op: ReduceOp::Add,
+                        exact,
+                    }),
+                    scope: scope(stream),
+                },
+            ),
+            // Commit + wait carry DISTINCT stmt ids (separate builder calls): the
+            // window pass flushes the pending Read/Write into a window when the stmt id
+            // changes, the CommitGroup then closes the group, and WaitGroup(0) drains it.
+            event(stid + 1, TraceEventKind::CommitGroup { scope: scope(stream) }),
+            event(
+                stid + 2,
+                TraceEventKind::WaitGroup {
+                    n: 0,
+                    scope: scope(stream),
+                },
+            ),
+        ]
     }
 
     fn pass_status(report: &ProtocolReport, name: &str) -> ProtocolStatus {
@@ -3203,6 +3446,193 @@ mod tests {
         ];
         let ordering = OrderingAnalysis::new(&events);
         assert!(!ordering.happens_before(1, 2));
+    }
+
+    // ===================== GMEM semaphore value-keyed HB =====================
+    // The serialized cross-CTA reduce-add: CTA0 (stream 0, turn 0) reduce-adds then
+    // signals (atomic_add -> counter 1); CTA1 (stream 1) waits counter==1, then
+    // reduce-adds. The value-keyed acquire must order CTA0's add+drain BEFORE CTA1's
+    // add, so HB(closeA, addB) holds — exactly the dest-access proof.
+
+    #[test]
+    fn sem_value_keyed_acquire_orders_cross_cta_reduce_add() {
+        // stream 0 (stmt 10): reduce-add [Read,Write,Commit,Wait] = idx 0..3, then
+        // SemRelease(new_value=1) = idx 4. stream 1 (stmt 20): SemAcquire(value=1) =
+        // idx 5, then reduce-add = idx 6..9.
+        let mut events = reduce_add_events(0, 10); // 0,1,2,3 (drain = WaitGroup at idx 3)
+        events.push(sem_release(1, 0)); //            4  publish (cell,1)=clock@stream0
+        events.push(sem_acquire(1, 1)); //            5  join the (cell,1) release into stream1
+        events.extend(reduce_add_events(1, 20)); //   6,7,8,9 (CTA1's Write at idx 7)
+        let ordering = OrderingAnalysis::new(&events);
+        // CTA0's drain (idx 3, WaitGroup) happens-before CTA1's reduce-add Write (idx 7).
+        assert!(
+            ordering.happens_before(3, 7),
+            "value-keyed acquire must order CTA0's drained add before CTA1's add"
+        );
+        // ...and the reverse must NOT hold (it is a one-way edge).
+        assert!(!ordering.happens_before(7, 3));
+    }
+
+    #[test]
+    fn sem_acquire_of_wrong_value_creates_no_edge() {
+        // CTA1 waits the WRONG value (2) — the release was published under value 1, so
+        // VALUE-KEYED lookup finds nothing and no cross-CTA edge forms (proves the key
+        // is the specific value, not "the cell's latest release").
+        let mut events = reduce_add_events(0, 10);
+        events.push(sem_release(1, 0)); // publish (cell, 1)
+        events.push(sem_acquire(2, 1)); // wait value 2 — no (cell,2) release exists
+        events.extend(reduce_add_events(1, 20));
+        let ordering = OrderingAnalysis::new(&events);
+        assert!(
+            !ordering.happens_before(3, 7),
+            "acquiring a value that was never produced must NOT order across streams"
+        );
+    }
+
+    #[test]
+    fn sem_relaxed_release_publishes_no_edge() {
+        // order=relaxed publishes nothing, so even a correctly-keyed acquire can't form
+        // the edge (faithful: a relaxed atomic carries no release fence).
+        let mut events = reduce_add_events(0, 10);
+        events.push(event(
+            0,
+            TraceEventKind::SemRelease {
+                key: sem_key(0),
+                new_value: 1,
+                order: super::super::protocol::GmemAtomicOrderEvent::Relaxed,
+                scope: scope(0),
+            },
+        ));
+        events.push(sem_acquire(1, 1));
+        events.extend(reduce_add_events(1, 20));
+        let ordering = OrderingAnalysis::new(&events);
+        assert!(!ordering.happens_before(3, 7));
+    }
+
+    // End-to-end: the dest-access pass flips Inconclusive -> Passed with the sem wrap,
+    // and stays Inconclusive without it (the edge is load-bearing — NEGATIVE A at the
+    // checker level).
+    fn build_two_cta_reduce_add(with_sem: bool) -> Vec<TraceEvent> {
+        let mut events = Vec::new();
+        // CTA0 (stream 0, turn 0): wait counter==0 (immediate on a zero cell), add, signal.
+        if with_sem {
+            events.push(sem_acquire(0, 0));
+        }
+        events.extend(reduce_add_events(0, 10));
+        if with_sem {
+            events.push(sem_release(1, 0));
+        }
+        // CTA1 (stream 1, turn 1): wait counter==1, add, signal.
+        if with_sem {
+            events.push(sem_acquire(1, 1));
+        }
+        events.extend(reduce_add_events(1, 20));
+        if with_sem {
+            events.push(sem_release(2, 1));
+        }
+        events
+    }
+
+    #[test]
+    fn sem_wrapped_cross_cta_reduce_add_passes_dest_access() {
+        let kernel = empty_kernel("sem_dest_access", vec![]);
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &build_two_cta_reduce_add(true),
+        );
+        assert_eq!(
+            pass_status(&report, "trace_gap_audit"),
+            ProtocolStatus::Passed,
+            "sem-serialized reduce-adds must resolve the dest-access Inconclusive"
+        );
+        assert!(!diagnostic_codes(&report).contains("async_group_cross_stream_dest_access"));
+        // sem-ordered (deterministic) -> NO non-determinism warning (the distinguishing fact).
+        assert!(!report.warnings.iter().any(|w| w.code == "nondeterministic_reduction"));
+    }
+
+    #[test]
+    fn unwrapped_cross_cta_float_reduce_add_is_passed_but_nondeterministic() {
+        // commutative-reduce skip: two FLOAT atomic reduce-adds to one location WITHOUT any
+        // ordering are race-free (atomicity + commutativity) -> Passed, but order-dependent
+        // (float not associative) -> a nondeterministic_reduction warning.
+        let kernel = empty_kernel("no_sem_float_reduce", vec![]);
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &build_two_cta_reduce_add(false),
+        );
+        assert_eq!(pass_status(&report, "trace_gap_audit"), ProtocolStatus::Passed);
+        assert!(!diagnostic_codes(&report).contains("async_group_cross_stream_dest_access"));
+        assert!(report.warnings.iter().any(|w| w.code == "nondeterministic_reduction"));
+    }
+
+    #[test]
+    fn unwrapped_cross_cta_int_reduce_add_is_passed_clean() {
+        // INTEGER atomic reduce-adds are associative-exact -> order-INdependent -> Passed with
+        // NO warning (the false-alarm fix: a correct+deterministic integer reduce isn't flagged).
+        let mut events = reduce_add_events_x(0, 10, true);
+        events.extend(reduce_add_events_x(1, 20, true));
+        let kernel = empty_kernel("no_sem_int_reduce", vec![]);
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(pass_status(&report, "trace_gap_audit"), ProtocolStatus::Passed);
+        assert!(!diagnostic_codes(&report).contains("async_group_cross_stream_dest_access"));
+        assert!(!report.warnings.iter().any(|w| w.code == "nondeterministic_reduction"));
+    }
+
+    fn reduce_then_plain(plain_read: bool) -> Vec<TraceEvent> {
+        // stream 0: an in-flight atomic reduce window over gmem_region(7,0,64).
+        let mut events = reduce_add_events(0, 10);
+        // stream 1 (unordered): a PLAIN, NON-atomic access to the same region.
+        let region = gmem_region(7, 0, 64);
+        let payload = if plain_read {
+            TraceEventKind::Read {
+                region,
+                proxy: MemoryProxy::Generic,
+                access_kind: MemoryAccessKind::Tensor(TensorAccessKind::TmaLoad),
+                scope: scope(1),
+            }
+        } else {
+            TraceEventKind::Write {
+                region,
+                proxy: MemoryProxy::Generic,
+                access_kind: MemoryAccessKind::Tensor(TensorAccessKind::TmaStore),
+                scope: scope(1),
+            }
+        };
+        events.push(event(20, payload));
+        events
+    }
+
+    #[test]
+    fn reduce_plus_unordered_plain_read_still_flagged() {
+        // NEGATIVE: a plain (non-reduce) READ of a reduce destination would see a PARTIAL sum;
+        // the commutative-reduce skip must NOT apply (the access carries no TmaReduce marker).
+        let kernel = empty_kernel("reduce_plus_read", vec![]);
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &reduce_then_plain(true),
+        );
+        assert!(diagnostic_codes(&report).contains("async_group_cross_stream_dest_access"));
+    }
+
+    #[test]
+    fn reduce_plus_unordered_plain_write_still_flagged() {
+        // NEGATIVE (the user's atomicity point): a plain non-atomic WRITE (e.g. a software
+        // accumulate) to a reduce destination TEARS the atomic — it carries no TmaReduce marker,
+        // so the skip must NOT apply.
+        let kernel = empty_kernel("reduce_plus_write", vec![]);
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &reduce_then_plain(false),
+        );
+        assert!(diagnostic_codes(&report).contains("async_group_cross_stream_dest_access"));
     }
 
     #[test]

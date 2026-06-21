@@ -201,6 +201,53 @@ impl DenseTensorValue {
         Ok(())
     }
 
+    /// Like `write_slice_inplace` but accumulates: `dst[slice] += values` (f32).
+    /// The TMA reduce-add value semantics (`cp.reduce.async.bulk...add.f32`). The
+    /// destination must already be a valid f32 region (e.g. a zero-initialized output).
+    pub fn accumulate_slice_inplace(
+        &mut self,
+        offsets: &[usize],
+        slice_shape: &[usize],
+        values: &ValueArray1,
+    ) -> IResult<()> {
+        self.check_bounds(offsets, slice_shape)?;
+        let k = numel(slice_shape);
+        if values.len() != k {
+            return Err(InterpreterError::new(
+                "tensor_value",
+                "slice reduce-add value count mismatch",
+            ));
+        }
+        if values.dtype() != self.dtype {
+            return Err(InterpreterError::new(
+                "tensor_value",
+                "slice reduce-add dtype must match the destination container",
+            ));
+        }
+        if k == 0 {
+            return Ok(());
+        }
+        let strides = self.strides();
+        let base = flat_with_strides(offsets, &strides);
+        let rank = slice_shape.len();
+        let inner = slice_shape[rank - 1];
+        let run_starts = rect_intra_offsets(&slice_shape[..rank - 1], &strides[..rank - 1]);
+        let mut vi = 0;
+        for &rs in &run_starts {
+            let s = base + rs;
+            self.data.add_run_from(s, values, vi, inner)?;
+            vi += inner;
+        }
+        if !self.all_valid {
+            let valid = self.valid.as_slice_mut().expect("contiguous valid");
+            for &rs in &run_starts {
+                let s = base + rs;
+                valid[s..s + inner].fill(true);
+            }
+        }
+        Ok(())
+    }
+
     pub fn invalidate_indices(&mut self, indices: &[usize]) -> IResult<()> {
         let n = numel(&self.shape);
         if indices.iter().any(|&idx| idx >= n) {

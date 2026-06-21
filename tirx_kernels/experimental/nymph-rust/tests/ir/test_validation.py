@@ -104,8 +104,8 @@ def test_accepts_mma_tmem_operand():
 
 def test_rejects_mma_operand_dtype():
     dst, _, b = mma_operands()
-    a = smem([128, 16], dtype=n.DType.F32)[:, :]
-    with pytest.raises(ValueError, match="operand dtype must be f16, bf16, or f8e4m3"):
+    a = smem([128, 16], dtype=n.DType.F32)[:, :]  # f32 SMEM operand is still rejected
+    with pytest.raises(ValueError, match="operand dtype must be f16, bf16, f8e4m3"):
         make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=256, k=16)])
 
 

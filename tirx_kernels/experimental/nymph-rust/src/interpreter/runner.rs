@@ -87,7 +87,7 @@ fn kind_name(k: super::registry::StmtKind) -> &'static str {
         MBarrierArrive | MBarrierExpectTx | MBarrierArriveExpectTx | MBarrierInit => {
             "exec:MBarrier*"
         }
-        CtaSync | WgSync | WarpSync | ClusterSync => "exec:Sync",
+        CtaSync | WgSync | NamedBarrier | WarpSync | ClusterSync => "exec:Sync",
         TmemAlloc | TmemDealloc => "exec:Tmem",
         ForLoop | ForEachTask | SchedulerImpl | SchedNext | Loop | BreakIf | If | Role
         | KernelInit | KernelFinalize => "exec:Control",

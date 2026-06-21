@@ -17,6 +17,7 @@ use super::super::registry::{StmtExecutorRegistry, StmtKind};
 use super::super::scheduler::CtaActivityStatus;
 use super::super::slice_indexing::ResolvedSlice;
 use super::super::values::arrays::ValueArray1;
+use super::super::values::dtypes::decode_e4m3;
 use super::super::values::indexing::numel;
 use super::super::values::mbars::{MbarCell, MbarCellKey};
 use super::super::values::tcgen05_datapath::{
@@ -737,59 +738,68 @@ fn shape_str(shape: &crate::ir::LdStShape) -> &'static str {
 // ---- MMA ----
 
 fn execute_mma<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
-    // NVFP4 (e2m1 fp4 operands / e4m3 scales) value compute isn't modeled yet — but the
-    // TRACE/protocol path only needs the access events (which warp reads/writes which
-    // SMEM/TMEM region), so let trace mode run. Bail only in VALUE mode.
-    if !ctx.trace_mode()
-        && matches!(
-            stmt,
-            Stmt::Tcgen05Mma { sf_e4m3: true, .. }
-                | Stmt::Tcgen05Mma { a_fp4: true, .. }
-                | Stmt::Tcgen05Mma { b_fp4: true, .. }
-        )
-    {
-        return Err(InterpreterError::new(
-            "tcgen05_mma_nvfp4_unsupported",
-            "tcgen05_mma: NVFP4 (e4m3 scale / fp4 operands) value compute not yet supported",
-        ));
-    }
-    let (dst, a_sl, b_sl, m, n, k, accum, trans_a, trans_b, cta_group, sfa, sfb, sf_byte) =
-        match stmt {
-            Stmt::Tcgen05Mma {
-                dst,
-                a,
-                b,
-                m,
-                n,
-                k,
-                accum,
-                trans_a,
-                trans_b,
-                cta_group,
-                sfa,
-                sfb,
-                sf_byte,
-                ..
-            } => (
-                dst,
-                a,
-                b,
-                *m as usize,
-                *n as usize,
-                *k as usize,
-                *accum,
-                *trans_a,
-                *trans_b,
-                *cta_group,
-                sfa.as_ref(),
-                sfb.as_ref(),
-                *sf_byte as usize,
-            ),
-            _ => unreachable!(),
-        };
-    ctx.check_full_warp_or_elected_cohort(
+    #[allow(clippy::type_complexity)]
+    let (
+        dst,
+        a_sl,
+        b_sl,
+        m,
+        n,
+        k,
+        accum,
+        trans_a,
+        trans_b,
+        cta_group,
+        sfa,
+        sfb,
+        sf_byte,
+        sf_e4m3,
+        sf_block,
+        a_fp4,
+        b_fp4,
+    ) = match stmt {
+        Stmt::Tcgen05Mma {
+            dst,
+            a,
+            b,
+            m,
+            n,
+            k,
+            accum,
+            trans_a,
+            trans_b,
+            cta_group,
+            sfa,
+            sfb,
+            sf_byte,
+            sf_e4m3,
+            sf_block,
+            a_fp4,
+            b_fp4,
+        } => (
+            dst,
+            a,
+            b,
+            *m as usize,
+            *n as usize,
+            *k as usize,
+            *accum,
+            *trans_a,
+            *trans_b,
+            *cta_group,
+            sfa.as_ref(),
+            sfb.as_ref(),
+            *sf_byte as usize,
+            *sf_e4m3,
+            *sf_block as usize,
+            *a_fp4,
+            *b_fp4,
+        ),
+        _ => unreachable!(),
+    };
+    ctx.check_full_warp_cohort(
         "tcgen05_mma_mask",
-        "tcgen05_mma must be issued by full warps or a single elected lane",
+        "tcgen05_mma must be issued by one or more full warps",
     )?;
 
     // The accumulator CTA(s): cta_group=2's even CTA computes the whole pair; odd is a no-op.
@@ -823,6 +833,7 @@ fn execute_mma<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResu
     if ctx.trace_mode() {
         trace_mma(
             ctx, dst, a_sl, b_sl, m, n, k, cta_group, accum, trans_a, trans_b, &cta_ids, sfa, sfb,
+            a_fp4, b_fp4,
         )?;
         return Ok(StepStatus::advance());
     }
@@ -849,9 +860,19 @@ fn execute_mma<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResu
             _ => None,
         };
         accumulate_inplace(
-            ctx, dst, a_sl, b_sl, m, n, k, cta_group, accum, &cta_ids, scales,
+            ctx, dst, a_sl, b_sl, m, n, k, cta_group, accum, &cta_ids, scales, sf_e4m3, sf_block,
+            a_fp4, b_fp4,
         )?;
         return Ok(StepStatus::advance());
+    }
+    if a_fp4 || b_fp4 {
+        // FP4 operand materialization lives only on the in-place path (the only
+        // path nvfp4's non-transposed rank-2 SMEM operands take); a transposed /
+        // non-rank-2 fp4 MMA would need the fallback to unpack too.
+        return Err(InterpreterError::new(
+            "tcgen05_mma_unsupported",
+            "fp4 tcgen05_mma requires the in-place datapath (non-transposed rank-2 SMEM operands)",
+        ));
     }
 
     let t_read = super::super::runner::prof_now();
@@ -873,14 +894,24 @@ fn execute_mma<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResu
         // product is exact (powers of two). A's scales are split by M across the
         // CTA pair like A itself; B's scales are duplicated per CTA and each CTA's
         // M-half applies its own copy (what the 2-CTA datapath reads).
+        // Fallback handles fp8 only (UE8M0, one scale per row); fp4 is rejected
+        // before reaching here, so `nblocks=1` with the selected `sf_byte`.
         let rows_per_cta = m / cta_ids.len();
         let mut sa: Vec<f32> = Vec::with_capacity(m);
         for &cta in cta_ids.iter() {
-            sa.extend(read_scale_rows(ctx, sfa_sl, sf_byte, rows_per_cta, cta)?);
+            sa.extend(read_scale_blocks(
+                ctx,
+                sfa_sl,
+                sf_byte,
+                1,
+                rows_per_cta,
+                false,
+                cta,
+            )?);
         }
         let mut sb: Vec<Vec<f32>> = Vec::with_capacity(cta_ids.len());
         for &cta in cta_ids.iter() {
-            sb.push(read_scale_rows(ctx, sfb_sl, sf_byte, n, cta)?);
+            sb.push(read_scale_blocks(ctx, sfb_sl, sf_byte, 1, n, false, cta)?);
         }
         for mm in 0..m {
             let half = mm / rows_per_cta;
@@ -912,15 +943,17 @@ fn trace_mma(
     cta_ids: &[usize],
     sfa: Option<&TensorSlice>,
     sfb: Option<&TensorSlice>,
+    a_fp4: bool,
+    b_fp4: bool,
 ) -> IResult<()> {
     let a_r = ctx.eval_slice(a_sl)?;
     let b_r = ctx.eval_slice(b_sl)?;
     let a_eff = trace_mma_effective_shape(&a_r.shape, trans_a, cta_ids.len())?;
     let b_eff = trace_mma_effective_shape(&b_r.shape, trans_b, cta_ids.len())?;
-    // NVFP4 fp4 operands are packed 2-per-u8 byte, so the operand's K extent is k/2 bytes.
-    let a_kdim = if a_sl.tensor.dtype == crate::ir::DType::U8 { k / 2 } else { k };
-    let b_kdim = if b_sl.tensor.dtype == crate::ir::DType::U8 { k / 2 } else { k };
-    if a_eff != (m, a_kdim) || b_eff != (n, b_kdim) {
+    // fp4 operands are packed 2 e2m1 per byte, so the byte-extent is k/2.
+    let a_k = if a_fp4 { k / 2 } else { k };
+    let b_k = if b_fp4 { k / 2 } else { k };
+    if a_eff != (m, a_k) || b_eff != (n, b_k) {
         return Err(InterpreterError::new(
             "tcgen05_mma_shape",
             "tcgen05_mma operand shape does not match m/n/k",
@@ -999,15 +1032,19 @@ fn trace_mma(
     Ok(())
 }
 
-/// Read `rows` per-row UE8M0 scales from a (128, cols) packed-u32 scale-vector
-/// TMEM slice on one CTA: logical row r sits at cell (lane = r % 128,
-/// col = col_start + col_offset + r / 128); byte `sf_byte` of the cell is the
-/// biased exponent, scale = 2^(byte - 127).
-fn read_scale_rows(
+/// Read per-(row, block) block scales from a (128, cols) packed-u32 scale-vector
+/// TMEM slice on one CTA. Logical row r sits at cell (lane = r % 128,
+/// col = col_start + col_offset + r / 128); within the cell, block `bi` reads
+/// byte `byte_base + bi`. Decode is either e4m3 (nvfp4) or UE8M0 biased exponent
+/// `2^(byte-127)` (fp8). Returns `rows * nblocks` scales, row-major (a row's
+/// blocks contiguous). fp8 calls this with `nblocks=1` (one scale per row).
+fn read_scale_blocks(
     ctx: &CohortContext,
     sl: &TensorSlice,
-    sf_byte: usize,
+    byte_base: usize,
+    nblocks: usize,
     rows: usize,
+    e4m3: bool,
     cta_id: usize,
 ) -> IResult<Vec<f32>> {
     let offsets = eval_uniform_usize(ctx, &sl.offsets, "mma scale offset")?;
@@ -1022,6 +1059,12 @@ fn read_scale_rows(
         return Err(InterpreterError::new(
             "tcgen05_mma_scale",
             "mma scale slice does not cover the scaled rows",
+        ));
+    }
+    if byte_base + nblocks > 4 {
+        return Err(InterpreterError::new(
+            "tcgen05_mma_scale",
+            "mma scale block range exceeds the 4 bytes of a packed u32 cell",
         ));
     }
     let layout = tmem_layout_for(&sl.tensor)?;
@@ -1040,13 +1083,18 @@ fn read_scale_rows(
             "mma scale tensor dtype must be u32",
         ));
     };
-    Ok(packed
-        .iter()
-        .map(|&cell| {
-            let byte = ((cell >> (8 * sf_byte)) & 0xFF) as i32;
-            ((byte - 127) as f32).exp2()
-        })
-        .collect())
+    let mut out = Vec::with_capacity(rows * nblocks);
+    for &cell in packed.iter() {
+        for bi in 0..nblocks {
+            let byte = ((cell >> (8 * (byte_base + bi))) & 0xFF) as u8;
+            out.push(if e4m3 {
+                decode_e4m3(byte)
+            } else {
+                ((byte as i32 - 127) as f32).exp2()
+            });
+        }
+    }
+    Ok(out)
 }
 
 /// `tcgen05.cp` — copy packed u32 scale cells from SMEM into TMEM. One leader
@@ -1363,6 +1411,25 @@ fn squeeze_operand(
     Ok((off, shape, rows, cols))
 }
 
+/// Scale a materialized operand buffer in place by per-row, per-block scale
+/// factors. The buffer is `rows × k` row-major; each row is split into `nblocks`
+/// contiguous column blocks of width `k/nblocks`, block `bi` of row r multiplied
+/// by `scales[r*nblocks + bi]`. fp8 uses `nblocks=1` (one scale over the whole
+/// row); nvfp4 uses `nblocks = k/16` (one per 16-element block).
+fn apply_block_scales(buf: &mut [f32], scales: &[f32], k: usize, nblocks: usize) {
+    let blockw = k / nblocks;
+    for (row, chunk) in buf.chunks_exact_mut(k).enumerate() {
+        for bi in 0..nblocks {
+            let s = scales[row * nblocks + bi];
+            if s != 1.0 {
+                for v in &mut chunk[bi * blockw..(bi + 1) * blockw] {
+                    *v *= s;
+                }
+            }
+        }
+    }
+}
+
 /// In-place contiguous accumulate: for each accumulator CTA, `sgemm(beta)` reads its
 /// A tile and each B segment from SMEM f32 compute slices (base+lda) and writes the
 /// result into the column-major TMEM grid. cta_group=2's B spans both CTAs' SMEM,
@@ -1381,28 +1448,47 @@ fn accumulate_inplace(
     accum: bool,
     cta_ids: &[usize],
     scales: Option<(&TensorSlice, &TensorSlice, usize)>,
+    sf_e4m3: bool,
+    sf_block: usize,
+    a_fp4: bool,
+    b_fp4: bool,
 ) -> IResult<()> {
     let (a_off, a_box, a_rows, a_cols) = squeeze_operand(ctx, a_sl)?;
     let (b_off, b_box, b_rows, b_cols) = squeeze_operand(ctx, b_sl)?;
     let rows_per_cta = if cta_group == 1 { m } else { m / 2 };
     let n_seg = if cta_group == 1 { n } else { n / 2 };
-    if [a_rows, a_cols] != [rows_per_cta, k] || [b_rows, b_cols] != [n_seg, k] {
+    // fp4 operands are packed 2 e2m1 per byte, so the slice's inner byte extent is k/2.
+    let a_inner = if a_fp4 { k / 2 } else { k };
+    let b_inner = if b_fp4 { k / 2 } else { k };
+    if [a_rows, a_cols] != [rows_per_cta, a_inner] || [b_rows, b_cols] != [n_seg, b_inner] {
         return Err(InterpreterError::new(
             "tcgen05_mma_shape",
             "tcgen05_mma operand shape does not match m/n/k",
         ));
     }
-    // UE8M0 scale vectors: A's split by M across the pair like A itself; B's
-    // duplicated per CTA, each acc half applying its own copy. Scaling the
-    // materialized operand rows by exact powers of two commutes bit-for-bit
-    // with the fallback's product scaling.
+    // Scale vectors: A's split by M across the pair like A itself; B's duplicated
+    // per CTA, each acc half applying its own copy. Scaling the materialized
+    // operand rows commutes bit-for-bit with product scaling. nvfp4 (sf_block=16)
+    // applies a per-16-column-block scale; fp8 (sf_block=0) one scale per row.
+    let nblocks = if sf_block == 0 { 1 } else { k / sf_block };
     let (sa_scales, sb_scales) = match scales {
         Some((sfa_sl, sfb_sl, sf_byte)) => {
+            let byte_base = if sf_block == 0 { sf_byte } else { 0 };
             let mut sa = Vec::with_capacity(cta_ids.len());
             let mut sb = Vec::with_capacity(cta_ids.len());
             for &cta in cta_ids {
-                sa.push(read_scale_rows(ctx, sfa_sl, sf_byte, rows_per_cta, cta)?);
-                sb.push(read_scale_rows(ctx, sfb_sl, sf_byte, n, cta)?);
+                sa.push(read_scale_blocks(
+                    ctx,
+                    sfa_sl,
+                    byte_base,
+                    nblocks,
+                    rows_per_cta,
+                    sf_e4m3,
+                    cta,
+                )?);
+                sb.push(read_scale_blocks(
+                    ctx, sfb_sl, byte_base, nblocks, n, sf_e4m3, cta,
+                )?);
             }
             (sa, sb)
         }
@@ -1440,43 +1526,39 @@ fn accumulate_inplace(
             sb.clear();
             for &b_cta in cta_ids {
                 let pool = ctx.state.values.smem.pool_for(b_cta)?;
-                pool.append_f32_block(&b_sl.tensor, &b_off, &b_box, sb)?;
+                if b_fp4 {
+                    pool.append_f32_block_fp4(&b_sl.tensor, &b_off, &b_box, sb)?;
+                } else {
+                    pool.append_f32_block(&b_sl.tensor, &b_off, &b_box, sb)?;
+                }
             }
         }
         for (acc_idx, &acc_cta) in cta_ids.iter().enumerate() {
             if scales.is_some() {
                 // Scaled: each acc half applies ITS OWN SFB copy, so the B
-                // scratch is rebuilt (and row-scaled) per half.
+                // scratch is rebuilt (and block-scaled) per half.
                 sb.clear();
                 for &b_cta in cta_ids {
                     let pool = ctx.state.values.smem.pool_for(b_cta)?;
-                    pool.append_f32_block(&b_sl.tensor, &b_off, &b_box, sb)?;
-                }
-                let sbv = &sb_scales[acc_idx];
-                for (row, chunk) in sb.chunks_exact_mut(k).enumerate() {
-                    let scale = sbv[row];
-                    if scale != 1.0 {
-                        for v in chunk.iter_mut() {
-                            *v *= scale;
-                        }
+                    if b_fp4 {
+                        pool.append_f32_block_fp4(&b_sl.tensor, &b_off, &b_box, sb)?;
+                    } else {
+                        pool.append_f32_block(&b_sl.tensor, &b_off, &b_box, sb)?;
                     }
                 }
+                apply_block_scales(sb, &sb_scales[acc_idx], k, nblocks);
             }
             sa.clear();
             {
                 let pool = ctx.state.values.smem.pool_for(acc_cta)?;
-                pool.append_f32_block(&a_sl.tensor, &a_off, &a_box, sa)?;
+                if a_fp4 {
+                    pool.append_f32_block_fp4(&a_sl.tensor, &a_off, &a_box, sa)?;
+                } else {
+                    pool.append_f32_block(&a_sl.tensor, &a_off, &a_box, sa)?;
+                }
             }
             if scales.is_some() {
-                let sav = &sa_scales[acc_idx];
-                for (row, chunk) in sa.chunks_exact_mut(k).enumerate() {
-                    let scale = sav[row];
-                    if scale != 1.0 {
-                        for v in chunk.iter_mut() {
-                            *v *= scale;
-                        }
-                    }
-                }
+                apply_block_scales(sa, &sa_scales[acc_idx], k, nblocks);
             }
             let sp = ctx
                 .state
@@ -1811,6 +1893,25 @@ fn accumulate_blocks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apply_block_scales_fp8_per_row_matches_legacy() {
+        // nblocks=1 (fp8): one scale over the whole k-row, identical to the
+        // pre-generalization per-row loop.
+        let mut buf = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]; // 2 rows x k=3
+        apply_block_scales(&mut buf, &[2.0, 0.5], 3, 1);
+        assert_eq!(buf, vec![2.0, 4.0, 6.0, 2.0, 2.5, 3.0]);
+    }
+
+    #[test]
+    fn apply_block_scales_nvfp4_per_16block() {
+        // nblocks=2: row split into two blocks of width 2; block 0 of row 0 x4,
+        // block 1 x1; row 1 blocks x0.5 and x8.
+        let mut buf = vec![1.0f32, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]; // 2 rows x k=4
+        apply_block_scales(&mut buf, &[4.0, 1.0, 0.5, 8.0], 4, 2);
+        assert_eq!(buf, vec![4.0, 4.0, 1.0, 1.0, 0.5, 0.5, 8.0, 8.0]);
+        // scale == 1.0 is a no-op (skips the inner loop), value unchanged
+    }
 
     #[test]
     fn mma_blocks_model_m64_lane_align_halves() {

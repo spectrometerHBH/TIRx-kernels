@@ -424,6 +424,7 @@ fn try_direct_reduce(
     Ok(true)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn try_direct_causal_mask(
     ctx: &mut CohortContext,
     dst: &TensorSlice,
@@ -432,6 +433,7 @@ fn try_direct_causal_mask(
     key_start: &crate::ir::ScalarValue,
     group_size: u32,
     mask_value: &RegOperand,
+    swap_qk: bool,
 ) -> IResult<bool> {
     let Some(dst_range) = resolve_reg_range(ctx, dst)? else {
         return Ok(false);
@@ -464,8 +466,12 @@ fn try_direct_causal_mask(
     let tid_in_wg: Vec<usize> = ctx.cohort.iter().map(|thread| thread.tid_in_wg()).collect();
     let timer = super::super::runner::prof_now();
     write_direct_float_result_with(ctx, &dst_range, &rows, |ai, j| {
-        let q = q0 + (tid_in_wg[ai] / group_size as usize) as i64;
-        let k = k0 + j as i64;
+        // swap_qk: bwd transposed fragment [kv-row, q-col] — k(kv)=row, q=col/gs.
+        let (q, k) = if swap_qk {
+            (q0 + (j / group_size as usize) as i64, k0 + tid_in_wg[ai] as i64)
+        } else {
+            (q0 + (tid_in_wg[ai] / group_size as usize) as i64, k0 + j as i64)
+        };
         if k > q {
             mask_v.get(ai, j)
         } else {
@@ -668,6 +674,7 @@ fn execute_reg_unary<'a, 'k>(
         let src_v = read_reg_operand(ctx, src, shape, dtype)?.to_f32_compute();
         let out = match op {
             RegUnaryOp::Exp2 => src_v.mapv(|v| v.exp2()),
+            RegUnaryOp::Log2 => src_v.mapv(|v| v.log2()),
             RegUnaryOp::Rcp => src_v.mapv(|v| 1.0 / v),
             RegUnaryOp::Neg => src_v.mapv(|v| -v),
         };
@@ -956,7 +963,7 @@ fn execute_reg_causal_mask<'a, 'k>(
     ctx: &mut CohortContext<'a, 'k>,
     stmt: &'k Stmt,
 ) -> IResult<StepStatus> {
-    let (dst, src, query_start, key_start, group_size, mask_value) = match stmt {
+    let (dst, src, query_start, key_start, group_size, mask_value, swap_qk) = match stmt {
         Stmt::RegCausalMask {
             dst,
             src,
@@ -964,7 +971,16 @@ fn execute_reg_causal_mask<'a, 'k>(
             key_start,
             group_size,
             mask_value,
-        } => (dst, src, query_start, key_start, *group_size, mask_value),
+            swap_qk,
+        } => (
+            dst,
+            src,
+            query_start,
+            key_start,
+            *group_size,
+            mask_value,
+            *swap_qk,
+        ),
         _ => unreachable!(),
     };
     reg_op_exec(ctx, dst, &[src, mask_value], |ctx, dst| {
@@ -976,6 +992,7 @@ fn execute_reg_causal_mask<'a, 'k>(
             key_start,
             group_size,
             mask_value,
+            swap_qk,
         )? {
             return Ok(());
         }
@@ -1005,8 +1022,12 @@ fn execute_reg_causal_mask<'a, 'k>(
         let timer = super::super::runner::prof_now();
         let rows: Vec<usize> = ctx.cohort.iter().map(|thread| thread.tid_in_wg()).collect();
         let out = Array2::from_shape_fn(shape, |(ai, j)| {
-            let q = q0 + (rows[ai] / group_size as usize) as i64;
-            let k = k0 + j as i64;
+            // swap_qk: bwd transposed fragment [kv-row, q-col] — k(kv)=row, q=col/gs.
+            let (q, k) = if swap_qk {
+                (q0 + (j / group_size as usize) as i64, k0 + rows[ai] as i64)
+            } else {
+                (q0 + (rows[ai] / group_size as usize) as i64, k0 + j as i64)
+            };
             if k > q {
                 mask_v[[ai, j]]
             } else {

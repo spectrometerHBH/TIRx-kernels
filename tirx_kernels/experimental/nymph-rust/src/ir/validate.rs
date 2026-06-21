@@ -186,10 +186,10 @@ fn check_mma_shape(m: u32, n: u32, k: u32, cta_group: u8) -> R {
     check_positive(m, "tcgen05_mma m")?;
     check_positive(n, "tcgen05_mma n")?;
     check_positive(k, "tcgen05_mma k")?;
-    // 16 dense f16/bf16; 32 block-scaled f8; 64 the nvfp4 MMA-K instruction; 128/256 a
-    // full block-scaled k-tile issued as one gemm_async (canon issues one per k-tile).
-    if k != 16 && k != 32 && k != 64 && k != 128 && k != 256 {
-        return bail("tcgen05_mma k must be 16, 32, 64, 128, or 256");
+    if k != 16 && k != 32 && k != 64 {
+        return bail(
+            "tcgen05_mma k must be 16 (dense f16/bf16), 32 (block-scaled f8), or 64 (block-scaled fp4)",
+        );
     }
     match cta_group {
         1 => {
@@ -200,10 +200,10 @@ fn check_mma_shape(m: u32, n: u32, k: u32, cta_group: u8) -> R {
             Ok(())
         }
         2 => {
-            // The block-scaled instructions (f8 k=32, nvfp4 k=64) step N by 16
-            // (DeepGEMM's swap_ab grid uses N = block_m in 16-element steps, e.g. 240);
-            // the dense f16/bf16 shape (k=16) keeps the 32-step rule.
-            let granularity = if k == 16 { 32 } else { 16 };
+            // The block-scaled f8 instruction (k=32) steps N by 16 (DeepGEMM's
+            // swap_ab grid uses N = block_m in 16-element steps, e.g. 240);
+            // the dense f16/bf16 and nvfp4 (k=64) shapes keep the 32-step rule.
+            let granularity = if k == 32 { 16 } else { 32 };
             if (m != 128 && m != 256) || n > 256 || n % granularity != 0 {
                 return bail("tcgen05_mma matrix shape is invalid for cta_group=2");
             }
@@ -539,13 +539,6 @@ fn validate_stmt(s: &Stmt) -> R {
             }
             validate_scalar(value)?;
         }
-        Stmt::ShuffleSync { var, src, src_lane } => {
-            if var.binding != VarBinding::Scalar {
-                return bail("shuffle_sync var binding must be scalar");
-            }
-            validate_scalar(src)?;
-            validate_scalar(src_lane)?;
-        }
         Stmt::StoreScalar { dst, value } => {
             validate_slice(dst, "store_scalar dst")?;
             validate_scalar(value)?;
@@ -627,37 +620,6 @@ fn validate_stmt(s: &Stmt) -> R {
             }
             if var.binding != VarBinding::Task {
                 return bail("sched_next var binding must be task");
-            }
-        }
-        Stmt::ClcTryCancel {
-            scheduler,
-            handle,
-            cta_group,
-            ..
-        } => {
-            validate_scheduler(scheduler)?;
-            if scheduler.policy.is_functional() {
-                return bail("clc_try_cancel requires a concurrent scheduler policy");
-            }
-            if handle.space != MemorySpace::Smem {
-                return bail("clc_try_cancel handle must be SMEM");
-            }
-            check_cta_group(*cta_group, "clc_try_cancel cta_group")?;
-        }
-        Stmt::ClcQueryCancel {
-            scheduler,
-            var,
-            handle,
-        } => {
-            validate_scheduler(scheduler)?;
-            if scheduler.policy.is_functional() {
-                return bail("clc_query_cancel requires a concurrent scheduler policy");
-            }
-            if handle.space != MemorySpace::Smem {
-                return bail("clc_query_cancel handle must be SMEM");
-            }
-            if var.binding != VarBinding::Scalar {
-                return bail("clc_query_cancel var binding must be scalar");
             }
         }
         Stmt::Loop { .. } => {}
@@ -748,17 +710,57 @@ fn validate_stmt(s: &Stmt) -> R {
             check_slice_covers(dst, shape, "tma_load dst slice")?;
             check_cta_group(*cta_group, "tma_load cta_group")?;
         }
+        Stmt::CpAsyncBulkS2Cluster {
+            dst, src, ..
+        } => {
+            validate_slice(src, "cp_async_bulk_s2cluster src")?;
+            validate_slice(dst, "cp_async_bulk_s2cluster dst")?;
+            if src.tensor.space != MemorySpace::Smem || dst.tensor.space != MemorySpace::Smem {
+                return bail("cp_async_bulk_s2cluster src and dst must both be SMEM");
+            }
+            if dst.tensor.dtype != src.tensor.dtype {
+                return bail("cp_async_bulk_s2cluster src and dst dtype must match");
+            }
+        }
+        Stmt::GmemAtomicAdd { sem, coords, .. } => {
+            validate_slice(sem, "gmem_atomic_add sem")?;
+            if sem.tensor.space != MemorySpace::Gmem {
+                return bail("gmem_atomic_add sem must be GMEM");
+            }
+            if sem.tensor.dtype != DType::I32 {
+                return bail("gmem_atomic_add sem must be an i32 semaphore");
+            }
+            if coords.len() != sem.tensor.shape.len() {
+                return bail("gmem_atomic_add coords rank must match the semaphore tensor rank");
+            }
+        }
+        Stmt::GmemWaitEq { sem, coords, .. } => {
+            validate_slice(sem, "gmem_wait_eq sem")?;
+            if sem.tensor.space != MemorySpace::Gmem {
+                return bail("gmem_wait_eq sem must be GMEM");
+            }
+            if sem.tensor.dtype != DType::I32 {
+                return bail("gmem_wait_eq sem must be an i32 semaphore");
+            }
+            if coords.len() != sem.tensor.shape.len() {
+                return bail("gmem_wait_eq coords rank must match the semaphore tensor rank");
+            }
+        }
         Stmt::TmaStore {
             dst,
             src,
             coords,
             shape,
             gmem_shape,
+            reduce_add,
         } => {
             validate_slice(src, "tma_store src")?;
             validate_tensor(dst)?;
             if dst.space != MemorySpace::Gmem {
                 return bail("tma_store dst must be GMEM");
+            }
+            if *reduce_add && dst.dtype != DType::F32 {
+                return bail("tma_reduce_add dst must be f32");
             }
             if src.tensor.space != MemorySpace::Smem {
                 return bail("tma_store src must be SMEM");
@@ -798,7 +800,7 @@ fn validate_stmt(s: &Stmt) -> R {
             sfa,
             sfb,
             sf_byte,
-            sf_e4m3,
+            sf_block,
             a_fp4,
             b_fp4,
             ..
@@ -816,28 +818,42 @@ fn validate_stmt(s: &Stmt) -> R {
             {
                 return bail("tcgen05_mma operands must be SMEM or TMEM");
             }
-            if *a_fp4 || *b_fp4 {
-                // NVFP4: operands are e2m1 fp4 packed 2-per-u8; both must be fp4.
-                if !*a_fp4 || !*b_fp4 {
-                    return bail("tcgen05_mma a_fp4 and b_fp4 must be set together");
+            // fp4 (e2m1) operands are stored packed 2-per-byte as u8; the others
+            // are one element per container slot.
+            let want_dtype = |dt: DType, fp4: bool| -> bool {
+                if fp4 {
+                    dt == DType::U8
+                } else {
+                    matches!(dt, DType::F16 | DType::Bf16 | DType::F8E4M3)
                 }
-                if a.tensor.dtype != DType::U8 || b.tensor.dtype != DType::U8 {
-                    return bail("tcgen05_mma fp4 operands must be u8 (2 packed e2m1 per byte)");
-                }
+            };
+            // A TMEM operand may be the f32 accumulator read directly as the MMA
+            // operand (e.g. the GDN state S, kept in TMEM); the value model reads
+            // every operand as logical f32, so an f32 TMEM operand is exact.
+            let tmem_f32 = |sl: &TensorSlice| {
+                sl.tensor.space == MemorySpace::Tmem && sl.tensor.dtype == DType::F32
+            };
+            let ok_dtype = |sl: &TensorSlice, fp4: bool| want_dtype(sl.tensor.dtype, fp4) || tmem_f32(sl);
+            if !ok_dtype(a, *a_fp4) || !ok_dtype(b, *b_fp4) {
+                return bail(
+                    "tcgen05_mma operand dtype must be f16, bf16, f8e4m3, packed u8 (fp4), or an f32 TMEM operand",
+                );
+            }
+            // Operand dtypes must match, EXCEPT a bf16/f16 operand paired with an
+            // f32 TMEM operand (both materialize to f32 in value mode).
+            if a.tensor.dtype != b.tensor.dtype && !tmem_f32(a) && !tmem_f32(b) {
+                return bail("tcgen05_mma a and b operand dtype must match");
+            }
+            // instruction K per format: f16/bf16 = 16, f8e4m3 = 32, fp4 = 64.
+            let want_k = if *a_fp4 {
+                64
+            } else if a.tensor.dtype == DType::F8E4M3 {
+                32
             } else {
-                if !matches!(a.tensor.dtype, DType::F16 | DType::Bf16 | DType::F8E4M3)
-                    || !matches!(b.tensor.dtype, DType::F16 | DType::Bf16 | DType::F8E4M3)
-                {
-                    return bail("tcgen05_mma operand dtype must be f16, bf16, or f8e4m3");
-                }
-                if a.tensor.dtype != b.tensor.dtype {
-                    return bail("tcgen05_mma a and b operand dtype must match");
-                }
-                if (*k == 32) != (a.tensor.dtype == DType::F8E4M3) {
-                    return bail(
-                        "tcgen05_mma k=32 is the f8e4m3 instruction shape (k=16 for f16/bf16)",
-                    );
-                }
+                16
+            };
+            if *k != want_k {
+                return bail("tcgen05_mma k does not match the operand format (16/32/64)");
             }
             if dst.tensor.dtype != DType::F32 {
                 return bail("tcgen05_mma dst dtype must be f32");
@@ -846,38 +862,47 @@ fn validate_stmt(s: &Stmt) -> R {
             let a_rows = if *cta_group == 1 { *m } else { m / 2 };
             let b_rows = if *cta_group == 1 { *n } else { n / 2 };
             check_slice_covers(dst, &[dst_rows as usize, *n as usize], "tcgen05_mma dst")?;
-            // fp4 operands are packed 2-per-byte, so the K (contraction) extent in the
-            // SMEM tile is k/2 bytes, not k elements.
-            let a_kdim = if *a_fp4 { (*k / 2) as usize } else { *k as usize };
-            let b_kdim = if *b_fp4 { (*k / 2) as usize } else { *k as usize };
-            let a_shape = if *trans_a {
-                [a_kdim, a_rows as usize]
+            // fp4 operands occupy k/2 packed bytes along the inner dim.
+            let a_k = if *a_fp4 {
+                (*k / 2) as usize
             } else {
-                [a_rows as usize, a_kdim]
+                *k as usize
+            };
+            let b_k = if *b_fp4 {
+                (*k / 2) as usize
+            } else {
+                *k as usize
+            };
+            let a_shape = if *trans_a {
+                [a_k, a_rows as usize]
+            } else {
+                [a_rows as usize, a_k]
             };
             let b_shape = if *trans_b {
-                [b_kdim, b_rows as usize]
+                [b_k, b_rows as usize]
             } else {
-                [b_rows as usize, b_kdim]
+                [b_rows as usize, b_k]
             };
             check_slice_covers_trailing(a, &a_shape, "tcgen05_mma a")?;
             check_slice_covers_trailing(b, &b_shape, "tcgen05_mma b")?;
+            let block_scaled = a.tensor.dtype == DType::F8E4M3 || *a_fp4;
             match (sfa, sfb) {
                 (None, None) => {
-                    if a.tensor.dtype == DType::F8E4M3 {
-                        return bail("tcgen05_mma f8e4m3 operands require sfa/sfb scale vectors");
+                    if block_scaled {
+                        return bail("tcgen05_mma block-scaled operands require sfa/sfb vectors");
                     }
                 }
                 (Some(sfa), Some(sfb)) => {
-                    // UE8M0 path requires f8e4m3 operands; NVFP4 (sf_e4m3) uses fp4 operands.
-                    if !*sf_e4m3 && a.tensor.dtype != DType::F8E4M3 {
-                        return bail("tcgen05_mma sfa/sfb require f8e4m3 operands");
-                    }
-                    if *sf_e4m3 && !*a_fp4 {
-                        return bail("tcgen05_mma sf_e4m3 (NVFP4) requires fp4 operands");
+                    if !block_scaled {
+                        return bail("tcgen05_mma sfa/sfb require f8e4m3 or fp4 operands");
                     }
                     if *sf_byte >= 4 {
                         return bail("tcgen05_mma sf_byte must be in 0..4");
+                    }
+                    if *a_fp4 && (*sf_block == 0 || *k % *sf_block != 0 || *k / *sf_block > 4) {
+                        return bail(
+                            "tcgen05_mma fp4 sf_block must divide k into at most 4 blocks per issue",
+                        );
                     }
                     for (sf, rows, label) in [
                         (sfa, a_rows as usize, "tcgen05_mma sfa"),
@@ -887,13 +912,9 @@ fn validate_stmt(s: &Stmt) -> R {
                         if sf.tensor.space != MemorySpace::Tmem {
                             return bail(format!("{label} must be TMEM"));
                         }
-                        // UE8M0 packs 4 exponent bytes per u32 cell; NVFP4 holds e4m3 bytes.
-                        let want = if *sf_e4m3 { DType::F8E4M3 } else { DType::U32 };
-                        if sf.tensor.dtype != want {
+                        if sf.tensor.dtype != DType::U32 {
                             return bail(format!(
-                                "{label} dtype must be {} ({})",
-                                if *sf_e4m3 { "e4m3" } else { "u32" },
-                                if *sf_e4m3 { "nvfp4 scales" } else { "4 packed UE8M0 bytes" }
+                                "{label} dtype must be u32 (4 packed UE8M0 bytes)"
                             ));
                         }
                         let Some(shape) = static_slice_shape(sf) else {
@@ -924,10 +945,8 @@ fn validate_stmt(s: &Stmt) -> R {
             if src.tensor.space != MemorySpace::Smem {
                 return bail("tcgen05_cp src must be SMEM");
             }
-            // UE8M0 path packs scale bytes as u32 cells; NVFP4 moves e4m3 scale bytes.
-            let ok_sf = |d: DType| matches!(d, DType::U32 | DType::F8E4M3);
-            if !ok_sf(dst.tensor.dtype) || !ok_sf(src.tensor.dtype) {
-                return bail("tcgen05_cp moves u32 (UE8M0) or e4m3 (nvfp4) scale cells");
+            if dst.tensor.dtype != DType::U32 || src.tensor.dtype != DType::U32 {
+                return bail("tcgen05_cp moves packed u32 scale cells");
             }
             let (Some(dst_shape), Some(src_shape)) =
                 (static_slice_shape(dst), static_slice_shape(src))
@@ -1110,6 +1129,47 @@ fn validate_stmt(s: &Stmt) -> R {
                 }
             }
         }
+        Stmt::WarpMma { d, a, b, c, m, n, k, ab_dtype } => {
+            for (sl, lbl) in [(d, "d"), (a, "a"), (b, "b"), (c, "c")] {
+                validate_slice(sl, &format!("mma_sync {lbl}"))?;
+                if sl.tensor.space != MemorySpace::Reg {
+                    return bail(format!("mma_sync {lbl} must be REG"));
+                }
+            }
+            // m16n8k{8,16}: A/B are u32 packed-16bit fragments, C/D are f32.
+            if !(*m == 16 && *n == 8 && (*k == 8 || *k == 16)) {
+                return bail("mma_sync supports only m16n8k8 / m16n8k16");
+            }
+            if !matches!(*ab_dtype, DType::Bf16 | DType::F16) {
+                return bail("mma_sync ab_dtype must be bf16 or f16");
+            }
+            // A/B are u32 packed-bf16 words OR a bf16/f16 fragment (2 elems = 1 word).
+            for (sl, lbl) in [(a, "A"), (b, "B")] {
+                if !is_b32_reg_dtype(sl.tensor.dtype) && !is_b16_dtype(sl.tensor.dtype) {
+                    return bail(format!(
+                        "mma_sync {lbl} must be u32/i32 words or a bf16/f16 fragment"
+                    ));
+                }
+            }
+            if c.tensor.dtype != DType::F32 || d.tensor.dtype != DType::F32 {
+                return bail("mma_sync C/D must be f32 register fragments");
+            }
+            let (la, lb, lcd) = (
+                (*m * *k / 64) as usize,
+                (*n * *k / 64) as usize,
+                (*m * *n / 32) as usize,
+            );
+            for (sl, words, lbl) in [(a, la, "A"), (b, lb, "B"), (c, lcd, "C"), (d, lcd, "D")] {
+                let want = if is_b16_dtype(sl.tensor.dtype) { 2 * words } else { words };
+                if let Some(got) = static_shape_numel(&sl.shape) {
+                    if got != want {
+                        return bail(format!(
+                            "mma_sync {lbl} fragment must hold {want} elements per lane"
+                        ));
+                    }
+                }
+            }
+        }
 
         Stmt::RegFill { dst, value } => check_reg_alu(dst, &[("value", value)], "reg_fill")?,
         Stmt::RegUnary { dst, src, .. } => {
@@ -1235,6 +1295,7 @@ fn validate_stmt(s: &Stmt) -> R {
             key_start,
             group_size,
             mask_value,
+            ..
         } => {
             if !is_float_reg_dtype(dst.tensor.dtype) {
                 return bail("reg_causal_mask dst dtype must be f16, bf16, or f32");
@@ -1285,10 +1346,20 @@ fn validate_stmt(s: &Stmt) -> R {
 
         Stmt::Fence { .. } => {}
         Stmt::CtaSync | Stmt::WarpSync | Stmt::ClusterSync => {}
-        Stmt::ClusterBarrierArrive | Stmt::ClusterBarrierWait => {}
         Stmt::WgSync { barrier_id } => {
             if *barrier_id < 1 || *barrier_id > 15 {
                 return bail("wg_sync barrier_id must be an integer in [1, 15]");
+            }
+        }
+        Stmt::NamedBarrier {
+            barrier_id,
+            num_warps,
+        } => {
+            if *barrier_id < 1 || *barrier_id > 15 {
+                return bail("named_barrier barrier_id must be an integer in [1, 15]");
+            }
+            if *num_warps < 1 {
+                return bail("named_barrier num_warps must be >= 1");
             }
         }
     }
@@ -1497,17 +1568,6 @@ fn check_context(
             Stmt::ClusterSync if scope != Scope::Cta => {
                 return bail("cluster_sync must be in CTA scope")
             }
-            // Split cluster barrier: the collective ARRIVE is a CTA-scope prologue op
-            // (all threads, like cluster_sync); the WAIT is per-role, so it is ALLOWED
-            // inside a role (the whole point — idle warps skip it, active roles defer it
-            // past their local setup). The checker verifies a role can't touch peer
-            // state before its wait (premature peer mbarrier access errors).
-            Stmt::ClusterBarrierArrive if inside_role => {
-                return bail("cluster_barrier_arrive cannot be used inside role")
-            }
-            Stmt::ClusterBarrierArrive if scope != Scope::Cta => {
-                return bail("cluster_barrier_arrive must be in CTA scope")
-            }
             Stmt::WgSync { barrier_id } => {
                 if scope != Scope::Warpgroup {
                     return bail("wg_sync must be in warpgroup scope");
@@ -1516,6 +1576,17 @@ fn check_context(
                 let owner = *barriers.entry(*barrier_id).or_insert(token);
                 if owner != token {
                     return bail("wg_sync barrier_id cannot be shared across roles");
+                }
+            }
+            Stmt::NamedBarrier { .. } => {
+                // Cross-warpgroup named barrier: warpgroup scope + a role, but
+                // intentionally SHARED across roles (the rendezvous spans them), so
+                // no single-owner check (unlike wg_sync).
+                if scope != Scope::Warpgroup {
+                    return bail("named_barrier must be in warpgroup scope");
+                }
+                if role_token.is_none() {
+                    return bail("named_barrier must be in a role");
                 }
             }
             Stmt::WarpSync if scope == Scope::Single => {
@@ -1541,13 +1612,6 @@ fn check_context(
                 let mut vars = Vec::new();
                 collect_vars(value, &mut vars);
                 require_defined(&vars, defined, "scalar_store value")?;
-            }
-            Stmt::ShuffleSync { var, src, src_lane } => {
-                let mut vars = Vec::new();
-                collect_vars(src, &mut vars);
-                collect_vars(src_lane, &mut vars);
-                require_defined(&vars, defined, "shuffle_sync src")?;
-                define_var(*var, defined)?;
             }
             Stmt::StoreScalar { dst, value } => {
                 let mut vars = Vec::new();
@@ -1582,7 +1646,6 @@ fn check_context(
                 stop,
                 step,
                 body,
-                unroll: _,
             } => {
                 let mut vars = Vec::new();
                 collect_vars(start, &mut vars);
@@ -1636,19 +1699,6 @@ fn check_context(
                 if !in_scheduler_impl {
                     return bail("sched_next must be inside scheduler_impl");
                 }
-                define_var(*var, defined)?;
-            }
-            Stmt::ClcTryCancel { stage, .. } => {
-                if !in_scheduler_impl {
-                    return bail("clc_try_cancel must be inside scheduler_impl");
-                }
-                if let Some(s) = stage {
-                    let mut vars = Vec::new();
-                    collect_vars(s, &mut vars);
-                    require_defined(&vars, defined, "clc_try_cancel stage")?;
-                }
-            }
-            Stmt::ClcQueryCancel { var, .. } => {
                 define_var(*var, defined)?;
             }
             Stmt::Loop { body } => {
@@ -1930,6 +1980,13 @@ fn check_smem_pool_bounds(kernel: &Kernel) -> R {
             Stmt::StoreScalar { dst, .. } => {
                 if seen.insert(dst.tensor.id) {
                     check_tensor(&dst.tensor, smem_size_bytes)?;
+                }
+            }
+            Stmt::WarpMma { d, a, b, c, .. } => {
+                for sl in [d, a, b, c] {
+                    if seen.insert(sl.tensor.id) {
+                        check_tensor(&sl.tensor, smem_size_bytes)?;
+                    }
                 }
             }
             _ => {}

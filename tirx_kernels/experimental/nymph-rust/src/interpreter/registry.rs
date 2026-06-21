@@ -15,7 +15,6 @@ pub enum StmtKind {
     TmemDealloc,
     ScalarDef,
     ScalarStore,
-    ShuffleSync,
     StoreScalar,
     MBarDef,
     KernelInit,
@@ -35,6 +34,9 @@ pub enum StmtKind {
     MBarrierArriveExpectTx,
     TmaLoad,
     TmaStore,
+    CpAsyncBulkS2Cluster,
+    GmemAtomicAdd,
+    GmemWaitEq,
     CpAsyncBulkCommitGroup,
     CpAsyncBulkWaitGroupRead,
     Tcgen05Mma,
@@ -46,6 +48,7 @@ pub enum StmtKind {
     Tcgen05WaitSt,
     LdMatrix,
     StMatrix,
+    WarpMma,
     RegFill,
     RegUnary,
     RegAdd,
@@ -66,12 +69,9 @@ pub enum StmtKind {
     Fence,
     CtaSync,
     WgSync,
+    NamedBarrier,
     WarpSync,
     ClusterSync,
-    ClusterBarrierArrive,
-    ClusterBarrierWait,
-    ClcTryCancel,
-    ClcQueryCancel,
 }
 
 pub fn stmt_kind(stmt: &Stmt) -> StmtKind {
@@ -81,7 +81,6 @@ pub fn stmt_kind(stmt: &Stmt) -> StmtKind {
         Stmt::TmemDealloc { .. } => StmtKind::TmemDealloc,
         Stmt::ScalarDef { .. } => StmtKind::ScalarDef,
         Stmt::ScalarStore { .. } => StmtKind::ScalarStore,
-        Stmt::ShuffleSync { .. } => StmtKind::ShuffleSync,
         Stmt::StoreScalar { .. } => StmtKind::StoreScalar,
         Stmt::MBarDef { .. } => StmtKind::MBarDef,
         Stmt::KernelInit { .. } => StmtKind::KernelInit,
@@ -101,6 +100,9 @@ pub fn stmt_kind(stmt: &Stmt) -> StmtKind {
         Stmt::MBarrierArriveExpectTx { .. } => StmtKind::MBarrierArriveExpectTx,
         Stmt::TmaLoad { .. } => StmtKind::TmaLoad,
         Stmt::TmaStore { .. } => StmtKind::TmaStore,
+        Stmt::CpAsyncBulkS2Cluster { .. } => StmtKind::CpAsyncBulkS2Cluster,
+        Stmt::GmemAtomicAdd { .. } => StmtKind::GmemAtomicAdd,
+        Stmt::GmemWaitEq { .. } => StmtKind::GmemWaitEq,
         Stmt::CpAsyncBulkCommitGroup => StmtKind::CpAsyncBulkCommitGroup,
         Stmt::CpAsyncBulkWaitGroupRead { .. } => StmtKind::CpAsyncBulkWaitGroupRead,
         Stmt::Tcgen05Mma { .. } => StmtKind::Tcgen05Mma,
@@ -112,6 +114,7 @@ pub fn stmt_kind(stmt: &Stmt) -> StmtKind {
         Stmt::Tcgen05WaitSt => StmtKind::Tcgen05WaitSt,
         Stmt::LdMatrix { .. } => StmtKind::LdMatrix,
         Stmt::StMatrix { .. } => StmtKind::StMatrix,
+        Stmt::WarpMma { .. } => StmtKind::WarpMma,
         Stmt::RegFill { .. } => StmtKind::RegFill,
         Stmt::RegUnary { .. } => StmtKind::RegUnary,
         Stmt::RegAdd { .. } => StmtKind::RegAdd,
@@ -132,19 +135,16 @@ pub fn stmt_kind(stmt: &Stmt) -> StmtKind {
         Stmt::Fence { .. } => StmtKind::Fence,
         Stmt::CtaSync => StmtKind::CtaSync,
         Stmt::WgSync { .. } => StmtKind::WgSync,
+        Stmt::NamedBarrier { .. } => StmtKind::NamedBarrier,
         Stmt::WarpSync => StmtKind::WarpSync,
         Stmt::ClusterSync => StmtKind::ClusterSync,
-        Stmt::ClusterBarrierArrive => StmtKind::ClusterBarrierArrive,
-        Stmt::ClusterBarrierWait => StmtKind::ClusterBarrierWait,
-        Stmt::ClcTryCancel { .. } => StmtKind::ClcTryCancel,
-        Stmt::ClcQueryCancel { .. } => StmtKind::ClcQueryCancel,
     }
 }
 
 impl StmtKind {
-    /// `ClcQueryCancel` is the last variant; the enum is fieldless so `as usize`
+    /// `ClusterSync` is the last variant; the enum is fieldless so `as usize`
     /// gives a contiguous 0..COUNT index — used to dispatch via a flat array.
-    pub const COUNT: usize = StmtKind::ClcQueryCancel as usize + 1;
+    pub const COUNT: usize = StmtKind::ClusterSync as usize + 1;
     #[inline]
     pub fn index(self) -> usize {
         self as usize

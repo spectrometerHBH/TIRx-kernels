@@ -9,10 +9,6 @@ from typing import Literal
 from .nymph_rs import (
     _SCALAR_GMEM_DTYPES,
     BreakIf,
-    ClcQueryCancel,
-    ClcTryCancel,
-    ClusterBarrierArrive,
-    ClusterBarrierWait,
     ClusterShape,
     ClusterSync,
     CpAsyncBulkCommitGroup,
@@ -69,8 +65,8 @@ from .nymph_rs import (
     SchedulerImpl,
     ScopeValue,
     Shape,
-    ShuffleSync,
     StMatrix,
+    WarpMma,
     Stmt,
     StoreScalar,
     TaskSpace,
@@ -86,12 +82,16 @@ from .nymph_rs import (
     TensorSlice,
     TmaLoad,
     TmaStore,
+    CpAsyncBulkS2Cluster,
+    GmemAtomicAdd,
+    GmemWaitEq,
     TmemAlloc,
     TmemDealloc,
     Var,
     VarBinding,
     WarpSync,
     WgSync,
+    NamedBarrier,
 )
 
 Tcgen05LdStShape = Literal["32x32b", "16x32bx2", "16x64b", "16x128b", "16x256b"]
@@ -221,18 +221,6 @@ class IRBuilder:
         self._append(ScalarDef(var=var, initial=initial))
         return var
 
-    def shuffle_sync(
-        self, src: ScalarValue, src_lane: ScalarValue = 0, *, dtype: ScalarDType = ScalarDType.I32
-    ) -> Var:
-        """Warp broadcast that DEFINES a scalar: every lane gets the value of ``src``
-        on lane ``src_lane`` (a faithful ``__shfl_sync``). For a warp-uniform ``src``
-        it is value-preserving and makes the result compiler-provably uniform (so the
-        derived index/address math lowers to the uniform datapath). The value model
-        runs the broadcast, so broadcasting a non-uniform value is caught as a mismatch."""
-        var = Var(binding=VarBinding.SCALAR, dtype=dtype)
-        self._append(ShuffleSync(var=var, src=src, src_lane=src_lane))
-        return var
-
     def scalar_store(self, var: Var, value: ScalarValue) -> None:
         self._append(ScalarStore(var=var, value=value))
 
@@ -348,6 +336,78 @@ class IRBuilder:
         stmt = TmaStore(dst=dst, src=src, coords=coords, shape=shape, gmem_shape=gmem_shape)
         self._append(stmt)
 
+    def cp_async_bulk_s2cluster(
+        self,
+        dst: Tensor | TensorSlice,
+        src: Tensor | TensorSlice,
+        *,
+        mbar: MBar | MBarRef,
+        bytes: ScalarValue,
+    ) -> None:
+        """`cp.async.bulk.shared::cluster` — async bulk copy of this CTA's SMEM `src`
+        into a PEER CTA's SMEM `dst` (the peer instance), signalling the peer's `mbar`
+        (pass `mbar_ref(m, remote_coord=peer)`) on completion. The dS cross-CTA
+        exchange in the 2-CTA backward. The peer CTA = the mbar's target."""
+        if isinstance(dst, Tensor):
+            dst = dst[...]
+        if isinstance(src, Tensor):
+            src = src[...]
+        self._append(CpAsyncBulkS2Cluster(dst=dst, src=src, mbar=mbar, bytes=bytes))
+
+    def tma_reduce_add(
+        self,
+        dst: Tensor,
+        src: Tensor | TensorSlice,
+        *,
+        coords: tuple[ScalarValue, ...],
+        shape: Shape,
+        gmem_shape: Shape | None = None,
+    ) -> None:
+        """TMA reduce-add (``cp.reduce.async.bulk...add.f32``): atomically accumulate
+        ``dst += src`` (SMEM→GMEM, f32). Same bulk-async path as ``tma_store`` (commit
+        with ``cp_async_bulk_commit_group`` / wait with ``cp_async_bulk_wait_group_read``);
+        value-mode accumulates instead of overwriting. dst must be an f32 GMEM tensor."""
+        if isinstance(src, Tensor):
+            src = src[...]
+        stmt = TmaStore(dst=dst, src=src, coords=coords, shape=shape,
+                        gmem_shape=gmem_shape, reduce_add=True)
+        self._append(stmt)
+
+    def gmem_atomic_add(
+        self,
+        sem: Tensor | TensorSlice,
+        *,
+        coords: tuple[ScalarValue, ...],
+        value: ScalarValue,
+        order: Literal["release", "relaxed"] = "release",
+    ) -> None:
+        """GMEM semaphore atomic-add ("signal") — ``red.<order>.gpu.global.add.s32``:
+        ``sem[coords] += value``. A value-keyed RELEASE: it is a SYNC op (NOT a data
+        access on the semaphore tensor), publishing this stream's clock as the release
+        clock for the post-increment counter value, so a later ``gmem_wait_eq`` on that
+        exact value joins it (acquire). ``order='release'`` carries the release fence
+        ordering prior writes (incl. a drained reduce-add) before the publish. ``sem``
+        must be an i32 GMEM tensor."""
+        if isinstance(sem, Tensor):
+            sem = sem[...]
+        self._append(GmemAtomicAdd(sem=sem, coords=coords, value=value, order=order))
+
+    def gmem_wait_eq(
+        self,
+        sem: Tensor | TensorSlice,
+        *,
+        coords: tuple[ScalarValue, ...],
+        value: ScalarValue,
+    ) -> None:
+        """GMEM semaphore spin-wait ("wait") — ``ld.global.acquire.gpu`` poll until
+        ``sem[coords] == value``. A value-keyed ACQUIRE: blocks this stream until the
+        counter equals ``value`` (never reaching it → deadlock), and joins the release
+        clock published by the ``gmem_atomic_add`` that produced THIS exact value. A
+        SYNC op (no data access on the semaphore tensor). ``sem`` must be i32 GMEM."""
+        if isinstance(sem, Tensor):
+            sem = sem[...]
+        self._append(GmemWaitEq(sem=sem, coords=coords, value=value))
+
     def cp_async_bulk_commit_group(self) -> None:
         self._append(CpAsyncBulkCommitGroup())
 
@@ -356,12 +416,7 @@ class IRBuilder:
 
     @contextmanager
     def for_loop(
-        self,
-        *,
-        stop: ScalarValue,
-        start: ScalarValue = 0,
-        step: ScalarValue = 1,
-        unroll: bool = False,
+        self, *, stop: ScalarValue, start: ScalarValue = 0, step: ScalarValue = 1
     ) -> Iterator[Var]:
         var = Var()
         body: list[Stmt] = []
@@ -373,9 +428,7 @@ class IRBuilder:
             raise
         else:
             self._body_stack.pop()
-            self._append(
-                ForLoop(var=var, start=start, stop=stop, step=step, body=tuple(body), unroll=unroll)
-            )
+            self._append(ForLoop(var=var, start=start, stop=stop, step=step, body=tuple(body)))
 
     def task_space(self, *, grid: tuple[int, ...], fields: tuple[str, ...]) -> TaskSpace:
         return TaskSpace(grid=grid, fields=fields)
@@ -421,36 +474,6 @@ class IRBuilder:
         var = Var(binding=VarBinding.TASK)
         self._append(SchedNext(scheduler=scheduler, var=var))
         return TaskToken(var, scheduler.space, has_valid=True)
-
-    def clc_try_cancel(
-        self,
-        scheduler: Scheduler,
-        handle: Tensor,
-        mbar: MBar | MBarRef,
-        *,
-        stage: ScalarValue | None = None,
-        cta_group: int = 2,
-    ) -> None:
-        """CLC async work-steal issue (``clusterlaunchcontrol.try_cancel``): the 16B
-        response lands in ``handle`` and ``mbar`` is completed-tx (multicast to both
-        cluster CTAs). Written explicitly inside ``scheduler_impl``; the canonical task
-        value is read back by the paired ``clc_query_cancel``. Codegen translates 1:1."""
-        self._append(
-            ClcTryCancel(
-                scheduler=scheduler, handle=handle, mbar=mbar, stage=stage, cta_group=cta_group
-            )
-        )
-
-    def clc_query_cancel(
-        self, scheduler: Scheduler, handle: Tensor, *, dtype: ScalarDType = ScalarDType.I32
-    ) -> Var:
-        """CLC handle decode (``clusterlaunchcontrol.query_cancel``) that DEFINES a
-        scalar: the cancelled cluster's first ``ctaid.x`` (= task * cta_group), or -1
-        when drained. Read by the scheduler and every worker that queries the same
-        handle (all observe the same id). Codegen translates 1:1."""
-        var = Var(binding=VarBinding.SCALAR, dtype=dtype)
-        self._append(ClcQueryCancel(scheduler=scheduler, var=var, handle=handle))
-        return var
 
     @contextmanager
     def loop(self) -> Iterator[None]:
@@ -498,19 +521,20 @@ class IRBuilder:
         sfb: Tensor | TensorSlice | None = None,
         sf_byte: int = 0,
         sf_e4m3: bool = False,
-        sf_block: int = 32,
+        sf_block: int = 0,
         a_fp4: bool = False,
         b_fp4: bool = False,
     ) -> None:
-        """``sfa``/``sfb`` make this a block-scaled MMA. Two flavors:
+        """``sfa``/``sfb`` make this a block-scaled MMA. Each is a (128, cols) u32 TMEM
+        slice of packed scale bytes. Two modes:
 
-        - UE8M0 (``kind::mxf8f6f4``, ``sf_e4m3=False``): each SF is a (128, cols) u32
-          TMEM slice of packed UE8M0 exponent bytes; operand row r is dequantized by
-          2^(byte - 127), ``sf_byte`` picks the packed byte for this k-slice.
-        - NVFP4 (``kind::mxf4nvf4``, ``sf_e4m3=True``): operands are e2m1 fp4 packed
-          2-per-u8 (``a_fp4``/``b_fp4``; the operand trailing dim is k/2), scales are
-          full e4m3 fp8 at block size ``sf_block`` (16). One k=MMA_K issue consumes the
-          ``MMA_K/sf_block`` e4m3 bytes of the SF cell (no ``sf_byte`` selection)."""
+        * fp8 block-128 (``sf_e4m3=False``, ``sf_block=0``): one UE8M0 scale per operand
+          row, constant over the k-slice; ``sf_byte`` picks the packed byte, dequant
+          ``2^(byte-127)``.
+        * nvfp4 block-16 (``sf_e4m3=True``, ``sf_block=16``): one e4m3 scale per 16
+          contiguous k-elements; this MMA's ``k`` spans ``k//16`` blocks taking cell
+          bytes ``0..k//16``. ``a_fp4``/``b_fp4`` mark operands as packed e2m1 (2 per
+          u8 byte), so the operand slice's inner extent is the packed byte count k//2."""
         if isinstance(dst, Tensor):
             dst = dst[...]
         if isinstance(a, Tensor):
@@ -543,7 +567,11 @@ class IRBuilder:
         self._append(stmt)
 
     def tcgen05_cp(
-        self, dst: Tensor | TensorSlice, src: Tensor | TensorSlice, *, cta_group: Literal[1, 2] = 1
+        self,
+        dst: Tensor | TensorSlice,
+        src: Tensor | TensorSlice,
+        *,
+        cta_group: Literal[1, 2] = 1,
     ) -> None:
         """``tcgen05.cp`` — bulk-copy packed u32 scale cells from SMEM into TMEM.
         With ``cta_group=2`` the leader's single issue drives both CTAs: each CTA
@@ -637,6 +665,29 @@ class IRBuilder:
         if isinstance(src, Tensor):
             src = src[...]
         self._append(StMatrix(dst=dst, src=src, shape=shape, num=num, trans=trans, dtype=dtype))
+
+    def mma_sync(
+        self,
+        d: Tensor | TensorSlice,
+        a: Tensor | TensorSlice,
+        b: Tensor | TensorSlice,
+        c: Tensor | TensorSlice,
+        *,
+        m: int = 16,
+        n: int = 8,
+        k: int = 16,
+        ab_dtype: DType = DType.BF16,
+    ) -> None:
+        """Warp-level SM80 tensor-core MMA: D = A·Bᵀ + C
+        (``mma.sync.aligned.m{m}n{n}k{k}.row.col.f32.{abt}.{abt}.f32``). A/B are
+        packed-16bit reg fragments of ``ab_dtype`` (bf16 or f16 — the PTX operand
+        type); C/D are f32 reg fragments — all in the standard mma warp fragment
+        layout (the layout ldmatrix produces)."""
+        d = d[...] if isinstance(d, Tensor) else d
+        a = a[...] if isinstance(a, Tensor) else a
+        b = b[...] if isinstance(b, Tensor) else b
+        c = c[...] if isinstance(c, Tensor) else c
+        self._append(WarpMma(d=d, a=a, b=b, c=c, m=m, n=n, k=k, ab_dtype=ab_dtype))
 
     def reg_fill(self, dst: Tensor | TensorSlice, value: RegOperand) -> None:
         if isinstance(dst, Tensor):
@@ -794,6 +845,7 @@ class IRBuilder:
         key_start: ScalarValue,
         group_size: int,
         mask_value: RegOperand = -float("inf"),
+        swap_qk: bool = False,
     ) -> None:
         if isinstance(dst, Tensor):
             dst = dst[...]
@@ -809,6 +861,7 @@ class IRBuilder:
                 key_start=key_start,
                 group_size=group_size,
                 mask_value=mask_value,
+                swap_qk=swap_qk,
             )
         )
 
@@ -851,22 +904,17 @@ class IRBuilder:
     def wg_sync(self, *, barrier_id: int) -> None:
         self._append(WgSync(barrier_id=barrier_id))
 
+    def named_barrier(self, *, barrier_id: int, num_warps: int) -> None:
+        """Named barrier across `num_warps` warps spanning warpgroups —
+        `bar.sync barrier_id, num_warps*32` (flashattn NamedBarrierBwdSm100).
+        Distinct roles that call this with the same barrier_id rendezvous."""
+        self._append(NamedBarrier(barrier_id=barrier_id, num_warps=num_warps))
+
     def warp_sync(self) -> None:
         self._append(WarpSync())
 
     def cluster_sync(self) -> None:
         self._append(ClusterSync())
-
-    def cluster_barrier_arrive(self) -> None:
-        """Split cluster barrier — collective non-blocking arrival (CTA scope, all
-        threads). Pair with per-role ``cluster_barrier_wait``: decouples the
-        cluster-barrier latency from each role's setup; idle warps skip the wait."""
-        self._append(ClusterBarrierArrive())
-
-    def cluster_barrier_wait(self) -> None:
-        """Split cluster barrier — per-role wait. Blocks until all cluster threads have
-        executed ``cluster_barrier_arrive``. Allowed inside a role (unlike cluster_sync)."""
-        self._append(ClusterBarrierWait())
 
     @contextmanager
     def role(

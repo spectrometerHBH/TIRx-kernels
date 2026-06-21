@@ -646,6 +646,32 @@ fn event_to_py<'py>(py: Python<'py>, event: &TraceEvent) -> PyResult<Bound<'py, 
             out.set_item("bar_id", bar_id)?;
             out.set_item("scope", scope_to_py(py, scope)?)?;
         }
+        TraceEventKind::SemRelease {
+            key,
+            new_value,
+            order,
+            scope,
+        } => {
+            out.set_item("kind", "sem_release")?;
+            out.set_item("tensor_id", key.tensor_id)?;
+            out.set_item("flat_coord", key.flat_coord)?;
+            out.set_item("new_value", new_value)?;
+            out.set_item(
+                "order",
+                match order {
+                    crate::interpreter::protocol::GmemAtomicOrderEvent::Release => "release",
+                    crate::interpreter::protocol::GmemAtomicOrderEvent::Relaxed => "relaxed",
+                },
+            )?;
+            out.set_item("scope", scope_to_py(py, scope)?)?;
+        }
+        TraceEventKind::SemAcquire { key, value, scope } => {
+            out.set_item("kind", "sem_acquire")?;
+            out.set_item("tensor_id", key.tensor_id)?;
+            out.set_item("flat_coord", key.flat_coord)?;
+            out.set_item("value", value)?;
+            out.set_item("scope", scope_to_py(py, scope)?)?;
+        }
         TraceEventKind::TmemAlloc {
             cta_ids,
             region,
@@ -810,7 +836,7 @@ py_enum!(PyMBarKind = "MBarKind" => MBarKind {
     TMA => Tma, TCGEN05 => Tcgen05, THREAD => Thread,
 });
 py_enum!(PyFenceKind = "FenceKind" => FenceKind {
-    MEMORY => Memory, ASYNC_PROXY => AsyncProxy, VIEW => View, MBARRIER_INIT => MbarrierInit,
+    MEMORY => Memory, ASYNC_PROXY => AsyncProxy, VIEW => View,
 });
 py_enum!(PyFenceScope = "FenceScope" => FenceScope {
     CTA => Cta, CLUSTER => Cluster, GPU => Gpu,
@@ -1203,23 +1229,6 @@ impl PyTmemLayout {
     }
 }
 
-/// `SfSmemLayout` — NVFP4 scale-factor buffer layout.
-#[pyclass(name = "SfSmemLayout")]
-#[derive(Clone)]
-pub struct PySfSmemLayout(pub ir::SfSmemLayout);
-#[pymethods]
-impl PySfSmemLayout {
-    #[new]
-    #[pyo3(signature = (sf_per_mma = 4))]
-    fn new(sf_per_mma: u8) -> Self {
-        PySfSmemLayout(ir::SfSmemLayout { sf_per_mma })
-    }
-    #[getter]
-    fn sf_per_mma(&self) -> u8 {
-        self.0.sf_per_mma
-    }
-}
-
 fn coerce_layout(obj: &Bound<'_, PyAny>) -> PyResult<ir::Layout> {
     if let Ok(l) = obj.extract::<PyTmemLayout>() {
         return Ok(ir::Layout::Tmem(l.0));
@@ -1227,11 +1236,8 @@ fn coerce_layout(obj: &Bound<'_, PyAny>) -> PyResult<ir::Layout> {
     if let Ok(l) = obj.extract::<PySmemSwizzleLayout>() {
         return Ok(ir::Layout::Swizzle(l.0));
     }
-    if let Ok(l) = obj.extract::<PySfSmemLayout>() {
-        return Ok(ir::Layout::SfSmem(l.0));
-    }
     Err(PyTypeError::new_err(
-        "expected a Layout (TmemLayout, SmemSwizzleLayout, or SfSmemLayout)",
+        "expected a Layout (TmemLayout or SmemSwizzleLayout)",
     ))
 }
 
@@ -1703,9 +1709,7 @@ impl PyStmt {
             | ir::Stmt::ForEachTask { var, .. }
             | ir::Stmt::SchedNext { var, .. }
             | ir::Stmt::ScalarDef { var, .. }
-            | ir::Stmt::ScalarStore { var, .. }
-            | ir::Stmt::ShuffleSync { var, .. }
-            | ir::Stmt::ClcQueryCancel { var, .. } => Ok(PyVar(*var)),
+            | ir::Stmt::ScalarStore { var, .. } => Ok(PyVar(*var)),
             _ => Err(PyAttributeError::new_err("var")),
         }
     }
@@ -1824,19 +1828,6 @@ fn scalar_store(var: PyVar, value: Bound<'_, PyAny>) -> PyResult<PyStmt> {
     }))
 }
 #[pyfunction]
-#[pyo3(name = "ShuffleSync")]
-fn shuffle_sync(
-    var: PyVar,
-    src: Bound<'_, PyAny>,
-    src_lane: Bound<'_, PyAny>,
-) -> PyResult<PyStmt> {
-    Ok(PyStmt(ir::Stmt::ShuffleSync {
-        var: var.0,
-        src: coerce_scalar(&src)?,
-        src_lane: coerce_scalar(&src_lane)?,
-    }))
-}
-#[pyfunction]
 #[pyo3(name = "StoreScalar")]
 fn store_scalar(dst: Bound<'_, PyAny>, value: Bound<'_, PyAny>) -> PyResult<PyStmt> {
     Ok(PyStmt(ir::Stmt::StoreScalar {
@@ -1897,14 +1888,13 @@ fn role(
     }))
 }
 #[pyfunction]
-#[pyo3(name = "ForLoop", signature = (var, start = None, stop = None, step = None, body = None, unroll = false))]
+#[pyo3(name = "ForLoop", signature = (var, start = None, stop = None, step = None, body = None))]
 fn for_loop(
     var: PyVar,
     start: Option<Bound<'_, PyAny>>,
     stop: Option<Bound<'_, PyAny>>,
     step: Option<Bound<'_, PyAny>>,
     body: Option<Bound<'_, PyAny>>,
-    unroll: bool,
 ) -> PyResult<PyStmt> {
     Ok(PyStmt(ir::Stmt::ForLoop {
         var: var.0,
@@ -1912,7 +1902,6 @@ fn for_loop(
         stop: opt_scalar_or(stop, 0)?,
         step: opt_scalar_or(step, 1)?,
         body: opt_body(body)?,
-        unroll,
     }))
 }
 #[pyfunction]
@@ -1942,32 +1931,6 @@ fn sched_next(scheduler: PyScheduler, var: PyVar) -> PyStmt {
     PyStmt(ir::Stmt::SchedNext {
         scheduler: scheduler.0,
         var: var.0,
-    })
-}
-#[pyfunction]
-#[pyo3(name = "ClcTryCancel", signature = (scheduler, handle, mbar, stage = None, cta_group = 2))]
-fn clc_try_cancel(
-    scheduler: PyScheduler,
-    handle: PyTensor,
-    mbar: Bound<'_, PyAny>,
-    stage: Option<Bound<'_, PyAny>>,
-    cta_group: u8,
-) -> PyResult<PyStmt> {
-    Ok(PyStmt(ir::Stmt::ClcTryCancel {
-        scheduler: scheduler.0,
-        handle: handle.0,
-        mbar: coerce_mbar_ref(&mbar)?,
-        stage: coerce_opt_scalar(stage)?,
-        cta_group,
-    }))
-}
-#[pyfunction]
-#[pyo3(name = "ClcQueryCancel")]
-fn clc_query_cancel(scheduler: PyScheduler, var: PyVar, handle: PyTensor) -> PyStmt {
-    PyStmt(ir::Stmt::ClcQueryCancel {
-        scheduler: scheduler.0,
-        var: var.0,
-        handle: handle.0,
     })
 }
 #[pyfunction]
@@ -2086,13 +2049,60 @@ fn tma_load(
     }))
 }
 #[pyfunction]
-#[pyo3(name = "TmaStore", signature = (dst, src, coords, shape, gmem_shape = None))]
+#[pyo3(name = "CpAsyncBulkS2Cluster", signature = (dst, src, mbar, bytes))]
+fn cp_async_bulk_s2cluster(
+    dst: Bound<'_, PyAny>,
+    src: Bound<'_, PyAny>,
+    mbar: Bound<'_, PyAny>,
+    bytes: Bound<'_, PyAny>,
+) -> PyResult<PyStmt> {
+    Ok(PyStmt(ir::Stmt::CpAsyncBulkS2Cluster {
+        dst: coerce_slice(&dst)?,
+        src: coerce_slice(&src)?,
+        mbar: coerce_mbar_ref(&mbar)?,
+        bytes: coerce_scalar(&bytes)?,
+    }))
+}
+#[pyfunction]
+#[pyo3(name = "GmemAtomicAdd", signature = (sem, coords, value, order))]
+fn gmem_atomic_add(
+    sem: Bound<'_, PyAny>,
+    coords: Bound<'_, PyAny>,
+    value: Bound<'_, PyAny>,
+    order: &str,
+) -> PyResult<PyStmt> {
+    let order = ir::GmemAtomicOrder::parse(order).ok_or_else(|| {
+        PyRuntimeError::new_err("gmem_atomic_add order must be 'release' or 'relaxed'")
+    })?;
+    Ok(PyStmt(ir::Stmt::GmemAtomicAdd {
+        sem: coerce_slice(&sem)?,
+        coords: coerce_scalar_seq(&coords)?,
+        value: coerce_scalar(&value)?,
+        order,
+    }))
+}
+#[pyfunction]
+#[pyo3(name = "GmemWaitEq", signature = (sem, coords, value))]
+fn gmem_wait_eq(
+    sem: Bound<'_, PyAny>,
+    coords: Bound<'_, PyAny>,
+    value: Bound<'_, PyAny>,
+) -> PyResult<PyStmt> {
+    Ok(PyStmt(ir::Stmt::GmemWaitEq {
+        sem: coerce_slice(&sem)?,
+        coords: coerce_scalar_seq(&coords)?,
+        value: coerce_scalar(&value)?,
+    }))
+}
+#[pyfunction]
+#[pyo3(name = "TmaStore", signature = (dst, src, coords, shape, gmem_shape = None, reduce_add = false))]
 fn tma_store(
     dst: PyTensor,
     src: Bound<'_, PyAny>,
     coords: Bound<'_, PyAny>,
     shape: Vec<usize>,
     gmem_shape: Option<Vec<usize>>,
+    reduce_add: bool,
 ) -> PyResult<PyStmt> {
     Ok(PyStmt(ir::Stmt::TmaStore {
         dst: dst.0,
@@ -2100,6 +2110,7 @@ fn tma_store(
         coords: coerce_scalar_seq(&coords)?,
         shape,
         gmem_shape,
+        reduce_add,
     }))
 }
 #[pyfunction]
@@ -2113,7 +2124,7 @@ fn cp_async_bulk_wait_group_read(n: u8) -> PyStmt {
     PyStmt(ir::Stmt::CpAsyncBulkWaitGroupRead { n })
 }
 #[pyfunction]
-#[pyo3(name = "Tcgen05Mma", signature = (dst, a, b, m, n, k = 16, accum = false, trans_a = false, trans_b = false, cta_group = 1, sfa = None, sfb = None, sf_byte = 0, sf_e4m3 = false, sf_block = 32, a_fp4 = false, b_fp4 = false))]
+#[pyo3(name = "Tcgen05Mma", signature = (dst, a, b, m, n, k = 16, accum = false, trans_a = false, trans_b = false, cta_group = 1, sfa = None, sfb = None, sf_byte = 0, sf_e4m3 = false, sf_block = 0, a_fp4 = false, b_fp4 = false))]
 #[allow(clippy::too_many_arguments)]
 fn tcgen05_mma(
     dst: Bound<'_, PyAny>,
@@ -2130,7 +2141,7 @@ fn tcgen05_mma(
     sfb: Option<Bound<'_, PyAny>>,
     sf_byte: u8,
     sf_e4m3: bool,
-    sf_block: u8,
+    sf_block: u32,
     a_fp4: bool,
     b_fp4: bool,
 ) -> PyResult<PyStmt> {
@@ -2276,6 +2287,30 @@ fn stmatrix(
         num,
         trans,
         dtype,
+    }))
+}
+
+#[pyfunction]
+#[pyo3(name = "WarpMma", signature = (d, a, b, c, m = 16, n = 8, k = 16, ab_dtype = None))]
+fn warp_mma(
+    d: Bound<'_, PyAny>,
+    a: Bound<'_, PyAny>,
+    b: Bound<'_, PyAny>,
+    c: Bound<'_, PyAny>,
+    m: u32,
+    n: u32,
+    k: u32,
+    ab_dtype: Option<PyDType>,
+) -> PyResult<PyStmt> {
+    Ok(PyStmt(ir::Stmt::WarpMma {
+        d: coerce_slice(&d)?,
+        a: coerce_slice(&a)?,
+        b: coerce_slice(&b)?,
+        c: coerce_slice(&c)?,
+        m,
+        n,
+        k,
+        ab_dtype: ab_dtype.map_or(ir::DType::Bf16, Into::into),
     }))
 }
 
@@ -2439,7 +2474,7 @@ fn reg_softmax_rescale(
 }
 
 #[pyfunction]
-#[pyo3(name = "RegCausalMask", signature = (dst, src, query_start, key_start, group_size, mask_value = None))]
+#[pyo3(name = "RegCausalMask", signature = (dst, src, query_start, key_start, group_size, mask_value = None, swap_qk = false))]
 fn reg_causal_mask(
     dst: Bound<'_, PyAny>,
     src: Bound<'_, PyAny>,
@@ -2447,6 +2482,7 @@ fn reg_causal_mask(
     key_start: Bound<'_, PyAny>,
     group_size: u32,
     mask_value: Option<Bound<'_, PyAny>>,
+    swap_qk: bool,
 ) -> PyResult<PyStmt> {
     Ok(PyStmt(ir::Stmt::RegCausalMask {
         dst: coerce_slice(&dst)?,
@@ -2458,6 +2494,7 @@ fn reg_causal_mask(
             Some(v) => coerce_reg_operand(&v)?,
             None => ir::RegOperand::Literal(ir::RegLiteral::f32(f32::NEG_INFINITY)),
         },
+        swap_qk,
     }))
 }
 
@@ -2521,6 +2558,14 @@ fn wg_sync(barrier_id: u32) -> PyStmt {
     PyStmt(ir::Stmt::WgSync { barrier_id })
 }
 #[pyfunction]
+#[pyo3(name = "NamedBarrier")]
+fn named_barrier(barrier_id: u32, num_warps: u32) -> PyStmt {
+    PyStmt(ir::Stmt::NamedBarrier {
+        barrier_id,
+        num_warps,
+    })
+}
+#[pyfunction]
 #[pyo3(name = "WarpSync")]
 fn warp_sync() -> PyStmt {
     PyStmt(ir::Stmt::WarpSync)
@@ -2529,16 +2574,6 @@ fn warp_sync() -> PyStmt {
 #[pyo3(name = "ClusterSync")]
 fn cluster_sync() -> PyStmt {
     PyStmt(ir::Stmt::ClusterSync)
-}
-#[pyfunction]
-#[pyo3(name = "ClusterBarrierArrive")]
-fn cluster_barrier_arrive() -> PyStmt {
-    PyStmt(ir::Stmt::ClusterBarrierArrive)
-}
-#[pyfunction]
-#[pyo3(name = "ClusterBarrierWait")]
-fn cluster_barrier_wait() -> PyStmt {
-    PyStmt(ir::Stmt::ClusterBarrierWait)
 }
 
 // ===========================================================================
@@ -2626,11 +2661,15 @@ impl PyKernel {
     }
 }
 
-/// Lower a kernel to a TVMScript (`tvm.script.tirx`) source string.
-#[pyfunction]
-fn kernel_to_tirx_source(kernel: &PyKernel) -> PyResult<String> {
-    crate::ir::kernel_to_tirx_source(&kernel.0).map_err(PyValueError::new_err)
-}
+// ===========================================================================
+// TIRx codegen (staging-only): nymph IR -> TVMScript source string
+// ===========================================================================
+
+// codegen temporarily disabled (IR divergence vs dev framework — see src/ir/mod.rs)
+// #[pyfunction]
+// fn kernel_to_tirx_source(kernel: &PyKernel) -> PyResult<String> {
+//     crate::ir::kernel_to_tirx_source(&kernel.0).map_err(PyValueError::new_err)
+// }
 
 // ===========================================================================
 // module registration
@@ -2662,7 +2701,6 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // chunk 3 — tensors / slices / layouts
     m.add_class::<PySmemSwizzleLayout>()?;
     m.add_class::<PyTmemLayout>()?;
-    m.add_class::<PySfSmemLayout>()?;
     m.add_class::<PyTensor>()?;
     m.add_class::<PyTensorSlice>()?;
     // chunk 4 — mbarriers
@@ -2679,7 +2717,6 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(tmem_dealloc, m)?,
         wrap_pyfunction!(scalar_def, m)?,
         wrap_pyfunction!(scalar_store, m)?,
-        wrap_pyfunction!(shuffle_sync, m)?,
         wrap_pyfunction!(store_scalar, m)?,
         wrap_pyfunction!(mbar_def, m)?,
         wrap_pyfunction!(kernel_init, m)?,
@@ -2689,8 +2726,6 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(for_each_task, m)?,
         wrap_pyfunction!(scheduler_impl, m)?,
         wrap_pyfunction!(sched_next, m)?,
-        wrap_pyfunction!(clc_try_cancel, m)?,
-        wrap_pyfunction!(clc_query_cancel, m)?,
         wrap_pyfunction!(loop_stmt, m)?,
         wrap_pyfunction!(break_if, m)?,
         wrap_pyfunction!(if_stmt, m)?,
@@ -2701,6 +2736,9 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(mbarrier_arrive_expect_tx, m)?,
         wrap_pyfunction!(tma_load, m)?,
         wrap_pyfunction!(tma_store, m)?,
+        wrap_pyfunction!(cp_async_bulk_s2cluster, m)?,
+        wrap_pyfunction!(gmem_atomic_add, m)?,
+        wrap_pyfunction!(gmem_wait_eq, m)?,
         wrap_pyfunction!(cp_async_bulk_commit_group, m)?,
         wrap_pyfunction!(cp_async_bulk_wait_group_read, m)?,
         wrap_pyfunction!(tcgen05_mma, m)?,
@@ -2712,6 +2750,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(tcgen05_wait_st, m)?,
         wrap_pyfunction!(ldmatrix, m)?,
         wrap_pyfunction!(stmatrix, m)?,
+        wrap_pyfunction!(warp_mma, m)?,
         wrap_pyfunction!(reg_fill, m)?,
         wrap_pyfunction!(reg_unary, m)?,
         wrap_pyfunction!(reg_add, m)?,
@@ -2732,10 +2771,9 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(fence, m)?,
         wrap_pyfunction!(cta_sync, m)?,
         wrap_pyfunction!(wg_sync, m)?,
+        wrap_pyfunction!(named_barrier, m)?,
         wrap_pyfunction!(warp_sync, m)?,
         wrap_pyfunction!(cluster_sync, m)?,
-        wrap_pyfunction!(cluster_barrier_arrive, m)?,
-        wrap_pyfunction!(cluster_barrier_wait, m)?,
     ] {
         m.add_function(f)?;
     }
@@ -2745,8 +2783,8 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(interpret, m)?)?;
     m.add_function(wrap_pyfunction!(trace, m)?)?;
     m.add_function(wrap_pyfunction!(check_protocol, m)?)?;
-    // the Rust -> TVMScript codegen entry point
-    m.add_function(wrap_pyfunction!(kernel_to_tirx_source, m)?)?;
+    // codegen temporarily disabled (IR divergence vs dev framework)
+    // m.add_function(wrap_pyfunction!(kernel_to_tirx_source, m)?)?;
 
     // chunk 7 — builder compatibility: the GMEM-scalar dtype map (used at runtime
     // by scalar_def) and the names the builder imports but only uses in lazy

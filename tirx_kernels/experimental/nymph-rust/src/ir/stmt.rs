@@ -5,7 +5,7 @@
 //! Body-bearing control nodes hold `Vec<Stmt>` (a recursive enum; `Vec` heap-
 //! allocates so the type has a finite size).
 
-use super::dtype::{FenceKind, FenceScope};
+use super::dtype::{DType, FenceKind, FenceScope};
 use super::mbar::{MBar, MBarRef};
 use super::scalar::{ScalarInitial, ScalarValue, Var};
 use super::scheduler::Scheduler;
@@ -90,6 +90,7 @@ impl From<TensorSlice> for RegOperand {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RegUnaryOp {
     Exp2,
+    Log2,
     Rcp,
     Neg,
 }
@@ -98,6 +99,7 @@ impl RegUnaryOp {
     pub fn as_str(self) -> &'static str {
         match self {
             RegUnaryOp::Exp2 => "exp2",
+            RegUnaryOp::Log2 => "log2",
             RegUnaryOp::Rcp => "rcp",
             RegUnaryOp::Neg => "neg",
         }
@@ -106,6 +108,7 @@ impl RegUnaryOp {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "exp2" => Some(RegUnaryOp::Exp2),
+            "log2" => Some(RegUnaryOp::Log2),
             "rcp" => Some(RegUnaryOp::Rcp),
             "neg" => Some(RegUnaryOp::Neg),
             _ => None,
@@ -286,6 +289,32 @@ impl MatrixDType {
     }
 }
 
+/// Memory order for a GMEM semaphore atomic-add (`red.<order>.gpu.global.add`).
+/// `Release` carries the release fence that publishes prior writes (e.g. a drained
+/// reduce-add) before the counter bump; `Relaxed` does not order memory.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GmemAtomicOrder {
+    Release,
+    Relaxed,
+}
+
+impl GmemAtomicOrder {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GmemAtomicOrder::Release => "release",
+            GmemAtomicOrder::Relaxed => "relaxed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "release" => Some(GmemAtomicOrder::Release),
+            "relaxed" => Some(GmemAtomicOrder::Relaxed),
+            _ => None,
+        }
+    }
+}
+
 /// `Stmt` — one statement of the kernel body. `cta_group` fields are 1 or 2;
 /// `*_mask` are 16-bit CTA masks.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -311,17 +340,6 @@ pub enum Stmt {
     ScalarStore {
         var: Var,
         value: ScalarValue,
-    },
-    /// Warp shuffle/broadcast that DEFINES a scalar: `var` gets the value of `src`
-    /// evaluated on lane `src_lane` of each warp, broadcast to all lanes (a faithful
-    /// `__shfl_sync`). First-class so the value-sim verifies it — broadcasting a value
-    /// that ISN'T warp-uniform changes it, which surfaces as a value mismatch. Used to
-    /// promote warp-uniform SMEM reads (the scheduler mailbox) to a form the CUDA
-    /// compiler proves uniform → the index/address chain lowers to the uniform datapath.
-    ShuffleSync {
-        var: Var,
-        src: ScalarValue,
-        src_lane: ScalarValue,
     },
     StoreScalar {
         dst: TensorSlice,
@@ -357,11 +375,6 @@ pub enum Stmt {
         stop: ScalarValue,
         step: ScalarValue,
         body: Vec<Stmt>,
-        /// Emit as `T.unroll(N)` instead of `T.serial(N)` — a compile-time-unrolled loop
-        /// (the TVMScript parser substitutes a constant loop var per iteration, so it keeps
-        /// the same SASS as a manual unroll) but written as a `for` in the source, matching
-        /// canon's `for i in T.unroll(N)` for fixed-count loops (mbarrier inits, etc.).
-        unroll: bool,
     },
     ForEachTask {
         scheduler: Arc<Scheduler>,
@@ -375,33 +388,6 @@ pub enum Stmt {
     SchedNext {
         scheduler: Arc<Scheduler>,
         var: Var,
-    },
-    /// CLC (Cluster Launch Control) async work-steal issue: hardware
-    /// `clusterlaunchcontrol.try_cancel` writes a 16B response into `handle` and
-    /// completes-tx `mbar` (multicast to both cluster CTAs). Written out EXPLICITLY
-    /// in the kernel's `policy="custom"` scheduler — codegen translates it 1:1 and
-    /// never synthesizes it. In sim it (1) runs the canonical round-robin oracle —
-    /// the trusted seam, §7 of the scheduler RFC — and stores the resulting work id
-    /// into a per-cluster handle slot, and (2) completes-tx the signalled mbar (like
-    /// a TMA landing) so the handshake the checker validates is real. The paired
-    /// `ClcQueryCancel` reads the slot, so the scheduler and every worker that query
-    /// the same handle observe the same id.
-    ClcTryCancel {
-        scheduler: Arc<Scheduler>,
-        handle: Arc<Tensor>,
-        mbar: MBarRef,
-        stage: Option<ScalarValue>,
-        cta_group: u8,
-    },
-    /// CLC decode of the response `handle`: DEFINES `var` by reading the per-cluster
-    /// handle slot the paired `ClcTryCancel` filled — the cancelled cluster's first
-    /// `ctaid.x` (= task * cta_group), or `0xFFFFFFFF` (→ -1 as int32) when drained.
-    /// Codegen translates 1:1 to `T.ptx.clc_query_cancel`; `scheduler` is sim-only
-    /// metadata (keys the slot read).
-    ClcQueryCancel {
-        scheduler: Arc<Scheduler>,
-        var: Var,
-        handle: Arc<Tensor>,
     },
     Loop {
         body: Vec<Stmt>,
@@ -460,6 +446,48 @@ pub enum Stmt {
         coords: Vec<ScalarValue>,
         shape: Vec<usize>,
         gmem_shape: Option<Vec<usize>>,
+        /// True for `cp.reduce.async.bulk...add.f32` (TMA reduce-add): value-mode
+        /// accumulates `dst += src` instead of overwriting. Trace/protocol treat it
+        /// like a store (a GMEM-output bulk async write).
+        reduce_add: bool,
+    },
+    /// `cp.async.bulk.shared::cluster.shared::cta` — async bulk copy from this CTA's
+    /// SMEM (`src`) to a PEER CTA's SMEM (`dst`, the peer instance), signalling the
+    /// peer's `mbar` (via its `remote_coord`) on completion. The peer CTA is the
+    /// mbar's target. Trace/protocol model it as a local-SMEM async-proxy READ +
+    /// a peer-CTA-SMEM async-proxy WRITE (attributed to the peer's SMEM pool, so the
+    /// race checker matches it against the peer's read) + a `complete_tx` on the
+    /// PEER's mbar (so the cross-CTA happens-before closes through the peer's wait).
+    CpAsyncBulkS2Cluster {
+        dst: TensorSlice,
+        src: TensorSlice,
+        mbar: MBarRef,
+        bytes: ScalarValue,
+    },
+    /// `red.<order>.gpu.global.add.s32` — a GMEM semaphore atomic-add ("signal").
+    /// VALUE: serialized RMW of the i32 semaphore cell `sem[coords]` (`+= value`).
+    /// TRACE/protocol: a SYNC op (NOT a data access — no Read/Write on the
+    /// semaphore tensor); it publishes this stream's clock as the RELEASE clock for
+    /// the semaphore slot at its POST-increment value (value-keyed), so a later
+    /// `wait_eq` on that exact value joins it (acquire). `order=release` carries the
+    /// release fence ordering all prior writes (incl. drained reduce-adds) before
+    /// the publish.
+    GmemAtomicAdd {
+        sem: TensorSlice,
+        coords: Vec<ScalarValue>,
+        value: ScalarValue,
+        order: GmemAtomicOrder,
+    },
+    /// `ld.global.acquire.gpu` spin-loop until `sem[coords] == value` ("wait").
+    /// VALUE: BLOCK this stream (polled re-check) until the i32 cell equals `value`;
+    /// never reaching it -> the runner's deadlock detection fires. TRACE/protocol: a
+    /// SYNC op (no Read/Write) that ACQUIRES — joins the release clock published by
+    /// the `atomic_add` that PRODUCED this exact `value` (value-keyed, mirroring the
+    /// mbar phase-keyed pattern with the counter-value in place of parity).
+    GmemWaitEq {
+        sem: TensorSlice,
+        coords: Vec<ScalarValue>,
+        value: ScalarValue,
     },
     CpAsyncBulkCommitGroup,
     CpAsyncBulkWaitGroupRead {
@@ -478,22 +506,24 @@ pub enum Stmt {
         trans_a: bool,
         trans_b: bool,
         cta_group: u8,
-        /// Block-scaled MMA. Two flavors, selected by `sf_e4m3`:
-        /// - UE8M0 (`kind::mxf8f6f4`, `sf_e4m3=false`): per-row scale factors held in
-        ///   TMEM as packed u32 cells (4 biased-exponent bytes each); `sf_byte` selects
-        ///   the byte for this k-slice; operand row r dequantizes by 2^(byte - 127).
-        /// - NVFP4 (`kind::mxf4nvf4`, `sf_e4m3=true`): operands are e2m1 fp4 (2 packed
-        ///   per u8 byte, `a_fp4`/`b_fp4`), scales are full e4m3 fp8 at block size
-        ///   `sf_block` (16). The SF u32 cell holds `MMA_K/sf_block` e4m3 bytes, all
-        ///   consumed by one k=MMA_K issue (no `sf_byte` selection).
+        /// Block-scaled MMA scale vectors for A and B, held in TMEM as packed u32
+        /// cells (4 scale bytes each).
+        ///
+        /// Two scale modes share this field set:
+        /// * fp8 block-128 (UE8M0): one scale per operand row, constant over the
+        ///   whole k-slice. `sf_e4m3=false`, `sf_block=0` (per-row); `sf_byte`
+        ///   selects which of the 4 packed bytes applies, dequant `2^(byte-127)`.
+        /// * nvfp4 block-16 (e4m3): one scale per 16 contiguous k-elements.
+        ///   `sf_e4m3=true`, `sf_block=16`; this MMA's k spans `k/16` blocks whose
+        ///   scales are bytes `0..k/16` of the cell, each decoded as e4m3.
         sfa: Option<TensorSlice>,
         sfb: Option<TensorSlice>,
         sf_byte: u8,
-        /// SF encoding: false = UE8M0 (pure exponent), true = e4m3 (full fp8) — NVFP4.
+        /// scale decode: e4m3 (nvfp4) when true, UE8M0 biased exponent (fp8) when false.
         sf_e4m3: bool,
-        /// Scale block size in K-elements (UE8M0: 32; NVFP4: 16).
-        sf_block: u8,
-        /// Operands are e2m1 fp4 packed 2-per-u8 byte (operand trailing dim is k/2).
+        /// scale block width in operand elements; 0 = one scale per row (fp8).
+        sf_block: u32,
+        /// operands are packed fp4 (e2m1, 2 per u8 byte); materialize by unpacking.
         a_fp4: bool,
         b_fp4: bool,
     },
@@ -549,6 +579,19 @@ pub enum Stmt {
         num: u32,
         trans: bool,
         dtype: MatrixDType,
+    },
+    /// Warp-level SM80 tensor-core MMA (`mma.sync.aligned.m{M}n{N}k{K}.row.col`).
+    /// D = A·Bᵀ + C, with A (M×K) / B (N×K) bf16 reg fragments and C/D (M×N)
+    /// f32 reg accumulators, all in the standard mma warp fragment layout.
+    WarpMma {
+        d: TensorSlice,
+        a: TensorSlice,
+        b: TensorSlice,
+        c: TensorSlice,
+        m: u32,
+        n: u32,
+        k: u32,
+        ab_dtype: DType,   // A/B operand type — the PTX .bf16 / .f16 (C/D are f32)
     },
 
     // ---- register ALU ----
@@ -627,6 +670,11 @@ pub enum Stmt {
         key_start: ScalarValue,
         group_size: u32,
         mask_value: RegOperand,
+        /// Fragment orientation. False = forward `[q-row, kv-col]` (q = query_start +
+        /// row/group_size, k = key_start + col). True = backward `[kv-row, q-col]` (the
+        /// fa-bwd fragment is transposed): k = key_start + row, q = query_start +
+        /// col/group_size — group_size lands on the q (col) axis. Both mask when k > q.
+        swap_qk: bool,
     },
     RegCombineIntFracEx2 {
         dst: TensorSlice,
@@ -656,20 +704,16 @@ pub enum Stmt {
     WgSync {
         barrier_id: u32,
     },
+    /// Named barrier across `num_warps` warps that may span warpgroups —
+    /// `bar.sync barrier_id, num_warps*32` (flashattn `NamedBarrierBwdSm100`).
+    /// Unlike WgSync (per-warpgroup), threads from different roles rendezvous
+    /// on the shared `barrier_id` (count-based completion).
+    NamedBarrier {
+        barrier_id: u32,
+        num_warps: u32,
+    },
     WarpSync,
     ClusterSync,
-    /// Split cluster barrier — ARRIVE side. A non-blocking collective arrival
-    /// (`barrier.cluster.arrive`, aligned) issued once at CTA scope after the
-    /// prologue init. Paired with per-role `ClusterBarrierWait`s: decouples the
-    /// cluster-barrier latency from each role's local setup, and idle warps skip the
-    /// wait. Modeled faithfully (unlike a codegen-synthesized split of the fused
-    /// `ClusterSync`) so the protocol checker verifies every role waits before any
-    /// cross-CTA (peer mbarrier) access.
-    ClusterBarrierArrive,
-    /// Split cluster barrier — WAIT side. Blocks the calling role until all threads
-    /// of the cluster have executed `ClusterBarrierArrive`. Allowed inside a role
-    /// (unlike `ClusterSync`).
-    ClusterBarrierWait,
 }
 
 impl Stmt {

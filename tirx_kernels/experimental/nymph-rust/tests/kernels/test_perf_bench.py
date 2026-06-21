@@ -34,7 +34,7 @@ from nymph_rs.kernels import build_fp16_bf16_gemm
 from nymph_rs.kernels.fp16_bf16_gemm import Fp16Bf16GemmConfig
 
 K = 16384
-TASKS = [1, 2, 4, 8, 16]
+TASKS = [1, 2, 4]
 EXTRAPOLATE_TO = 2048
 REPS = 2
 
