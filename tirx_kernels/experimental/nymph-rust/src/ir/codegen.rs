@@ -24,7 +24,7 @@
 //! `__syncthreads` inside a single-warp/wg role would not be reached by all CTA
 //! threads).
 
-use super::dtype::{MemorySpace, ScalarOp, ScopeValueKind, Swizzle, VarBinding};
+use super::dtype::{DType, MemorySpace, ScalarOp, ScopeValueKind, Swizzle, VarBinding};
 use super::kernel::Kernel;
 use super::scalar::{ScalarExpr, ScalarInitial, ScalarValue, Var};
 use super::stmt::Stmt;
@@ -39,7 +39,8 @@ from tvm.ir.type import PointerType, PrimType
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.cuda.operator.tile_primitive.tma_utils import mma_shared_layout
-from tvm.tirx.layout import S, TCol, TileLayout, TLane
+from tvm.tirx.cuda.operator.tile_primitive.gemm_async.tcgen05 import sf_smem_layout
+from tvm.tirx.layout import R, S, TCol, TileLayout, TLane
 from tvm.tirx.layout import tid_in_wg as axis_tid_in_wg
 ";
 
@@ -266,7 +267,9 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
     // canonical kernel's `_swizzle_for_row_bytes(EPI_N * elem_bytes)`. The plain I32
     // mailbox (task_smem) takes no layout (a flat row-major buffer).
     for t in collect_tensors(k) {
-        if t.space != MemorySpace::Smem || is_int_dtype(t.dtype) {
+        // Layout-less SMEM = the flat i32/u32 scheduler mailbox + mbar buffers. Packed
+        // fp4 operands (u8) DO get a swizzle, and e4m3 SF buffers get sf_smem_layout.
+        if t.space != MemorySpace::Smem || (is_int_dtype(t.dtype) && t.dtype != DType::U8) {
             continue;
         }
         let name = ctx.tensor_name(t.id)?;
@@ -276,6 +279,22 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
             .map(|d| d.to_string())
             .collect::<Vec<_>>()
             .join(", ");
+        // e4m3 SMEM = NVFP4 scale factors → canon's sf_smem_layout(rows, sf_k,
+        // sf_per_mma=4, pipe_depth). The TMA lands the bytes in cp-ready order.
+        if t.dtype == DType::F8E4M3 {
+            let (rows, sf_k, pipe) = if t.shape.len() == 3 {
+                (t.shape[1], t.shape[2], Some(t.shape[0]))
+            } else {
+                (t.shape[0], t.shape[1], None)
+            };
+            let pd = pipe
+                .map(|p| format!(", pipe_depth={p}"))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "{name}_layout = sf_smem_layout({rows}, {sf_k}, sf_per_mma=4{pd})\n"
+            ));
+            continue;
+        }
         // The swizzle atom row (128/64/32 B for mode 3/2/1) must DIVIDE the tile row
         // width, else `mma_shared_layout` tiles a too-wide atom over a narrower row and
         // `Layout.tile_to` lowers to a `floormod`-by-zero ("Divide by zero"). The IR's
@@ -318,8 +337,19 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
             .map(|d| d.to_string())
             .collect::<Vec<_>>()
             .join(", ");
+        // e4m3 GMEM args are the NVFP4 scale factors: lay them out with canon's
+        // sf_smem_layout(rows, sf_k, sf_per_mma=4) so the TMA reads cp-ready bytes.
+        let layout = if t.dtype == DType::F8E4M3 && t.shape.len() == 2 {
+            format!(
+                ", layout=sf_smem_layout({rows}, {sf_k}, sf_per_mma=4)",
+                rows = t.shape[0],
+                sf_k = t.shape[1],
+            )
+        } else {
+            String::new()
+        };
         out.push_str(&format!(
-            "{p}{name} = T.match_buffer({name}_ptr, ({dims}), \"{dt}\")\n",
+            "{p}{name} = T.match_buffer({name}_ptr, ({dims}), \"{dt}\"{layout})\n",
             p = pad(ind),
             name = arg_name(i),
             dims = dims,
@@ -390,7 +420,7 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
             .map(|d| d.to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        if is_int_dtype(t.dtype) {
+        if is_int_dtype(t.dtype) && t.dtype != DType::U8 {
             // The scheduler mailbox: a flat row-major shared buffer (no swizzle).
             out.push_str(&format!(
                 "{p}{name} = T.alloc_buffer(({dims}), \"{dt}\", scope=\"shared\")\n",
@@ -817,6 +847,7 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
     //   - ab dtype, no layout -> `d_smem{i}`  (D writeback rings; we synthesize a
     //                            swizzle layout from the row byte width)
     let mut tmem_idx = 0usize;
+    let mut sf_tmem_idx = 0usize;
     let mut reg_idx = 0usize;
     let mut ab_idx = 0usize;
     let mut d_idx = 0usize;
@@ -851,17 +882,28 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
                 }
             }
             MemorySpace::Tmem => {
-                // First TMEM tensor is the base allocation; the second is the accum
-                // view at col_start 0. Name base "tmem"; views are emitted as
-                // tmem[:, lo:hi] at the slice site, but the tensor still needs a name
-                // (only used if referenced as a whole tensor, e.g. tmem_alloc).
-                let n = if tmem_idx == 0 {
-                    "tmem".to_string()
+                // e4m3 TMEM = NVFP4 scale factors → named SFA_tmem / SFB_tmem (alloc_sf'd).
+                if t.dtype == DType::F8E4M3 {
+                    let n = if sf_tmem_idx == 0 {
+                        "SFA_tmem".to_string()
+                    } else {
+                        "SFB_tmem".to_string()
+                    };
+                    sf_tmem_idx += 1;
+                    n
                 } else {
-                    format!("tmem_view{tmem_idx}")
-                };
-                tmem_idx += 1;
-                n
+                    // First TMEM tensor is the base allocation; the second is the accum
+                    // view at col_start 0. Name base "tmem"; views are emitted as
+                    // tmem[:, lo:hi] at the slice site, but the tensor still needs a name
+                    // (only used if referenced as a whole tensor, e.g. tmem_alloc).
+                    let n = if tmem_idx == 0 {
+                        "tmem".to_string()
+                    } else {
+                        format!("tmem_view{tmem_idx}")
+                    };
+                    tmem_idx += 1;
+                    n
+                }
             }
             MemorySpace::Reg => {
                 let n = match reg_idx {
