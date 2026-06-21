@@ -1655,6 +1655,14 @@ fn single_issue_guard(stmt: &Stmt, scope: Scope, ctx: &Ctx) -> Option<&'static s
         | MBarrierArrive { .. }
         | StoreScalar { .. }
         | TmaLoad { .. }
+        // Tcgen05Cp MUST coalesce with the adjacent Tcgen05Mma/Commit under ONE elect
+        // block: each tcgen05 op (cp SFA, cp SFB, gemm, commit) in its OWN `if elect_sync()`
+        // forces a warp reconvergence between them, which on Blackwell breaks the tcgen05
+        // async issue stream and STALLS the block-scaled MMA (a GPU deadlock — the nvfp4
+        // cluster gemm never retires, so tmem_full is never committed). Coalescing all the
+        // consecutive same-guard tcgen05 ops into one elect (canon's `if elect_sync(): cp;
+        // cp; gemm`) keeps the single issuing lane converged across the whole issue burst.
+        | Tcgen05Cp { .. }
         | Tcgen05Mma { .. }
         | Tcgen05Commit { .. } => Some(scope.issue_guard()),
         _ => None,
@@ -1766,17 +1774,35 @@ fn emit_stmt(
                 ));
             }
             // NVFP4 e4m3 scale-factor TMEM (canon's tmem_pool.alloc_sf(..., sf_per_mma=4)).
-            // The TileLayout is fixed for sf_per_mma=4 / (128, 16); allocated_addr is the
-            // IR's TmemLayout col_start (448 / 464).
+            // The TileLayout follows `sf_tmem_layout(rows, SF_K, sf_per_mma=4)`: with
+            // SF_K=16, sf_per_mma=4 (so the outer K=4, pack_factor=1) the atom is
+            // `S[(32, 4):(1@TLane,1@TCol)] + R[4:32@TLane]` direct-summed with
+            // `outer = S[(M, 4):(epc=4 @TCol, M*4 @TCol)]` (M = rows//32), giving
+            // `S[(M, 32, 4, 4):(4@TCol, 1@TLane, M*4 @TCol, 1@TCol)] + R[4:32@TLane]`.
+            // rows=128 (M=4): (4,32,4,4):(4,1,16,1); rows=256 (M=8): (8,32,4,4):(4,1,32,1).
+            //
+            // UN-FOLD: the IR/value-model tensor is the PHYSICAL (128, SF_K * n_chunks)
+            // (TMEM is 128 lanes; canon's `128 * SFB_n_chunks`-row SFB band folds its extra
+            // super-blocks into columns). The decl_buffer the gemm dispatch reads is canon's
+            // LOGICAL (128 * n_chunks, SF_K): the block-scaled dispatch derives N from
+            // SFB_tmem's logical row count and needs SFB_rows >= N=MMA_N. The per-super-block
+            // SF_K is the nvfp4 invariant CTA_K//SF_BLOCK = 16 (sf_per_mma=4 × MMA_K_BLOCKS=4),
+            // so n_chunks = physical_cols // 16, logical_rows = 128 * n_chunks.
+            const BASE_SF_K: usize = 16;
             for sf in &ctx.sf_tmems {
                 let name = ctx.tensor_name(sf.id)?;
                 let col = match &sf.layout {
                     Some(Layout::Tmem(tm)) => tm.col_start,
                     _ => 0,
                 };
+                let phys_cols = sf.shape[1];
+                let n_chunks = (phys_cols / BASE_SF_K).max(1);
+                let logical_rows = 128 * n_chunks;
+                let logical_cols = phys_cols / n_chunks;
+                let m_super = logical_rows / 32; // sf_tmem_layout's M = rows // 32
                 out.push_str(&format!(
-                    "{p}{name} = T.decl_buffer((128, {d1}), \"float8_e4m3fn\", scope=\"tmem\", layout=TileLayout(S[(4, 32, 4, 4) : (4 @ TCol, 1 @ TLane, 16 @ TCol, 1 @ TCol)] + R[4:32 @ TLane]), allocated_addr={col})\n",
-                    d1 = sf.shape[1],
+                    "{p}{name} = T.decl_buffer(({logical_rows}, {logical_cols}), \"float8_e4m3fn\", scope=\"tmem\", layout=TileLayout(S[({m_super}, 32, 4, 4) : (4 @ TCol, 1 @ TLane, {m_stride} @ TCol, 1 @ TCol)] + R[4:32 @ TLane]), allocated_addr={col})\n",
+                    m_stride = m_super * 4,
                 ));
             }
             // KernelInit emits ONLY the warp-0 body (tmem alloc + mbarrier inits). The entire
@@ -2245,12 +2271,27 @@ fn emit_stmt(
                     a_s = view(a)?;
                     b_s = view(b)?;
                 }
-                let sfa_name = ctx.tensor_name(sfa.tensor.id)?;
-                let sfb_name = ctx.tensor_name(sfb.tensor.id)?;
+                // Emit the SF operands as EXPLICIT logical slices `[0:rows, 0:cols]`,
+                // exactly like canon (`SFA_tmem[0:128, 0:16], SFB_tmem[0:256, 0:16]`),
+                // NOT the bare buffer — the gemm's block-scaled dispatch addresses the SF
+                // through this slice's logical (rows, cols). Un-fold the physical
+                // `(128, SF_K * n_chunks)` TMEM tensor to its logical `(128*n_chunks, SF_K)`
+                // (per-super-block SF_K=16), matching the SFB_tmem decl_buffer.
+                let sf_slice = |sf: &TensorSlice| -> Result<String, String> {
+                    const BASE_SF_K_MMA: usize = 16;
+                    let name = ctx.tensor_name(sf.tensor.id)?;
+                    let phys_cols = sf.tensor.shape.get(1).copied().unwrap_or(0);
+                    let n_chunks = (phys_cols / BASE_SF_K_MMA).max(1);
+                    let rows = sf.tensor.shape.first().copied().unwrap_or(128) * n_chunks;
+                    let cols = phys_cols / n_chunks;
+                    Ok(format!("{name}[0:{rows}, 0:{cols}]"))
+                };
+                let sfa_s = sf_slice(sfa)?;
+                let sfb_s = sf_slice(sfb)?;
                 emit_guarded(
                     out,
                     &format!(
-                        "Tx.gemm_async({dst_s}, {a_s}, {b_s}, SFA={sfa_name}, SFB={sfb_name}, accum={accum_s}, dispatch=\"tcgen05\", cta_group={cg})",
+                        "Tx.gemm_async({dst_s}, {a_s}, {b_s}, SFA={sfa_s}, SFB={sfb_s}, accum={accum_s}, dispatch=\"tcgen05\", cta_group={cg})",
                         cg = ctx.cta_group,
                     ),
                 );
@@ -2271,15 +2312,26 @@ fn emit_stmt(
             dst, src, cta_group,
         } => {
             let dst_name = ctx.tensor_name(dst.tensor.id)?;
-            let dst_cols = dst.shape.get(1).and_then(as_int).unwrap_or(0);
+            // Emit canon's EXACT cp form: `Tx.copy_async(SFB_tmem[0:256, 0:16],
+            // SFB_smem[stage, 0:256, 0:16], cta_group=2)` — explicit logical slices on
+            // BOTH ends. Un-fold the dst's physical `(128, SF_K * n_chunks)` TMEM tensor
+            // to its logical `(128*n_chunks, SF_K)` (per-super-block SF_K=16), matching the
+            // SFB_tmem decl_buffer; the src is the staged SF SMEM `(rows, SF_CTA_K)`.
+            const BASE_SF_K_CP: usize = 16;
+            let phys_dst_cols = dst.tensor.shape.get(1).copied().unwrap_or(0);
+            let n_chunks = (phys_dst_cols / BASE_SF_K_CP).max(1);
+            let dst_rows = dst.tensor.shape.first().copied().unwrap_or(128) * n_chunks;
+            let dst_cols = phys_dst_cols / n_chunks;
             let src_name = ctx.tensor_name(src.tensor.id)?;
             let stage = emit_scalar(src.offsets.first().unwrap_or(&ScalarValue::Int(0)), ctx);
-            let r = src.shape.get(1).and_then(as_int).unwrap_or(0);
-            let c = src.shape.get(2).and_then(as_int).unwrap_or(0);
+            // src is a staged SF SMEM tile `(SMEM_DEPTH, rows, SF_CTA_K)`; its full
+            // (rows, SF_CTA_K) at this stage.
+            let r = src.tensor.shape.get(1).copied().unwrap_or(0);
+            let c = src.tensor.shape.get(2).copied().unwrap_or(0);
             emit_guarded(
                 out,
                 &format!(
-                    "Tx.copy_async({dst_name}[0:128, 0:{dst_cols}], {src_name}[{stage}, 0:{r}, 0:{c}], cta_group={cta_group})"
+                    "Tx.copy_async({dst_name}[0:{dst_rows}, 0:{dst_cols}], {src_name}[{stage}, 0:{r}, 0:{c}], cta_group={cta_group})"
                 ),
             );
             Ok(())

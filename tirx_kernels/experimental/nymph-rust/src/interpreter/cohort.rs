@@ -271,6 +271,33 @@ impl<'a, 'k> CohortContext<'a, 'k> {
     pub fn stmt_id(&self, stmt: &Stmt) -> usize {
         self.ids.stmt_id(stmt)
     }
+    /// Issuer check for a single-thread-ISSUE tcgen05 async op (`tcgen05.mma`,
+    /// `tcgen05.cp`). UNLIKE `mma.sync` (warp-collective, every lane contributes its
+    /// register fragment), a tcgen05 MMA/cp is issued by ONE thread on behalf of the
+    /// warp and reads its operands from SMEM/TMEM — so the value computation
+    /// (`accumulate_inplace`) is independent of cohort size. The valid issuer is either a
+    /// FULL warp (the non-elected role) OR a single elected lane (`lane 0`, canon's
+    /// `if elect_sync(): gemm` — the structure the B200 tensor pipe requires: per-op elect
+    /// guards that reconverge the warp between consecutive tcgen05 issues STALL the async
+    /// stream). Accept both; still reject ragged/partial cohorts (a real divergence bug).
+    pub fn check_tcgen05_issuer(
+        &self,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> IResult<()> {
+        let code = code.into();
+        let message = message.into();
+        if self.cohort.is_empty() {
+            return Err(InterpreterError::new(code, message));
+        }
+        // Single elected lane (lane 0 of each participating warp) is a valid tcgen05 issuer.
+        if self.cohort.iter().all(|t| t.lane_id == 0) {
+            return Ok(());
+        }
+        // Otherwise require full warps (the non-elected role): same rule as mma.sync.
+        self.check_full_warp_cohort(code, message)
+    }
+
     pub fn check_full_warp_cohort(
         &self,
         code: impl Into<String>,
