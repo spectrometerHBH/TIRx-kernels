@@ -47,6 +47,7 @@ mod tests {
             shape: vec![256, 256],
             layout: None,
             byte_offset: None,
+            reg_frag: None,
         });
         let a = Arc::new(Tensor {
             id: 1,
@@ -55,6 +56,7 @@ mod tests {
             shape: vec![256, 16],
             layout: None,
             byte_offset: Some(0),
+            reg_frag: None,
         });
 
         // A loop variable `k` (identity is its id).

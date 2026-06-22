@@ -1248,13 +1248,17 @@ pub struct PyTensor(pub Arc<ir::Tensor>);
 #[pymethods]
 impl PyTensor {
     #[new]
-    #[pyo3(signature = (space, dtype, shape, layout = None, byte_offset = None))]
+    #[pyo3(signature = (space, dtype, shape, layout = None, byte_offset = None, reg_frag = None))]
     fn new(
         space: PyMemorySpace,
         dtype: PyDType,
         shape: Vec<usize>,
         layout: Option<Bound<'_, PyAny>>,
         byte_offset: Option<usize>,
+        // Optional REG-fragment marker (epilogue stmatrix datapath). Either `None`
+        // (the default thread-axis tile) or a `(instr_shape: str, cast_of: int|None)`
+        // tuple — see `ir::RegFrag::Stmatrix`. `cast_of` is the read frag's tensor id.
+        reg_frag: Option<(String, Option<u32>)>,
     ) -> PyResult<Self> {
         let rust_space: ir::MemorySpace = space.into();
         if rust_space == ir::MemorySpace::Smem && byte_offset.is_none() {
@@ -1265,6 +1269,20 @@ impl PyTensor {
                 "byte_offset is only valid for SMEM tensors",
             ));
         }
+        let reg_frag = match reg_frag {
+            Some((instr_shape, cast_of)) => {
+                if rust_space != ir::MemorySpace::Reg {
+                    return Err(PyValueError::new_err(
+                        "reg_frag is only valid for REG tensors",
+                    ));
+                }
+                Some(ir::RegFrag::Stmatrix {
+                    instr_shape,
+                    cast_of,
+                })
+            }
+            None => None,
+        };
         let layout = match layout {
             Some(l) => Some(coerce_layout(&l)?),
             None => None,
@@ -1276,6 +1294,7 @@ impl PyTensor {
             shape,
             layout,
             byte_offset,
+            reg_frag,
         })))
     }
     #[getter]

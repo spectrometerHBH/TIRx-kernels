@@ -782,6 +782,7 @@ mod tests {
                 lane_align: 0,
             })),
             byte_offset: None,
+            reg_frag: None,
         }
     }
 
