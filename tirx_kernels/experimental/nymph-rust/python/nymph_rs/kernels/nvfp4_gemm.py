@@ -240,7 +240,7 @@ GEMM_CONFIGS = {
     # ncu already has nymph≈canon (0.994), so 2048's residual is grid-level (64 tasks on
     # 74 clusters → ~1 task/cluster, tail-/latency-bound), not the epilogue store. Stay
     # on the proven overlap path.
-    (2048, 2048, 2048): {"l2_group_size": 2, "load_cache_hint": None},
+    (2048, 2048, 2048): {"l2_group_size": 2, "load_cache_hint": "evict_normal"},
     # 4096: the epilogue is the wall-clock residual (ncu nymph-vs-canon at the OVERLAP
     # baseline: nymph executed 3.7% FEWER instructions yet ran 4.1% LONGER, SM throughput
     # 51.5% vs canon 57.8%, 95 vs 172 regs/thread). Canon runs OVERLAP_EPI=False + EPI_TILE=32
