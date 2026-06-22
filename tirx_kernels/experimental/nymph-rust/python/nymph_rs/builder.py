@@ -149,12 +149,17 @@ class IRBuilder:
         smem_size_bytes: int = 0,
         launch_shape: LaunchShape = (1,),
         cluster_shape: ClusterShape = (1,),
+        smem_pool: bool = False,
     ):
         self.name = name
         self.num_warps = num_warps
         self.smem_size_bytes = smem_size_bytes
         self.launch_shape = launch_shape
         self.cluster_shape = cluster_shape
+        # Emit the SMEM data buffers as one canon-style dynamic T.SMEMPool() the
+        # tensors alias into (vs N static T.alloc_buffer(scope="shared")). Gated to
+        # the small-shape variant; see NvFp4GemmConfig.smem_pool.
+        self.smem_pool = smem_pool
         self._args: list[Tensor] = []
         self._body: list[Stmt] = []
         self._body_stack: list[list[Stmt]] = [self._body]
@@ -168,6 +173,7 @@ class IRBuilder:
             smem_size_bytes=self.smem_size_bytes,
             launch_shape=self.launch_shape,
             cluster_shape=self.cluster_shape,
+            smem_pool=self.smem_pool,
         )
 
     @property

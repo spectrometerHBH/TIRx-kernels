@@ -114,6 +114,63 @@ def test_nvfp4_gemm_value_cell_exact(m, n, k, alpha):
     assert int((d != ref).sum()) == 0
 
 
+# The dynamic-SMEM-pool variant (canon's T.SMEMPool() allocation form, gated to the
+# small squares). It is purely the SMEM allocation FORM — the physical byte layout is
+# unchanged (the buffers alias the pool at the same IR offsets) — so the protocol and the
+# bit-exact value model must be identical to the default static-buffer form.
+@pytest.mark.parametrize(
+    "m,n,k,alpha", _VALUE_CASES, ids=[f"{m}x{n}x{k}@{a}" for m, n, k, a in _VALUE_CASES]
+)
+def test_nvfp4_gemm_smem_pool_value_cell_exact(m, n, k, alpha):
+    kernel = build_nvfp4_gemm(
+        NvFp4GemmConfig(m=m, n=n, k=k, alpha=alpha, launch_shape=(2,), smem_pool=True)
+    )
+    assert kernel.smem_pool
+    a_t, b_t, sfa_t, sfb_t, d_t = kernel.args
+    a_q, b_q, sfa_pack, sfb_pack, ref = _prepare(m, n, k, alpha, seed=m + n + k)
+    out = nr.interpret(kernel, {a_t: a_q, b_t: b_q, sfa_t: sfa_pack, sfb_t: sfb_pack})
+    d = np.asarray(out[d_t.id], dtype=np.float32).reshape(m, n)
+    assert np.isfinite(d).all()
+    assert int((d != ref).sum()) == 0
+
+
+@pytest.mark.parametrize("cfg", NVFP4_CONFIGS_SUPPORTED, ids=lambda c: c["label"])
+def test_nvfp4_gemm_smem_pool_protocol_passes(cfg):
+    kernel = build_nvfp4_gemm(
+        NvFp4GemmConfig(
+            m=cfg["m"], n=cfg["n"], k=cfg["k"], launch_shape=(2,), smem_pool=True
+        )
+    )
+    report = nr.check_protocol(kernel)
+    assert report["status"] == "Passed", report["diagnostics"]
+
+
+def test_nvfp4_gemm_smem_pool_emits_dynamic_pool():
+    # The pool variant emits canon's `T.SMEMPool()` + `pool.alloc(... scope="shared.dyn")`,
+    # while the default form emits the static `T.alloc_buffer(scope="shared")`. The big
+    # data buffers must move to the dynamic pool; the small mbar buffers stay static.
+    static = nr.kernel_to_tirx_source(
+        build_nvfp4_gemm(NvFp4GemmConfig(m=1024, n=1024, k=1024, launch_shape=(2,)))
+    )
+    pool = nr.kernel_to_tirx_source(
+        build_nvfp4_gemm(
+            NvFp4GemmConfig(m=1024, n=1024, k=1024, launch_shape=(2,), smem_pool=True)
+        )
+    )
+    assert "T.SMEMPool()" not in static
+    assert "T.alloc_shared" in static and 'scope="shared.dyn"' not in static
+    assert "T.SMEMPool()" in pool
+    assert "pool.commit()" in pool
+    assert 'scope="shared.dyn"' in pool
+    # The whole shared window (data buffers AND the mbar/tmem_addr buffers) goes through
+    # the dynamic pool — there is no separate static T.alloc_shared region (mixing static
+    # `shared` with the `shared.dyn` pool misaligns the pool base; everything in one pool
+    # keeps the 1024-byte alignment, exactly like canon).
+    assert "T.alloc_shared" not in pool
+    assert 'pool.alloc([5], "uint64"' in pool  # mbars come from the pool
+    assert "tmem_addr = pool.alloc(" in pool
+
+
 @pytest.mark.parametrize("size", [1024, 2048, 4096, 8192, 16384])
 def test_nvfp4_gemm_builds_every_config(size):
     # Every TIRx CONFIGS square builds. Protocol is checked up to 4096^3 here;

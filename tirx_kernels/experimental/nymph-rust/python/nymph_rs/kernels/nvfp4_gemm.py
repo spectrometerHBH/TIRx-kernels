@@ -171,6 +171,23 @@ class NvFp4GemmConfig:
     #                  store STSM, matching canon's epilogue exactly. Used by the latency-bound
     #                  small squares (1024/2048) where the epilogue store is the residual.
     epilogue: str = "overlap"
+    # SMEM allocation form (canon's `T.SMEMPool()`). Two emitted shapes over the SAME
+    # physical SMEM layout (the IR's byte offsets are unchanged):
+    #   False (default, the big-shape path) — each SMEM data buffer (A/B/SFA/SFB/D) is
+    #          its own static `T.alloc_buffer(scope="shared")`. TVM sizes the kernel's
+    #          STATIC shared footprint as the sum of those extents (ncu at 1024/2048:
+    #          176 KB static SMEM + 87 regs/thread).
+    #   True  — canon's dynamic pool: ONE `T.SMEMPool()` (`alloc_buffer([0], "uint8",
+    #          scope="shared.dyn")`) that every data buffer aliases into via
+    #          `pool.alloc(..., byte_offset=<the IR offset>)`. The buffers become
+    #          `shared.dyn`, so the static footprint drops (canon emits 159 KB DYNAMIC),
+    #          which also relieves the register pressure toward canon's 40 regs/thread.
+    #          The mbar/tmem_addr buffers stay `T.alloc_shared` (tiny). The physical
+    #          layout is byte-identical to the static form (same offsets), so the value
+    #          sim + protocol are unaffected — this is purely the allocation FORM. Gated
+    #          to the small squares (1024/2048) via GEMM_CONFIGS; the big shapes keep the
+    #          byte-identical static path.
+    smem_pool: bool = False
 
 
 def _cfg_cta_n(config: NvFp4GemmConfig) -> int:
@@ -231,7 +248,22 @@ GEMM_CONFIGS = {
     # already has nymph≈canon (16.93us vs 16.83us, 0.994), so the residual is grid-level
     # occupancy/tail latency, which STSM does not touch (and its extra reg pressure, 48 vs
     # 40, slightly hurts the latency-bound tail). So stay on the proven overlap path.
-    (1024, 1024, 1024): {"cta_n": 64, "l2_group_size": 2, "load_cache_hint": None},
+    (1024, 1024, 1024): {
+        "cta_n": 64,
+        "l2_group_size": 2,
+        "load_cache_hint": None,
+        # Canon's dynamic SMEM pool (one T.SMEMPool() the buffers alias into) instead of
+        # N static T.alloc_buffer(scope="shared"). The static SMEM footprint drops to 0
+        # (the whole 176 KB window becomes shared.dyn), giving the latency-bound 1024 more
+        # occupancy headroom. Measured (tir-bench, clean B200): 0.961 -> 0.980.
+        "smem_pool": True,
+        # Shallower SMEM pipe (4 vs the default 5 stages). With the pool form in place the
+        # 32-byte-per-tile-shallower ring is a real occupancy lever at this latency-bound
+        # square (the pipe is never the bottleneck at K=1024 / 4 k-tiles). Measured on top
+        # of the pool: 0.980 -> 0.984. (2048 keeps depth 5 — there depth 4 was 0.989 vs
+        # 0.992, and the big cubes keep their own depths.)
+        "smem_depth": 4,
+    },
     # 2048 / 4096: keep the coarse MMA_N=256 tiling; the persistent scheduler now decodes a
     # cluster's OWN linear task index through the group-major order (canon's
     # ClusterPersistentScheduler2D), so a cluster's back-to-back tiles stay in one L2 band.
@@ -250,7 +282,9 @@ GEMM_CONFIGS = {
     # ncu already has nymph≈canon (0.994), so 2048's residual is grid-level (64 tasks on
     # 74 clusters → ~1 task/cluster, tail-/latency-bound), not the epilogue store. Stay
     # on the proven overlap path.
-    (2048, 2048, 2048): {"l2_group_size": 2, "load_cache_hint": "evict_normal"},
+    # 2048: + canon's dynamic SMEM pool (smem_pool). Measured (tir-bench, clean B200):
+    # 0.976 -> 0.990 (clears the >=0.99 target). Keeps smem_depth=5 (depth 4 was 0.989).
+    (2048, 2048, 2048): {"l2_group_size": 2, "load_cache_hint": "evict_normal", "smem_pool": True},
     # 4096: the epilogue is the wall-clock residual (ncu nymph-vs-canon at the OVERLAP
     # baseline: nymph executed 3.7% FEWER instructions yet ran 4.1% LONGER, SM throughput
     # 51.5% vs canon 57.8%, 95 vs 172 regs/thread). Canon runs OVERLAP_EPI=False + EPI_TILE=32
@@ -348,6 +382,9 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
         smem_size_bytes=smem_size_bytes,
         launch_shape=launch_shape,
         cluster_shape=(cta_group,),
+        # Canon's dynamic T.SMEMPool() allocation form for the small-shape variant
+        # (1024/2048), gated via GEMM_CONFIGS; the big shapes keep the static form.
+        smem_pool=config.smem_pool,
     )
     # Operands are packed fp4: uint8[rows, K//2] (two e2m1 per byte), exactly the
     # TIRx A_packed/B_packed storage. Scales are packed e4m3 cells (u32).

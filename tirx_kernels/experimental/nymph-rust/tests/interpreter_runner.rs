@@ -206,6 +206,7 @@ fn failed_runs_do_not_expose_partial_values() {
         smem_size_bytes: 0,
         launch_shape: vec![1],
         cluster_shape: vec![1],
+        smem_pool: false,
     };
 
     let result = interpret(
@@ -244,6 +245,7 @@ fn tmem_cta_group2_collective_success_populates_peer_scratchpads() {
         smem_size_bytes: 0,
         launch_shape: vec![4],
         cluster_shape: vec![2],
+        smem_pool: false,
     };
     let result = run_value_kernel(&kernel, HashMap::new());
     assert!(kernel.validate().is_ok(), "{:?}", kernel.validate());
@@ -262,6 +264,7 @@ fn bad_input_metadata_fail_closed_is_rust_internal() {
         smem_size_bytes: 0,
         launch_shape: vec![1],
         cluster_shape: vec![1],
+        smem_pool: false,
     };
     let wrong_len = run_value_kernel(
         &empty_kernel,
@@ -345,6 +348,7 @@ fn tma_roundtrip_mbar_cell_parity_is_rust_internal() {
         smem_size_bytes: 16,
         launch_shape: vec![1],
         cluster_shape: vec![1],
+        smem_pool: false,
     };
     let result = run_trace_kernel(&kernel, HashMap::new());
     assert!(result.completed, "failed: {:?}", result.failure_reason);
@@ -413,6 +417,7 @@ fn tma_multicast_group2_mbar_targets_are_deduplicated() {
         smem_size_bytes: 16,
         launch_shape: vec![2],
         cluster_shape: vec![2],
+        smem_pool: false,
     };
     let result = run_trace_kernel(&kernel, HashMap::new());
     assert!(result.completed, "failed: {:?}", result.failure_reason);
@@ -483,6 +488,7 @@ fn mbarrier_wait_success_and_blocked_frontier_are_rust_internal() {
         smem_size_bytes: 16,
         launch_shape: vec![1],
         cluster_shape: vec![1],
+        smem_pool: false,
     };
     let result = run_trace_kernel(&kernel, HashMap::new());
     assert!(result.completed, "failed: {:?}", result.failure_reason);
@@ -535,6 +541,7 @@ fn mbarrier_wait_success_and_blocked_frontier_are_rust_internal() {
         smem_size_bytes: 0,
         launch_shape: vec![1],
         cluster_shape: vec![1],
+        smem_pool: false,
     };
     let expect_tx_result = run_trace_kernel(&expect_tx_kernel, HashMap::new());
     assert!(!expect_tx_result.completed);
@@ -592,6 +599,7 @@ fn mbarrier_wait_success_and_blocked_frontier_are_rust_internal() {
         smem_size_bytes: 0,
         launch_shape: vec![2],
         cluster_shape: vec![2],
+        smem_pool: false,
     };
     let remote_success_result = run_trace_kernel(&remote_success_kernel, HashMap::new());
     assert!(
@@ -631,6 +639,7 @@ fn scalar_tensor_initial_loads_per_thread_gmem() {
         smem_size_bytes: 0,
         launch_shape: vec![1],
         cluster_shape: vec![1],
+        smem_pool: false,
     };
     let values: Vec<i64> = (0..32).map(|x| x * 3).collect();
     let result = run_value_kernel(&kernel, HashMap::from([(source.id, u32_array(&values))]));
@@ -648,6 +657,7 @@ fn cluster_sync_cleanup_is_rust_internal() {
         smem_size_bytes: 0,
         launch_shape: vec![2],
         cluster_shape: vec![2],
+        smem_pool: false,
     };
     let result = run_trace_kernel(&kernel, HashMap::new());
     assert!(result.completed, "failed: {:?}", result.failure_reason);
@@ -696,6 +706,7 @@ fn fence_cp_async_trace_limit_fail_closed() {
         smem_size_bytes: 0,
         launch_shape: vec![1],
         cluster_shape: vec![1],
+        smem_pool: false,
     };
     let trace_limited = interpret(
         &kernel,
@@ -736,6 +747,7 @@ fn tma_and_reg_runtime_failures_expose_no_partial_values() {
         smem_size_bytes: 16,
         launch_shape: vec![1],
         cluster_shape: vec![1],
+        smem_pool: false,
     };
     let missing_source_result = run_value_kernel(&missing_source, HashMap::new());
     assert!(!missing_source_result.completed);
@@ -766,6 +778,7 @@ fn tma_and_reg_runtime_failures_expose_no_partial_values() {
         smem_size_bytes: 16,
         launch_shape: vec![1],
         cluster_shape: vec![1],
+        smem_pool: false,
     };
     let divergent_result = run_value_kernel(&divergent, HashMap::new());
     assert!(!divergent_result.completed);
@@ -794,6 +807,7 @@ fn tma_and_reg_runtime_failures_expose_no_partial_values() {
         smem_size_bytes: 0,
         launch_shape: vec![1],
         cluster_shape: vec![1],
+        smem_pool: false,
     };
     let reg_oob_result =
         run_value_kernel(&reg_oob, HashMap::from([(short.id, u32_array(&[0; 8]))]));
@@ -821,6 +835,7 @@ fn tma_and_reg_runtime_failures_expose_no_partial_values() {
         smem_size_bytes: 0,
         launch_shape: vec![1],
         cluster_shape: vec![1],
+        smem_pool: false,
     };
     let reg_missing_store_result = run_value_kernel(&reg_missing_store, HashMap::new());
     assert!(!reg_missing_store_result.completed);
@@ -869,6 +884,7 @@ fn tcgen05_commit_success_paths_update_rust_internal_mbar_cells() {
         smem_size_bytes: 0,
         launch_shape: vec![2],
         cluster_shape: vec![2],
+        smem_pool: false,
     };
     let group2 = run_trace_kernel(&group2_kernel, HashMap::new());
     assert!(group2.completed, "failed: {:?}", group2.failure_reason);
@@ -917,6 +933,7 @@ fn tcgen05_commit_success_paths_update_rust_internal_mbar_cells() {
         smem_size_bytes: 0,
         launch_shape: vec![2],
         cluster_shape: vec![2],
+        smem_pool: false,
     };
     let multicast_result = run_trace_kernel(&multicast_kernel, HashMap::new());
     assert!(
