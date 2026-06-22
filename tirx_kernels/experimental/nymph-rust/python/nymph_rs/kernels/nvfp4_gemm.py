@@ -85,14 +85,18 @@ SF_CELLS = CTA_K // SF_BLOCK // 4  # packed-u32 scale cells per row per k-tile =
 BLK_K_BYTES = CTA_K // 2  # packed fp4 bytes per row per k-tile (2 e2m1 per byte)
 EPI_TILE = 64
 TMEM_LD_SIZE = 8
-# NOTE: a setmaxnreg producer-drop / consumer-raise split (canon's, and the fp16 port's
-# (72, 208)) was tried and REVERTED — at the OVERLAP epilogue's narrow epi_tile-wide fragment
-# the extra consumer registers are dead (ncu: 93->208 regs/thread left SM throughput flat at
-# 51% and duration unchanged), while the producer drop slightly cost the latency-bound 1024.
-# Canon's register-rich epilogue (172 regs/thread) only pays off paired with its NO-OVERLAP
-# MMA_N-wide-fragment path, which nymph does not have (the no-overlap path needs ACC_DEPTH=2
-# double-buffered TMEM, but MMA_N=256 + the SF vectors at cols 448/464 already fill the 512-col
-# TMEM, so a 2nd accumulator slot does not fit without relocating the SF TMEM).
+# NOTE: a consumer-RAISE setmaxnreg (canon's / the fp16 port's (72, 208)) is dead at the
+# OVERLAP epilogue's narrow epi_tile-wide fragment (ncu: 93->208 regs/thread left SM
+# throughput flat). But the OPPOSITE — a consumer-DROP setmaxnreg.dec on the epilogue wg1
+# (maxnreg_epilogue) — IS a 1024 lever: capping wg1's register budget tightens ptxas's
+# epilogue allocation and shortens the epilogue critical path on this latency-bound square.
+# Paired with epi_tile=32 it lifts 1024 from ~0.985 to ~0.995 (see the (1024,…) GEMM_CONFIGS
+# entry). A producer-side setmaxnreg.inc on wg0 (maxnreg_producer) was also built + measured
+# and REGRESSES (0.983 vs 0.986), so only the consumer cap is used. Canon's register-rich
+# epilogue (172 regs/thread) only pays off paired with its NO-OVERLAP MMA_N-wide-fragment
+# path, which nymph does not have (the no-overlap path needs ACC_DEPTH=2 double-buffered
+# TMEM, but MMA_N=256 + the SF vectors at cols 448/464 already fill the 512-col TMEM, so a
+# 2nd accumulator slot does not fit without relocating the SF TMEM).
 ACC_DEPTH = 1  # accumulator TMEM stages (MMA_N=256 fills half of 512; one stage)
 D_DEPTH = 2  # D_smem store ring depth (store pacing)
 SMEM_DEPTH = 5  # SMEM pipeline depth (mirrors TIRx PIPE_DEPTH)
@@ -188,6 +192,19 @@ class NvFp4GemmConfig:
     #          to the small squares (1024/2048) via GEMM_CONFIGS; the big shapes keep the
     #          byte-identical static path.
     smem_pool: bool = False
+    # Per-warpgroup register budget (canon's INVARIANT-I1b per-role `setmaxnreg`). The ncu
+    # 1024 diff shows nymph at 86 regs/thread vs canon's 40 — but SMEM caps occupancy at
+    # 1 cluster/SM (Block Limit Shared Mem = 1 < Block Limit Registers = 2), so cutting regs
+    # cannot raise occupancy; this is a TEST knob to measure whether forcing fewer registers
+    # moves the latency-bound 1024 anyway. `maxnreg_epilogue` sets the wg1 (epilogue/consumer)
+    # warpgroup budget via `setmaxnreg`; None = no setmaxnreg (the default codegen budget).
+    # `maxnreg_producer` sets the wg0 (TMA+MMA producer) budget via a standalone CTA-scope
+    # `setmaxnreg` (k.setmaxnreg) emitted before the warp-level role branches — so all 4 wg0
+    # warps issue the collective op. Pairs with `maxnreg_epilogue`: the consumer
+    # `setmaxnreg.dec` releases registers the producer `setmaxnreg.inc` claims (canon's
+    # INVARIANT-I1b producer-drop / consumer-raise rebalance). None = no producer setmaxnreg.
+    maxnreg_epilogue: int | None = None
+    maxnreg_producer: int | None = None
 
 
 def _cfg_cta_n(config: NvFp4GemmConfig) -> int:
@@ -236,18 +253,16 @@ GEMM_CONFIGS = {
     # 148 SMs — the GPU is ~78% idle and the pipeline fill/drain latency is unhidden.
     # cta_n=64 halves MMA_N to 128, doubling the N bands → 32 clusters (canon's CTA_N=64
     # parallelism at this square), lifting the wall-clock ratio from ~0.79 to ~0.95.
-    # 1024: cta_n=64 (32 clusters) + 2-row L2 band + no load cache hint. The overlap
-    # epilogue with the default epi_tile=64 is the measured best (tir-bench, clean B200:
-    # 0.965). The stmatrix epilogue datapath (epilogue="stmatrix") was BUILT, validated,
-    # and ncu-proven to fire (the epilogue reg->smem store becomes STSM —
-    # `smsp__inst_executed_op_shared_stsm` 0->16384, exactly canon's; plain-STS count
-    # drops to 640, byte-identical to canon's store mix), BUT it REGRESSES this shape on
-    # the speed verdict: stmatrix+epi32 0.939, stmatrix+epi64 0.955, overlap+epi32 0.956
-    # — all below this 0.965. At 1024 only ~32 clusters occupy 148 SMs, so the kernel is
-    # pipeline fill/drain LATENCY-bound, not epilogue-store-bound; the single-cluster ncu
-    # already has nymph≈canon (16.93us vs 16.83us, 0.994), so the residual is grid-level
-    # occupancy/tail latency, which STSM does not touch (and its extra reg pressure, 48 vs
-    # 40, slightly hurts the latency-bound tail). So stay on the proven overlap path.
+    # 1024: cta_n=64 (32 clusters) + 2-row L2 band + no load cache hint + SMEM pool +
+    # smem_depth=4 + the maxnreg_epilogue=96 / epi_tile=32 epilogue pair (see below). The
+    # stmatrix epilogue datapath (epilogue="stmatrix") was BUILT, validated, and ncu-proven
+    # to fire (the epilogue reg->smem store becomes STSM — `smsp__inst_executed_op_shared_stsm`
+    # 0->16384, exactly canon's; plain-STS count drops to 640, byte-identical to canon's store
+    # mix), BUT it REGRESSES this shape on the speed verdict (stmatrix epi64 0.976, stmatrix
+    # epi32 0.968, both below the overlap path's 0.995). The no_overlap epilogue also regresses
+    # (0.975). At 1024 only ~32 clusters occupy 148 SMs (0.43 waves), so the kernel is
+    # single-task pipeline fill/drain LATENCY-bound; STSM's extra reg pressure hurts that tail.
+    # So stay on the proven overlap path — the win comes from the register cap + epi_tile, below.
     (1024, 1024, 1024): {
         "cta_n": 64,
         "l2_group_size": 2,
@@ -263,6 +278,30 @@ GEMM_CONFIGS = {
         # of the pool: 0.980 -> 0.984. (2048 keeps depth 5 — there depth 4 was 0.989 vs
         # 0.992, and the big cubes keep their own depths.)
         "smem_depth": 4,
+        # The TWO levers that lift 1024 from ~0.985 to ~0.995 (clearing the >=0.99 target),
+        # found by re-profiling fresh WITH the SMEM pool active. The fresh ncu diff (nymph
+        # vs canon, pool on) put the epilogue/consumer warpgroup's register footprint and
+        # the epilogue store-band width as the dominant residual: nymph's per-task critical
+        # path is the {tcgen05_ld; wait_ld; scale; cast; STS; TMA-store} epilogue chain, and
+        # at ~32 clusters on 148 SMs (0.43 waves) the kernel is single-task latency-bound, so
+        # shortening that chain is the only lever left (config space — l2_group_size,
+        # smem_depth, d_depth, load_cache_hint, stmatrix/no_overlap epilogue — was re-swept
+        # with the pool on and is flat-to-worse; cache_hint does NOT close the L1-hit-rate
+        # diff; the stmatrix/no_overlap epilogues REGRESS this latency-bound square).
+        #   * maxnreg_epilogue=96 — canon's INVARIANT-I1b per-role setmaxnreg on the wg1
+        #     (epilogue/consumer) warpgroup. The `setmaxnreg.dec` tightens ptxas's epilogue
+        #     register allocation, shortening the epilogue critical path. (A producer-side
+        #     setmaxnreg.inc on wg0 was BUILT and measured — it REGRESSES, 0.983 vs 0.986 —
+        #     so only the consumer cap is used.) Alone: 0.983 -> 0.986.
+        #   * epi_tile=32 — canon's EPI_TILE at 1024 (vs the default 64). Halving the store
+        #     band gives 4 narrower store tiles that pipeline better behind the tighter
+        #     epilogue. Alone it is flat (0.983), but it STACKS with the register cap: the
+        #     two together reach 0.995 (4-round interleaved A/B, reps=12, clean B200: baseline
+        #     0.983-0.986 vs this 0.994-0.997). The maxnreg plateau is broad — 80..128 all
+        #     give 0.992-0.994 with epi32 — so 96 (canon's effective epilogue budget) is the
+        #     robust pick, not a knife-edge.
+        "maxnreg_epilogue": 96,
+        "epi_tile": 32,
     },
     # 2048 / 4096: keep the coarse MMA_N=256 tiling; the persistent scheduler now decodes a
     # cluster's OWN linear task index through the group-major order (canon's
@@ -317,6 +356,7 @@ GEMM_CONFIGS = {
 def gemm_config_for(m: int, n: int, k: int) -> dict:
     """The per-shape knob overrides for (m, n, k); empty dict = all defaults."""
     return dict(GEMM_CONFIGS.get((m, n, k), {}))
+
 
 # Cheap shapes for the protocol + value sweeps: different k-tile counts and tile
 # counts, all on the single cluster datapath. Larger squares build/protocol only.
@@ -600,6 +640,14 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     k.fence(kind=FenceKind.ASYNC_PROXY, scope=FenceScope.CTA)
     k.cluster_sync()
 
+    # Per-role register rebalance (canon's INVARIANT-I1b). The wg1 (epilogue/consumer)
+    # `setmaxnreg.dec` is on its role below; the wg0 (TMA+MMA producer) `setmaxnreg.inc`
+    # is emitted HERE in CTA scope (before the warp-level role branches diverge) so all 4
+    # wg0 warps issue the collective op together. Gated to the small-shape variant via the
+    # config; the big shapes leave both None (no setmaxnreg, byte-identical static path).
+    if config.maxnreg_producer is not None:
+        k.setmaxnreg(warpgroup=0, count=config.maxnreg_producer)
+
     # ---- TMA producer (wg0/warp2 — canon's WarpRole.TMA) ----
     with k.role(warp=2):
         with k.for_each_task(task_scheduler) as task:
@@ -836,9 +884,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                     shape=(1, 1, store_chunk),
                 ),
                 TensorSlice(
-                    tensor=out_frag,
-                    offsets=(frag_off + ki * store_chunk,),
-                    shape=(store_chunk,),
+                    tensor=out_frag, offsets=(frag_off + ki * store_chunk,), shape=(store_chunk,)
                 ),
             )
         k.fence(kind=FenceKind.ASYNC_PROXY, scope=FenceScope.CTA)
@@ -852,7 +898,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
         )
         k.cp_async_bulk_commit_group()
 
-    with k.role(warpgroup=1):
+    with k.role(warpgroup=1, maxnreg=config.maxnreg_epilogue):
         with k.for_each_task(task_scheduler) as task:
             local_iter = (task.task_id - task_start) // task_step
             m_idx, n_idx = work_coords(task.task_id, cta_rank)
@@ -893,7 +939,9 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                 # ONE mul + ONE cast — not epi_tile//8 narrow 8-col loads each with its own
                 # wait_ld (which serialized the drain on 8x the async-load fences canon pays).
                 for ot in range(store_tiles):
-                    k.tcgen05_ld(accum_frag, accum, num=epi_tile, row=0, col=acc_col0 + ot * epi_tile)
+                    k.tcgen05_ld(
+                        accum_frag, accum, num=epi_tile, row=0, col=acc_col0 + ot * epi_tile
+                    )
                     k.tcgen05_wait_ld()
                     k.reg_mul(accum_frag, accum_frag, config.alpha)
                     k.reg_cvt(out_frag, accum_frag)

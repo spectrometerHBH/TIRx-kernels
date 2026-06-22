@@ -55,7 +55,10 @@ fn ab_words(arr: ValueArray2, ab_dtype: DType, label: &str) -> IResult<Array2<u3
     let pack = |lo: u16, hi: u16| (lo as u32) | ((hi as u32) << 16);
     let pack_reg = |a: Array2<f32>| {
         Array2::from_shape_fn((a.nrows(), a.ncols() / 2), |(t, w)| {
-            pack(encode_half(a[[t, 2 * w]], ab_dtype), encode_half(a[[t, 2 * w + 1]], ab_dtype))
+            pack(
+                encode_half(a[[t, 2 * w]], ab_dtype),
+                encode_half(a[[t, 2 * w + 1]], ab_dtype),
+            )
         })
     };
     match arr {
@@ -74,9 +77,16 @@ fn execute_warp_mma<'a, 'k>(
     stmt: &'k Stmt,
 ) -> IResult<StepStatus> {
     let (d, a, b, c, m, n, kk, ab_dtype) = match stmt {
-        Stmt::WarpMma { d, a, b, c, m, n, k, ab_dtype } => {
-            (d, a, b, c, *m as usize, *n as usize, *k as usize, *ab_dtype)
-        }
+        Stmt::WarpMma {
+            d,
+            a,
+            b,
+            c,
+            m,
+            n,
+            k,
+            ab_dtype,
+        } => (d, a, b, c, *m as usize, *n as usize, *k as usize, *ab_dtype),
         _ => unreachable!(),
     };
     ctx.check_full_warp_cohort(

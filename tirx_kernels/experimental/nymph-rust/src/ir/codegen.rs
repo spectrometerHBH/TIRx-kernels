@@ -254,7 +254,10 @@ fn pad(indent: usize) -> String {
 /// Positional arg name: A, B, C, D, E, … (then Arg{i} past the alphabet).
 fn arg_name(i: usize) -> String {
     const NAMES: [&str; 8] = ["A", "B", "C", "D", "E", "F", "G", "H"];
-    NAMES.get(i).map(|s| s.to_string()).unwrap_or_else(|| format!("Arg{i}"))
+    NAMES
+        .get(i)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("Arg{i}"))
 }
 
 pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
@@ -459,9 +462,9 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
             // the swizzle atom indexing computes a misaligned address and the kernel faults
             // (cudaErrorMisalignedAddress) — even though the byte offset is identical. The
             // mailbox (flat row-major int, no layout) takes no alignment.
-            let off = t.byte_offset.ok_or_else(|| {
-                format!("codegen: smem_pool tensor {name} has no byte_offset")
-            })?;
+            let off = t
+                .byte_offset
+                .ok_or_else(|| format!("codegen: smem_pool tensor {name} has no byte_offset"))?;
             out.push_str(&format!(
                 "{p}pool.move_base_to({off})\n",
                 p = pad(ind),
@@ -1825,25 +1828,26 @@ fn emit_stmt(
                 // `alloc_tcgen05_ldst_frag(instr_shape, (128, W), dtype)`; the cast (output)
                 // frag is `alloc_cast_frag(<read_frag>, dtype)`, inheriting the read frag's
                 // (lane, register) layout so the f32->bf16 cast is a per-thread no-movement op.
-                Some(super::tensor::RegFrag::Stmatrix { instr_shape, cast_of }) => {
-                    match cast_of {
-                        None => {
-                            out.push_str(&format!(
+                Some(super::tensor::RegFrag::Stmatrix {
+                    instr_shape,
+                    cast_of,
+                }) => match cast_of {
+                    None => {
+                        out.push_str(&format!(
                                 "{p}{name} = T.alloc_tcgen05_ldst_frag(\"{instr_shape}\", (128, {width}), \"{dt}\")\n",
                                 p = pad(indent),
                                 dt = dtype_str(tensor.dtype),
                             ));
-                        }
-                        Some(src_id) => {
-                            let src_name = ctx.tensor_name(*src_id)?.to_string();
-                            out.push_str(&format!(
-                                "{p}{name} = T.alloc_cast_frag({src_name}, \"{dt}\")\n",
-                                p = pad(indent),
-                                dt = dtype_str(tensor.dtype),
-                            ));
-                        }
                     }
-                }
+                    Some(src_id) => {
+                        let src_name = ctx.tensor_name(*src_id)?.to_string();
+                        out.push_str(&format!(
+                            "{p}{name} = T.alloc_cast_frag({src_name}, \"{dt}\")\n",
+                            p = pad(indent),
+                            dt = dtype_str(tensor.dtype),
+                        ));
+                    }
+                },
                 None => {
                     out.push_str(&format!(
                         "{p}{name} = T.wg_reg_tile({width}, dtype=\"{dt}\")\n",
@@ -2159,7 +2163,10 @@ fn emit_stmt(
         // (the kernel's own `sched_arr` full barrier). Single-issue (the role's elect
         // guard), exactly like canon's `if T.ptx.elect_sync(): clc_try_cancel(...)`.
         ClcTryCancel {
-            handle, mbar, stage, ..
+            handle,
+            mbar,
+            stage,
+            ..
         } => {
             let handle_name = ctx.tensor_name(handle.id)?;
             // Both args are `T.address_of(buf[i])` — exactly canon's
@@ -2260,7 +2267,10 @@ fn emit_stmt(
         }
         MBarrierExpectTx { mbar, bytes, stage } => {
             let slot_ptr = mbar_slot_ptr(mbar, stage, ctx)?;
-            emit_guarded(out, &format!("T.ptx.mbarrier.expect_tx({slot_ptr}, {bytes})"));
+            emit_guarded(
+                out,
+                &format!("T.ptx.mbarrier.expect_tx({slot_ptr}, {bytes})"),
+            );
             Ok(())
         }
         MBarrierArrive { mbar, count, stage } => {
@@ -2401,7 +2411,14 @@ fn emit_stmt(
 
         // ---- tcgen05 MMA ----
         Tcgen05Mma {
-            dst, a, b, accum, sfa, sfb, a_fp4, ..
+            dst,
+            a,
+            b,
+            accum,
+            sfa,
+            sfb,
+            a_fp4,
+            ..
         } => {
             let dst_s = emit_tmem_dst(dst, ctx)?;
             // The A/B operands are staged SMEM tiles: drop the leading ring index so
@@ -2466,7 +2483,9 @@ fn emit_stmt(
         // NVFP4 scale-factor copy SMEM -> e4m3 TMEM (canon's Tx.copy_async(SFA_tmem,
         // SFA_smem[stage], cta_group=2)). Single-issue, like the MMA/commit.
         Tcgen05Cp {
-            dst, src, cta_group,
+            dst,
+            src,
+            cta_group,
         } => {
             let dst_name = ctx.tensor_name(dst.tensor.id)?;
             // Emit canon's EXACT cp form: `Tx.copy_async(SFB_tmem[0:256, 0:16],
@@ -2679,7 +2698,9 @@ fn emit_stmt(
                         out.push_str(&format!("{p}T.ptx.fence.proxy_async(\"shared::cta\")\n"));
                     } else {
                         out.push_str(&format!("{p}if tid_in_wg == 0:\n"));
-                        out.push_str(&format!("{p}    T.ptx.fence.proxy_async(\"shared::cta\")\n"));
+                        out.push_str(&format!(
+                            "{p}    T.ptx.fence.proxy_async(\"shared::cta\")\n"
+                        ));
                     }
                 }
                 FenceKind::Memory | FenceKind::View => {}
@@ -2729,6 +2750,15 @@ fn emit_stmt(
         WarpSync => Ok(()),
         WgSync { barrier_id } => {
             out.push_str(&format!("{p}T.cuda.warpgroup_sync({barrier_id})\n"));
+            Ok(())
+        }
+        // Standalone per-warpgroup register budget (canon's per-role setmaxnreg). Gate on
+        // `wg_id == <warpgroup>` so exactly that warpgroup's 4 warps issue the collective
+        // `T.ptx.setmaxnreg`; inc when the budget rises above the 128-reg default, else dec.
+        SetMaxNReg { warpgroup, count } => {
+            let inc = if *count > 128 { "True" } else { "False" };
+            out.push_str(&format!("{p}if wg_id == {warpgroup}:\n"));
+            out.push_str(&format!("{p}    T.ptx.setmaxnreg({inc}, {count})\n"));
             Ok(())
         }
         // Cross-warpgroup named barrier — `bar.sync barrier_id, num_warps*32`. Unlike

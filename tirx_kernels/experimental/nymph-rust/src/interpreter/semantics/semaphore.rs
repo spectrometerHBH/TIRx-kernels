@@ -122,11 +122,8 @@ fn execute_gmem_wait_eq<'a, 'k>(
         _ => unreachable!(),
     };
     let key = resolve_sem_key(ctx, sem, coords, "gmem_wait_eq coords")?;
-    let want = ctx.eval_scalar_uniform(
-        value,
-        "gmem_wait_eq value",
-        "divergent_semaphore_operands",
-    )?;
+    let want =
+        ctx.eval_scalar_uniform(value, "gmem_wait_eq value", "divergent_semaphore_operands")?;
     let current = ctx.state.values.semaphores.get(key);
     if current != want {
         // Not our turn yet — yield and re-run next scheduler round (the polled

@@ -140,3 +140,36 @@ def test_nvfp4_gemm_value_d_depth(m, n, k, alpha, d_depth):
     d = np.asarray(out[d_t.id], dtype=np.float32).reshape(m, n)
     assert np.isfinite(d).all()
     assert int((d != ref).sum()) == 0, f"{int((d != ref).sum())} mismatches (d_depth={d_depth})"
+
+
+# Per-warpgroup register budgets (canon's INVARIANT-I1b setmaxnreg). The 1024 square
+# carries maxnreg_epilogue=96 + epi_tile=32 in GEMM_CONFIGS; setmaxnreg is a pure
+# register-allocation hint with NO value, protocol, or rendezvous effect, so the values
+# must stay bit-exact for both the consumer cap alone AND the producer.inc / consumer.dec
+# pair. epi_tile=32 here mirrors the shipped 1024 config.
+@pytest.mark.parametrize(
+    "m,n,k,alpha,mnr_epi,mnr_prod",
+    [
+        (512, 512, 1024, 1.0, 96, None),  # consumer cap only (the shipped 1024 lever)
+        (1024, 1024, 1024, 0.5, 96, 152),  # consumer.dec + producer.inc rebalance
+    ],
+    ids=["mnr-epi96", "mnr-epi96-prod152"],
+)
+def test_nvfp4_gemm_value_setmaxnreg(m, n, k, alpha, mnr_epi, mnr_prod):
+    cfg = NvFp4GemmConfig(
+        m=m,
+        n=n,
+        k=k,
+        alpha=alpha,
+        launch_shape=(2,),
+        epi_tile=32,
+        maxnreg_epilogue=mnr_epi,
+        maxnreg_producer=mnr_prod,
+    )
+    kernel = build_nvfp4_gemm(cfg)
+    a_t, b_t, sfa_t, sfb_t, d_t = kernel.args
+    a_q, b_q, sfa, sfb, ref = _prepare(m, n, k, alpha, seed=m + n + k + (mnr_prod or 0))
+    out = nr.interpret(kernel, {a_t: a_q, b_t: b_q, sfa_t: sfa, sfb_t: sfb})
+    d = np.asarray(out[d_t.id], dtype=np.float32).reshape(m, n)
+    assert np.isfinite(d).all()
+    assert int((d != ref).sum()) == 0, f"{int((d != ref).sum())} mismatches (setmaxnreg)"

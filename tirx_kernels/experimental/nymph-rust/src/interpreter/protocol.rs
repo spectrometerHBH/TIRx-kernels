@@ -352,7 +352,10 @@ pub enum TensorAccessKind {
     /// is order-dependent). The checker uses BOTH facts: atomicity makes two same-op reduces
     /// to one location race-free without ordering; `exact=false` makes the result
     /// order-dependent (non-deterministic), which it surfaces as a warning, not a race.
-    TmaReduce { op: ReduceOp, exact: bool },
+    TmaReduce {
+        op: ReduceOp,
+        exact: bool,
+    },
 }
 
 impl TensorAccessKind {

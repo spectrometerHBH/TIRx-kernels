@@ -24,6 +24,17 @@ pub fn register(reg: &mut StmtExecutorRegistry) {
         execute_cluster_barrier_arrive,
     );
     reg.register(StmtKind::ClusterBarrierWait, execute_cluster_barrier_wait);
+    reg.register(StmtKind::SetMaxNReg, execute_setmaxnreg);
+}
+
+/// `setmaxnreg` is a pure per-warpgroup register-allocation hint — no value, protocol,
+/// or rendezvous effect. The value/protocol model just advances past it (the threads of
+/// the gated warpgroup execute it independently; it is not a collective barrier).
+fn execute_setmaxnreg<'a, 'k>(
+    _ctx: &mut CohortContext<'a, 'k>,
+    _stmt: &'k Stmt,
+) -> IResult<StepStatus> {
+    Ok(StepStatus::advance())
 }
 
 /// Split cluster barrier key — one hardware named cluster barrier per cluster, used
@@ -109,7 +120,10 @@ fn execute_named_barrier<'a, 'k>(
         _ => unreachable!(),
     };
     let expected_count = (num_warps as usize) * 32;
-    let key = format!("named_barrier:cta{}:bar{}", ctx.cohort[0].cta_id, barrier_id);
+    let key = format!(
+        "named_barrier:cta{}:bar{}",
+        ctx.cohort[0].cta_id, barrier_id
+    );
     let arriving: HashSet<ThreadId> = ctx.cohort.iter().cloned().collect();
     let cycle = ctx
         .state

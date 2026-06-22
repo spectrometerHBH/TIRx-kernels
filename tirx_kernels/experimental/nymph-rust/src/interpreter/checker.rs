@@ -683,7 +683,12 @@ fn async_group_lifetime_local(cx: &mut CheckerCx<'_>) -> CheckResult {
     };
     // per-STREAM pending store (two CTAs execute the SAME kernel stmt, so the
     // stmt id alone cannot key an in-flight store)
-    type PendingStore = (usize, Option<Region>, Option<Region>, Option<(ReduceOp, bool)>);
+    type PendingStore = (
+        usize,
+        Option<Region>,
+        Option<Region>,
+        Option<(ReduceOp, bool)>,
+    );
     let mut pending_store: HashMap<usize, PendingStore> = HashMap::new();
     fn flush_pending(
         pending: PendingStore,
@@ -767,10 +772,12 @@ fn async_group_lifetime_local(cx: &mut CheckerCx<'_>) -> CheckResult {
                     event.stmt_id,
                     event,
                 )?;
-                let entry =
-                    pending_store
-                        .entry(scope.stream_id)
-                        .or_insert((event.stmt_id, None, None, None));
+                let entry = pending_store.entry(scope.stream_id).or_insert((
+                    event.stmt_id,
+                    None,
+                    None,
+                    None,
+                ));
                 entry.1 = Some(region.clone());
             }
             // An async bulk store dest — a plain TMA store OR an atomic reduce
@@ -787,10 +794,12 @@ fn async_group_lifetime_local(cx: &mut CheckerCx<'_>) -> CheckResult {
                 TensorAccessKind::TmaStore | TensorAccessKind::TmaReduce { .. }
             ) =>
             {
-                let entry =
-                    pending_store
-                        .entry(scope.stream_id)
-                        .or_insert((event.stmt_id, None, None, None));
+                let entry = pending_store.entry(scope.stream_id).or_insert((
+                    event.stmt_id,
+                    None,
+                    None,
+                    None,
+                ));
                 entry.2 = Some(region.clone());
                 entry.3 = k.reduce();
             }
@@ -3167,7 +3176,12 @@ mod tests {
             // Commit + wait carry DISTINCT stmt ids (separate builder calls): the
             // window pass flushes the pending Read/Write into a window when the stmt id
             // changes, the CommitGroup then closes the group, and WaitGroup(0) drains it.
-            event(stid + 1, TraceEventKind::CommitGroup { scope: scope(stream) }),
+            event(
+                stid + 1,
+                TraceEventKind::CommitGroup {
+                    scope: scope(stream),
+                },
+            ),
             event(
                 stid + 2,
                 TraceEventKind::WaitGroup {
@@ -3550,7 +3564,10 @@ mod tests {
         );
         assert!(!diagnostic_codes(&report).contains("async_group_cross_stream_dest_access"));
         // sem-ordered (deterministic) -> NO non-determinism warning (the distinguishing fact).
-        assert!(!report.warnings.iter().any(|w| w.code == "nondeterministic_reduction"));
+        assert!(!report
+            .warnings
+            .iter()
+            .any(|w| w.code == "nondeterministic_reduction"));
     }
 
     #[test]
@@ -3564,9 +3581,15 @@ mod tests {
             ProtocolReport::new(ProtocolStatus::Passed),
             &build_two_cta_reduce_add(false),
         );
-        assert_eq!(pass_status(&report, "trace_gap_audit"), ProtocolStatus::Passed);
+        assert_eq!(
+            pass_status(&report, "trace_gap_audit"),
+            ProtocolStatus::Passed
+        );
         assert!(!diagnostic_codes(&report).contains("async_group_cross_stream_dest_access"));
-        assert!(report.warnings.iter().any(|w| w.code == "nondeterministic_reduction"));
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w.code == "nondeterministic_reduction"));
     }
 
     #[test]
@@ -3581,9 +3604,15 @@ mod tests {
             ProtocolReport::new(ProtocolStatus::Passed),
             &events,
         );
-        assert_eq!(pass_status(&report, "trace_gap_audit"), ProtocolStatus::Passed);
+        assert_eq!(
+            pass_status(&report, "trace_gap_audit"),
+            ProtocolStatus::Passed
+        );
         assert!(!diagnostic_codes(&report).contains("async_group_cross_stream_dest_access"));
-        assert!(!report.warnings.iter().any(|w| w.code == "nondeterministic_reduction"));
+        assert!(!report
+            .warnings
+            .iter()
+            .any(|w| w.code == "nondeterministic_reduction"));
     }
 
     fn reduce_then_plain(plain_read: bool) -> Vec<TraceEvent> {
