@@ -85,6 +85,14 @@ SF_CELLS = CTA_K // SF_BLOCK // 4  # packed-u32 scale cells per row per k-tile =
 BLK_K_BYTES = CTA_K // 2  # packed fp4 bytes per row per k-tile (2 e2m1 per byte)
 EPI_TILE = 64
 TMEM_LD_SIZE = 8
+# NOTE: a setmaxnreg producer-drop / consumer-raise split (canon's, and the fp16 port's
+# (72, 208)) was tried and REVERTED — at the OVERLAP epilogue's narrow epi_tile-wide fragment
+# the extra consumer registers are dead (ncu: 93->208 regs/thread left SM throughput flat at
+# 51% and duration unchanged), while the producer drop slightly cost the latency-bound 1024.
+# Canon's register-rich epilogue (172 regs/thread) only pays off paired with its NO-OVERLAP
+# MMA_N-wide-fragment path, which nymph does not have (the no-overlap path needs ACC_DEPTH=2
+# double-buffered TMEM, but MMA_N=256 + the SF vectors at cols 448/464 already fill the 512-col
+# TMEM, so a 2nd accumulator slot does not fit without relocating the SF TMEM).
 ACC_DEPTH = 1  # accumulator TMEM stages (MMA_N=256 fills half of 512; one stage)
 D_DEPTH = 2  # D_smem store ring depth (store pacing)
 SMEM_DEPTH = 5  # SMEM pipeline depth (mirrors TIRx PIPE_DEPTH)
@@ -125,6 +133,15 @@ class NvFp4GemmConfig:
     # back-to-back tiles hit in L2. Per-shape (canon: 12 @ 1024, 4 @ 2048/4096). None =
     # default TILE_GROUPS_ROW_SIZE.
     l2_group_size: int | None = None
+    # L2 eviction policy on the A/B/SFA/SFB g2c loads (canon's `_tma_g2c_args` cache_hint).
+    # The big cubes (8192/16384, many persistent tasks/cluster) NEED `evict_normal` to bound
+    # the L2 cache-policy traffic — without it a TMA reads a stale tensormap and the launch
+    # faults (error 719). But on the SMALL shapes (1024/2048/4096) the operand bands fit L2
+    # comfortably, so the hint is dead weight that costs ~1% (ncu: it perturbs the L2 sector
+    # policy with no hit-rate gain). So this is a per-shape knob: `None` (no hint) for the
+    # small shapes, `"evict_normal"` for the cubes. Default `evict_normal` keeps the cubes
+    # stable when no shape override is present. The epilogue store keeps its own evict_first.
+    load_cache_hint: str | None = "evict_normal"
 
 
 def _cfg_cta_n(config: NvFp4GemmConfig) -> int:
@@ -169,16 +186,19 @@ GEMM_CONFIGS = {
     # 148 SMs — the GPU is ~78% idle and the pipeline fill/drain latency is unhidden.
     # cta_n=64 halves MMA_N to 128, doubling the N bands → 32 clusters (canon's CTA_N=64
     # parallelism at this square), lifting the wall-clock ratio from ~0.79 to ~0.95.
-    (1024, 1024, 1024): {"cta_n": 64, "l2_group_size": 12},
+    (1024, 1024, 1024): {"cta_n": 64, "l2_group_size": 2, "load_cache_hint": None},
     # 2048 / 4096: keep the coarse MMA_N=256 tiling; the persistent scheduler now decodes a
     # cluster's OWN linear task index through the group-major order (canon's
     # ClusterPersistentScheduler2D), so a cluster's back-to-back tiles stay in one L2 band.
-    # The L2_GROUP_SIZE row-band width is tuned per shape against tir-bench wall-clock:
-    # 2048 peaks sharply at a 4-row band (1->0.975, 4->0.983, 8->0.965); 4096 is flat-to-mildly
-    # better at a 1-row band (column-major within an N band: 1->0.962, 4->0.957, 16->0.961) —
-    # at 4096 the kernel is compute-bound (nymph==canon per-CTA), so the grouping is a weak lever.
-    (2048, 2048, 2048): {"l2_group_size": 4},
-    (4096, 4096, 4096): {"l2_group_size": 1},
+    # The L2_GROUP_SIZE row-band width is tuned per shape against tir-bench wall-clock on a
+    # DEDICATED idle B200 (re-swept after dropping the small-shape load cache hint): a 2-row
+    # band is the consistent marginal peak across all three small squares (2048: 1->0.973,
+    # 2->0.978, 4->0.974, 8->0.975; 4096: 1->0.960, 2->0.961, 4->0.957, 8->0.960; 1024 is flat
+    # since its cta_n=64 gives pair_rows=4). At 2048/4096 the kernel is compute-bound (nymph≈canon
+    # per-CTA, ncu), so the grouping is a weak lever — within shared-GPU noise — but 2 is never
+    # worse and is the median-best on the clean GPU.
+    (2048, 2048, 2048): {"l2_group_size": 2, "load_cache_hint": None},
+    (4096, 4096, 4096): {"l2_group_size": 2, "load_cache_hint": None},
     # 8192 / 16384: NO per-shape override yet. These squares run ~14 persistent tasks per
     # cluster, and there is a PRE-EXISTING, timing-sensitive async-pipeline hazard in the
     # cross-task continuation that surfaces ONLY at ~10+ tasks/cluster at full async
@@ -221,6 +241,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     sfb_cols = SF_CTA_K * sfb_n_chunks  # the full N band's SF cells per lane (folded)
     epi_tile = _cfg_epi_tile(config)
     smem_depth = _cfg_smem_depth(config)
+    load_cache_hint = config.load_cache_hint  # per-shape L2 hint on the g2c loads (see config)
     blk_m = CTA_M  # per-CTA A rows (its own M tile)
     blk_n = cta_n  # per-CTA B rows (its half of the shared N band)
     sched_rows = _ceil_div(M, CTA_M)  # M tiles
@@ -485,7 +506,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                     shape=(1, blk_m, BLK_K_BYTES),
                     gmem_shape=(blk_m, BLK_K_BYTES),
                     mbar_stage=stage,
-                    cache_hint="evict_normal",
+                    cache_hint=load_cache_hint,
                 )
                 k.tma_load(
                     TensorSlice(
@@ -498,7 +519,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                     shape=(1, blk_n, BLK_K_BYTES),
                     gmem_shape=(blk_n, BLK_K_BYTES),
                     mbar_stage=stage,
-                    cache_hint="evict_normal",
+                    cache_hint=load_cache_hint,
                 )
                 # SFA: this CTA's M rows; SFB: the full N band. e4m3 (rows, SF_CTA_K)
                 # straight from the (rows, K//16) GMEM at this k-tile's column band,
@@ -513,7 +534,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                     shape=(1, blk_m, SF_CTA_K),
                     gmem_shape=(blk_m, SF_CTA_K),
                     mbar_stage=stage,
-                    cache_hint="evict_normal",
+                    cache_hint=load_cache_hint,
                 )
                 # SFB: the FULL MMA_N=256-wide N band (rank-independent sf_n), so both
                 # CTAs hold the same full-band scales (canon's SFB_N==MMA_N path). The B
@@ -545,7 +566,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                     shape=(1, mma_n, SF_CTA_K),
                     gmem_shape=(mma_n, SF_CTA_K),
                     mbar_stage=stage,
-                    cache_hint="evict_normal",
+                    cache_hint=load_cache_hint,
                 )
 
     # ---- MMA (wg0/warp0, cluster leader only — canon's WarpRole.MMA) ----
