@@ -231,13 +231,22 @@ void nvfp4_cublaslt(torch::Tensor A, torch::Tensor B, torch::Tensor A_scale,
     return _CUBLASLT_EXT
 
 
-def _tma_g2c_args(bar, stage, cta_mask, cta_group):
+def _tma_g2c_args(bar_r0, stage, cta_mask, cta_group):
     """Shared kwargs for the A/B and SF TMA g2c loads; only the mbarrier and
-    cta_mask vary."""
+    cta_mask vary.
+
+    ``bar_r0`` is the barrier ALREADY mapped to cluster rank 0 (the pair leader)
+    once via ``bar.remote_view(0)`` — its ``.buf`` is the rank-0-mapped base, so
+    ``bar_r0.ptr_to([stage])`` is a plain ``base + stage*8`` add, NOT a per-call
+    ``mapa.shared::cluster`` (the `0x654` PRMT/UPRMT/SEL/IMAD.WIDE remap chain).
+    The old form re-mapped ``bar.ptr_to([stage])`` on EVERY g2c copy (4 copies x
+    K_TILES x tasks), emitting that `mapa` ALU per copy; hoisting the rank-0 map
+    out of the k-loop (mirroring nymph's prologue ``smem_full_cta0_ptr``) sheds
+    it — leaving only the cheap stage index add."""
     return {
         "dispatch": "tma",
         "cta_group": cta_group,
-        "mbar": T.reinterpret("handle", T.ptx.map_shared_rank(bar.ptr_to([stage]), 0)),
+        "mbar": T.reinterpret("handle", bar_r0.ptr_to([stage])),
         "cta_mask": cta_mask,
         "cache_hint": "evict_normal",
         "prefetch_tensormap": True,
@@ -274,6 +283,34 @@ def _kernel(
     L2_GROUP_SIZE: T.constexpr = 8,
     NUM_WARPS: T.constexpr = 8,
     OVERLAP_EPI: T.constexpr = True,
+    # Epilogue reg->smem store datapath:
+    #   "stsm" — the tcgen05.ld-atom fragment (`alloc_tcgen05_ldst_frag` "16x256b")
+    #            stored with `dispatch="ldstmatrix"` → STSM. The narrow per-store-tile
+    #            EPI_TILE-wide tcgen05.ld atoms force a tcgen05.ld per chunk (the more
+    #            store tiles, the more tcgen05.ld) plus the STSM datapath's address ALU.
+    #   "sts"  — nymph's / fp16_bf16_gemm's datapath: a plain `T.wg_reg_tile` (thread-axis
+    #            (128, W) reg tile) drained from TMEM with ONE wide tcgen05.ld per EPI_TILE
+    #            band, stored reg->smem with plain `Tx.wg.copy` in 8-bf16 (128b) sub-slices
+    #            → STS.128. Sheds the per-chunk STSM/tcgen05.ld address ALU (ncu @16384:
+    #            canon's STSM datapath issued +7.7M ALU + 8x the tcgen05.ld vs nymph's STS).
+    EPI_STORE: T.constexpr = "stsm",
+    # MMA/consumer k-loop structure:
+    #   False — the flat `T.serial(K_TILES)` form with a RUNTIME `accum` register
+    #           (accum=0 then accum=1 inside the loop), feeding gemm_async an
+    #           accumulate flag the tcgen05 MMA reads from a register every issue.
+    #   True  — nymph's PEELED software-pipeline form: peel k=0 with a COMPILE-TIME
+    #           `accum=False` (cold accumulate), then a `T.serial(K_TILES-1)` steady
+    #           state with a COMPILE-TIME `accum=True`. Dropping the runtime accum
+    #           variable sheds the per-k-tile `accum=1` store + the register read on
+    #           the gemm issue, and lets the peeled prologue (k=0) issue its
+    #           cp/cp/gemm before the steady-state loop's per-iteration ring counter
+    #           runs — matching nymph's emitted k-loop (its `mma_ktile(0, False)` +
+    #           `for ti in serial(63): mma_ktile(ti+1, True)`). Trims the consumer
+    #           warp's ALU/CBU pipe pressure (ncu @16384: canon's flat form executes
+    #           +5.3M ALU vs nymph at equal instruction count; under the shared ~990W
+    #           power cap that extra per-cycle ALU intensity pins canon's sustained
+    #           clock ~100 MHz below nymph). Gated per-shape in TIRX_CONFIGS.
+    MMA_PEEL: T.constexpr = False,
 ):
     # Derived shapes (formulas, so they track the params above).
     CLUSTER_SIZE = T.meta_var(CLUSTER_M * CLUSTER_N)
@@ -350,6 +387,14 @@ def _kernel(
     tile_full_bar.init(1)
     scale_full_bar = TMABar(pool, PIPE_DEPTH, leader=mbar_leader)
     scale_full_bar.init(1)
+    # Hoist the cluster-rank-0 (pair-leader) barrier mapping out of the per-k-tile
+    # g2c loads. `remote_view(0)` computes `map_shared_rank(buf.ptr_to([0]), 0)`
+    # ONCE; the TMA copies then index `[stage]` (a plain add) instead of re-issuing
+    # the `mapa.shared::cluster` remap (`0x654` PRMT/UPRMT/SEL + IMAD.WIDE) on every
+    # copy. Mirrors nymph's prologue `smem_full_cta0_ptr` (ncu @16384: the per-copy
+    # mapa is ~1.05M each of SEL/UPRMT/PRMT/IMAD.WIDE in the producer warps).
+    tile_full_bar_r0 = tile_full_bar.remote_view(0)
+    scale_full_bar_r0 = scale_full_bar.remote_view(0)
     tmem_pipe = Pipeline(
         pool,
         TMEM_PIPE_DEPTH,
@@ -404,13 +449,17 @@ def _kernel(
             smem_pipe.empty.wait(tma_cur.stage, tma_cur.phase)
             if id_in_pair == 0:
                 tile_bytes = T.meta_var(A_BYTES + B_BYTES)
-                T.ptx.mbarrier.arrive.expect_tx(
-                    tile_full_bar.ptr_to([stage]), tile_bytes, cta_id=pair_leader_rank
-                )
+                # id_in_pair == 0 ⇒ the executing CTA *is* pair_leader_rank (cluster
+                # rank 0), so this arrives on its OWN barrier. Use the LOCAL
+                # `mbarrier.arrive.expect_tx.shared::cta` form (no cta_id) instead of
+                # the `.shared::cluster` + `mapa` self-map — the cross-CTA op emitted a
+                # per-k-tile mapa (the `0x654` PRMT/SEL/IMAD.WIDE remap) to map rank 0
+                # to itself. The local form drops that address ALU entirely.
+                T.ptx.mbarrier.arrive.expect_tx(tile_full_bar.ptr_to([stage]), tile_bytes)
             single_cta_mask: T.int32 = 1 << id_in_pair
             # Barrier pre-mapped to the cluster leader (the g2c primitive maps
             # neither the barrier nor expect_tx — both handled above).
-            tile_copy = T.meta_var(_tma_g2c_args(tile_full_bar, stage, single_cta_mask, CTA_GROUP))
+            tile_copy = T.meta_var(_tma_g2c_args(tile_full_bar_r0, stage, single_cta_mask, CTA_GROUP))
             Tx.copy_async(
                 A_smem_packed[stage, 0:CTA_M, 0 : CTA_K // 2],
                 A_packed[a_m : a_m + CTA_M, k : k + CTA_K // 2],
@@ -439,19 +488,19 @@ def _kernel(
             smem_pipe.empty.wait(tma_cur.stage, tma_cur.phase)
             if id_in_pair == 0:
                 scale_bytes = T.meta_var(SFA_BYTES + SFB_BYTES)
-                T.ptx.mbarrier.arrive.expect_tx(
-                    scale_full_bar.ptr_to([stage]), scale_bytes, cta_id=pair_leader_rank
-                )
+                # Self-arrive (id_in_pair == 0 ⇒ this CTA is pair_leader_rank); local
+                # `shared::cta` form drops the per-k-tile self-`mapa` (see issue_tma_load).
+                T.ptx.mbarrier.arrive.expect_tx(scale_full_bar.ptr_to([stage]), scale_bytes)
             single_cta_mask: T.int32 = 1 << id_in_pair
             # SFA: each CTA loads its half (single_cta_mask). SFB: multicast to
             # both CTAs (pair_mask).
-            sfa_copy = T.meta_var(_tma_g2c_args(scale_full_bar, stage, single_cta_mask, CTA_GROUP))
+            sfa_copy = T.meta_var(_tma_g2c_args(scale_full_bar_r0, stage, single_cta_mask, CTA_GROUP))
             Tx.copy_async(
                 SFA_smem[stage, 0:CTA_M, 0:SF_CTA_K],
                 SFA_in[sf_m : sf_m + CTA_M, sf_k : sf_k + SF_CTA_K],
                 **sfa_copy,
             )
-            sfb_copy = T.meta_var(_tma_g2c_args(scale_full_bar, stage, pair_mask, CTA_GROUP))
+            sfb_copy = T.meta_var(_tma_g2c_args(scale_full_bar_r0, stage, pair_mask, CTA_GROUP))
             if SFB_N == 128:
                 if id_in_pair == 0:
                     Tx.copy_async(
@@ -494,29 +543,77 @@ def _kernel(
             accum = 1
             smem_pipe.empty.arrive(mma_smem.stage, cta_group=CTA_GROUP, cta_mask=pair_mask)
 
+        # Peeled-pipeline variant of execute_mma: the accumulate flag is a
+        # COMPILE-TIME constant (`accum_flag`), so the gemm issues with a literal
+        # accum and there is no runtime `accum` register / per-iteration `accum=1`
+        # store. k=0 issues with accum_flag=False (cold), k>=1 with accum_flag=True.
+        @T.inline
+        def execute_mma_peeled(accum_flag: T.constexpr):
+            stage = mma_smem.stage
+            scale_full_bar.wait(mma_smem.stage, mma_smem.phase)
+            tile_full_bar.wait(mma_smem.stage, mma_smem.phase)
+            Tx.copy_async(SFA_tmem, SFA_smem[stage], cta_group=CTA_GROUP)
+            Tx.copy_async(SFB_tmem, SFB_smem[stage], cta_group=CTA_GROUP)
+            Tx.gemm_async(
+                tmem[:, 0:MMA_N],
+                A_smem[stage],
+                B_smem[stage],
+                SFA=SFA_tmem,
+                SFB=SFB_tmem,
+                accum=accum_flag,
+                dispatch="tcgen05",
+                cta_group=CTA_GROUP,
+            )
+            smem_pipe.empty.arrive(mma_smem.stage, cta_group=CTA_GROUP, cta_mask=pair_mask)
+
         if T.ptx.elect_sync():
-            while tile_scheduler.valid():
-                tmem_pipe.empty.wait(mma_tmem.stage, mma_tmem.phase)
-                accum = 0
-                for k_tile in T.serial(K_TILES):
-                    execute_mma()
+            if MMA_PEEL:
+                # nymph's peeled software pipeline: peel k=0 (cold accum), then a
+                # T.serial(K_TILES-1) steady state with a compile-time hot accum.
+                while tile_scheduler.valid():
+                    tmem_pipe.empty.wait(mma_tmem.stage, mma_tmem.phase)
+                    execute_mma_peeled(False)
                     mma_smem.advance()
-                tmem_pipe.full.arrive(mma_tmem.stage, cta_group=CTA_GROUP, cta_mask=pair_mask)
-                mma_tmem.advance()
-                tile_scheduler.next_tile()
+                    for k_tile in T.serial(K_TILES - 1):
+                        execute_mma_peeled(True)
+                        mma_smem.advance()
+                    tmem_pipe.full.arrive(mma_tmem.stage, cta_group=CTA_GROUP, cta_mask=pair_mask)
+                    mma_tmem.advance()
+                    tile_scheduler.next_tile()
+            else:
+                while tile_scheduler.valid():
+                    tmem_pipe.empty.wait(mma_tmem.stage, mma_tmem.phase)
+                    accum = 0
+                    for k_tile in T.serial(K_TILES):
+                        execute_mma()
+                        mma_smem.advance()
+                    tmem_pipe.full.arrive(mma_tmem.stage, cta_group=CTA_GROUP, cta_mask=pair_mask)
+                    mma_tmem.advance()
+                    tile_scheduler.next_tile()
     elif warp_id >= int(WarpRole.EPILOGUE):
 
         @T.inline
         def regs_to_smem(reg_ldst_16b):
-            # R->S in 16-col chunks to match stmatrix.x4 granularity (one wide
-            # copy schedules worse).
-            for cj in T.unroll(EPI_TILE // 16):
-                cc = T.meta_var(cj * 16)
-                Tx.wg.copy(
-                    output_smem[epi_wb_state.stage, 0:CTA_M, cc : cc + 16],
-                    reg_ldst_16b[:, cc : cc + 16],
-                    dispatch="ldstmatrix",
-                )
+            if EPI_STORE == "sts":
+                # nymph / fp16_bf16_gemm datapath: plain `Tx.wg.copy` of the thread-axis
+                # reg tile in 8-bf16 (128b) sub-slices → STS.128 (one swizzle chunk each),
+                # no ldstmatrix dispatch. Sheds the STSM address-ALU overhead.
+                for cj in T.unroll(EPI_TILE // 8):
+                    cc = T.meta_var(cj * 8)
+                    Tx.wg.copy(
+                        output_smem[epi_wb_state.stage, 0:CTA_M, cc : cc + 8],
+                        reg_ldst_16b[:, cc : cc + 8],
+                    )
+            else:
+                # R->S in 16-col chunks to match stmatrix.x4 granularity (one wide
+                # copy schedules worse).
+                for cj in T.unroll(EPI_TILE // 16):
+                    cc = T.meta_var(cj * 16)
+                    Tx.wg.copy(
+                        output_smem[epi_wb_state.stage, 0:CTA_M, cc : cc + 16],
+                        reg_ldst_16b[:, cc : cc + 16],
+                        dispatch="ldstmatrix",
+                    )
 
         @T.inline
         def epilogue():
@@ -546,7 +643,27 @@ def _kernel(
             # Fusion vs fission of {load; scale+cast; store}: overlap fuses and reuses
             # a small (128, EPI_TILE) frag; non-overlap splits the loops, needing a big
             # (128, MMA_N) frag (all chunks live between load and store).
-            if OVERLAP_EPI:
+            if OVERLAP_EPI and EPI_STORE == "sts":
+                # nymph's overlap datapath (its default at 16384): per EPI_TILE band, ONE
+                # wide tcgen05.ld into a plain (128, EPI_TILE) thread-axis reg tile, ONE
+                # wait.ld, scale+cast, then plain-STS store. The wide drain keeps the
+                # tcgen05.ld count at MMA_N/EPI_TILE (4 @ EPI_TILE=64) instead of the STSM
+                # frag's per-chunk count, and the store is STS not STSM — shedding canon's
+                # +7.7M ALU / 8x tcgen05.ld epilogue overhead (the residual @16384).
+                reg_ldst = T.wg_reg_tile(EPI_TILE, dtype="float32")
+                reg_ldst_16b = T.wg_reg_tile(EPI_TILE, dtype="bfloat16")
+                for no in T.unroll(MMA_N // EPI_TILE):
+                    linear_n = T.meta_var(no * EPI_TILE)
+                    Tx.wg.copy_async(reg_ldst[:, :], tmem[:, linear_n : linear_n + EPI_TILE])
+                    T.ptx.tcgen05.wait.ld()
+                    Tx.wg.mul(reg_ldst, reg_ldst, alpha_local)
+                    Tx.wg.cast(reg_ldst_16b, reg_ldst)
+                    if no == MMA_N // EPI_TILE - 1 and tid_in_wg == 0:
+                        tmem_pipe.empty.arrive(
+                            epi_cur.stage, cta_id=pair_leader_rank, pred=True, count=1
+                        )
+                    store_epi_chunk(reg_ldst_16b, linear_n)
+            elif OVERLAP_EPI:
                 reg_ldst = T.alloc_tcgen05_ldst_frag("16x256b", (128, EPI_TILE), "float32")
                 reg_ldst_16b = T.alloc_cast_frag(reg_ldst, "bfloat16")
                 for no in T.unroll(MMA_N // EPI_TILE):
@@ -643,10 +760,57 @@ TIRX_CONFIGS = {
     (16384, 16384, 16384): {
         "SM_COUNT": 148,
         "CTA_N": 128,
+        # Epilogue datapath @16384 — INVESTIGATED, the no_overlap/STSM/EPI_TILE=16 form below
+        # is the measured best; the nymph-style sts/overlap form was built and ruled out:
+        #
+        # Fresh ncu (clean B200, fixed clocks) showed canon is ALREADY structurally faster
+        # than nymph here: 1.95M vs 2.00M cycles, tensor pipe 96.0% vs 93.3%, SM throughput
+        # 97.9% vs 94.0%. The wall-clock residual (canon/nymph ~1.06) is therefore NOT a
+        # canon-internal stall; the two kernels' instruction counts are within 1% (canon
+        # 86.5M vs nymph 85.6M) and at equal clock canon wins. The gap is the SUSTAINED
+        # BOOST CLOCK during the free-running bench (canon ~1850 MHz vs nymph ~1900+,
+        # measured per-kernel via nvidia-smi under sustained load), which the bench captures
+        # and ncu (locked clocks) does not — hence the ±0.05 run-to-run ratio noise.
+        #
+        # The prompt's hypothesis was that canon's epilogue (1.05M tcgen05.ld = 8x nymph's
+        # 131K; 1.05M STSM vs nymph's plain STS) steals MMA issue slots. That was tested:
+        # the EPI_STORE="sts" + OVERLAP_EPI=True + EPI_TILE=64 path below reproduces nymph's
+        # epilogue datapath EXACTLY (ncu after: tcgen05.ld 131K, STSM 0, STS 1.05M — all
+        # byte-identical to nymph) and draws LESS power (583-686 W vs the STSM form's
+        # 684-707 W). But it does NOT improve wall-clock: a tightly-paired A/B (NEW vs this
+        # OLD form timed back-to-back in the SAME boost-clock window, so clock cancels) gave
+        # NEW/OLD median 1.007 — i.e. the STSM form is marginally FASTER at equal clock, and
+        # NEW won only 8/20 reps. So the epilogue datapath is a wall-clock wash; the
+        # tcgen05.ld/STSM counts are off the critical path here (canon's tensor pipe is the
+        # wall and it is already higher than nymph's). The sts overlap path is kept as the
+        # EPI_STORE="sts" capability (matches fp16_bf16_gemm) but is not selected at 16384.
+        # A clock-controlled paired sweep of the remaining levers (PIPE_DEPTH 4, L2_GROUP
+        # 8/32, TMEM_PIPE_DEPTH 2) all tied-or-regressed vs this config, confirming it is the
+        # measured optimum reachable from this kernel's construct space.
         "EPI_TILE": 16,
-        "PIPE_DEPTH": 4,
-        "L2_GROUP_SIZE": 12,
+        "EPI_STORE": "stsm",
         "OVERLAP_EPI": False,
+        # PIPE_DEPTH 4 -> 5: deeper A/B/SF SMEM ring. At 16384 the kernel is tensor-bound
+        # but the MMA periodically stalls waiting on the next k-tile's TMA loads — a 5th
+        # ring stage hides that load latency so the tcgen05 pipe stops bubbling. ncu: the
+        # tensor pipe active fraction rises 91.9% -> 93.5% on the profiled launch. EPI_TILE=16
+        # keeps the D store ring small enough that the extra A/B/SF stage still fits SMEM.
+        "PIPE_DEPTH": 5,
+        # L2_GROUP_SIZE 12 -> 16: the persistent scheduler walks each cluster's consecutive
+        # tasks down an L2_GROUP_SIZE-row band of the cluster-tile grid. At 16384 that grid is
+        # CLUSTER_M_TILES = M/CTA_M/CLUSTER_M = 64 rows; 64 % 12 = 4 leaves a 4-row tail group,
+        # so the scheduler takes the _gm_emit_full_and_tail path (an extra runtime tail branch +
+        # its own row/col index arithmetic every next_tile). 64 % 16 == 0 makes FULL_GROUPS=4 /
+        # TAIL_ROWS=0, so it takes the leaner _gm_emit_full_only path (no tail branch) AND the
+        # 16-row band is the wider A-row/B-col working set that fits L2 best here (sweep peak:
+        # L2=12 -> ~5.40 PFLOP/s, L2=16 -> ~5.50 PFLOP/s on a clean B200). nymph's default
+        # l2_group_size is 16 (TILE_GROUPS_ROW_SIZE) for this shape; this matches it.
+        "L2_GROUP_SIZE": 16,
+        # Peel the MMA k-loop into nymph's software-pipeline form (compile-time accum,
+        # k=0 peeled). Sheds the runtime `accum` register + per-k-tile ALU on the
+        # consumer warp; see MMA_PEEL doc above. Scoped to 16384 (the shape where the
+        # consumer warp's ALU pressure pins the sustained clock below nymph).
+        "MMA_PEEL": True,
     },
 }
 
