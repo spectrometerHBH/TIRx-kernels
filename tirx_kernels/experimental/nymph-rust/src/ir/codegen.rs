@@ -421,6 +421,22 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
     out.push('\n');
 
     // ---- SMEM buffers (N-D; the swizzled rings + the plain I32 mailbox) ----
+    // Two emission forms, selected by `k.smem_pool`:
+    //   * STATIC (default, the big-shape path): each SMEM data buffer is its own
+    //     `T.alloc_buffer(scope="shared")`. TVM sizes the static SMEM footprint as
+    //     the sum of the per-buffer extents (the 176 KB ncu observes at 1024/2048).
+    //   * DYNAMIC POOL (the small-shape variant): canon's `T.SMEMPool()` form — ONE
+    //     dynamic `alloc_buffer([0], "uint8", scope="shared.dyn")` that every data
+    //     buffer aliases into via `pool.alloc(..., data=pool.ptr, byte_offset=...)`.
+    //     The buffers carry the IR's own `byte_offset`, so `pool.move_base_to(off)`
+    //     places each at exactly the offset the static form used (byte-for-byte the
+    //     same physical layout) — but now as `shared.dyn`, cutting the STATIC SMEM
+    //     footprint (and, with the dynamic pool, the register pressure) toward canon's
+    //     159 KB / 40-reg shape. The mbar/tmem_addr buffers stay `T.alloc_shared`
+    //     (tiny, and the protocol/peer-ref machinery references them by name).
+    if k.smem_pool {
+        out.push_str(&format!("{p}pool = T.SMEMPool()\n", p = pad(ind)));
+    }
     for t in collect_tensors(k) {
         if t.space != MemorySpace::Smem {
             continue;
@@ -432,7 +448,40 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
             .map(|d| d.to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        if is_int_dtype(t.dtype) && t.dtype != DType::U8 {
+        let is_mailbox = is_int_dtype(t.dtype) && t.dtype != DType::U8;
+        if k.smem_pool {
+            // Alias into the dynamic pool at the IR's computed byte offset. `move_base_to`
+            // sets the exact offset, then `pool.alloc` rounds it UP to `align` — the data
+            // buffers' IR offsets are already 1024-aligned, so the offset is unchanged, but
+            // the `align=1024` is REQUIRED: it sets the buffer's data-alignment attribute,
+            // which the swizzled-SMEM / TMA-descriptor codegen assumes (canon's
+            // `pool.alloc(..., align=1024)` / `alloc_mma(..., align=1024)`). With `align=0`
+            // the swizzle atom indexing computes a misaligned address and the kernel faults
+            // (cudaErrorMisalignedAddress) — even though the byte offset is identical. The
+            // mailbox (flat row-major int, no layout) takes no alignment.
+            let off = t.byte_offset.ok_or_else(|| {
+                format!("codegen: smem_pool tensor {name} has no byte_offset")
+            })?;
+            out.push_str(&format!(
+                "{p}pool.move_base_to({off})\n",
+                p = pad(ind),
+                off = off,
+            ));
+            let (layout, align) = if is_mailbox {
+                (String::new(), 0)
+            } else {
+                (format!(", layout={name}_layout"), 1024)
+            };
+            out.push_str(&format!(
+                "{p}{name} = pool.alloc(({dims}), \"{dt}\", scope=\"shared.dyn\", align={align}{layout})\n",
+                p = pad(ind),
+                name = name,
+                dims = dims,
+                dt = dtype_str(t.dtype),
+                align = align,
+                layout = layout,
+            ));
+        } else if is_mailbox {
             // The scheduler mailbox: a flat row-major shared buffer (no swizzle).
             out.push_str(&format!(
                 "{p}{name} = T.alloc_buffer(({dims}), \"{dt}\", scope=\"shared\")\n",
@@ -451,34 +500,73 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
             ));
         }
     }
-
     // ---- mbar shared buffers + tmem_addr ----
     // A multi-stage mbarrier allocates `[stages]` slots; each op indexes the slot it
     // uses. A single-stage mbar keeps the bootstrap's `[1]` form.
+    //
+    // In the dynamic-pool variant these buffers ALSO come from the pool (canon's
+    // `TMABar(pool, ...)` / `pool.alloc([1], "uint32", align=4)`). They MUST NOT be a
+    // separate static `T.alloc_shared(scope="shared")`: mixing a static `shared`
+    // region (the mbars) with the `shared.dyn` pool pushes the dynamic base off its
+    // 1024-byte boundary by the static region's size, so every swizzled pool buffer
+    // ends up misaligned and the kernel faults (cudaErrorMisalignedAddress). Putting
+    // them in the pool keeps the whole shared window one dynamic allocation, exactly
+    // like canon. Emitted before `pool.commit()` so they're inside the pool's extent.
     let mut have_peer = false;
-    for s in &k.body {
-        if let Stmt::MBarDef { mbar } = s {
-            let name = ctx
-                .mbar_names
-                .get(&mbar.id)
-                .ok_or_else(|| format!("codegen: no name for mbar {}", mbar.id))?;
-            let stages = ctx.mbar_stages.get(&mbar.id).copied().unwrap_or(1).max(1);
-            out.push_str(&format!(
-                "{p}{name} = T.alloc_shared([{stages}], \"uint64\")\n",
-                p = pad(ind),
-                name = name,
-                stages = stages,
-            ));
+    if k.smem_pool {
+        for s in &k.body {
+            if let Stmt::MBarDef { mbar } = s {
+                let name = ctx
+                    .mbar_names
+                    .get(&mbar.id)
+                    .ok_or_else(|| format!("codegen: no name for mbar {}", mbar.id))?;
+                let stages = ctx.mbar_stages.get(&mbar.id).copied().unwrap_or(1).max(1);
+                // mbarriers are 8 B (uint64); align=8 keeps each slot naturally aligned.
+                out.push_str(&format!(
+                    "{p}{name} = pool.alloc([{stages}], \"uint64\", scope=\"shared.dyn\", align=8)\n",
+                    p = pad(ind),
+                    name = name,
+                    stages = stages,
+                ));
+            }
         }
+        out.push_str(&format!(
+            "{p}tmem_addr = pool.alloc([1], \"uint32\", scope=\"shared.dyn\", align=4)\n",
+            p = pad(ind)
+        ));
+        // Seal the dynamic pool: emit the `tirx.pool_max_bytes` size annotation from
+        // the allocator high-water mark (the whole shared window: data buffers + mbars).
+        out.push_str(&format!("{p}pool.commit()\n", p = pad(ind)));
+    } else {
+        for s in &k.body {
+            if let Stmt::MBarDef { mbar } = s {
+                let name = ctx
+                    .mbar_names
+                    .get(&mbar.id)
+                    .ok_or_else(|| format!("codegen: no name for mbar {}", mbar.id))?;
+                let stages = ctx.mbar_stages.get(&mbar.id).copied().unwrap_or(1).max(1);
+                out.push_str(&format!(
+                    "{p}{name} = T.alloc_shared([{stages}], \"uint64\")\n",
+                    p = pad(ind),
+                    name = name,
+                    stages = stages,
+                ));
+            }
+        }
+        out.push_str(&format!(
+            "{p}tmem_addr = T.alloc_shared([1], \"uint32\")\n",
+            p = pad(ind)
+        ));
     }
-    out.push_str(&format!(
-        "{p}tmem_addr = T.alloc_shared([1], \"uint32\")\n",
-        p = pad(ind)
-    ));
 
     // peer mbar (remote_coord) decl — find the referenced mbar id. The peer view
     // spans the full stage count so a multi-stage peer wait can index its slot.
-    for (mbar_id, peer_name) in &ctx.peer_names {
+    // Emitted in a stable (id-sorted) order — `peer_names` is a HashMap, so iterating
+    // it directly made the emitted source nondeterministic across runs (the decls were
+    // reordered run-to-run). Sort by mbar id to match the leader_ids block below.
+    let mut peer_entries: Vec<(&u32, &String)> = ctx.peer_names.iter().collect();
+    peer_entries.sort_unstable_by_key(|(id, _)| **id);
+    for (mbar_id, peer_name) in peer_entries {
         let base = ctx
             .mbar_names
             .get(mbar_id)

@@ -20,6 +20,14 @@ pub struct Kernel {
     pub launch_shape: Vec<usize>,
     /// Same-rank tile over the grid.
     pub cluster_shape: Vec<usize>,
+    /// When true, the codegen emits the SMEM data buffers (A/B/SFA/SFB/D) as a
+    /// single canon-style dynamic `T.SMEMPool()` allocation that the per-tensor
+    /// buffers alias into (via their `byte_offset`), instead of N independent
+    /// static `T.alloc_buffer(scope="shared")` allocations. This cuts the static
+    /// SMEM footprint (the buffers become `shared.dyn`) and the register pressure
+    /// toward canon's. Off by default; gated to the small-shape variant so the big
+    /// shapes keep the byte-identical static path.
+    pub smem_pool: bool,
 }
 
 impl Kernel {

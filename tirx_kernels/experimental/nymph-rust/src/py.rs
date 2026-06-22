@@ -2670,7 +2670,7 @@ pub struct PyKernel(pub ir::Kernel);
 #[pymethods]
 impl PyKernel {
     #[new]
-    #[pyo3(signature = (name, args = None, body = None, num_warps = 12, smem_size_bytes = 0, launch_shape = None, cluster_shape = None))]
+    #[pyo3(signature = (name, args = None, body = None, num_warps = 12, smem_size_bytes = 0, launch_shape = None, cluster_shape = None, smem_pool = false))]
     fn new(
         name: String,
         args: Option<Bound<'_, PyAny>>,
@@ -2679,6 +2679,7 @@ impl PyKernel {
         smem_size_bytes: usize,
         launch_shape: Option<Vec<usize>>,
         cluster_shape: Option<Vec<usize>>,
+        smem_pool: bool,
     ) -> PyResult<Self> {
         let kernel = ir::Kernel {
             name,
@@ -2691,6 +2692,7 @@ impl PyKernel {
             smem_size_bytes,
             launch_shape: launch_shape.unwrap_or_else(|| vec![1]),
             cluster_shape: cluster_shape.unwrap_or_else(|| vec![1]),
+            smem_pool,
         };
         kernel
             .validate()
@@ -2729,6 +2731,10 @@ impl PyKernel {
     #[getter]
     fn cluster_shape(&self) -> Vec<usize> {
         self.0.cluster_shape.clone()
+    }
+    #[getter]
+    fn smem_pool(&self) -> bool {
+        self.0.smem_pool
     }
     fn launch_cta_count(&self) -> usize {
         self.0.launch_cta_count()
