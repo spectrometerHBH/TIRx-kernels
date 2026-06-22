@@ -137,14 +137,18 @@ struct Ctx {
     /// granularity); the collapsed wide read/cast/store needs it sized to the full
     /// column band. id -> width.
     reg_widths: HashMap<u32, usize>,
-    /// mbar id of the TMA-load completion barrier (`smem_full`) in a cta_group=2
-    /// cluster kernel. In cluster mode the canonical pattern routes BOTH CTAs' TMA
-    /// completions to the LEADER CTA's barrier (a `map_shared_rank(.., 0)` view used
-    /// uniformly by both CTAs): each CTA's `Tx.copy_async` signals it, the leader
-    /// (cbx==0) issues one `arrive.expect_tx` for the full cluster byte count, and the
-    /// leader's MMA waits its own LOCAL barrier (which both CTAs fill). This replaces
-    /// the illegal peer `try_wait`. None when not cluster mode / no TMA barrier.
-    tma_leader_mbar: Option<u32>,
+    /// mbar ids of the TMA-load completion barriers (`smem_full`, `sf_full`, ...) in a
+    /// cta_group=2 cluster kernel — every TMA barrier carrying a peer reference. In
+    /// cluster mode the canonical pattern routes BOTH CTAs' TMA completions to the
+    /// LEADER CTA's barrier (a `map_shared_rank(.., 0)` view used uniformly by both
+    /// CTAs): each CTA's `Tx.copy_async` signals it, the leader (cbx==0) issues one
+    /// `arrive.expect_tx` for the full cluster byte count, and the leader's MMA waits
+    /// its own LOCAL barrier (which both CTAs fill). This replaces the illegal peer
+    /// `try_wait` AND is the prerequisite for multicast TMA loads (the per-destination
+    /// transaction count of a `multicast::cluster` copy must land on the single leader
+    /// barrier, accounted via the `* cta_group` factor in the leader expect_tx). Empty
+    /// when not cluster mode / no cluster TMA barrier.
+    tma_leader_mbars: std::collections::HashSet<u32>,
     /// Number of launched clusters (`launch_cta_count / cta_group`) — the grid stride
     /// for a `ForEachTask` grid-stride scheduler loop.
     num_clusters: usize,
@@ -154,12 +158,17 @@ struct Ctx {
 }
 
 impl Ctx {
-    /// The `map_shared_rank(.., 0)` (leader CTA-0) DSMEM view name for the TMA-load
+    /// The `map_shared_rank(.., 0)` (leader CTA-0) DSMEM view name for a TMA-load
     /// barrier, e.g. `smem_full_cta0`. Used by the cluster TMA load + expect_tx.
-    fn tma_leader_view(&self) -> Option<String> {
-        let id = self.tma_leader_mbar?;
+    fn tma_leader_view_for(&self, id: u32) -> Option<String> {
+        if !self.tma_leader_mbars.contains(&id) {
+            return None;
+        }
         let base = self.mbar_names.get(&id)?;
         Some(format!("{base}_cta0"))
+    }
+    fn is_tma_leader_mbar(&self, id: u32) -> bool {
+        self.tma_leader_mbars.contains(&id)
     }
 }
 
@@ -494,11 +503,17 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
     }
     let _ = have_peer;
 
-    // Leader (CTA-0) DSMEM view of the TMA-load barrier, used uniformly by BOTH CTAs to
+    // Leader (CTA-0) DSMEM view of each TMA-load barrier, used uniformly by BOTH CTAs to
     // route every TMA completion to the leader's single barrier (the canonical
     // cta_group=2 pattern; replaces the illegal peer try_wait). `map_shared_rank(.., 0)`
     // is identity on CTA 0 and the cross-CTA remap on CTA 1, so one form serves both.
-    if let (Some(id), Some(view)) = (ctx.tma_leader_mbar, ctx.tma_leader_view()) {
+    // Emitted in a stable (id-sorted) order so the source is deterministic.
+    let mut leader_ids: Vec<u32> = ctx.tma_leader_mbars.iter().copied().collect();
+    leader_ids.sort_unstable();
+    for id in leader_ids {
+        let view = ctx
+            .tma_leader_view_for(id)
+            .ok_or_else(|| format!("codegen: tma leader references unknown mbar {id}"))?;
         let base = ctx
             .mbar_names
             .get(&id)
@@ -1000,30 +1015,34 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
     // cta_group from the cluster size (the bootstrap is cta_group=2).
     let cta_group = k.cluster_shape.iter().product::<usize>().max(1) as u8;
 
-    // The TMA-load completion barrier to leader-route in cluster (cta_group=2) mode:
-    // the mbar that a `TmaLoad` signals AND that carries a peer reference (the IR's
-    // `smem_full`, waited on both locally and via the now-skipped peer view). Routing
-    // both CTAs' TMA to the leader's copy of this barrier (and waiting only the local
-    // copy) is the legal substitute for the peer wait. Only set when cta_group > 1.
-    let mut tma_leader_mbar: Option<u32> = None;
+    // The TMA-load completion barriers to leader-route in cluster (cta_group=2) mode:
+    // EVERY mbar that a `TmaLoad` signals AND that carries a peer reference (the IR's
+    // `smem_full` for A/B, `sf_full` for the scales, ...). Routing both CTAs' TMA to the
+    // leader's copy of each barrier (and waiting only the local copy) is the legal
+    // substitute for the peer wait, AND the prerequisite for multicast loads — a
+    // `multicast::cluster` copy's per-destination transaction count must accumulate on
+    // the single leader barrier (the `* cta_group` leader expect_tx accounts for it).
+    // Only the barriers with a peer reference are routed; single-CTA TMA barriers stay
+    // local. Only populated when cta_group > 1.
+    let mut tma_leader_mbars: std::collections::HashSet<u32> = std::collections::HashSet::new();
     if cta_group > 1 {
-        fn find_tma_mbar(stmts: &[Stmt], out: &mut Option<u32>) {
+        fn find_tma_mbars(stmts: &[Stmt], out: &mut std::collections::HashSet<u32>) {
             for s in stmts {
                 if let Stmt::TmaLoad { mbar, .. } = s {
-                    out.get_or_insert(mbar.mbar.id);
+                    out.insert(mbar.mbar.id);
                 }
                 for body in s.child_bodies() {
-                    find_tma_mbar(body, out);
+                    find_tma_mbars(body, out);
                 }
             }
         }
-        let mut tma_mbar = None;
-        find_tma_mbar(&k.body, &mut tma_mbar);
-        // Only leader-route it if it actually has a peer reference (a true cluster
+        let mut tma_mbars = std::collections::HashSet::new();
+        find_tma_mbars(&k.body, &mut tma_mbars);
+        // Only leader-route a barrier that actually has a peer reference (a true cluster
         // TMA barrier); a single-CTA TMA barrier stays local.
-        if let Some(id) = tma_mbar {
+        for id in tma_mbars {
             if peer_names.contains_key(&id) {
-                tma_leader_mbar = Some(id);
+                tma_leader_mbars.insert(id);
             }
         }
     }
@@ -1123,7 +1142,7 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
         tmem_base,
         tmem_alloc_cols,
         reg_widths,
-        tma_leader_mbar,
+        tma_leader_mbars,
         num_clusters: (k.launch_cta_count() / (cta_group as usize).max(1)).max(1),
         sf_tmems: collect_tensors(k)
             .into_iter()
@@ -1648,7 +1667,7 @@ fn single_issue_guard(stmt: &Stmt, scope: Scope, ctx: &Ctx) -> Option<&'static s
     use Stmt::*;
     match stmt {
         // The leader expect_tx nests under `cbx == 0` first — not a plain single guard.
-        MBarrierArriveExpectTx { mbar, .. } if ctx.tma_leader_mbar == Some(mbar.mbar.id) => None,
+        MBarrierArriveExpectTx { mbar, .. } if ctx.is_tma_leader_mbar(mbar.mbar.id) => None,
         MBarrierInit { .. }
         | MBarrierArriveExpectTx { .. }
         | MBarrierExpectTx { .. }
@@ -2096,8 +2115,7 @@ fn emit_stmt(
             // (CTA-0) barrier for the FULL cluster byte count (both CTAs' loads land
             // here), and only on the leader CTA (cbx==0) so it is counted once. The IR's
             // `bytes` is the per-CTA byte count, so multiply by cta_group.
-            if ctx.tma_leader_mbar == Some(mbar.mbar.id) {
-                let view = ctx.tma_leader_view().expect("leader view exists");
+            if let Some(view) = ctx.tma_leader_view_for(mbar.mbar.id) {
                 let slot = stage
                     .as_ref()
                     .map(|s| emit_scalar(s, ctx))
@@ -2208,6 +2226,8 @@ fn emit_stmt(
             shape,
             gmem_shape,
             mbar_stage,
+            multicast_cta_mask,
+            cache_hint,
             ..
         } => {
             // The completion mbarrier indexes the ring slot it signals. In cluster mode
@@ -2215,11 +2235,10 @@ fn emit_stmt(
             // (CTA-0) barrier via its `_cta0` map_shared_rank(.., 0) view (identity on
             // CTA 0, the remap on CTA 1), so the leader's MMA can wait its own local
             // barrier instead of an (illegal) peer try_wait.
-            let mbar_name = if ctx.tma_leader_mbar == Some(mbar.mbar.id) {
-                ctx.tma_leader_view().expect("leader view exists")
-            } else {
-                mbar_buf_name(mbar, ctx)?
-            };
+            let mbar_name = ctx
+                .tma_leader_view_for(mbar.mbar.id)
+                .map(Ok)
+                .unwrap_or_else(|| mbar_buf_name(mbar, ctx))?;
             let mbar_slot = mbar_stage
                 .as_ref()
                 .map(|s| emit_scalar(s, ctx))
@@ -2228,6 +2247,26 @@ fn emit_stmt(
             // integer index so the operand rank matches the 2D GMEM region.
             let dst_s = emit_smem_tile(dst, ctx)?;
             let src_s = emit_gmem_region(src, coords, gmem_extents(gmem_shape, shape), ctx)?;
+            // `multicast_cta_mask`: a `multicast::cluster` g2c copy — one TMA fills the
+            // SMEM of EVERY CTA in the mask (canon's `cta_mask=pair_mask` for the shared
+            // SFB scale band), so the cluster shares ONE load instead of each CTA reading
+            // the full band (halving the L2/TMA traffic). The completion's transaction
+            // count is added per multicast destination to the (leader-routed) barrier,
+            // which the `* cta_group` factor in the leader expect_tx already accounts for.
+            let cta_mask = match multicast_cta_mask {
+                Some(mask) => format!(", cta_mask={mask}"),
+                None => String::new(),
+            };
+            // `cache_hint`: the per-load L2 eviction policy (canon's `cache_hint` on its
+            // g2c loads). When opted in (e.g. `"evict_normal"`) a tile read once per
+            // k-tile does not pin an L2 line the next tile evicts anyway — bounding the
+            // L2 cache-policy traffic, the lever that stops the full-cube launch fault.
+            // None = no hint (the codegen-default policy). Generic: any kernel/load
+            // chooses its own hint via the IR.
+            let cache_hint_kw = match cache_hint {
+                Some(hint) => format!(", cache_hint=\"{hint}\""),
+                None => String::new(),
+            };
             // `prefetch_tensormap=True`: the canonical prefetches the A/B tensormaps at
             // entry (a `warp_id_in_cta==0`-guarded `prefetch.tensormap`, synthesized by
             // the TMA dispatch from this config flag). On the latency-bound small shapes
@@ -2235,7 +2274,7 @@ fn emit_stmt(
             emit_guarded(
                 out,
                 &format!(
-                    "Tx.copy_async({dst_s}, {src_s}, dispatch=\"tma\", mbar={mbar_name}.ptr_to([{mbar_slot}]), cta_group={cg}, prefetch_tensormap=True)",
+                    "Tx.copy_async({dst_s}, {src_s}, dispatch=\"tma\", mbar={mbar_name}.ptr_to([{mbar_slot}]), cta_group={cg}{cta_mask}{cache_hint_kw}, prefetch_tensormap=True)",
                     cg = ctx.cta_group,
                 ),
             );

@@ -480,7 +480,17 @@ pub enum Stmt {
         shape: Vec<usize>,
         gmem_shape: Option<Vec<usize>>,
         mbar_stage: Option<ScalarValue>,
+        /// `multicast::cluster` cta_mask: one TMA fills the SMEM of every masked CTA of
+        /// the cluster (canon's shared-SF-band multicast), so the cluster shares one load
+        /// instead of each CTA reading the band — halving the L2/TMA load traffic. `None`
+        /// = a plain per-CTA (unicast) load.
         multicast_cta_mask: Option<u16>,
+        /// L2 cache-eviction policy hint (canon's `cache_hint` on its g2c loads). `None`
+        /// = no hint (codegen-default policy); `Some(hint)` emits `cache_hint="<hint>"`
+        /// (e.g. `"evict_normal"` — a tile read once per k-tile should not pin an L2 line
+        /// the next tile evicts anyway). Bounding the L2 cache-policy traffic is the lever
+        /// that stops the full-cube launch fault. Codegen passes the string through.
+        cache_hint: Option<String>,
         cta_group: u8,
     },
     TmaStore {
