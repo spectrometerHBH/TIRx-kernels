@@ -749,9 +749,7 @@ fn validate_stmt(s: &Stmt) -> R {
             check_slice_covers(dst, shape, "tma_load dst slice")?;
             check_cta_group(*cta_group, "tma_load cta_group")?;
         }
-        Stmt::CpAsyncBulkS2Cluster {
-            dst, src, ..
-        } => {
+        Stmt::CpAsyncBulkS2Cluster { dst, src, .. } => {
             validate_slice(src, "cp_async_bulk_s2cluster src")?;
             validate_slice(dst, "cp_async_bulk_s2cluster dst")?;
             if src.tensor.space != MemorySpace::Smem || dst.tensor.space != MemorySpace::Smem {
@@ -898,8 +896,16 @@ fn validate_stmt(s: &Stmt) -> R {
             check_slice_covers(dst, &[dst_rows as usize, *n as usize], "tcgen05_mma dst")?;
             // fp4 operands are packed 2-per-byte, so the K (contraction) extent in the
             // SMEM tile is k/2 bytes, not k elements.
-            let a_kdim = if *a_fp4 { (*k / 2) as usize } else { *k as usize };
-            let b_kdim = if *b_fp4 { (*k / 2) as usize } else { *k as usize };
+            let a_kdim = if *a_fp4 {
+                (*k / 2) as usize
+            } else {
+                *k as usize
+            };
+            let b_kdim = if *b_fp4 {
+                (*k / 2) as usize
+            } else {
+                *k as usize
+            };
             let a_shape = if *trans_a {
                 [a_kdim, a_rows as usize]
             } else {
@@ -943,7 +949,11 @@ fn validate_stmt(s: &Stmt) -> R {
                             return bail(format!(
                                 "{label} dtype must be {} ({})",
                                 if *sf_e4m3 { "e4m3" } else { "u32" },
-                                if *sf_e4m3 { "nvfp4 scales" } else { "4 packed UE8M0 bytes" }
+                                if *sf_e4m3 {
+                                    "nvfp4 scales"
+                                } else {
+                                    "4 packed UE8M0 bytes"
+                                }
                             ));
                         }
                         let Some(shape) = static_slice_shape(sf) else {
@@ -1160,7 +1170,16 @@ fn validate_stmt(s: &Stmt) -> R {
                 }
             }
         }
-        Stmt::WarpMma { d, a, b, c, m, n, k, ab_dtype } => {
+        Stmt::WarpMma {
+            d,
+            a,
+            b,
+            c,
+            m,
+            n,
+            k,
+            ab_dtype,
+        } => {
             for (sl, lbl) in [(d, "d"), (a, "a"), (b, "b"), (c, "c")] {
                 validate_slice(sl, &format!("mma_sync {lbl}"))?;
                 if sl.tensor.space != MemorySpace::Reg {
@@ -1191,7 +1210,11 @@ fn validate_stmt(s: &Stmt) -> R {
                 (*m * *n / 32) as usize,
             );
             for (sl, words, lbl) in [(a, la, "A"), (b, lb, "B"), (c, lcd, "C"), (d, lcd, "D")] {
-                let want = if is_b16_dtype(sl.tensor.dtype) { 2 * words } else { words };
+                let want = if is_b16_dtype(sl.tensor.dtype) {
+                    2 * words
+                } else {
+                    words
+                };
                 if let Some(got) = static_shape_numel(&sl.shape) {
                     if got != want {
                         return bail(format!(
@@ -1392,6 +1415,12 @@ fn validate_stmt(s: &Stmt) -> R {
             }
             if *num_warps < 1 {
                 return bail("named_barrier num_warps must be >= 1");
+            }
+        }
+        Stmt::SetMaxNReg { count, .. } => {
+            // PTX setmaxnreg: register count must be a multiple of 8 in [24, 256].
+            if *count < 24 || *count > 256 || *count % 8 != 0 {
+                return bail("setmaxnreg count must be a multiple of 8 in [24, 256]");
             }
         }
     }

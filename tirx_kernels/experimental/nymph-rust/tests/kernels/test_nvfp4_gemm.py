@@ -90,6 +90,29 @@ def test_nvfp4_gemm_protocol_passes(cfg):
     assert report["status"] == "Passed", report["diagnostics"]
 
 
+# Per-warpgroup register budgets (canon's INVARIANT-I1b setmaxnreg) — the 1024 lever.
+# setmaxnreg is a pure register-allocation hint (no value / protocol / rendezvous effect),
+# so the protocol must still pass with the consumer cap alone and with the producer.inc /
+# consumer.dec pair.
+@pytest.mark.parametrize(
+    "mnr_epi,mnr_prod", [(96, None), (96, 152)], ids=["epi96", "epi96-prod152"]
+)
+def test_nvfp4_gemm_setmaxnreg_protocol_passes(mnr_epi, mnr_prod):
+    kernel = build_nvfp4_gemm(
+        NvFp4GemmConfig(
+            m=1024,
+            n=1024,
+            k=1024,
+            launch_shape=(2,),
+            epi_tile=32,
+            maxnreg_epilogue=mnr_epi,
+            maxnreg_producer=mnr_prod,
+        )
+    )
+    report = nr.check_protocol(kernel)
+    assert report["status"] == "Passed", report["diagnostics"]
+
+
 # A few shapes × alphas exercising multiple M pairs, N bands, k-tiles, and a
 # non-unit power-of-two alpha — all cell-exact.
 _VALUE_CASES = [
@@ -137,9 +160,7 @@ def test_nvfp4_gemm_smem_pool_value_cell_exact(m, n, k, alpha):
 @pytest.mark.parametrize("cfg", NVFP4_CONFIGS_SUPPORTED, ids=lambda c: c["label"])
 def test_nvfp4_gemm_smem_pool_protocol_passes(cfg):
     kernel = build_nvfp4_gemm(
-        NvFp4GemmConfig(
-            m=cfg["m"], n=cfg["n"], k=cfg["k"], launch_shape=(2,), smem_pool=True
-        )
+        NvFp4GemmConfig(m=cfg["m"], n=cfg["n"], k=cfg["k"], launch_shape=(2,), smem_pool=True)
     )
     report = nr.check_protocol(kernel)
     assert report["status"] == "Passed", report["diagnostics"]
@@ -153,9 +174,7 @@ def test_nvfp4_gemm_smem_pool_emits_dynamic_pool():
         build_nvfp4_gemm(NvFp4GemmConfig(m=1024, n=1024, k=1024, launch_shape=(2,)))
     )
     pool = nr.kernel_to_tirx_source(
-        build_nvfp4_gemm(
-            NvFp4GemmConfig(m=1024, n=1024, k=1024, launch_shape=(2,), smem_pool=True)
-        )
+        build_nvfp4_gemm(NvFp4GemmConfig(m=1024, n=1024, k=1024, launch_shape=(2,), smem_pool=True))
     )
     assert "T.SMEMPool()" not in static
     assert "T.alloc_shared" in static and 'scope="shared.dyn"' not in static

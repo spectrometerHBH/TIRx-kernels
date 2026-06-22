@@ -36,15 +36,25 @@ fn pack(lo: u16, hi: u16) -> u32 {
     (lo as u32) | ((hi as u32) << 16)
 }
 fn enc(x: f32, is_f16: bool) -> u16 {
-    if is_f16 { f16::from_f32(x).to_bits() } else { bf16::from_f32(x).to_bits() }
+    if is_f16 {
+        f16::from_f32(x).to_bits()
+    } else {
+        bf16::from_f32(x).to_bits()
+    }
 }
 fn rounded(x: f32, is_f16: bool) -> f32 {
-    if is_f16 { f16::from_f32(x).to_f32() } else { bf16::from_f32(x).to_f32() }
+    if is_f16 {
+        f16::from_f32(x).to_f32()
+    } else {
+        bf16::from_f32(x).to_f32()
+    }
 }
 
 // Deterministic pseudo-random in [-0.5, 0.5).
 fn rnd(seed: &mut u64) -> f32 {
-    *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    *seed = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     (((*seed >> 33) as u32) as f32 / u32::MAX as f32) - 0.5
 }
 
@@ -64,8 +74,12 @@ fn mma_sync_matches_hardware() {
     for &(kk, is_f16) in &cases {
         let mut a = vec![0f32; m * kk];
         let mut b = vec![0f32; n * kk];
-        for v in a.iter_mut() { *v = rounded(rnd(&mut seed) * 0.8, is_f16); }
-        for v in b.iter_mut() { *v = rounded(rnd(&mut seed) * 0.8, is_f16); }
+        for v in a.iter_mut() {
+            *v = rounded(rnd(&mut seed) * 0.8, is_f16);
+        }
+        for v in b.iter_mut() {
+            *v = rounded(rnd(&mut seed) * 0.8, is_f16);
+        }
         // pack A: reg ru -> (mt=ru%2, kt=ru/2); halves h -> A[mt*8+g][kt*8+2t+h]
         let na = m * kk / 64;
         let nb = n * kk / 64;
@@ -93,7 +107,9 @@ fn mma_sync_matches_hardware() {
         for mm in 0..m {
             for nn in 0..n {
                 let mut acc = 0f32;
-                for x in 0..kk { acc += a[mm * kk + x] * b[nn * kk + x]; }
+                for x in 0..kk {
+                    acc += a[mm * kk + x] * b[nn * kk + x];
+                }
                 dr[mm * n + nn] = acc;
             }
         }
@@ -110,14 +126,33 @@ fn mma_sync_matches_hardware() {
     let bin = dir.join("mma_sync_hardware");
     fs::write(&cu, generate_cuda(&cases)).expect("write cuda");
     let nvcc = Command::new("nvcc")
-        .args(["-gencode", "arch=compute_100a,code=sm_100a", "-o",
-               bin.to_str().unwrap(), cu.to_str().unwrap()])
-        .output().expect("run nvcc");
-    assert!(nvcc.status.success(), "nvcc failed\n{}", String::from_utf8_lossy(&nvcc.stderr));
+        .args([
+            "-gencode",
+            "arch=compute_100a,code=sm_100a",
+            "-o",
+            bin.to_str().unwrap(),
+            cu.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run nvcc");
+    assert!(
+        nvcc.status.success(),
+        "nvcc failed\n{}",
+        String::from_utf8_lossy(&nvcc.stderr)
+    );
     let run = Command::new(&bin)
-        .args([a_bin.to_str().unwrap(), b_bin.to_str().unwrap(), d_bin.to_str().unwrap()])
-        .output().expect("run harness");
-    assert!(run.status.success(), "harness failed\n{}", String::from_utf8_lossy(&run.stderr));
+        .args([
+            a_bin.to_str().unwrap(),
+            b_bin.to_str().unwrap(),
+            d_bin.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run harness");
+    assert!(
+        run.status.success(),
+        "harness failed\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
 
     let d_hw = read_f32(&d_bin); // [case][lane][ri], ri in 0..4
     assert_eq!(d_hw.len(), cases.len() * THREADS * 4);
@@ -138,7 +173,9 @@ fn mma_sync_matches_hardware() {
         for i in 0..m * n {
             assert!(
                 (dm[i] - d_ref[ci][i]).abs() <= atol + 0.05 * d_ref[ci][i].abs(),
-                "case {ci} (f16={is_f16}) cell {i}: hw={} ref={}", dm[i], d_ref[ci][i]
+                "case {ci} (f16={is_f16}) cell {i}: hw={} ref={}",
+                dm[i],
+                d_ref[ci][i]
             );
         }
     }
@@ -149,12 +186,17 @@ fn bytemuck_u32(v: &[u32]) -> Vec<u8> {
 }
 fn read_f32(path: &PathBuf) -> Vec<f32> {
     let bytes = fs::read(path).expect("read d.bin");
-    bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 fn generate_cuda(cases: &[(usize, bool)]) -> String {
     let mut out = String::new();
-    out.push_str("#include <cstdint>\n#include <cstdio>\n#include <vector>\n#include <cuda_runtime.h>\n\n");
+    out.push_str(
+        "#include <cstdint>\n#include <cstdio>\n#include <vector>\n#include <cuda_runtime.h>\n\n",
+    );
     // offsets into the flat a/b frag arrays per case
     let mut a_off = 0usize;
     let mut b_off = 0usize;
@@ -162,12 +204,18 @@ fn generate_cuda(cases: &[(usize, bool)]) -> String {
     for (ci, &(kk, _)) in cases.iter().enumerate() {
         let na = 16 * kk / 64;
         let nb = 8 * kk / 64;
-        writeln!(offs, "// case {ci}: a_off={a_off} na={na} b_off={b_off} nb={nb}").unwrap();
+        writeln!(
+            offs,
+            "// case {ci}: a_off={a_off} na={na} b_off={b_off} nb={nb}"
+        )
+        .unwrap();
         a_off += THREADS * na;
         b_off += THREADS * nb;
     }
     out.push_str(&offs);
-    out.push_str("\n__global__ void mma_kernel(const uint32_t* a, const uint32_t* b, float* d) {\n");
+    out.push_str(
+        "\n__global__ void mma_kernel(const uint32_t* a, const uint32_t* b, float* d) {\n",
+    );
     out.push_str("  unsigned lane = threadIdx.x & 31;\n");
     let mut a_o = 0usize;
     let mut b_o = 0usize;
@@ -176,11 +224,15 @@ fn generate_cuda(cases: &[(usize, bool)]) -> String {
         let nb = 8 * kk / 64;
         let abt = if is_f16 { "f16" } else { "bf16" };
         writeln!(out, "  {{ // case {ci}").unwrap();
-        for r in 0..na { writeln!(out, "    uint32_t a{r} = a[{} + lane*{na} + {r}];", a_o).unwrap(); }
-        for r in 0..nb { writeln!(out, "    uint32_t b{r} = b[{} + lane*{nb} + {r}];", b_o).unwrap(); }
+        for r in 0..na {
+            writeln!(out, "    uint32_t a{r} = a[{} + lane*{na} + {r}];", a_o).unwrap();
+        }
+        for r in 0..nb {
+            writeln!(out, "    uint32_t b{r} = b[{} + lane*{nb} + {r}];", b_o).unwrap();
+        }
         writeln!(out, "    float d0=0.f,d1=0.f,d2=0.f,d3=0.f;").unwrap();
-        let a_ops = brace(0, na);       // operands %4 .. %(4+na-1)
-        let b_ops = brace(na, nb);      // operands %(4+na) .. (after A)
+        let a_ops = brace(0, na); // operands %4 .. %(4+na-1)
+        let b_ops = brace(na, nb); // operands %(4+na) .. (after A)
         writeln!(out,
             "    asm volatile(\"mma.sync.aligned.m16n8k{kk}.row.col.f32.{abt}.{abt}.f32 \"\n      \"{{%0,%1,%2,%3}}, {a_ops}, {b_ops}, {{%0,%1,%2,%3}};\\n\"\n      : \"+f\"(d0),\"+f\"(d1),\"+f\"(d2),\"+f\"(d3) : {ins});",
             ins = mma_inputs(na, nb)).unwrap();
@@ -218,7 +270,14 @@ fn brace(start: usize, n: usize) -> String {
 }
 fn mma_inputs(na: usize, nb: usize) -> String {
     let mut s = String::new();
-    for r in 0..na { write!(s, "\"r\"(a{r}),").unwrap(); }
-    for r in 0..nb { write!(s, "\"r\"(b{r})").unwrap(); if r + 1 < nb { s.push(','); } }
+    for r in 0..na {
+        write!(s, "\"r\"(a{r}),").unwrap();
+    }
+    for r in 0..nb {
+        write!(s, "\"r\"(b{r})").unwrap();
+        if r + 1 < nb {
+            s.push(',');
+        }
+    }
     s
 }

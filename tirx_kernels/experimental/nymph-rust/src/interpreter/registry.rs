@@ -77,6 +77,7 @@ pub enum StmtKind {
     ClusterSync,
     ClusterBarrierArrive,
     ClusterBarrierWait,
+    SetMaxNReg,
 }
 
 pub fn stmt_kind(stmt: &Stmt) -> StmtKind {
@@ -148,13 +149,14 @@ pub fn stmt_kind(stmt: &Stmt) -> StmtKind {
         Stmt::ClusterSync => StmtKind::ClusterSync,
         Stmt::ClusterBarrierArrive => StmtKind::ClusterBarrierArrive,
         Stmt::ClusterBarrierWait => StmtKind::ClusterBarrierWait,
+        Stmt::SetMaxNReg { .. } => StmtKind::SetMaxNReg,
     }
 }
 
 impl StmtKind {
-    /// `ClusterBarrierWait` is the last variant; the enum is fieldless so `as usize`
+    /// `SetMaxNReg` is the last variant; the enum is fieldless so `as usize`
     /// gives a contiguous 0..COUNT index — used to dispatch via a flat array.
-    pub const COUNT: usize = StmtKind::ClusterBarrierWait as usize + 1;
+    pub const COUNT: usize = StmtKind::SetMaxNReg as usize + 1;
     #[inline]
     pub fn index(self) -> usize {
         self as usize

@@ -1850,11 +1850,7 @@ fn scalar_store(var: PyVar, value: Bound<'_, PyAny>) -> PyResult<PyStmt> {
 }
 #[pyfunction]
 #[pyo3(name = "ShuffleSync")]
-fn shuffle_sync(
-    var: PyVar,
-    src: Bound<'_, PyAny>,
-    src_lane: Bound<'_, PyAny>,
-) -> PyResult<PyStmt> {
+fn shuffle_sync(var: PyVar, src: Bound<'_, PyAny>, src_lane: Bound<'_, PyAny>) -> PyResult<PyStmt> {
     Ok(PyStmt(ir::Stmt::ShuffleSync {
         var: var.0,
         src: coerce_scalar(&src)?,
@@ -2622,6 +2618,11 @@ fn wg_sync(barrier_id: u32) -> PyStmt {
     PyStmt(ir::Stmt::WgSync { barrier_id })
 }
 #[pyfunction]
+#[pyo3(name = "SetMaxNReg")]
+fn set_max_nreg(warpgroup: u32, count: u32) -> PyStmt {
+    PyStmt(ir::Stmt::SetMaxNReg { warpgroup, count })
+}
+#[pyfunction]
 #[pyo3(name = "NamedBarrier")]
 fn named_barrier(barrier_id: u32, num_warps: u32) -> PyStmt {
     PyStmt(ir::Stmt::NamedBarrier {
@@ -2853,6 +2854,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(fence, m)?,
         wrap_pyfunction!(cta_sync, m)?,
         wrap_pyfunction!(wg_sync, m)?,
+        wrap_pyfunction!(set_max_nreg, m)?,
         wrap_pyfunction!(named_barrier, m)?,
         wrap_pyfunction!(warp_sync, m)?,
         wrap_pyfunction!(cluster_sync, m)?,

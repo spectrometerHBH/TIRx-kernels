@@ -644,7 +644,7 @@ pub enum Stmt {
         m: u32,
         n: u32,
         k: u32,
-        ab_dtype: DType,   // A/B operand type — the PTX .bf16 / .f16 (C/D are f32)
+        ab_dtype: DType, // A/B operand type — the PTX .bf16 / .f16 (C/D are f32)
     },
 
     // ---- register ALU ----
@@ -779,6 +779,20 @@ pub enum Stmt {
     /// of the cluster have executed `ClusterBarrierArrive`. Allowed inside a role
     /// (unlike `ClusterSync`).
     ClusterBarrierWait,
+    /// Standalone per-warpgroup register budget (canon's INVARIANT-I1b per-role
+    /// `setmaxnreg`). Emitted as a warpgroup-gated `if wg_id == <warpgroup>:
+    /// T.ptx.setmaxnreg(<inc>, <count>)` where `inc = count > 128` (rise above the
+    /// 128-reg default → `True`/inc, else `False`/dec). Unlike the `maxnreg` field on
+    /// `Role` (which is bound to a role branch), this is a free-standing statement so a
+    /// warpgroup whose warps live in SEPARATE warp-level roles (e.g. the producer wg0
+    /// = a `warp=0` MMA role + a `warp=2` TMA role) can still issue the collective
+    /// `setmaxnreg` from all 4 of its warps before the role branches diverge. The
+    /// `setmaxnreg.inc` side claims registers the consumer warpgroup released via its
+    /// own `setmaxnreg.dec` — canon's producer-drop / consumer-raise rebalance.
+    SetMaxNReg {
+        warpgroup: u32,
+        count: u32,
+    },
 }
 
 impl Stmt {

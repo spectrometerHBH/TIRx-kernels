@@ -97,6 +97,7 @@ from .nymph_rs import (
     WarpSync,
     WgSync,
     NamedBarrier,
+    SetMaxNReg,
 )
 
 Tcgen05LdStShape = Literal["32x32b", "16x32bx2", "16x64b", "16x128b", "16x256b"]
@@ -409,8 +410,9 @@ class IRBuilder:
         value-mode accumulates instead of overwriting. dst must be an f32 GMEM tensor."""
         if isinstance(src, Tensor):
             src = src[...]
-        stmt = TmaStore(dst=dst, src=src, coords=coords, shape=shape,
-                        gmem_shape=gmem_shape, reduce_add=True)
+        stmt = TmaStore(
+            dst=dst, src=src, coords=coords, shape=shape, gmem_shape=gmem_shape, reduce_add=True
+        )
         self._append(stmt)
 
     def gmem_atomic_add(
@@ -433,11 +435,7 @@ class IRBuilder:
         self._append(GmemAtomicAdd(sem=sem, coords=coords, value=value, order=order))
 
     def gmem_wait_eq(
-        self,
-        sem: Tensor | TensorSlice,
-        *,
-        coords: tuple[ScalarValue, ...],
-        value: ScalarValue,
+        self, sem: Tensor | TensorSlice, *, coords: tuple[ScalarValue, ...], value: ScalarValue
     ) -> None:
         """GMEM semaphore spin-wait ("wait") — ``ld.global.acquire.gpu`` poll until
         ``sem[coords] == value``. A value-keyed ACQUIRE: blocks this stream until the
@@ -644,11 +642,7 @@ class IRBuilder:
         self._append(stmt)
 
     def tcgen05_cp(
-        self,
-        dst: Tensor | TensorSlice,
-        src: Tensor | TensorSlice,
-        *,
-        cta_group: Literal[1, 2] = 1,
+        self, dst: Tensor | TensorSlice, src: Tensor | TensorSlice, *, cta_group: Literal[1, 2] = 1
     ) -> None:
         """``tcgen05.cp`` — bulk-copy packed u32 scale cells from SMEM into TMEM.
         With ``cta_group=2`` the leader's single issue drives both CTAs: each CTA
@@ -980,6 +974,15 @@ class IRBuilder:
 
     def wg_sync(self, *, barrier_id: int) -> None:
         self._append(WgSync(barrier_id=barrier_id))
+
+    def setmaxnreg(self, *, warpgroup: int, count: int) -> None:
+        """Standalone per-warpgroup register budget (canon's per-role setmaxnreg).
+        Emits a warpgroup-gated `if wg_id == warpgroup: T.ptx.setmaxnreg(inc, count)`
+        (inc = count > 128). Unlike the `maxnreg=` field on `role(...)`, this is a free
+        statement, so a warpgroup whose warps live in separate warp-level roles (the
+        producer wg0 = a warp-0 MMA role + a warp-2 TMA role) can still issue the
+        collective setmaxnreg from all 4 of its warps before those roles diverge."""
+        self._append(SetMaxNReg(warpgroup=warpgroup, count=count))
 
     def named_barrier(self, *, barrier_id: int, num_warps: int) -> None:
         """Named barrier across `num_warps` warps spanning warpgroups —

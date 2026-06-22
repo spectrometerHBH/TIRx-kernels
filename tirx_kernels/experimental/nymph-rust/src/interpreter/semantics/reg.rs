@@ -468,9 +468,15 @@ fn try_direct_causal_mask(
     write_direct_float_result_with(ctx, &dst_range, &rows, |ai, j| {
         // swap_qk: bwd transposed fragment [kv-row, q-col] — k(kv)=row, q=col/gs.
         let (q, k) = if swap_qk {
-            (q0 + (j / group_size as usize) as i64, k0 + tid_in_wg[ai] as i64)
+            (
+                q0 + (j / group_size as usize) as i64,
+                k0 + tid_in_wg[ai] as i64,
+            )
         } else {
-            (q0 + (tid_in_wg[ai] / group_size as usize) as i64, k0 + j as i64)
+            (
+                q0 + (tid_in_wg[ai] / group_size as usize) as i64,
+                k0 + j as i64,
+            )
         };
         if k > q {
             mask_v.get(ai, j)
