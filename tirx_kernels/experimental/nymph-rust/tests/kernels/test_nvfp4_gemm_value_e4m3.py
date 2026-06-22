@@ -95,3 +95,29 @@ def test_nvfp4_gemm_value_e4m3_sf_cell_exact(m, n, k, alpha):
     d = np.asarray(out[d_t.id], dtype=np.float32).reshape(m, n)
     assert np.isfinite(d).all()
     assert int((d != ref).sum()) == 0, f"{int((d != ref).sum())} mismatches"
+
+
+# The no_overlap epilogue (canon's OVERLAP_EPI=False, used per-shape e.g. at 4096) is a distinct
+# TMEM-drain schedule over the SAME accumulator; it must be cell-exact too (not a special path).
+_NO_OVERLAP_CASES = [
+    (512, 512, 1024, 1.0),  # 4 k-tiles
+    (1024, 1024, 1024, 0.5),  # larger square, non-unit alpha
+]
+
+
+@pytest.mark.parametrize(
+    "m,n,k,alpha",
+    _NO_OVERLAP_CASES,
+    ids=[f"{m}x{n}x{k}@{a}-noov" for m, n, k, a in _NO_OVERLAP_CASES],
+)
+def test_nvfp4_gemm_value_no_overlap_epilogue(m, n, k, alpha):
+    cfg = NvFp4GemmConfig(
+        m=m, n=n, k=k, alpha=alpha, launch_shape=(2,), epilogue="no_overlap", epi_tile=32
+    )
+    kernel = build_nvfp4_gemm(cfg)
+    a_t, b_t, sfa_t, sfb_t, d_t = kernel.args
+    a_q, b_q, sfa, sfb, ref = _prepare(m, n, k, alpha, seed=m + n + k)
+    out = nr.interpret(kernel, {a_t: a_q, b_t: b_q, sfa_t: sfa, sfb_t: sfb})
+    d = np.asarray(out[d_t.id], dtype=np.float32).reshape(m, n)
+    assert np.isfinite(d).all()
+    assert int((d != ref).sum()) == 0, f"{int((d != ref).sum())} mismatches (no_overlap)"

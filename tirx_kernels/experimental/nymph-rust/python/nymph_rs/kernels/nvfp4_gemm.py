@@ -142,6 +142,20 @@ class NvFp4GemmConfig:
     # small shapes, `"evict_normal"` for the cubes. Default `evict_normal` keeps the cubes
     # stable when no shape override is present. The epilogue store keeps its own evict_first.
     load_cache_hint: str | None = "evict_normal"
+    # Epilogue schedule (canon's OVERLAP_EPI). Two TMEM-drain schedules over ONE accumulator:
+    #   "overlap"    — fuse {load EPI_TILE band; wait_ld; scale+cast; store} per store tile,
+    #                  reusing a narrow (128, EPI_TILE) reg fragment. The TMEM drain overlaps
+    #                  with THIS tile's own reg->smem stores. Default; the big cubes use it.
+    #   "no_overlap" — canon's OVERLAP_EPI=False: load the WHOLE MMA_N-wide accumulator into a
+    #                  wide (128, MMA_N) reg fragment in one burst, ONE wait_ld, signal
+    #                  tmem_empty (freeing TMEM for the MMA's NEXT tile EARLY), then one wide
+    #                  scale+cast over the full band, then store all tiles. The TMEM drain now
+    #                  overlaps with the NEXT TILE'S MMA (not this tile's stores), so the MMA
+    #                  pipe never stalls on the epilogue — the lever that lifts canon's SM
+    #                  throughput (ncu 4096: canon 57.8% vs nymph-overlap 51.5%) and its
+    #                  register pressure (172 vs 95 regs/thread). Used by the 4096 square,
+    #                  where the epilogue is the wall-clock residual.
+    epilogue: str = "overlap"
 
 
 def _cfg_cta_n(config: NvFp4GemmConfig) -> int:
@@ -198,7 +212,21 @@ GEMM_CONFIGS = {
     # per-CTA, ncu), so the grouping is a weak lever — within shared-GPU noise — but 2 is never
     # worse and is the median-best on the clean GPU.
     (2048, 2048, 2048): {"l2_group_size": 2, "load_cache_hint": None},
-    (4096, 4096, 4096): {"l2_group_size": 2, "load_cache_hint": None},
+    # 4096: the epilogue is the wall-clock residual (ncu nymph-vs-canon at the OVERLAP
+    # baseline: nymph executed 3.7% FEWER instructions yet ran 4.1% LONGER, SM throughput
+    # 51.5% vs canon 57.8%, 95 vs 172 regs/thread). Canon runs OVERLAP_EPI=False + EPI_TILE=32
+    # here. Two levers, both canon's:
+    #   * epilogue="no_overlap" — frees the accumulator TMEM right after the wide load so the
+    #     MMA's NEXT tile overlaps the TMEM drain (not this tile's stores) → MMA pipe stops
+    #     stalling on the epilogue (0.954 -> 0.978).
+    #   * epi_tile=32 — canon's EPI_TILE at 4096. The 32-wide store tile uses the 64B-atom D
+    #     swizzle and a better-shaped TMA store; the dominant remaining lever (0.978 -> 0.999).
+    (4096, 4096, 4096): {
+        "l2_group_size": 2,
+        "load_cache_hint": None,
+        "epilogue": "no_overlap",
+        "epi_tile": 32,
+    },
     # 8192 / 16384: NO per-shape override yet. These squares run ~14 persistent tasks per
     # cluster, and there is a PRE-EXISTING, timing-sensitive async-pipeline hazard in the
     # cross-task continuation that surfaces ONLY at ~10+ tasks/cluster at full async
@@ -370,9 +398,18 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     # tcgen05_ld (canon's `Tx.wg.copy_async(reg_ldst[:, :], tmem[:, n:n+EPI_TILE])`),
     # then a SINGLE wait_ld / mul / cast over the whole band — not epi_tile//8 narrow
     # 8-col loads each with its own wait_ld (which serialized the TMEM drain on 8x the
-    # async-load fences canon pays). The reg fragments are therefore epi_tile wide.
-    accum_frag = k.tensor(space=MemorySpace.REG, dtype=DType.F32, shape=(epi_tile,))
-    out_frag = k.tensor(space=MemorySpace.REG, dtype=DType.BF16, shape=(epi_tile,))
+    # async-load fences canon pays).
+    #
+    # OVERLAP (default): the reg fragments are epi_tile wide and reused per store tile.
+    # NO-OVERLAP (canon's OVERLAP_EPI=False): the fragments span the WHOLE MMA_N band so
+    # all store tiles' atoms live between the single wait_ld and the stores — canon's
+    # `reg_all = alloc_tcgen05_ldst_frag("16x256b", (128, MMA_N), "float32")`. The codegen
+    # declares the wg_reg_tile width from the max (offset+width) seen across the loads/
+    # casts/stores (reg_widths in codegen.rs), so a mma_n-wide alloc + epi_tile-sliced
+    # loads emit canon's wide fragment exactly.
+    frag_width = mma_n if config.epilogue == "no_overlap" else epi_tile
+    accum_frag = k.tensor(space=MemorySpace.REG, dtype=DType.F32, shape=(frag_width,))
+    out_frag = k.tensor(space=MemorySpace.REG, dtype=DType.BF16, shape=(frag_width,))
 
     smem_full = k.mbar(kind=MBarKind.TMA, stages=smem_depth)
     # Separate SF-load completion barrier (canon's `scale_full_bar`/buffer_6, distinct from
@@ -677,6 +714,43 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                 )
 
     # ---- epilogue (wg1) ----
+    no_overlap = config.epilogue == "no_overlap"
+
+    def store_band(local_iter, d_m, d_n, ot, frag_off):
+        """reg->smem (STSM granularity) + S->G TMA store of one EPI_TILE band. The reg
+        source slice starts at ``frag_off`` (0 for the narrow overlap frag, ot*epi_tile
+        for the wide no-overlap frag), exactly canon's `store_epi_chunk`."""
+        store_iter = local_iter * store_tiles + ot
+        with k.if_(store_iter >= D_DEPTH):
+            k.cp_async_bulk_wait_group_read(D_DEPTH - 1)
+            k.wg_sync(barrier_id=10)
+        d_stage = store_iter % D_DEPTH
+        # Store reg->smem in TMEM_LD_SIZE-wide sub-slices (the wg reg->smem copy granularity,
+        # mirroring the proven fp16/bf16 port's epilogue store).
+        for ki in range(epi_tile // TMEM_LD_SIZE):
+            k.reg_store(
+                TensorSlice(
+                    tensor=d_smem,
+                    offsets=(d_stage, k.tid_in_wg(), ki * TMEM_LD_SIZE),
+                    shape=(1, 1, TMEM_LD_SIZE),
+                ),
+                TensorSlice(
+                    tensor=out_frag,
+                    offsets=(frag_off + ki * TMEM_LD_SIZE,),
+                    shape=(TMEM_LD_SIZE,),
+                ),
+            )
+        k.fence(kind=FenceKind.ASYNC_PROXY, scope=FenceScope.CTA)
+        k.wg_sync(barrier_id=10)
+        k.tma_store(
+            d_gmem,
+            TensorSlice(tensor=d_smem, offsets=(d_stage, 0, 0), shape=(1, blk_m, epi_tile)),
+            coords=(d_m, d_n + ot * epi_tile),
+            shape=(1, blk_m, epi_tile),
+            gmem_shape=(blk_m, epi_tile),
+        )
+        k.cp_async_bulk_commit_group()
+
     with k.role(warpgroup=1):
         with k.for_each_task(task_scheduler) as task:
             local_iter = (task.task_id - task_start) // task_step
@@ -685,48 +759,46 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
             d_n = n_idx * mma_n
             tmem_idx = local_iter % ACC_DEPTH
             k.mbarrier_wait(tmem_full, stage=tmem_idx, phase=(local_iter // ACC_DEPTH) % 2)
-            for ot in range(store_tiles):
-                store_iter = local_iter * store_tiles + ot
-                with k.if_(store_iter >= D_DEPTH):
-                    k.cp_async_bulk_wait_group_read(D_DEPTH - 1)
-                    k.wg_sync(barrier_id=10)
-                d_stage = store_iter % D_DEPTH
-                # Drain the full EPI_TILE-wide band in ONE wide tcgen05_ld + ONE wait_ld +
-                # ONE mul + ONE cast (canon's overlap epilogue). The narrow per-8-col loop
-                # paid EPI_TILE//8 = 8 wait_ld fences per band — the dominant epilogue stall.
-                col = tmem_idx * mma_n + ot * epi_tile
-                k.tcgen05_ld(accum_frag, accum, num=epi_tile, row=0, col=col)
+            acc_col0 = tmem_idx * mma_n
+            if no_overlap:
+                # canon's OVERLAP_EPI=False (reg_all = (128, MMA_N)): load the WHOLE band
+                # into the wide reg fragment in one burst (epi_tile-sliced atoms into
+                # distinct frag columns), ONE wait_ld for all atoms, signal tmem_empty
+                # EARLY (the MMA can start the next tile's accumulate while we scale/cast/
+                # store), then ONE wide mul + ONE wide cast, then store every band. The
+                # TMEM drain overlaps with the NEXT tile's MMA, not this tile's stores.
+                for ot in range(store_tiles):
+                    k.tcgen05_ld(
+                        TensorSlice(tensor=accum_frag, offsets=(ot * epi_tile,), shape=(epi_tile,)),
+                        accum,
+                        num=epi_tile,
+                        row=0,
+                        col=acc_col0 + ot * epi_tile,
+                    )
                 k.tcgen05_wait_ld()
-                # alpha rescale (epilogue global scale), then f32 -> bf16
+                # Free the accumulator TMEM for the MMA's next tile BEFORE the scale/cast/
+                # store (canon arrives tmem_empty right after wait.ld) — all TMEM reads are
+                # complete once wait_ld passes, so the early arrive is the canon-faithful
+                # MMA/epilogue overlap (and is safe: the value model's read already landed).
+                k.mbarrier_arrive(tmem_empty_leader, stage=tmem_idx)
                 k.reg_mul(accum_frag, accum_frag, config.alpha)
                 k.reg_cvt(out_frag, accum_frag)
-                # Store reg->smem in TMEM_LD_SIZE-wide STSM sub-slices (the reg->smem copy
-                # dispatches to stmatrix at this granularity; a wide copy drops to STS.128).
-                for ki in range(epi_tile // TMEM_LD_SIZE):
-                    k.reg_store(
-                        TensorSlice(
-                            tensor=d_smem,
-                            offsets=(d_stage, k.tid_in_wg(), ki * TMEM_LD_SIZE),
-                            shape=(1, 1, TMEM_LD_SIZE),
-                        ),
-                        TensorSlice(
-                            tensor=out_frag,
-                            offsets=(ki * TMEM_LD_SIZE,),
-                            shape=(TMEM_LD_SIZE,),
-                        ),
-                    )
-                if ot == store_tiles - 1:
-                    k.mbarrier_arrive(tmem_empty_leader, stage=tmem_idx)
-                k.fence(kind=FenceKind.ASYNC_PROXY, scope=FenceScope.CTA)
-                k.wg_sync(barrier_id=10)
-                k.tma_store(
-                    d_gmem,
-                    TensorSlice(tensor=d_smem, offsets=(d_stage, 0, 0), shape=(1, blk_m, epi_tile)),
-                    coords=(d_m, d_n + ot * epi_tile),
-                    shape=(1, blk_m, epi_tile),
-                    gmem_shape=(blk_m, epi_tile),
-                )
-                k.cp_async_bulk_commit_group()
+                for ot in range(store_tiles):
+                    store_band(local_iter, d_m, d_n, ot, frag_off=ot * epi_tile)
+            else:
+                # OVERLAP: fuse {load EPI_TILE; wait_ld; scale+cast; store} per store tile,
+                # reusing the narrow (128, EPI_TILE) frag. The TMEM drain overlaps with this
+                # tile's own stores. Drain the band in ONE wide tcgen05_ld + ONE wait_ld +
+                # ONE mul + ONE cast — not epi_tile//8 narrow 8-col loads each with its own
+                # wait_ld (which serialized the drain on 8x the async-load fences canon pays).
+                for ot in range(store_tiles):
+                    k.tcgen05_ld(accum_frag, accum, num=epi_tile, row=0, col=acc_col0 + ot * epi_tile)
+                    k.tcgen05_wait_ld()
+                    k.reg_mul(accum_frag, accum_frag, config.alpha)
+                    k.reg_cvt(out_frag, accum_frag)
+                    if ot == store_tiles - 1:
+                        k.mbarrier_arrive(tmem_empty_leader, stage=tmem_idx)
+                    store_band(local_iter, d_m, d_n, ot, frag_off=0)
         k.cp_async_bulk_wait_group_read(0)
         k.wg_sync(barrier_id=10)
 
@@ -777,6 +849,8 @@ def _validate_config(config: NvFp4GemmConfig) -> None:
     pair_rows = sched_rows // CLUSTER_M
     if pair_rows > l2_group_size and pair_rows % l2_group_size != 0:
         raise ValueError("nvfp4_gemm l2_group_size must divide the cluster-tile row count")
+    if config.epilogue not in ("overlap", "no_overlap"):
+        raise ValueError('nvfp4_gemm epilogue must be "overlap" or "no_overlap"')
 
 
 def _validate_launch_shape(launch_shape: LaunchShape, cta_group: int) -> None:
