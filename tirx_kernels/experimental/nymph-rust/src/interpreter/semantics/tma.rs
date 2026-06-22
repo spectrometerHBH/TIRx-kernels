@@ -308,6 +308,7 @@ fn execute_tma_load<'a, 'k>(
                 gmem_shape,
                 mbar_stage,
                 multicast_cta_mask,
+                cache_hint: _,
                 cta_group,
             } => (
                 dst,

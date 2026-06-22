@@ -2064,7 +2064,7 @@ fn mbarrier_arrive_expect_tx(
     }))
 }
 #[pyfunction]
-#[pyo3(name = "TmaLoad", signature = (dst, src, mbar, bytes, coords, shape, gmem_shape = None, mbar_stage = None, multicast_cta_mask = None, cta_group = 1))]
+#[pyo3(name = "TmaLoad", signature = (dst, src, mbar, bytes, coords, shape, gmem_shape = None, mbar_stage = None, multicast_cta_mask = None, cache_hint = None, cta_group = 1))]
 #[allow(clippy::too_many_arguments)]
 fn tma_load(
     dst: Bound<'_, PyAny>,
@@ -2076,6 +2076,7 @@ fn tma_load(
     gmem_shape: Option<Vec<usize>>,
     mbar_stage: Option<Bound<'_, PyAny>>,
     multicast_cta_mask: Option<u16>,
+    cache_hint: Option<String>,
     cta_group: u8,
 ) -> PyResult<PyStmt> {
     Ok(PyStmt(ir::Stmt::TmaLoad {
@@ -2088,6 +2089,7 @@ fn tma_load(
         gmem_shape,
         mbar_stage: coerce_opt_scalar(mbar_stage)?,
         multicast_cta_mask,
+        cache_hint,
         cta_group,
     }))
 }

@@ -321,8 +321,14 @@ class IRBuilder:
         gmem_shape: Shape | None = None,
         mbar_stage: ScalarValue | None = None,
         multicast_cta_mask: int | None = None,
+        cache_hint: str | None = None,
         cta_group: int = 1,
     ) -> None:
+        """``multicast_cta_mask``: emit a ``multicast::cluster`` g2c copy that fills the
+        SMEM of every CTA in the mask (one shared load for the cluster, halving the load
+        traffic vs each CTA reading the band). ``cache_hint``: the per-load L2 eviction
+        policy (e.g. ``"evict_normal"`` — canon's hint on its g2c loads); ``None`` = no
+        hint. Both are generic and opt-in."""
         if isinstance(dst, Tensor):
             dst = dst[...]
         stmt = TmaLoad(
@@ -335,6 +341,7 @@ class IRBuilder:
             gmem_shape=gmem_shape,
             mbar_stage=mbar_stage,
             multicast_cta_mask=multicast_cta_mask,
+            cache_hint=cache_hint,
             cta_group=cta_group,
         )
         self._append(stmt)

@@ -318,6 +318,7 @@ fn tma_roundtrip_mbar_cell_parity_is_rust_internal() {
                         gmem_shape: None,
                         mbar_stage: None,
                         multicast_cta_mask: None,
+                        cache_hint: None,
                         cta_group: 1,
                     },
                     Stmt::MBarrierWait {
@@ -397,6 +398,7 @@ fn tma_multicast_group2_mbar_targets_are_deduplicated() {
                             gmem_shape: None,
                             mbar_stage: None,
                             multicast_cta_mask: Some(0b11),
+                            cache_hint: None,
                             cta_group: 2,
                         }],
                     },
@@ -468,6 +470,7 @@ fn mbarrier_wait_success_and_blocked_frontier_are_rust_internal() {
                     gmem_shape: None,
                     mbar_stage: None,
                     multicast_cta_mask: None,
+                    cache_hint: None,
                     cta_group: 1,
                 }],
                 warp: Some(1),

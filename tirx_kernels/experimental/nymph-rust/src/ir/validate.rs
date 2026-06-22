@@ -714,6 +714,7 @@ fn validate_stmt(s: &Stmt) -> R {
             gmem_shape,
             mbar_stage,
             multicast_cta_mask,
+            cache_hint: _,
             cta_group,
         } => {
             validate_slice(dst, "tma_load dst")?;

@@ -467,6 +467,13 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                 k.mbarrier_arrive_expect_tx(smem_full, bytes=ab_bytes, stage=stage)
                 k.mbarrier_arrive_expect_tx(sf_full, bytes=sf_bytes, stage=stage)
                 kb = t * BLK_K_BYTES  # packed-fp4 byte column
+                # canon tags every g2c load with the L2 `evict_normal` policy (its
+                # `_tma_g2c_args`): a tile read once per k-tile should not pin an L2 line
+                # the next tile evicts anyway. Bounding the L2 cache-policy traffic on the
+                # LOADS is the lever that stops the full-cube (8192/16384) launch fault —
+                # the operand bands no longer saturate L2 until a TMA reads a stale
+                # tensormap and the launch traps. Pairs with the epilogue store's
+                # `evict_first` (write-once output). Applied to A/B and SFA/SFB alike.
                 k.tma_load(
                     TensorSlice(
                         tensor=a_smem, offsets=(stage, 0, 0), shape=(1, blk_m, BLK_K_BYTES)
@@ -478,6 +485,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                     shape=(1, blk_m, BLK_K_BYTES),
                     gmem_shape=(blk_m, BLK_K_BYTES),
                     mbar_stage=stage,
+                    cache_hint="evict_normal",
                 )
                 k.tma_load(
                     TensorSlice(
@@ -490,6 +498,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                     shape=(1, blk_n, BLK_K_BYTES),
                     gmem_shape=(blk_n, BLK_K_BYTES),
                     mbar_stage=stage,
+                    cache_hint="evict_normal",
                 )
                 # SFA: this CTA's M rows; SFB: the full N band. e4m3 (rows, SF_CTA_K)
                 # straight from the (rows, K//16) GMEM at this k-tile's column band,
@@ -504,10 +513,29 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                     shape=(1, blk_m, SF_CTA_K),
                     gmem_shape=(blk_m, SF_CTA_K),
                     mbar_stage=stage,
+                    cache_hint="evict_normal",
                 )
                 # SFB: the FULL MMA_N=256-wide N band (rank-independent sf_n), so both
                 # CTAs hold the same full-band scales (canon's SFB_N==MMA_N path). The B
                 # operand is still N-split (b_n), but its scales are not.
+                #
+                # NOTE on multicast: canon halves this band's load traffic by having each
+                # CTA read only its cta_rank-indexed half and MULTICAST it to both CTAs
+                # (cta_mask=pair_mask). The codegen + builder support that (multicast_cta_mask
+                # on tma_load, generalized leader-routing of the SF barrier), but it is NOT
+                # wired here: a `multicast::cluster` copy's transaction count completes once
+                # PER multicast destination on the GPU (canon's SFB_BYTES carries the
+                # `* CTA_GROUP` factor for exactly this), whereas the value-model's
+                # transaction accounting completes once per UNIQUE barrier cell
+                # (`apply_mbar_complete_tx` coalesces duplicate targets — the behaviour the
+                # `tma_multicast_group2_mbar_targets_are_deduplicated` interpreter test
+                # locks in). On the shared SFA+SFB barrier the two models cannot agree on a
+                # single IR expect_tx byte count (GPU wants the full band, the value model
+                # wants the issued half), so multicasting SFB here would either desync the
+                # GPU pipeline or break the bit-exact sim. The full-cube launch fault is
+                # instead resolved by the L2 `evict_normal` cache hint on the loads above
+                # (the same lever canon pairs with its multicast); the cubes are
+                # compute-bound, so the doubled SFB read is not the wall-clock bottleneck.
                 k.tma_load(
                     TensorSlice(tensor=sfb_smem, offsets=(stage, 0, 0), shape=(1, mma_n, SF_CTA_K)),
                     sfb_gmem,
@@ -517,6 +545,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                     shape=(1, mma_n, SF_CTA_K),
                     gmem_shape=(mma_n, SF_CTA_K),
                     mbar_stage=stage,
+                    cache_hint="evict_normal",
                 )
 
     # ---- MMA (wg0/warp0, cluster leader only — canon's WarpRole.MMA) ----
