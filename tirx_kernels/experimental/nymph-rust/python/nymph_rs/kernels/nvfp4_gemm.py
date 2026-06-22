@@ -119,6 +119,12 @@ class NvFp4GemmConfig:
     # SMEM pipeline depth (canon's PIPE_DEPTH; 4 or 5). Fewer stages = less SMEM, which
     # the 8192/16384 squares need to stay under the 227 KB cap. None = default 5.
     smem_depth: int | None = None
+    # Persistent-scheduler L2 tile-group size (canon's L2_GROUP_SIZE): the number of
+    # cluster-tile ROWS per group-major L2 locality band. The scheduler walks a cluster's
+    # consecutive tasks down an l2_group_size-row band (shared A row-band / B col-band) so
+    # back-to-back tiles hit in L2. Per-shape (canon: 12 @ 1024, 4 @ 2048/4096). None =
+    # default TILE_GROUPS_ROW_SIZE.
+    l2_group_size: int | None = None
 
 
 def _cfg_cta_n(config: NvFp4GemmConfig) -> int:
@@ -131,6 +137,10 @@ def _cfg_epi_tile(config: NvFp4GemmConfig) -> int:
 
 def _cfg_smem_depth(config: NvFp4GemmConfig) -> int:
     return config.smem_depth if config.smem_depth is not None else SMEM_DEPTH
+
+
+def _cfg_l2_group_size(config: NvFp4GemmConfig) -> int:
+    return config.l2_group_size if config.l2_group_size is not None else TILE_GROUPS_ROW_SIZE
 
 
 def nvfp4_task_config(tasks: int) -> NvFp4GemmConfig:
@@ -159,7 +169,16 @@ GEMM_CONFIGS = {
     # 148 SMs — the GPU is ~78% idle and the pipeline fill/drain latency is unhidden.
     # cta_n=64 halves MMA_N to 128, doubling the N bands → 32 clusters (canon's CTA_N=64
     # parallelism at this square), lifting the wall-clock ratio from ~0.79 to ~0.95.
-    (1024, 1024, 1024): {"cta_n": 64},
+    (1024, 1024, 1024): {"cta_n": 64, "l2_group_size": 12},
+    # 2048 / 4096: keep the coarse MMA_N=256 tiling; the persistent scheduler now decodes a
+    # cluster's OWN linear task index through the group-major order (canon's
+    # ClusterPersistentScheduler2D), so a cluster's back-to-back tiles stay in one L2 band.
+    # The L2_GROUP_SIZE row-band width is tuned per shape against tir-bench wall-clock:
+    # 2048 peaks sharply at a 4-row band (1->0.975, 4->0.983, 8->0.965); 4096 is flat-to-mildly
+    # better at a 1-row band (column-major within an N band: 1->0.962, 4->0.957, 16->0.961) —
+    # at 4096 the kernel is compute-bound (nymph==canon per-CTA), so the grouping is a weak lever.
+    (2048, 2048, 2048): {"l2_group_size": 4},
+    (4096, 4096, 4096): {"l2_group_size": 1},
     # 8192 / 16384: NO per-shape override yet. These squares run ~14 persistent tasks per
     # cluster, and there is a PRE-EXISTING, timing-sensitive async-pipeline hazard in the
     # cross-task continuation that surfaces ONLY at ~10+ tasks/cluster at full async
@@ -196,6 +215,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     # Per-shape tiling knobs (canon's CTA_N / EPI_TILE / PIPE_DEPTH). All other module
     # constants are fixed-hardware (CTA_M, CTA_K, MMA_K, SF_BLOCK, …).
     cta_n = _cfg_cta_n(config)
+    l2_group_size = _cfg_l2_group_size(config)
     mma_n = cta_n * CTA_GROUP  # the pair's shared N band (256 default; 128 for cta_n=64)
     sfb_n_chunks = mma_n // 128  # 1 (mma_n=128) or 2 (mma_n=256) SF column super-blocks
     sfb_cols = SF_CTA_K * sfb_n_chunks  # the full N band's SF cells per lane (folded)
@@ -373,18 +393,35 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     ab_bytes = a_tile_bytes + b_tile_bytes
     sf_bytes = sfa_tile_bytes + sfb_tile_bytes
 
-    def work_coords(work_idx):
-        """ClusterPersistentScheduler2D group-major mapping: rows (M tiles) walk
-        within a TILE_GROUPS_ROW_SIZE-row L2 group, groups row-major. Consecutive
-        work indices (a cluster pair) land on adjacent M tiles of the same N band.
-        Returns (m_idx, n_idx)."""
-        if sched_rows <= TILE_GROUPS_ROW_SIZE:
-            return work_idx % sched_rows, work_idx // sched_rows
-        group_span = TILE_GROUPS_ROW_SIZE * sched_cols
-        group_id = work_idx // group_span
-        within = work_idx % group_span
-        m_idx = group_id * TILE_GROUPS_ROW_SIZE + within % TILE_GROUPS_ROW_SIZE
-        n_idx = within // TILE_GROUPS_ROW_SIZE
+    def work_coords(task_id, cta_rank):
+        """Canon's ClusterPersistentScheduler2D group-major mapping, at PAIR
+        (cluster) granularity — the fix for L2 tile-grouping.
+
+        Canon threads a CLUSTER's own linear tile index through the group-major
+        order: cluster ``c``'s k-th tile is ``pair_idx = c + k*num_clusters``,
+        and that single ``pair_idx`` is decoded over the cluster-tile grid
+        (``pair_rows = sched_rows // CLUSTER_M`` rows × ``sched_cols`` N bands),
+        so a cluster's CONSECUTIVE tasks stay inside one ``l2_group``-row band
+        (a shared A row-band / B col-band → L2 reuse). The per-CTA M tile is then
+        ``pair_row * CLUSTER_M + cta_rank`` (the pair's two adjacent M tiles).
+
+        The OLD mapping decoded the GLOBAL ``work_idx = task_id*CLUSTER_M + rank``
+        (group rows over CTA M tiles), so a cluster's stride of
+        ``num_clusters*CLUSTER_M`` through ``work_idx`` scattered its back-to-back
+        tiles across the whole M/N grid — no inter-task L2 band reuse.
+
+        Returns (m_idx, n_idx) — the CTA's own M tile and the pair's N band."""
+        pair_rows = sched_rows // CLUSTER_M  # cluster-tile rows (canon CLUSTER_M_TILES)
+        if pair_rows <= l2_group_size:
+            pair_row = task_id % pair_rows
+            n_idx = task_id // pair_rows
+        else:
+            group_span = l2_group_size * sched_cols
+            group_id = task_id // group_span
+            within = task_id % group_span
+            pair_row = group_id * l2_group_size + within % l2_group_size
+            n_idx = within // l2_group_size
+        m_idx = pair_row * CLUSTER_M + cta_rank
         return m_idx, n_idx
 
     with k.kernel_init(warp=0):
@@ -414,8 +451,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     with k.role(warp=2):
         with k.for_each_task(task_scheduler) as task:
             local_iter = (task.task_id - task_start) // task_step
-            work_idx = task.task_id * cta_group + cta_rank
-            m_idx, n_idx = work_coords(work_idx)
+            m_idx, n_idx = work_coords(task.task_id, cta_rank)
             a_m = m_idx * CTA_M  # this CTA's own M tile
             b_n = n_idx * mma_n + cta_rank * cta_n  # this CTA's half of the N band
             sf_n = n_idx * mma_n  # the FULL N band's B scales (rank-independent)
@@ -594,8 +630,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     with k.role(warpgroup=1):
         with k.for_each_task(task_scheduler) as task:
             local_iter = (task.task_id - task_start) // task_step
-            work_idx = task.task_id * cta_group + cta_rank
-            m_idx, n_idx = work_coords(work_idx)
+            m_idx, n_idx = work_coords(task.task_id, cta_rank)
             d_m = m_idx * CTA_M
             d_n = n_idx * mma_n
             tmem_idx = local_iter % ACC_DEPTH
@@ -682,8 +717,16 @@ def _validate_config(config: NvFp4GemmConfig) -> None:
     sched_rows = _ceil_div(config.m, CTA_M)
     if sched_rows % CTA_GROUP != 0:
         raise ValueError("nvfp4_gemm requires an even number of M tiles per cluster pair")
-    if sched_rows > TILE_GROUPS_ROW_SIZE and sched_rows % TILE_GROUPS_ROW_SIZE != 0:
-        raise ValueError("nvfp4_gemm supports tail-only or full-group tilings")
+    # The group-major scheduler decodes a cluster's linear task index over the cluster-tile
+    # grid (pair_rows = sched_rows // CLUSTER_M rows). The bijection requires the band split
+    # to be exact: either one short column-walk (pair_rows <= l2_group_size) or whole groups
+    # with no tail (pair_rows % l2_group_size == 0).
+    l2_group_size = _cfg_l2_group_size(config)
+    if not isinstance(l2_group_size, int) or isinstance(l2_group_size, bool) or l2_group_size < 1:
+        raise ValueError("nvfp4_gemm l2_group_size must be a positive integer")
+    pair_rows = sched_rows // CLUSTER_M
+    if pair_rows > l2_group_size and pair_rows % l2_group_size != 0:
+        raise ValueError("nvfp4_gemm l2_group_size must divide the cluster-tile row count")
 
 
 def _validate_launch_shape(launch_shape: LaunchShape, cta_group: int) -> None:
