@@ -2459,9 +2459,19 @@ fn emit_stmt(
             let src_s = emit_smem_tile(src, ctx)?;
             let dst_s = emit_gmem_region(dst, coords, gmem_extents(gmem_shape, shape), ctx)?;
             out.push_str(&format!("{p}if tid_in_wg == 0:\n"));
+            // `cache_hint="evict_first"`: the store band is write-once output, never
+            // re-read by this kernel. Marking it evict-first keeps the persistent
+            // grid's many in-flight D tiles from packing L2 with dead lines and
+            // evicting the live operand tiles / TMA tensormaps. Without it, a fully
+            // occupied persistent launch (148 CTAs each streaming many output tiles
+            // through L2) pressures the memory subsystem until a TMA store reads a
+            // stale descriptor and the launch faults (cudaErrorLaunchFailure 719) —
+            // an L2-policy hazard, invisible to the happens-before protocol model
+            // (the checker stays green), occupancy-driven, and masked by any
+            // serialization. canon's epilogue store carries the same hint.
             // Prefetch the D (store) tensormap too, matching the canonical epilogue store.
             out.push_str(&format!(
-                "{p}    Tx.copy_async({dst_s}, {src_s}, dispatch=\"tma\", prefetch_tensormap=True)\n"
+                "{p}    Tx.copy_async({dst_s}, {src_s}, dispatch=\"tma\", cache_hint=\"evict_first\", prefetch_tensormap=True)\n"
             ));
             Ok(())
         }
