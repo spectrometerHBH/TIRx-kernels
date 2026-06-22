@@ -24,8 +24,12 @@ SF_CELLS = 4  # CTA_K // SF_BLOCK(16) // 4
 
 def _compile_nymph(M, N, K, **ov):
     # Per-shape knob overrides (cta_n / epi_tile / smem_depth), mirroring canon's
-    # TIRX_CONFIGS. Explicit kwargs win over the table.
-    knobs = {**gemm_config_for(M, N, K), **ov}
+    # TIRX_CONFIGS. Explicit kwargs win over the table. NVFP4_OV (env JSON) is a
+    # bench-time override sweep hook (merged last).
+    import json as _json
+
+    env_ov = _json.loads(os.environ.get("NVFP4_OV", "{}"))
+    knobs = {**gemm_config_for(M, N, K), **ov, **env_ov}
     cfg = NvFp4GemmConfig(m=M, n=N, k=K, **knobs)
     src = nr.kernel_to_tirx_source(build_nvfp4_gemm(cfg))
     d = tempfile.mkdtemp(prefix="nvfp4_")

@@ -127,6 +127,12 @@ class NvFp4GemmConfig:
     # SMEM pipeline depth (canon's PIPE_DEPTH; 4 or 5). Fewer stages = less SMEM, which
     # the 8192/16384 squares need to stay under the 227 KB cap. None = default 5.
     smem_depth: int | None = None
+    # D-store ring depth (canon's WB_PIPE_DEPTH; the number of output SMEM stages the
+    # epilogue can have in flight before it must `cp_async.bulk.wait_group`). A deeper ring
+    # lets the drain issue more store-tile TMAs back-to-back (shorter drain tail on the
+    # latency-bound small squares); it costs `d_depth * blk_m * epi_tile * 2` SMEM, so the
+    # cap-tight squares keep it shallow. None = default D_DEPTH (2).
+    d_depth: int | None = None
     # Persistent-scheduler L2 tile-group size (canon's L2_GROUP_SIZE): the number of
     # cluster-tile ROWS per group-major L2 locality band. The scheduler walks a cluster's
     # consecutive tasks down an l2_group_size-row band (shared A row-band / B col-band) so
@@ -177,6 +183,10 @@ def _cfg_epi_tile(config: NvFp4GemmConfig) -> int:
 
 def _cfg_smem_depth(config: NvFp4GemmConfig) -> int:
     return config.smem_depth if config.smem_depth is not None else SMEM_DEPTH
+
+
+def _cfg_d_depth(config: NvFp4GemmConfig) -> int:
+    return config.d_depth if config.d_depth is not None else D_DEPTH
 
 
 def _cfg_l2_group_size(config: NvFp4GemmConfig) -> int:
@@ -298,6 +308,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     sfb_cols = SF_CTA_K * sfb_n_chunks  # the full N band's SF cells per lane (folded)
     epi_tile = _cfg_epi_tile(config)
     smem_depth = _cfg_smem_depth(config)
+    d_depth = _cfg_d_depth(config)  # output store-ring depth (canon WB_PIPE_DEPTH)
     load_cache_hint = config.load_cache_hint  # per-shape L2 hint on the g2c loads (see config)
     blk_m = CTA_M  # per-CTA A rows (its own M tile)
     blk_n = cta_n  # per-CTA B rows (its half of the shared N band)
@@ -329,7 +340,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     sfa_off = b_off + smem_depth * b_tile_bytes
     sfb_off = sfa_off + smem_depth * sfa_tile_bytes
     d_off = sfb_off + smem_depth * sfb_tile_bytes
-    smem_size_bytes = d_off + D_DEPTH * d_tile_bytes
+    smem_size_bytes = d_off + d_depth * d_tile_bytes
 
     k = IRBuilder(
         "nymph_nvfp4_gemm",
@@ -380,7 +391,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     d_smem = k.tensor(
         space=MemorySpace.SMEM,
         dtype=DType.BF16,
-        shape=(D_DEPTH, blk_m, epi_tile),
+        shape=(d_depth, blk_m, epi_tile),
         byte_offset=d_off,
     )
 
@@ -774,10 +785,10 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
         source slice starts at ``frag_off`` (0 for the narrow overlap frag, ot*epi_tile
         for the wide no-overlap frag), exactly canon's `store_epi_chunk`."""
         store_iter = local_iter * store_tiles + ot
-        with k.if_(store_iter >= D_DEPTH):
-            k.cp_async_bulk_wait_group_read(D_DEPTH - 1)
+        with k.if_(store_iter >= d_depth):
+            k.cp_async_bulk_wait_group_read(d_depth - 1)
             k.wg_sync(barrier_id=10)
-        d_stage = store_iter % D_DEPTH
+        d_stage = store_iter % d_depth
         # Store reg->smem in store_chunk-wide sub-slices (stmatrix: 16-col chunks → STSM;
         # else TMEM_LD_SIZE → STS, mirroring the proven fp16/bf16 port's epilogue store).
         for ki in range(epi_tile // store_chunk):
@@ -889,6 +900,9 @@ def _validate_config(config: NvFp4GemmConfig) -> None:
     epi_tile = _cfg_epi_tile(config)
     if mma_n % epi_tile != 0 or epi_tile % TMEM_LD_SIZE != 0:
         raise ValueError("nvfp4_gemm epi_tile must divide MMA_N and be a multiple of TMEM_LD_SIZE")
+    d_depth = _cfg_d_depth(config)
+    if not isinstance(d_depth, int) or isinstance(d_depth, bool) or d_depth < 2:
+        raise ValueError("nvfp4_gemm d_depth must be an integer >= 2")
     sched_rows = _ceil_div(config.m, CTA_M)
     if sched_rows % CTA_GROUP != 0:
         raise ValueError("nvfp4_gemm requires an even number of M tiles per cluster pair")

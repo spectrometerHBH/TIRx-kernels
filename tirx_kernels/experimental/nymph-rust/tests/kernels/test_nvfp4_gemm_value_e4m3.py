@@ -121,3 +121,22 @@ def test_nvfp4_gemm_value_no_overlap_epilogue(m, n, k, alpha):
     d = np.asarray(out[d_t.id], dtype=np.float32).reshape(m, n)
     assert np.isfinite(d).all()
     assert int((d != ref).sum()) == 0, f"{int((d != ref).sum())} mismatches (no_overlap)"
+
+
+# A deeper output store ring (canon's WB_PIPE_DEPTH > 2). The d_depth knob only
+# changes how many D_smem stages the epilogue cycles through (store pacing); the
+# values must stay bit-exact regardless of ring depth.
+@pytest.mark.parametrize(
+    "m,n,k,alpha,d_depth",
+    [(512, 512, 1024, 1.0, 3), (512, 512, 1024, 0.5, 4)],
+    ids=lambda v: f"dd{v}" if isinstance(v, int) and v in (3, 4) else str(v),
+)
+def test_nvfp4_gemm_value_d_depth(m, n, k, alpha, d_depth):
+    cfg = NvFp4GemmConfig(m=m, n=n, k=k, alpha=alpha, launch_shape=(2,), d_depth=d_depth)
+    kernel = build_nvfp4_gemm(cfg)
+    a_t, b_t, sfa_t, sfb_t, d_t = kernel.args
+    a_q, b_q, sfa, sfb, ref = _prepare(m, n, k, alpha, seed=m + n + k + d_depth)
+    out = nr.interpret(kernel, {a_t: a_q, b_t: b_q, sfa_t: sfa, sfb_t: sfb})
+    d = np.asarray(out[d_t.id], dtype=np.float32).reshape(m, n)
+    assert np.isfinite(d).all()
+    assert int((d != ref).sum()) == 0, f"{int((d != ref).sum())} mismatches (d_depth={d_depth})"
