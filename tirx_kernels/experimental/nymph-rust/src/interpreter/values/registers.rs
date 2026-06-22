@@ -360,6 +360,7 @@ mod tests {
             shape: vec![1],
             layout: None,
             byte_offset: None,
+            reg_frag: None,
         });
         let mut values = RegisterValues::default();
         values.by_instance.insert(

@@ -36,6 +36,29 @@ pub struct TmemLayout {
     pub lane_align: u8, // 0 or 16
 }
 
+/// Register-fragment physical layout for an epilogue REG tensor. `None` (the
+/// default) is the plain warpgroup thread-axis tile (`T.wg_reg_tile`): each of the
+/// 128 lanes owns one contiguous row. `Stmatrix` selects the `tcgen05.{ld,st}`-atom
+/// layout (`T.alloc_tcgen05_ldst_frag` / `T.alloc_cast_frag`) — the per-(lane,
+/// register) decomposition that the `Tx.copy(dispatch="ldstmatrix")` reg->smem store
+/// requires to lower to STSM/stmatrix instead of plain STS (canon's nvfp4 epilogue).
+///
+/// This is a CODEGEN-ONLY concern: the value model and protocol checker see a plain
+/// REG tensor either way (the physical register decomposition is below the value
+/// model). So the marker rides on the IR tensor purely to drive the emitted alloc +
+/// the reg->smem dispatch; it never changes interpreter/validate behaviour.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum RegFrag {
+    /// `tcgen05.{ld,st}`-atom fragment. `instr_shape` is the PTX atom shape
+    /// (canon's `"16x256b"`). `cast_of` links a cast (output) frag to its source
+    /// (read) frag by id: `None` = the read frag (`alloc_tcgen05_ldst_frag`),
+    /// `Some(src_id)` = a `alloc_cast_frag(<src>, dtype)` of that read frag.
+    Stmatrix {
+        instr_shape: String,
+        cast_of: Option<u32>,
+    },
+}
+
 /// `Tensor` — the data, plus a stable `id` for identity. Held by `Arc<Tensor>`
 /// wherever it's referenced (no copies of the shape/layout).
 #[derive(Debug)]
@@ -46,6 +69,10 @@ pub struct Tensor {
     pub shape: Vec<usize>,
     pub layout: Option<Layout>,
     pub byte_offset: Option<usize>,
+    /// Physical register-fragment layout for REG-space epilogue tensors (see
+    /// `RegFrag`). `None` for every non-REG tensor and for the default thread-axis
+    /// reg tile.
+    pub reg_frag: Option<RegFrag>,
 }
 
 // Identity = id only (so `Arc<Tensor>` comparisons reduce to id comparisons, and a

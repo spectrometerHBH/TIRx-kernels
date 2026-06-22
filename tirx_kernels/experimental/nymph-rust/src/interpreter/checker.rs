@@ -3055,6 +3055,7 @@ mod tests {
                 swizzle: Swizzle::None,
             })),
             byte_offset: Some(byte_offset),
+            reg_frag: None,
         })
     }
 

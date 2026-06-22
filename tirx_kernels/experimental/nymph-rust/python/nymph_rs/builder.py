@@ -200,9 +200,19 @@ class IRBuilder:
         shape: Shape,
         layout: Layout | None = None,
         byte_offset: int | None = None,
+        reg_frag: tuple[str, int | None] | None = None,
     ) -> Tensor:
+        # `reg_frag` (REG tensors only) selects the stmatrix-atom register layout for
+        # the epilogue reg->smem store: a `(instr_shape, cast_of)` tuple where
+        # `cast_of` is the read frag's tensor id (None = the read frag itself). See
+        # ir::RegFrag::Stmatrix — codegen-only, invisible to the value model.
         tensor = Tensor(
-            space=space, dtype=dtype, shape=shape, layout=layout, byte_offset=byte_offset
+            space=space,
+            dtype=dtype,
+            shape=shape,
+            layout=layout,
+            byte_offset=byte_offset,
+            reg_frag=reg_frag,
         )
         self._append(TensorDef(tensor))
         return tensor

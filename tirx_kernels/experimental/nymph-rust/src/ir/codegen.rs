@@ -1729,11 +1729,41 @@ fn emit_stmt(
                 .copied()
                 .filter(|w| *w > 0)
                 .unwrap_or_else(|| tensor.shape.first().copied().unwrap_or(0));
-            out.push_str(&format!(
-                "{p}{name} = T.wg_reg_tile({width}, dtype=\"{dt}\")\n",
-                p = pad(indent),
-                dt = dtype_str(tensor.dtype),
-            ));
+            match &tensor.reg_frag {
+                // STMATRIX epilogue datapath (canon's nvfp4 epilogue): the reg frag is
+                // a `tcgen05.{ld,st}`-atom fragment, not a plain thread-axis tile, so the
+                // reg->smem store lowers to STSM/stmatrix (vs the thread-axis tile's plain
+                // STS, which carries 5.4x the SMEM bank conflicts). The read frag is
+                // `alloc_tcgen05_ldst_frag(instr_shape, (128, W), dtype)`; the cast (output)
+                // frag is `alloc_cast_frag(<read_frag>, dtype)`, inheriting the read frag's
+                // (lane, register) layout so the f32->bf16 cast is a per-thread no-movement op.
+                Some(super::tensor::RegFrag::Stmatrix { instr_shape, cast_of }) => {
+                    match cast_of {
+                        None => {
+                            out.push_str(&format!(
+                                "{p}{name} = T.alloc_tcgen05_ldst_frag(\"{instr_shape}\", (128, {width}), \"{dt}\")\n",
+                                p = pad(indent),
+                                dt = dtype_str(tensor.dtype),
+                            ));
+                        }
+                        Some(src_id) => {
+                            let src_name = ctx.tensor_name(*src_id)?.to_string();
+                            out.push_str(&format!(
+                                "{p}{name} = T.alloc_cast_frag({src_name}, \"{dt}\")\n",
+                                p = pad(indent),
+                                dt = dtype_str(tensor.dtype),
+                            ));
+                        }
+                    }
+                }
+                None => {
+                    out.push_str(&format!(
+                        "{p}{name} = T.wg_reg_tile({width}, dtype=\"{dt}\")\n",
+                        p = pad(indent),
+                        dt = dtype_str(tensor.dtype),
+                    ));
+                }
+            }
             Ok(())
         }
         // ---- definitions handled in the header; skip in the body walk ----
@@ -2465,7 +2495,16 @@ fn emit_stmt(
                 let src_off = src.offsets.first().unwrap_or(&zero);
                 let width = src.shape.first().and_then(as_int).unwrap_or(0).max(0) as usize;
                 let src_s = emit_reg_view_slice(out, &p, &src.tensor, src_off, width, ctx)?;
-                out.push_str(&format!("{p}Tx.wg.copy({dst_s}, {src_s})\n"));
+                // STMATRIX epilogue: a `tcgen05.{ld,st}`-atom src frag stores reg->smem via
+                // `dispatch="ldstmatrix"` (canon's `regs_to_smem`), lowering to STSM. The
+                // kernel slices the store in 16-col chunks (stmatrix.x4 granularity). A plain
+                // thread-axis frag (reg_frag=None) keeps the default `Tx.wg.copy` (STS).
+                let dispatch = if src.tensor.reg_frag.is_some() {
+                    ", dispatch=\"ldstmatrix\""
+                } else {
+                    ""
+                };
+                out.push_str(&format!("{p}Tx.wg.copy({dst_s}, {src_s}{dispatch})\n"));
             } else {
                 // GMEM store (bootstrap direct epilogue): the warpgroup-collective
                 // `Tx.wg.copy(C[row:row+128, c0:c1], reg[:, :])`. The reg fragment is a

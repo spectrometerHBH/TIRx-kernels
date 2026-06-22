@@ -155,6 +155,15 @@ class NvFp4GemmConfig:
     #                  throughput (ncu 4096: canon 57.8% vs nymph-overlap 51.5%) and its
     #                  register pressure (172 vs 95 regs/thread). Used by the 4096 square,
     #                  where the epilogue is the wall-clock residual.
+    #   "stmatrix"   — the OVERLAP schedule, but the reg-frag datapath is canon's
+    #                  `alloc_tcgen05_ldst_frag` ("16x256b") read frag + `alloc_cast_frag`
+    #                  output frag, and the reg->smem store is `dispatch="ldstmatrix"` in
+    #                  16-col chunks (stmatrix.x4). The plain overlap path emits a thread-axis
+    #                  `wg_reg_tile` stored via `Tx.wg.copy` → STS, which carries 5.4x the
+    #                  SMEM bank conflicts of canon's STSM (ncu: nymph 535 vs canon 100;
+    #                  `smsp__inst_executed_op_shared_stsm` 0 vs 16384). stmatrix makes the
+    #                  store STSM, matching canon's epilogue exactly. Used by the latency-bound
+    #                  small squares (1024/2048) where the epilogue store is the residual.
     epilogue: str = "overlap"
 
 
@@ -200,6 +209,18 @@ GEMM_CONFIGS = {
     # 148 SMs — the GPU is ~78% idle and the pipeline fill/drain latency is unhidden.
     # cta_n=64 halves MMA_N to 128, doubling the N bands → 32 clusters (canon's CTA_N=64
     # parallelism at this square), lifting the wall-clock ratio from ~0.79 to ~0.95.
+    # 1024: cta_n=64 (32 clusters) + 2-row L2 band + no load cache hint. The overlap
+    # epilogue with the default epi_tile=64 is the measured best (tir-bench, clean B200:
+    # 0.965). The stmatrix epilogue datapath (epilogue="stmatrix") was BUILT, validated,
+    # and ncu-proven to fire (the epilogue reg->smem store becomes STSM —
+    # `smsp__inst_executed_op_shared_stsm` 0->16384, exactly canon's; plain-STS count
+    # drops to 640, byte-identical to canon's store mix), BUT it REGRESSES this shape on
+    # the speed verdict: stmatrix+epi32 0.939, stmatrix+epi64 0.955, overlap+epi32 0.956
+    # — all below this 0.965. At 1024 only ~32 clusters occupy 148 SMs, so the kernel is
+    # pipeline fill/drain LATENCY-bound, not epilogue-store-bound; the single-cluster ncu
+    # already has nymph≈canon (16.93us vs 16.83us, 0.994), so the residual is grid-level
+    # occupancy/tail latency, which STSM does not touch (and its extra reg pressure, 48 vs
+    # 40, slightly hurts the latency-bound tail). So stay on the proven overlap path.
     (1024, 1024, 1024): {"cta_n": 64, "l2_group_size": 2, "load_cache_hint": None},
     # 2048 / 4096: keep the coarse MMA_N=256 tiling; the persistent scheduler now decodes a
     # cluster's OWN linear task index through the group-major order (canon's
@@ -211,6 +232,14 @@ GEMM_CONFIGS = {
     # since its cta_n=64 gives pair_rows=4). At 2048/4096 the kernel is compute-bound (nymph≈canon
     # per-CTA, ncu), so the grouping is a weak lever — within shared-GPU noise — but 2 is never
     # worse and is the median-best on the clean GPU.
+    # 2048: 2-row L2 band + no load cache hint, overlap epilogue with the default
+    # epi_tile=64 — the measured best (tir-bench, clean B200: 0.982). As with 1024, the
+    # stmatrix epilogue (epilogue="stmatrix") was built + ncu-proven to fire (STSM
+    # 0->16384, plain-STS 640 = byte-identical to canon's store mix) but REGRESSES this
+    # shape on the speed verdict (stmatrix+epi32 0.936 vs this 0.982). The single-cluster
+    # ncu already has nymph≈canon (0.994), so 2048's residual is grid-level (64 tasks on
+    # 74 clusters → ~1 task/cluster, tail-/latency-bound), not the epilogue store. Stay
+    # on the proven overlap path.
     (2048, 2048, 2048): {"l2_group_size": 2, "load_cache_hint": None},
     # 4096: the epilogue is the wall-clock residual (ncu nymph-vs-canon at the OVERLAP
     # baseline: nymph executed 3.7% FEWER instructions yet ran 4.1% LONGER, SM throughput
@@ -408,8 +437,26 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     # casts/stores (reg_widths in codegen.rs), so a mma_n-wide alloc + epi_tile-sliced
     # loads emit canon's wide fragment exactly.
     frag_width = mma_n if config.epilogue == "no_overlap" else epi_tile
-    accum_frag = k.tensor(space=MemorySpace.REG, dtype=DType.F32, shape=(frag_width,))
-    out_frag = k.tensor(space=MemorySpace.REG, dtype=DType.BF16, shape=(frag_width,))
+    # STMATRIX epilogue: the reg frags are canon's `tcgen05.{ld,st}`-atom fragments
+    # (`alloc_tcgen05_ldst_frag("16x256b", (128, W), "float32")` for the f32 read frag,
+    # `alloc_cast_frag(<read>, "bfloat16")` for the bf16 output frag), so the reg->smem
+    # store lowers to STSM (vs the thread-axis tile's plain STS — 5.4x the bank conflicts).
+    # The marker is a `(instr_shape, cast_of)` tuple on the IR REG tensor (codegen-only;
+    # the value model sees a plain REG tensor). cast_of=None = the read frag; cast_of=
+    # accum_frag.id links the output frag to it (alloc_cast_frag inherits its layout).
+    stmatrix_epi = config.epilogue == "stmatrix"
+    accum_frag = k.tensor(
+        space=MemorySpace.REG,
+        dtype=DType.F32,
+        shape=(frag_width,),
+        reg_frag=("16x256b", None) if stmatrix_epi else None,
+    )
+    out_frag = k.tensor(
+        space=MemorySpace.REG,
+        dtype=DType.BF16,
+        shape=(frag_width,),
+        reg_frag=("16x256b", accum_frag.id) if stmatrix_epi else None,
+    )
 
     smem_full = k.mbar(kind=MBarKind.TMA, stages=smem_depth)
     # Separate SF-load completion barrier (canon's `scale_full_bar`/buffer_6, distinct from
@@ -714,7 +761,13 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                 )
 
     # ---- epilogue (wg1) ----
+    # stmatrix runs the OVERLAP schedule (canon's 1024/2048 are OVERLAP_EPI=True + stmatrix
+    # store); only "no_overlap" takes the wide-frag MMA-overlap path.
     no_overlap = config.epilogue == "no_overlap"
+    # reg->smem store-chunk width: 16 cols for the stmatrix path (stmatrix.x4 granularity —
+    # canon's `regs_to_smem` chunks `EPI_TILE // 16`), else the plain `Tx.wg.copy`/STS path's
+    # TMEM_LD_SIZE (=8) sub-slice (the proven fp16/bf16 port's granularity).
+    store_chunk = 16 if stmatrix_epi else TMEM_LD_SIZE
 
     def store_band(local_iter, d_m, d_n, ot, frag_off):
         """reg->smem (STSM granularity) + S->G TMA store of one EPI_TILE band. The reg
@@ -725,19 +778,19 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
             k.cp_async_bulk_wait_group_read(D_DEPTH - 1)
             k.wg_sync(barrier_id=10)
         d_stage = store_iter % D_DEPTH
-        # Store reg->smem in TMEM_LD_SIZE-wide sub-slices (the wg reg->smem copy granularity,
-        # mirroring the proven fp16/bf16 port's epilogue store).
-        for ki in range(epi_tile // TMEM_LD_SIZE):
+        # Store reg->smem in store_chunk-wide sub-slices (stmatrix: 16-col chunks → STSM;
+        # else TMEM_LD_SIZE → STS, mirroring the proven fp16/bf16 port's epilogue store).
+        for ki in range(epi_tile // store_chunk):
             k.reg_store(
                 TensorSlice(
                     tensor=d_smem,
-                    offsets=(d_stage, k.tid_in_wg(), ki * TMEM_LD_SIZE),
-                    shape=(1, 1, TMEM_LD_SIZE),
+                    offsets=(d_stage, k.tid_in_wg(), ki * store_chunk),
+                    shape=(1, 1, store_chunk),
                 ),
                 TensorSlice(
                     tensor=out_frag,
-                    offsets=(frag_off + ki * TMEM_LD_SIZE,),
-                    shape=(TMEM_LD_SIZE,),
+                    offsets=(frag_off + ki * store_chunk,),
+                    shape=(store_chunk,),
                 ),
             )
         k.fence(kind=FenceKind.ASYNC_PROXY, scope=FenceScope.CTA)
@@ -849,8 +902,13 @@ def _validate_config(config: NvFp4GemmConfig) -> None:
     pair_rows = sched_rows // CLUSTER_M
     if pair_rows > l2_group_size and pair_rows % l2_group_size != 0:
         raise ValueError("nvfp4_gemm l2_group_size must divide the cluster-tile row count")
-    if config.epilogue not in ("overlap", "no_overlap"):
-        raise ValueError('nvfp4_gemm epilogue must be "overlap" or "no_overlap"')
+    if config.epilogue not in ("overlap", "no_overlap", "stmatrix"):
+        raise ValueError('nvfp4_gemm epilogue must be "overlap", "no_overlap", or "stmatrix"')
+    if config.epilogue == "stmatrix" and epi_tile % 16 != 0:
+        # The reg->smem store chunks in 16-col slices (stmatrix.x4 granularity), and the
+        # f32 read frag's "16x256b" atom needs cols divisible by 8 — epi_tile=16/32/64 all
+        # satisfy both; epi_tile=8 would not (and is not a configured value anyway).
+        raise ValueError("nvfp4_gemm stmatrix epilogue requires epi_tile a multiple of 16")
 
 
 def _validate_launch_shape(launch_shape: LaunchShape, cta_group: int) -> None:

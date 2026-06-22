@@ -1212,6 +1212,7 @@ mod tests {
                 lane_align: 0,
             })),
             byte_offset: None,
+            reg_frag: None,
         });
         let whole = Arc::new(Tensor {
             id: 11,
@@ -1224,6 +1225,7 @@ mod tests {
                 lane_align: 0,
             })),
             byte_offset: None,
+            reg_frag: None,
         });
         let lo = tensor_region_from_uniform(&half, 0, &[0, 0], &[1, 1]).unwrap();
         let hi = tensor_region_from_uniform(&half, 0, &[0, 1], &[1, 1]).unwrap();
