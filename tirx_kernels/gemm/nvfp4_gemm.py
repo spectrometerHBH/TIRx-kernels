@@ -979,6 +979,19 @@ TIRX_CONFIGS = {
         # 3's whole stream; the generated-CUDA `for`/`while`/`if` (persistent-loop) and
         # scheduler-decode counts converge toward nymph. Scoped to 16384.
         "MERGE_TMA": True,
+        # RULED OUT — split operand-load pipeline depth (A/B ring at depth 6, decoupled
+        # from the SF ring at 5). Uniform PIPE_DEPTH=6 overflows the SMEM cap (241888 B >
+        # ~232448); the split form (separate ab_empty/tile_full at depth 6 + sf_empty/
+        # scale_full at depth 5, with WB_PIPE_DEPTH=1 for headroom) FITS at 231632 B
+        # (816 B spare) — BUILT, runs (cudaFuncSetAttribute succeeds), CORRECT (cosine
+        # 0.99096), and the generated CUDA shows the two rings (stage wrap `== 6` x3 for
+        # A/B, `== 5` x3 for SF). But it is BENCH-NEUTRAL: order-controlled 1.653/1.652 ms
+        # both orders and tir-bench median 1.063 — indistinguishable from the depth-5
+        # baseline (1.649/1.650 ms, median 1.071). At 16384 the kernel is tensor-bound and
+        # PIPE_DEPTH=5 already hides the A/B load latency (the MMA does not stall on A/B
+        # loads), so a 6th A/B stage buys no extra latency hiding. The split also needs a
+        # meta-class ring holder + per-ring cursors/barriers (significant structural cost)
+        # and is not kept for zero measured gain. canon stays at uniform PIPE_DEPTH=5.
         # RULED OUT — MMA scheduler ring-index form. canon drives the MMA SMEM ring with
         # an explicit `stage++; if(stage==5){stage=0; phase^=1}` counter+wrap (SASS:
         # ISETP.NE/SEL/SEL/LOP3, ~4 cheap int ops/advance). nymph uses a continuous
