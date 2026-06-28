@@ -1,8 +1,8 @@
-# tir-bench
+# bench-suite
 
 Pre-commit regression benchmark for TIRx kernels. Runs the curated workload
 sweep in `workloads.yaml` against the **working tree**, assigns GPUs
-automatically, and writes run JSON + reports under `.tir-bench/`.
+automatically, and writes run JSON + reports under `.bench-suite/`.
 
 ```bash
 cd /path/to/tirx-kernels-staging
@@ -14,12 +14,12 @@ export TVM_LIBRARY_PATH="${TVM_PATH}/build/lib"
 # Do NOT set CUDA_VISIBLE_DEVICES — GPU selection is automatic.
 ```
 
-Entry point: `python -m tirx_kernels.tir_bench` (same flags as `run.py`).
+Entry point: `python -m tirx_kernels.bench_suite` (same flags as `run.py`).
 
 Import gate (kernels referenced in `workloads.yaml` only):
 
 ```bash
-python -m tirx_kernels.tir_bench --check-imports
+python -m tirx_kernels.bench_suite --check-imports
 ```
 
 ## Directory layout
@@ -30,7 +30,7 @@ python -m tirx_kernels.tir_bench --check-imports
 | **Pinned baseline (git)** | `tir.json`, `ref.json`, `ratio.json`, `baseline.md` |
 | **Promote / report** | `promote_baseline.py`, `reaggregate_from_logs.py`, `ratio_diff.py`, `baseline_view.py` |
 
-Run artifacts (logs, `runs/*.json`, `reports/*`) live under `.tir-bench/` and are not committed.
+Run artifacts (logs, `runs/*.json`, `reports/*`) live under `.bench-suite/` and are not committed.
 
 ## Strategy (TL;DR)
 
@@ -73,9 +73,9 @@ Promote through `promote_baseline.py` only (never bare `cp`).
 ### Daily: kernel iteration
 
 ```bash
-python -m tirx_kernels.tir_bench --impls ours
-python tirx_kernels/tir_bench/promote_baseline.py \
-  .tir-bench/runs/<id>.json --tir
+python -m tirx_kernels.bench_suite --impls ours
+python tirx_kernels/bench_suite/promote_baseline.py \
+  .bench-suite/runs/<id>.json --tir
 ```
 
 Before merge, add `--rounds 5` and promote.
@@ -83,25 +83,25 @@ Before merge, add `--rounds 5` and promote.
 ### Refresh references (rare)
 
 ```bash
-python -m tirx_kernels.tir_bench --impls baseline --rounds 5
-python tirx_kernels/tir_bench/reaggregate_from_logs.py --ref
+python -m tirx_kernels.bench_suite --impls baseline --rounds 5
+python tirx_kernels/bench_suite/reaggregate_from_logs.py --ref
 ```
 
 Or separate ours + baseline runs, then:
 
 ```bash
-python -m tirx_kernels.tir_bench --impls ours --rounds 5
-python -m tirx_kernels.tir_bench --impls baseline --rounds 5
-python tirx_kernels/tir_bench/promote_baseline.py .tir-bench/runs/<ours-id>.json --tir
-python tirx_kernels/tir_bench/reaggregate_from_logs.py --ref
+python -m tirx_kernels.bench_suite --impls ours --rounds 5
+python -m tirx_kernels.bench_suite --impls baseline --rounds 5
+python tirx_kernels/bench_suite/promote_baseline.py .bench-suite/runs/<ours-id>.json --tir
+python tirx_kernels/bench_suite/reaggregate_from_logs.py --ref
 ```
 
 ### Full ratio sweep
 
 ```bash
-python -m tirx_kernels.tir_bench --impls all --rounds 5
-less .tir-bench/reports/latest/bench.md
-python tirx_kernels/tir_bench/promote_baseline.py .tir-bench/runs/<id>.json --both
+python -m tirx_kernels.bench_suite --impls all --rounds 5
+less .bench-suite/reports/latest/bench.md
+python tirx_kernels/bench_suite/promote_baseline.py .bench-suite/runs/<id>.json --both
 ```
 
 Spot-check one workload: `python -m tirx_kernels.bench --kernel ... --config ... --impls all --rounds 5`
@@ -130,9 +130,9 @@ Promoted baselines often use **trimmed_mean ×5** via `reaggregate_from_logs.py`
 
 | Path | Description |
 |------|-------------|
-| `.tir-bench/runs/<id>.json` | Aggregated run results (times in microseconds) |
-| `.tir-bench/reports/<id>/bench.md` | Main diff report |
-| `.tir-bench/logs/*__<role>_a<N>.log` | Subprocess stdout (N proton trees when `--rounds N`) |
+| `.bench-suite/runs/<id>.json` | Aggregated run results (times in microseconds) |
+| `.bench-suite/reports/<id>/bench.md` | Main diff report |
+| `.bench-suite/logs/*__<role>_a<N>.log` | Subprocess stdout (N proton trees when `--rounds N`) |
 
 ## Exit codes
 

@@ -21,7 +21,7 @@ from collections import defaultdict
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-DEFAULT_LOG_DIR = HERE.parents[2] / ".tir-bench" / "logs"
+DEFAULT_LOG_DIR = HERE.parents[2] / ".bench-suite" / "logs"
 OURS_IMPLS = frozenset({"tir", "tirx"})
 FA4_SKIP_BASELINES = frozenset({"flashinfer"})
 
@@ -109,11 +109,7 @@ def _merge_sample_maps(
 
 
 def _aggregate_rows(
-    samples: dict[tuple[str, str], dict[str, list[float]]],
-    *,
-    impl_filter,
-    rounds: int,
-    method: str,
+    samples: dict[tuple[str, str], dict[str, list[float]]], *, impl_filter, rounds: int, method: str
 ) -> dict[tuple[str, str], dict]:
     out: dict[tuple[str, str], dict] = {}
     for key, impl_samples in samples.items():
@@ -125,10 +121,7 @@ def _aggregate_rows(
                 continue
             qualified[impl] = aggregate_impl_times(us_list[:rounds], method)
         if qualified:
-            out[key] = {
-                "impls": qualified,
-                "aggregated": {"rounds": rounds, "method": method},
-            }
+            out[key] = {"impls": qualified, "aggregated": {"rounds": rounds, "method": method}}
     return out
 
 

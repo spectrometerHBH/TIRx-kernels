@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Ratio-based regression diff for tir-bench.
+"""Ratio-based regression diff for bench-suite.
 
 For each (kernel, config) we measure with multiple impls, compute the
 ratio ref/ours where ref = fastest non-ours impl picked in baseline and
@@ -40,7 +40,7 @@ OUR_IMPLS = {"tir", "tirx"}
 DEFAULT_RATIO_THRESHOLD = 1.0
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent.parent
-DEFAULT_LATEST_RUN = REPO_ROOT / ".tir-bench" / "latest.json"
+DEFAULT_LATEST_RUN = REPO_ROOT / ".bench-suite" / "latest.json"
 DEFAULT_TIR_BASELINE = HERE / "tir.json"
 DEFAULT_REF_BASELINE = HERE / "ref.json"
 DEFAULT_RATIO_BASELINE = HERE / "ratio.json"
@@ -166,10 +166,7 @@ def load_ratio_baseline(path: Path | str | None = None) -> dict | None:
 
 
 def write_ratio_json(
-    path: Path | None = None,
-    *,
-    tir_path: Path | None = None,
-    ref_path: Path | None = None,
+    path: Path | None = None, *, tir_path: Path | None = None, ref_path: Path | None = None
 ) -> Path:
     """Regenerate ratio.json from pinned tir.json + ref.json."""
     tir_path = tir_path or DEFAULT_TIR_BASELINE
@@ -299,7 +296,7 @@ def build_report(
         else "computed from tir.json + ref.json"
     )
 
-    w("# tir-bench bench report")
+    w("# bench-suite bench report")
     w()
     w(f"- Baseline (abs µs): `{baseline_label}`")
     w(f"- Saved ratios: `{ratio_label}` from ratio.json")
@@ -369,9 +366,7 @@ def main() -> None:
         help=f"Current run JSON (default: {DEFAULT_LATEST_RUN})",
     )
     ap.add_argument(
-        "--baseline",
-        default=None,
-        help="Combined baseline JSON; default joins tir.json + ref.json",
+        "--baseline", default=None, help="Combined baseline JSON; default joins tir.json + ref.json"
     )
     ap.add_argument(
         "--threshold",
@@ -384,7 +379,7 @@ def main() -> None:
         "-o",
         type=Path,
         default=None,
-        help="Write report path (default: .tir-bench/reports/<run>/bench.md)",
+        help="Write report path (default: .bench-suite/reports/<run>/bench.md)",
     )
     ap.add_argument(
         "--refresh-ratio-json",

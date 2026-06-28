@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""tir-bench: pre-commit regression benchmark for TIRx kernels.
+"""bench-suite: pre-commit regression benchmark for TIRx kernels.
 
 See README.md in this directory for setup, baseline workflow, and flags.
 
 Quick start:
-    python -m tirx_kernels.tir_bench --impls ours
-    python -m tirx_kernels.tir_bench --impls all --rounds 5
-    python tirx_kernels/tir_bench/promote_baseline.py .tir-bench/runs/<id>.json --both
+    python -m tirx_kernels.bench_suite --impls ours
+    python -m tirx_kernels.bench_suite --impls all --rounds 5
+    python tirx_kernels/bench_suite/promote_baseline.py .bench-suite/runs/<id>.json --both
 
 Exit codes:
     0  no regressions (or no baseline yet)
@@ -42,7 +42,7 @@ def _kernels_repo_root() -> Path:
     return SCRIPT_DIR.parent.parent
 
 
-DEFAULT_OUT_DIR = _kernels_repo_root() / ".tir-bench"
+DEFAULT_OUT_DIR = _kernels_repo_root() / ".bench-suite"
 DEFAULT_WORKLOADS = SCRIPT_DIR / "workloads.yaml"
 # Two pinned baselines with independent update cadences: our kernels (refreshed
 # by `--impls ours`) and external references (refreshed by `--impls baseline`).
@@ -276,7 +276,7 @@ class _Tee:
 # Thread-safe one-liner emitter. `print()` calls file.write() multiple times
 # (once for the message, once for the trailing newline), so without this
 # lock concurrent prints from worker threads can interleave halfway through
-# a line. Use log() for any [tir-bench] status print from a worker thread.
+# a line. Use log() for any [bench-suite] status print from a worker thread.
 _log_lock = threading.Lock()
 
 
@@ -325,10 +325,10 @@ def detect_usable_gpus(
             ok, err = fut.result()
             if ok:
                 usable.add(idx)
-                log(f"[tir-bench]   gpu {idx}: ok")
+                log(f"[bench-suite]   gpu {idx}: ok")
             else:
                 failures[idx] = err
-                log(f"[tir-bench]   gpu {idx}: FAIL — {err}")
+                log(f"[bench-suite]   gpu {idx}: FAIL — {err}")
     return usable, failures
 
 
@@ -639,7 +639,7 @@ def run_one(
 
     # Each workload gets its own scratch cwd so concurrent runs don't race on
     # proton's <proton_name>.hatchet file.
-    workdir = tempfile.mkdtemp(prefix=f"tir-bench-{kernel}-{config}-")
+    workdir = tempfile.mkdtemp(prefix=f"bench-suite-{kernel}-{config}-")
 
     label = f"{kernel}/{config}/{impls_mode}"
     worker = threading.current_thread().name
@@ -648,7 +648,7 @@ def run_one(
     interfered = False
     intruder_pids: list[int] = []
     try:
-        log(f"[tir-bench] {started} {worker} gpu={gpu} START {label} (attempt {attempt})")
+        log(f"[bench-suite] {started} {worker} gpu={gpu} START {label} (attempt {attempt})")
         # Pass the physical GPU index; the monitor uses per-PID sm-util (pmon).
         returncode, interfered, intruder_pids = _run_subprocess_monitored(
             cmd, env, workdir, log_path, gpu, MONITOR_INTERVAL, pool.util_threshold
@@ -700,14 +700,14 @@ def run_one(
     impl_str = ", ".join(f"{k}={v:.3f}µs" for k, v in impls.items())
     if interfered:
         # Make INTERFERED stand out — easy to spot when scrolling.
-        log("[tir-bench] " + "*" * 70)
-        log(f"[tir-bench] *** INTERFERED *** {worker} gpu={gpu} {label} attempt {attempt}")
-        log(f"[tir-bench] ***   intruder PIDs on gpu {gpu}: {intruder_pids}")
-        log("[tir-bench] ***   subprocess killed, will retry until ok")
-        log("[tir-bench] " + "*" * 70)
+        log("[bench-suite] " + "*" * 70)
+        log(f"[bench-suite] *** INTERFERED *** {worker} gpu={gpu} {label} attempt {attempt}")
+        log(f"[bench-suite] ***   intruder PIDs on gpu {gpu}: {intruder_pids}")
+        log("[bench-suite] ***   subprocess killed, will retry until ok")
+        log("[bench-suite] " + "*" * 70)
     else:
         log(
-            f"[tir-bench] {record['finished_at']} {worker} gpu={gpu} {status:4s} {label} {impl_str}"
+            f"[bench-suite] {record['finished_at']} {worker} gpu={gpu} {status:4s} {label} {impl_str}"
         )
     return record
 
@@ -1008,8 +1008,10 @@ BASELINE_IMPL_BY_KERNEL = {
     "deepgemm_sm100_fp8_mqa_logits": "deepgemm",
     "deepgemm_sm100_fp4_mqa_logits": "deepgemm",
     "deepgemm_sm100_fp4_paged_mqa_logits": "deepgemm",
+    "flash_mla_sparse_fwd": "flashmla",
     "sparse_flashmla_prefill_head64_phase1": "flashmla",
     "sparse_flashmla_prefill_head128_phase1": "flashmla",
+    "sparse_flashmla_prefill_head128_small_topk_phase1": "flashmla",
 }
 
 
@@ -1024,7 +1026,7 @@ def _our_impl(row_impls: dict) -> str | None:
 def write_summary(out_dir: Path, current: dict) -> Path:
     """Human-readable per-run report, grouped by kernel.
 
-    Times are in µs to match the existing tir-bench doc convention. Per row:
+    Times are in µs to match the existing bench-suite doc convention. Per row:
     config, one column per impl present in that kernel, baseline/ours ratio
     (against the kernel's reference impl from BASELINE_IMPL_BY_KERNEL),
     then attempt + gpu.
@@ -1033,7 +1035,7 @@ def write_summary(out_dir: Path, current: dict) -> Path:
     reports_dir = out_dir / "reports" / stamp
     reports_dir.mkdir(parents=True, exist_ok=True)
     lines: list[str] = []
-    lines.append(f"# tir-bench run {stamp}")
+    lines.append(f"# bench-suite run {stamp}")
     lines.append("")
     label = current.get("label") or "-"
     git = current.get("git") or {}
@@ -1223,7 +1225,7 @@ def diff_report(baseline: dict, current: dict, threshold_pct: float) -> tuple[st
         return lines
 
     md: list[str] = []
-    md.append("# tir-bench regression report")
+    md.append("# bench-suite regression report")
     md.append("")
     md.append(f"- Current:  `{current['timestamp']}` ({current.get('label') or '-'})")
     md.append(
@@ -1379,7 +1381,7 @@ def run_scheduled_jobs(
                 with state_lock:
                     retry_log.append((kernel, config, role, attempt, detail[:240]))
                 log(
-                    f"[tir-bench] >>> REQUEUE {kernel}/{config}/{role} "
+                    f"[bench-suite] >>> REQUEUE {kernel}/{config}/{role} "
                     f"attempt {attempt} ({reason}): {detail[:160]} <<<"
                 )
                 pending.put((workload, role, attempt + 1))
@@ -1399,7 +1401,7 @@ def run_scheduled_jobs(
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="tir-bench: pre-commit regression benchmark")
+    ap = argparse.ArgumentParser(description="bench-suite: pre-commit regression benchmark")
     ap.add_argument(
         "--workloads",
         type=Path,
@@ -1411,7 +1413,7 @@ def main() -> None:
         type=Path,
         default=DEFAULT_OUT_DIR,
         help="Where to store runs/, logs/, reports/, latest.json "
-        "(default: <tirx-kernels>/.tir-bench)",
+        "(default: <tirx-kernels>/.bench-suite)",
     )
     ap.add_argument(
         "--baseline",
@@ -1514,27 +1516,27 @@ def main() -> None:
     )
     args = ap.parse_args()
     if args.rounds < 1:
-        print("[tir-bench] --rounds must be >= 1", file=sys.stderr)
+        print("[bench-suite] --rounds must be >= 1", file=sys.stderr)
         sys.exit(2)
     if args.round_cooldown < 0:
-        print("[tir-bench] --round-cooldown must be >= 0", file=sys.stderr)
+        print("[bench-suite] --round-cooldown must be >= 0", file=sys.stderr)
         sys.exit(2)
     if args.util_threshold < 0 or args.mem_threshold < 0:
-        print("[tir-bench] --util-threshold/--mem-threshold must be >= 0", file=sys.stderr)
+        print("[bench-suite] --util-threshold/--mem-threshold must be >= 0", file=sys.stderr)
         sys.exit(2)
 
     workloads = load_workloads(args.workloads)
     if args.filter:
         workloads = [w for w in workloads if args.filter in w["kernel"]]
     if not workloads:
-        print("[tir-bench] no workloads to run.", file=sys.stderr)
+        print("[bench-suite] no workloads to run.", file=sys.stderr)
         sys.exit(2)
 
     if args.check_imports:
         from tirx_kernels.registry import check_workload_imports
 
         names = check_workload_imports(workloads, strict=True)
-        print(f"[tir-bench] import check ok ({len(names)} kernels from {args.workloads})")
+        print(f"[bench-suite] import check ok ({len(names)} kernels from {args.workloads})")
         return
 
     out_dir = args.out_dir.resolve()
@@ -1552,16 +1554,16 @@ def main() -> None:
     run_log_fh = open(run_log_path, "a", buffering=1)
     sys.stdout = _Tee(sys.stdout, run_log_fh)
     sys.stderr = _Tee(sys.stderr, run_log_fh)
-    # Repoint `latest.log` symlink immediately so `tail -f .tir-bench/latest.log`
+    # Repoint `latest.log` symlink immediately so `tail -f .bench-suite/latest.log`
     # picks up this run before any output happens.
     latest_log = out_dir / "latest.log"
     if latest_log.exists() or latest_log.is_symlink():
         latest_log.unlink()
     latest_log.symlink_to(run_log_path.relative_to(out_dir))
 
-    print(f"[tir-bench] live log: {run_log_path}")
-    print(f"[tir-bench]   tail : tail -f {latest_log}")
-    print(f"[tir-bench] run id : {stamp}")
+    print(f"[bench-suite] live log: {run_log_path}")
+    print(f"[bench-suite]   tail : tail -f {latest_log}")
+    print(f"[bench-suite] run id : {stamp}")
 
     # ── Automatic GPU selection (no manual override on purpose) ──
     # 1. Startup probe: run a tiny fp16 matmul on every visible card
@@ -1569,13 +1571,10 @@ def main() -> None:
     #    contended card; this catches broken drivers / ECC). Probe failures
     #    are banned for the rest of the run.
     # 2. Per-workload acquire: re-scan utilization/memory every time we need a card.
-    listing_pool = GpuPool(
-        util_threshold=args.util_threshold,
-        mem_threshold=args.mem_threshold,
-    )
+    listing_pool = GpuPool(util_threshold=args.util_threshold, mem_threshold=args.mem_threshold)
     in_filter = [idx for idx, _ in listing_pool._all_gpus()]
     if not in_filter:
-        print("[tir-bench] no visible GPUs.", file=sys.stderr)
+        print("[bench-suite] no visible GPUs.", file=sys.stderr)
         sys.exit(1)
     utils_now = listing_pool._utils()
     mem_now = listing_pool._mem_used_pct()
@@ -1584,12 +1583,12 @@ def main() -> None:
     util_str = " ".join(f"{i}:{utils_now.get(i, 0):.0f}%" for i in sorted(in_filter, key=int))
     mem_str = " ".join(f"{i}:{mem_now.get(i, 0):.1f}%" for i in sorted(in_filter, key=int))
     print(
-        f"[tir-bench] visible: {len(in_filter)} {sorted(in_filter, key=int)}; "
+        f"[bench-suite] visible: {len(in_filter)} {sorted(in_filter, key=int)}; "
         f"util now [{util_str}]; mem now [{mem_str}]",
         flush=True,
     )
     print(
-        f"[tir-bench] gate: util-threshold={args.util_threshold:g}%, "
+        f"[bench-suite] gate: util-threshold={args.util_threshold:g}%, "
         f"mem-threshold={args.mem_threshold:g}% — "
         f"occupied (skip): {occupied_now if occupied_now else 'none'}; "
         f"shareable: "
@@ -1603,20 +1602,19 @@ def main() -> None:
         probe_failures: dict[str, str] = {}
     else:
         print(
-            f"[tir-bench] probing {len(in_filter)} GPU(s) with fp16 512x512 matmul ...", flush=True
+            f"[bench-suite] probing {len(in_filter)} GPU(s) with fp16 512x512 matmul ...",
+            flush=True,
         )
         usable, probe_failures = detect_usable_gpus(in_filter, args.probe_timeout)
 
     if not usable:
-        print("[tir-bench] no usable GPUs (all probes failed).", file=sys.stderr)
+        print("[bench-suite] no usable GPUs (all probes failed).", file=sys.stderr)
         for idx, err in probe_failures.items():
-            print(f"[tir-bench]   gpu {idx}: {err}", file=sys.stderr)
+            print(f"[bench-suite]   gpu {idx}: {err}", file=sys.stderr)
         sys.exit(1)
 
     pool = GpuPool(
-        allowed=usable,
-        util_threshold=args.util_threshold,
-        mem_threshold=args.mem_threshold,
+        allowed=usable, util_threshold=args.util_threshold, mem_threshold=args.mem_threshold
     )
     n_gpus = len(usable)
     cpu_workers = args.cpu_workers if args.cpu_workers > 0 else n_gpus
@@ -1632,7 +1630,7 @@ def main() -> None:
         else ""
     )
     print(
-        f"[tir-bench] {len(workloads)} workloads, {n_gpus} probe-OK GPU(s) in pool, "
+        f"[bench-suite] {len(workloads)} workloads, {n_gpus} probe-OK GPU(s) in pool, "
         f"{cpu_workers} worker(s), roles={roles}, label={label}{agg_note}",
         flush=True,
     )
@@ -1649,11 +1647,11 @@ def main() -> None:
     )
 
     if retry_log:
-        log(f"[tir-bench] requeue summary: {len(retry_log)} failed attempt(s) before success")
+        log(f"[bench-suite] requeue summary: {len(retry_log)} failed attempt(s) before success")
         for k, c, role, att, detail in retry_log:
-            log(f"[tir-bench]   - {k}/{c}/{role}: attempt {att} → {detail}")
+            log(f"[bench-suite]   - {k}/{c}/{role}: attempt {att} → {detail}")
     else:
-        log("[tir-bench] requeue summary: none (every job succeeded on first try)")
+        log("[bench-suite] requeue summary: none (every job succeeded on first try)")
 
     results.sort(key=lambda r: (r["kernel"], r.get("label") or r.get("config")))
     probe_meta = {"enabled": not args.no_probe, "usable": sorted(usable), "failed": probe_failures}
@@ -1666,8 +1664,8 @@ def main() -> None:
     latest.symlink_to(run_path.relative_to(out_dir))
 
     summary_path = write_summary(out_dir, current)
-    print(f"[tir-bench] wrote {run_path}")
-    print(f"[tir-bench] wrote {summary_path}")
+    print(f"[bench-suite] wrote {run_path}")
+    print(f"[bench-suite] wrote {summary_path}")
 
     if args.no_report:
         return
@@ -1676,8 +1674,8 @@ def main() -> None:
     # fresh run by cp-ing it over the matching file (per-mode hints below).
     baseline = load_baseline(args.baseline)
     if baseline is None:
-        print("[tir-bench] no baseline (tir.json / ref.json) — skipping regression report")
-        print(f"[tir-bench]   set baseline: promote_baseline.py {run_path} --tir/--ref")
+        print("[bench-suite] no baseline (tir.json / ref.json) — skipping regression report")
+        print(f"[bench-suite]   set baseline: promote_baseline.py {run_path} --tir/--ref")
         return
 
     reports_dir = out_dir / "reports" / current["timestamp"]
@@ -1702,28 +1700,30 @@ def main() -> None:
                 ratio_baseline=load_ratio_baseline(DEFAULT_RATIO_BASELINE),
             )
         except Exception as e:
-            print(f"[tir-bench] bench report failed: {e}", file=sys.stderr)
+            print(f"[bench-suite] bench report failed: {e}", file=sys.stderr)
             sys.exit(3)
     else:
         bench_md, n_regress = diff_report(baseline, current, args.threshold)
         bench_md = bench_md.replace(
-            "# tir-bench regression report",
-            "# tir-bench bench report\n\n_Absolute-µs diff only "
+            "# bench-suite regression report",
+            "# bench-suite bench report\n\n_Absolute-µs diff only "
             f"(--impls {args.impls}; run with --impls all for ref+ours+ratio)._",
             1,
         )
         if args.impls == "baseline":
-            print(f"[tir-bench]   promote reference times: promote_baseline.py {run_path} --ref")
+            print(f"[bench-suite]   promote reference times: promote_baseline.py {run_path} --ref")
         else:
             print(
-                "[tir-bench] --impls ours: absolute-µs diff only "
+                "[bench-suite] --impls ours: absolute-µs diff only "
                 "(run --impls all for ref+ours+ratio vs ratio.json)"
             )
-            print(f"[tir-bench]   promote your kernel times: promote_baseline.py {run_path} --tir")
+            print(
+                f"[bench-suite]   promote your kernel times: promote_baseline.py {run_path} --tir"
+            )
 
     bench_path = reports_dir / "bench.md"
     bench_path.write_text(bench_md)
-    print(f"[tir-bench] wrote {bench_path}\n")
+    print(f"[bench-suite] wrote {bench_path}\n")
     print(bench_md)
 
     if n_regress > 0:

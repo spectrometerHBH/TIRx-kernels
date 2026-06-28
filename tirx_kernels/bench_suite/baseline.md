@@ -1,4 +1,4 @@
-# tir-bench baseline view: `tir.json + ref.json`
+# bench-suite baseline view: `tir.json + ref.json`
 
 - Timestamp: `12`
 - Label:     `3a146e3c-dirty`

@@ -1,4 +1,4 @@
-# tir-bench workloads — curated sweep for `python -m tirx_kernels.tir_bench`.
+# bench-suite workloads — curated sweep for `python -m tirx_kernels.bench_suite`.
 # Edit freely. Run `python -m tirx_kernels.registry --format=benchrun --cc 10` to see the full set.
 
 defaults:
