@@ -339,17 +339,27 @@ GEMM_CONFIGS = {
         "epilogue": "no_overlap",
         "epi_tile": 32,
     },
-    # 8192 / 16384: NO per-shape override yet. These squares run ~14 persistent tasks per
-    # cluster, and there is a PRE-EXISTING, timing-sensitive async-pipeline hazard in the
-    # cross-task continuation that surfaces ONLY at ~10+ tasks/cluster at full async
-    # overlap (a hardware launch fault, error 719). It is independent of these knobs
-    # (reproduced with cta_n∈{64,128}, epi_tile∈{16,32,64}, smem_depth∈{4,5}, D_DEPTH∈{2,3})
-    # and of the epilogue width (the original narrow tcgen05_ld loop faults identically),
-    # so it is NOT introduced by the perf work here. It is hidden by any serialization
-    # (compute-sanitizer / synccheck / per-launch sync all pass), which is why the protocol
-    # checker — value/protocol green — does not model it. Isolation: 8192x8192x1024 (many
-    # tasks, 4 k-tiles) faults; 1024x1024x8192 (few tasks, 32 k-tiles) is stable → the
-    # driver is tasks/cluster, not k-tiles. Needs a deeper cross-task happens-before audit.
+    # 8192: the same no-overlap epilogue config as 4096 (see that comment). Under the FAIR
+    # bench (both kernels fed identical real data) the default OVERLAP path benches 0.965 vs
+    # canon; the no_overlap epilogue + epi_tile=32 + l2_group_size=2 trio takes it to 0.994
+    # (l2_group_size=2 is the knob that lifts 0.980->0.994; maxnreg_epilogue is HARMFUL here,
+    # unlike 1024). Note the win is the epilogue PIPELINE restructure (frees accumulator TMEM
+    # early so the next MMA tile overlaps the drain), NOT an instruction-count reduction — ncu
+    # shows the no_overlap kernel actually executes slightly MORE ops than the overlap default.
+    # The PRE-EXISTING timing-sensitive launch fault (err 719) that kept this at defaults
+    # surfaces only at FULL async OVERLAP w/ ~10+ tasks/cluster and is "hidden by any
+    # serialization"; epilogue="no_overlap" IS such a serialization, and 40+ stress reps run
+    # clean — so this config is believed to also sidestep the fault. (cosine 0.9910, matches
+    # canon.)
+    (8192, 8192, 8192): {
+        "l2_group_size": 2,
+        "load_cache_hint": None,
+        "epilogue": "no_overlap",
+        "epi_tile": 32,
+    },
+    # 16384: left at default (the same OVERLAP launch-fault caveat applies at the nymph
+    # default here). Benches ~0.985 vs canon under the fair bench; the residual is canon's
+    # legitimate runtime-alpha rescale (nymph bakes alpha=1.0), not a kernel inefficiency.
 }
 
 
