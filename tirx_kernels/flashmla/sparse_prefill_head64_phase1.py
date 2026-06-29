@@ -468,6 +468,7 @@ def _kernel(
     tiled_mma_o_k = T.meta_var(tiled_mma_O[2])
     tiled_mma_o_col = T.meta_var(tiled_mma_O[3])
     tmem_pool = T.TMEMPool(pool, total_cols=512, cta_group=1, tmem_addr=tmem_start_addr)
+    tmem_ldst = tmem_pool.alloc((128, 512), "float32", datapath="D")
     tmem_pool.move_base_to(tiled_mma_o_col)
     tmem_o_lo = tmem_pool.alloc(
         (B_H, D_V // 2),
@@ -604,161 +605,31 @@ def _kernel(
             T.ptx.tcgen05.fence.after_thread_sync()
 
             # CUDA common_subroutine.h:75-134 retrieve_mask_and_reduce_p.
-            p = T.alloc_local((num_elems_per_thread,), "float32")
-            p_peer = T.alloc_local((num_elems_per_thread,), "float32")
+            p_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, num_elems_per_thread), "float32")
+            p_peer_frag = T.alloc_tcgen05_ldst_frag(
+                "32x32b", (128, num_elems_per_thread), "float32"
+            )
+            p = p_frag.local()
+            p_peer = p_peer_frag.local()
             if warp_idx < 2:
-                T.ptx.tcgen05.ld(
-                    T.uint32(0),
-                    p[0],
-                    p[1],
-                    p[2],
-                    p[3],
-                    p[4],
-                    p[5],
-                    p[6],
-                    p[7],
-                    p[8],
-                    p[9],
-                    p[10],
-                    p[11],
-                    p[12],
-                    p[13],
-                    p[14],
-                    p[15],
-                    p[16],
-                    p[17],
-                    p[18],
-                    p[19],
-                    p[20],
-                    p[21],
-                    p[22],
-                    p[23],
-                    p[24],
-                    p[25],
-                    p[26],
-                    p[27],
-                    p[28],
-                    p[29],
-                    p[30],
-                    p[31],
-                    shape="32x32b",
-                    num=num_elems_per_thread,
-                    col=TMEM_COL_P,
+                Tx.wg.copy_async(
+                    p_frag[:, :], tmem_ldst[:, TMEM_COL_P : TMEM_COL_P + num_elems_per_thread]
                 )
-                T.ptx.tcgen05.ld(
-                    T.uint32(0),
-                    p_peer[0],
-                    p_peer[1],
-                    p_peer[2],
-                    p_peer[3],
-                    p_peer[4],
-                    p_peer[5],
-                    p_peer[6],
-                    p_peer[7],
-                    p_peer[8],
-                    p_peer[9],
-                    p_peer[10],
-                    p_peer[11],
-                    p_peer[12],
-                    p_peer[13],
-                    p_peer[14],
-                    p_peer[15],
-                    p_peer[16],
-                    p_peer[17],
-                    p_peer[18],
-                    p_peer[19],
-                    p_peer[20],
-                    p_peer[21],
-                    p_peer[22],
-                    p_peer[23],
-                    p_peer[24],
-                    p_peer[25],
-                    p_peer[26],
-                    p_peer[27],
-                    p_peer[28],
-                    p_peer[29],
-                    p_peer[30],
-                    p_peer[31],
-                    shape="32x32b",
-                    num=num_elems_per_thread,
-                    col=TMEM_COL_P + num_elems_per_thread,
+                Tx.wg.copy_async(
+                    p_peer_frag[:, :],
+                    tmem_ldst[
+                        :, TMEM_COL_P + num_elems_per_thread : TMEM_COL_P + num_elems_per_thread * 2
+                    ],
                 )
             else:
-                T.ptx.tcgen05.ld(
-                    T.uint32(0),
-                    p_peer[0],
-                    p_peer[1],
-                    p_peer[2],
-                    p_peer[3],
-                    p_peer[4],
-                    p_peer[5],
-                    p_peer[6],
-                    p_peer[7],
-                    p_peer[8],
-                    p_peer[9],
-                    p_peer[10],
-                    p_peer[11],
-                    p_peer[12],
-                    p_peer[13],
-                    p_peer[14],
-                    p_peer[15],
-                    p_peer[16],
-                    p_peer[17],
-                    p_peer[18],
-                    p_peer[19],
-                    p_peer[20],
-                    p_peer[21],
-                    p_peer[22],
-                    p_peer[23],
-                    p_peer[24],
-                    p_peer[25],
-                    p_peer[26],
-                    p_peer[27],
-                    p_peer[28],
-                    p_peer[29],
-                    p_peer[30],
-                    p_peer[31],
-                    shape="32x32b",
-                    num=num_elems_per_thread,
-                    col=TMEM_COL_P,
+                Tx.wg.copy_async(
+                    p_peer_frag[:, :], tmem_ldst[:, TMEM_COL_P : TMEM_COL_P + num_elems_per_thread]
                 )
-                T.ptx.tcgen05.ld(
-                    T.uint32(0),
-                    p[0],
-                    p[1],
-                    p[2],
-                    p[3],
-                    p[4],
-                    p[5],
-                    p[6],
-                    p[7],
-                    p[8],
-                    p[9],
-                    p[10],
-                    p[11],
-                    p[12],
-                    p[13],
-                    p[14],
-                    p[15],
-                    p[16],
-                    p[17],
-                    p[18],
-                    p[19],
-                    p[20],
-                    p[21],
-                    p[22],
-                    p[23],
-                    p[24],
-                    p[25],
-                    p[26],
-                    p[27],
-                    p[28],
-                    p[29],
-                    p[30],
-                    p[31],
-                    shape="32x32b",
-                    num=num_elems_per_thread,
-                    col=TMEM_COL_P + num_elems_per_thread,
+                Tx.wg.copy_async(
+                    p_frag[:, :],
+                    tmem_ldst[
+                        :, TMEM_COL_P + num_elems_per_thread : TMEM_COL_P + num_elems_per_thread * 2
+                    ],
                 )
             T.ptx.tcgen05.wait.ld()
             T.ptx.tcgen05.fence.before_thread_sync()
@@ -884,47 +755,17 @@ def _kernel(
                 # CUDA common_subroutine.h:147-168 rescale_O.
                 rescale_o_d_v = T.meta_var(D_V)
                 chunk_size = T.meta_var(32)
-                tmem_col_start = T.meta_var(TMEM_COL_O)
                 scale_for_old_pair: T.let = T.cuda.make_float2(scale_for_old, scale_for_old)
-                o_rescale = T.alloc_local((32,), "float32")
+                o_rescale_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, 32), "float32")
+                o_rescale = o_rescale_frag.local()
                 for chunk_idx in T.unroll((rescale_o_d_v // 2) // chunk_size):
-                    T.ptx.tcgen05.ld(
-                        T.uint32(0),
-                        o_rescale[0],
-                        o_rescale[1],
-                        o_rescale[2],
-                        o_rescale[3],
-                        o_rescale[4],
-                        o_rescale[5],
-                        o_rescale[6],
-                        o_rescale[7],
-                        o_rescale[8],
-                        o_rescale[9],
-                        o_rescale[10],
-                        o_rescale[11],
-                        o_rescale[12],
-                        o_rescale[13],
-                        o_rescale[14],
-                        o_rescale[15],
-                        o_rescale[16],
-                        o_rescale[17],
-                        o_rescale[18],
-                        o_rescale[19],
-                        o_rescale[20],
-                        o_rescale[21],
-                        o_rescale[22],
-                        o_rescale[23],
-                        o_rescale[24],
-                        o_rescale[25],
-                        o_rescale[26],
-                        o_rescale[27],
-                        o_rescale[28],
-                        o_rescale[29],
-                        o_rescale[30],
-                        o_rescale[31],
-                        shape="32x32b",
-                        num=chunk_size,
-                        col=tmem_col_start + chunk_idx * chunk_size,
+                    Tx.wg.copy_async(
+                        o_rescale_frag[:, :],
+                        tmem_ldst[
+                            :,
+                            TMEM_COL_O + chunk_idx * chunk_size : TMEM_COL_O
+                            + (chunk_idx + 1) * chunk_size,
+                        ],
                     )
                     T.ptx.tcgen05.wait.ld()
                     for o_i in T.unroll(chunk_size // 2):
@@ -935,43 +776,13 @@ def _kernel(
                         T.ptx.mul_f32x2(o_pair_tmp.ptr_to([0]), o_pair, scale_for_old_pair)
                         o_rescale[o_i * 2] = T.cuda.float2_x(o_pair_tmp[0])
                         o_rescale[o_i * 2 + 1] = T.cuda.float2_y(o_pair_tmp[0])
-                    T.ptx.tcgen05.st(
-                        T.uint32(0),
-                        o_rescale[0],
-                        o_rescale[1],
-                        o_rescale[2],
-                        o_rescale[3],
-                        o_rescale[4],
-                        o_rescale[5],
-                        o_rescale[6],
-                        o_rescale[7],
-                        o_rescale[8],
-                        o_rescale[9],
-                        o_rescale[10],
-                        o_rescale[11],
-                        o_rescale[12],
-                        o_rescale[13],
-                        o_rescale[14],
-                        o_rescale[15],
-                        o_rescale[16],
-                        o_rescale[17],
-                        o_rescale[18],
-                        o_rescale[19],
-                        o_rescale[20],
-                        o_rescale[21],
-                        o_rescale[22],
-                        o_rescale[23],
-                        o_rescale[24],
-                        o_rescale[25],
-                        o_rescale[26],
-                        o_rescale[27],
-                        o_rescale[28],
-                        o_rescale[29],
-                        o_rescale[30],
-                        o_rescale[31],
-                        shape="32x32b",
-                        num=chunk_size,
-                        col=tmem_col_start + chunk_idx * chunk_size,
+                    Tx.wg.copy_async(
+                        tmem_ldst[
+                            :,
+                            TMEM_COL_O + chunk_idx * chunk_size : TMEM_COL_O
+                            + (chunk_idx + 1) * chunk_size,
+                        ],
+                        o_rescale_frag[:, :],
                     )
                     T.ptx.tcgen05.wait.st()
                 T.ptx.tcgen05.fence.before_thread_sync()
@@ -1014,7 +825,8 @@ def _kernel(
         output_scale = T.cuda.fdividef(T.float32(1.0), li + T.ptx.exp2(attn_sink_log2 - mi))
 
         b_epi = T.meta_var(64)
-        o_epi = T.alloc_local((b_epi,), "float32")
+        o_epi_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, 64), "float32")
+        o_epi = o_epi_frag.local()
         have_valid_indices: T.let = T.ptx.any_sync(T.uint32(0xFFFFFFFF), li != 0.0) != 0
         if not have_valid_indices:
             for o_zero_i in T.unroll(b_epi):
@@ -1026,75 +838,11 @@ def _kernel(
             for epi_k in T.unroll((D_V // 4) // b_epi):
                 if have_valid_indices:
                     # CUDA phase1.cuh:314-317: TMEM O load/fence.
-                    T.ptx.tcgen05.ld(
-                        T.uint32(0),
-                        o_epi[0],
-                        o_epi[1],
-                        o_epi[2],
-                        o_epi[3],
-                        o_epi[4],
-                        o_epi[5],
-                        o_epi[6],
-                        o_epi[7],
-                        o_epi[8],
-                        o_epi[9],
-                        o_epi[10],
-                        o_epi[11],
-                        o_epi[12],
-                        o_epi[13],
-                        o_epi[14],
-                        o_epi[15],
-                        o_epi[16],
-                        o_epi[17],
-                        o_epi[18],
-                        o_epi[19],
-                        o_epi[20],
-                        o_epi[21],
-                        o_epi[22],
-                        o_epi[23],
-                        o_epi[24],
-                        o_epi[25],
-                        o_epi[26],
-                        o_epi[27],
-                        o_epi[28],
-                        o_epi[29],
-                        o_epi[30],
-                        o_epi[31],
-                        o_epi[32],
-                        o_epi[33],
-                        o_epi[34],
-                        o_epi[35],
-                        o_epi[36],
-                        o_epi[37],
-                        o_epi[38],
-                        o_epi[39],
-                        o_epi[40],
-                        o_epi[41],
-                        o_epi[42],
-                        o_epi[43],
-                        o_epi[44],
-                        o_epi[45],
-                        o_epi[46],
-                        o_epi[47],
-                        o_epi[48],
-                        o_epi[49],
-                        o_epi[50],
-                        o_epi[51],
-                        o_epi[52],
-                        o_epi[53],
-                        o_epi[54],
-                        o_epi[55],
-                        o_epi[56],
-                        o_epi[57],
-                        o_epi[58],
-                        o_epi[59],
-                        o_epi[60],
-                        o_epi[61],
-                        o_epi[62],
-                        o_epi[63],
-                        shape="32x32b",
-                        num=b_epi,
-                        col=TMEM_COL_O + epi_c * 128 + epi_k * b_epi,
+                    Tx.wg.copy_async(
+                        o_epi_frag[:, :],
+                        tmem_ldst[
+                            :, epi_c * 128 + epi_k * b_epi : epi_c * 128 + (epi_k + 1) * b_epi
+                        ],
                     )
                     T.ptx.tcgen05.wait.ld()
                 for o_i in T.unroll(b_epi // 8):

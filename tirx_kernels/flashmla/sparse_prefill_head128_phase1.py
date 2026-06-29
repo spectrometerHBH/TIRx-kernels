@@ -435,8 +435,6 @@ def _kernel(
     out_tma = out.view(D_V, h_q, s_q, layout=TileLayout(S[(D_V, h_q, s_q) : (1, D_V, h_q * D_V)]))
 
     g_indices_base: T.let = s_q_idx * stride_indices_s_q
-    tP_col = T.meta_var(TMEM_COL_P)
-    tO_col = T.meta_var(TMEM_COL_O)
     tiled_mma_p_accumulate = T.alloc_local((1,), "uint32")
     tiled_mma_o_accumulate = T.alloc_local((1,), "uint32")
     tiled_mma_p_accumulate[0] = T.uint32(0)
@@ -490,6 +488,7 @@ def _kernel(
     T.cuda.cta_sync()
 
     tmem_pool = T.TMEMPool(pool, total_cols=512, cta_group=2, tmem_addr=tmem_start_addr)
+    tmem_ldst = tmem_pool.alloc((128, 512), "float32", datapath="D")
     tmem_pool.move_base_to(TMEM_COL_P)
     tmem_p = tmem_pool.alloc(
         (B_H // 2, B_TOPK),
@@ -540,82 +539,12 @@ def _kernel(
             bar_qk_done.wait(cur_buf, cur_phase)
             T.ptx.tcgen05.fence.after_thread_sync()
 
-            # CUDA source keeps `float2 p[32]` and aliases it as
-            # `float *p_float = reinterpret_cast<float *>(p)`. The upstream
-            # helper immediately casts the same storage to uint32_t* for the
-            # tcgen05.ld operands, so TIRx keeps the raw 32-bit lane payloads and
-            # applies the p_float view only at float use sites.
-            p = T.alloc_local((P_TMEM_ELEMENTS,), "uint32")
-            T.ptx.tcgen05.ld(
-                T.uint32(0),
-                p[0],
-                p[1],
-                p[2],
-                p[3],
-                p[4],
-                p[5],
-                p[6],
-                p[7],
-                p[8],
-                p[9],
-                p[10],
-                p[11],
-                p[12],
-                p[13],
-                p[14],
-                p[15],
-                p[16],
-                p[17],
-                p[18],
-                p[19],
-                p[20],
-                p[21],
-                p[22],
-                p[23],
-                p[24],
-                p[25],
-                p[26],
-                p[27],
-                p[28],
-                p[29],
-                p[30],
-                p[31],
-                p[32],
-                p[33],
-                p[34],
-                p[35],
-                p[36],
-                p[37],
-                p[38],
-                p[39],
-                p[40],
-                p[41],
-                p[42],
-                p[43],
-                p[44],
-                p[45],
-                p[46],
-                p[47],
-                p[48],
-                p[49],
-                p[50],
-                p[51],
-                p[52],
-                p[53],
-                p[54],
-                p[55],
-                p[56],
-                p[57],
-                p[58],
-                p[59],
-                p[60],
-                p[61],
-                p[62],
-                p[63],
-                shape="32x32b",
-                num=P_TMEM_ELEMENTS,
-                col=tP_col,
+            p_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, P_TMEM_ELEMENTS), "uint32")
+            Tx.wg.copy_async(
+                p_frag[:, :],
+                tmem_ldst.with_dtype("uint32")[:, TMEM_COL_P : TMEM_COL_P + P_TMEM_ELEMENTS],
             )
+            p = p_frag.local()
             T.ptx.tcgen05.wait.ld()
             T.ptx.tcgen05.fence.before_thread_sync()
             bar_p_free.arrive(cur_buf, cta_id=T.uint32(0))
@@ -708,45 +637,14 @@ def _kernel(
             if (k > 0) & should_scale_o:
                 T.ptx.tcgen05.fence.after_thread_sync()
                 scale_for_old_pair: T.let = T.cuda.make_float2(scale_for_old, scale_for_old)
-                o_rescale = T.alloc_local((32,), "float32")
+                o_rescale_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, 32), "float32")
+                o_rescale = o_rescale_frag.local()
                 for chunk_idx in T.unroll((D_V // 2) // 32):
-                    T.ptx.tcgen05.ld(
-                        T.uint32(0),
-                        o_rescale[0],
-                        o_rescale[1],
-                        o_rescale[2],
-                        o_rescale[3],
-                        o_rescale[4],
-                        o_rescale[5],
-                        o_rescale[6],
-                        o_rescale[7],
-                        o_rescale[8],
-                        o_rescale[9],
-                        o_rescale[10],
-                        o_rescale[11],
-                        o_rescale[12],
-                        o_rescale[13],
-                        o_rescale[14],
-                        o_rescale[15],
-                        o_rescale[16],
-                        o_rescale[17],
-                        o_rescale[18],
-                        o_rescale[19],
-                        o_rescale[20],
-                        o_rescale[21],
-                        o_rescale[22],
-                        o_rescale[23],
-                        o_rescale[24],
-                        o_rescale[25],
-                        o_rescale[26],
-                        o_rescale[27],
-                        o_rescale[28],
-                        o_rescale[29],
-                        o_rescale[30],
-                        o_rescale[31],
-                        shape="32x32b",
-                        num=32,
-                        col=tO_col + chunk_idx * 32,
+                    Tx.wg.copy_async(
+                        o_rescale_frag[:, :],
+                        tmem_ldst[
+                            :, TMEM_COL_O + chunk_idx * 32 : TMEM_COL_O + (chunk_idx + 1) * 32
+                        ],
                     )
                     T.ptx.tcgen05.wait.ld()
                     for o_i in T.unroll(16):
@@ -757,43 +655,11 @@ def _kernel(
                         T.ptx.mul_f32x2(o_pair_tmp.ptr_to([0]), o_pair, scale_for_old_pair)
                         o_rescale[o_i * 2] = T.cuda.float2_x(o_pair_tmp[0])
                         o_rescale[o_i * 2 + 1] = T.cuda.float2_y(o_pair_tmp[0])
-                    T.ptx.tcgen05.st(
-                        T.uint32(0),
-                        o_rescale[0],
-                        o_rescale[1],
-                        o_rescale[2],
-                        o_rescale[3],
-                        o_rescale[4],
-                        o_rescale[5],
-                        o_rescale[6],
-                        o_rescale[7],
-                        o_rescale[8],
-                        o_rescale[9],
-                        o_rescale[10],
-                        o_rescale[11],
-                        o_rescale[12],
-                        o_rescale[13],
-                        o_rescale[14],
-                        o_rescale[15],
-                        o_rescale[16],
-                        o_rescale[17],
-                        o_rescale[18],
-                        o_rescale[19],
-                        o_rescale[20],
-                        o_rescale[21],
-                        o_rescale[22],
-                        o_rescale[23],
-                        o_rescale[24],
-                        o_rescale[25],
-                        o_rescale[26],
-                        o_rescale[27],
-                        o_rescale[28],
-                        o_rescale[29],
-                        o_rescale[30],
-                        o_rescale[31],
-                        shape="32x32b",
-                        num=32,
-                        col=tO_col + chunk_idx * 32,
+                    Tx.wg.copy_async(
+                        tmem_ldst[
+                            :, TMEM_COL_O + chunk_idx * 32 : TMEM_COL_O + (chunk_idx + 1) * 32
+                        ],
+                        o_rescale_frag[:, :],
                     )
                     T.ptx.tcgen05.wait.st()
                 T.ptx.tcgen05.fence.before_thread_sync()
@@ -839,7 +705,8 @@ def _kernel(
         )
         output_scale = T.local_scalar("float32")
         output_scale = T.cuda.fdividef(T.float32(1.0), li + T.ptx.exp2(attn_sink_log2 - mi))
-        o_epi = T.alloc_local((B_EPI,), "float32")
+        o_epi_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, B_EPI), "float32")
+        o_epi = o_epi_frag.local()
         have_valid_indices: T.let = T.ptx.any_sync(T.uint32(0xFFFFFFFF), li != 0.0) != 0
         if not have_valid_indices:
             for o_zero_i in T.unroll(B_EPI):
@@ -848,75 +715,9 @@ def _kernel(
         output_scale_pair: T.let = T.cuda.make_float2(output_scale, output_scale)
         for epi_k in T.unroll((D_V // 2) // B_EPI):
             if have_valid_indices:
-                T.ptx.tcgen05.ld(
-                    T.uint32(0),
-                    o_epi[0],
-                    o_epi[1],
-                    o_epi[2],
-                    o_epi[3],
-                    o_epi[4],
-                    o_epi[5],
-                    o_epi[6],
-                    o_epi[7],
-                    o_epi[8],
-                    o_epi[9],
-                    o_epi[10],
-                    o_epi[11],
-                    o_epi[12],
-                    o_epi[13],
-                    o_epi[14],
-                    o_epi[15],
-                    o_epi[16],
-                    o_epi[17],
-                    o_epi[18],
-                    o_epi[19],
-                    o_epi[20],
-                    o_epi[21],
-                    o_epi[22],
-                    o_epi[23],
-                    o_epi[24],
-                    o_epi[25],
-                    o_epi[26],
-                    o_epi[27],
-                    o_epi[28],
-                    o_epi[29],
-                    o_epi[30],
-                    o_epi[31],
-                    o_epi[32],
-                    o_epi[33],
-                    o_epi[34],
-                    o_epi[35],
-                    o_epi[36],
-                    o_epi[37],
-                    o_epi[38],
-                    o_epi[39],
-                    o_epi[40],
-                    o_epi[41],
-                    o_epi[42],
-                    o_epi[43],
-                    o_epi[44],
-                    o_epi[45],
-                    o_epi[46],
-                    o_epi[47],
-                    o_epi[48],
-                    o_epi[49],
-                    o_epi[50],
-                    o_epi[51],
-                    o_epi[52],
-                    o_epi[53],
-                    o_epi[54],
-                    o_epi[55],
-                    o_epi[56],
-                    o_epi[57],
-                    o_epi[58],
-                    o_epi[59],
-                    o_epi[60],
-                    o_epi[61],
-                    o_epi[62],
-                    o_epi[63],
-                    shape="32x32b",
-                    num=B_EPI,
-                    col=tO_col + epi_k * B_EPI,
+                Tx.wg.copy_async(
+                    o_epi_frag[:, :],
+                    tmem_ldst[:, TMEM_COL_O + epi_k * B_EPI : TMEM_COL_O + (epi_k + 1) * B_EPI],
                 )
                 T.ptx.tcgen05.wait.ld()
             for o_i in T.unroll(B_EPI // 8):
