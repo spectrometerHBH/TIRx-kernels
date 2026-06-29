@@ -327,26 +327,18 @@ def _run_tirx_launches(
         executable(*launch["args"])
 
 
-def _mbarrier_complete_tx(bar_ptr: Any, transaction_bytes: Any) -> Any:
-    return T.ptx.mbarrier.complete_tx(bar_ptr, transaction_bytes)
-
-
-def _cpasync_barrier_arrive_noinc(bar_ptr: Any) -> Any:
-    return T.ptx.cp_async.mbarrier.arrive.noinc(bar_ptr)
-
-
-def _ldg_256_indices(dst: Any, src_ptr: Any) -> Any:
-    return T.ptx.ld(
-        src_ptr,
-        "int32",
-        "s32",
-        dst=dst,
-        space="global",
-        cop="nc",
-        vec="v8",
-        l1_evict="L1::no_allocate",
-        l2_evict="L2::evict_normal",
-        prefetch_size="L2::256B",
+def _tirx_benchmark_tensors(
+    case: dict[str, Any], launches: list[dict[str, Any]]
+) -> tuple[Any, ...]:
+    return (
+        case["q"],
+        case["kv"],
+        case["indices"],
+        case["attn_sink"],
+        case["topk_length"],
+        case["out"],
+        case["max_logits"],
+        case["lse"],
     )
 
 
@@ -393,18 +385,6 @@ def _tma_gather4_kv_nope(
         row_idx2,
         row_idx3,
     )
-
-
-def _ld_shared_float4(dst0: Any, dst1: Any, dst2: Any, dst3: Any, src_ptr: Any) -> Any:
-    return T.ptx.ld(src_ptr, "float32", "f32", dst=dst0, space="shared", vec="v4")
-
-
-def _st_shared_b128_float4(dst_ptr: Any, x0: Any, x1: Any, x2: Any, x3: Any) -> Any:
-    return T.ptx.st(dst_ptr, x0, x1, x2, x3, space="shared", vec="v4", ptx_type="f32")
-
-
-def _fdividef(x: Any, y: Any) -> Any:
-    return T.cuda.fdividef(x, y)
 
 
 def _ring_mod3(value: Any, max_value: int) -> Any:
@@ -862,27 +842,27 @@ def _kernel(
 
             for exchange_i in T.unroll(num_elems_per_thread // 4):
                 exchange_offset: T.let = exchange_i * 32 * 4 + lane_idx * 4
-                T.evaluate(
-                    _st_shared_b128_float4(
-                        p_exchange_buf.ptr_to([warp_idx ^ 2, exchange_offset]),
-                        p_peer[exchange_i * 4],
-                        p_peer[exchange_i * 4 + 1],
-                        p_peer[exchange_i * 4 + 2],
-                        p_peer[exchange_i * 4 + 3],
-                    )
+                T.ptx.st(
+                    p_exchange_buf.ptr_to([warp_idx ^ 2, exchange_offset]),
+                    p_peer[exchange_i * 4],
+                    p_peer[exchange_i * 4 + 1],
+                    p_peer[exchange_i * 4 + 2],
+                    p_peer[exchange_i * 4 + 3],
+                    space="shared",
+                    vec="v4",
+                    ptx_type="f32",
                 )
             T.ptx.bar.sync(NAMED_BARRIER_WG0_WARP02_SYNC + T.bitwise_and(warp_idx, T.int32(1)), 64)
             for exchange_i in T.unroll(num_elems_per_thread // 4):
                 exchange_offset: T.let = exchange_i * 32 * 4 + lane_idx * 4
                 p_exchange_tmp = T.alloc_local((4,), "float32")
-                T.evaluate(
-                    _ld_shared_float4(
-                        p_exchange_tmp.ptr_to([0]),
-                        p_exchange_tmp.ptr_to([1]),
-                        p_exchange_tmp.ptr_to([2]),
-                        p_exchange_tmp.ptr_to([3]),
-                        p_exchange_buf.ptr_to([warp_idx, exchange_offset]),
-                    )
+                T.ptx.ld(
+                    p_exchange_buf.ptr_to([warp_idx, exchange_offset]),
+                    "float32",
+                    "f32",
+                    dst=p_exchange_tmp.ptr_to([0]),
+                    space="shared",
+                    vec="v4",
                 )
                 p_pair0: T.let = T.cuda.make_float2(p[exchange_i * 4], p[exchange_i * 4 + 1])
                 peer_pair0: T.let = T.cuda.make_float2(p_exchange_tmp[0], p_exchange_tmp[1])
@@ -1093,7 +1073,7 @@ def _kernel(
             else T.float32(-float("inf"))
         )
         output_scale = T.local_scalar("float32")
-        output_scale = _fdividef(T.float32(1.0), li + T.ptx.exp2(attn_sink_log2 - mi))
+        output_scale = T.cuda.fdividef(T.float32(1.0), li + T.ptx.exp2(attn_sink_log2 - mi))
 
         b_epi = T.meta_var(64)
         o_epi = T.alloc_local((b_epi,), "float32")
@@ -1355,16 +1335,12 @@ def _kernel(
                             WG1_NUM_LOCAL_ROWS_PER_WARP * 4 * (D_V // 2) * BF16_BYTES
                         )
                         if part_idx == 0:
-                            T.evaluate(
-                                _mbarrier_complete_tx(
-                                    bar_kv_nope_ready_part0.ptr_to([cur_buf]), tx_bytes
-                                )
+                            T.ptx.mbarrier.complete_tx(
+                                bar_kv_nope_ready_part0.ptr_to([cur_buf]), tx_bytes
                             )
                         else:
-                            T.evaluate(
-                                _mbarrier_complete_tx(
-                                    bar_kv_nope_ready_part1.ptr_to([cur_buf]), tx_bytes
-                                )
+                            T.ptx.mbarrier.complete_tx(
+                                bar_kv_nope_ready_part1.ptr_to([cur_buf]), tx_bytes
                             )
 
     else:
@@ -1556,11 +1532,17 @@ def _kernel(
                 lane_indices = T.alloc_local((8,), "int32")
                 for k in T.serial(0, num_k_blocks, unroll=False):
                     abs_pos_start: T.let = k * B_TOPK
-                    T.evaluate(
-                        _ldg_256_indices(
-                            lane_indices.ptr_to([0]),
-                            indices.ptr_to([g_indices_base + k * B_TOPK + lane_idx * 8]),
-                        )
+                    T.ptx.ld(
+                        indices.ptr_to([g_indices_base + k * B_TOPK + lane_idx * 8]),
+                        "int32",
+                        "s32",
+                        dst=lane_indices.ptr_to([0]),
+                        space="global",
+                        cop="nc",
+                        vec="v8",
+                        l1_evict="L1::no_allocate",
+                        l2_evict="L2::evict_normal",
+                        prefetch_size="L2::256B",
                     )
                     valid0: T.let = (
                         (lane_indices[0] >= 0)
@@ -1675,7 +1657,7 @@ def _kernel(
                             predicate=is_valid_index,
                             fill_mode="zero",
                         )
-                    T.evaluate(_cpasync_barrier_arrive_noinc(bar_kv_rope_ready.ptr_to([0])))
+                    T.ptx.cp_async.mbarrier.arrive.noinc(bar_kv_rope_ready.ptr_to([0]))
 
 
 def get_kernel(**kwargs: Any):
