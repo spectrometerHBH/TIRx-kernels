@@ -16,12 +16,12 @@ from tirx_kernels.flashmla.sparse_prefill_head128_phase1 import (
     _ldg_i32_at,
     _mul_f32x2,
     _shfl_sync_i32,
-    _tcgen05_mma_ws_ss_2cta,
-    _tcgen05_mma_ws_ts_2cta,
     _tma_gather4_kv_cta_group2,
 )
 from tvm.script import tirx as T
+from tvm.script.tirx import tile as Tx
 from tvm.tirx.lang.pipeline import MBarrier, TCGen05Bar, TMABar
+from tvm.tirx.layout import ComposeLayout, S, SwizzleLayout, TCol, TileLayout, TLane
 
 B_H = 128
 B_TOPK = 64
@@ -265,32 +265,16 @@ def _reference_sparse_prefill(
 
 def _build_tirx_tensor_maps(case: dict[str, Any]) -> dict[str, Any]:
     cfg: SparseFlashMLAPrefillHead128SmallTopKConfig = case["config"]
-    q = case["q"]
     kv = case["kv"]
-    out = case["out"]
 
     return {
-        "tensor_map_q": _encode_tma_desc(
-            tensor=q,
-            global_shape=(64, cfg.h_q, 2, cfg.d_qk // 64 // 2, cfg.s_q),
-            global_strides=(int(q.stride(1)), cfg.d_qk // 2, 64, int(q.stride(0))),
-            box_dim=(64, cfg.h_q // 2, 2, cfg.d_qk // 64 // 2, 1),
-            swizzle_mode=128,
-        ),
         "tensor_map_kv": _encode_tma_desc(
             tensor=kv,
             global_shape=(cfg.d_qk, cfg.s_kv),
             global_strides=(int(kv.stride(0)),),
             box_dim=(64, 1),
             swizzle_mode=128,
-        ),
-        "tensor_map_o": _encode_tma_desc(
-            tensor=out,
-            global_shape=(64, cfg.h_q, cfg.d_v // 64, cfg.s_q, 1),
-            global_strides=(cfg.d_v, 64, cfg.h_q * cfg.d_v, cfg.h_q * cfg.d_v),
-            box_dim=(64, cfg.h_q // 2, cfg.d_v // 64, 1, 1),
-            swizzle_mode=128,
-        ),
+        )
     }
 
 
@@ -321,9 +305,7 @@ def _make_tirx_launch(case: dict[str, Any]) -> dict[str, Any]:
             case["out"],
             case["max_logits"],
             case["lse"],
-            tensor_maps["tensor_map_q"].ptr,
             tensor_maps["tensor_map_kv"].ptr,
-            tensor_maps["tensor_map_o"].ptr,
         ),
     }
 
@@ -339,64 +321,18 @@ def _run_tirx_launches(
         executable(*launch["args"])
 
 
-def _tma_5d_cta_group2_nosplit(
-    dst_ptr: Any,
-    bar_ptr: Any,
-    tensor_map_ptr: Any,
-    coord0: Any,
-    coord1: Any,
-    coord2: Any,
-    coord3: Any,
-    coord4: Any,
-    cache_hint: Any,
-) -> Any:
-    func_name = "sparse_flashmla_small_topk_head128_tma_5d_cta_group2_nosplit"
-    source_code = f"""
-__device__ __forceinline__ void {func_name}(
-    void* dst_ptr, void* bar_ptr, unsigned long long tensor_map_addr,
-    int coord0, int coord1, int coord2, int coord3, int coord4,
-    unsigned long long cache_hint) {{
-  uint32_t smem_addr;
-  uint32_t mbar_addr;
-  asm volatile(
-    "{{\\n\\t"
-    ".reg .u64 smem_addr64;\\n\\t"
-    "cvta.to.shared.u64 smem_addr64, %1;\\n\\t"
-    "cvt.u32.u64 %0, smem_addr64;\\n\\t"
-    "}}\\n"
-    : "=r"(smem_addr) : "l"(dst_ptr));
-  asm volatile(
-    "{{\\n\\t"
-    ".reg .u64 mbar_addr64;\\n\\t"
-    "cvta.to.shared.u64 mbar_addr64, %1;\\n\\t"
-    "cvt.u32.u64 %0, mbar_addr64;\\n\\t"
-    "}}\\n"
-    : "=r"(mbar_addr) : "l"(bar_ptr));
-  mbar_addr &= 0xFEFFFFFFu;
-  asm volatile(
-    "cp.async.bulk.tensor.5d.cta_group::2.shared::cluster.global"
-    ".mbarrier::complete_tx::bytes.L2::cache_hint "
-    "[%0], [%1, {{%3, %4, %5, %6, %7}}], [%2], %8;\\n"
-    :
-    : "r"(smem_addr), "l"(tensor_map_addr), "r"(mbar_addr),
-      "r"(coord0), "r"(coord1), "r"(coord2), "r"(coord3), "r"(coord4),
-      "l"(cache_hint)
-    : "memory");
-}}
-"""
-    return T.cuda.func_call(
-        func_name,
-        dst_ptr,
-        bar_ptr,
-        tensor_map_ptr,
-        coord0,
-        coord1,
-        coord2,
-        coord3,
-        coord4,
-        cache_hint,
-        source_code=source_code,
-        return_type="void",
+def _tirx_benchmark_tensors(
+    case: dict[str, Any], launches: list[dict[str, Any]]
+) -> tuple[Any, ...]:
+    return (
+        case["q"],
+        case["kv"],
+        case["indices"],
+        case["attn_sink"],
+        case["topk_length"],
+        case["out"],
+        case["max_logits"],
+        case["lse"],
     )
 
 
@@ -620,9 +556,7 @@ def _kernel(
     out: T.Buffer((s_q, h_q, D_V), "bfloat16"),
     max_logits: T.Buffer((s_q, h_q), "float32"),
     lse: T.Buffer((s_q, h_q), "float32"),
-    tensor_map_q: T.TensorMap(),
     tensor_map_kv: T.TensorMap(),
-    tensor_map_o: T.TensorMap(),
     *,
     s_q: T.constexpr,
     s_kv: T.constexpr,
@@ -648,8 +582,6 @@ def _kernel(
     idx_in_warpgroup: T.let = thread_idx % 128
 
     if thread_idx == 0:
-        T.evaluate(T.ptx.prefetch_tensormap(T.address_of(tensor_map_q)))
-        T.evaluate(T.ptx.prefetch_tensormap(T.address_of(tensor_map_o)))
         T.evaluate(T.ptx.prefetch_tensormap(T.address_of(tensor_map_kv)))
 
     pool = T.SMEMPool()
@@ -681,6 +613,75 @@ def _kernel(
     clc_response = pool.alloc((4,), "uint32", align=16)
     tmem_start_addr = pool.alloc((1,), "uint32", align=4)
     pool.commit()
+    q_tma = q.view(
+        64,
+        h_q,
+        2,
+        D_QK // 64 // 2,
+        s_q,
+        layout=TileLayout(
+            S[(64, h_q, 2, D_QK // 64 // 2, s_q) : (1, D_QK, D_QK // 2, 64, h_q * D_QK)]
+        ),
+    )
+    q_smem_tma = q_smem.view(
+        64,
+        B_H // 2,
+        2,
+        D_QK // 64 // 2,
+        layout=ComposeLayout(
+            SwizzleLayout(3, 3, 3, swizzle_inner=True),
+            TileLayout(S[(64, B_H // 2, 2, D_QK // 64 // 2) : (1, 64, 4096 * 4, 4096)]),
+        ),
+    )
+    tmem_p = T.decl_buffer(
+        (B_H // 2, B_TOPK * 2),
+        "float32",
+        scope="tmem",
+        allocated_addr=TMEM_COL_P,
+        layout=TileLayout(S[(B_H // 2, 2, B_TOPK) : (1 @ TLane, 64 @ TLane, 1 @ TCol)]),
+    )
+    q_tmem = T.decl_buffer(
+        (B_H // 2, D_QK // 2),
+        "bfloat16",
+        scope="tmem",
+        allocated_addr=TMEM_COL_Q,
+        layout=TileLayout(S[(B_H // 2, D_QK // 2) : (1 @ TLane, 1 @ TCol)]),
+    )
+    tmem_o_lo = T.decl_buffer(
+        (B_H // 2, D_V // 2),
+        "float32",
+        scope="tmem",
+        allocated_addr=TMEM_COL_O,
+        layout=TileLayout(S[(B_H // 2, 2, D_V // 4) : (1 @ TLane, 64 @ TLane, 1 @ TCol)]),
+    )
+    tmem_o_hi = T.decl_buffer(
+        (B_H // 2, D_V // 2),
+        "float32",
+        scope="tmem",
+        allocated_addr=TMEM_COL_O + 128,
+        layout=TileLayout(S[(B_H // 2, 2, D_V // 4) : (1 @ TLane, 64 @ TLane, 1 @ TCol)]),
+    )
+    s_smem_gemm = s_smem.view(
+        B_H // 2, B_TOPK, layout=TileLayout(S[(B_H // 2, B_TOPK // 8, 8) : (8, (B_H // 2) * 8, 1)])
+    )
+    k_smem_gemm = k_smem.view(
+        NUM_K_BUFS,
+        B_TOPK,
+        D_QK // 2,
+        layout=ComposeLayout(
+            SwizzleLayout(3, 3, 3, swizzle_inner=True),
+            TileLayout(
+                S[
+                    (NUM_K_BUFS, B_TOPK, (D_QK // 2) // 64, 64) : (
+                        B_TOPK * (D_QK // 2),
+                        64,
+                        B_TOPK * 64,
+                        1,
+                    )
+                ]
+            ),
+        ),
+    )
 
     if warp_idx == 1:
         if T.ptx.elect_sync():
@@ -723,40 +724,42 @@ def _kernel(
             if warp_idx == 0:
                 if T.ptx.elect_sync():
                     T.ptx.cp_async.bulk.wait_group(0)
-                    T.evaluate(
-                        _tma_5d_cta_group2_nosplit(
-                            q_smem.ptr_to([0, 0]),
-                            bar_sQ_full.ptr_to([0]),
-                            T.address_of(tensor_map_q),
-                            T.uint32(0),
-                            cta_idx * (B_H // 2),
-                            T.uint32(0),
-                            T.uint32(0),
-                            q_s_q_idx,
-                            T.uint64(0x12F0000000000000),
-                        )
+                    Tx.copy_async(
+                        q_smem_tma[:, :, :, :],
+                        q_tma[
+                            :,
+                            cta_idx * (B_H // 2) : (cta_idx + 1) * (B_H // 2),
+                            :,
+                            :,
+                            q_s_q_idx : q_s_q_idx + 1,
+                        ],
+                        dispatch="tma",
+                        mbar=bar_sQ_full.ptr_to([0]),
+                        cta_group=2,
+                        cache_hint=T.uint64(0x12F0000000000000),
+                        tensor_map_dim_order="natural",
+                        prefetch_tensormap=True,
                     )
                     if cta_idx == 0:
                         bar_sQ_full.arrive(0, tx_count=B_H * D_QK * BF16_BYTES)
                         bar_sQ_full.wait(0, q_outer_loop_phase)
                         bar_tQ_empty.wait(0, q_outer_loop_phase ^ 1)
                         T.ptx.tcgen05.fence.after_thread_sync()
-                        q_desc: T.uint64
-                        T.ptx.tcgen05.encode_matrix_descriptor(
-                            T.address_of(q_desc),
-                            q_smem.ptr_to([0, 0]),
-                            ldo=K_MAJOR_SWIZZLED_DESC_LDO,
-                            sdo=Q_DESC_SDO,
-                            swizzle=3,
+                        Tx.copy_async(
+                            q_tmem[:, :],
+                            q_smem[:, :],
+                            shape="128x256b",
+                            cta_group=2,
+                            desc_ldo=K_MAJOR_SWIZZLED_DESC_LDO,
+                            desc_sdo=Q_DESC_SDO,
+                            desc_swizzle=3,
+                            tile_count=D_QK // 64 // 2,
+                            subtile_count=4,
+                            tmem_tile_stride_32b=32,
+                            tmem_subtile_stride_32b=8,
+                            desc_tile_stride_16b=1024,
+                            desc_subtile_stride_16b=2,
                         )
-                        for tile_idx in T.unroll(D_QK // 64 // 2):
-                            for subtile_idx in T.unroll(4):
-                                T.ptx.tcgen05.cp(
-                                    T.uint32(TMEM_COL_Q + tile_idx * 32 + subtile_idx * 8),
-                                    q_desc + T.uint64(tile_idx * 1024 + subtile_idx * 2),
-                                    shape="128x256b",
-                                    cta_group=2,
-                                )
                         bar_tQ_full.arrive(0, cta_group=2, cta_mask=3)
 
         @T.inline
@@ -878,18 +881,15 @@ def _kernel(
             T.ptx.bar.sync(NAMED_BARRIER_WG0_SYNC, 128)
             if warp_idx == 0:
                 if T.ptx.elect_sync():
-                    T.evaluate(
-                        T.ptx.cp_async.bulk.tensor.s2g(
-                            5,
-                            q_smem.ptr_to([0, 0]),
-                            T.address_of(tensor_map_o),
-                            "",
-                            T.uint32(0),
-                            cta_idx * (B_H // 2),
-                            T.uint32(0),
-                            o_s_q_idx,
-                            T.uint32(0),
-                        )
+                    Tx.copy_async(
+                        out[
+                            o_s_q_idx : o_s_q_idx + 1,
+                            cta_idx * (B_H // 2) : (cta_idx + 1) * (B_H // 2),
+                            :,
+                        ],
+                        q_smem[:, :],
+                        dispatch="tma",
+                        prefetch_tensormap=True,
                     )
                     T.ptx.cp_async.bulk.commit_group()
 
@@ -1072,29 +1072,20 @@ def _kernel(
                             T.ptx.tcgen05.fence.after_thread_sync()
                             qk_accumulate = T.alloc_local((1,), "uint32")
                             qk_accumulate[0] = T.uint32(0)
-                            k_desc_base: T.uint64
-                            T.ptx.tcgen05.encode_matrix_descriptor(
-                                T.address_of(k_desc_base),
-                                k_smem.access_ptr("r", offset=k_buf_idx * B_TOPK * (D_QK // 2)),
-                                ldo=K_MAJOR_SWIZZLED_DESC_LDO,
-                                sdo=K_DESC_SDO,
-                                swizzle=3,
+                            # Keep this dynamic CLC/ring-buffer loop in descriptor
+                            # recompute mode.  It is still a tile primitive MMA,
+                            # but avoids local descriptor stores in this control flow.
+                            Tx.gemm_async(
+                                tmem_p[:, :],
+                                q_tmem[:, :],
+                                k_smem_gemm[k_buf_idx, :, :],
+                                accum=qk_accumulate[0],
+                                dispatch="tcgen05",
+                                cta_group=2,
+                                smem_desc="recompute",
+                                descI=desc_i_p,
                             )
-                            for qk_k in T.unroll((D_QK // 2) // 16):
-                                k_desc_col: T.let = qk_k * 16
-                                k_desc: T.let = k_desc_base + T.uint64(
-                                    (k_desc_col // 64) * (64 * B_TOPK // 8) + (k_desc_col % 64) // 8
-                                )
-                                T.evaluate(
-                                    _tcgen05_mma_ws_ts_2cta(
-                                        T.uint32(TMEM_COL_P),
-                                        T.uint32(TMEM_COL_Q + qk_k * 8),
-                                        k_desc,
-                                        desc_i_p,
-                                        qk_accumulate[0],
-                                    )
-                                )
-                                qk_accumulate[0] = T.uint32(1)
+                            qk_accumulate[0] = T.uint32(1)
                             bar_QK_done.arrive(0, cta_group=2, cta_mask=3)
                             if k == umma_num_k_blocks - 1:
                                 T.ptx.tcgen05.commit(
@@ -1112,45 +1103,29 @@ def _kernel(
                             T.ptx.tcgen05.fence.after_thread_sync()
                             o_accumulate = T.alloc_local((1,), "uint32")
                             o_accumulate[0] = T.if_then_else(prev_k == 0, T.uint32(0), T.uint32(1))
-                            s_desc_base: T.uint64
-                            v_desc_base: T.uint64
-                            T.ptx.tcgen05.encode_matrix_descriptor(
-                                T.address_of(s_desc_base),
-                                s_smem.ptr_to([0]),
-                                ldo=S_DESC_LDO,
-                                sdo=S_DESC_SDO,
-                                swizzle=0,
+                            Tx.gemm_async(
+                                tmem_o_lo[:, :],
+                                s_smem_gemm[:, :],
+                                k_smem_gemm[prev_buf, :, 0 : D_V // 4],
+                                transB=True,
+                                accum=o_accumulate[0],
+                                dispatch="tcgen05",
+                                cta_group=2,
+                                smem_desc="recompute",
+                                descI=desc_i_o,
                             )
-                            T.ptx.tcgen05.encode_matrix_descriptor(
-                                T.address_of(v_desc_base),
-                                k_smem.access_ptr("r", offset=prev_buf * B_TOPK * (D_QK // 2)),
-                                ldo=V_DESC_LDO,
-                                sdo=V_DESC_SDO,
-                                swizzle=3,
+                            Tx.gemm_async(
+                                tmem_o_hi[:, :],
+                                s_smem_gemm[:, :],
+                                k_smem_gemm[prev_buf, :, D_V // 4 : D_V // 2],
+                                transB=True,
+                                accum=o_accumulate[0],
+                                dispatch="tcgen05",
+                                cta_group=2,
+                                smem_desc="recompute",
+                                descI=desc_i_o,
                             )
-                            for sv_k in T.unroll(B_TOPK // 16):
-                                sv_desc_offset: T.let = sv_k * 16 * 64 // 8
-                                s_desc: T.let = s_desc_base + T.uint64(sv_desc_offset)
-                                v_desc: T.let = v_desc_base + T.uint64(sv_desc_offset)
-                                T.evaluate(
-                                    _tcgen05_mma_ws_ss_2cta(
-                                        T.uint32(TMEM_COL_O),
-                                        s_desc,
-                                        v_desc,
-                                        desc_i_o,
-                                        o_accumulate[0],
-                                    )
-                                )
-                                T.evaluate(
-                                    _tcgen05_mma_ws_ss_2cta(
-                                        T.uint32(TMEM_COL_O + 128),
-                                        s_desc,
-                                        v_desc + T.uint64(1024),
-                                        desc_i_o,
-                                        o_accumulate[0],
-                                    )
-                                )
-                                o_accumulate[0] = T.uint32(1)
+                            o_accumulate[0] = T.uint32(1)
                             bar_SV_done.arrive(0, cta_group=2, cta_mask=3)
                             bar_KV_empty.arrive(prev_buf, cta_group=2, cta_mask=3)
 
