@@ -661,7 +661,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     # ---- TMA producer (wg0/warp2 — canon's WarpRole.TMA) ----
     with k.role(warp=2):
         with k.for_each_task(task_scheduler) as task:
-            local_iter = (task.task_id - task_start) // task_step
+            local_iter = k.shuffle_sync((task.task_id - task_start) // task_step)
             m_idx, n_idx = work_coords(task.task_id, cta_rank)
             a_m = m_idx * CTA_M  # this CTA's own M tile
             b_n = n_idx * mma_n + cta_rank * cta_n  # this CTA's half of the N band
@@ -777,7 +777,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     # checker's tcgen05 issuer rule accepts a single elected lane).
     with k.role(warp=0, elected=True):
         with k.for_each_task(task_scheduler) as task:
-            local_iter = (task.task_id - task_start) // task_step
+            local_iter = k.shuffle_sync((task.task_id - task_start) // task_step)
             with k.if_(cta_rank.eq(0)):
                 tmem_idx = local_iter % ACC_DEPTH
                 k.mbarrier_wait(tmem_empty, stage=tmem_idx, phase=(local_iter // ACC_DEPTH + 1) % 2)
@@ -910,7 +910,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
 
     with k.role(warpgroup=1, maxnreg=config.maxnreg_epilogue):
         with k.for_each_task(task_scheduler) as task:
-            local_iter = (task.task_id - task_start) // task_step
+            local_iter = k.shuffle_sync((task.task_id - task_start) // task_step)
             m_idx, n_idx = work_coords(task.task_id, cta_rank)
             d_m = m_idx * CTA_M
             d_n = n_idx * mma_n
