@@ -331,188 +331,19 @@ def _run_tirx_launches(
         executable(*launch["args"])
 
 
-def _mbarrier_complete_tx(bar_ptr: Any, dst_cta_id: Any, transaction_bytes: Any, pred: Any) -> Any:
-    return T.ptx.mbarrier.complete_tx(bar_ptr, transaction_bytes, dst_cta_id, pred)
-
-
-def _ldg_int4_indices(dst0: Any, dst1: Any, dst2: Any, dst3: Any, src_ptr: Any) -> Any:
-    return T.cuda.ldg(src_ptr, "int32", dst=(dst0, dst1, dst2, dst3), vec="v4")
-
-
-def _int4_max(x: Any, y: Any, z: Any, w: Any) -> Any:
-    return T.max(T.max(x, y), T.max(z, w))
-
-
-def _int4_min(x: Any, y: Any, z: Any, w: Any) -> Any:
-    return T.min(T.min(x, y), T.min(z, w))
-
-
-def _tmem_ld_32dp32bNx_btopk_half(tmem_col: Any, p_float: Any) -> Any:
-    # CUDA helper boundary: ku::tmem_ld_32dp32bNx<B_TOPK/2>(tmem_col, p).
-    return T.ptx.tcgen05.ld(
-        T.uint32(0),
-        p_float[0],
-        p_float[1],
-        p_float[2],
-        p_float[3],
-        p_float[4],
-        p_float[5],
-        p_float[6],
-        p_float[7],
-        p_float[8],
-        p_float[9],
-        p_float[10],
-        p_float[11],
-        p_float[12],
-        p_float[13],
-        p_float[14],
-        p_float[15],
-        p_float[16],
-        p_float[17],
-        p_float[18],
-        p_float[19],
-        p_float[20],
-        p_float[21],
-        p_float[22],
-        p_float[23],
-        p_float[24],
-        p_float[25],
-        p_float[26],
-        p_float[27],
-        p_float[28],
-        p_float[29],
-        p_float[30],
-        p_float[31],
-        p_float[32],
-        p_float[33],
-        p_float[34],
-        p_float[35],
-        p_float[36],
-        p_float[37],
-        p_float[38],
-        p_float[39],
-        p_float[40],
-        p_float[41],
-        p_float[42],
-        p_float[43],
-        p_float[44],
-        p_float[45],
-        p_float[46],
-        p_float[47],
-        p_float[48],
-        p_float[49],
-        p_float[50],
-        p_float[51],
-        p_float[52],
-        p_float[53],
-        p_float[54],
-        p_float[55],
-        p_float[56],
-        p_float[57],
-        p_float[58],
-        p_float[59],
-        p_float[60],
-        p_float[61],
-        p_float[62],
-        p_float[63],
-        shape="32x32b",
-        num=P_TMEM_ELEMENTS,
-        col=tmem_col,
+def _tirx_benchmark_tensors(
+    case: dict[str, Any], launches: list[dict[str, Any]]
+) -> tuple[Any, ...]:
+    return (
+        case["q"],
+        case["kv"],
+        case["indices"],
+        case["attn_sink"],
+        case["topk_length"],
+        case["out"],
+        case["max_logits"],
+        case["lse"],
     )
-
-
-def _ldg_256_indices(dst: Any, src_ptr: Any) -> Any:
-    return T.ptx.ld(
-        src_ptr,
-        "int32",
-        "s32",
-        dst=dst,
-        space="global",
-        cop="nc",
-        vec="v8",
-        l1_evict="L1::evict_normal",
-        l2_evict="L2::evict_normal",
-        prefetch_size="L2::256B",
-    )
-
-
-def _canonical_warp_idx_sync(thread_idx: Any) -> Any:
-    return T.cuda.__shfl_sync(T.uint32(0xFFFFFFFF), thread_idx // 32, 0, 32)
-
-
-def _shfl_sync_i32(value: Any) -> Any:
-    return T.cuda.__shfl_sync(T.uint32(0xFFFFFFFF), value, 0, 32)
-
-
-def _ld_shared_u32(src_ptr: Any) -> Any:
-    return T.ptx.ld(src_ptr, "uint32", "u32", space="shared")
-
-
-def _ldg_i32_at(base_ptr: Any, idx: Any) -> Any:
-    return T.cuda.ldg(T.handle_add_byte_offset(base_ptr, idx * 4), "int32")
-
-
-def _ldg_f32_at(base_ptr: Any, idx: Any) -> Any:
-    return T.cuda.ldg(T.handle_add_byte_offset(base_ptr, idx * 4), "float32")
-
-
-def _tma_gather4_kv_cta_group2_bar_addr(
-    dst_ptr: Any,
-    bar_addr: Any,
-    tensor_map_ptr: Any,
-    col_idx: Any,
-    row_idx0: Any,
-    row_idx1: Any,
-    row_idx2: Any,
-    row_idx3: Any,
-    cache_hint: Any,
-) -> Any:
-    # Gather4 has four independent dynamic row coordinates, so this cannot go
-    # through Tx.copy_async's BufferRegion dispatcher yet.  This path still uses
-    # the tile primitive intrinsic and the shared-address mbarrier helper.
-    return T.ptx.cp_async.bulk.tensor.g2c_tile_gather4_bar_addr(
-        2,
-        dst_ptr,
-        bar_addr,
-        tensor_map_ptr,
-        T.uint16(1),
-        2,
-        cache_hint,
-        T.int32(1),
-        col_idx,
-        row_idx0,
-        row_idx1,
-        row_idx2,
-        row_idx3,
-    )
-
-
-def _tma_gather4_kv_cta_group2(
-    dst_ptr: Any,
-    bar_ptr: Any,
-    tensor_map_ptr: Any,
-    col_idx: Any,
-    row_idx0: Any,
-    row_idx1: Any,
-    row_idx2: Any,
-    row_idx3: Any,
-    cache_hint: Any,
-) -> Any:
-    return _tma_gather4_kv_cta_group2_bar_addr(
-        dst_ptr,
-        T.cuda.sm100_tma_2sm_mbarrier_addr(bar_ptr),
-        tensor_map_ptr,
-        col_idx,
-        row_idx0,
-        row_idx1,
-        row_idx2,
-        row_idx3,
-        cache_hint,
-    )
-
-
-def _fdividef(x: Any, y: Any) -> Any:
-    return T.cuda.fdividef(x, y)
 
 
 @T.jit
@@ -548,11 +379,15 @@ def _kernel(
     cta_idx: T.let = block_idx % 2
     s_q_idx: T.let = block_idx // 2
     thread_idx = T.thread_id([NUM_THREADS])
-    warp_idx: T.let = _canonical_warp_idx_sync(thread_idx)
+    warp_idx: T.let = T.cuda.__shfl_sync(T.uint32(0xFFFFFFFF), thread_idx // 32, 0, 32)
     lane_idx: T.let = thread_idx % 32
-    topk_len: T.let = _ldg_i32_at(topk_length, s_q_idx) if have_topk_length else topk
+    topk_len: T.let = (
+        T.cuda.ldg(T.handle_add_byte_offset(topk_length, s_q_idx * 4), "int32")
+        if have_topk_length
+        else topk
+    )
     num_k_blocks: T.let = T.max((topk_len + B_TOPK - 1) // B_TOPK, 1)
-    warpgroup_idx: T.let = _shfl_sync_i32(thread_idx // 128)
+    warpgroup_idx: T.let = T.cuda.__shfl_sync(T.uint32(0xFFFFFFFF), thread_idx // 128, 0, 32)
     idx_in_warpgroup: T.let = thread_idx % 128
     d_sq = T.meta_var(d_qk - D_TQ)
     num_sq_tiles = T.meta_var((d_qk - D_TQ) // 64)
@@ -711,16 +546,87 @@ def _kernel(
             # tcgen05.ld operands, so TIRx keeps the raw 32-bit lane payloads and
             # applies the p_float view only at float use sites.
             p = T.alloc_local((P_TMEM_ELEMENTS,), "uint32")
-            _tmem_ld_32dp32bNx_btopk_half(tP_col, p)
+            T.ptx.tcgen05.ld(
+                T.uint32(0),
+                p[0],
+                p[1],
+                p[2],
+                p[3],
+                p[4],
+                p[5],
+                p[6],
+                p[7],
+                p[8],
+                p[9],
+                p[10],
+                p[11],
+                p[12],
+                p[13],
+                p[14],
+                p[15],
+                p[16],
+                p[17],
+                p[18],
+                p[19],
+                p[20],
+                p[21],
+                p[22],
+                p[23],
+                p[24],
+                p[25],
+                p[26],
+                p[27],
+                p[28],
+                p[29],
+                p[30],
+                p[31],
+                p[32],
+                p[33],
+                p[34],
+                p[35],
+                p[36],
+                p[37],
+                p[38],
+                p[39],
+                p[40],
+                p[41],
+                p[42],
+                p[43],
+                p[44],
+                p[45],
+                p[46],
+                p[47],
+                p[48],
+                p[49],
+                p[50],
+                p[51],
+                p[52],
+                p[53],
+                p[54],
+                p[55],
+                p[56],
+                p[57],
+                p[58],
+                p[59],
+                p[60],
+                p[61],
+                p[62],
+                p[63],
+                shape="32x32b",
+                num=P_TMEM_ELEMENTS,
+                col=tP_col,
+            )
             T.ptx.tcgen05.wait.ld()
             T.ptx.tcgen05.fence.before_thread_sync()
             bar_p_free.arrive(cur_buf, cta_id=T.uint32(0))
 
             bar_k_valid_ready.wait(cur_buf, cur_phase)
             valid_word_offset: T.let = T.if_then_else(idx_in_warpgroup >= 64, B_TOPK // 8 // 2, 0)
-            is_k_valid_lo: T.let = _ld_shared_u32(is_k_valid.ptr_to([cur_buf, valid_word_offset]))
-            is_k_valid_hi: T.let = _ld_shared_u32(
-                is_k_valid.ptr_to([cur_buf, valid_word_offset + 4])
+            is_k_valid_lo: T.let = T.ptx.ld(
+                is_k_valid.ptr_to([cur_buf, valid_word_offset]), "uint32", "u32", space="shared"
+            )
+            is_k_valid_hi: T.let = T.ptx.ld(
+                is_k_valid.ptr_to([cur_buf, valid_word_offset + 4]), "uint32", "u32", space="shared"
             )
             for p_i in T.unroll(P_TMEM_ELEMENTS // 2):
                 invalid_p_predicate: T.let = T.bitwise_and(
@@ -921,12 +827,18 @@ def _kernel(
         T.ptx.tcgen05.fence.after_thread_sync()
 
         attn_sink_log2: T.let = (
-            _ldg_f32_at(attn_sink, cta_idx * (B_H // 2) + (idx_in_warpgroup % 64)) * LOG_2_E
+            T.cuda.ldg(
+                T.handle_add_byte_offset(
+                    attn_sink, (cta_idx * (B_H // 2) + (idx_in_warpgroup % 64)) * 4
+                ),
+                "float32",
+            )
+            * LOG_2_E
             if have_attn_sink
             else T.float32(-float("inf"))
         )
         output_scale = T.local_scalar("float32")
-        output_scale = _fdividef(T.float32(1.0), li + T.ptx.exp2(attn_sink_log2 - mi))
+        output_scale = T.cuda.fdividef(T.float32(1.0), li + T.ptx.exp2(attn_sink_log2 - mi))
         o_epi = T.alloc_local((B_EPI,), "float32")
         have_valid_indices: T.let = T.ptx.any_sync(T.uint32(0xFFFFFFFF), li != 0.0) != 0
         if not have_valid_indices:
@@ -1084,26 +996,24 @@ def _kernel(
                         + cta_idx * (B_TOPK // 2)
                         + (local_row * WG1_NUM_WARPS + wg1_warp_idx) * 4
                     )
-                    T.evaluate(
-                        _ldg_int4_indices(
+                    T.cuda.ldg(
+                        indices.ptr_to([row_base]),
+                        "int32",
+                        dst=(
                             indices_int4.ptr_to([local_row, 0]),
                             indices_int4.ptr_to([local_row, 1]),
                             indices_int4.ptr_to([local_row, 2]),
                             indices_int4.ptr_to([local_row, 3]),
-                            indices.ptr_to([row_base]),
-                        )
+                        ),
+                        vec="v4",
                     )
-                    local_max: T.let = _int4_max(
-                        indices_int4[local_row, 0],
-                        indices_int4[local_row, 1],
-                        indices_int4[local_row, 2],
-                        indices_int4[local_row, 3],
+                    local_max: T.let = T.max(
+                        T.max(indices_int4[local_row, 0], indices_int4[local_row, 1]),
+                        T.max(indices_int4[local_row, 2], indices_int4[local_row, 3]),
                     )
-                    local_min: T.let = _int4_min(
-                        indices_int4[local_row, 0],
-                        indices_int4[local_row, 1],
-                        indices_int4[local_row, 2],
-                        indices_int4[local_row, 3],
+                    local_min: T.let = T.min(
+                        T.min(indices_int4[local_row, 0], indices_int4[local_row, 1]),
+                        T.min(indices_int4[local_row, 2], indices_int4[local_row, 3]),
                     )
                     max_indices = T.max(max_indices, local_max)
                     min_indices = T.min(min_indices, local_min)
@@ -1125,27 +1035,29 @@ def _kernel(
                                 + local_row * (4 * WG1_NUM_WARPS) * 64
                                 + local_col * ((B_TOPK // 2) * 64)
                             )
-                            T.evaluate(
-                                _tma_gather4_kv_cta_group2(
-                                    k_smem.access_ptr("w", offset=raw_k_offset),
-                                    bar_k_part0_ready.ptr_to([cur_buf]),
-                                    T.address_of(tensor_map_kv),
-                                    local_col * 64,
-                                    indices_int4[local_row, 0],
-                                    indices_int4[local_row, 1],
-                                    indices_int4[local_row, 2],
-                                    indices_int4[local_row, 3],
-                                    T.uint64(0x14F0000000000000),
-                                )
+                            T.ptx.cp_async.bulk.tensor.g2c_tile_gather4_bar_addr(
+                                2,
+                                k_smem.access_ptr("w", offset=raw_k_offset),
+                                T.cuda.sm100_tma_2sm_mbarrier_addr(
+                                    bar_k_part0_ready.ptr_to([cur_buf])
+                                ),
+                                T.address_of(tensor_map_kv),
+                                T.uint16(1),
+                                2,
+                                T.uint64(0x14F0000000000000),
+                                T.int32(1),
+                                local_col * 64,
+                                indices_int4[local_row, 0],
+                                indices_int4[local_row, 1],
+                                indices_int4[local_row, 2],
+                                indices_int4[local_row, 3],
                             )
                 else:
-                    T.evaluate(
-                        _mbarrier_complete_tx(
-                            bar_k_part0_ready.ptr_to([cur_buf]),
-                            T.uint32(0),
-                            T.uint32(WG1_NUM_LOCAL_ROWS_PER_WARP * 4 * d_sq * BF16_BYTES),
-                            T.uint32(1),
-                        )
+                    T.ptx.mbarrier.complete_tx(
+                        bar_k_part0_ready.ptr_to([cur_buf]),
+                        T.uint32(WG1_NUM_LOCAL_ROWS_PER_WARP * 4 * d_sq * BF16_BYTES),
+                        T.uint32(0),
+                        T.uint32(1),
                     )
 
                 if k > 0:
@@ -1161,27 +1073,29 @@ def _kernel(
                                 + local_row * (4 * WG1_NUM_WARPS) * 64
                                 + local_col * ((B_TOPK // 2) * 64)
                             )
-                            T.evaluate(
-                                _tma_gather4_kv_cta_group2(
-                                    k_smem.access_ptr("w", offset=raw_k_offset),
-                                    bar_k_part1_ready.ptr_to([cur_buf]),
-                                    T.address_of(tensor_map_kv),
-                                    local_col * 64,
-                                    indices_int4[local_row, 0],
-                                    indices_int4[local_row, 1],
-                                    indices_int4[local_row, 2],
-                                    indices_int4[local_row, 3],
-                                    T.uint64(0x14F0000000000000),
-                                )
+                            T.ptx.cp_async.bulk.tensor.g2c_tile_gather4_bar_addr(
+                                2,
+                                k_smem.access_ptr("w", offset=raw_k_offset),
+                                T.cuda.sm100_tma_2sm_mbarrier_addr(
+                                    bar_k_part1_ready.ptr_to([cur_buf])
+                                ),
+                                T.address_of(tensor_map_kv),
+                                T.uint16(1),
+                                2,
+                                T.uint64(0x14F0000000000000),
+                                T.int32(1),
+                                local_col * 64,
+                                indices_int4[local_row, 0],
+                                indices_int4[local_row, 1],
+                                indices_int4[local_row, 2],
+                                indices_int4[local_row, 3],
                             )
                 else:
-                    T.evaluate(
-                        _mbarrier_complete_tx(
-                            bar_k_part1_ready.ptr_to([cur_buf]),
-                            T.uint32(0),
-                            T.uint32(WG1_NUM_LOCAL_ROWS_PER_WARP * 4 * D_TQ * BF16_BYTES),
-                            T.uint32(1),
-                        )
+                    T.ptx.mbarrier.complete_tx(
+                        bar_k_part1_ready.ptr_to([cur_buf]),
+                        T.uint32(WG1_NUM_LOCAL_ROWS_PER_WARP * 4 * D_TQ * BF16_BYTES),
+                        T.uint32(0),
+                        T.uint32(1),
                     )
 
     elif warpgroup_idx == 2:
@@ -1202,14 +1116,16 @@ def _kernel(
                     row_base: T.let = (
                         g_indices_base + k * B_TOPK + (local_row * WG2_NUM_WARPS + wg2_warp_idx) * 4
                     )
-                    T.evaluate(
-                        _ldg_int4_indices(
+                    T.cuda.ldg(
+                        indices.ptr_to([row_base]),
+                        "int32",
+                        dst=(
                             token_idxs.ptr_to([0]),
                             token_idxs.ptr_to([1]),
                             token_idxs.ptr_to([2]),
                             token_idxs.ptr_to([3]),
-                            indices.ptr_to([row_base]),
-                        )
+                        ),
+                        vec="v4",
                     )
                     for local_col in T.unroll((D_V // 2) // 64):
                         raw_v_offset: T.let = (
@@ -1217,18 +1133,20 @@ def _kernel(
                             + local_row * (4 * WG2_NUM_WARPS) * 64
                             + local_col * (B_TOPK * 64)
                         )
-                        T.evaluate(
-                            _tma_gather4_kv_cta_group2(
-                                v_smem.access_ptr("w", offset=raw_v_offset),
-                                bar_v_part0_ready.ptr_to([cur_buf]),
-                                T.address_of(tensor_map_kv),
-                                local_col * 64 + cta_idx * 256,
-                                token_idxs[0],
-                                token_idxs[1],
-                                token_idxs[2],
-                                token_idxs[3],
-                                T.uint64(0x14F0000000000000),
-                            )
+                        T.ptx.cp_async.bulk.tensor.g2c_tile_gather4_bar_addr(
+                            2,
+                            v_smem.access_ptr("w", offset=raw_v_offset),
+                            T.cuda.sm100_tma_2sm_mbarrier_addr(bar_v_part0_ready.ptr_to([cur_buf])),
+                            T.address_of(tensor_map_kv),
+                            T.uint16(1),
+                            2,
+                            T.uint64(0x14F0000000000000),
+                            T.int32(1),
+                            local_col * 64 + cta_idx * 256,
+                            token_idxs[0],
+                            token_idxs[1],
+                            token_idxs[2],
+                            token_idxs[3],
                         )
 
                 if k > 0:
@@ -1241,14 +1159,16 @@ def _kernel(
                     row_base: T.let = (
                         g_indices_base + k * B_TOPK + (local_row * WG2_NUM_WARPS + wg2_warp_idx) * 4
                     )
-                    T.evaluate(
-                        _ldg_int4_indices(
+                    T.cuda.ldg(
+                        indices.ptr_to([row_base]),
+                        "int32",
+                        dst=(
                             token_idxs.ptr_to([0]),
                             token_idxs.ptr_to([1]),
                             token_idxs.ptr_to([2]),
                             token_idxs.ptr_to([3]),
-                            indices.ptr_to([row_base]),
-                        )
+                        ),
+                        vec="v4",
                     )
                     for local_col in T.unroll((D_V // 2) // 64):
                         raw_v_offset: T.let = (
@@ -1256,18 +1176,20 @@ def _kernel(
                             + local_row * (4 * WG2_NUM_WARPS) * 64
                             + local_col * (B_TOPK * 64)
                         )
-                        T.evaluate(
-                            _tma_gather4_kv_cta_group2(
-                                v_smem.access_ptr("w", offset=raw_v_offset),
-                                bar_v_part1_ready.ptr_to([cur_buf]),
-                                T.address_of(tensor_map_kv),
-                                local_col * 64 + cta_idx * 256,
-                                token_idxs[0],
-                                token_idxs[1],
-                                token_idxs[2],
-                                token_idxs[3],
-                                T.uint64(0x14F0000000000000),
-                            )
+                        T.ptx.cp_async.bulk.tensor.g2c_tile_gather4_bar_addr(
+                            2,
+                            v_smem.access_ptr("w", offset=raw_v_offset),
+                            T.cuda.sm100_tma_2sm_mbarrier_addr(bar_v_part1_ready.ptr_to([cur_buf])),
+                            T.address_of(tensor_map_kv),
+                            T.uint16(1),
+                            2,
+                            T.uint64(0x14F0000000000000),
+                            T.int32(1),
+                            local_col * 64 + cta_idx * 256,
+                            token_idxs[0],
+                            token_idxs[1],
+                            token_idxs[2],
+                            token_idxs[3],
                         )
 
     else:
@@ -1453,11 +1375,17 @@ def _kernel(
             if lane_idx < B_TOPK // 8:
                 lane_indices = T.alloc_local((8,), "int32")
                 for k in T.serial(0, num_k_blocks, unroll=False):
-                    T.evaluate(
-                        _ldg_256_indices(
-                            lane_indices.ptr_to([0]),
-                            indices.ptr_to([g_indices_base + k * B_TOPK + lane_idx * 8]),
-                        )
+                    T.ptx.ld(
+                        indices.ptr_to([g_indices_base + k * B_TOPK + lane_idx * 8]),
+                        "int32",
+                        "s32",
+                        dst=lane_indices.ptr_to([0]),
+                        space="global",
+                        cop="nc",
+                        vec="v8",
+                        l1_evict="L1::evict_normal",
+                        l2_evict="L2::evict_normal",
+                        prefetch_size="L2::256B",
                     )
                     abs_pos_start: T.let = k * B_TOPK
                     valid0: T.let = (

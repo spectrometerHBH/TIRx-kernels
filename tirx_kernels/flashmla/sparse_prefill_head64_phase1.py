@@ -332,51 +332,6 @@ def _tirx_benchmark_tensors(
     )
 
 
-def _tma_gather4_kv_nope(
-    dst_ptr: Any,
-    bar_ptr: Any,
-    tensor_map_ptr: Any,
-    col_idx: Any,
-    row_idx0: Any,
-    row_idx1: Any,
-    row_idx2: Any,
-    row_idx3: Any,
-    cache_hint: Any,
-    use_bar_addr: bool,
-) -> Any:
-    if use_bar_addr:
-        return T.ptx.cp_async.bulk.tensor.g2c_tile_gather4_bar_addr(
-            2,
-            dst_ptr,
-            T.cuda.cvta_generic_to_shared(bar_ptr),
-            tensor_map_ptr,
-            0,
-            1,
-            cache_hint,
-            1,
-            col_idx,
-            row_idx0,
-            row_idx1,
-            row_idx2,
-            row_idx3,
-        )
-    return T.ptx.cp_async.bulk.tensor.g2c_tile_gather4(
-        2,
-        dst_ptr,
-        bar_ptr,
-        tensor_map_ptr,
-        0,
-        1,
-        cache_hint,
-        1,
-        col_idx,
-        row_idx0,
-        row_idx1,
-        row_idx2,
-        row_idx3,
-    )
-
-
 def _ring_mod3(value: Any, max_value: int) -> Any:
     if max_value <= 8:
         packed_mod3 = T.uint32(0x10210210)
@@ -1276,20 +1231,40 @@ def _kernel(
                             raw_k_nope_offset: T.let = (
                                 cur_buf * B_TOPK * D_V + smem_row * 64 + local_col * B_TOPK * 64
                             )
-                            T.evaluate(
-                                _tma_gather4_kv_nope(
+                            if d_qk == D_V and s_kv >= 49152:
+                                T.ptx.cp_async.bulk.tensor.g2c_tile_gather4_bar_addr(
+                                    2,
                                     k_nope.access_ptr("w", offset=raw_k_nope_offset),
-                                    bar_kv_nope_ready_part0.ptr_to([cur_buf]),
+                                    T.cuda.cvta_generic_to_shared(
+                                        bar_kv_nope_ready_part0.ptr_to([cur_buf])
+                                    ),
                                     T.address_of(tensor_map_kv_nope),
+                                    0,
+                                    1,
+                                    T.uint64(0x14F0000000000000),
+                                    1,
                                     local_col * 64,
                                     selected_idx0[local_row],
                                     selected_idx1[local_row],
                                     selected_idx2[local_row],
                                     selected_idx3[local_row],
-                                    T.uint64(0x14F0000000000000),
-                                    d_qk == D_V and s_kv >= 49152,
                                 )
-                            )
+                            else:
+                                T.ptx.cp_async.bulk.tensor.g2c_tile_gather4(
+                                    2,
+                                    k_nope.access_ptr("w", offset=raw_k_nope_offset),
+                                    bar_kv_nope_ready_part0.ptr_to([cur_buf]),
+                                    T.address_of(tensor_map_kv_nope),
+                                    0,
+                                    1,
+                                    T.uint64(0x14F0000000000000),
+                                    1,
+                                    local_col * 64,
+                                    selected_idx0[local_row],
+                                    selected_idx1[local_row],
+                                    selected_idx2[local_row],
+                                    selected_idx3[local_row],
+                                )
                     part_idx1 = T.meta_var(1)
                     for local_row in T.unroll(WG1_NUM_LOCAL_ROWS_PER_WARP):
                         for local_col_inner in T.unroll((D_V // 2) // 64):
@@ -1298,20 +1273,40 @@ def _kernel(
                             raw_k_nope_offset: T.let = (
                                 cur_buf * B_TOPK * D_V + smem_row * 64 + local_col * B_TOPK * 64
                             )
-                            T.evaluate(
-                                _tma_gather4_kv_nope(
+                            if d_qk == D_V and s_kv >= 49152:
+                                T.ptx.cp_async.bulk.tensor.g2c_tile_gather4_bar_addr(
+                                    2,
                                     k_nope.access_ptr("w", offset=raw_k_nope_offset),
-                                    bar_kv_nope_ready_part1.ptr_to([cur_buf]),
+                                    T.cuda.cvta_generic_to_shared(
+                                        bar_kv_nope_ready_part1.ptr_to([cur_buf])
+                                    ),
                                     T.address_of(tensor_map_kv_nope),
+                                    0,
+                                    1,
+                                    T.uint64(0x14F0000000000000),
+                                    1,
                                     local_col * 64,
                                     selected_idx0[local_row],
                                     selected_idx1[local_row],
                                     selected_idx2[local_row],
                                     selected_idx3[local_row],
-                                    T.uint64(0x14F0000000000000),
-                                    d_qk == D_V and s_kv >= 49152,
                                 )
-                            )
+                            else:
+                                T.ptx.cp_async.bulk.tensor.g2c_tile_gather4(
+                                    2,
+                                    k_nope.access_ptr("w", offset=raw_k_nope_offset),
+                                    bar_kv_nope_ready_part1.ptr_to([cur_buf]),
+                                    T.address_of(tensor_map_kv_nope),
+                                    0,
+                                    1,
+                                    T.uint64(0x14F0000000000000),
+                                    1,
+                                    local_col * 64,
+                                    selected_idx0[local_row],
+                                    selected_idx1[local_row],
+                                    selected_idx2[local_row],
+                                    selected_idx3[local_row],
+                                )
                 else:
                     for part_idx in T.unroll(2):
                         tx_bytes = T.uint32(

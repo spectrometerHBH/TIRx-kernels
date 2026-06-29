@@ -7,14 +7,6 @@ from unittest import SkipTest
 
 import torch
 
-from tirx_kernels.flashmla.sparse_prefill_head128_phase1 import (
-    _canonical_warp_idx_sync,
-    _fdividef,
-    _ldg_f32_at,
-    _ldg_i32_at,
-    _shfl_sync_i32,
-    _tma_gather4_kv_cta_group2,
-)
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.lang.pipeline import MBarrier, TCGen05Bar, TMABar
@@ -330,59 +322,6 @@ def _tirx_benchmark_tensors(
     )
 
 
-def _ld_shared_u32(src_ptr: Any) -> Any:
-    return T.ptx.ld(src_ptr, "uint32", "u32", space="shared")
-
-
-def _ldg_256_indices_policy(dst: Any, src_ptr: Any, *, func_name: str, l2_policy: str) -> Any:
-    return T.ptx.ld(
-        src_ptr,
-        "int32",
-        "s32",
-        dst=dst,
-        space="global",
-        cop="nc",
-        vec="v8",
-        l1_evict="L1::no_allocate",
-        l2_evict=f"L2::{l2_policy}",
-        prefetch_size="L2::256B",
-    )
-
-
-def _ldg_256_indices_evict_first(dst: Any, src_ptr: Any) -> Any:
-    return _ldg_256_indices_policy(
-        dst,
-        src_ptr,
-        func_name="sparse_flashmla_small_topk_head128_ldg_256_indices_evict_first",
-        l2_policy="evict_first",
-    )
-
-
-def _ldg_256_indices_evict_normal(dst: Any, src_ptr: Any) -> Any:
-    return _ldg_256_indices_policy(
-        dst,
-        src_ptr,
-        func_name="sparse_flashmla_small_topk_head128_ldg_256_indices_evict_normal",
-        l2_policy="evict_normal",
-    )
-
-
-def _trigger_programmatic_launch_completion() -> Any:
-    return T.ptx.griddepcontrol.launch_dependents()
-
-
-def _clc_query_cancel_acquire_x(response_ptr: Any) -> Any:
-    return T.ptx.clc_query_cancel(response_ptr, acquire=True)
-
-
-def _mbarrier_arrive_remote_unpred(bar_ptr: Any, cta_id: Any) -> Any:
-    return T.ptx.mbarrier.arrive(bar_ptr, cta_id=cta_id, pred=True)
-
-
-def _clc_try_cancel_multicast(response_ptr: Any, bar_ptr: Any) -> Any:
-    return T.ptx.clc_try_cancel(response_ptr, bar_ptr)
-
-
 @T.jit
 def _kernel(
     q: T.Buffer((s_q, h_q, d_qk), "bfloat16"),
@@ -413,9 +352,9 @@ def _kernel(
     T.cta_id_in_cluster([2])
     cta_idx: T.let = block_idx % 2
     thread_idx = T.thread_id([NUM_THREADS])
-    warp_idx: T.let = _canonical_warp_idx_sync(thread_idx)
+    warp_idx: T.let = T.cuda.__shfl_sync(T.uint32(0xFFFFFFFF), thread_idx // 32, 0, 32)
     lane_idx: T.let = thread_idx % 32
-    warpgroup_idx: T.let = _shfl_sync_i32(thread_idx // 128)
+    warpgroup_idx: T.let = T.cuda.__shfl_sync(T.uint32(0xFFFFFFFF), thread_idx // 128, 0, 32)
     idx_in_warpgroup: T.let = thread_idx % 128
 
     if thread_idx == 0:
@@ -605,7 +544,7 @@ def _kernel(
             bar_tOut_full.wait(0, o_outer_loop_phase)
             if is_last_o:
                 if T.ptx.elect_sync():
-                    T.evaluate(_trigger_programmatic_launch_completion())
+                    T.ptx.griddepcontrol.launch_dependents()
 
             o_epi = T.alloc_local((B_EPI,), "float32")
             for epi_k in T.unroll((D_V // 2) // B_EPI):
@@ -754,8 +693,10 @@ def _kernel(
             last_outer_loop_phase = wg0_outer_loop_phase
 
             bar_clc_full.wait(0, wg0_outer_loop_phase)
-            wg0_next_job: T.let = _clc_query_cancel_acquire_x(T.address_of(clc_response[0]))
-            T.evaluate(_mbarrier_arrive_remote_unpred(bar_clc_empty.ptr_to([0]), T.uint32(0)))
+            wg0_next_job: T.let = T.ptx.clc_query_cancel(
+                T.address_of(clc_response[0]), acquire=True
+            )
+            T.ptx.mbarrier.arrive(bar_clc_empty.ptr_to([0]), cta_id=T.uint32(0), pred=True)
             if wg0_next_job == T.uint32(0xFFFFFFFF):
                 wg0_job_valid = 0
             else:
@@ -789,7 +730,9 @@ def _kernel(
             while wg1_job_valid != 0:
                 wg1_s_q_idx: T.let = wg1_job_block_idx // 2
                 wg1_topk_len: T.let = (
-                    _ldg_i32_at(topk_length, wg1_s_q_idx) if have_topk_length else topk
+                    T.cuda.ldg(T.handle_add_byte_offset(topk_length, wg1_s_q_idx * 4), "int32")
+                    if have_topk_length
+                    else topk
                 )
                 wg1_num_k_blocks: T.let = T.max((wg1_topk_len + B_TOPK - 1) // B_TOPK, 1)
                 wg1_g_indices_base: T.let = wg1_s_q_idx * stride_indices_s_q
@@ -800,11 +743,17 @@ def _kernel(
                     cur_indices = T.alloc_local((WG1_ROWS_PER_WARP,), "int32")
                     for local_row in T.unroll(WG1_ROWS_PER_WARP // 8):
                         row: T.let = local_row * (4 * 8) + wg1_warp_idx * 8
-                        T.evaluate(
-                            _ldg_256_indices_evict_first(
-                                cur_indices.ptr_to([local_row * 8]),
-                                indices.ptr_to([wg1_g_indices_base + k * B_TOPK + row]),
-                            )
+                        T.ptx.ld(
+                            indices.ptr_to([wg1_g_indices_base + k * B_TOPK + row]),
+                            "int32",
+                            "s32",
+                            dst=cur_indices.ptr_to([local_row * 8]),
+                            space="global",
+                            cop="nc",
+                            vec="v8",
+                            l1_evict="L1::no_allocate",
+                            l2_evict="L2::evict_first",
+                            prefetch_size="L2::256B",
                         )
                     bar_KV_empty.wait(k_buf_idx, k_bar_phase ^ 1)
                     for local_row in T.unroll(WG1_ROWS_PER_WARP // 4):
@@ -817,24 +766,28 @@ def _kernel(
                                 + row * 64
                                 + local_col * 64 * B_TOPK
                             )
-                            T.evaluate(
-                                _tma_gather4_kv_cta_group2(
-                                    k_smem.access_ptr("w", offset=raw_k_offset),
-                                    bar_KV_full.ptr_to([k_buf_idx]),
-                                    T.address_of(tensor_map_kv),
-                                    local_col * 64 + cta_idx * (D_QK // 2),
-                                    cur_indices[local_row * 4 + 0],
-                                    cur_indices[local_row * 4 + 1],
-                                    cur_indices[local_row * 4 + 2],
-                                    cur_indices[local_row * 4 + 3],
-                                    T.uint64(0x14F0000000000000),
-                                )
+                            T.ptx.cp_async.bulk.tensor.g2c_tile_gather4_bar_addr(
+                                2,
+                                k_smem.access_ptr("w", offset=raw_k_offset),
+                                T.cuda.sm100_tma_2sm_mbarrier_addr(bar_KV_full.ptr_to([k_buf_idx])),
+                                T.address_of(tensor_map_kv),
+                                T.uint16(1),
+                                2,
+                                T.uint64(0x14F0000000000000),
+                                T.int32(1),
+                                local_col * 64 + cta_idx * (D_QK // 2),
+                                cur_indices[local_row * 4 + 0],
+                                cur_indices[local_row * 4 + 1],
+                                cur_indices[local_row * 4 + 2],
+                                cur_indices[local_row * 4 + 3],
                             )
                     wg1_rs = wg1_rs + 1
 
                 bar_clc_full.wait(0, wg1_outer_loop_phase)
-                wg1_next_job: T.let = _clc_query_cancel_acquire_x(T.address_of(clc_response[0]))
-                T.evaluate(_mbarrier_arrive_remote_unpred(bar_clc_empty.ptr_to([0]), T.uint32(0)))
+                wg1_next_job: T.let = T.ptx.clc_query_cancel(
+                    T.address_of(clc_response[0]), acquire=True
+                )
+                T.ptx.mbarrier.arrive(bar_clc_empty.ptr_to([0]), cta_id=T.uint32(0), pred=True)
                 if wg1_next_job == T.uint32(0xFFFFFFFF):
                     wg1_job_valid = 0
                 else:
@@ -884,7 +837,9 @@ def _kernel(
                 while umma_job_valid != 0:
                     umma_s_q_idx: T.let = umma_job_block_idx // 2
                     umma_topk_len: T.let = (
-                        _ldg_i32_at(topk_length, umma_s_q_idx) if have_topk_length else topk
+                        T.cuda.ldg(T.handle_add_byte_offset(topk_length, umma_s_q_idx * 4), "int32")
+                        if have_topk_length
+                        else topk
                     )
                     umma_num_k_blocks: T.let = T.max((umma_topk_len + B_TOPK - 1) // B_TOPK, 1)
                     bar_tQ_full.wait(0, umma_outer_loop_phase)
@@ -964,12 +919,10 @@ def _kernel(
                     bar_tOut_full.arrive(0, cta_group=2, cta_mask=3)
 
                     bar_clc_full.wait(0, umma_outer_loop_phase)
-                    umma_next_job: T.let = _clc_query_cancel_acquire_x(
-                        T.address_of(clc_response[0])
+                    umma_next_job: T.let = T.ptx.clc_query_cancel(
+                        T.address_of(clc_response[0]), acquire=True
                     )
-                    T.evaluate(
-                        _mbarrier_arrive_remote_unpred(bar_clc_empty.ptr_to([0]), T.uint32(0))
-                    )
+                    T.ptx.mbarrier.arrive(bar_clc_empty.ptr_to([0]), cta_id=T.uint32(0), pred=True)
                     if umma_next_job == T.uint32(0xFFFFFFFF):
                         umma_job_valid = 0
                     else:
@@ -990,16 +943,26 @@ def _kernel(
                 while valid_job_valid != 0:
                     valid_s_q_idx: T.let = valid_job_block_idx // 2
                     valid_topk_len: T.let = (
-                        _ldg_i32_at(topk_length, valid_s_q_idx) if have_topk_length else topk
+                        T.cuda.ldg(
+                            T.handle_add_byte_offset(topk_length, valid_s_q_idx * 4), "int32"
+                        )
+                        if have_topk_length
+                        else topk
                     )
                     valid_num_k_blocks: T.let = T.max((valid_topk_len + B_TOPK - 1) // B_TOPK, 1)
                     valid_g_indices_base: T.let = valid_s_q_idx * stride_indices_s_q
                     for k in T.serial(0, valid_num_k_blocks, unroll=False):
-                        T.evaluate(
-                            _ldg_256_indices_evict_normal(
-                                lane_indices.ptr_to([0]),
-                                indices.ptr_to([valid_g_indices_base + k * B_TOPK + lane_idx * 8]),
-                            )
+                        T.ptx.ld(
+                            indices.ptr_to([valid_g_indices_base + k * B_TOPK + lane_idx * 8]),
+                            "int32",
+                            "s32",
+                            dst=lane_indices.ptr_to([0]),
+                            space="global",
+                            cop="nc",
+                            vec="v8",
+                            l1_evict="L1::no_allocate",
+                            l2_evict="L2::evict_normal",
+                            prefetch_size="L2::256B",
                         )
                         abs_pos_start: T.let = k * B_TOPK
                         valid0: T.let = (
@@ -1078,12 +1041,10 @@ def _kernel(
                         valid_rs = valid_rs + 1
 
                     bar_clc_full.wait(0, valid_outer_loop_phase)
-                    valid_next_job: T.let = _clc_query_cancel_acquire_x(
-                        T.address_of(clc_response[0])
+                    valid_next_job: T.let = T.ptx.clc_query_cancel(
+                        T.address_of(clc_response[0]), acquire=True
                     )
-                    T.evaluate(
-                        _mbarrier_arrive_remote_unpred(bar_clc_empty.ptr_to([0]), T.uint32(0))
-                    )
+                    T.ptx.mbarrier.arrive(bar_clc_empty.ptr_to([0]), cta_id=T.uint32(0), pred=True)
                     if valid_next_job == T.uint32(0xFFFFFFFF):
                         valid_job_valid = 0
                     else:
@@ -1100,19 +1061,17 @@ def _kernel(
                     while clc_job_valid != 0:
                         if cta_idx == 0:
                             bar_clc_empty.wait(0, clc_outer_loop_phase ^ 1)
-                            T.evaluate(
-                                _clc_try_cancel_multicast(
-                                    T.address_of(clc_response[0]), bar_clc_full.ptr_to([0])
-                                )
+                            T.ptx.clc_try_cancel(
+                                T.address_of(clc_response[0]), bar_clc_full.ptr_to([0])
                             )
                         bar_clc_full.arrive(0, tx_count=16)
 
                         bar_clc_full.wait(0, clc_outer_loop_phase)
-                        clc_next_job: T.let = _clc_query_cancel_acquire_x(
-                            T.address_of(clc_response[0])
+                        clc_next_job: T.let = T.ptx.clc_query_cancel(
+                            T.address_of(clc_response[0]), acquire=True
                         )
-                        T.evaluate(
-                            _mbarrier_arrive_remote_unpred(bar_clc_empty.ptr_to([0]), T.uint32(0))
+                        T.ptx.mbarrier.arrive(
+                            bar_clc_empty.ptr_to([0]), cta_id=T.uint32(0), pred=True
                         )
                         if clc_next_job == T.uint32(0xFFFFFFFF):
                             clc_job_valid = 0
@@ -1133,7 +1092,9 @@ def _kernel(
         while wg3_job_valid != 0:
             wg3_s_q_idx: T.let = wg3_job_block_idx // 2
             wg3_topk_len: T.let = (
-                _ldg_i32_at(topk_length, wg3_s_q_idx) if have_topk_length else topk
+                T.cuda.ldg(T.handle_add_byte_offset(topk_length, wg3_s_q_idx * 4), "int32")
+                if have_topk_length
+                else topk
             )
             wg3_num_k_blocks: T.let = T.max((wg3_topk_len + B_TOPK - 1) // B_TOPK, 1)
             mi = T.local_scalar("float32")
@@ -1319,8 +1280,11 @@ def _kernel(
                 valid_word_offset: T.let = T.if_then_else(
                     local_warp_idx >= 2, WG3_NUM_ELEMS_PER_THREAD // 8, 0
                 )
-                is_k_valid_u32: T.let = _ld_shared_u32(
-                    is_k_valid.ptr_to([index_buf_idx, valid_word_offset])
+                is_k_valid_u32: T.let = T.ptx.ld(
+                    is_k_valid.ptr_to([index_buf_idx, valid_word_offset]),
+                    "uint32",
+                    "u32",
+                    space="shared",
                 )
                 for p_i in T.unroll(WG3_NUM_ELEMS_PER_THREAD):
                     invalid_p_predicate: T.let = T.bitwise_and(
@@ -1552,11 +1516,12 @@ def _kernel(
             if idx_in_warpgroup < B_H // 2:
                 head_idx: T.let = cta_idx * (B_H // 2) + idx_in_warpgroup
                 attn_sink_log2: T.let = (
-                    _ldg_f32_at(attn_sink, head_idx) * LOG_2_E
+                    T.cuda.ldg(T.handle_add_byte_offset(attn_sink, head_idx * 4), "float32")
+                    * LOG_2_E
                     if have_attn_sink
                     else T.float32(-float("inf"))
                 )
-                output_scale: T.let = _fdividef(
+                output_scale: T.let = T.cuda.fdividef(
                     T.float32(1.0), li + T.ptx.exp2(attn_sink_log2 - mi)
                 )
                 rowwise_li_buf[idx_in_warpgroup] = T.if_then_else(li == 0.0, 0.0, output_scale)
@@ -1570,8 +1535,10 @@ def _kernel(
                 lse[wg3_s_q_idx, head_idx] = cur_lse
 
             bar_clc_full.wait(0, wg3_outer_loop_phase)
-            wg3_next_job: T.let = _clc_query_cancel_acquire_x(T.address_of(clc_response[0]))
-            T.evaluate(_mbarrier_arrive_remote_unpred(bar_clc_empty.ptr_to([0]), T.uint32(0)))
+            wg3_next_job: T.let = T.ptx.clc_query_cancel(
+                T.address_of(clc_response[0]), acquire=True
+            )
+            T.ptx.mbarrier.arrive(bar_clc_empty.ptr_to([0]), cta_id=T.uint32(0), pred=True)
             if wg3_next_job == T.uint32(0xFFFFFFFF):
                 wg3_job_valid = 0
             else:
