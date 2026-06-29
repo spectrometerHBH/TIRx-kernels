@@ -321,9 +321,11 @@ GEMM_CONFIGS = {
     # ncu already has nymph≈canon (0.994), so 2048's residual is grid-level (64 tasks on
     # 74 clusters → ~1 task/cluster, tail-/latency-bound), not the epilogue store. Stay
     # on the proven overlap path.
-    # 2048: + canon's dynamic SMEM pool (smem_pool). Measured (tir-bench, clean B200):
-    # 0.976 -> 0.990 (clears the >=0.99 target). Keeps smem_depth=5 (depth 4 was 0.989).
-    (2048, 2048, 2048): {"l2_group_size": 2, "load_cache_hint": "evict_normal", "smem_pool": True},
+    # 2048: l2_group_size=4 matches canon's TIRX_CONFIGS[2048] L2_GROUP_SIZE=4 (the earlier
+    # l2_group_size=2 was the peak under the OLD data-asymmetric bench; under the fair bench the
+    # canon-matching 4-row band benches ~0.991 vs 2's ~0.987). + canon's dynamic SMEM pool
+    # (smem_pool) and evict_normal load hint. Keeps smem_depth=5 (depth 4 was 0.989).
+    (2048, 2048, 2048): {"l2_group_size": 4, "load_cache_hint": "evict_normal", "smem_pool": True},
     # 4096: the epilogue is the wall-clock residual (ncu nymph-vs-canon at the OVERLAP
     # baseline: nymph executed 3.7% FEWER instructions yet ran 4.1% LONGER, SM throughput
     # 51.5% vs canon 57.8%, 95 vs 172 regs/thread). Canon runs OVERLAP_EPI=False + EPI_TILE=32
