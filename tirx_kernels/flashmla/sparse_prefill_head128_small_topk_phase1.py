@@ -11,10 +11,8 @@ from tirx_kernels.flashmla.sparse_prefill_head128_phase1 import (
     _canonical_warp_idx_sync,
     _encode_tma_desc,
     _fdividef,
-    _fma_f32x2,
     _ldg_f32_at,
     _ldg_i32_at,
-    _mul_f32x2,
     _shfl_sync_i32,
     _tma_gather4_kv_cta_group2,
 )
@@ -337,122 +335,36 @@ def _tirx_benchmark_tensors(
 
 
 def _ld_shared_u32(src_ptr: Any) -> Any:
-    func_name = "sparse_flashmla_small_topk_head128_ld_shared_u32"
-    source_code = f"""
-__device__ __forceinline__ unsigned int {func_name}(const void* src_ptr) {{
-  unsigned int smem_addr;
-  asm volatile(
-    "{{\\n\\t"
-    ".reg .u64 smem_addr64;\\n\\t"
-    "cvta.to.shared.u64 smem_addr64, %1;\\n\\t"
-    "cvt.u32.u64 %0, smem_addr64;\\n\\t"
-    "}}\\n"
-    : "=r"(smem_addr) : "l"(src_ptr));
-  unsigned int val;
-  asm volatile("ld.shared.u32 %0, [%1];\\n" : "=r"(val) : "r"(smem_addr));
-  return val;
-}}
-"""
-    return T.cuda.func_call(func_name, src_ptr, source_code=source_code, return_type="uint32")
+    return T.ptx.ld(src_ptr, "uint32", "u32", space="shared")
 
 
-def _ldg_256_indices_policy(
-    dst0: Any,
-    dst1: Any,
-    dst2: Any,
-    dst3: Any,
-    dst4: Any,
-    dst5: Any,
-    dst6: Any,
-    dst7: Any,
-    src_ptr: Any,
-    *,
-    func_name: str,
-    l2_policy: str,
-) -> Any:
-    source_code = f"""
-__device__ __forceinline__ void {func_name}(
-    int* dst0, int* dst1, int* dst2, int* dst3,
-    int* dst4, int* dst5, int* dst6, int* dst7, const int* src_ptr) {{
-  int raw0, raw1, raw2, raw3, raw4, raw5, raw6, raw7;
-  asm volatile(
-    "ld.global.nc.L1::no_allocate.L2::{l2_policy}.L2::256B.v8.s32 "
-    "{{%0, %1, %2, %3, %4, %5, %6, %7}}, [%8];\\n"
-    : "=r"(raw0), "=r"(raw1), "=r"(raw2), "=r"(raw3),
-      "=r"(raw4), "=r"(raw5), "=r"(raw6), "=r"(raw7)
-    : "l"(src_ptr));
-  *dst0 = raw0;
-  *dst1 = raw1;
-  *dst2 = raw2;
-  *dst3 = raw3;
-  *dst4 = raw4;
-  *dst5 = raw5;
-  *dst6 = raw6;
-  *dst7 = raw7;
-}}
-"""
-    return T.cuda.func_call(
-        func_name,
-        dst0,
-        dst1,
-        dst2,
-        dst3,
-        dst4,
-        dst5,
-        dst6,
-        dst7,
+def _ldg_256_indices_policy(dst: Any, src_ptr: Any, *, func_name: str, l2_policy: str) -> Any:
+    return T.ptx.ld(
         src_ptr,
-        source_code=source_code,
-        return_type="void",
+        "int32",
+        "s32",
+        dst=dst,
+        space="global",
+        cop="nc",
+        vec="v8",
+        l1_evict="L1::no_allocate",
+        l2_evict=f"L2::{l2_policy}",
+        prefetch_size="L2::256B",
     )
 
 
-def _ldg_256_indices_evict_first(
-    dst0: Any,
-    dst1: Any,
-    dst2: Any,
-    dst3: Any,
-    dst4: Any,
-    dst5: Any,
-    dst6: Any,
-    dst7: Any,
-    src_ptr: Any,
-) -> Any:
+def _ldg_256_indices_evict_first(dst: Any, src_ptr: Any) -> Any:
     return _ldg_256_indices_policy(
-        dst0,
-        dst1,
-        dst2,
-        dst3,
-        dst4,
-        dst5,
-        dst6,
-        dst7,
+        dst,
         src_ptr,
         func_name="sparse_flashmla_small_topk_head128_ldg_256_indices_evict_first",
         l2_policy="evict_first",
     )
 
 
-def _ldg_256_indices_evict_normal(
-    dst0: Any,
-    dst1: Any,
-    dst2: Any,
-    dst3: Any,
-    dst4: Any,
-    dst5: Any,
-    dst6: Any,
-    dst7: Any,
-    src_ptr: Any,
-) -> Any:
+def _ldg_256_indices_evict_normal(dst: Any, src_ptr: Any) -> Any:
     return _ldg_256_indices_policy(
-        dst0,
-        dst1,
-        dst2,
-        dst3,
-        dst4,
-        dst5,
-        dst6,
-        dst7,
+        dst,
         src_ptr,
         func_name="sparse_flashmla_small_topk_head128_ldg_256_indices_evict_normal",
         l2_policy="evict_normal",
@@ -460,90 +372,19 @@ def _ldg_256_indices_evict_normal(
 
 
 def _trigger_programmatic_launch_completion() -> Any:
-    func_name = "sparse_flashmla_small_topk_head128_trigger_programmatic_launch_completion"
-    source_code = f"""
-__device__ __forceinline__ void {func_name}() {{
-  asm volatile("griddepcontrol.launch_dependents;":::);
-}}
-"""
-    return T.cuda.func_call(func_name, source_code=source_code, return_type="void")
+    return T.ptx.griddepcontrol.launch_dependents()
 
 
 def _clc_query_cancel_acquire_x(response_ptr: Any) -> Any:
-    func_name = "sparse_flashmla_small_topk_head128_clc_query_cancel_acquire_x"
-    source_code = f"""
-__device__ __forceinline__ unsigned int {func_name}(void* response_ptr) {{
-  unsigned int response_addr = (unsigned int)__cvta_generic_to_shared(response_ptr);
-  unsigned int first_ctaid_x;
-  asm volatile(
-    "{{\\n\\t"
-    ".reg .pred canceled;\\n\\t"
-    ".reg .b128 response;\\n\\t"
-    "ld.acquire.cta.shared.b128 response, [%1];\\n\\t"
-    "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 canceled, response;\\n\\t"
-    "mov.u32 %0, 0xffffffff;\\n\\t"
-    "@canceled clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, response;\\n\\t"
-    "}}\\n"
-    : "=r"(first_ctaid_x) : "r"(response_addr) : "memory");
-  return first_ctaid_x;
-}}
-"""
-    return T.cuda.func_call(func_name, response_ptr, source_code=source_code, return_type="uint32")
+    return T.ptx.clc_query_cancel(response_ptr, acquire=True)
 
 
 def _mbarrier_arrive_remote_unpred(bar_ptr: Any, cta_id: Any) -> Any:
-    func_name = "sparse_flashmla_small_topk_head128_mbarrier_arrive_remote_unpred"
-    source_code = f"""
-__device__ __forceinline__ void {func_name}(void* bar_ptr, unsigned int cta_id) {{
-  unsigned int smem_addr;
-  asm volatile(
-    "{{\\n\\t"
-    ".reg .u64 smem_addr64;\\n\\t"
-    "cvta.to.shared.u64 smem_addr64, %1;\\n\\t"
-    "cvt.u32.u64 %0, smem_addr64;\\n\\t"
-    "}}\\n"
-    : "=r"(smem_addr) : "l"(bar_ptr));
-  asm volatile(
-    "{{\\n\\t"
-    ".reg .b32 remAddr32;\\n\\t"
-    "mapa.shared::cluster.u32 remAddr32, %0, %1;\\n\\t"
-    "mbarrier.arrive.shared::cluster.b64 _, [remAddr32];\\n\\t"
-    "}}\\n"
-    :: "r"(smem_addr), "r"(cta_id) : "memory");
-}}
-"""
-    return T.cuda.func_call(func_name, bar_ptr, cta_id, source_code=source_code, return_type="void")
+    return T.ptx.mbarrier.arrive(bar_ptr, cta_id=cta_id, pred=True)
 
 
 def _clc_try_cancel_multicast(response_ptr: Any, bar_ptr: Any) -> Any:
-    func_name = "sparse_flashmla_small_topk_head128_clc_try_cancel_multicast"
-    source_code = f"""
-__device__ __forceinline__ void {func_name}(void* response_ptr, void* bar_ptr) {{
-  unsigned int response_addr;
-  unsigned int mbarrier_addr;
-  asm volatile(
-    "{{\\n\\t"
-    ".reg .u64 response_addr64;\\n\\t"
-    "cvta.to.shared.u64 response_addr64, %1;\\n\\t"
-    "cvt.u32.u64 %0, response_addr64;\\n\\t"
-    "}}\\n"
-    : "=r"(response_addr) : "l"(response_ptr));
-  asm volatile(
-    "{{\\n\\t"
-    ".reg .u64 mbarrier_addr64;\\n\\t"
-    "cvta.to.shared.u64 mbarrier_addr64, %1;\\n\\t"
-    "cvt.u32.u64 %0, mbarrier_addr64;\\n\\t"
-    "}}\\n"
-    : "=r"(mbarrier_addr) : "l"(bar_ptr));
-  asm volatile(
-    "clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes"
-    ".multicast::cluster::all.b128 [%0], [%1];\\n"
-    :: "r"(response_addr), "r"(mbarrier_addr));
-}}
-"""
-    return T.cuda.func_call(
-        func_name, response_ptr, bar_ptr, source_code=source_code, return_type="void"
-    )
+    return T.ptx.clc_try_cancel(response_ptr, bar_ptr)
 
 
 @T.jit
@@ -576,7 +417,7 @@ def _kernel(
     T.cta_id_in_cluster([2])
     cta_idx: T.let = block_idx % 2
     thread_idx = T.thread_id([NUM_THREADS])
-    warp_idx: T.let = _canonical_warp_idx_sync()
+    warp_idx: T.let = _canonical_warp_idx_sync(thread_idx)
     lane_idx: T.let = thread_idx % 32
     warpgroup_idx: T.let = _shfl_sync_i32(thread_idx // 128)
     idx_in_warpgroup: T.let = thread_idx % 128
@@ -859,7 +700,9 @@ def _kernel(
                     for o_j in T.unroll(4):
                         o_pair_idx: T.let = o_i * 8 + o_j * 2
                         o_pair: T.let = T.cuda.make_float2(o_epi[o_pair_idx], o_epi[o_pair_idx + 1])
-                        o_scaled_pair: T.let = _mul_f32x2(o_pair, output_scale_pair)
+                        o_scaled_pair_tmp = T.alloc_local((1,), "uint64")
+                        T.ptx.mul_f32x2(o_scaled_pair_tmp.ptr_to([0]), o_pair, output_scale_pair)
+                        o_scaled_pair: T.let = o_scaled_pair_tmp[0]
                         o_epi_bf16[o_j] = T.cuda.float22bfloat162_rn(
                             T.cuda.float2_x(o_scaled_pair), T.cuda.float2_y(o_scaled_pair)
                         )
@@ -967,14 +810,7 @@ def _kernel(
                         row: T.let = local_row * (4 * 8) + wg1_warp_idx * 8
                         T.evaluate(
                             _ldg_256_indices_evict_first(
-                                cur_indices.ptr_to([local_row * 8 + 0]),
-                                cur_indices.ptr_to([local_row * 8 + 1]),
-                                cur_indices.ptr_to([local_row * 8 + 2]),
-                                cur_indices.ptr_to([local_row * 8 + 3]),
-                                cur_indices.ptr_to([local_row * 8 + 4]),
-                                cur_indices.ptr_to([local_row * 8 + 5]),
-                                cur_indices.ptr_to([local_row * 8 + 6]),
-                                cur_indices.ptr_to([local_row * 8 + 7]),
+                                cur_indices.ptr_to([local_row * 8]),
                                 indices.ptr_to([wg1_g_indices_base + k * B_TOPK + row]),
                             )
                         )
@@ -1170,13 +1006,6 @@ def _kernel(
                         T.evaluate(
                             _ldg_256_indices_evict_normal(
                                 lane_indices.ptr_to([0]),
-                                lane_indices.ptr_to([1]),
-                                lane_indices.ptr_to([2]),
-                                lane_indices.ptr_to([3]),
-                                lane_indices.ptr_to([4]),
-                                lane_indices.ptr_to([5]),
-                                lane_indices.ptr_to([6]),
-                                lane_indices.ptr_to([7]),
                                 indices.ptr_to([valid_g_indices_base + k * B_TOPK + lane_idx * 8]),
                             )
                         )
@@ -1590,7 +1419,9 @@ def _kernel(
                     p_pair: T.let = T.cuda.make_float2(
                         T.cuda.uint_as_float(p[s_i * 2]), T.cuda.uint_as_float(p[s_i * 2 + 1])
                     )
-                    fma_pair: T.let = _fma_f32x2(p_pair, scale_pair, neg_new_max_pair)
+                    fma_pair_tmp = T.alloc_local((1,), "uint64")
+                    T.ptx.fma_f32x2(fma_pair_tmp.ptr_to([0]), p_pair, scale_pair, neg_new_max_pair)
+                    fma_pair: T.let = fma_pair_tmp[0]
                     s_x: T.let = T.ptx.exp2(T.cuda.float2_x(fma_pair))
                     s_y: T.let = T.ptx.exp2(T.cuda.float2_y(fma_pair))
                     s_pair: T.let = T.cuda.make_float2(s_x, s_y)
@@ -1667,9 +1498,10 @@ def _kernel(
                             o_pair: T.let = T.cuda.make_float2(
                                 o_rescale[o_i * 2], o_rescale[o_i * 2 + 1]
                             )
-                            o_pair_tmp: T.let = _mul_f32x2(o_pair, scale_for_old_pair)
-                            o_rescale[o_i * 2] = T.cuda.float2_x(o_pair_tmp)
-                            o_rescale[o_i * 2 + 1] = T.cuda.float2_y(o_pair_tmp)
+                            o_pair_tmp = T.alloc_local((1,), "uint64")
+                            T.ptx.mul_f32x2(o_pair_tmp.ptr_to([0]), o_pair, scale_for_old_pair)
+                            o_rescale[o_i * 2] = T.cuda.float2_x(o_pair_tmp[0])
+                            o_rescale[o_i * 2 + 1] = T.cuda.float2_y(o_pair_tmp[0])
                         T.ptx.tcgen05.st(
                             T.uint32(0),
                             o_rescale[0],

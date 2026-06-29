@@ -367,114 +367,25 @@ def _run_tirx_launches(
 
 
 def _mbarrier_complete_tx(bar_ptr: Any, transaction_bytes: Any) -> Any:
-    func_name = "sparse_flashmla_mbarrier_complete_tx"
-    source_code = f"""
-__device__ __forceinline__ void {func_name}(void* bar_ptr, unsigned int transaction_bytes) {{
-  unsigned int smem_addr;
-  asm volatile(
-    "{{\\n\\t"
-    ".reg .u64 smem_addr64;\\n\\t"
-    "cvta.to.shared.u64 smem_addr64, %1;\\n\\t"
-    "cvt.u32.u64 %0, smem_addr64;\\n\\t"
-    "}}\\n"
-    : "=r"(smem_addr) : "l"(bar_ptr));
-  asm volatile(
-    "mbarrier.complete_tx.shared::cluster.relaxed.cluster.b64 [%0], %1;\\n"
-    :: "r"(smem_addr), "r"(transaction_bytes) : "memory");
-}}
-"""
-    return T.cuda.func_call(
-        func_name, bar_ptr, transaction_bytes, source_code=source_code, return_type="void"
-    )
+    return T.ptx.mbarrier.complete_tx(bar_ptr, transaction_bytes)
 
 
 def _cpasync_barrier_arrive_noinc(bar_ptr: Any) -> Any:
-    func_name = "sparse_flashmla_cpasync_barrier_arrive_noinc"
-    source_code = f"""
-__device__ __forceinline__ void {func_name}(void* bar_ptr) {{
-  unsigned int smem_addr;
-  asm volatile(
-    "{{\\n\\t"
-    ".reg .u64 smem_addr64;\\n\\t"
-    "cvta.to.shared.u64 smem_addr64, %1;\\n\\t"
-    "cvt.u32.u64 %0, smem_addr64;\\n\\t"
-    "}}\\n"
-    : "=r"(smem_addr) : "l"(bar_ptr));
-  asm volatile(
-    "cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\\n"
-    :: "r"(smem_addr) : "memory");
-}}
-"""
-    return T.cuda.func_call(func_name, bar_ptr, source_code=source_code, return_type="void")
+    return T.ptx.cp_async.mbarrier.arrive.noinc(bar_ptr)
 
 
-def _ldg_int4_indices(dst0: Any, dst1: Any, dst2: Any, dst3: Any, src_ptr: Any) -> Any:
-    func_name = "sparse_flashmla_ldg_int4_indices"
-    source_code = f"""
-__device__ __forceinline__ void {func_name}(
-    int* dst0, int* dst1, int* dst2, int* dst3, const int* src_ptr) {{
-  int4 v = __ldg(reinterpret_cast<const int4*>(src_ptr));
-  *dst0 = v.x;
-  *dst1 = v.y;
-  *dst2 = v.z;
-  *dst3 = v.w;
-}}
-"""
-    return T.cuda.func_call(
-        func_name, dst0, dst1, dst2, dst3, src_ptr, source_code=source_code, return_type="void"
-    )
-
-
-def _ldg_256_indices(
-    dst0: Any,
-    dst1: Any,
-    dst2: Any,
-    dst3: Any,
-    dst4: Any,
-    dst5: Any,
-    dst6: Any,
-    dst7: Any,
-    src_ptr: Any,
-) -> Any:
-    func_name = "sparse_flashmla_ldg_256_indices"
-    source_code = f"""
-__device__ __forceinline__ void {func_name}(
-    int* dst0, int* dst1, int* dst2, int* dst3,
-    int* dst4, int* dst5, int* dst6, int* dst7, const int* src_ptr) {{
-  uint64_t raw0, raw1, raw2, raw3;
-  asm volatile(
-    "ld.global.nc.L1::no_allocate.L2::evict_normal.L2::256B.v4.u64 "
-    "{{%0, %1, %2, %3}}, [%4];\\n"
-    : "=l"(raw0), "=l"(raw1), "=l"(raw2), "=l"(raw3)
-    : "l"(src_ptr));
-  int vals[8];
-  reinterpret_cast<uint64_t*>(vals)[0] = raw0;
-  reinterpret_cast<uint64_t*>(vals)[1] = raw1;
-  reinterpret_cast<uint64_t*>(vals)[2] = raw2;
-  reinterpret_cast<uint64_t*>(vals)[3] = raw3;
-  *dst0 = vals[0];
-  *dst1 = vals[1];
-  *dst2 = vals[2];
-  *dst3 = vals[3];
-  *dst4 = vals[4];
-  *dst5 = vals[5];
-  *dst6 = vals[6];
-  *dst7 = vals[7];
-}}
-"""
-    return T.cuda.func_call(
-        func_name,
-        dst0,
-        dst1,
-        dst2,
-        dst3,
-        dst4,
-        dst5,
-        dst6,
-        dst7,
+def _ldg_256_indices(dst: Any, src_ptr: Any) -> Any:
+    return T.ptx.ld(
         src_ptr,
-        source_code=source_code,
-        return_type="void",
+        "int32",
+        "s32",
+        dst=dst,
+        space="global",
+        cop="nc",
+        vec="v8",
+        l1_evict="L1::no_allocate",
+        l2_evict="L2::evict_normal",
+        prefetch_size="L2::256B",
     )
 
 
@@ -524,63 +435,15 @@ def _tma_gather4_kv_nope(
 
 
 def _ld_shared_float4(dst0: Any, dst1: Any, dst2: Any, dst3: Any, src_ptr: Any) -> Any:
-    func_name = "sparse_flashmla_ld_shared_float4"
-    source_code = f"""
-__device__ __forceinline__ void {func_name}(
-    float* dst0, float* dst1, float* dst2, float* dst3, const float* src_ptr) {{
-  unsigned int smem_addr;
-  asm volatile(
-    "{{\\n\\t"
-    ".reg .u64 smem_addr64;\\n\\t"
-    "cvta.to.shared.u64 smem_addr64, %1;\\n\\t"
-    "cvt.u32.u64 %0, smem_addr64;\\n\\t"
-    "}}\\n"
-    : "=r"(smem_addr) : "l"(src_ptr));
-  float x0, x1, x2, x3;
-  asm volatile(
-    "ld.shared.v4.f32 {{%0, %1, %2, %3}}, [%4];\\n"
-    : "=f"(x0), "=f"(x1), "=f"(x2), "=f"(x3)
-    : "r"(smem_addr));
-  *dst0 = x0;
-  *dst1 = x1;
-  *dst2 = x2;
-  *dst3 = x3;
-}}
-"""
-    return T.cuda.func_call(
-        func_name, dst0, dst1, dst2, dst3, src_ptr, source_code=source_code, return_type="void"
-    )
+    return T.ptx.ld(src_ptr, "float32", "f32", dst=dst0, space="shared", vec="v4")
 
 
 def _st_shared_b128_float4(dst_ptr: Any, x0: Any, x1: Any, x2: Any, x3: Any) -> Any:
-    func_name = "sparse_flashmla_st_shared_b128_float4"
-    source_code = f"""
-__device__ __forceinline__ void {func_name}(
-    void* dst_ptr, float x0, float x1, float x2, float x3) {{
-  struct alignas(16) Float4Pack {{
-    float x;
-    float y;
-    float z;
-    float w;
-  }};
-  Float4Pack pack{{x0, x1, x2, x3}};
-  __int128_t val = *reinterpret_cast<__int128_t*>(&pack);
-  asm volatile("st.shared.b128 [%0], %1;" :: "l"(__cvta_generic_to_shared(dst_ptr)), "q"(val));
-}}
-"""
-    return T.cuda.func_call(
-        func_name, dst_ptr, x0, x1, x2, x3, source_code=source_code, return_type="void"
-    )
+    return T.ptx.st(dst_ptr, x0, x1, x2, x3, space="shared", vec="v4", ptx_type="f32")
 
 
 def _fdividef(x: Any, y: Any) -> Any:
-    func_name = "sparse_flashmla_fdividef"
-    source_code = f"""
-__device__ __forceinline__ float {func_name}(float x, float y) {{
-  return __fdividef(x, y);
-}}
-"""
-    return T.cuda.func_call(func_name, x, y, source_code=source_code, return_type="float32")
+    return T.cuda.fdividef(x, y)
 
 
 def _ring_mod3(value: Any, max_value: int) -> Any:
@@ -1443,14 +1306,19 @@ def _kernel(
                         + local_row * WG1_NUM_WARPS * 4
                         + wg1_warp_idx * 4
                     )
-                    T.evaluate(
-                        _ldg_int4_indices(
+                    T.ptx.ld(
+                        indices.ptr_to([row_base]),
+                        "int32",
+                        "s32",
+                        dst=(
                             selected_idx0.ptr_to([local_row]),
                             selected_idx1.ptr_to([local_row]),
                             selected_idx2.ptr_to([local_row]),
                             selected_idx3.ptr_to([local_row]),
-                            indices.ptr_to([row_base]),
-                        )
+                        ),
+                        space="global",
+                        cop="nc",
+                        vec="v4",
                     )
                     idx0: T.let = selected_idx0[local_row]
                     idx1: T.let = selected_idx1[local_row]
@@ -1730,13 +1598,6 @@ def _kernel(
                     T.evaluate(
                         _ldg_256_indices(
                             lane_indices.ptr_to([0]),
-                            lane_indices.ptr_to([1]),
-                            lane_indices.ptr_to([2]),
-                            lane_indices.ptr_to([3]),
-                            lane_indices.ptr_to([4]),
-                            lane_indices.ptr_to([5]),
-                            lane_indices.ptr_to([6]),
-                            lane_indices.ptr_to([7]),
                             indices.ptr_to([g_indices_base + k * B_TOPK + lane_idx * 8]),
                         )
                     )
