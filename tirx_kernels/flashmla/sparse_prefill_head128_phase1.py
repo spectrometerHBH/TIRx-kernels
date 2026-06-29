@@ -601,7 +601,6 @@ def _kernel(
 
     g_indices_base: T.let = s_q_idx * stride_indices_s_q
     tP_col = T.meta_var(TMEM_COL_P)
-    tQr_col = T.meta_var(TMEM_COL_Q)
     tO_col = T.meta_var(TMEM_COL_O)
     tiled_mma_p_accumulate = T.alloc_local((1,), "uint32")
     tiled_mma_o_accumulate = T.alloc_local((1,), "uint32")
@@ -655,32 +654,26 @@ def _kernel(
 
     T.cuda.cta_sync()
 
-    tmem_p = T.decl_buffer(
+    tmem_pool = T.TMEMPool(pool, total_cols=512, cta_group=2, tmem_addr=tmem_start_addr)
+    tmem_pool.move_base_to(TMEM_COL_P)
+    tmem_p = tmem_pool.alloc(
         (B_H // 2, B_TOPK),
         "float32",
-        scope="tmem",
-        allocated_addr=tP_col,
         layout=TileLayout(S[(B_H // 2, 2, B_TOPK // 2) : (1 @ TLane, 64 @ TLane, 1 @ TCol)]),
     )
-    q_tmem = T.decl_buffer(
-        (B_H // 2, D_TQ),
-        "bfloat16",
-        scope="tmem",
-        allocated_addr=tQr_col,
-        layout=TileLayout(S[(B_H // 2, D_TQ) : (1 @ TLane, 1 @ TCol)]),
+    tmem_pool.move_base_to(TMEM_COL_Q)
+    q_tmem = tmem_pool.alloc(
+        (B_H // 2, D_TQ), "bfloat16", layout=TileLayout(S[(B_H // 2, D_TQ) : (1 @ TLane, 1 @ TCol)])
     )
-    tmem_o_lo = T.decl_buffer(
+    tmem_pool.move_base_to(TMEM_COL_O)
+    tmem_o_lo = tmem_pool.alloc(
         (B_H // 2, D_V // 2),
         "float32",
-        scope="tmem",
-        allocated_addr=tO_col,
         layout=TileLayout(S[(B_H // 2, 2, D_V // 4) : (1 @ TLane, 64 @ TLane, 1 @ TCol)]),
     )
-    tmem_o_hi = T.decl_buffer(
+    tmem_o_hi = tmem_pool.alloc(
         (B_H // 2, D_V // 2),
         "float32",
-        scope="tmem",
-        allocated_addr=tO_col + 128,
         layout=TileLayout(S[(B_H // 2, 2, D_V // 4) : (1 @ TLane, 64 @ TLane, 1 @ TCol)]),
     )
     s_smem_gemm = s_smem.view(

@@ -512,40 +512,33 @@ def _kernel(
     tiled_mma_o_n = T.meta_var(tiled_mma_O[1])
     tiled_mma_o_k = T.meta_var(tiled_mma_O[2])
     tiled_mma_o_col = T.meta_var(tiled_mma_O[3])
-    tmem_p = T.decl_buffer(
-        (B_H, B_TOPK * 2),
-        "float32",
-        scope="tmem",
-        allocated_addr=tiled_mma_p_col,
-        layout=TileLayout(S[(B_H, 2, B_TOPK) : (1 @ TLane, 64 @ TLane, 1 @ TCol)]),
-    )
-    q_nope_tmem = T.decl_buffer(
+    tmem_pool = T.TMEMPool(pool, total_cols=512, cta_group=1, tmem_addr=tmem_start_addr)
+    tmem_pool.move_base_to(tiled_mma_o_col)
+    tmem_o_lo = tmem_pool.alloc(
         (B_H, D_V // 2),
-        "bfloat16",
-        scope="tmem",
-        allocated_addr=TMEM_COL_Q,
-        layout=TileLayout(S[(B_H, D_V // 2) : (1 @ TLane, 1 @ TCol)]),
+        "float32",
+        layout=TileLayout(S[(B_H, 2, D_V // 4) : (1 @ TLane, 64 @ TLane, 1 @ TCol)]),
     )
-    q_rope_tmem = T.decl_buffer(
+    tmem_o_hi = tmem_pool.alloc(
+        (B_H, D_V // 2),
+        "float32",
+        layout=TileLayout(S[(B_H, 2, D_V // 4) : (1 @ TLane, 64 @ TLane, 1 @ TCol)]),
+    )
+    tmem_pool.move_base_to(TMEM_COL_Q)
+    q_nope_tmem = tmem_pool.alloc(
+        (B_H, D_V // 2), "bfloat16", layout=TileLayout(S[(B_H, D_V // 2) : (1 @ TLane, 1 @ TCol)])
+    )
+    tmem_pool.move_base_to(TMEM_COL_Q_ROPE)
+    q_rope_tmem = tmem_pool.alloc(
         (B_H, Q_ROPE_DIM // 2),
         "bfloat16",
-        scope="tmem",
-        allocated_addr=TMEM_COL_Q_ROPE,
         layout=TileLayout(S[(B_H, Q_ROPE_DIM // 2) : (1 @ TLane, 1 @ TCol)]),
     )
-    tmem_o_lo = T.decl_buffer(
-        (B_H, D_V // 2),
+    tmem_pool.move_base_to(tiled_mma_p_col)
+    tmem_p = tmem_pool.alloc(
+        (B_H, B_TOPK * 2),
         "float32",
-        scope="tmem",
-        allocated_addr=tiled_mma_o_col,
-        layout=TileLayout(S[(B_H, 2, D_V // 4) : (1 @ TLane, 64 @ TLane, 1 @ TCol)]),
-    )
-    tmem_o_hi = T.decl_buffer(
-        (B_H, D_V // 2),
-        "float32",
-        scope="tmem",
-        allocated_addr=tiled_mma_o_col + 128,
-        layout=TileLayout(S[(B_H, 2, D_V // 4) : (1 @ TLane, 64 @ TLane, 1 @ TCol)]),
+        layout=TileLayout(S[(B_H, 2, B_TOPK) : (1 @ TLane, 64 @ TLane, 1 @ TCol)]),
     )
     k_rope_tiled_mma = k_rope.view(
         B_TOPK * 2, Q_ROPE_DIM // 2, layout=SwizzleLayout(3, 2, 3, swizzle_inner=True)

@@ -470,32 +470,28 @@ def _kernel(
             TileLayout(S[(64, B_H // 2, 2, D_QK // 64 // 2) : (1, 64, 4096 * 4, 4096)]),
         ),
     )
-    tmem_p = T.decl_buffer(
+    tmem_pool = T.TMEMPool(pool, total_cols=512, cta_group=2, tmem_addr=tmem_start_addr)
+    tmem_pool.move_base_to(TMEM_COL_P)
+    tmem_p = tmem_pool.alloc(
         (B_H // 2, B_TOPK * 2),
         "float32",
-        scope="tmem",
-        allocated_addr=TMEM_COL_P,
         layout=TileLayout(S[(B_H // 2, 2, B_TOPK) : (1 @ TLane, 64 @ TLane, 1 @ TCol)]),
     )
-    q_tmem = T.decl_buffer(
+    tmem_pool.move_base_to(TMEM_COL_Q)
+    q_tmem = tmem_pool.alloc(
         (B_H // 2, D_QK // 2),
         "bfloat16",
-        scope="tmem",
-        allocated_addr=TMEM_COL_Q,
         layout=TileLayout(S[(B_H // 2, D_QK // 2) : (1 @ TLane, 1 @ TCol)]),
     )
-    tmem_o_lo = T.decl_buffer(
+    tmem_pool.move_base_to(TMEM_COL_O)
+    tmem_o_lo = tmem_pool.alloc(
         (B_H // 2, D_V // 2),
         "float32",
-        scope="tmem",
-        allocated_addr=TMEM_COL_O,
         layout=TileLayout(S[(B_H // 2, 2, D_V // 4) : (1 @ TLane, 64 @ TLane, 1 @ TCol)]),
     )
-    tmem_o_hi = T.decl_buffer(
+    tmem_o_hi = tmem_pool.alloc(
         (B_H // 2, D_V // 2),
         "float32",
-        scope="tmem",
-        allocated_addr=TMEM_COL_O + 128,
         layout=TileLayout(S[(B_H // 2, 2, D_V // 4) : (1 @ TLane, 64 @ TLane, 1 @ TCol)]),
     )
     s_smem_gemm = s_smem.view(
