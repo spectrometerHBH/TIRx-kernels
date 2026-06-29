@@ -275,45 +275,6 @@ def _reference_sparse_prefill(
     return ref_out.to(torch.bfloat16), ref_max_logits, ref_lse
 
 
-def _encode_tma_desc(
-    *,
-    tensor: torch.Tensor,
-    global_shape: tuple[int, ...],
-    global_strides: tuple[int, ...],
-    box_dim: tuple[int, ...],
-    swizzle_mode: int,
-) -> Any:
-    import ctypes
-
-    import tvm
-    from tirx_kernels.deepgemm import mega_moe
-
-    rank = len(global_shape)
-    if len(global_strides) != rank - 1:
-        raise ValueError("TensorMap global_strides must have rank - 1 entries")
-    if len(box_dim) != rank:
-        raise ValueError("TensorMap box_dim must have rank entries")
-
-    elem_size = int(tensor.element_size())
-    encode_tensormap = tvm.get_global_func("runtime.cuTensorMapEncodeTiled")
-    desc = mega_moe._AlignedTensorMap()
-    encode_tensormap(
-        desc.ptr,
-        mega_moe._torch_dtype_to_tvm_dtype(tensor),
-        rank,
-        ctypes.c_void_p(int(tensor.data_ptr())),
-        *[int(v) for v in global_shape],
-        *[int(v * elem_size) for v in global_strides],
-        *[int(v) for v in box_dim],
-        *([1] * rank),
-        mega_moe._CUDA_TENSOR_MAP_INTERLEAVE_NONE,
-        mega_moe._tensor_map_swizzle_from_mode(swizzle_mode),
-        mega_moe._CUDA_TENSOR_MAP_L2_PROMOTION_L2_256B,
-        mega_moe._CUDA_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
-    )
-    return desc
-
-
 def _build_tirx_tensor_maps(case: dict[str, Any]) -> dict[str, Any]:
     import tvm
     from tirx_kernels.deepgemm.mega_moe import _encode_tma_2d_desc
