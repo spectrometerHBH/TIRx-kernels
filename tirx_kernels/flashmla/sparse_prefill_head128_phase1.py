@@ -38,22 +38,13 @@ BF16_BYTES = 2
 D_TQ = 384
 NUM_TQ_TILES = D_TQ // 64
 Q_FULL_DESC_SDO = 64
-SQ_DESC_SDO = 64
-K_DESC_SDO = 64
 K_MAJOR_SWIZZLED_DESC_LDO = 1
-S_DESC_LDO = 64
-S_DESC_SDO = 8
-V_DESC_LDO = 1024
-V_DESC_SDO = 64
-O_DESC_SDO = 64
 P_TMEM_ELEMENTS = B_TOPK // 2
 B_EPI = 64
 WG1_NUM_WARPS = 4
 WG1_NUM_LOCAL_ROWS_PER_WARP = (B_TOPK // 2) // 4 // WG1_NUM_WARPS
 WG2_NUM_WARPS = 4
 WG2_NUM_LOCAL_ROWS_PER_PART = (B_TOPK // 2) // 4 // WG2_NUM_WARPS
-
-_IMPLEMENTATION_COMPLETE = True
 
 
 @dataclass(frozen=True)
@@ -273,45 +264,6 @@ def _reference_sparse_prefill(
         ref_max_logits[s_q_idx] = max_logits
         ref_lse[s_q_idx] = max_logits + torch.log(denom)
     return ref_out.to(torch.bfloat16), ref_max_logits, ref_lse
-
-
-def _encode_tma_desc(
-    *,
-    tensor: torch.Tensor,
-    global_shape: tuple[int, ...],
-    global_strides: tuple[int, ...],
-    box_dim: tuple[int, ...],
-    swizzle_mode: int,
-) -> Any:
-    import ctypes
-
-    import tvm
-    from tirx_kernels.deepgemm import mega_moe
-
-    rank = len(global_shape)
-    if len(global_strides) != rank - 1:
-        raise ValueError("TensorMap global_strides must have rank - 1 entries")
-    if len(box_dim) != rank:
-        raise ValueError("TensorMap box_dim must have rank entries")
-
-    elem_size = int(tensor.element_size())
-    encode_tensormap = tvm.get_global_func("runtime.cuTensorMapEncodeTiled")
-    desc = mega_moe._AlignedTensorMap()
-    encode_tensormap(
-        desc.ptr,
-        mega_moe._torch_dtype_to_tvm_dtype(tensor),
-        rank,
-        ctypes.c_void_p(int(tensor.data_ptr())),
-        *[int(v) for v in global_shape],
-        *[int(v * elem_size) for v in global_strides],
-        *[int(v) for v in box_dim],
-        *([1] * rank),
-        mega_moe._CUDA_TENSOR_MAP_INTERLEAVE_NONE,
-        mega_moe._tensor_map_swizzle_from_mode(swizzle_mode),
-        mega_moe._CUDA_TENSOR_MAP_L2_PROMOTION_L2_256B,
-        mega_moe._CUDA_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
-    )
-    return desc
 
 
 def _build_tirx_tensor_maps(case: dict[str, Any]) -> dict[str, Any]:
@@ -625,7 +577,6 @@ def _kernel(
     o_smem = pool.alloc_mma((B_H // 2, D_V), "bfloat16")
     pool.move_base_to(u_base + shared_u_elems * BF16_BYTES)
     s_smem = pool.alloc(((B_H // 2) * B_TOPK,), "bfloat16")
-    p_smem = pool.alloc(((B_H // 2) * B_TOPK,), "float32")
     is_k_valid = pool.alloc((NUM_BUFS, B_TOPK // 8), "int8")
     bar_prologue_q = TMABar(pool, 1)
     bar_prologue_utccp = TCGen05Bar(pool, 1)
@@ -1608,8 +1559,6 @@ def get_kernel(**kwargs: Any):
 
 
 def run_test(**kwargs: Any) -> None:
-    if not _IMPLEMENTATION_COMPLETE:
-        raise SkipTest("sparse FlashMLA head128 phase1 transcription is not complete")
     if not torch.cuda.is_available():
         raise SkipTest("CUDA is required for sparse FlashMLA head128 phase1")
 
@@ -1636,8 +1585,6 @@ def run_bench(
 ) -> dict[str, Any]:
     _rounds = kwargs.pop("rounds", 1)
     _round_cooldown_s = kwargs.pop("round_cooldown_s", 1.0)
-    if not _IMPLEMENTATION_COMPLETE:
-        raise SkipTest("sparse FlashMLA head128 phase1 transcription is not complete")
     if not torch.cuda.is_available():
         raise SkipTest("CUDA is required for sparse FlashMLA head128 phase1 benchmark")
 

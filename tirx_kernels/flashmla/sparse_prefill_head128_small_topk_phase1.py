@@ -9,7 +9,6 @@ import torch
 
 from tirx_kernels.flashmla.sparse_prefill_head128_phase1 import (
     _canonical_warp_idx_sync,
-    _encode_tma_desc,
     _fdividef,
     _ldg_f32_at,
     _ldg_i32_at,
@@ -47,25 +46,15 @@ TMEM_COL_P = 384
 
 BF16_BYTES = 2
 B_EPI = 64
-P_TMEM_ELEMENTS = B_TOPK // 2
 K_MAJOR_SWIZZLED_DESC_LDO = 1
 Q_DESC_SDO = 64
-K_DESC_SDO = 64
-S_DESC_LDO = 64
-S_DESC_SDO = 8
-V_DESC_LDO = 512
-V_DESC_SDO = 64
 
 NAMED_BARRIER_WG0_SYNC = 0
 NAMED_BARRIER_WG2_SYNC = 1
 NAMED_BARRIER_WG2_WARP02_SYNC = 2
-NAMED_BARRIER_WG2_WARP13_SYNC = 3
 
-WG1_NUM_WARPS = 4
 WG1_ROWS_PER_WARP = B_TOPK // 4
 WG3_NUM_ELEMS_PER_THREAD = B_TOPK // 2
-
-_IMPLEMENTATION_COMPLETE = True
 
 
 @dataclass(frozen=True)
@@ -262,15 +251,22 @@ def _reference_sparse_prefill(
 
 
 def _build_tirx_tensor_maps(case: dict[str, Any]) -> dict[str, Any]:
+    import tvm
+    from tirx_kernels.deepgemm.mega_moe import _encode_tma_2d_desc
+
     cfg: SparseFlashMLAPrefillHead128SmallTopKConfig = case["config"]
     kv = case["kv"]
+    encode_tensormap = tvm.get_global_func("runtime.cuTensorMapEncodeTiled")
 
     return {
-        "tensor_map_kv": _encode_tma_desc(
+        "tensor_map_kv": _encode_tma_2d_desc(
+            encode_tensormap=encode_tensormap,
             tensor=kv,
-            global_shape=(cfg.d_qk, cfg.s_kv),
-            global_strides=(int(kv.stride(0)),),
-            box_dim=(64, 1),
+            gmem_inner_dim=cfg.d_qk,
+            gmem_outer_dim=cfg.s_kv,
+            smem_inner_dim=64,
+            smem_outer_dim=1,
+            gmem_outer_stride=int(kv.stride(0)),
             swizzle_mode=128,
         )
     }
@@ -1609,8 +1605,6 @@ def get_kernel(**kwargs: Any):
 
 
 def run_test(**kwargs: Any) -> None:
-    if not _IMPLEMENTATION_COMPLETE:
-        raise SkipTest("sparse FlashMLA head128 small-topk phase1 transcription is not complete")
     if not torch.cuda.is_available():
         raise SkipTest("CUDA is required for sparse FlashMLA head128 small-topk phase1")
 
@@ -1637,8 +1631,6 @@ def run_bench(
 ) -> dict[str, Any]:
     _rounds = kwargs.pop("rounds", 1)
     _round_cooldown_s = kwargs.pop("round_cooldown_s", 1.0)
-    if not _IMPLEMENTATION_COMPLETE:
-        raise SkipTest("sparse FlashMLA head128 small-topk phase1 transcription is not complete")
     if not torch.cuda.is_available():
         raise SkipTest("CUDA is required for sparse FlashMLA head128 small-topk phase1 benchmark")
 

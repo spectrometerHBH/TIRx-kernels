@@ -17,7 +17,6 @@ B_H = 64
 B_TOPK = 64
 D_V = 512
 NUM_BUFS = 3
-NUM_THREADS = 384
 MAX_INIT_VAL = -1.0e30
 LOG_2_E = math.log2(math.e)
 LN_2 = math.log(2.0)
@@ -40,23 +39,14 @@ SHARED_U_BYTES = (B_TOPK * 64 + 2 * B_TOPK * D_V + B_H * D_V) * BF16_BYTES
 K_ROPE_BYTES = B_TOPK * Q_ROPE_DIM * BF16_BYTES
 K_NOPE_OFFSET_BYTES = K_ROPE_BYTES
 Q_NOPE_OFFSET_BYTES = (B_TOPK * 64 + 2 * B_TOPK * D_V) * BF16_BYTES
-Q_NOPE_TMA_BYTES = B_H * D_V * BF16_BYTES
 # tcgen05 shared-memory descriptors store stride fields in uint128_t units;
 # these values match CuTe make_umma_desc<UMMA::Major::K> for the source layouts.
 K_MAJOR_SWIZZLED_DESC_LDO = 1
 Q_NOPE_DESC_SDO = 64
-Q_ROPE_TMA_BYTES = B_H * Q_ROPE_DIM * BF16_BYTES
 Q_ROPE_DESC_SDO = 32
-S_DESC_LDO = 64
-S_DESC_SDO = 8
-V_DESC_LDO = 512
-V_DESC_SDO = 64
-P_EXCHANGE_BYTES = 4 * 32 * (B_TOPK // 2) * 4
 S_Q_ROPE_BYTES = B_H * B_TOPK * BF16_BYTES
 WG1_NUM_WARPS = 4
 WG1_NUM_LOCAL_ROWS_PER_WARP = (B_TOPK // 4) // WG1_NUM_WARPS
-
-_IMPLEMENTATION_COMPLETE = True
 
 
 @dataclass(frozen=True)
