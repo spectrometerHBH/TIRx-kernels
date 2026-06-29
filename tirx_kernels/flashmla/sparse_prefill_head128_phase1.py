@@ -616,22 +616,14 @@ def _kernel(
                 bar_sv_done.wait(prev_buf, prev_phase)
 
             for s_store_i in T.unroll(P_TMEM_ELEMENTS // 8):
-                s_store_offset: T.let = (
+                s_store_offset = (
                     (idx_in_warpgroup % 64) * 8
                     + (idx_in_warpgroup // 64) * ((B_H // 2) * (B_TOPK // 2))
                     + s_store_i * (B_H // 2) * 8
                 )
-                T.evaluate(
-                    T.ptx.st(
-                        s_smem.ptr_to([s_store_offset]),
-                        s_pack[s_store_i * 4],
-                        s_pack[s_store_i * 4 + 1],
-                        s_pack[s_store_i * 4 + 2],
-                        s_pack[s_store_i * 4 + 3],
-                        space="shared",
-                        ptx_type="u32",
-                        vec="v4",
-                    )
+                Tx.copy(
+                    s_smem.view("uint32")[s_store_offset // 2 : s_store_offset // 2 + 4],
+                    s_pack[s_store_i * 4 : s_store_i * 4 + 4],
                 )
 
             if (k > 0) & should_scale_o:
@@ -731,18 +723,12 @@ def _kernel(
                     o_epi_bf16[o_j] = T.cuda.float22bfloat162_rn(
                         T.cuda.float2_x(o_epi_pair), T.cuda.float2_y(o_epi_pair)
                     )
-                o_base_col: T.let = (idx_in_warpgroup // 64) * (D_V // 2) + epi_k * B_EPI + o_i * 8
-                T.evaluate(
-                    T.ptx.st(
-                        o_smem.ptr_to([idx_in_warpgroup % 64, o_base_col]),
-                        o_epi_bf16[0],
-                        o_epi_bf16[1],
-                        o_epi_bf16[2],
-                        o_epi_bf16[3],
-                        space="shared",
-                        ptx_type="u32",
-                        vec="v4",
-                    )
+                o_base_col = (idx_in_warpgroup // 64) * (D_V // 2) + epi_k * B_EPI + o_i * 8
+                Tx.copy(
+                    o_smem.view("uint32")[
+                        idx_in_warpgroup % 64, o_base_col // 2 : o_base_col // 2 + 4
+                    ],
+                    o_epi_bf16[:],
                 )
 
             T.ptx.fence.proxy_async("shared::cta")

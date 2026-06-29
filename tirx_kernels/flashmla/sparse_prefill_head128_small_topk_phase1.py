@@ -573,18 +573,13 @@ def _kernel(
                         o_epi_bf16[o_j] = T.cuda.float22bfloat162_rn(
                             T.cuda.float2_x(o_scaled_pair), T.cuda.float2_y(o_scaled_pair)
                         )
-                    o_base_col: T.let = (idx_in_warpgroup // 64) * (D_V // 2) + epi_k * B_EPI
-                    T.evaluate(
-                        T.ptx.st(
-                            q_smem.ptr_to([idx_in_warpgroup % 64, o_base_col + o_i * 8]),
-                            o_epi_bf16[0],
-                            o_epi_bf16[1],
-                            o_epi_bf16[2],
-                            o_epi_bf16[3],
-                            space="shared",
-                            ptx_type="u32",
-                            vec="v4",
-                        )
+                    o_base_col = (idx_in_warpgroup // 64) * (D_V // 2) + epi_k * B_EPI
+                    q_smem_col = o_base_col + o_i * 8
+                    Tx.copy(
+                        q_smem.view("uint32")[
+                            idx_in_warpgroup % 64, q_smem_col // 2 : q_smem_col // 2 + 4
+                        ],
+                        o_epi_bf16[:],
                     )
 
             T.ptx.fence.proxy_async("shared::cta")
@@ -1107,32 +1102,18 @@ def _kernel(
                     p[p_i] = T.if_then_else(invalid_p_predicate, T.uint32(0xFF800000), p[p_i])
 
                 for exchange_i in T.unroll(WG3_NUM_ELEMS_PER_THREAD // 4):
-                    exchange_offset: T.let = exchange_i * 32 * 4 + lane_idx * 4
-                    T.evaluate(
-                        T.ptx.st(
-                            p_exchange.ptr_to([local_warp_idx ^ 2, exchange_offset]),
-                            p_peer[exchange_i * 4 + 0],
-                            p_peer[exchange_i * 4 + 1],
-                            p_peer[exchange_i * 4 + 2],
-                            p_peer[exchange_i * 4 + 3],
-                            space="shared",
-                            ptx_type="u32",
-                            vec="v4",
-                        )
+                    exchange_offset = exchange_i * 32 * 4 + lane_idx * 4
+                    Tx.copy(
+                        p_exchange[local_warp_idx ^ 2, exchange_offset : exchange_offset + 4],
+                        p_peer[exchange_i * 4 : exchange_i * 4 + 4],
                     )
                 T.ptx.bar.sync(NAMED_BARRIER_WG2_WARP02_SYNC + (local_warp_idx & 1), 64)
                 for exchange_i in T.unroll(WG3_NUM_ELEMS_PER_THREAD // 4):
-                    exchange_offset: T.let = exchange_i * 32 * 4 + lane_idx * 4
+                    exchange_offset = exchange_i * 32 * 4 + lane_idx * 4
                     p_exchange_tmp = T.alloc_local((4,), "uint32")
-                    T.evaluate(
-                        T.ptx.ld(
-                            p_exchange.ptr_to([local_warp_idx, exchange_offset]),
-                            "uint32",
-                            "u32",
-                            dst=p_exchange_tmp.ptr_to([0]),
-                            space="shared",
-                            vec="v4",
-                        )
+                    Tx.copy(
+                        p_exchange_tmp[:],
+                        p_exchange[local_warp_idx, exchange_offset : exchange_offset + 4],
                     )
                     p_pair0: T.let = T.cuda.make_float2(
                         T.cuda.uint_as_float(p[exchange_i * 4]),
@@ -1206,18 +1187,10 @@ def _kernel(
 
                 bar_SV_done.wait(0, (wg3_rs & 1) ^ 1)
                 for s_store_i in T.unroll(WG3_NUM_ELEMS_PER_THREAD // 8):
-                    s_store_offset: T.let = s_smem_base + s_store_i * 8 * (B_H // 2)
-                    T.evaluate(
-                        T.ptx.st(
-                            s_smem.ptr_to([s_store_offset]),
-                            s_pack[s_store_i * 4 + 0],
-                            s_pack[s_store_i * 4 + 1],
-                            s_pack[s_store_i * 4 + 2],
-                            s_pack[s_store_i * 4 + 3],
-                            space="shared",
-                            ptx_type="u32",
-                            vec="v4",
-                        )
+                    s_store_offset = s_smem_base + s_store_i * 8 * (B_H // 2)
+                    Tx.copy(
+                        s_smem.view("uint32")[s_store_offset // 2 : s_store_offset // 2 + 4],
+                        s_pack[s_store_i * 4 : s_store_i * 4 + 4],
                     )
 
                 if (k > 0) & should_scale_o:
