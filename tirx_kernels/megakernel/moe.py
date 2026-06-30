@@ -1170,42 +1170,6 @@ def _compute_reference_routing(ref_case, mk: MegaKernelMOE):
     )
 
 
-def _build_sglang_fused_reference(batch_size: int, mk: MegaKernelMOE):
-    try:
-        import importlib
-
-        triton_compiler = importlib.import_module("triton.compiler.compiler")
-        if not hasattr(triton_compiler, "triton_key"):
-            triton_key = triton_compiler.get_cache_key.__globals__.get("triton_key")
-            if triton_key is not None:
-                triton_compiler.triton_key = triton_key
-        from sglang.srt.layers.moe import MoeRunnerConfig
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe as fused_moe_triton
-        from sglang.srt.layers.moe.topk import StandardTopKOutput
-    except (ImportError, AttributeError) as err:
-        raise RuntimeError(f"sglang fused MoE reference is unavailable: {err}") from err
-
-    def run(case):
-        ref_case = _ensure_reference_cuda_case(case, mk)
-        gating_output, topk_weights, topk_indices = _compute_reference_routing(ref_case, mk)
-        topk_output = StandardTopKOutput(
-            topk_weights=topk_weights, topk_ids=topk_indices, router_logits=gating_output
-        )
-        moe_config = MoeRunnerConfig(inplace=False)
-        # SGLang expects the first MoE weight in up/gate order.
-        out = fused_moe_triton(
-            ref_case["hidden_state"],
-            ref_case["grp_up_gate_weight"],
-            ref_case["grp_down_weight"],
-            topk_output,
-            moe_config,
-        )
-        ref_case["sglang_fused_output"] = out
-        return out
-
-    return run
-
-
 def _build_flashinfer_cutlass_reference(batch_size: int, mk: MegaKernelMOE):
     try:
         import os
@@ -1403,8 +1367,7 @@ def run_bench(
         timer=timer,
         proton_name=f"megakernel_moe_{scheduler}",
         references={
-            "sglang_fused": lambda: _build_sglang_fused_reference(batch_size, mk),
-            "flashinfer_cutlass": lambda: _build_flashinfer_cutlass_reference(batch_size, mk),
+            "flashinfer_cutlass": lambda: _build_flashinfer_cutlass_reference(batch_size, mk)
         },
         rounds=rounds,
         round_cooldown_s=round_cooldown_s,
