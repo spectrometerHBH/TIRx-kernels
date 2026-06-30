@@ -29,6 +29,7 @@ from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.bench import CudaProfiler
 from tvm.tirx.layout import S, TCol, TileLayout, TLane
+from tvm.tirx.layout import tid_in_wg as axis_tid_in_wg
 from tvm.tirx.operator.tile_primitive_dispatch.cuda.tma_utils import SwizzleMode, mma_shared_layout
 
 
@@ -265,7 +266,11 @@ class GemmTile(Tile):
                     T.ptx.cp_async.bulk.wait_group(self.TMEM_PIPE_DEPTH - 1)
                 T.cuda.warpgroup_sync(10)
             for ki in T.unroll(self.EPI_TILE // self.TMEM_LD_SIZE):
-                reg_wg = T.wg_reg_tile(self.TMEM_LD_SIZE)
+                reg_wg = self.reg.view(
+                    128,
+                    self.TMEM_LD_SIZE,
+                    layout=TileLayout(S[(128, self.TMEM_LD_SIZE) : (1 @ axis_tid_in_wg, 1)]),
+                )
                 col_st = T.meta_var(
                     self.tmem_idx * self.M_pad_size + ko * self.EPI_TILE + ki * self.TMEM_LD_SIZE
                 )
@@ -273,7 +278,11 @@ class GemmTile(Tile):
                 T.ptx.tcgen05.wait.ld()
                 st = T.meta_var(ki * self.TMEM_LD_SIZE)
                 if self.out_type == "float16":
-                    reg_wg_fp16 = T.wg_reg_tile(self.TMEM_LD_SIZE, dtype=self.out_type)
+                    reg_wg_fp16 = self.reg_fp16.view(
+                        128,
+                        self.TMEM_LD_SIZE,
+                        layout=TileLayout(S[(128, self.TMEM_LD_SIZE) : (1 @ axis_tid_in_wg, 1)]),
+                    )
                     Tx.wg.cast(reg_wg_fp16, reg_wg)
                     Tx.wg.copy(
                         self.output_smem[self.stage, st : st + self.TMEM_LD_SIZE, 0:128],

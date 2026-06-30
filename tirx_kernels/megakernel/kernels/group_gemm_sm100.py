@@ -21,6 +21,8 @@ from tirx_kernels.megakernel.utils.config import F16_BYTES, F32_BYTES, KernelCon
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.bench import CudaProfiler
+from tvm.tirx.layout import S, TileLayout
+from tvm.tirx.layout import tid_in_wg as axis_tid_in_wg
 
 from .gate_up_silu import GateUpSiluTile
 from .gemm import GemmTile
@@ -129,12 +131,13 @@ class GroupGEMMTile(GemmTile):
             token_linear[0] = T.min(T.max(val, 0), self.numel - 1)
             stage_valid = stage_k + col + vec_len <= self.K
             if stage_valid:
-                Tx.thread.copy(
+                Tx.thread.copy_async(
                     self.A_smem[ks, row, col : col + vec_len],
                     A[
                         (token_linear[0] if self.acc_output else token_linear[0] // self.top_k),
                         stage_k + col : stage_k + col + vec_len,
                     ],
+                    dispatch="non-bulk-copy",
                     vec_len=vec_len,
                 )
             else:
@@ -282,7 +285,11 @@ class GroupGEMMTile(GemmTile):
                 ) % self.TMEM_PIPE_DEPTH
                 # tmem -> rf (ld) -> smem
                 for ki in T.unroll(self.EPI_TILE // self.TMEM_LD_SIZE):
-                    reg_wg = T.wg_reg_tile(self.TMEM_LD_SIZE)
+                    reg_wg = self.reg.view(
+                        128,
+                        self.TMEM_LD_SIZE,
+                        layout=TileLayout(S[(128, self.TMEM_LD_SIZE) : (1 @ axis_tid_in_wg, 1)]),
+                    )
                     col_st = T.meta_var(
                         self.tmem_idx * self.M_pad_size
                         + ko * self.EPI_TILE

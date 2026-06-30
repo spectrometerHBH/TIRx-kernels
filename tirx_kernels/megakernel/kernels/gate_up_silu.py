@@ -20,6 +20,8 @@ from tirx_kernels.megakernel.utils.utils import silu
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.bench import CudaProfiler
+from tvm.tirx.layout import S, TileLayout
+from tvm.tirx.layout import tid_in_wg as axis_tid_in_wg
 
 from .gemm import GemmTile
 
@@ -98,8 +100,12 @@ class GateUpSiluTile(GemmTile):
                     T.ptx.cp_async.bulk.wait_group(self.TMEM_PIPE_DEPTH - 1)
                 T.cuda.warpgroup_sync(10)
             for ki in T.unroll(self.EPI_TILE // self.TMEM_LD_SIZE):
-                reg_wg = T.wg_reg_tile(self.TMEM_LD_SIZE)
-                reg = reg_wg.local()
+                reg_wg = self.reg.view(
+                    128,
+                    self.TMEM_LD_SIZE,
+                    layout=TileLayout(S[(128, self.TMEM_LD_SIZE) : (1 @ axis_tid_in_wg, 1)]),
+                )
+                reg = self.reg
                 col_st = T.meta_var(
                     self.tmem_idx * self.M_pad_size + ko * self.EPI_TILE + ki * self.TMEM_LD_SIZE
                 )

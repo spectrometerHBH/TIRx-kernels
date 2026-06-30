@@ -218,14 +218,24 @@ class CountAndSortExpertTokens(Tile):
         col_idx[0] = tid * self.VEC_SIZE
         for i in T.unroll(self.PIPE_DEPTH - 1):
             if idx[0] < self.numel and col_idx[0] < self.hidden_size:
-                Tx.thread.copy(self.fetched_data[i, tid, :], data[idx[0] // self.topk, col_idx[0]:col_idx[0] + self.VEC_SIZE], vec_len=self.VEC_SIZE)
+                Tx.thread.copy_async(
+                    self.fetched_data[i, tid, :],
+                    data[idx[0] // self.topk, col_idx[0] : col_idx[0] + self.VEC_SIZE],
+                    dispatch="non-bulk-copy",
+                    vec_len=self.VEC_SIZE,
+                )
             T.ptx.cp_async.commit_group()
             idx[0] += KernelConfig.SM_NUMBER
         cnt[0] = 0
         while idx[0] < self.numel + (self.PIPE_DEPTH - 1) * KernelConfig.SM_NUMBER:
             if idx[0] < self.numel and col_idx[0] < self.hidden_size:
                 cp_pipe_idx = T.meta_var((idx[0] // KernelConfig.SM_NUMBER) % self.PIPE_DEPTH)
-                Tx.thread.copy(self.fetched_data[cp_pipe_idx, tid, :], data[idx[0] // self.topk, col_idx[0]:col_idx[0] + self.VEC_SIZE], vec_len=self.VEC_SIZE)
+                Tx.thread.copy_async(
+                    self.fetched_data[cp_pipe_idx, tid, :],
+                    data[idx[0] // self.topk, col_idx[0] : col_idx[0] + self.VEC_SIZE],
+                    dispatch="non-bulk-copy",
+                    vec_len=self.VEC_SIZE,
+                )
             T.ptx.cp_async.commit_group()
             T.ptx.cp_async.wait_group(self.PIPE_DEPTH - 1)
             rank_post_pad: T.let = self.s_rank_post_pad[cnt[0]]
