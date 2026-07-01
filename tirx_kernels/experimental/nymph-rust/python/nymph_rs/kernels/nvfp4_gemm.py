@@ -325,7 +325,18 @@ GEMM_CONFIGS = {
     # l2_group_size=2 was the peak under the OLD data-asymmetric bench; under the fair bench the
     # canon-matching 4-row band benches ~0.991 vs 2's ~0.987). + canon's dynamic SMEM pool
     # (smem_pool) and evict_normal load hint. Keeps smem_depth=5 (depth 4 was 0.989).
-    (2048, 2048, 2048): {"l2_group_size": 4, "load_cache_hint": "evict_normal", "smem_pool": True},
+    # maxnreg_epilogue=96 — canon's INVARIANT-I1b per-role setmaxnreg on the epilogue/consumer
+    # warpgroup (same lever as 1024). ncu is unavailable on this box (counter library fails on
+    # ANY kernel), so this was picked by a nymph-vs-nymph head-to-head bench that cancels canon's
+    # DVFS noise: maxnreg96 is consistently faster than the no-cap default (median +0.33%, 16/16
+    # reps >= default, never slower); 96 vs 128 is a tie (median 1.0005), so 96 = canon's epilogue
+    # budget is the robust plateau pick. cta_n=64 and epi_tile=32 both REGRESS here (0.935 / 0.974).
+    (2048, 2048, 2048): {
+        "l2_group_size": 4,
+        "load_cache_hint": "evict_normal",
+        "smem_pool": True,
+        "maxnreg_epilogue": 96,
+    },
     # 4096: the epilogue is the wall-clock residual (ncu nymph-vs-canon at the OVERLAP
     # baseline: nymph executed 3.7% FEWER instructions yet ran 4.1% LONGER, SM throughput
     # 51.5% vs canon 57.8%, 95 vs 172 regs/thread). Canon runs OVERLAP_EPI=False + EPI_TILE=32
