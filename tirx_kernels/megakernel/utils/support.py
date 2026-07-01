@@ -63,6 +63,33 @@ def push_moe_tasks(
             central_queue.append((m_idx, n_idx, 0, JobType.MOE_GROUP_GEMM_DOWN.value))
 
 
+def push_moe_expert_tasks(
+    central_queue: list[tuple[int, int, int, int]], batch_size: int, config: dict
+):
+    """Append the static expert-only task sequence.
+
+    The input top-k weights/indices are precomputed by the caller. This matches
+    external fused-MoE primitives such as FlashInfer cutlass_fused_moe, which
+    consume routing results instead of computing router logits internally.
+    """
+    moe_blk_m = 128
+    for i in range(KernelConfig.SM_NUMBER):
+        central_queue.append((i, 0, 0, JobType.WAIT_ETENSOR_INIT.value))
+    central_queue.append((0, 0, 0, JobType.MOE_ALIGN.value))
+    for m_idx in range(KernelConfig.SM_NUMBER):
+        central_queue.append((m_idx, 0, 0, JobType.MOE_COUNT_AND_SORT.value))
+
+    max_num_tokens_padded = get_max_num_tokens_padded(
+        batch_size, config["NUM_EXPERTS_PER_TOK"], config["NUM_EXPERTS"], moe_blk_m
+    )
+    for m_idx in range(max_num_tokens_padded // moe_blk_m):
+        for n_idx in range(config["INTERMEDIATE_SIZE"] * 2 // GroupGEMMTileSM100.BLK_N):
+            central_queue.append((m_idx, n_idx, 0, JobType.MOE_GROUP_GEMM_GATE_UP_SILU.value))
+    for m_idx in range(max_num_tokens_padded // moe_blk_m):
+        for n_idx in range(config["HIDDEN_SIZE"] // GroupGEMMTileSM100.BLK_N):
+            central_queue.append((m_idx, n_idx, 0, JobType.MOE_GROUP_GEMM_DOWN.value))
+
+
 @tvm_ffi.register_global_func("tirx.megakernel.get_max_num_tokens_padded")
 def get_max_num_tokens_padded(batch_size, topk, num_experts, moe_blk_m):
     if isinstance(batch_size, int):
@@ -81,16 +108,22 @@ def get_max_blocks_padded_relaxed(batch_size, topk, num_experts, moe_blk_m):
 
 
 def generate_exec_queue_moe(
-    batch_size: int, config: dict, etensor_num: int, scheduler: Literal["static", "dynamic"]
+    batch_size: int,
+    config: dict,
+    etensor_num: int,
+    scheduler: Literal["static", "dynamic", "expert"],
 ):
-    if scheduler == "static":
+    if scheduler in ("static", "expert"):
         exec_queue = np.zeros(
             (KernelConfig.SM_NUMBER, StaticTileScheduler.MAX_TASKS), dtype=np.int32
         )
         central_queue = []
         for i in range(etensor_num):
             central_queue.append((i, 0, 0, JobType.INIT_ETENSOR.value))
-        push_moe_tasks(central_queue, batch_size, config, insert_wait_etensor_init=True)
+        if scheduler == "expert":
+            push_moe_expert_tasks(central_queue, batch_size, config)
+        else:
+            push_moe_tasks(central_queue, batch_size, config, insert_wait_etensor_init=True)
 
         tile_idx = 0
         while central_queue:

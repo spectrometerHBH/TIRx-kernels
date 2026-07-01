@@ -48,13 +48,18 @@ from tirx_kernels.megakernel.utils.support import (
     get_max_num_tokens_padded,
 )
 from tirx_kernels.megakernel.utils.utils import ceildiv, f_init_const, get_source
+from tvm.script import ir as I
 from tvm.script import tirx as Tx
 
 # TODO: fix abnormal slowness of batch-attn on the first tile
 
 KERNEL_META = {"name": "megakernel_moe", "category": "megakernel", "compute_capability": 10}
 
-_SUPPORTED_SCHEDULERS = ("static", "dynamic", "unfused")
+_FULL_MOE_SCHEDULERS = ("static", "dynamic", "unfused")
+_EXPERT_ONLY_SCHEDULERS = ("expert", "expert_unfused")
+_SUPPORTED_SCHEDULERS = (*_FULL_MOE_SCHEDULERS, *_EXPERT_ONLY_SCHEDULERS)
+_STATIC_QUEUE_SCHEDULERS = ("static", "unfused", *_EXPERT_ONLY_SCHEDULERS)
+_TEST_SCHEDULERS = (*_FULL_MOE_SCHEDULERS, *_EXPERT_ONLY_SCHEDULERS)
 _TEST_BATCH_SIZES = (1, 128)
 _BENCH_BATCH_SIZES = (1, 8, 32, 128, 512, 1024, 2048, 4096)
 
@@ -66,7 +71,7 @@ CONFIGS = [
         "world_size": 1,
     }
     for batch_size in _TEST_BATCH_SIZES
-    for scheduler in _SUPPORTED_SCHEDULERS
+    for scheduler in _TEST_SCHEDULERS
 ]
 
 BENCH_CONFIGS = [
@@ -163,6 +168,7 @@ class MegaKernelMOE(MegaKernelWrapper):
         Semaphore: type[static_scheduler.Semaphore | dynamic_scheduler.Semaphore],
         etensor_workspace_global,
         unfused=False,
+        precomputed_topk=False,
     ):
         self.evt_gating = self.add_etensor(
             Semaphore,
@@ -176,7 +182,7 @@ class MegaKernelMOE(MegaKernelWrapper):
             Semaphore,
             etensor_workspace_global,
             shape=[1],
-            f_init=f_init_const(KernelConfig.SM_NUMBER),
+            f_init=f_init_const(0 if precomputed_topk else KernelConfig.SM_NUMBER),
         )
         self.evt_moe_align = self.add_etensor(
             Semaphore, etensor_workspace_global, shape=[1], f_init=f_init_const(1)
@@ -234,8 +240,15 @@ class MegaKernelMOE(MegaKernelWrapper):
         Semaphore: type[static_scheduler.Semaphore | dynamic_scheduler.Semaphore],
         etensor_workspace_global,
         unfused=False,
+        precomputed_topk=False,
     ):
-        self._set_events(batch_size, Semaphore, etensor_workspace_global, unfused=unfused)
+        self._set_events(
+            batch_size,
+            Semaphore,
+            etensor_workspace_global,
+            unfused=unfused,
+            precomputed_topk=precomputed_topk,
+        )
         self.set_events_complete(is_dynamic_sch, Semaphore, etensor_workspace_global)
         self.num_etensors[is_dynamic_sch] = len(self.etensor_and_f_init_pairs)
 
@@ -546,6 +559,7 @@ class MegaKernelMOE(MegaKernelWrapper):
         down_proj_task_size, # to amortize dynamic scheduling overhead
         low_batch,
         unfused,
+        precomputed_topk,
         is_dynamic_sch,
         Semaphore: type[static_scheduler.Semaphore | dynamic_scheduler.Semaphore],
         Scheduler: type[static_scheduler.StaticTileScheduler | dynamic_scheduler.DynamicTileScheduler],
@@ -573,7 +587,14 @@ class MegaKernelMOE(MegaKernelWrapper):
             self.class_init_all(self.smem_manager)
 
             # initialize event tensors
-            self.set_events(is_dynamic_sch, batch_size, Semaphore, etensor_workspace_global, unfused)
+            self.set_events(
+                is_dynamic_sch,
+                batch_size,
+                Semaphore,
+                etensor_workspace_global,
+                unfused,
+                precomputed_topk,
+            )
 
             # initialize tile scheduler and smem_manager
             if not is_dynamic_sch:
@@ -613,7 +634,7 @@ class MegaKernelMOE(MegaKernelWrapper):
 
     # FIXME: change offset_factor to 0 can make performance better
     #       but it requires change on engine side
-    def get_func_static(self, unfused=False):
+    def get_func_static(self, unfused=False, precomputed_topk=False):
         compile_batch_size = getattr(self, "_compile_batch_size", 1)
 
         # fmt: off
@@ -699,7 +720,7 @@ class MegaKernelMOE(MegaKernelWrapper):
                     cumsum_buffer_global, reordered_hidden_state_global, gate_up_output_global, silu_mul_output_global, topk_reduce_output_global,
                     etensor_workspace_global,
                     profiler_buffer, exec_queue, None, None, None, 1, low_batch, unfused,
-                    False, static_scheduler.Semaphore, static_scheduler.StaticTileScheduler
+                    precomputed_topk, False, static_scheduler.Semaphore, static_scheduler.StaticTileScheduler
                 )
 
             if compile_batch_size >= 2048:
@@ -801,7 +822,7 @@ class MegaKernelMOE(MegaKernelWrapper):
                     cumsum_buffer_global, reordered_hidden_state_global, gate_up_output_global, silu_mul_output_global, topk_reduce_output_global,
                     etensor_workspace_global,
                     profiler_buffer, None, queue_tasks_global, queue_head_global, queue_tail_global, down_proj_task_size, low_batch, False,
-                    True, dynamic_scheduler.Semaphore, dynamic_scheduler.DynamicTileScheduler
+                    False, True, dynamic_scheduler.Semaphore, dynamic_scheduler.DynamicTileScheduler
                 )
 
             if compile_batch_size >= 2048:
@@ -814,6 +835,23 @@ class MegaKernelMOE(MegaKernelWrapper):
                 run(low_batch=True, dynamic_gemm_size=False, down_proj_task_size=1)
             # fmt: on
         return main
+
+    def get_module(self, scheduler: str):
+        if scheduler not in _EXPERT_ONLY_SCHEDULERS:
+            return super().get_module(scheduler)
+
+        @I.ir_module(tirx=True)
+        class Module:
+            @Tx.prim_func(tirx=True)
+            def main():
+                pass
+
+        module: tvm.IRModule = Module
+        module.update_func(
+            module.get_global_var("main"),
+            self.get_func_static(unfused=scheduler == "expert_unfused", precomputed_topk=True),
+        )
+        return module
 
 
 arg_dict = {}
@@ -932,6 +970,28 @@ def _check_scheduler(scheduler: str):
         )
 
 
+def _is_expert_scheduler(scheduler: str) -> bool:
+    return scheduler in _EXPERT_ONLY_SCHEDULERS
+
+
+def _needs_unfused_reference(scheduler: str) -> bool:
+    return scheduler in ("static", "dynamic")
+
+
+def _populate_precomputed_topk(data: dict[str, torch.Tensor], mk: MegaKernelMOE):
+    with torch.inference_mode():
+        hidden_state = data["hidden_state"].cuda().to(torch.float32)
+        gate_weight = data["gate_weight"].cuda().to(torch.float32)
+        gating_output = hidden_state @ gate_weight.T
+        routing_weights = torch.softmax(gating_output, dim=-1, dtype=torch.float32)
+        topk_weights, topk_indices = torch.topk(routing_weights, mk.NUM_EXPERTS_PER_TOK, dim=-1)
+
+    data["gating_output"] = gating_output.cpu()
+    data["topk_weights"] = topk_weights.to(torch.float32).cpu()
+    data["topk_indices"] = topk_indices.to(torch.int32).cpu()
+    return data
+
+
 def _compile_moe_schedulers(
     schedulers: tuple[str, ...], batch_size: int, world_size: int, profiler_on: bool
 ) -> tuple[MegaKernelMOE, dict[str, tvm.runtime.Module]]:
@@ -1011,9 +1071,10 @@ def _make_tir_case(
         case["gating_output"].append(_as_tvm_tensor(data["gating_output"], dev))
         case["topk_reduce_output"].append(_as_tvm_tensor(data["topk_reduce_output"], dev))
 
-    if scheduler in ("static", "unfused"):
+    if scheduler in _STATIC_QUEUE_SCHEDULERS:
+        queue_scheduler = "expert" if _is_expert_scheduler(scheduler) else "static"
         exec_queue = generate_exec_queue_moe(
-            batch_size, mk.config, mk.num_etensors[False], "static"
+            batch_size, mk.config, mk.num_etensors[False], queue_scheduler
         )
         case["exec_queue"] = tvm.runtime.tensor(exec_queue, dev)
     else:
@@ -1050,7 +1111,7 @@ def _make_tir_case(
         case["gating_output"][0],
         case["topk_reduce_output"][0],
     ]
-    if scheduler in ("static", "unfused"):
+    if scheduler in _STATIC_QUEUE_SCHEDULERS:
         byte_tensors.append(case["exec_queue"])
     else:
         byte_tensors.extend([case["queue_tasks"][0], case["queue_head"][0], case["queue_tail"][0]])
@@ -1067,7 +1128,7 @@ def _run_tir_case(case):
             f"({case['launch_slots']}); increase warmup/repeat slot allocation"
         )
     kernel = case["kernel"]
-    if case["scheduler"] in ("static", "unfused"):
+    if case["scheduler"] in _STATIC_QUEUE_SCHEDULERS:
         kernel(
             case["hidden_state"],
             case["residual"][idx],
@@ -1128,6 +1189,7 @@ def _ensure_reference_cuda_case(case, mk: MegaKernelMOE):
         return ref_case
 
     cpu_data = case["cpu_data"]
+    precomputed_topk = case.get("precomputed_topk", False)
     ref_case = {
         key: cpu_data[key].clone().cuda()
         for key in (
@@ -1138,6 +1200,12 @@ def _ensure_reference_cuda_case(case, mk: MegaKernelMOE):
             "grp_down_weight",
         )
     }
+    ref_case["precomputed_topk"] = precomputed_topk
+    if precomputed_topk:
+        ref_case["precomputed_topk_weights"] = cpu_data["topk_weights"].clone().cuda()
+        ref_case["precomputed_topk_indices"] = (
+            cpu_data["topk_indices"].clone().cuda().to(torch.int32)
+        )
     ref_case["baseline_topk_weights"] = torch.empty(
         (case["batch_size"], mk.NUM_EXPERTS_PER_TOK), dtype=torch.float32, device="cuda"
     )
@@ -1149,6 +1217,13 @@ def _ensure_reference_cuda_case(case, mk: MegaKernelMOE):
 
 
 def _compute_reference_routing(ref_case, mk: MegaKernelMOE):
+    if ref_case.get("precomputed_topk", False):
+        return (
+            ref_case.get("baseline_gating_output"),
+            ref_case["precomputed_topk_weights"],
+            ref_case["precomputed_topk_indices"],
+        )
+
     cached = (
         ref_case.get("baseline_gating_output"),
         ref_case.get("baseline_topk_weights"),
@@ -1195,7 +1270,7 @@ def _build_flashinfer_cutlass_reference(batch_size: int, mk: MegaKernelMOE):
             ref_case["hidden_state"],
             topk_indices,
             topk_weights,
-            ref_case["grp_gate_up_weight"],
+            ref_case["grp_up_gate_weight"],
             ref_case["grp_down_weight"],
             ref_case["hidden_state"].dtype,
             quant_scales=[],
@@ -1227,15 +1302,21 @@ def _build_flashinfer_cutlass_reference(batch_size: int, mk: MegaKernelMOE):
     return run
 
 
-def _torch_moe_reference(data: dict[str, torch.Tensor], mk: MegaKernelMOE):
+def _torch_moe_reference(
+    data: dict[str, torch.Tensor], mk: MegaKernelMOE, *, precomputed_topk: bool = False
+):
     hidden_state = data["hidden_state"].cuda().to(torch.float32)
     gate_weight = data["gate_weight"].cuda().to(torch.float32)
     gate_up_weight = data["grp_gate_up_weight"].cuda().to(torch.float32)
     down_weight = data["grp_down_weight"].cuda().to(torch.float32)
 
-    gating_output = hidden_state @ gate_weight.T
-    routing_weights = torch.softmax(gating_output, dim=-1)
-    topk_weights, topk_indices = torch.topk(routing_weights, mk.NUM_EXPERTS_PER_TOK, dim=-1)
+    if precomputed_topk:
+        topk_weights = data["topk_weights"].cuda().to(torch.float32)
+        topk_indices = data["topk_indices"].cuda().to(torch.int64)
+    else:
+        gating_output = hidden_state @ gate_weight.T
+        routing_weights = torch.softmax(gating_output, dim=-1)
+        topk_weights, topk_indices = torch.topk(routing_weights, mk.NUM_EXPERTS_PER_TOK, dim=-1)
 
     output = torch.zeros(
         (hidden_state.shape[0], mk.HIDDEN_SIZE), dtype=torch.float32, device="cuda"
@@ -1259,20 +1340,41 @@ def _validate_tir_case(case, mk: MegaKernelMOE):
     if not np.isfinite(out).all():
         raise AssertionError("MegaKernelMOE TIR output contains non-finite values")
 
-    ref = _torch_moe_reference(case["cpu_data"], mk)
+    ref = _torch_moe_reference(
+        case["cpu_data"], mk, precomputed_topk=case.get("precomputed_topk", False)
+    )
     np.testing.assert_allclose(out, ref, rtol=2e-2, atol=1e-2)
 
     reference = case.get("tir_reference")
     if reference is not None:
         ref = _run_tir_case(reference).numpy()
         np.testing.assert_allclose(out, ref, rtol=1e-3, atol=1e-2)
+    return out
+
+
+def _validate_tir_matches_flashinfer(case, mk: MegaKernelMOE, flashinfer_run):
+    out = case["tir"].get("last_output")
+    if out is None:
+        out_np = _validate_tir_case(case, mk)
+    else:
+        out_np = out.numpy()
+    ref_np = flashinfer_run(case).detach().cpu().numpy()
+    np.testing.assert_allclose(out_np, ref_np, rtol=2e-2, atol=1e-2)
+    abs_diff = np.abs(out_np.astype(np.float32) - ref_np.astype(np.float32))
+    return {
+        "allclose_rtol": 2e-2,
+        "allclose_atol": 1e-2,
+        "max_abs": float(abs_diff.max(initial=0.0)),
+        "mean_abs": float(abs_diff.mean()),
+        "numel": int(abs_diff.size),
+    }
 
 
 def run_test(batch_size: int, scheduler: str, world_size: int = 1, profiler_on: bool = False):
     _require_cuda_sm100()
     _check_scheduler(scheduler)
     compile_schedulers = [scheduler]
-    if scheduler != "unfused":
+    if _needs_unfused_reference(scheduler):
         compile_schedulers.append("unfused")
     mk, libs = _compile_moe_schedulers(
         tuple(compile_schedulers), batch_size, world_size, profiler_on
@@ -1280,9 +1382,13 @@ def run_test(batch_size: int, scheduler: str, world_size: int = 1, profiler_on: 
 
     _reset_prepare_data_cache()
     data = dict(prepare_data(batch_size, mk))
+    precomputed_topk = _is_expert_scheduler(scheduler)
+    if precomputed_topk:
+        _populate_precomputed_topk(data, mk)
     case = {
         "batch_size": batch_size,
         "cpu_data": data,
+        "precomputed_topk": precomputed_topk,
         "tir": _make_tir_case(
             batch_size=batch_size,
             mk=mk,
@@ -1292,7 +1398,7 @@ def run_test(batch_size: int, scheduler: str, world_size: int = 1, profiler_on: 
             launch_slots=2,
         ),
     }
-    if scheduler != "unfused":
+    if _needs_unfused_reference(scheduler):
         case["tir_reference"] = _make_tir_case(
             batch_size=batch_size,
             mk=mk,
@@ -1322,7 +1428,8 @@ def run_bench(
     from tvm.tirx.bench import bench, bench_impls_mode, tensor_bytes
 
     compile_schedulers = [scheduler]
-    if scheduler != "unfused" and bench_impls_mode() != "baseline":
+    precomputed_topk = _is_expert_scheduler(scheduler)
+    if _needs_unfused_reference(scheduler) and bench_impls_mode() != "baseline":
         compile_schedulers.append("unfused")
     mk, libs = _compile_moe_schedulers(
         tuple(compile_schedulers), batch_size, world_size, profiler_on
@@ -1333,7 +1440,9 @@ def run_bench(
 
     def make_input():
         data = dict(prepare_data(batch_size, mk))
-        case = {"batch_size": batch_size, "cpu_data": data}
+        if precomputed_topk:
+            _populate_precomputed_topk(data, mk)
+        case = {"batch_size": batch_size, "cpu_data": data, "precomputed_topk": precomputed_topk}
         if bench_impls_mode() != "baseline":
             case["tir"] = _make_tir_case(
                 batch_size=batch_size,
@@ -1343,7 +1452,7 @@ def run_bench(
                 data=data,
                 launch_slots=launch_slots,
             )
-            if scheduler != "unfused":
+            if _needs_unfused_reference(scheduler):
                 case["tir_reference"] = _make_tir_case(
                     batch_size=batch_size,
                     mk=mk,
@@ -1355,9 +1464,22 @@ def run_bench(
             return case, tensor_bytes(*case["tir"]["byte_tensors"])
         return case, tensor_bytes(*data.values())
 
+    reference_cache = {}
+    validation = {}
+
+    def build_flashinfer_cutlass():
+        runner = _build_flashinfer_cutlass_reference(batch_size, mk)
+        reference_cache["flashinfer_cutlass"] = runner
+        return runner
+
     def validate_case(case):
-        if bench_impls_mode() != "baseline":
+        mode = bench_impls_mode()
+        if mode != "baseline":
             _validate_tir_case(case, mk)
+        if mode == "all" and precomputed_topk and "flashinfer_cutlass" in reference_cache:
+            validation["tir_vs_flashinfer_cutlass"] = _validate_tir_matches_flashinfer(
+                case, mk, reference_cache["flashinfer_cutlass"]
+            )
 
     result = bench(
         {"tir": lambda case: _run_tir_case(case["tir"])},
@@ -1366,9 +1488,7 @@ def run_bench(
         repeat=repeat,
         timer=timer,
         proton_name=f"megakernel_moe_{scheduler}",
-        references={
-            "flashinfer_cutlass": lambda: _build_flashinfer_cutlass_reference(batch_size, mk)
-        },
+        references={"flashinfer_cutlass": build_flashinfer_cutlass},
         rounds=rounds,
         round_cooldown_s=round_cooldown_s,
         validate_case=validate_case,
@@ -1381,6 +1501,12 @@ def run_bench(
             "batch_size": batch_size,
             "world_size": world_size,
             "config": MEGAKERNEL_MOE_BENCH_CONFIG["CONFIG_NAME"],
+            "benchmark_scope": "expert_only_precomputed_topk"
+            if precomputed_topk
+            else "full_moe_router_plus_expert",
+            "flashinfer_weight_layout": "grp_up_gate_weight",
         }
     )
+    if validation:
+        result["metadata"]["validation"] = validation
     return result
