@@ -1033,45 +1033,6 @@ def _kernel(
         # cp.async data paths after the exact SMEM/TMEM views are introduced.
         if warp_idx == 8:
             if T.ptx.elect_sync():
-                desc_i_p_rope: T.uint32
-                desc_i_p_nope: T.uint32
-                desc_i_o: T.uint32
-                T.ptx.tcgen05.encode_instr_descriptor(
-                    T.address_of(desc_i_p_rope),
-                    d_dtype="float32",
-                    a_dtype="bfloat16",
-                    b_dtype="bfloat16",
-                    M=tiled_mma_p_m,
-                    N=tiled_mma_p_n,
-                    K=tiled_mma_p_k,
-                    trans_a=False,
-                    trans_b=False,
-                    n_cta_groups=1,
-                )
-                T.ptx.tcgen05.encode_instr_descriptor(
-                    T.address_of(desc_i_p_nope),
-                    d_dtype="float32",
-                    a_dtype="bfloat16",
-                    b_dtype="bfloat16",
-                    M=tiled_mma_p_m,
-                    N=tiled_mma_p_n,
-                    K=tiled_mma_p_k,
-                    trans_a=False,
-                    trans_b=False,
-                    n_cta_groups=1,
-                )
-                T.ptx.tcgen05.encode_instr_descriptor(
-                    T.address_of(desc_i_o),
-                    d_dtype="float32",
-                    a_dtype="bfloat16",
-                    b_dtype="bfloat16",
-                    M=tiled_mma_o_m,
-                    N=tiled_mma_o_n,
-                    K=tiled_mma_o_k,
-                    trans_a=False,
-                    trans_b=True,
-                    n_cta_groups=1,
-                )
                 if have_rope:
                     bar_prologue_q_rope.arrive(0, tx_count=B_H * (d_qk - D_V) * BF16_BYTES)
                     bar_prologue_q_rope.wait(0, 0)
@@ -1133,7 +1094,6 @@ def _kernel(
                                 dispatch="tcgen05",
                                 cta_group=1,
                                 smem_desc=tiled_mma_smem_desc,
-                                descI=desc_i_p_rope,
                                 warp_specialized=True,
                             )
                             bar_qk_rope_done.arrive(0)
@@ -1172,7 +1132,6 @@ def _kernel(
                                 dispatch="tcgen05",
                                 cta_group=1,
                                 smem_desc=tiled_mma_smem_desc,
-                                descI=desc_i_p_nope,
                                 warp_specialized=True,
                             )
                         bar_qk_nope_done.arrive(cur_buf)
@@ -1192,7 +1151,6 @@ def _kernel(
                             dispatch="tcgen05",
                             cta_group=1,
                             smem_desc=tiled_mma_smem_desc,
-                            descI=desc_i_o,
                             warp_specialized=True,
                         )
                         Tx.gemm_async(
@@ -1204,7 +1162,6 @@ def _kernel(
                             dispatch="tcgen05",
                             cta_group=1,
                             smem_desc=tiled_mma_smem_desc,
-                            descI=desc_i_o,
                             warp_specialized=True,
                         )
                         tiled_mma_o_accumulate[0] = T.uint32(1)

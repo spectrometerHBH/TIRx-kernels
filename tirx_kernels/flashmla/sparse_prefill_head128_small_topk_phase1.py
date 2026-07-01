@@ -738,32 +738,6 @@ def _kernel(
 
         if (warp_idx == 8) & (cta_idx == 0):
             if T.ptx.elect_sync():
-                desc_i_p: T.uint32
-                desc_i_o: T.uint32
-                T.ptx.tcgen05.encode_instr_descriptor(
-                    T.address_of(desc_i_p),
-                    d_dtype="float32",
-                    a_dtype="bfloat16",
-                    b_dtype="bfloat16",
-                    M=B_H,
-                    N=B_TOPK * 2,
-                    K=16,
-                    trans_a=False,
-                    trans_b=False,
-                    n_cta_groups=2,
-                )
-                T.ptx.tcgen05.encode_instr_descriptor(
-                    T.address_of(desc_i_o),
-                    d_dtype="float32",
-                    a_dtype="bfloat16",
-                    b_dtype="bfloat16",
-                    M=B_H,
-                    N=256,
-                    K=16,
-                    trans_a=False,
-                    trans_b=True,
-                    n_cta_groups=2,
-                )
                 umma_job_valid = T.local_scalar("int32")
                 umma_job_valid = 1
                 umma_job_block_idx = T.local_scalar("int32")
@@ -804,7 +778,6 @@ def _kernel(
                                 dispatch="tcgen05",
                                 cta_group=2,
                                 smem_desc="recompute",
-                                descI=desc_i_p,
                             )
                             qk_accumulate[0] = T.uint32(1)
                             bar_QK_done.arrive(0, cta_group=2, cta_mask=3)
@@ -833,7 +806,6 @@ def _kernel(
                                 dispatch="tcgen05",
                                 cta_group=2,
                                 smem_desc="recompute",
-                                descI=desc_i_o,
                             )
                             Tx.gemm_async(
                                 tmem_o_hi[:, :],
@@ -844,7 +816,6 @@ def _kernel(
                                 dispatch="tcgen05",
                                 cta_group=2,
                                 smem_desc="recompute",
-                                descI=desc_i_o,
                             )
                             o_accumulate[0] = T.uint32(1)
                             bar_SV_done.arrive(0, cta_group=2, cta_mask=3)

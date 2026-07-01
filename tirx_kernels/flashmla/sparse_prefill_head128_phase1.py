@@ -1031,46 +1031,6 @@ def _kernel(
         T.ptx.setmaxnreg(True, 168)
         if (cta_idx == 0) & (warp_idx == 12):
             if T.ptx.elect_sync():
-                desc_i_p_sq: T.uint32
-                desc_i_p_tq: T.uint32
-                desc_i_o: T.uint32
-                T.ptx.tcgen05.encode_instr_descriptor(
-                    T.address_of(desc_i_p_sq),
-                    d_dtype="float32",
-                    a_dtype="bfloat16",
-                    b_dtype="bfloat16",
-                    M=B_H,
-                    N=B_TOPK,
-                    K=16,
-                    trans_a=False,
-                    trans_b=False,
-                    n_cta_groups=2,
-                )
-                T.ptx.tcgen05.encode_instr_descriptor(
-                    T.address_of(desc_i_p_tq),
-                    d_dtype="float32",
-                    a_dtype="bfloat16",
-                    b_dtype="bfloat16",
-                    M=B_H,
-                    N=B_TOPK,
-                    K=16,
-                    trans_a=False,
-                    trans_b=False,
-                    n_cta_groups=2,
-                )
-                T.ptx.tcgen05.encode_instr_descriptor(
-                    T.address_of(desc_i_o),
-                    d_dtype="float32",
-                    a_dtype="bfloat16",
-                    b_dtype="bfloat16",
-                    M=B_H,
-                    N=256,
-                    K=16,
-                    trans_a=False,
-                    trans_b=True,
-                    n_cta_groups=2,
-                )
-
                 bar_prologue_q.arrive(0, tx_count=B_H * d_qk * BF16_BYTES)
                 bar_prologue_q.wait(0, 0)
                 T.ptx.tcgen05.fence.after_thread_sync()
@@ -1115,7 +1075,6 @@ def _kernel(
                                 dispatch="tcgen05",
                                 cta_group=2,
                                 smem_desc=tiled_mma_smem_desc,
-                                descI=desc_i_p_sq,
                             )
                             tiled_mma_p_accumulate[0] = T.uint32(1)
                         bar_qk_part_done.arrive(cur_buf, cta_group=2, cta_mask=3)
@@ -1134,7 +1093,6 @@ def _kernel(
                             dispatch="tcgen05",
                             cta_group=2,
                             smem_desc=tiled_mma_smem_desc,
-                            descI=desc_i_p_tq,
                         )
                         tiled_mma_p_accumulate[0] = T.uint32(1)
                         bar_qk_done.arrive(cur_buf, cta_group=2, cta_mask=3)
@@ -1159,7 +1117,6 @@ def _kernel(
                             dispatch="tcgen05",
                             cta_group=2,
                             smem_desc=tiled_mma_smem_desc,
-                            descI=desc_i_o,
                         )
                         Tx.gemm_async(
                             tmem_o_hi[:, :],
@@ -1170,7 +1127,6 @@ def _kernel(
                             dispatch="tcgen05",
                             cta_group=2,
                             smem_desc=tiled_mma_smem_desc,
-                            descI=desc_i_o,
                         )
                         tiled_mma_o_accumulate[0] = T.uint32(1)
                         bar_sv_part_done.arrive(cur_buf_prev, cta_group=2, cta_mask=3)
@@ -1189,7 +1145,6 @@ def _kernel(
                             dispatch="tcgen05",
                             cta_group=2,
                             smem_desc=tiled_mma_smem_desc,
-                            descI=desc_i_o,
                         )
                         Tx.gemm_async(
                             tmem_o_hi[:, :],
@@ -1200,7 +1155,6 @@ def _kernel(
                             dispatch="tcgen05",
                             cta_group=2,
                             smem_desc=tiled_mma_smem_desc,
-                            descI=desc_i_o,
                         )
                         tiled_mma_o_accumulate[0] = T.uint32(1)
                         bar_sv_done.arrive(cur_buf_prev, cta_group=2, cta_mask=3)
