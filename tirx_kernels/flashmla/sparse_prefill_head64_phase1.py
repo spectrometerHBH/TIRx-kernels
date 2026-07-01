@@ -1028,7 +1028,7 @@ def _kernel(
                             )
 
     else:
-        # CUDA phase1.cuh:413-572.  MMA warpgroup.  Keep the warp-specialized
+        # CUDA phase1.cuh:413-572.  MMA warpgroup.  Keep the issue-thread
         # control flow source-ordered; materialize tcgen05.cp/gemm_async and
         # cp.async data paths after the exact SMEM/TMEM views are introduced.
         if warp_idx == 8:
@@ -1094,7 +1094,7 @@ def _kernel(
                                 dispatch="tcgen05",
                                 cta_group=1,
                                 smem_desc=tiled_mma_smem_desc,
-                                warp_specialized=True,
+                                weight_stationary=True,
                             )
                             bar_qk_rope_done.arrive(0)
 
@@ -1132,7 +1132,7 @@ def _kernel(
                                 dispatch="tcgen05",
                                 cta_group=1,
                                 smem_desc=tiled_mma_smem_desc,
-                                warp_specialized=True,
+                                weight_stationary=True,
                             )
                         bar_qk_nope_done.arrive(cur_buf)
 
@@ -1151,7 +1151,7 @@ def _kernel(
                             dispatch="tcgen05",
                             cta_group=1,
                             smem_desc=tiled_mma_smem_desc,
-                            warp_specialized=True,
+                            weight_stationary=True,
                         )
                         Tx.gemm_async(
                             tmem_o_hi[:, :],
@@ -1162,7 +1162,7 @@ def _kernel(
                             dispatch="tcgen05",
                             cta_group=1,
                             smem_desc=tiled_mma_smem_desc,
-                            warp_specialized=True,
+                            weight_stationary=True,
                         )
                         tiled_mma_o_accumulate[0] = T.uint32(1)
                         bar_sv_done.arrive(cur_buf_prev)
