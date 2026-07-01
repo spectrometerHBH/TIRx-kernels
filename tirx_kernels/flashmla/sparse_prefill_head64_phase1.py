@@ -11,7 +11,7 @@ from tvm.backend.cuda.operator.tile_primitive.tma_utils import SwizzleMode
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.lang.pipeline import MBarrier, TCGen05Bar, TMABar
-from tvm.tirx.layout import ComposeLayout, S, SwizzleLayout, TCol, TileLayout, TLane
+from tvm.tirx.layout import ComposeLayout, Iter, S, SwizzleLayout, TCol, TileLayout, TLane
 
 B_H = 64
 B_TOPK = 64
@@ -265,33 +265,9 @@ def _reference_sparse_prefill(
     return ref_out.to(torch.bfloat16), ref_max_logits, ref_lse
 
 
-def _build_tirx_tensor_maps(case: dict[str, Any]) -> dict[str, Any]:
-    import tvm
-    from tirx_kernels.deepgemm.mega_moe import _encode_tma_2d_desc
-
-    cfg: SparseFlashMLAPrefillHead64Config = case["config"]
-    kv = case["kv"]
-    encode_tensormap = tvm.get_global_func("runtime.cuTensorMapEncodeTiled")
-
-    return {
-        "tensor_map_kv_nope": _encode_tma_2d_desc(
-            encode_tensormap=encode_tensormap,
-            tensor=kv,
-            gmem_inner_dim=D_V,
-            gmem_outer_dim=cfg.s_kv,
-            smem_inner_dim=64,
-            smem_outer_dim=1,
-            gmem_outer_stride=int(kv.stride(0)),
-            swizzle_mode=128,
-        )
-    }
-
-
 def _make_tirx_launch(case: dict[str, Any]) -> dict[str, Any]:
-    tensor_maps = _build_tirx_tensor_maps(case)
     return {
         "case": case,
-        "tensor_maps": tensor_maps,
         "args": (
             case["q"],
             case["kv"].reshape(-1),
@@ -301,7 +277,6 @@ def _make_tirx_launch(case: dict[str, Any]) -> dict[str, Any]:
             case["out"],
             case["max_logits"],
             case["lse"],
-            tensor_maps["tensor_map_kv_nope"].ptr,
         ),
     }
 
@@ -370,7 +345,6 @@ def _kernel(
     out: T.Buffer((s_q, h_q, D_V), "bfloat16"),
     max_logits: T.Buffer((s_q, h_q), "float32"),
     lse: T.Buffer((s_q, h_q), "float32"),
-    tensor_map_kv_nope: T.TensorMap(),
     *,
     s_q: T.constexpr,
     s_kv: T.constexpr,
@@ -449,6 +423,7 @@ def _kernel(
     pool.commit()
     q_tma = q.view(d_qk, h_q, s_q, layout=TileLayout(S[(d_qk, h_q, s_q) : (1, d_qk, h_q * d_qk)]))
     out_tma = out.view(D_V, h_q, s_q, layout=TileLayout(S[(D_V, h_q, s_q) : (1, D_V, h_q * D_V)]))
+    kv_nope_tma = kv.view(s_kv, D_V, layout=TileLayout(S[(s_kv, D_V) : (stride_kv_s_kv, 1)]))
 
     # CUDA phase1.cuh:77. h_kv is fixed to 1, so the row pointer is
     # params.indices + s_q_idx * params.stride_indices_s_q.
@@ -553,9 +528,6 @@ def _kernel(
                     tensor_map_dim_order="natural",
                     prefetch_tensormap=True,
                 )
-
-            T.evaluate(T.ptx.prefetch_tensormap(T.address_of(tensor_map_kv_nope)))
-
             bar_prologue_utccp_rope.init(1)
             bar_prologue_utccp_nope.init(1)
             if bar_qk_nope_done.leader:
@@ -955,40 +927,37 @@ def _kernel(
                             raw_k_nope_offset: T.let = (
                                 cur_buf * B_TOPK * D_V + smem_row * 64 + local_col * B_TOPK * 64
                             )
-                            if d_qk == D_V and s_kv >= 49152:
-                                T.ptx.cp_async.bulk.tensor.g2c_tile_gather4_bar_addr(
-                                    2,
-                                    k_nope.access_ptr("w", offset=raw_k_nope_offset),
-                                    T.cuda.cvta_generic_to_shared(
-                                        bar_kv_nope_ready_part0.ptr_to([cur_buf])
-                                    ),
-                                    T.address_of(tensor_map_kv_nope),
-                                    0,
-                                    1,
-                                    T.uint64(0x14F0000000000000),
-                                    1,
-                                    local_col * 64,
-                                    selected_idx0[local_row],
-                                    selected_idx1[local_row],
-                                    selected_idx2[local_row],
-                                    selected_idx3[local_row],
-                                )
-                            else:
-                                T.ptx.cp_async.bulk.tensor.g2c_tile_gather4(
-                                    2,
-                                    k_nope.access_ptr("w", offset=raw_k_nope_offset),
-                                    bar_kv_nope_ready_part0.ptr_to([cur_buf]),
-                                    T.address_of(tensor_map_kv_nope),
-                                    0,
-                                    1,
-                                    T.uint64(0x14F0000000000000),
-                                    1,
-                                    local_col * 64,
-                                    selected_idx0[local_row],
-                                    selected_idx1[local_row],
-                                    selected_idx2[local_row],
-                                    selected_idx3[local_row],
-                                )
+                            k_nope_gather_tile = T.decl_buffer(
+                                (4, 64),
+                                "bfloat16",
+                                k_nope_gemm.data,
+                                elem_offset=k_nope_gemm.elem_offset + raw_k_nope_offset,
+                                scope="shared.dyn",
+                                layout=ComposeLayout(
+                                    SwizzleLayout(3, 3, 3, swizzle_inner=True),
+                                    TileLayout.from_iters([Iter(4, 64, "m"), Iter(64, 1, "m")]),
+                                ),
+                            )
+                            Tx.copy_async(
+                                k_nope_gather_tile[:, :],
+                                kv_nope_tma[:, local_col * 64 : (local_col + 1) * 64],
+                                dispatch="tma",
+                                mbar=bar_kv_nope_ready_part0.ptr_to([cur_buf]),
+                                cta_group=1,
+                                cache_hint=T.uint64(0x14F0000000000000),
+                                mbarrier_addr=d_qk == D_V and s_kv >= 65536,
+                                gather_axis=0,
+                                indexer=[
+                                    selected_idx[local_row]
+                                    for selected_idx in (
+                                        selected_idx0,
+                                        selected_idx1,
+                                        selected_idx2,
+                                        selected_idx3,
+                                    )
+                                ],
+                                prefetch_tensormap=True,
+                            )
                     part_idx1 = T.meta_var(1)
                     for local_row in T.unroll(WG1_NUM_LOCAL_ROWS_PER_WARP):
                         for local_col_inner in T.unroll((D_V // 2) // 64):
@@ -997,40 +966,37 @@ def _kernel(
                             raw_k_nope_offset: T.let = (
                                 cur_buf * B_TOPK * D_V + smem_row * 64 + local_col * B_TOPK * 64
                             )
-                            if d_qk == D_V and s_kv >= 49152:
-                                T.ptx.cp_async.bulk.tensor.g2c_tile_gather4_bar_addr(
-                                    2,
-                                    k_nope.access_ptr("w", offset=raw_k_nope_offset),
-                                    T.cuda.cvta_generic_to_shared(
-                                        bar_kv_nope_ready_part1.ptr_to([cur_buf])
-                                    ),
-                                    T.address_of(tensor_map_kv_nope),
-                                    0,
-                                    1,
-                                    T.uint64(0x14F0000000000000),
-                                    1,
-                                    local_col * 64,
-                                    selected_idx0[local_row],
-                                    selected_idx1[local_row],
-                                    selected_idx2[local_row],
-                                    selected_idx3[local_row],
-                                )
-                            else:
-                                T.ptx.cp_async.bulk.tensor.g2c_tile_gather4(
-                                    2,
-                                    k_nope.access_ptr("w", offset=raw_k_nope_offset),
-                                    bar_kv_nope_ready_part1.ptr_to([cur_buf]),
-                                    T.address_of(tensor_map_kv_nope),
-                                    0,
-                                    1,
-                                    T.uint64(0x14F0000000000000),
-                                    1,
-                                    local_col * 64,
-                                    selected_idx0[local_row],
-                                    selected_idx1[local_row],
-                                    selected_idx2[local_row],
-                                    selected_idx3[local_row],
-                                )
+                            k_nope_gather_tile = T.decl_buffer(
+                                (4, 64),
+                                "bfloat16",
+                                k_nope_gemm.data,
+                                elem_offset=k_nope_gemm.elem_offset + raw_k_nope_offset,
+                                scope="shared.dyn",
+                                layout=ComposeLayout(
+                                    SwizzleLayout(3, 3, 3, swizzle_inner=True),
+                                    TileLayout.from_iters([Iter(4, 64, "m"), Iter(64, 1, "m")]),
+                                ),
+                            )
+                            Tx.copy_async(
+                                k_nope_gather_tile[:, :],
+                                kv_nope_tma[:, local_col * 64 : (local_col + 1) * 64],
+                                dispatch="tma",
+                                mbar=bar_kv_nope_ready_part1.ptr_to([cur_buf]),
+                                cta_group=1,
+                                cache_hint=T.uint64(0x14F0000000000000),
+                                mbarrier_addr=d_qk == D_V and s_kv >= 65536,
+                                gather_axis=0,
+                                indexer=[
+                                    selected_idx[local_row]
+                                    for selected_idx in (
+                                        selected_idx0,
+                                        selected_idx1,
+                                        selected_idx2,
+                                        selected_idx3,
+                                    )
+                                ],
+                                prefetch_tensormap=True,
+                            )
                 else:
                     for part_idx in T.unroll(2):
                         tx_bytes = T.uint32(

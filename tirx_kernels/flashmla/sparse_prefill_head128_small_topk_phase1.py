@@ -10,7 +10,7 @@ import torch
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.lang.pipeline import MBarrier, TCGen05Bar, TMABar
-from tvm.tirx.layout import ComposeLayout, S, SwizzleLayout, TCol, TileLayout, TLane
+from tvm.tirx.layout import ComposeLayout, Iter, S, SwizzleLayout, TCol, TileLayout, TLane
 
 B_H = 128
 B_TOPK = 64
@@ -242,32 +242,9 @@ def _reference_sparse_prefill(
     return ref_out.to(torch.bfloat16), ref_max_logits, ref_lse
 
 
-def _build_tirx_tensor_maps(case: dict[str, Any]) -> dict[str, Any]:
-    import tvm
-    from tirx_kernels.deepgemm.mega_moe import _encode_tma_2d_desc
-
-    cfg: SparseFlashMLAPrefillHead128SmallTopKConfig = case["config"]
-    kv = case["kv"]
-    encode_tensormap = tvm.get_global_func("runtime.cuTensorMapEncodeTiled")
-
-    return {
-        "tensor_map_kv": _encode_tma_2d_desc(
-            encode_tensormap=encode_tensormap,
-            tensor=kv,
-            gmem_inner_dim=cfg.d_qk,
-            gmem_outer_dim=cfg.s_kv,
-            smem_inner_dim=64,
-            smem_outer_dim=1,
-            gmem_outer_stride=int(kv.stride(0)),
-            swizzle_mode=128,
-        )
-    }
-
-
 def _make_tirx_launch(case: dict[str, Any]) -> dict[str, Any]:
     import ctypes
 
-    tensor_maps = _build_tirx_tensor_maps(case)
     cfg: SparseFlashMLAPrefillHead128SmallTopKConfig = case["config"]
     attn_sink_ptr = (
         ctypes.c_void_p(int(case["attn_sink"].data_ptr()))
@@ -281,7 +258,6 @@ def _make_tirx_launch(case: dict[str, Any]) -> dict[str, Any]:
     )
     return {
         "case": case,
-        "tensor_maps": tensor_maps,
         "args": (
             case["q"],
             case["kv"].reshape(-1),
@@ -291,7 +267,6 @@ def _make_tirx_launch(case: dict[str, Any]) -> dict[str, Any]:
             case["out"],
             case["max_logits"],
             case["lse"],
-            tensor_maps["tensor_map_kv"].ptr,
         ),
     }
 
@@ -332,7 +307,6 @@ def _kernel(
     out: T.Buffer((s_q, h_q, D_V), "bfloat16"),
     max_logits: T.Buffer((s_q, h_q), "float32"),
     lse: T.Buffer((s_q, h_q), "float32"),
-    tensor_map_kv: T.TensorMap(),
     *,
     s_q: T.constexpr,
     s_kv: T.constexpr,
@@ -356,9 +330,6 @@ def _kernel(
     lane_idx: T.let = thread_idx % 32
     warpgroup_idx: T.let = T.cuda.__shfl_sync(T.uint32(0xFFFFFFFF), thread_idx // 128, 0, 32)
     idx_in_warpgroup: T.let = thread_idx % 128
-
-    if thread_idx == 0:
-        T.evaluate(T.ptx.prefetch_tensormap(T.address_of(tensor_map_kv)))
 
     pool = T.SMEMPool()
     q_smem = pool.alloc_mma((B_H // 2, D_QK), "bfloat16")
@@ -409,6 +380,7 @@ def _kernel(
             TileLayout(S[(64, B_H // 2, 2, D_QK // 64 // 2) : (1, 64, 4096 * 4, 4096)]),
         ),
     )
+    kv_tma = kv.view(s_kv, D_QK, layout=TileLayout(S[(s_kv, D_QK) : (stride_kv_s_kv, 1)]))
     tmem_pool = T.TMEMPool(pool, total_cols=512, cta_group=2, tmem_addr=tmem_start_addr)
     tmem_ldst = tmem_pool.alloc((128, 512), "float32", datapath="D")
     tmem_pool.move_base_to(TMEM_COL_P)
@@ -687,31 +659,50 @@ def _kernel(
                             prefetch_size="L2::256B",
                         )
                     bar_KV_empty.wait(k_buf_idx, k_bar_phase ^ 1)
-                    for local_row in T.unroll(WG1_ROWS_PER_WARP // 4):
-                        row: T.let = (
-                            wg1_warp_idx * 8 + (local_row // 2) * (4 * 8) + (local_row % 2) * 4
+                    k_smem_gemm_cur = T.decl_buffer(
+                        (B_TOPK, D_QK // 2),
+                        "bfloat16",
+                        k_smem_gemm.data,
+                        elem_offset=k_smem_gemm.elem_offset + k_buf_idx * B_TOPK * (D_QK // 2),
+                        scope="shared.dyn",
+                        layout=ComposeLayout(
+                            SwizzleLayout(3, 3, 3, swizzle_inner=True),
+                            TileLayout(S[(B_TOPK, (D_QK // 2) // 64, 64) : (64, B_TOPK * 64, 1)]),
+                        ),
+                    )
+                    for local_col in T.unroll((D_QK // 64) // 2):
+                        src_col: T.let = local_col * 64 + cta_idx * (D_QK // 2)
+                        raw_k_offset: T.let = wg1_warp_idx * 8 * 64 + local_col * B_TOPK * 64
+                        k_gather_tile = T.decl_buffer(
+                            (WG1_ROWS_PER_WARP, 64),
+                            "bfloat16",
+                            k_smem_gemm_cur.data,
+                            elem_offset=k_smem_gemm_cur.elem_offset + raw_k_offset,
+                            scope="shared.dyn",
+                            layout=ComposeLayout(
+                                SwizzleLayout(3, 3, 3, swizzle_inner=True),
+                                TileLayout.from_iters(
+                                    [
+                                        Iter(WG1_ROWS_PER_WARP // 8, 4 * 8 * 64, "m"),
+                                        Iter(2, 4 * 64, "m"),
+                                        Iter(4, 64, "m"),
+                                        Iter(64, 1, "m"),
+                                    ]
+                                ),
+                            ),
                         )
-                        for local_col in T.unroll((D_QK // 64) // 2):
-                            raw_k_offset: T.let = (
-                                k_buf_idx * B_TOPK * (D_QK // 2)
-                                + row * 64
-                                + local_col * 64 * B_TOPK
-                            )
-                            T.ptx.cp_async.bulk.tensor.g2c_tile_gather4_bar_addr(
-                                2,
-                                k_smem.access_ptr("w", offset=raw_k_offset),
-                                T.cuda.sm100_tma_2sm_mbarrier_addr(bar_KV_full.ptr_to([k_buf_idx])),
-                                T.address_of(tensor_map_kv),
-                                T.uint16(1),
-                                2,
-                                T.uint64(0x14F0000000000000),
-                                T.int32(1),
-                                local_col * 64 + cta_idx * (D_QK // 2),
-                                cur_indices[local_row * 4 + 0],
-                                cur_indices[local_row * 4 + 1],
-                                cur_indices[local_row * 4 + 2],
-                                cur_indices[local_row * 4 + 3],
-                            )
+                        Tx.copy_async(
+                            k_gather_tile[:, :],
+                            kv_tma[:, src_col : src_col + 64],
+                            dispatch="tma",
+                            mbar=bar_KV_full.ptr_to([k_buf_idx]),
+                            cta_group=2,
+                            cta_mask=T.uint16(1),
+                            cache_hint=T.uint64(0x14F0000000000000),
+                            gather_axis=0,
+                            indexer=[cur_indices[i] for i in range(WG1_ROWS_PER_WARP)],
+                            prefetch_tensormap=True,
+                        )
                     wg1_rs = wg1_rs + 1
 
                 bar_clc_full.wait(0, wg1_outer_loop_phase)
