@@ -297,6 +297,22 @@ def _tirx_benchmark_tensors(
     )
 
 
+def _pack_valid_mask8(
+    lane_indices: Any, abs_pos_start: Any, lane_idx: Any, topk_len: Any, s_kv: Any
+) -> Any:
+    terms = []
+    for i in range(8):
+        valid = (
+            (lane_indices[i] >= 0)
+            & (lane_indices[i] < s_kv)
+            & (abs_pos_start + lane_idx * 8 + i < topk_len)
+        )
+        terms.append(T.Select(valid, T.int32(1 << i), T.int32(0)))
+    while len(terms) > 1:
+        terms = [T.bitwise_or(terms[i], terms[i + 1]) for i in range(0, len(terms), 2)]
+    return T.cast(terms[0], "int8")
+
+
 @T.jit
 def _kernel(
     q: T.Buffer((s_q, h_q, d_qk), "bfloat16"),
@@ -887,73 +903,8 @@ def _kernel(
                             prefetch_size="L2::256B",
                         )
                         abs_pos_start: T.let = k * B_TOPK
-                        valid0: T.let = (
-                            (lane_indices[0] >= 0)
-                            & (lane_indices[0] < s_kv)
-                            & (abs_pos_start + lane_idx * 8 < valid_topk_len)
-                        )
-                        valid1: T.let = (
-                            (lane_indices[1] >= 0)
-                            & (lane_indices[1] < s_kv)
-                            & (abs_pos_start + lane_idx * 8 + 1 < valid_topk_len)
-                        )
-                        valid2: T.let = (
-                            (lane_indices[2] >= 0)
-                            & (lane_indices[2] < s_kv)
-                            & (abs_pos_start + lane_idx * 8 + 2 < valid_topk_len)
-                        )
-                        valid3: T.let = (
-                            (lane_indices[3] >= 0)
-                            & (lane_indices[3] < s_kv)
-                            & (abs_pos_start + lane_idx * 8 + 3 < valid_topk_len)
-                        )
-                        valid4: T.let = (
-                            (lane_indices[4] >= 0)
-                            & (lane_indices[4] < s_kv)
-                            & (abs_pos_start + lane_idx * 8 + 4 < valid_topk_len)
-                        )
-                        valid5: T.let = (
-                            (lane_indices[5] >= 0)
-                            & (lane_indices[5] < s_kv)
-                            & (abs_pos_start + lane_idx * 8 + 5 < valid_topk_len)
-                        )
-                        valid6: T.let = (
-                            (lane_indices[6] >= 0)
-                            & (lane_indices[6] < s_kv)
-                            & (abs_pos_start + lane_idx * 8 + 6 < valid_topk_len)
-                        )
-                        valid7: T.let = (
-                            (lane_indices[7] >= 0)
-                            & (lane_indices[7] < s_kv)
-                            & (abs_pos_start + lane_idx * 8 + 7 < valid_topk_len)
-                        )
-                        mask: T.let = T.cast(
-                            T.bitwise_or(
-                                T.bitwise_or(
-                                    T.bitwise_or(
-                                        T.bitwise_or(
-                                            T.Select(valid0, T.int32(1), T.int32(0)),
-                                            T.Select(valid1, T.int32(2), T.int32(0)),
-                                        ),
-                                        T.bitwise_or(
-                                            T.Select(valid2, T.int32(4), T.int32(0)),
-                                            T.Select(valid3, T.int32(8), T.int32(0)),
-                                        ),
-                                    ),
-                                    T.bitwise_or(
-                                        T.bitwise_or(
-                                            T.Select(valid4, T.int32(16), T.int32(0)),
-                                            T.Select(valid5, T.int32(32), T.int32(0)),
-                                        ),
-                                        T.bitwise_or(
-                                            T.Select(valid6, T.int32(64), T.int32(0)),
-                                            T.Select(valid7, T.int32(128), T.int32(0)),
-                                        ),
-                                    ),
-                                ),
-                                T.int32(0),
-                            ),
-                            "int8",
+                        mask: T.let = _pack_valid_mask8(
+                            lane_indices, abs_pos_start, lane_idx, valid_topk_len, s_kv
                         )
                         index_buf_idx: T.let = valid_rs % NUM_INDEX_BUFS
                         index_bar_phase: T.let = (valid_rs // NUM_INDEX_BUFS) & 1
