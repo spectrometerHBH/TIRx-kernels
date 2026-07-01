@@ -248,11 +248,6 @@ fn validate_tensor(t: &Tensor) -> R {
             }
         }
     }
-    if let Some(Layout::Tmem(tm)) = &t.layout {
-        if tm.lane_align != 0 && tm.lane_align != 16 {
-            return bail("tmem layout lane_align must be 0 or 16");
-        }
-    }
     Ok(())
 }
 
@@ -840,6 +835,7 @@ fn validate_stmt(s: &Stmt) -> R {
             sf_e4m3,
             a_fp4,
             b_fp4,
+            lane_align,
             ..
         } => {
             validate_slice(dst, "tcgen05_mma dst")?;
@@ -847,6 +843,9 @@ fn validate_stmt(s: &Stmt) -> R {
             validate_slice(b, "tcgen05_mma b")?;
             check_cta_group(*cta_group, "tcgen05_mma cta_group")?;
             check_mma_shape(*m, *n, *k, *cta_group)?;
+            if *lane_align != 0 && *lane_align != 16 {
+                return bail("tcgen05_mma lane_align must be 0 or 16");
+            }
             if dst.tensor.space != MemorySpace::Tmem {
                 return bail("tcgen05_mma dst must be TMEM");
             }

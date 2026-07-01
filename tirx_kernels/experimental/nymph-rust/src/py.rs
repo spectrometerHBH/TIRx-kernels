@@ -830,7 +830,6 @@ py_enum!(PySwizzle = "Swizzle" => Swizzle {
 });
 py_enum!(PyTmemLayoutKind = "TmemLayoutKind" => TmemLayoutKind {
     LANE_128 => Lane128, LANE_64_UPPER => Lane64Upper, LANE_64_LOWER => Lane64Lower,
-    SCALE_VEC_1X => ScaleVec1x, SCALE_VEC_2X => ScaleVec2x, SCALE_VEC_4X => ScaleVec4x,
 });
 py_enum!(PyMBarKind = "MBarKind" => MBarKind {
     TMA => Tma, TCGEN05 => Tcgen05, THREAD => Thread,
@@ -1207,12 +1206,11 @@ pub struct PyTmemLayout(pub ir::TmemLayout);
 #[pymethods]
 impl PyTmemLayout {
     #[new]
-    #[pyo3(signature = (kind = PyTmemLayoutKind::LANE_128, col_start = 0, lane_align = 0))]
-    fn new(kind: PyTmemLayoutKind, col_start: usize, lane_align: u8) -> Self {
+    #[pyo3(signature = (kind = PyTmemLayoutKind::LANE_128, col_start = 0))]
+    fn new(kind: PyTmemLayoutKind, col_start: usize) -> Self {
         PyTmemLayout(ir::TmemLayout {
             kind: kind.into(),
             col_start,
-            lane_align,
         })
     }
     #[getter]
@@ -1222,10 +1220,6 @@ impl PyTmemLayout {
     #[getter]
     fn col_start(&self) -> usize {
         self.0.col_start
-    }
-    #[getter]
-    fn lane_align(&self) -> u8 {
-        self.0.lane_align
     }
 }
 
@@ -2184,7 +2178,7 @@ fn cp_async_bulk_wait_group_read(n: u8) -> PyStmt {
     PyStmt(ir::Stmt::CpAsyncBulkWaitGroupRead { n })
 }
 #[pyfunction]
-#[pyo3(name = "Tcgen05Mma", signature = (dst, a, b, m, n, k = 16, accum = false, trans_a = false, trans_b = false, cta_group = 1, sfa = None, sfb = None, sf_byte = 0, sf_e4m3 = false, sf_block = 0, a_fp4 = false, b_fp4 = false))]
+#[pyo3(name = "Tcgen05Mma", signature = (dst, a, b, m, n, k = 16, accum = false, trans_a = false, trans_b = false, cta_group = 1, sfa = None, sfb = None, sf_byte = 0, sf_e4m3 = false, sf_block = 0, a_fp4 = false, b_fp4 = false, lane_align = 0))]
 #[allow(clippy::too_many_arguments)]
 fn tcgen05_mma(
     dst: Bound<'_, PyAny>,
@@ -2204,6 +2198,7 @@ fn tcgen05_mma(
     sf_block: u32,
     a_fp4: bool,
     b_fp4: bool,
+    lane_align: u8,
 ) -> PyResult<PyStmt> {
     Ok(PyStmt(ir::Stmt::Tcgen05Mma {
         dst: coerce_slice(&dst)?,
@@ -2223,6 +2218,7 @@ fn tcgen05_mma(
         sf_block,
         a_fp4,
         b_fp4,
+        lane_align,
     }))
 }
 #[pyfunction]

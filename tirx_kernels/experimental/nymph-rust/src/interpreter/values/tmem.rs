@@ -607,7 +607,6 @@ pub fn tmem_layout_for(tensor: &Tensor) -> IResult<TmemLayout> {
         None => Ok(TmemLayout {
             kind: TmemLayoutKind::Lane128,
             col_start: 0,
-            lane_align: 0,
         }),
         Some(Layout::Tmem(tm)) => Ok(*tm),
         Some(_) => Err(InterpreterError::new(
@@ -671,10 +670,6 @@ fn tmem_lane_for(layout: &TmemLayout, row: usize) -> IResult<usize> {
             }
             Ok(row + 64)
         }
-        _ => Err(InterpreterError::new(
-            "unsupported_tmem_layout",
-            "scale-vector TMEM layouts are unsupported for value access",
-        )),
     }
 }
 
@@ -779,7 +774,6 @@ mod tests {
             layout: Some(Layout::Tmem(TmemLayout {
                 kind: TmemLayoutKind::Lane128,
                 col_start,
-                lane_align: 0,
             })),
             byte_offset: None,
             reg_frag: None,

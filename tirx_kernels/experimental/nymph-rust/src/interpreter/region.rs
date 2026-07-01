@@ -946,12 +946,6 @@ fn tmem_logical_box(tensor: &Tensor, offset: &[i64], shape: &[usize]) -> IResult
             }
             row0 + 64
         }
-        _ => {
-            return Err(InterpreterError::new(
-                "unsupported_tmem_layout",
-                "scale-vector TMEM layouts are unsupported for trace access",
-            ))
-        }
     };
     let elem_size = dtype_size_bytes(tensor.dtype);
     if !matches!(elem_size, 1 | 2 | 4) {
@@ -1209,7 +1203,6 @@ mod tests {
             layout: Some(Layout::Tmem(TmemLayout {
                 kind: TmemLayoutKind::Lane128,
                 col_start: 0,
-                lane_align: 0,
             })),
             byte_offset: None,
             reg_frag: None,
@@ -1222,7 +1215,6 @@ mod tests {
             layout: Some(Layout::Tmem(TmemLayout {
                 kind: TmemLayoutKind::Lane128,
                 col_start: 0,
-                lane_align: 0,
             })),
             byte_offset: None,
             reg_frag: None,

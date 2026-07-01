@@ -579,6 +579,11 @@ pub enum Stmt {
         /// operands are packed fp4 (e2m1, 2 per u8 byte); materialize by unpacking.
         a_fp4: bool,
         b_fp4: bool,
+        /// d-tmem accumulator lane field (0 or 16): only the cta_group=1 m=64
+        /// (Layout F) accumulator uses 16 to place its second 64-row half at
+        /// lane 16+. A property of THIS MMA's accumulator write, not of the TMEM
+        /// tensor's view — so it rides on the op, not on `TmemLayout`.
+        lane_align: u8,
     },
     /// `tcgen05.cp` — bulk SMEM -> TMEM copy of packed u32 scale-factor cells.
     /// With `cta_group=2` one leader issue drives both CTAs' datapaths: each CTA

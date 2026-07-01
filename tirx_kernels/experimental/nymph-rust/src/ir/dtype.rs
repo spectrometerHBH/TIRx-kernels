@@ -68,9 +68,6 @@ pub enum TmemLayoutKind {
     Lane128,
     Lane64Upper,
     Lane64Lower,
-    ScaleVec1x,
-    ScaleVec2x,
-    ScaleVec4x,
 }
 
 /// `MBarKind` — what kind of work an mbarrier tracks.

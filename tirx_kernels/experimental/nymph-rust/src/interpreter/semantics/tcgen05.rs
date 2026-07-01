@@ -757,6 +757,7 @@ fn execute_mma<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResu
         sf_block,
         a_fp4,
         b_fp4,
+        lane_align,
     ) = match stmt {
         Stmt::Tcgen05Mma {
             dst,
@@ -776,6 +777,7 @@ fn execute_mma<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResu
             sf_block,
             a_fp4,
             b_fp4,
+            lane_align,
         } => (
             dst,
             a,
@@ -794,6 +796,7 @@ fn execute_mma<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResu
             *sf_block as usize,
             *a_fp4,
             *b_fp4,
+            *lane_align,
         ),
         _ => unreachable!(),
     };
@@ -837,7 +840,7 @@ fn execute_mma<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResu
     if ctx.trace_mode() {
         trace_mma(
             ctx, dst, a_sl, b_sl, m, n, k, cta_group, accum, trans_a, trans_b, &cta_ids, sfa, sfb,
-            a_fp4, b_fp4,
+            a_fp4, b_fp4, lane_align,
         )?;
         return Ok(StepStatus::advance());
     }
@@ -865,7 +868,7 @@ fn execute_mma<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResu
         };
         accumulate_inplace(
             ctx, dst, a_sl, b_sl, m, n, k, cta_group, accum, &cta_ids, scales, sf_e4m3, sf_block,
-            a_fp4, b_fp4,
+            a_fp4, b_fp4, lane_align,
         )?;
         return Ok(StepStatus::advance());
     }
@@ -926,7 +929,9 @@ fn execute_mma<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResu
         }
     }
     let t_acc = super::super::runner::prof_now();
-    accumulate_blocks(ctx, dst, &product, m, n, cta_group, accum, &cta_ids)?;
+    accumulate_blocks(
+        ctx, dst, &product, m, n, cta_group, accum, &cta_ids, lane_align,
+    )?;
     super::super::runner::prof_end("MMA:fallback_accumulate", t_acc);
     Ok(StepStatus::advance())
 }
@@ -949,6 +954,7 @@ fn trace_mma(
     sfb: Option<&TensorSlice>,
     a_fp4: bool,
     b_fp4: bool,
+    lane_align: u8,
 ) -> IResult<()> {
     let a_r = ctx.eval_slice(a_sl)?;
     let b_r = ctx.eval_slice(b_sl)?;
@@ -975,7 +981,7 @@ fn trace_mma(
         m,
         n,
         cta_group,
-        layout.lane_align,
+        lane_align,
         layout.col_start,
         dst_off[1],
         TMEM_ROWS,
@@ -1520,6 +1526,7 @@ fn accumulate_inplace(
     sf_block: usize,
     a_fp4: bool,
     b_fp4: bool,
+    lane_align: u8,
 ) -> IResult<()> {
     let (a_off, a_box, a_rows, a_cols) = squeeze_operand(ctx, a_sl)?;
     let (b_off, b_box, b_rows, b_cols) = squeeze_operand(ctx, b_sl)?;
@@ -1569,7 +1576,7 @@ fn accumulate_inplace(
         }
         None => (Vec::new(), Vec::new()),
     };
-    let (c0, _) = inplace_geometry(ctx, dst, cta_group)?;
+    let (c0, _) = inplace_geometry(ctx, dst, cta_group, lane_align)?;
     let beta = if accum { 1.0 } else { 0.0 };
     let stride = super::super::values::tmem::TMEM_COLS;
 
@@ -1826,6 +1833,7 @@ fn inplace_geometry(
     ctx: &CohortContext,
     dst: &TensorSlice,
     cta_group: u8,
+    lane_align: u8,
 ) -> IResult<(usize, usize)> {
     let dst_off: Vec<usize> = dst
         .offsets
@@ -1842,7 +1850,7 @@ fn inplace_geometry(
         ));
     }
     let layout = tmem_layout_for(&dst.tensor)?;
-    if layout.lane_align != 0 {
+    if lane_align != 0 {
         return Err(InterpreterError::new(
             "tcgen05_mma_lane_align",
             "tcgen05_mma lane_align is only valid for the cta_group=1 m=64 (Layout F) accumulator",
@@ -1876,6 +1884,7 @@ fn accumulate_blocks(
     cta_group: u8,
     accum: bool,
     cta_ids: &[usize],
+    lane_align: u8,
 ) -> IResult<()> {
     let dst_off: Vec<usize> = dst
         .offsets
@@ -1918,7 +1927,7 @@ fn accumulate_blocks(
         m,
         n,
         cta_group,
-        layout.lane_align,
+        lane_align,
         layout.col_start,
         dst_col,
         n_lanes,
