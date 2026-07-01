@@ -39,10 +39,63 @@ from tvm.ir.type import PointerType, PrimType
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.cuda.operator.tile_primitive.tma_utils import mma_shared_layout
-from tvm.tirx.cuda.operator.tile_primitive.gemm_async.tcgen05 import sf_smem_layout
 from tvm.tirx.layout import R, S, TCol, TileLayout, TLane
 from tvm.tirx.layout import tid_in_wg as axis_tid_in_wg
 ";
+
+/// SF SMEM/GMEM physical layout, computed HERE from the fixed nvfp4 SF formula
+/// (128-row super-blocks, epc=4) instead of importing TVM's `sf_smem_layout`.
+/// Emits the same `TileLayout(S[...])` nymph already emits for the SF *TMEM*
+/// side, so the codegen is self-contained — no external SF-layout helper.
+///
+/// Mirrors `sf_smem_layout(rows, sf_k, sf_per_mma, pipe_depth)`: the SF is read
+/// in 128-row super-blocks of 32 lanes; a logical `(rows, sf_k)` tile decomposes
+/// as `M_super x M_SF_INNER(4) x LANE(32) x K_outer x sf_per_mma x in_lane_K`,
+/// size-1 dims dropped, optional pipe-depth outer prepended.
+fn sf_smem_tile_layout(
+    rows: usize,
+    sf_k: usize,
+    sf_per_mma: usize,
+    pipe_depth: Option<usize>,
+) -> String {
+    const EPC: usize = 4;
+    const M_SUPER_ROWS: usize = 128;
+    const LANE: usize = 32;
+    let m_sf_inner = M_SUPER_ROWS / LANE; // 4
+    let in_lane_k = EPC / sf_per_mma; // 1 for nvfp4 (sf_per_mma=4)
+    let k_outer = sf_k / EPC;
+    let m_super = rows / M_SUPER_ROWS;
+    let lane_bytes = EPC * m_sf_inner; // 16
+    let super_bytes = lane_bytes * LANE; // 512
+    let k_total_bytes = super_bytes * k_outer;
+    let stage_bytes = k_total_bytes * m_super;
+
+    let raw_shape = [m_super, m_sf_inner, LANE, k_outer, sf_per_mma, in_lane_k];
+    let raw_strides = [k_total_bytes, EPC, lane_bytes, super_bytes, in_lane_k, 1];
+    let mut shape: Vec<usize> = Vec::new();
+    let mut strides: Vec<usize> = Vec::new();
+    for (s, st) in raw_shape.iter().zip(raw_strides.iter()) {
+        if *s != 1 {
+            shape.push(*s);
+            strides.push(*st);
+        }
+    }
+    if let Some(p) = pipe_depth {
+        shape.insert(0, p);
+        strides.insert(0, stage_bytes);
+    }
+    let sh = shape
+        .iter()
+        .map(|x| x.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let st = strides
+        .iter()
+        .map(|x| x.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("TileLayout(S[({sh}) : ({st})])")
+}
 
 /// The thread scope of the enclosing role branch, threaded through the body walk.
 /// Determines (a) whether a CTA-wide `cta_sync` may be emitted (only at function
@@ -302,12 +355,8 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
             } else {
                 (t.shape[0], t.shape[1], None)
             };
-            let pd = pipe
-                .map(|p| format!(", pipe_depth={p}"))
-                .unwrap_or_default();
-            out.push_str(&format!(
-                "{name}_layout = sf_smem_layout({rows}, {sf_k}, sf_per_mma=4{pd})\n"
-            ));
+            let layout = sf_smem_tile_layout(rows, sf_k, 4, pipe);
+            out.push_str(&format!("{name}_layout = {layout}\n"));
             continue;
         }
         // The swizzle atom row (128/64/32 B for mode 3/2/1) must DIVIDE the tile row
@@ -356,9 +405,8 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
         // sf_smem_layout(rows, sf_k, sf_per_mma=4) so the TMA reads cp-ready bytes.
         let layout = if t.dtype == DType::F8E4M3 && t.shape.len() == 2 {
             format!(
-                ", layout=sf_smem_layout({rows}, {sf_k}, sf_per_mma=4)",
-                rows = t.shape[0],
-                sf_k = t.shape[1],
+                ", layout={}",
+                sf_smem_tile_layout(t.shape[0], t.shape[1], 4, None)
             )
         } else {
             String::new()
@@ -930,11 +978,13 @@ fn try_collapse_mma_run(stmts: &[Stmt]) -> Option<(Stmt, usize)> {
         sfb: None,
         sf_byte: *sf_byte,
         // The collapse only runs on the non-scaled GEMM (bailed above on any SF),
-        // so the NVFP4 flags are always their dense defaults here.
+        // so the NVFP4 flags are always their dense defaults here; the dense
+        // cta_group=2 m=128/256 accumulator never uses lane_align.
         sf_e4m3: false,
         sf_block: 32,
         a_fp4: false,
         b_fp4: false,
+        lane_align: 0,
     };
     Some((collapsed, count))
 }

@@ -27,13 +27,14 @@ pub struct SmemSwizzleLayout {
     pub swizzle: Swizzle,
 }
 
-/// `TmemLayout`. `lane_align` is the MMA accumulator d-tmem lane field (0 or 16),
-/// NOT part of the view mapping (see the Python docstring).
+/// `TmemLayout` — a TMEM tensor's view into the shared 128-lane x 512-col
+/// physical allocation: `col_start` is its column band, `kind` its logical
+/// row->lane mapping. (The MMA accumulator's d-tmem `lane_align` is NOT here —
+/// it's a property of the MMA write, carried on `Tcgen05Mma`.)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TmemLayout {
     pub kind: TmemLayoutKind,
     pub col_start: usize,
-    pub lane_align: u8, // 0 or 16
 }
 
 /// Register-fragment physical layout for an epilogue REG tensor. `None` (the

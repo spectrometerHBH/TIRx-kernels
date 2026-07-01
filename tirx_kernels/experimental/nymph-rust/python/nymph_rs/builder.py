@@ -16,6 +16,7 @@ from .nymph_rs import (
     ClusterShape,
     ClusterSync,
     CpAsyncBulkCommitGroup,
+    CpAsyncBulkS2Cluster,
     CpAsyncBulkWaitGroupRead,
     CtaSync,
     DType,
@@ -24,6 +25,8 @@ from .nymph_rs import (
     FenceScope,
     ForEachTask,
     ForLoop,
+    GmemAtomicAdd,
+    GmemWaitEq,
     If,
     Kernel,
     KernelFinalize,
@@ -42,6 +45,7 @@ from .nymph_rs import (
     MBarrierInit,
     MBarrierWait,
     MemorySpace,
+    NamedBarrier,
     RegAdd,
     RegBitwise,
     RegCausalMask,
@@ -68,10 +72,10 @@ from .nymph_rs import (
     Scheduler,
     SchedulerImpl,
     ScopeValue,
+    SetMaxNReg,
     Shape,
     ShuffleSync,
     StMatrix,
-    WarpMma,
     Stmt,
     StoreScalar,
     TaskSpace,
@@ -87,17 +91,13 @@ from .nymph_rs import (
     TensorSlice,
     TmaLoad,
     TmaStore,
-    CpAsyncBulkS2Cluster,
-    GmemAtomicAdd,
-    GmemWaitEq,
     TmemAlloc,
     TmemDealloc,
     Var,
     VarBinding,
+    WarpMma,
     WarpSync,
     WgSync,
-    NamedBarrier,
-    SetMaxNReg,
 )
 
 Tcgen05LdStShape = Literal["32x32b", "16x32bx2", "16x64b", "16x128b", "16x256b"]
@@ -599,6 +599,7 @@ class IRBuilder:
         sf_block: int = 0,
         a_fp4: bool = False,
         b_fp4: bool = False,
+        lane_align: int = 0,
     ) -> None:
         """``sfa``/``sfb`` make this a block-scaled MMA. Each is a (128, cols) u32 TMEM
         slice of packed scale bytes. Two modes:
@@ -638,6 +639,7 @@ class IRBuilder:
             sf_block=sf_block,
             a_fp4=a_fp4,
             b_fp4=b_fp4,
+            lane_align=lane_align,
         )
         self._append(stmt)
 

@@ -32,9 +32,9 @@ fn tmem_tensor(id: u32, col_start: usize) -> Arc<Tensor> {
         layout: Some(Layout::Tmem(TmemLayout {
             kind: TmemLayoutKind::Lane128,
             col_start,
-            lane_align: 0,
         })),
         byte_offset: None,
+        reg_frag: None,
     })
 }
 
@@ -46,6 +46,7 @@ fn reg_tensor(id: u32, dtype: DType, shape: Vec<usize>) -> Arc<Tensor> {
         shape,
         layout: None,
         byte_offset: None,
+        reg_frag: None,
     })
 }
 
@@ -57,6 +58,7 @@ fn gmem_tensor(id: u32, dtype: DType, shape: Vec<usize>) -> Arc<Tensor> {
         shape,
         layout: None,
         byte_offset: None,
+        reg_frag: None,
     })
 }
 
@@ -68,6 +70,7 @@ fn smem_tensor(id: u32, dtype: DType, shape: Vec<usize>, byte_offset: usize) -> 
         shape,
         layout: None,
         byte_offset: Some(byte_offset),
+        reg_frag: None,
     })
 }
 
