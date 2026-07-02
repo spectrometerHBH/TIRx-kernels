@@ -339,21 +339,6 @@ def _run_tirx_launches(
         executable(*launch["args"])
 
 
-def _tirx_benchmark_tensors(
-    case: dict[str, Any], launches: list[dict[str, Any]]
-) -> tuple[Any, ...]:
-    return (
-        case["q"],
-        case["kv"],
-        case["indices"],
-        case["attn_sink"],
-        case["topk_length"],
-        case["out"],
-        case["max_logits"],
-        case["lse"],
-    )
-
-
 def _tma_5d_cta_group2_nosplit(
     dst_ptr: Any,
     bar_ptr: Any,

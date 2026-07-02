@@ -395,21 +395,6 @@ def _run_tirx_launches(
         executable(*launch["args"])
 
 
-def _tirx_benchmark_tensors(
-    case: dict[str, Any], launches: list[dict[str, Any]]
-) -> tuple[Any, ...]:
-    return (
-        case["q"],
-        case["kv"],
-        case["indices"],
-        case["attn_sink"],
-        case["topk_length"],
-        case["out"],
-        case["max_logits"],
-        case["lse"],
-    )
-
-
 def _mbarrier_complete_tx(bar_ptr: Any, dst_cta_id: Any, transaction_bytes: Any, pred: Any) -> Any:
     func_name = "sparse_flashmla_head128_mbarrier_complete_tx"
     source_code = f"""

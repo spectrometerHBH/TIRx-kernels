@@ -41,10 +41,6 @@ def prepare_data(M: int, N: int, K: int, *, return_origin: bool = False):
     return (A_fp4, B_fp4, A_sf, B_sf, alpha, C_ref)
 
 
-def _gemm_io_bytes(M: int, N: int, K: int) -> int:
-    return M * K // 2 + N * K // 2 + M * N * 2
-
-
 _CUBLASLT_EXT = None
 
 

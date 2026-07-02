@@ -23,6 +23,7 @@ import math
 import os
 import random
 import socket
+import sys
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -4932,6 +4933,17 @@ def _run_worker(local_rank: int, cfg_dict: dict[str, Any], mode: str) -> dict[st
     warmup = int(worker_kwargs.pop("warmup", 10))
     repeat = int(worker_kwargs.pop("repeat", 30))
     timer = str(worker_kwargs.pop("timer", "proton"))
+    if timer == "cudagraph_proton":
+        # mega_moe times the distributed group protocol via bench_tk, which supports
+        # only {event, proton} -- there is no CUDA-graph path here. proton is the
+        # closest equivalent (pure per-kernel GPU time), so normalize instead of
+        # letting bench_tk raise on the unsupported timer.
+        print(
+            "mega_moe: cudagraph_proton is unavailable for the bench_tk group protocol; "
+            "using proton instead",
+            file=sys.stderr,
+        )
+        timer = "proton"
     rounds = int(worker_kwargs.pop("rounds", 1))
     round_cooldown_s = float(worker_kwargs.pop("round_cooldown_s", 1.0))
     config = MegaMoeConfig(**worker_kwargs)

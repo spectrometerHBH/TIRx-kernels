@@ -872,13 +872,6 @@ def _make_bench_case(config_kwargs: dict[str, Any]) -> TF32HCBenchCase:
     )
 
 
-def _bench_case_input_bytes(case: TF32HCBenchCase) -> int:
-    return sum(
-        tensor.nelement() * tensor.element_size()
-        for tensor in (case.a, case.b, case.d_tirx, case.sqr_tirx)
-    )
-
-
 def _bench_tirx_case(case: TF32HCBenchCase, executable: Any) -> tuple[torch.Tensor, torch.Tensor]:
     executable(case.config.m, case.a, case.b, case.d_tirx, case.sqr_tirx.reshape(-1))
     return case.d_tirx, case.sqr_tirx
