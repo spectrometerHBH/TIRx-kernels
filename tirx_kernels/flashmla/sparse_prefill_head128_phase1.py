@@ -383,7 +383,15 @@ def _kernel(
     num_sq_tiles = T.meta_var((d_qk - D_TQ) // 64)
     num_qk_tiles = T.meta_var(d_qk // 64)
     shared_u_elems = T.meta_var((B_H // 2) * d_sq + (D_V // 2) * B_TOPK + (B_TOPK // 2) * d_qk)
-    tiled_mma_smem_desc = T.meta_var("hoist" if (d_qk == 512 and s_kv == 32768) else "encode")
+    tiled_mma_smem_desc = T.meta_var(
+        "recompute"
+        if (d_qk == 512 and s_kv == 8192)
+        else "local_hoist"
+        if (d_qk == 576 and s_kv != 65536)
+        else "hoist"
+        if ((d_qk == 512 and s_kv == 32768) or (d_qk == 576 and s_kv == 65536))
+        else "encode"
+    )
 
     # CUDA phase1.cuh:84-90, config.h:93-118.  Preserve SharedMemoryPlan's
     # union offsets: q_full, {sq, v, k}, and o alias the same base.
@@ -468,6 +476,7 @@ def _kernel(
                     cache_hint=T.uint64(0x12F0000000000000),
                     tensor_map_dim_order="natural",
                     prefetch_tensormap=True,
+                    tensormap_l2_promotion="L2::256B",
                 )
 
         T.ptx.tcgen05.alloc(T.address_of(tmem_start_addr[0]), n_cols=512, cta_group=2)
@@ -591,9 +600,7 @@ def _kernel(
                 p_pair: T.let = T.cuda.make_float2(
                     T.cuda.uint_as_float(p[s_i * 2]), T.cuda.uint_as_float(p[s_i * 2 + 1])
                 )
-                fma_pair_tmp = T.alloc_local((1,), "uint64")
-                T.ptx.fma_f32x2(fma_pair_tmp.ptr_to([0]), p_pair, scale_pair, neg_new_max_pair)
-                fma_pair: T.let = fma_pair_tmp[0]
+                fma_pair: T.let = T.ptx.fma_f32x2_val(p_pair, scale_pair, neg_new_max_pair)
                 s_x: T.let = T.ptx.exp2(T.cuda.float2_x(fma_pair))
                 s_y: T.let = T.ptx.exp2(T.cuda.float2_y(fma_pair))
                 li = li + s_x + s_y
@@ -632,10 +639,9 @@ def _kernel(
                         o_pair: T.let = T.cuda.make_float2(
                             o_rescale[o_i * 2], o_rescale[o_i * 2 + 1]
                         )
-                        o_pair_tmp = T.alloc_local((1,), "uint64")
-                        T.ptx.mul_f32x2(o_pair_tmp.ptr_to([0]), o_pair, scale_for_old_pair)
-                        o_rescale[o_i * 2] = T.cuda.float2_x(o_pair_tmp[0])
-                        o_rescale[o_i * 2 + 1] = T.cuda.float2_y(o_pair_tmp[0])
+                        o_scaled_pair: T.let = T.ptx.mul_f32x2_val(o_pair, scale_for_old_pair)
+                        o_rescale[o_i * 2] = T.cuda.float2_x(o_scaled_pair)
+                        o_rescale[o_i * 2 + 1] = T.cuda.float2_y(o_scaled_pair)
                     Tx.wg.copy_async(
                         tmem_ldst[
                             :, TMEM_COL_O + chunk_idx * 32 : TMEM_COL_O + (chunk_idx + 1) * 32
@@ -706,13 +712,11 @@ def _kernel(
                 for o_j in T.unroll(4):
                     o_pair_idx: T.let = o_i * 8 + o_j * 2
                     o_pair: T.let = T.cuda.make_float2(o_epi[o_pair_idx], o_epi[o_pair_idx + 1])
-                    o_epi_pair_tmp = T.alloc_local((1,), "uint64")
-                    T.ptx.mul_f32x2(o_epi_pair_tmp.ptr_to([0]), o_pair, output_scale_pair)
-                    o_epi_pair: T.let = o_epi_pair_tmp[0]
+                    o_epi_pair: T.let = T.ptx.mul_f32x2_val(o_pair, output_scale_pair)
                     o_epi_bf16[o_j] = T.cuda.float22bfloat162_rn(
                         T.cuda.float2_x(o_epi_pair), T.cuda.float2_y(o_epi_pair)
                     )
-                o_base_col = (idx_in_warpgroup // 64) * (D_V // 2) + epi_k * B_EPI + o_i * 8
+                o_base_col: T.let = (idx_in_warpgroup // 64) * (D_V // 2) + epi_k * B_EPI + o_i * 8
                 Tx.copy(
                     o_smem.view("uint32")[
                         idx_in_warpgroup % 64, o_base_col // 2 : o_base_col // 2 + 4
@@ -734,6 +738,7 @@ def _kernel(
                         dispatch="tma",
                         tensor_map_dim_order="natural",
                         prefetch_tensormap=True,
+                        tensormap_l2_promotion="L2::256B",
                     )
             if warp_idx == 1:
                 if T.ptx.elect_sync():
@@ -748,6 +753,7 @@ def _kernel(
                         dispatch="tma",
                         tensor_map_dim_order="natural",
                         prefetch_tensormap=True,
+                        tensormap_l2_promotion="L2::256B",
                     )
 
         if warp_idx == 0:
@@ -840,6 +846,7 @@ def _kernel(
                                 for lane in range(4)
                             ],
                             prefetch_tensormap=True,
+                            tensormap_l2_promotion="L2::256B",
                         )
                 else:
                     T.ptx.mbarrier.complete_tx(
@@ -891,6 +898,7 @@ def _kernel(
                                 for lane in range(4)
                             ],
                             prefetch_tensormap=True,
+                            tensormap_l2_promotion="L2::256B",
                         )
                 else:
                     T.ptx.mbarrier.complete_tx(
@@ -964,6 +972,7 @@ def _kernel(
                             for lane in range(4)
                         ],
                         prefetch_tensormap=True,
+                        tensormap_l2_promotion="L2::256B",
                     )
 
                 if k > 0:
@@ -1024,6 +1033,7 @@ def _kernel(
                             for lane in range(4)
                         ],
                         prefetch_tensormap=True,
+                        tensormap_l2_promotion="L2::256B",
                     )
 
     else:

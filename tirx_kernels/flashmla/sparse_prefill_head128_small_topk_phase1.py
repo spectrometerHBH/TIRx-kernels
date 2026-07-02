@@ -500,6 +500,7 @@ def _kernel(
                         cache_hint=T.uint64(0x12F0000000000000),
                         tensor_map_dim_order="natural",
                         prefetch_tensormap=True,
+                        tensormap_l2_promotion="L2::256B",
                     )
                     if cta_idx == 0:
                         bar_sQ_full.arrive(0, tx_count=B_H * D_QK * BF16_BYTES)
@@ -555,14 +556,12 @@ def _kernel(
                     for o_j in T.unroll(4):
                         o_pair_idx: T.let = o_i * 8 + o_j * 2
                         o_pair: T.let = T.cuda.make_float2(o_epi[o_pair_idx], o_epi[o_pair_idx + 1])
-                        o_scaled_pair_tmp = T.alloc_local((1,), "uint64")
-                        T.ptx.mul_f32x2(o_scaled_pair_tmp.ptr_to([0]), o_pair, output_scale_pair)
-                        o_scaled_pair: T.let = o_scaled_pair_tmp[0]
+                        o_scaled_pair: T.let = T.ptx.mul_f32x2_val(o_pair, output_scale_pair)
                         o_epi_bf16[o_j] = T.cuda.float22bfloat162_rn(
                             T.cuda.float2_x(o_scaled_pair), T.cuda.float2_y(o_scaled_pair)
                         )
-                    o_base_col = (idx_in_warpgroup // 64) * (D_V // 2) + epi_k * B_EPI
-                    q_smem_col = o_base_col + o_i * 8
+                    o_base_col: T.let = (idx_in_warpgroup // 64) * (D_V // 2) + epi_k * B_EPI
+                    q_smem_col: T.let = o_base_col + o_i * 8
                     Tx.copy(
                         q_smem.view("uint32")[
                             idx_in_warpgroup % 64, q_smem_col // 2 : q_smem_col // 2 + 4
@@ -583,6 +582,7 @@ def _kernel(
                         q_smem[:, :],
                         dispatch="tma",
                         prefetch_tensormap=True,
+                        tensormap_l2_promotion="L2::256B",
                     )
                     T.ptx.cp_async.bulk.commit_group()
 
@@ -686,39 +686,40 @@ def _kernel(
                             TileLayout(S[(B_TOPK, (D_QK // 2) // 64, 64) : (64, B_TOPK * 64, 1)]),
                         ),
                     )
-                    for local_col in T.unroll((D_QK // 64) // 2):
-                        src_col: T.let = local_col * 64 + cta_idx * (D_QK // 2)
-                        raw_k_offset: T.let = wg1_warp_idx * 8 * 64 + local_col * B_TOPK * 64
-                        k_gather_tile = T.decl_buffer(
-                            (WG1_ROWS_PER_WARP, 64),
-                            "bfloat16",
-                            k_smem_gemm_cur.data,
-                            elem_offset=k_smem_gemm_cur.elem_offset + raw_k_offset,
-                            scope="shared.dyn",
-                            layout=ComposeLayout(
-                                SwizzleLayout(3, 3, 3, swizzle_inner=True),
-                                TileLayout.from_iters(
-                                    [
-                                        Iter(WG1_ROWS_PER_WARP // 8, 4 * 8 * 64, "m"),
-                                        Iter(2, 4 * 64, "m"),
-                                        Iter(4, 64, "m"),
-                                        Iter(64, 1, "m"),
-                                    ]
-                                ),
+                    src_col: T.let = cta_idx * (D_QK // 2)
+                    raw_k_offset: T.let = wg1_warp_idx * 8 * 64
+                    k_gather_tile = T.decl_buffer(
+                        (WG1_ROWS_PER_WARP, (D_QK // 2) // 64, 64),
+                        "bfloat16",
+                        k_smem_gemm_cur.data,
+                        elem_offset=k_smem_gemm_cur.elem_offset + raw_k_offset,
+                        scope="shared.dyn",
+                        layout=ComposeLayout(
+                            SwizzleLayout(3, 3, 3, swizzle_inner=True),
+                            TileLayout.from_iters(
+                                [
+                                    Iter(WG1_ROWS_PER_WARP // 8, 4 * 8 * 64, "m"),
+                                    Iter(2, 4 * 64, "m"),
+                                    Iter(4, 64, "m"),
+                                    Iter((D_QK // 2) // 64, B_TOPK * 64, "m"),
+                                    Iter(64, 1, "m"),
+                                ]
                             ),
-                        )
-                        Tx.copy_async(
-                            k_gather_tile[:, :],
-                            kv_tma[:, src_col : src_col + 64],
-                            dispatch="tma",
-                            mbar=bar_KV_full.ptr_to([k_buf_idx]),
-                            cta_group=2,
-                            cta_mask=T.uint16(1),
-                            cache_hint=T.uint64(0x14F0000000000000),
-                            gather_axis=0,
-                            indexer=[cur_indices[i] for i in range(WG1_ROWS_PER_WARP)],
-                            prefetch_tensormap=True,
-                        )
+                        ),
+                    )
+                    Tx.copy_async(
+                        k_gather_tile[:, :, :],
+                        kv_tma[:, src_col : src_col + D_QK // 2],
+                        dispatch="tma",
+                        mbar=bar_KV_full.ptr_to([k_buf_idx]),
+                        cta_group=2,
+                        cta_mask=T.uint16(1),
+                        cache_hint=T.uint64(0x14F0000000000000),
+                        gather_axis=0,
+                        indexer=[cur_indices[i] for i in range(WG1_ROWS_PER_WARP)],
+                        prefetch_tensormap=True,
+                        tensormap_l2_promotion="L2::256B",
+                    )
                     wg1_rs = wg1_rs + 1
 
                 bar_clc_full.wait(0, wg1_outer_loop_phase)
@@ -767,9 +768,6 @@ def _kernel(
                             T.ptx.tcgen05.fence.after_thread_sync()
                             qk_accumulate = T.alloc_local((1,), "uint32")
                             qk_accumulate[0] = T.uint32(0)
-                            # Keep this dynamic CLC/ring-buffer loop in descriptor
-                            # recompute mode.  It is still a tile primitive MMA,
-                            # but avoids local descriptor stores in this control flow.
                             Tx.gemm_async(
                                 tmem_p[:, :],
                                 q_tmem[:, :],
@@ -777,7 +775,7 @@ def _kernel(
                                 accum=qk_accumulate[0],
                                 dispatch="tcgen05",
                                 cta_group=2,
-                                smem_desc="recompute",
+                                smem_desc="local_hoist",
                             )
                             qk_accumulate[0] = T.uint32(1)
                             bar_QK_done.arrive(0, cta_group=2, cta_mask=3)
@@ -805,7 +803,7 @@ def _kernel(
                                 accum=o_accumulate[0],
                                 dispatch="tcgen05",
                                 cta_group=2,
-                                smem_desc="recompute",
+                                smem_desc="local_hoist",
                             )
                             Tx.gemm_async(
                                 tmem_o_hi[:, :],
@@ -815,7 +813,7 @@ def _kernel(
                                 accum=o_accumulate[0],
                                 dispatch="tcgen05",
                                 cta_group=2,
-                                smem_desc="recompute",
+                                smem_desc="local_hoist",
                             )
                             o_accumulate[0] = T.uint32(1)
                             bar_SV_done.arrive(0, cta_group=2, cta_mask=3)
@@ -1036,10 +1034,9 @@ def _kernel(
                         T.cuda.uint_as_float(p_exchange_tmp[0]),
                         T.cuda.uint_as_float(p_exchange_tmp[1]),
                     )
-                    sum_pair0 = T.alloc_local((1,), "uint64")
-                    T.ptx.add_f32x2(sum_pair0.ptr_to([0]), p_pair0, peer_pair0)
-                    p[exchange_i * 4] = T.cuda.float_as_uint(T.cuda.float2_x(sum_pair0[0]))
-                    p[exchange_i * 4 + 1] = T.cuda.float_as_uint(T.cuda.float2_y(sum_pair0[0]))
+                    sum_pair0: T.let = T.ptx.add_f32x2_val(p_pair0, peer_pair0)
+                    p[exchange_i * 4] = T.cuda.float_as_uint(T.cuda.float2_x(sum_pair0))
+                    p[exchange_i * 4 + 1] = T.cuda.float_as_uint(T.cuda.float2_y(sum_pair0))
                     p_pair1: T.let = T.cuda.make_float2(
                         T.cuda.uint_as_float(p[exchange_i * 4 + 2]),
                         T.cuda.uint_as_float(p[exchange_i * 4 + 3]),
@@ -1048,10 +1045,9 @@ def _kernel(
                         T.cuda.uint_as_float(p_exchange_tmp[2]),
                         T.cuda.uint_as_float(p_exchange_tmp[3]),
                     )
-                    sum_pair1 = T.alloc_local((1,), "uint64")
-                    T.ptx.add_f32x2(sum_pair1.ptr_to([0]), p_pair1, peer_pair1)
-                    p[exchange_i * 4 + 2] = T.cuda.float_as_uint(T.cuda.float2_x(sum_pair1[0]))
-                    p[exchange_i * 4 + 3] = T.cuda.float_as_uint(T.cuda.float2_y(sum_pair1[0]))
+                    sum_pair1: T.let = T.ptx.add_f32x2_val(p_pair1, peer_pair1)
+                    p[exchange_i * 4 + 2] = T.cuda.float_as_uint(T.cuda.float2_x(sum_pair1))
+                    p[exchange_i * 4 + 3] = T.cuda.float_as_uint(T.cuda.float2_y(sum_pair1))
 
                 cur_pi_max = T.local_scalar("float32")
                 cur_pi_max = T.float32(-float("inf"))
@@ -1083,15 +1079,11 @@ def _kernel(
                     p_pair: T.let = T.cuda.make_float2(
                         T.cuda.uint_as_float(p[s_i * 2]), T.cuda.uint_as_float(p[s_i * 2 + 1])
                     )
-                    fma_pair_tmp = T.alloc_local((1,), "uint64")
-                    T.ptx.fma_f32x2(fma_pair_tmp.ptr_to([0]), p_pair, scale_pair, neg_new_max_pair)
-                    fma_pair: T.let = fma_pair_tmp[0]
+                    fma_pair: T.let = T.ptx.fma_f32x2_val(p_pair, scale_pair, neg_new_max_pair)
                     s_x: T.let = T.ptx.exp2(T.cuda.float2_x(fma_pair))
                     s_y: T.let = T.ptx.exp2(T.cuda.float2_y(fma_pair))
                     s_pair: T.let = T.cuda.make_float2(s_x, s_y)
-                    sum_pair_tmp = T.alloc_local((1,), "uint64")
-                    T.ptx.add_f32x2(sum_pair_tmp.ptr_to([0]), cur_sum_pair, s_pair)
-                    cur_sum_pair = sum_pair_tmp[0]
+                    cur_sum_pair = T.ptx.add_f32x2_val(cur_sum_pair, s_pair)
                     s_pack[s_i] = T.cuda.float22bfloat162_rn(s_x, s_y)
                 cur_sum: T.let = T.cuda.float2_x(cur_sum_pair) + T.cuda.float2_y(cur_sum_pair)
                 li_tmp = T.alloc_local((1,), "float32")
@@ -1123,10 +1115,9 @@ def _kernel(
                             o_pair: T.let = T.cuda.make_float2(
                                 o_rescale[o_i * 2], o_rescale[o_i * 2 + 1]
                             )
-                            o_pair_tmp = T.alloc_local((1,), "uint64")
-                            T.ptx.mul_f32x2(o_pair_tmp.ptr_to([0]), o_pair, scale_for_old_pair)
-                            o_rescale[o_i * 2] = T.cuda.float2_x(o_pair_tmp[0])
-                            o_rescale[o_i * 2 + 1] = T.cuda.float2_y(o_pair_tmp[0])
+                            o_scaled_pair: T.let = T.ptx.mul_f32x2_val(o_pair, scale_for_old_pair)
+                            o_rescale[o_i * 2] = T.cuda.float2_x(o_scaled_pair)
+                            o_rescale[o_i * 2 + 1] = T.cuda.float2_y(o_scaled_pair)
                         Tx.wg.copy_async(
                             tmem_ldst[
                                 :, TMEM_COL_O + chunk_idx * 32 : TMEM_COL_O + (chunk_idx + 1) * 32
