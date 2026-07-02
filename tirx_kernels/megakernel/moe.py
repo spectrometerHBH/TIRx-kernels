@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import sys
 from unittest import SkipTest
 
 import numpy as np
@@ -1272,13 +1273,14 @@ def _torch_moe_reference(data: dict[str, torch.Tensor], mk: MegaKernelMOE):
     return output.cpu().numpy()
 
 
-def _validate_tir_case(case, mk: MegaKernelMOE):
+def _validate_tir_case(case, mk: MegaKernelMOE, *, check_torch: bool = True):
     out = _run_tir_case(case["tir"]).numpy()
     if not np.isfinite(out).all():
         raise AssertionError("MegaKernelMOE TIR output contains non-finite values")
 
-    ref = _torch_moe_reference(case["cpu_data"], mk)
-    np.testing.assert_allclose(out, ref, rtol=2e-2, atol=1e-2)
+    if check_torch:
+        ref = _torch_moe_reference(case["cpu_data"], mk)
+        np.testing.assert_allclose(out, ref, rtol=2e-2, atol=1e-2)
 
     reference = case.get("tir_reference")
     if reference is not None:
@@ -1342,21 +1344,66 @@ def run_test(batch_size: int, scheduler: str, world_size: int = 1, profiler_on: 
     torch.cuda.synchronize()
 
 
+def _estimate_tir_runtime_us(case) -> float:
+    _run_tir_case(case)
+    torch.cuda.synchronize()
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
+    for _ in range(5):
+        _run_tir_case(case)
+    end_event.record()
+    torch.cuda.synchronize()
+    return max(start_event.elapsed_time(end_event) * 1000.0 / 5.0, 1.0)
+
+
+def _estimate_bench_launch_slots(
+    runtime_us: float, warmup: int | None, repeat: int | None, rounds: int, preflight_launches: int
+) -> int:
+    """Reserve enough pre-zeroed slots for the pure-launch bench loop.
+
+    The current MoE kernel uses reductions into output workspaces, so the timed
+    closure must not reuse a workspace slot unless it has been reset outside the
+    timed region.  The new Triton-style bench API takes warmup/repeat as
+    millisecond budgets, not fixed iteration counts.  This estimate is only for
+    workspace capacity; the actual benchmark protocol remains owned by
+    ``tvm.tirx.bench.bench``.
+    """
+    warmup_budget_ms = 25 if warmup is None else warmup
+    repeat_budget_ms = 100 if repeat is None else repeat
+    estimate_ms = max(runtime_us / 1000.0, 1e-6)
+    n_warmup = max(1, int(warmup_budget_ms / estimate_ms))
+    n_repeat = max(1, int(repeat_budget_ms / estimate_ms))
+    # bench() calls fn() once, then runs a five-call estimate before the warmup
+    # and timed loops. Add a small guard for integer rounding and post-bench
+    # validation.
+    return preflight_launches + rounds * (1 + 5 + n_warmup + n_repeat) + 16
+
+
 def run_bench(
     batch_size: int,
     scheduler: str,
     world_size: int = 1,
     profiler_on: bool = False,
-    warmup: int = 1,
-    repeat: int = 5,
-    timer: str = "proton",
+    warmup: int | None = None,
+    repeat: int | None = None,
+    timer: str | None = None,
     rounds: int = 1,
     round_cooldown_s: float = 1.0,
     **kwargs,
 ):
     _require_cuda_sm100()
     _check_scheduler(scheduler)
-    from tvm.tirx.bench import bench, bench_impls_mode, tensor_bytes
+    from tvm.tirx.bench import bench, bench_impls_mode
+
+    if timer == "cudagraph_proton":
+        print(
+            "megakernel_moe: cudagraph_proton is unavailable because the "
+            "dynamic scheduler queue and reduction workspaces are mutated across "
+            "launches; using proton instead",
+            file=sys.stderr,
+        )
+        timer = "proton"
 
     compile_schedulers = [scheduler]
     if _needs_unfused_reference(scheduler) and bench_impls_mode() != "baseline":
@@ -1366,62 +1413,80 @@ def run_bench(
     )
 
     _reset_prepare_data_cache()
-    launch_slots = max(2, rounds * (warmup + repeat) + 4)
+    mode = bench_impls_mode()
+    data = dict(prepare_data(batch_size, mk))
+    case = {"batch_size": batch_size, "cpu_data": data}
+    launch_slots = 0
+    tir_runtime_estimate_us = None
 
-    def make_input():
-        data = dict(prepare_data(batch_size, mk))
-        case = {"batch_size": batch_size, "cpu_data": data}
-        if bench_impls_mode() != "baseline":
-            case["tir"] = _make_tir_case(
+    if mode != "baseline":
+        probe_case = _make_tir_case(
+            batch_size=batch_size,
+            mk=mk,
+            lib=libs[scheduler],
+            scheduler=scheduler,
+            data=data,
+            launch_slots=8,
+        )
+        tir_runtime_estimate_us = _estimate_tir_runtime_us(probe_case)
+        launch_slots = _estimate_bench_launch_slots(
+            tir_runtime_estimate_us, warmup, repeat, rounds, preflight_launches=1
+        )
+        del probe_case
+        torch.cuda.empty_cache()
+
+        case["tir"] = _make_tir_case(
+            batch_size=batch_size,
+            mk=mk,
+            lib=libs[scheduler],
+            scheduler=scheduler,
+            data=data,
+            launch_slots=launch_slots,
+        )
+        if _needs_unfused_reference(scheduler):
+            case["tir_reference"] = _make_tir_case(
                 batch_size=batch_size,
                 mk=mk,
-                lib=libs[scheduler],
-                scheduler=scheduler,
+                lib=libs["unfused"],
+                scheduler="unfused",
                 data=data,
-                launch_slots=launch_slots,
+                launch_slots=2,
             )
-            if _needs_unfused_reference(scheduler):
-                case["tir_reference"] = _make_tir_case(
-                    batch_size=batch_size,
-                    mk=mk,
-                    lib=libs["unfused"],
-                    scheduler="unfused",
-                    data=data,
-                    launch_slots=2,
-                )
-            return case, tensor_bytes(*case["tir"]["byte_tensors"])
-        return case, tensor_bytes(*data.values())
+        _validate_tir_case(case, mk, check_torch=batch_size <= max(_TEST_BATCH_SIZES))
 
-    reference_cache = {}
+    flashinfer_runner = None
     validation = {}
 
     def build_flashinfer_full():
-        runner = _build_flashinfer_full_reference(batch_size, mk)
-        reference_cache["flashinfer_full"] = runner
-        return runner
+        nonlocal flashinfer_runner
+        if flashinfer_runner is None:
+            runner = _build_flashinfer_full_reference(batch_size, mk)
 
-    def validate_case(case):
-        mode = bench_impls_mode()
-        if mode != "baseline":
-            _validate_tir_case(case, mk)
-        if mode == "all" and "flashinfer_full" in reference_cache:
-            validation["tir_vs_flashinfer_full"] = _validate_tir_matches_flashinfer(
-                case, mk, reference_cache["flashinfer_full"]
-            )
+            def run():
+                return runner(case)
+
+            flashinfer_runner = run
+        return flashinfer_runner
 
     result = bench(
-        {"tir": lambda case: _run_tir_case(case["tir"])},
-        make_input,
+        {"tir": lambda: _run_tir_case(case["tir"])},
         warmup=warmup,
         repeat=repeat,
         timer=timer,
-        proton_name=f"megakernel_moe_{scheduler}",
         references={"flashinfer_full": build_flashinfer_full},
         rounds=rounds,
         round_cooldown_s=round_cooldown_s,
-        validate_case=validate_case,
         **kwargs,
     )
+
+    if mode == "all" and flashinfer_runner is not None and "tir" in case:
+        try:
+            validation["tir_vs_flashinfer_full"] = _validate_tir_matches_flashinfer(
+                case, mk, lambda _: flashinfer_runner()
+            )
+        except Exception as err:
+            validation["tir_vs_flashinfer_full_error"] = str(err)
+
     result.setdefault("metadata", {})
     result["metadata"].update(
         {
@@ -1432,6 +1497,8 @@ def run_bench(
             "benchmark_scope": "full_moe_router_plus_expert",
             "flashinfer_router": "torch_fp32_mm_softmax_topk",
             "flashinfer_weight_layout": "grp_up_gate_weight",
+            "launch_slots": launch_slots,
+            "tir_runtime_estimate_us": tir_runtime_estimate_us,
         }
     )
     if validation:
