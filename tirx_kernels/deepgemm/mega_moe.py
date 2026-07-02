@@ -5011,7 +5011,7 @@ def _run_worker(local_rank: int, cfg_dict: dict[str, Any], mode: str) -> dict[st
             }
 
         if mode == "bench":
-            from tvm.tirx.bench import bench, tensor_bytes
+            from tvm.tirx.bench import bench_tk, tensor_bytes
 
             dg_case = create_case(deep_gemm, config, group, rank_idx, num_ranks)
             tirx_case = create_case(deep_gemm, config, group, rank_idx, num_ranks)
@@ -5087,7 +5087,7 @@ def _run_worker(local_rank: int, cfg_dict: dict[str, Any], mode: str) -> dict[st
                 return run_deepgemm
 
             session_name = f"deepgemm_mega_moe_rank{rank_idx}_{os.getpid()}_{time.time_ns()}"
-            bench_result = bench(
+            bench_result = bench_tk(
                 {"tirx": run_tirx},
                 make_input,
                 warmup=warmup,
