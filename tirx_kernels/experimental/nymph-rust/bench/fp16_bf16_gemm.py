@@ -54,7 +54,7 @@ def run_bench(dtype, M, N, K, warmup=None, repeat=None, timer=None, **kwargs):
     nymph = _compile_nymph(dtype, M, N, K)
     a, b, c = prepare_data(dtype, M, N, K)
     oc, on = torch.zeros_like(c, device="cuda"), torch.zeros_like(c, device="cuda")
-    funcs = {"canon": lambda: canon(a, b, oc), "nymph": lambda: nymph(a, b, on)}
+    funcs = {"tir": lambda: canon(a, b, oc), "tirx": lambda: nymph(a, b, on)}
     return bench(funcs, warmup=warmup, repeat=repeat, timer=timer, **kwargs)
 
 

@@ -684,7 +684,62 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
     // ---- walk the body ----
     emit_body(&mut out, &k.body, ind, &ctx, Scope::Function)?;
 
-    Ok(out)
+    Ok(merge_adjacent_guards(&out))
+}
+
+/// Merge ADJACENT identical single-thread guard blocks (`if tid_in_wg == 0:` /
+/// `if T.ptx.elect_sync():`) into one block. Canon writes the epilogue trio as
+/// `if tid%128==0: fence; store; commit` under ONE guard; emitting each op with
+/// its own guard costs a BSSY/BSYNC reconvergence pair per block in SASS (ncu
+/// nvfp4 4096: BSSY +14K / BSYNC +22K vs canon). Both guard predicates are
+/// invariant across adjacent blocks (tid constant; elect.sync re-elects the same
+/// leader with no divergence in between), so folding is semantics-preserving.
+/// Conservative: only exactly-adjacent lines (no blank/other line between).
+fn merge_adjacent_guards(src: &str) -> String {
+    const GUARDS: [&str; 2] = ["if tid_in_wg == 0:", "if T.ptx.elect_sync():"];
+    let lines: Vec<&str> = src.lines().collect();
+    let mut out: Vec<&str> = Vec::new();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim_start();
+        let indent_len = line.len() - trimmed.len();
+        if GUARDS.contains(&trimmed) {
+            out.push(line);
+            i += 1;
+            loop {
+                // copy the guard's body: lines strictly deeper than the guard
+                while i < lines.len() {
+                    let l = lines[i];
+                    let lt = l.trim_start();
+                    if lt.is_empty() || l.len() - lt.len() <= indent_len {
+                        break;
+                    }
+                    out.push(l);
+                    i += 1;
+                }
+                // absorb an immediately-following identical guard at the same depth
+                let dup = i < lines.len() && {
+                    let l = lines[i];
+                    let lt = l.trim_start();
+                    lt == trimmed && l.len() - lt.len() == indent_len
+                };
+                if dup {
+                    i += 1; // drop the duplicate guard line; keep copying its body
+                } else {
+                    break;
+                }
+            }
+        } else {
+            out.push(line);
+            i += 1;
+        }
+    }
+    let mut s = out.join("\n");
+    if src.ends_with('\n') {
+        s.push('\n');
+    }
+    s
 }
 
 /// Collect every tensor referenced anywhere (args + defs + slices), deduped by id,
@@ -2711,7 +2766,21 @@ fn emit_stmt(
             Ok(())
         }
         CpAsyncBulkCommitGroup => {
-            out.push_str(&format!("{p}T.ptx.cp_async.bulk.commit_group()\n"));
+            // Scope-aware like the async-proxy fence: `commit_group` batches the TMA
+            // stores issued BY THIS THREAD, and the store itself is single-issue
+            // (`if tid_in_wg == 0`). Inside a role branch, guard the commit to that
+            // same issuing thread — canon's shape (`fence; store; commit` under ONE
+            // `tid%128==0` guard). Unguarded, all 4 warps of the epilogue warpgroup
+            // execute the uniform UTMACMDFLUSH (ncu: 4x canon's count) committing
+            // empty groups; the non-issuing threads' wait_group is already vacuous
+            // (no groups outstanding) and the wg_sync after the wait is the real
+            // cross-thread barrier.
+            if scope.is_function() {
+                out.push_str(&format!("{p}T.ptx.cp_async.bulk.commit_group()\n"));
+            } else {
+                out.push_str(&format!("{p}if tid_in_wg == 0:\n"));
+                out.push_str(&format!("{p}    T.ptx.cp_async.bulk.commit_group()\n"));
+            }
             Ok(())
         }
         CpAsyncBulkWaitGroupRead { n } => {

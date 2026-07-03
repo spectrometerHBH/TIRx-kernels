@@ -1,0 +1,16 @@
+# Bench-suite workloads for the nymph GEMM kernels (driven via
+#   python -m tirx_kernels.bench_suite --workloads <this file>
+# with bench/ on PYTHONPATH so usercustomize.py registers the kernels).
+workloads:
+  - {kernel: nymph_nvfp4_gemm, config: 1024x1024x1024}
+  - {kernel: nymph_nvfp4_gemm, config: 2048x2048x2048}
+  - {kernel: nymph_nvfp4_gemm, config: 4096x4096x4096}
+  - {kernel: nymph_nvfp4_gemm, config: 8192x8192x8192}
+  - {kernel: nymph_fp16_bf16_gemm, config: fp16_1024x1024x1024}
+  - {kernel: nymph_fp16_bf16_gemm, config: fp16_2048x2048x2048}
+  - {kernel: nymph_fp16_bf16_gemm, config: fp16_4096x4096x4096}
+  - {kernel: nymph_fp16_bf16_gemm, config: fp16_8192x8192x8192}
+  - {kernel: nymph_fp16_bf16_gemm, config: bf16_1024x1024x1024}
+  - {kernel: nymph_fp16_bf16_gemm, config: bf16_2048x2048x2048}
+  - {kernel: nymph_fp16_bf16_gemm, config: bf16_4096x4096x4096}
+  - {kernel: nymph_fp16_bf16_gemm, config: bf16_8192x8192x8192}
