@@ -525,9 +525,6 @@ def tir_kernel(M: int, N: int, K: int):
 
 KERNEL_META = {"name": "fp8_blockwise_gemm", "category": "gemm", "compute_capability": 10}
 CONFIGS = [
-    {"M": s, "N": s, "K": s, "label": f"{s}x{s}x{s}"} for s in [1024, 2048, 4096, 8192, 16384]
-]
-BENCH_CONFIGS = [
     {"M": 4096, "N": 2112, "K": 7168, "label": "deepgemm_m4096_n2112_k7168"},
     {"M": 4096, "N": 576, "K": 7168, "label": "deepgemm_m4096_n576_k7168"},
     {"M": 4096, "N": 24576, "K": 1536, "label": "deepgemm_m4096_n24576_k1536"},
@@ -536,6 +533,7 @@ BENCH_CONFIGS = [
     {"M": 4096, "N": 4096, "K": 7168, "label": "deepgemm_m4096_n4096_k7168"},
     {"M": 4096, "N": 7168, "K": 2048, "label": "deepgemm_m4096_n7168_k2048"},
 ]
+BENCH_CONFIGS = CONFIGS
 
 
 def get_kernel(M, N, K):

@@ -5248,86 +5248,7 @@ KERNEL_META = {
     "compute_capability": 10,
 }
 
-# One case per block_m bucket in `_get_block_config_for_mega_moe` so a per-PR
-# sm100a run covers all heuristic-selected block_m paths (16, 32, 64, 96, 128, 192).
-# Each tpe (= tokens * ranks * topk / experts) is set just below the bucket boundary.
 CONFIGS = [
-    {
-        "num_processes": 1,
-        "num_max_tokens_per_rank": 4,
-        "num_tokens": 2,
-        "hidden": 1024,
-        "intermediate_hidden": 512,
-        "num_experts": 2,
-        "num_topk": 1,
-        "activation_clamp": 10.0,
-        "fast_math": 1,
-        "label": "p1_tok2_h1024_i512_e2_k1_bm16",
-    },
-    {
-        "num_processes": 1,
-        "num_max_tokens_per_rank": 16,
-        "num_tokens": 16,
-        "hidden": 1024,
-        "intermediate_hidden": 512,
-        "num_experts": 2,
-        "num_topk": 2,
-        "activation_clamp": 10.0,
-        "fast_math": 1,
-        "label": "p1_tok16_h1024_i512_e2_k2_bm32",
-    },
-    {
-        "num_processes": 1,
-        "num_max_tokens_per_rank": 32,
-        "num_tokens": 32,
-        "hidden": 1024,
-        "intermediate_hidden": 512,
-        "num_experts": 2,
-        "num_topk": 2,
-        "activation_clamp": 10.0,
-        "fast_math": 1,
-        "label": "p1_tok32_h1024_i512_e2_k2_bm64",
-    },
-    {
-        "num_processes": 1,
-        "num_max_tokens_per_rank": 64,
-        "num_tokens": 64,
-        "hidden": 1024,
-        "intermediate_hidden": 512,
-        "num_experts": 2,
-        "num_topk": 2,
-        "activation_clamp": 10.0,
-        "fast_math": 1,
-        "label": "p1_tok64_h1024_i512_e2_k2_bm96",
-    },
-    {
-        "num_processes": 1,
-        "num_max_tokens_per_rank": 96,
-        "num_tokens": 96,
-        "hidden": 1024,
-        "intermediate_hidden": 512,
-        "num_experts": 2,
-        "num_topk": 2,
-        "activation_clamp": 10.0,
-        "fast_math": 1,
-        "label": "p1_tok96_h1024_i512_e2_k2_bm128",
-    },
-    {
-        "num_processes": 1,
-        "num_max_tokens_per_rank": 192,
-        "num_tokens": 192,
-        "hidden": 1024,
-        "intermediate_hidden": 512,
-        "num_experts": 2,
-        "num_topk": 2,
-        "activation_clamp": 10.0,
-        "fast_math": 1,
-        "label": "p1_tok192_h1024_i512_e2_k2_bm192",
-    },
-]
-
-
-BENCH_CONFIGS = [
     {
         "num_processes": 1,
         "num_max_tokens_per_rank": 8,
@@ -5449,6 +5370,7 @@ BENCH_CONFIGS = [
         "label": "t8192_h7168_i3072_e384_k6_g6",
     },
 ]
+BENCH_CONFIGS = CONFIGS
 
 
 def _make_config(

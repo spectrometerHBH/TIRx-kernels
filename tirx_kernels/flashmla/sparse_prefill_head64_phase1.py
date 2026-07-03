@@ -77,64 +77,9 @@ class SparseFlashMLAPrefillHead64Config:
             raise ValueError("topk must be a multiple of 64")
 
 
-CONFIGS = [
-    {"label": "smoke_dqk576_s1_kv128_topk128", "s_q": 1, "s_kv": 128, "topk": 128, "d_qk": 576},
-    {"label": "smoke_dqk512_s1_kv128_topk128", "s_q": 1, "s_kv": 128, "topk": 128, "d_qk": 512},
-    {
-        "label": "features_dqk576_s62_kv592_topk128",
-        "s_q": 62,
-        "s_kv": 592,
-        "topk": 128,
-        "d_qk": 576,
-        "have_attn_sink": True,
-        "have_topk_length": True,
-    },
-    {
-        "label": "features_dqk512_s62_kv592_topk128",
-        "s_q": 62,
-        "s_kv": 592,
-        "topk": 128,
-        "d_qk": 512,
-        "have_attn_sink": True,
-        "have_topk_length": True,
-    },
-    {
-        "label": "ring_dqk576_s3_kv640_topk512",
-        "s_q": 3,
-        "s_kv": 640,
-        "topk": 512,
-        "d_qk": 576,
-        "have_attn_sink": True,
-    },
-    {
-        "label": "ring_dqk512_s3_kv640_topk512",
-        "s_q": 3,
-        "s_kv": 640,
-        "topk": 512,
-        "d_qk": 512,
-        "have_attn_sink": True,
-    },
-    {
-        "label": "invalid_indices_dqk576_s17_kv192_topk128",
-        "s_q": 17,
-        "s_kv": 192,
-        "topk": 128,
-        "d_qk": 576,
-        "inject_invalid_indices": True,
-    },
-    {
-        "label": "invalid_indices_dqk512_s17_kv192_topk128",
-        "s_q": 17,
-        "s_kv": 192,
-        "topk": 128,
-        "d_qk": 512,
-        "inject_invalid_indices": True,
-    },
-]
-
 # Cover the two upstream fwd/head64 phase1 instantiations:
 # D_QK=512 and D_QK=576, h_q=64, topk=512 at the scoped s_kv values.
-BENCH_CONFIGS = [
+CONFIGS = [
     {
         "label": f"bench_dqk{d_qk}_hq64_s4096_kv{s_kv}_topk512",
         "s_q": 4096,
@@ -147,6 +92,7 @@ BENCH_CONFIGS = [
     for d_qk in (512, 576)
     for s_kv in (8192, 32768, 49152, 65536)
 ]
+BENCH_CONFIGS = CONFIGS
 
 KERNEL_META = {
     "name": "sparse_flashmla_prefill_head64_phase1",

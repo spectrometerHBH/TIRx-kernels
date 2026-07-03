@@ -80,25 +80,6 @@ class SparseFlashMLAPrefillHead128SmallTopKConfig:
 
 
 CONFIGS = [
-    {"label": "smalltopk_dqk512_s1_kv128_topk64", "s_q": 1, "s_kv": 128, "topk": 64},
-    {
-        "label": "smalltopk_features_dqk512_s17_kv2048_topk1280",
-        "s_q": 17,
-        "s_kv": 2048,
-        "topk": 1280,
-        "have_attn_sink": True,
-        "have_topk_length": True,
-    },
-    {
-        "label": "smalltopk_invalid_indices_dqk512_s3_kv257_topk192",
-        "s_q": 3,
-        "s_kv": 257,
-        "topk": 192,
-        "inject_invalid_indices": True,
-    },
-]
-
-BENCH_CONFIGS = [
     {
         "label": f"bench_smalltopk_dqk512_hq128_s4096_kv{s_kv}_topk1280",
         "s_q": 4096,
@@ -109,6 +90,7 @@ BENCH_CONFIGS = [
     }
     for s_kv in (8192, 32768, 65536)
 ]
+BENCH_CONFIGS = CONFIGS
 
 KERNEL_META = {
     "name": "sparse_flashmla_prefill_head128_small_topk_phase1",

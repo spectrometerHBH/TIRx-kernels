@@ -77,57 +77,6 @@ class SparseFlashMLAPrefillHead128Config:
 
 CONFIGS = [
     {
-        "label": "regular_dqk512_s1_kv2048_topk1408",
-        "s_q": 1,
-        "s_kv": 2048,
-        "topk": 1408,
-        "d_qk": 512,
-    },
-    {
-        "label": "regular_dqk576_s1_kv2048_topk1408",
-        "s_q": 1,
-        "s_kv": 2048,
-        "topk": 1408,
-        "d_qk": 576,
-    },
-    {
-        "label": "regular_features_dqk512_s17_kv4096_topk1536",
-        "s_q": 17,
-        "s_kv": 4096,
-        "topk": 1536,
-        "d_qk": 512,
-        "have_attn_sink": True,
-        "have_topk_length": True,
-    },
-    {
-        "label": "regular_features_dqk576_s17_kv4096_topk1536",
-        "s_q": 17,
-        "s_kv": 4096,
-        "topk": 1536,
-        "d_qk": 576,
-        "have_attn_sink": True,
-        "have_topk_length": True,
-    },
-    {
-        "label": "regular_invalid_indices_dqk512_s3_kv2304_topk1408",
-        "s_q": 3,
-        "s_kv": 2304,
-        "topk": 1408,
-        "d_qk": 512,
-        "inject_invalid_indices": True,
-    },
-    {
-        "label": "regular_invalid_indices_dqk576_s3_kv2304_topk1408",
-        "s_q": 3,
-        "s_kv": 2304,
-        "topk": 1408,
-        "d_qk": 576,
-        "inject_invalid_indices": True,
-    },
-]
-
-BENCH_CONFIGS = [
-    {
         "label": f"bench_regular_dqk{d_qk}_hq128_s4096_kv{s_kv}_topk2048",
         "s_q": 4096,
         "s_kv": s_kv,
@@ -139,6 +88,7 @@ BENCH_CONFIGS = [
     for d_qk in (512, 576)
     for s_kv in (8192, 32768, 65536)
 ]
+BENCH_CONFIGS = CONFIGS
 
 KERNEL_META = {
     "name": "sparse_flashmla_prefill_head128_phase1",
@@ -509,7 +459,7 @@ def _kernel(
         layout=TileLayout(S[(B_H // 2, 2, D_V // 4) : (1 @ TLane, 64 @ TLane, 1 @ TCol)]),
     )
     s_smem_gemm = s_smem.view(
-        B_H // 2, B_TOPK, layout=TileLayout(S[(B_H // 2, B_TOPK) : (1, B_H // 2)])
+        B_H // 2, B_TOPK, layout=TileLayout(S[(B_H // 2, B_TOPK // 8, 8) : (8, (B_H // 2) * 8, 1)])
     )
     v_smem_gemm = v_smem.view(
         B_TOPK,

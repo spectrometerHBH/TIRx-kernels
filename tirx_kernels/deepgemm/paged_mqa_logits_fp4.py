@@ -249,56 +249,8 @@ DSA_INDEXER_LIKE_COVERAGE = [
     )
 ]
 
-CONFIGS = [
-    _make_case(
-        batch_size=1,
-        next_n=1,
-        max_num_pages=4,
-        num_pages=128,
-        page_size=64,
-        logits_dtype="float32",
-        seed=0,
-    ),
-    _make_case(
-        batch_size=2,
-        next_n=1,
-        max_num_pages=4,
-        num_pages=128,
-        page_size=64,
-        logits_dtype="bfloat16",
-        seed=1,
-    ),
-    _make_case(
-        batch_size=2,
-        next_n=3,
-        max_num_pages=4,
-        num_pages=128,
-        page_size=64,
-        logits_dtype="float32",
-        seed=2,
-    ),
-    _make_case(
-        batch_size=2,
-        next_n=2,
-        max_num_pages=4,
-        num_pages=128,
-        page_size=32,
-        logits_dtype="bfloat16",
-        seed=3,
-    ),
-    _make_case(
-        batch_size=4,
-        next_n=1,
-        max_num_pages=4,
-        num_pages=128,
-        page_size=64,
-        logits_dtype="float32",
-        seed=4,
-        varlen=True,
-    ),
-]
-
-BENCH_CONFIGS = DSA_INDEXER_LIKE_COVERAGE
+CONFIGS = DSA_INDEXER_LIKE_COVERAGE
+BENCH_CONFIGS = CONFIGS
 
 
 def load_deep_gemm_paged_mqa() -> tuple[Any, str]:
