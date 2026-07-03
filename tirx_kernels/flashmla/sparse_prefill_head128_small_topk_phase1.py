@@ -662,13 +662,11 @@ def _kernel(
                     cur_indices = T.alloc_local((WG1_ROWS_PER_WARP,), "int32")
                     for local_row in T.unroll(WG1_ROWS_PER_WARP // 8):
                         row: T.let = local_row * (4 * 8) + wg1_warp_idx * 8
-                        T.ptx.ld(
+                        T.ptx.ld_global_nc(
                             indices.ptr_to([wg1_g_indices_base + k * B_TOPK + row]),
                             "int32",
                             "s32",
                             dst=cur_indices.ptr_to([local_row * 8]),
-                            space="global",
-                            cop="nc",
                             vec="v8",
                             l1_evict="L1::no_allocate",
                             l2_evict="L2::evict_first",
@@ -859,13 +857,11 @@ def _kernel(
                     valid_num_k_blocks: T.let = T.max((valid_topk_len + B_TOPK - 1) // B_TOPK, 1)
                     valid_g_indices_base: T.let = valid_s_q_idx * stride_indices_s_q
                     for k in T.serial(0, valid_num_k_blocks, unroll=False):
-                        T.ptx.ld(
+                        T.ptx.ld_global_nc(
                             indices.ptr_to([valid_g_indices_base + k * B_TOPK + lane_idx * 8]),
                             "int32",
                             "s32",
                             dst=lane_indices.ptr_to([0]),
-                            space="global",
-                            cop="nc",
                             vec="v8",
                             l1_evict="L1::no_allocate",
                             l2_evict="L2::evict_normal",

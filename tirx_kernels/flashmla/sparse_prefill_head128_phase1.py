@@ -1175,13 +1175,11 @@ def _kernel(
             if lane_idx < B_TOPK // 8:
                 lane_indices = T.alloc_local((8,), "int32")
                 for k in T.serial(0, num_k_blocks, unroll=False):
-                    T.ptx.ld(
+                    T.ptx.ld_global_nc(
                         indices.ptr_to([g_indices_base + k * B_TOPK + lane_idx * 8]),
                         "int32",
                         "s32",
                         dst=lane_indices.ptr_to([0]),
-                        space="global",
-                        cop="nc",
                         vec="v8",
                         l1_evict="L1::evict_normal",
                         l2_evict="L2::evict_normal",

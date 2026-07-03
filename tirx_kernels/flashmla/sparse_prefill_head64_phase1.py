@@ -896,7 +896,7 @@ def _kernel(
                         + local_row * WG1_NUM_WARPS * 4
                         + wg1_warp_idx * 4
                     )
-                    T.ptx.ld(
+                    T.ptx.ld_global_nc(
                         indices.ptr_to([row_base]),
                         "int32",
                         "s32",
@@ -906,8 +906,6 @@ def _kernel(
                             selected_idx2.ptr_to([local_row]),
                             selected_idx3.ptr_to([local_row]),
                         ),
-                        space="global",
-                        cop="nc",
                         vec="v4",
                     )
                     idx0: T.let = selected_idx0[local_row]
@@ -1241,13 +1239,11 @@ def _kernel(
                 lane_indices = T.alloc_local((8,), "int32")
                 for k in T.serial(0, num_k_blocks, unroll=False):
                     abs_pos_start: T.let = k * B_TOPK
-                    T.ptx.ld(
+                    T.ptx.ld_global_nc(
                         indices.ptr_to([g_indices_base + k * B_TOPK + lane_idx * 8]),
                         "int32",
                         "s32",
                         dst=lane_indices.ptr_to([0]),
-                        space="global",
-                        cop="nc",
                         vec="v8",
                         l1_evict="L1::no_allocate",
                         l2_evict="L2::evict_normal",
