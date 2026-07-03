@@ -71,7 +71,6 @@ from ..nymph_rs import (
     ScalarDType,
     SmemSwizzleLayout,
     Swizzle,
-    Tensor,
     TensorSlice,
     TmemLayout,
     TmemLayoutKind,
@@ -315,10 +314,7 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
     # CLC response handle: a 16B (uint32[4]) SMEM cell the scheduler's `clc_try_cancel`
     # fills and `clc_query_cancel` decodes. The kernel's own object (policy="custom").
     clc_handle = k.tensor(
-        space=MemorySpace.SMEM,
-        dtype=DType.U32,
-        shape=(CLC_HANDLE_WORDS,),
-        byte_offset=clc_off,
+        space=MemorySpace.SMEM, dtype=DType.U32, shape=(CLC_HANDLE_WORDS,), byte_offset=clc_off
     )
 
     # TMEM: one 512-col allocation; the accumulator is the leading TMEM_SLOTS *
@@ -500,13 +496,16 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
         # modulo/shift went vector + spilled). Walked inside a T.serial loop (uniform iteration).
         ld_stage = k.scalar(initial=0, dtype=ScalarDType.I32)
         ld_phase = k.scalar(initial=0, dtype=ScalarDType.I32)
-        with task_loop() as (
-            task_id,
-            local_iter,
-        ):
+        with task_loop() as (task_id, local_iter):
             # Hoist the per-task tile coords into registers ONCE per task (canon's
             # `buffer_5`/`buffer_6`), instead of re-deriving the L2-raster expression
             # `(task>>6)*4 + (task&63)&3` inline in every TMA address (3x/k-tile here).
+            # shuffle_sync: the task id comes from a scheduler-mailbox LDS (a vector
+            # load ptxas can't prove warp-uniform), but the TMA issue is a UNIFORM-pipe
+            # instruction (UTMALDG) whose coords live in URs — unwrapped, every TMA
+            # issue pays vector math + R2UR moves (ncu fp16 1024: R2UR 13.5K vs canon
+            # 1.8K, clustered on the two g2cluster lines). Same treatment as nvfp4's
+            # task loops (which wrap under elected=True as well).
             m_idx_e, n_idx_e = work_coords(task_id)
             m_idx = k.scalar(initial=m_idx_e, dtype=ScalarDType.I32)
             n_idx = k.scalar(initial=n_idx_e, dtype=ScalarDType.I32)
@@ -531,7 +530,9 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
                         mbar_stage=ld_stage,
                     )
                 k.tma_load(
-                    TensorSlice(tensor=b_smem, offsets=(ld_stage, 0, 0), shape=(1, r.blk_n, r.blk_k)),
+                    TensorSlice(
+                        tensor=b_smem, offsets=(ld_stage, 0, 0), shape=(1, r.blk_n, r.blk_k)
+                    ),
                     b_gmem,
                     mbar=smem_full,
                     bytes=b_tile_bytes,
@@ -556,10 +557,7 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
                 # descriptor address math is one increment per iter (NOT a per-iter modulo).
                 mma_stage = k.scalar(initial=0, dtype=ScalarDType.I32)
                 mma_phase = k.scalar(initial=0, dtype=ScalarDType.I32)
-                with task_loop() as (
-                    task_id,
-                    local_iter,
-                ):
+                with task_loop() as (task_id, local_iter):
                     if r.overlap:
                         slot = local_iter % r.tmem_slots
                         tmem_empty_phase = (local_iter // r.tmem_slots + 1) % 2
@@ -600,7 +598,10 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
                                 cta_group=CTA_GROUP,
                             )
                         k.tcgen05_commit(
-                            smem_empty, stage=mma_stage, cta_group=CTA_GROUP, multicast_cta_mask=0b11
+                            smem_empty,
+                            stage=mma_stage,
+                            cta_group=CTA_GROUP,
+                            multicast_cta_mask=0b11,
                         )
                         _advance_ring(k, mma_stage, mma_phase, r.pipe_depth)
 
@@ -623,19 +624,25 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
         with k.role(warpgroup=c, maxnreg=cons_maxnreg):
             if r.overlap:
                 k.cluster_barrier_wait()
-            with task_loop(wg_bar=wg_bar) as (
-                task_id,
-                local_iter,
-            ):
+            with task_loop(wg_bar=wg_bar) as (task_id, local_iter):
                 # The writeback fragments are declared FRESH per wb-tile inside the epilogue
                 # readback loops below (canon's loop-local Dreg/Dreg_16b) so ptxas promotes them
                 # to registers; a task- or function-scope fragment held across the store
                 # warpgroup-syncs spills to local memory (measured: 489K LDL -> 0).
                 # Hoist tile coords once/task (canon's `cur_m`/`cur_n`) — the epilogue
                 # store address re-derives the same L2-raster expression ×8 otherwise.
+                # shuffle_sync makes them compiler-provably warp-UNIFORM so the derived
+                # epilogue address/phase math lowers to the uniform datapath (UIADD3/
+                # UISETP/USEL like canon) instead of vector IMAD/ISETP/SEL + per-use
+                # R2UR conversions — the nvfp4 local_iter treatment (ncu fp16 1024:
+                # nymph R2UR 13.5K vs canon 1.8K, IMAD +9.4K, ISETP +8.3K; isolated
+                # duration 16% over canon). Wrap only the CONSUMER's derived values
+                # (wrapping raw task_id in the producer paths was the June bf16-8192
+                # pathological-compile case).
+                local_iter = k.shuffle_sync(local_iter)
                 m_idx_e, n_idx_e = work_coords(task_id)
-                m_idx = k.scalar(initial=m_idx_e, dtype=ScalarDType.I32)
-                n_idx = k.scalar(initial=n_idx_e, dtype=ScalarDType.I32)
+                m_idx = k.shuffle_sync(m_idx_e)
+                n_idx = k.shuffle_sync(n_idx_e)
                 if r.overlap:
                     slot = local_iter % r.tmem_slots
                     tmem_full_phase = (local_iter // r.tmem_slots) % 2

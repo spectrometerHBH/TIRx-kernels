@@ -55,10 +55,7 @@ def run_bench(M, N, K, *, warmup=None, repeat=None, timer=None, **kwargs):
     Ae, Be = Asf.view(torch.float8_e4m3fn), Bsf.view(torch.float8_e4m3fn)
     oc = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
     on = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
-    funcs = {
-        "canon": lambda: canon(A, B, Asf, Bsf, at, oc),
-        "nymph": lambda: nymph(A, B, Ae, Be, on),
-    }
+    funcs = {"tir": lambda: canon(A, B, Asf, Bsf, at, oc), "tirx": lambda: nymph(A, B, Ae, Be, on)}
     return bench(funcs, warmup=warmup, repeat=repeat, timer=timer, **kwargs)
 
 
