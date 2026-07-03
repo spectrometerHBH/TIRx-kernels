@@ -231,8 +231,8 @@ void nvfp4_cublaslt(torch::Tensor A, torch::Tensor B, torch::Tensor A_scale,
     return _CUBLASLT_EXT
 
 
-def _tma_g2c_args(bar, stage, cta_mask, cta_group):
-    """Shared kwargs for the A/B and SF TMA g2c loads; only the mbarrier and
+def _tma_g2s_args(bar, stage, cta_mask, cta_group):
+    """Shared kwargs for the A/B and SF TMA g2s loads; only the mbarrier and
     cta_mask vary."""
     return {
         "dispatch": "tma",
@@ -408,9 +408,9 @@ def _kernel(
                     tile_full_bar.ptr_to([stage]), tile_bytes, cta_id=pair_leader_rank
                 )
             single_cta_mask: T.int32 = 1 << id_in_pair
-            # Barrier pre-mapped to the cluster leader (the g2c primitive maps
+            # Barrier pre-mapped to the cluster leader (the g2s primitive maps
             # neither the barrier nor expect_tx — both handled above).
-            tile_copy = T.meta_var(_tma_g2c_args(tile_full_bar, stage, single_cta_mask, CTA_GROUP))
+            tile_copy = T.meta_var(_tma_g2s_args(tile_full_bar, stage, single_cta_mask, CTA_GROUP))
             Tx.copy_async(
                 A_smem_packed[stage, 0:CTA_M, 0 : CTA_K // 2],
                 A_packed[a_m : a_m + CTA_M, k : k + CTA_K // 2],
@@ -445,13 +445,13 @@ def _kernel(
             single_cta_mask: T.int32 = 1 << id_in_pair
             # SFA: each CTA loads its half (single_cta_mask). SFB: multicast to
             # both CTAs (pair_mask).
-            sfa_copy = T.meta_var(_tma_g2c_args(scale_full_bar, stage, single_cta_mask, CTA_GROUP))
+            sfa_copy = T.meta_var(_tma_g2s_args(scale_full_bar, stage, single_cta_mask, CTA_GROUP))
             Tx.copy_async(
                 SFA_smem[stage, 0:CTA_M, 0:SF_CTA_K],
                 SFA_in[sf_m : sf_m + CTA_M, sf_k : sf_k + SF_CTA_K],
                 **sfa_copy,
             )
-            sfb_copy = T.meta_var(_tma_g2c_args(scale_full_bar, stage, pair_mask, CTA_GROUP))
+            sfb_copy = T.meta_var(_tma_g2s_args(scale_full_bar, stage, pair_mask, CTA_GROUP))
             if SFB_N == 128:
                 if id_in_pair == 0:
                     Tx.copy_async(

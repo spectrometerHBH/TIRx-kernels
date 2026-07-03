@@ -655,12 +655,12 @@ def _kernel(
                 )
                 p_pair0: T.let = T.cuda.make_float2(p[exchange_i * 4], p[exchange_i * 4 + 1])
                 peer_pair0: T.let = T.cuda.make_float2(p_exchange_tmp[0], p_exchange_tmp[1])
-                p_add_pair0: T.let = T.ptx.add_f32x2_val(p_pair0, peer_pair0)
+                p_add_pair0: T.let = T.ptx.add_f32x2(p_pair0, peer_pair0, dps=False)
                 p[exchange_i * 4] = T.cuda.float2_x(p_add_pair0)
                 p[exchange_i * 4 + 1] = T.cuda.float2_y(p_add_pair0)
                 p_pair1: T.let = T.cuda.make_float2(p[exchange_i * 4 + 2], p[exchange_i * 4 + 3])
                 peer_pair1: T.let = T.cuda.make_float2(p_exchange_tmp[2], p_exchange_tmp[3])
-                p_add_pair1: T.let = T.ptx.add_f32x2_val(p_pair1, peer_pair1)
+                p_add_pair1: T.let = T.ptx.add_f32x2(p_pair1, peer_pair1, dps=False)
                 p[exchange_i * 4 + 2] = T.cuda.float2_x(p_add_pair1)
                 p[exchange_i * 4 + 3] = T.cuda.float2_y(p_add_pair1)
 
@@ -694,11 +694,11 @@ def _kernel(
             scale_pair: T.let = T.cuda.make_float2(sm_scale_div_log2, sm_scale_div_log2)
             for s_i in T.unroll(num_elems_per_thread // 2):
                 p_pair: T.let = T.cuda.make_float2(p[s_i * 2], p[s_i * 2 + 1])
-                fma_pair: T.let = T.ptx.fma_f32x2_val(p_pair, scale_pair, neg_new_max_pair)
+                fma_pair: T.let = T.ptx.fma_f32x2(p_pair, scale_pair, neg_new_max_pair, dps=False)
                 s_x: T.let = T.ptx.exp2(T.cuda.float2_x(fma_pair))
                 s_y: T.let = T.ptx.exp2(T.cuda.float2_y(fma_pair))
                 s_pair: T.let = T.cuda.make_float2(s_x, s_y)
-                cur_sum_pair = T.ptx.add_f32x2_val(cur_sum_pair, s_pair)
+                cur_sum_pair = T.ptx.add_f32x2(cur_sum_pair, s_pair, dps=False)
                 s_pack[s_i] = T.cuda.float22bfloat162_rn(s_x, s_y)
             cur_sum: T.let = T.cuda.float2_x(cur_sum_pair) + T.cuda.float2_y(cur_sum_pair)
             li_tmp = T.alloc_local((1,), "float32")
@@ -739,7 +739,9 @@ def _kernel(
                         o_pair: T.let = T.cuda.make_float2(
                             o_rescale[o_i * 2], o_rescale[o_i * 2 + 1]
                         )
-                        o_scaled_pair: T.let = T.ptx.mul_f32x2_val(o_pair, scale_for_old_pair)
+                        o_scaled_pair: T.let = T.ptx.mul_f32x2(
+                            o_pair, scale_for_old_pair, dps=False
+                        )
                         o_rescale[o_i * 2] = T.cuda.float2_x(o_scaled_pair)
                         o_rescale[o_i * 2 + 1] = T.cuda.float2_y(o_scaled_pair)
                     Tx.wg.copy_async(
@@ -815,7 +817,7 @@ def _kernel(
                     for o_j in T.unroll(4):
                         o_pair_idx: T.let = o_i * 8 + o_j * 2
                         o_pair: T.let = T.cuda.make_float2(o_epi[o_pair_idx], o_epi[o_pair_idx + 1])
-                        o_epi_pair: T.let = T.ptx.mul_f32x2_val(o_pair, output_scale_pair)
+                        o_epi_pair: T.let = T.ptx.mul_f32x2(o_pair, output_scale_pair, dps=False)
                         o_epi[o_pair_idx] = T.cuda.float2_x(o_epi_pair)
                         o_epi[o_pair_idx + 1] = T.cuda.float2_y(o_epi_pair)
                         o_epi_bf16[o_j] = T.cuda.float22bfloat162_rn(

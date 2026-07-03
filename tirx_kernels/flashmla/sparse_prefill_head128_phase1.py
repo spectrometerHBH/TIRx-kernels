@@ -600,7 +600,7 @@ def _kernel(
                 p_pair: T.let = T.cuda.make_float2(
                     T.cuda.uint_as_float(p[s_i * 2]), T.cuda.uint_as_float(p[s_i * 2 + 1])
                 )
-                fma_pair: T.let = T.ptx.fma_f32x2_val(p_pair, scale_pair, neg_new_max_pair)
+                fma_pair: T.let = T.ptx.fma_f32x2(p_pair, scale_pair, neg_new_max_pair, dps=False)
                 s_x: T.let = T.ptx.exp2(T.cuda.float2_x(fma_pair))
                 s_y: T.let = T.ptx.exp2(T.cuda.float2_y(fma_pair))
                 li = li + s_x + s_y
@@ -639,7 +639,9 @@ def _kernel(
                         o_pair: T.let = T.cuda.make_float2(
                             o_rescale[o_i * 2], o_rescale[o_i * 2 + 1]
                         )
-                        o_scaled_pair: T.let = T.ptx.mul_f32x2_val(o_pair, scale_for_old_pair)
+                        o_scaled_pair: T.let = T.ptx.mul_f32x2(
+                            o_pair, scale_for_old_pair, dps=False
+                        )
                         o_rescale[o_i * 2] = T.cuda.float2_x(o_scaled_pair)
                         o_rescale[o_i * 2 + 1] = T.cuda.float2_y(o_scaled_pair)
                     Tx.wg.copy_async(
@@ -712,7 +714,7 @@ def _kernel(
                 for o_j in T.unroll(4):
                     o_pair_idx: T.let = o_i * 8 + o_j * 2
                     o_pair: T.let = T.cuda.make_float2(o_epi[o_pair_idx], o_epi[o_pair_idx + 1])
-                    o_epi_pair: T.let = T.ptx.mul_f32x2_val(o_pair, output_scale_pair)
+                    o_epi_pair: T.let = T.ptx.mul_f32x2(o_pair, output_scale_pair, dps=False)
                     o_epi_bf16[o_j] = T.cuda.float22bfloat162_rn(
                         T.cuda.float2_x(o_epi_pair), T.cuda.float2_y(o_epi_pair)
                     )

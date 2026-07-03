@@ -1765,24 +1765,33 @@ def get_kernel(
     def tma_store_2d(src, tensormap, coord0, coord1):
         return T.ptx.cp_async.bulk.tensor.s2g(2, src, T.address_of(tensormap), "", coord0, coord1)
 
-    def sm100_tma_2sm_load_2d_addr(dst, bar, tensormap_addr, coord0, coord1):
-        bar_addr = T.cuda.sm100_tma_2sm_mbarrier_addr(bar)
+    def sm100_tma_2sm_load_2d_addr(dst, mbar, tensormap_addr, coord0, coord1):
+        mbar_addr = T.cuda.sm100_2sm_leader_smem_addr(mbar)
         T.evaluate(
-            T.ptx.cp_async.bulk.tensor.g2c_bar_addr(
-                2, dst, bar_addr, tensormap_addr, 1, 2, "evict_normal", coord0, coord1
+            T.ptx.cp_async.bulk.tensor.g2s_cluster(
+                2,
+                dst,
+                mbar_addr,
+                tensormap_addr,
+                1,
+                2,
+                "evict_normal",
+                coord0,
+                coord1,
+                mbar_is_shared_addr=True,
             )
         )
 
-    def sm100_tma_2sm_load_2d(dst, bar, tensormap, coord0, coord1):
-        sm100_tma_2sm_load_2d_addr(dst, bar, T.address_of(tensormap), coord0, coord1)
+    def sm100_tma_2sm_load_2d(dst, mbar, tensormap, coord0, coord1):
+        sm100_tma_2sm_load_2d_addr(dst, mbar, T.address_of(tensormap), coord0, coord1)
 
     @T.inline
     def sm100_tma_2sm_load_2d_select(
-        dst, bar, tensor_map_l1, tensor_map_l2, block_phase_value, coord0, coord1
+        dst, mbar, tensor_map_l1, tensor_map_l2, block_phase_value, coord0, coord1
     ):
         sm100_tma_2sm_load_2d_addr(
             dst,
-            bar,
+            mbar,
             T.Select(
                 block_phase_value == 1, T.address_of(tensor_map_l1), T.address_of(tensor_map_l2)
             ),
