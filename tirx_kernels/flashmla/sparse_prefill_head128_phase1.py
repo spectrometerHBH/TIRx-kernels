@@ -804,8 +804,8 @@ def _kernel(
                     T.ptx.mbarrier.complete_tx(
                         bar_k_part0_ready.ptr_to([cur_buf]),
                         T.uint32(WG1_NUM_LOCAL_ROWS_PER_WARP * 4 * d_sq * BF16_BYTES),
-                        T.uint32(0),
-                        T.uint32(1),
+                        remote=T.uint32(0),
+                        pred=T.uint32(1),
                     )
 
                 if k > 0:
@@ -856,8 +856,8 @@ def _kernel(
                     T.ptx.mbarrier.complete_tx(
                         bar_k_part1_ready.ptr_to([cur_buf]),
                         T.uint32(WG1_NUM_LOCAL_ROWS_PER_WARP * 4 * D_TQ * BF16_BYTES),
-                        T.uint32(0),
-                        T.uint32(1),
+                        remote=T.uint32(0),
+                        pred=T.uint32(1),
                     )
 
     elif warpgroup_idx == 2:
