@@ -587,17 +587,28 @@ def _kernel(
 
             for exchange_i in T.unroll(num_elems_per_thread // 4):
                 exchange_offset = exchange_i * 32 * 4 + lane_idx * 4
-                Tx.copy(
-                    p_exchange_buf[warp_idx ^ 2, exchange_offset : exchange_offset + 4],
-                    p_peer[exchange_i * 4 : exchange_i * 4 + 4],
+                p_peer_offset: T.let = exchange_i * 4
+                T.ptx.st(
+                    p_exchange_buf.ptr_to([warp_idx ^ 2, exchange_offset]),
+                    p_peer[p_peer_offset],
+                    p_peer[p_peer_offset + 1],
+                    p_peer[p_peer_offset + 2],
+                    p_peer[p_peer_offset + 3],
+                    space="shared",
+                    vec="v4",
+                    ptx_type="f32",
                 )
             T.ptx.bar.sync(NAMED_BARRIER_WG0_WARP02_SYNC + T.bitwise_and(warp_idx, T.int32(1)), 64)
             for exchange_i in T.unroll(num_elems_per_thread // 4):
                 exchange_offset = exchange_i * 32 * 4 + lane_idx * 4
                 p_exchange_tmp = T.alloc_local((4,), "float32")
-                Tx.copy(
-                    p_exchange_tmp[:],
-                    p_exchange_buf[warp_idx, exchange_offset : exchange_offset + 4],
+                T.ptx.ld(
+                    p_exchange_buf.ptr_to([warp_idx, exchange_offset]),
+                    "float32",
+                    "f32",
+                    dst=p_exchange_tmp.ptr_to([0]),
+                    space="shared",
+                    vec="v4",
                 )
                 p_pair0: T.let = T.cuda.make_float2(p[exchange_i * 4], p[exchange_i * 4 + 1])
                 peer_pair0: T.let = T.cuda.make_float2(p_exchange_tmp[0], p_exchange_tmp[1])
@@ -659,9 +670,16 @@ def _kernel(
             # CUDA phase1.cuh:229-232 vectorized uint128_t stores to sS_base.
             for s_store_i in T.unroll(num_elems_per_thread // 8):
                 s_store_offset = s_smem_lane_offset + B_H * 8 * s_store_i
-                Tx.copy(
-                    s_q_rope_s.view("uint32")[s_store_offset // 2 : s_store_offset // 2 + 4],
-                    s_pack[s_store_i * 4 : s_store_i * 4 + 4],
+                s_pack_offset: T.let = s_store_i * 4
+                T.ptx.st(
+                    s_q_rope_s.view("uint32").ptr_to([s_store_offset // 2]),
+                    s_pack[s_pack_offset],
+                    s_pack[s_pack_offset + 1],
+                    s_pack[s_pack_offset + 2],
+                    s_pack[s_pack_offset + 3],
+                    space="shared",
+                    vec="v4",
+                    ptx_type="u32",
                 )
             if (k > 0) & should_scale_o:
                 T.ptx.tcgen05.fence.after_thread_sync()
@@ -773,11 +791,15 @@ def _kernel(
                         epi_c * (D_V // 2) + (idx_in_warpgroup // B_H) * (D_V // 4) + epi_k * b_epi
                     )
                     o_base_col: T.let = o_i * 8 + o_store_source_offset
-                    Tx.copy(
-                        o_smem.view("uint32")[
-                            idx_in_warpgroup % B_H, o_base_col // 2 : o_base_col // 2 + 4
-                        ],
-                        o_epi_bf16[:],
+                    T.ptx.st(
+                        o_smem.view("uint32").ptr_to([idx_in_warpgroup % B_H, o_base_col // 2]),
+                        o_epi_bf16[0],
+                        o_epi_bf16[1],
+                        o_epi_bf16[2],
+                        o_epi_bf16[3],
+                        space="shared",
+                        vec="v4",
+                        ptx_type="u32",
                     )
                 T.ptx.fence.proxy_async("shared::cta")
                 T.ptx.bar.sync(NAMED_BARRIER_WG0_SYNC, 128)

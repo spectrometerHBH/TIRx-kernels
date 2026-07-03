@@ -544,11 +544,15 @@ def _kernel(
                         )
                     o_base_col: T.let = (idx_in_warpgroup // 64) * (D_V // 2) + epi_k * B_EPI
                     q_smem_col: T.let = o_base_col + o_i * 8
-                    Tx.copy(
-                        q_smem.view("uint32")[
-                            idx_in_warpgroup % 64, q_smem_col // 2 : q_smem_col // 2 + 4
-                        ],
-                        o_epi_bf16[:],
+                    T.ptx.st(
+                        q_smem.view("uint32").ptr_to([idx_in_warpgroup % 64, q_smem_col // 2]),
+                        o_epi_bf16[0],
+                        o_epi_bf16[1],
+                        o_epi_bf16[2],
+                        o_epi_bf16[3],
+                        space="shared",
+                        vec="v4",
+                        ptx_type="u32",
                     )
 
             T.ptx.fence.proxy_async("shared::cta")
@@ -992,17 +996,28 @@ def _kernel(
 
                 for exchange_i in T.unroll(WG3_NUM_ELEMS_PER_THREAD // 4):
                     exchange_offset = exchange_i * 32 * 4 + lane_idx * 4
-                    Tx.copy(
-                        p_exchange[local_warp_idx ^ 2, exchange_offset : exchange_offset + 4],
-                        p_peer[exchange_i * 4 : exchange_i * 4 + 4],
+                    p_peer_offset: T.let = exchange_i * 4
+                    T.ptx.st(
+                        p_exchange.ptr_to([local_warp_idx ^ 2, exchange_offset]),
+                        p_peer[p_peer_offset],
+                        p_peer[p_peer_offset + 1],
+                        p_peer[p_peer_offset + 2],
+                        p_peer[p_peer_offset + 3],
+                        space="shared",
+                        vec="v4",
+                        ptx_type="u32",
                     )
                 T.ptx.bar.sync(NAMED_BARRIER_WG2_WARP02_SYNC + (local_warp_idx & 1), 64)
                 for exchange_i in T.unroll(WG3_NUM_ELEMS_PER_THREAD // 4):
                     exchange_offset = exchange_i * 32 * 4 + lane_idx * 4
                     p_exchange_tmp = T.alloc_local((4,), "uint32")
-                    Tx.copy(
-                        p_exchange_tmp[:],
-                        p_exchange[local_warp_idx, exchange_offset : exchange_offset + 4],
+                    T.ptx.ld(
+                        p_exchange.ptr_to([local_warp_idx, exchange_offset]),
+                        "uint32",
+                        "u32",
+                        dst=p_exchange_tmp.ptr_to([0]),
+                        space="shared",
+                        vec="v4",
                     )
                     p_pair0: T.let = T.cuda.make_float2(
                         T.cuda.uint_as_float(p[exchange_i * 4]),
@@ -1073,9 +1088,16 @@ def _kernel(
                 bar_SV_done.wait(0, (wg3_rs & 1) ^ 1)
                 for s_store_i in T.unroll(WG3_NUM_ELEMS_PER_THREAD // 8):
                     s_store_offset = s_smem_base + s_store_i * 8 * (B_H // 2)
-                    Tx.copy(
-                        s_smem.view("uint32")[s_store_offset // 2 : s_store_offset // 2 + 4],
-                        s_pack[s_store_i * 4 : s_store_i * 4 + 4],
+                    s_pack_offset: T.let = s_store_i * 4
+                    T.ptx.st(
+                        s_smem.view("uint32").ptr_to([s_store_offset // 2]),
+                        s_pack[s_pack_offset],
+                        s_pack[s_pack_offset + 1],
+                        s_pack[s_pack_offset + 2],
+                        s_pack[s_pack_offset + 3],
+                        space="shared",
+                        vec="v4",
+                        ptx_type="u32",
                     )
 
                 if (k > 0) & should_scale_o:
