@@ -495,7 +495,7 @@ def _kernel(
             p = p_frag.local()
             T.ptx.tcgen05.wait.ld()
             T.ptx.tcgen05.fence.before_thread_sync()
-            bar_p_free.arrive(cur_buf, cta_id=T.uint32(0))
+            bar_p_free.arrive(cur_buf, remote=T.uint32(0))
 
             bar_k_valid_ready.wait(cur_buf, cur_phase)
             valid_word_offset: T.let = T.if_then_else(idx_in_warpgroup >= 64, B_TOPK // 8 // 2, 0)
@@ -604,7 +604,7 @@ def _kernel(
                 T.ptx.tcgen05.fence.before_thread_sync()
 
             T.ptx.fence.proxy_async("shared::cta")
-            bar_so_ready.arrive(cur_buf, cta_id=T.uint32(0))
+            bar_so_ready.arrive(cur_buf, remote=T.uint32(0))
 
         if real_mi == T.float32(-float("inf")):
             li = 0.0

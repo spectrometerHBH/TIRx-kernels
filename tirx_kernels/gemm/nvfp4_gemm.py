@@ -405,7 +405,7 @@ def _kernel(
             if id_in_pair == 0:
                 tile_bytes = T.meta_var(A_BYTES + B_BYTES)
                 T.ptx.mbarrier.arrive.expect_tx(
-                    tile_full_bar.ptr_to([stage]), tile_bytes, cta_id=pair_leader_rank
+                    tile_full_bar.ptr_to([stage]), tile_bytes, remote=pair_leader_rank, pred=True
                 )
             single_cta_mask: T.int32 = 1 << id_in_pair
             # Barrier pre-mapped to the cluster leader (the g2s primitive maps
@@ -440,7 +440,7 @@ def _kernel(
             if id_in_pair == 0:
                 scale_bytes = T.meta_var(SFA_BYTES + SFB_BYTES)
                 T.ptx.mbarrier.arrive.expect_tx(
-                    scale_full_bar.ptr_to([stage]), scale_bytes, cta_id=pair_leader_rank
+                    scale_full_bar.ptr_to([stage]), scale_bytes, remote=pair_leader_rank, pred=True
                 )
             single_cta_mask: T.int32 = 1 << id_in_pair
             # SFA: each CTA loads its half (single_cta_mask). SFB: multicast to
@@ -556,7 +556,7 @@ def _kernel(
                         T.ptx.tcgen05.wait.ld()
                         if tid_in_wg == 0:
                             tmem_pipe.empty.arrive(
-                                epi_cur.stage, cta_id=pair_leader_rank, pred=True, count=1
+                                epi_cur.stage, remote=pair_leader_rank, pred=True, count=1
                             )
                     Tx.wg.mul(reg_ldst, reg_ldst, alpha_local)
                     Tx.wg.cast(reg_ldst_16b, reg_ldst)
@@ -574,7 +574,7 @@ def _kernel(
                 Tx.wg.cast(reg_all_16b, reg_all)
                 if tid_in_wg == 0:
                     tmem_pipe.empty.arrive(
-                        epi_cur.stage, cta_id=pair_leader_rank, pred=True, count=1
+                        epi_cur.stage, remote=pair_leader_rank, pred=True, count=1
                     )
                 T.cuda.warpgroup_sync(1)
                 for no in T.unroll(MMA_N // EPI_TILE):
@@ -590,8 +590,11 @@ def _kernel(
         T.cuda.warpgroup_sync(1)
     if warp_id == int(WarpRole.EPILOGUE):
         if T.ptx.elect_sync():
-            T.ptx.mbarrier.arrive.cluster_count(
-                tmem_finished.ptr_to([0]), pair_leader_rank + 1 - id_in_pair, 1
+            T.ptx.mbarrier.arrive(
+                tmem_finished.ptr_to([0]),
+                remote=pair_leader_rank + 1 - id_in_pair,
+                pred=True,
+                count=1,
             )
         T.ptx.mbarrier.try_wait_acquire_cluster(tmem_finished.ptr_to([0]), 0)
         T.ptx.tcgen05.dealloc(tmem_pool.addr, n_cols=512, cta_group=CTA_GROUP)

@@ -532,7 +532,7 @@ def _kernel(
                     else:
                         bar_tQ_full.wait(0, o_outer_loop_phase ^ 1)
                 if epi_k == ((D_V // 2) // B_EPI) - 1:
-                    bar_tOut_empty.arrive(0, cta_id=T.uint32(0))
+                    bar_tOut_empty.arrive(0, remote=T.uint32(0))
                 for o_i in T.unroll(B_EPI // 8):
                     o_epi_bf16 = T.alloc_local((4,), "uint32")
                     for o_j in T.unroll(4):
@@ -597,7 +597,7 @@ def _kernel(
             wg0_next_job: T.let = T.ptx.clc_query_cancel(
                 T.address_of(clc_response[0]), use_ld_acquire=True
             )
-            T.ptx.mbarrier.arrive(bar_clc_empty.ptr_to([0]), cta_id=T.uint32(0), pred=True)
+            T.ptx.mbarrier.arrive(bar_clc_empty.ptr_to([0]), remote=T.uint32(0), pred=True)
             if wg0_next_job == T.uint32(0xFFFFFFFF):
                 wg0_job_valid = 0
             else:
@@ -706,7 +706,7 @@ def _kernel(
                 wg1_next_job: T.let = T.ptx.clc_query_cancel(
                     T.address_of(clc_response[0]), use_ld_acquire=True
                 )
-                T.ptx.mbarrier.arrive(bar_clc_empty.ptr_to([0]), cta_id=T.uint32(0), pred=True)
+                T.ptx.mbarrier.arrive(bar_clc_empty.ptr_to([0]), remote=T.uint32(0), pred=True)
                 if wg1_next_job == T.uint32(0xFFFFFFFF):
                     wg1_job_valid = 0
                 else:
@@ -809,7 +809,7 @@ def _kernel(
                     umma_next_job: T.let = T.ptx.clc_query_cancel(
                         T.address_of(clc_response[0]), use_ld_acquire=True
                     )
-                    T.ptx.mbarrier.arrive(bar_clc_empty.ptr_to([0]), cta_id=T.uint32(0), pred=True)
+                    T.ptx.mbarrier.arrive(bar_clc_empty.ptr_to([0]), remote=T.uint32(0), pred=True)
                     if umma_next_job == T.uint32(0xFFFFFFFF):
                         umma_job_valid = 0
                     else:
@@ -864,7 +864,7 @@ def _kernel(
                     valid_next_job: T.let = T.ptx.clc_query_cancel(
                         T.address_of(clc_response[0]), use_ld_acquire=True
                     )
-                    T.ptx.mbarrier.arrive(bar_clc_empty.ptr_to([0]), cta_id=T.uint32(0), pred=True)
+                    T.ptx.mbarrier.arrive(bar_clc_empty.ptr_to([0]), remote=T.uint32(0), pred=True)
                     if valid_next_job == T.uint32(0xFFFFFFFF):
                         valid_job_valid = 0
                     else:
@@ -891,7 +891,7 @@ def _kernel(
                             T.address_of(clc_response[0]), use_ld_acquire=True
                         )
                         T.ptx.mbarrier.arrive(
-                            bar_clc_empty.ptr_to([0]), cta_id=T.uint32(0), pred=True
+                            bar_clc_empty.ptr_to([0]), remote=T.uint32(0), pred=True
                         )
                         if clc_next_job == T.uint32(0xFFFFFFFF):
                             clc_job_valid = 0
@@ -973,7 +973,7 @@ def _kernel(
                     )
                 T.ptx.tcgen05.wait.ld()
                 T.ptx.tcgen05.fence.before_thread_sync()
-                bar_P_empty.arrive(0, cta_id=T.uint32(0))
+                bar_P_empty.arrive(0, remote=T.uint32(0))
 
                 valid_word_offset: T.let = T.if_then_else(
                     local_warp_idx >= 2, WG3_NUM_ELEMS_PER_THREAD // 8, 0
@@ -1110,7 +1110,7 @@ def _kernel(
                     T.ptx.tcgen05.fence.before_thread_sync()
 
                 T.ptx.fence.proxy_async("shared::cta")
-                bar_S_O_full.arrive(0, cta_id=T.uint32(0))
+                bar_S_O_full.arrive(0, remote=T.uint32(0))
                 bar_valid_coord_scales_empty.arrive(index_buf_idx)
                 wg3_rs = wg3_rs + 1
 
@@ -1148,7 +1148,7 @@ def _kernel(
             wg3_next_job: T.let = T.ptx.clc_query_cancel(
                 T.address_of(clc_response[0]), use_ld_acquire=True
             )
-            T.ptx.mbarrier.arrive(bar_clc_empty.ptr_to([0]), cta_id=T.uint32(0), pred=True)
+            T.ptx.mbarrier.arrive(bar_clc_empty.ptr_to([0]), remote=T.uint32(0), pred=True)
             if wg3_next_job == T.uint32(0xFFFFFFFF):
                 wg3_job_valid = 0
             else:

@@ -362,7 +362,7 @@ def _kernel(
                     Tx.warp.permute_layout(SFA_smem_post[ks, :], SFA_smem[ks, :])
                     Tx.warp.permute_layout(SFB_smem_post[ks, :], SFB_smem[ks, :])
                     T.ptx.fence.proxy_async("shared::cta")
-                trans_done.arrive(ks, cta_id=0)
+                trans_done.arrive(ks, remote=0)
 
             @T.inline
             def trans_iter():
@@ -477,7 +477,7 @@ def _kernel(
                             D_smem[stage, :, ki * TMEM_LD_SIZE : (ki + 1) * TMEM_LD_SIZE], Dreg_bf16
                         )
                 if ot == STORE_TILES - 1:
-                    tmem_pipe.empty.arrive(tmem_idx, cta_id=0)
+                    tmem_pipe.empty.arrive(tmem_idx, remote=0)
                 T.ptx.fence.proxy_async("shared::cta")
                 T.cuda.warpgroup_sync(10)
                 d_m: T.let = m_idx * DG_BLOCK_M + (ot * 16 if SWAP_AB else 0)

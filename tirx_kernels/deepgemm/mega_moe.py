@@ -3119,7 +3119,7 @@ def get_kernel(
 
         @T.inline
         def tmem_empty_barrier_arrive_cta0(tmem_empty_barrier_ptr):
-            T.ptx.mbarrier.arrive(tmem_empty_barrier_ptr, cta_id=0, pred=True)
+            T.ptx.mbarrier.arrive(tmem_empty_barrier_ptr, remote=0, pred=True)
 
         @T.inline
         def umma_arrive_multicast_2x1sm(barrier_ptr):
@@ -3191,7 +3191,7 @@ def get_kernel(
 
         @T.inline
         def full_barrier_arrive_cta0(full_barrier_ptr):
-            T.ptx.mbarrier.arrive(full_barrier_ptr, cta_id=0, pred=True)
+            T.ptx.mbarrier.arrive(full_barrier_ptr, remote=0, pred=True)
 
         @T.inline
         def make_instr_desc_block_scaled():

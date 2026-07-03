@@ -315,7 +315,7 @@ def _kernel(
                     T.ptx.tcgen05.wait.ld()
                     Tx.wg.cast(Dreg_16b, Dreg)
                     if i == WB_PIPE_DEPTH - 1:
-                        tmem_pipe.empty.arrive(slot, cta_id=0, pred=True)
+                        tmem_pipe.empty.arrive(slot, remote=0, pred=True)
                     db = T.meta_var(i % NUM_D_TILES)
                     T.ptx.cp_async.bulk.wait_group(NUM_D_TILES - 1, read=True)
                     T.cuda.warpgroup_sync(wg_id + 10)
@@ -352,7 +352,7 @@ def _kernel(
                     Tx.wg.copy_async(Dreg, tmem[:, tn : tn + NOL])
                     T.ptx.tcgen05.wait.ld()
                     Tx.wg.cast(Dreg_16b[:, i * NOL : (i + 1) * NOL], Dreg)
-                tmem_pipe.empty.arrive(wg_id, cta_id=0, pred=True)
+                tmem_pipe.empty.arrive(wg_id, remote=0, pred=True)
                 for i in T.unroll(WB_PIPE_DEPTH):
                     db = T.meta_var(i % NUM_D_TILES)
                     T.ptx.cp_async.bulk.wait_group(NUM_D_TILES - 1, read=True)
@@ -401,7 +401,7 @@ def _kernel(
             # cross-CTA mbarrier handshake before dealloc -- lighter than a full cluster_sync.
             T.cuda.warpgroup_sync(wg_id + 10)
             if (warp_id == 0) & (lane_id == 0):
-                tmem_fin.full.arrive(0, cta_id=1 - cbx, pred=True)
+                tmem_fin.full.arrive(0, remote=1 - cbx, pred=True)
             if warp_id == 0:
                 tmem_fin.full.wait(0, 0)
     if not OVERLAP_EPILOGUE:
