@@ -8,6 +8,7 @@ from unittest import SkipTest
 
 import torch
 
+from tirx_kernels.flashmla._gemm import tcgen05_config
 from tirx_kernels.flashmla._tma import tma_config
 from tvm.backend.cuda.operator.tile_primitive.tma_utils import SwizzleMode
 from tvm.script import tirx as T
@@ -34,6 +35,7 @@ WG1_NUM_WARPS = 4
 WG1_NUM_LOCAL_ROWS_PER_WARP = (B_TOPK // 4) // WG1_NUM_WARPS
 
 # KV gather4 TMA knobs shared by both gather call sites.
+_mma_config = partial(tcgen05_config, cta_group=1, weight_stationary=True)
 _kv_gather_tma = partial(
     tma_config, cta_group=1, gather_axis=0, cache_hint=T.uint64(0x14F0000000000000)
 )
@@ -914,11 +916,7 @@ def _kernel(
                                 tmem_p[:, :],
                                 q_rope_tmem[:, :],
                                 k_rope_tiled_mma[:, :],
-                                accum=mma_p_accumulate,
-                                dispatch="tcgen05",
-                                cta_group=1,
-                                smem_desc=mma_smem_desc,
-                                weight_stationary=True,
+                                **_mma_config(accum=mma_p_accumulate, smem_desc=mma_smem_desc),
                             )
                             bar_qk_rope_done.arrive(0)
 
@@ -952,11 +950,7 @@ def _kernel(
                                     kv_nope_part_idx * (D_V // 4) : (kv_nope_part_idx + 1)
                                     * (D_V // 4),
                                 ],
-                                accum=mma_p_accumulate,
-                                dispatch="tcgen05",
-                                cta_group=1,
-                                smem_desc=mma_smem_desc,
-                                weight_stationary=True,
+                                **_mma_config(accum=mma_p_accumulate, smem_desc=mma_smem_desc),
                             )
                         bar_qk_nope_done.arrive(cur_buf)
 
@@ -971,22 +965,14 @@ def _kernel(
                             s_smem_gemm[:, :],
                             k_nope_gemm[cur_buf_prev, :, 0 : D_V // 2],
                             transB=True,
-                            accum=mma_o_accumulate,
-                            dispatch="tcgen05",
-                            cta_group=1,
-                            smem_desc=mma_smem_desc,
-                            weight_stationary=True,
+                            **_mma_config(accum=mma_o_accumulate, smem_desc=mma_smem_desc),
                         )
                         Tx.gemm_async(
                             tmem_o_hi[:, :],
                             s_smem_gemm[:, :],
                             k_nope_gemm[cur_buf_prev, :, D_V // 2 : D_V],
                             transB=True,
-                            accum=mma_o_accumulate,
-                            dispatch="tcgen05",
-                            cta_group=1,
-                            smem_desc=mma_smem_desc,
-                            weight_stationary=True,
+                            **_mma_config(accum=mma_o_accumulate, smem_desc=mma_smem_desc),
                         )
                         mma_o_accumulate = T.uint32(1)
                         bar_sv_done.arrive(cur_buf_prev)

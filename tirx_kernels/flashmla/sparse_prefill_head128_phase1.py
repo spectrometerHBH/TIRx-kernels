@@ -8,6 +8,7 @@ from unittest import SkipTest
 
 import torch
 
+from tirx_kernels.flashmla._gemm import tcgen05_config
 from tirx_kernels.flashmla._tma import tma_config
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
@@ -42,6 +43,7 @@ WG2_NUM_WARPS = 4
 WG2_NUM_LOCAL_ROWS_PER_PART = (B_TOPK // 2) // 4 // WG2_NUM_WARPS
 
 # KV gather4 TMA knobs shared by the gather call sites.
+_mma_config = partial(tcgen05_config, cta_group=2)
 _kv_gather_tma = partial(
     tma_config,
     cta_group=2,
@@ -941,10 +943,7 @@ def _kernel(
                                 tmem_p[:, :],
                                 sq_smem[:, :d_sq],
                                 k_smem[:, :d_sq],
-                                accum=mma_p_accumulate,
-                                dispatch="tcgen05",
-                                cta_group=2,
-                                smem_desc=mma_smem_desc,
+                                **_mma_config(accum=mma_p_accumulate, smem_desc=mma_smem_desc),
                             )
                             mma_p_accumulate = T.uint32(1)
                         bar_qk_part_done.arrive(cur_buf, cta_group=2, cta_mask=3)
@@ -959,10 +958,7 @@ def _kernel(
                             tmem_p[:, :],
                             q_tmem[:, :D_TQ],
                             k_smem[:, d_sq : d_sq + D_TQ],
-                            accum=mma_p_accumulate,
-                            dispatch="tcgen05",
-                            cta_group=2,
-                            smem_desc=mma_smem_desc,
+                            **_mma_config(accum=mma_p_accumulate, smem_desc=mma_smem_desc),
                         )
                         mma_p_accumulate = T.uint32(1)
                         bar_qk_done.arrive(cur_buf, cta_group=2, cta_mask=3)
@@ -983,20 +979,14 @@ def _kernel(
                             s_smem_gemm[:, 0 : B_TOPK // 2],
                             v_smem_gemm[0 : B_TOPK // 2, 0 : D_V // 4],
                             transB=True,
-                            accum=mma_o_accumulate,
-                            dispatch="tcgen05",
-                            cta_group=2,
-                            smem_desc=mma_smem_desc,
+                            **_mma_config(accum=mma_o_accumulate, smem_desc=mma_smem_desc),
                         )
                         Tx.gemm_async(
                             tmem_o_hi[:, :],
                             s_smem_gemm[:, 0 : B_TOPK // 2],
                             v_smem_gemm[0 : B_TOPK // 2, D_V // 4 : D_V // 2],
                             transB=True,
-                            accum=mma_o_accumulate,
-                            dispatch="tcgen05",
-                            cta_group=2,
-                            smem_desc=mma_smem_desc,
+                            **_mma_config(accum=mma_o_accumulate, smem_desc=mma_smem_desc),
                         )
                         mma_o_accumulate = T.uint32(1)
                         bar_sv_part_done.arrive(cur_buf_prev, cta_group=2, cta_mask=3)
@@ -1011,20 +1001,14 @@ def _kernel(
                             s_smem_gemm[:, B_TOPK // 2 : B_TOPK],
                             v_smem_gemm[B_TOPK // 2 : B_TOPK, 0 : D_V // 4],
                             transB=True,
-                            accum=mma_o_accumulate,
-                            dispatch="tcgen05",
-                            cta_group=2,
-                            smem_desc=mma_smem_desc,
+                            **_mma_config(accum=mma_o_accumulate, smem_desc=mma_smem_desc),
                         )
                         Tx.gemm_async(
                             tmem_o_hi[:, :],
                             s_smem_gemm[:, B_TOPK // 2 : B_TOPK],
                             v_smem_gemm[B_TOPK // 2 : B_TOPK, D_V // 4 : D_V // 2],
                             transB=True,
-                            accum=mma_o_accumulate,
-                            dispatch="tcgen05",
-                            cta_group=2,
-                            smem_desc=mma_smem_desc,
+                            **_mma_config(accum=mma_o_accumulate, smem_desc=mma_smem_desc),
                         )
                         mma_o_accumulate = T.uint32(1)
                         bar_sv_done.arrive(cur_buf_prev, cta_group=2, cta_mask=3)

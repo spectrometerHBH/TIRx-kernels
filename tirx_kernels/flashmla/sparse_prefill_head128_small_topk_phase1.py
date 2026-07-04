@@ -8,6 +8,7 @@ from unittest import SkipTest
 
 import torch
 
+from tirx_kernels.flashmla._gemm import tcgen05_config
 from tirx_kernels.flashmla._tma import tma_config
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
@@ -45,6 +46,7 @@ WG1_ROWS_PER_WARP = B_TOPK // 4
 WG3_NUM_ELEMS_PER_THREAD = B_TOPK // 2
 
 # KV gather4 TMA knobs shared by the gather call sites.
+_mma_config = partial(tcgen05_config, cta_group=2, smem_desc="local_hoist")
 _kv_gather_tma = partial(
     tma_config,
     cta_group=2,
@@ -682,10 +684,7 @@ def _kernel(
                                 tmem_p[:, :],
                                 q_tmem[:, :],
                                 k_smem_gemm[k_buf_idx, :, :],
-                                accum=qk_accumulate,
-                                dispatch="tcgen05",
-                                cta_group=2,
-                                smem_desc="local_hoist",
+                                **_mma_config(accum=qk_accumulate),
                             )
                             qk_accumulate = T.uint32(1)
                             bar_QK_done.arrive(0, cta_group=2, cta_mask=3)
@@ -711,20 +710,14 @@ def _kernel(
                                 s_smem_gemm[:, :],
                                 k_smem_gemm[prev_buf, :, 0 : D_V // 4],
                                 transB=True,
-                                accum=o_accumulate,
-                                dispatch="tcgen05",
-                                cta_group=2,
-                                smem_desc="local_hoist",
+                                **_mma_config(accum=o_accumulate),
                             )
                             Tx.gemm_async(
                                 tmem_o_hi[:, :],
                                 s_smem_gemm[:, :],
                                 k_smem_gemm[prev_buf, :, D_V // 4 : D_V // 2],
                                 transB=True,
-                                accum=o_accumulate,
-                                dispatch="tcgen05",
-                                cta_group=2,
-                                smem_desc="local_hoist",
+                                **_mma_config(accum=o_accumulate),
                             )
                             o_accumulate = T.uint32(1)
                             bar_SV_done.arrive(0, cta_group=2, cta_mask=3)
