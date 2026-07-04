@@ -9,6 +9,7 @@ from unittest import SkipTest
 import torch
 
 from tirx_kernels.flashmla._gemm import tcgen05_config
+from tirx_kernels.flashmla._mask import pack_valid_mask8
 from tirx_kernels.flashmla._tma import tma_config
 from tvm.backend.cuda.operator.tile_primitive.tma_utils import SwizzleMode
 from tvm.script import tirx as T
@@ -254,22 +255,6 @@ def _ring_phase_parity(value: Any, max_value: int) -> Any:
     return result
 
 
-def _pack_valid_mask8(
-    lane_indices: Any, abs_pos_start: Any, lane_idx: Any, topk_len: Any, s_kv: Any
-) -> Any:
-    terms = []
-    for i in range(8):
-        valid = (
-            (lane_indices[i] >= 0)
-            & (lane_indices[i] < s_kv)
-            & (abs_pos_start + lane_idx * 8 + i < topk_len)
-        )
-        terms.append(T.Select(valid, T.int32(1 << i), T.int32(0)))
-    while len(terms) > 1:
-        terms = [T.bitwise_or(terms[i], terms[i + 1]) for i in range(0, len(terms), 2)]
-    return T.cast(terms[0], "int8")
-
-
 @T.jit
 def _kernel(
     q: T.Buffer((s_q, h_q, d_qk), "bfloat16"),
@@ -482,26 +467,23 @@ def _kernel(
             )
             p = p_frag.local()
             p_peer = p_peer_frag.local()
+
+            @T.inline
+            def load_p(lo_dst, hi_dst):
+                Tx.wg.copy_async(
+                    lo_dst[:, :], tmem_ldst[:, tmem_p_col : tmem_p_col + num_elems_per_thread]
+                )
+                Tx.wg.copy_async(
+                    hi_dst[:, :],
+                    tmem_ldst[
+                        :, tmem_p_col + num_elems_per_thread : tmem_p_col + num_elems_per_thread * 2
+                    ],
+                )
+
             if warp_idx < 2:
-                Tx.wg.copy_async(
-                    p_frag[:, :], tmem_ldst[:, tmem_p_col : tmem_p_col + num_elems_per_thread]
-                )
-                Tx.wg.copy_async(
-                    p_peer_frag[:, :],
-                    tmem_ldst[
-                        :, tmem_p_col + num_elems_per_thread : tmem_p_col + num_elems_per_thread * 2
-                    ],
-                )
+                load_p(p_frag, p_peer_frag)
             else:
-                Tx.wg.copy_async(
-                    p_peer_frag[:, :], tmem_ldst[:, tmem_p_col : tmem_p_col + num_elems_per_thread]
-                )
-                Tx.wg.copy_async(
-                    p_frag[:, :],
-                    tmem_ldst[
-                        :, tmem_p_col + num_elems_per_thread : tmem_p_col + num_elems_per_thread * 2
-                    ],
-                )
+                load_p(p_peer_frag, p_frag)
             T.ptx.tcgen05.wait.ld()
             T.ptx.tcgen05.fence.before_thread_sync()
             bar_p_free.arrive(0)
@@ -813,63 +795,39 @@ def _kernel(
                 cur_phase: T.int32 = _ring_phase_parity(k, max_k_blocks)
                 bar_sv_done.wait(cur_buf, T.bitwise_xor(cur_phase, T.int32(1)))
 
+                @T.inline
+                def gather_nope_part(part_idx, bar):
+                    for local_row in T.unroll(WG1_NUM_LOCAL_ROWS_PER_WARP):
+                        for local_col_inner in T.unroll((D_V // 2) // 64):
+                            local_col: T.let = part_idx * ((D_V // 2) // 64) + local_col_inner
+                            smem_row: T.let = wg1_warp_idx * 4 + local_row * WG1_NUM_WARPS * 4
+                            raw_k_nope_offset: T.let = (
+                                cur_buf * B_TOPK * D_V + smem_row * 64 + local_col * B_TOPK * 64
+                            )
+                            k_nope_gather_tile = T.decl_buffer(
+                                (4, 64),
+                                "bfloat16",
+                                k_nope_gemm.data,
+                                elem_offset=k_nope_gemm.elem_offset + raw_k_nope_offset,
+                                scope="shared.dyn",
+                                layout=ComposeLayout(
+                                    SwizzleLayout(3, 3, 3, swizzle_inner=True),
+                                    TileLayout.from_iters([Iter(4, 64, "m"), Iter(64, 1, "m")]),
+                                ),
+                            )
+                            Tx.copy_async(
+                                k_nope_gather_tile[:, :],
+                                kv_nope_tma[:, local_col * 64 : (local_col + 1) * 64],
+                                **_kv_gather_tma(
+                                    mbar=bar.ptr_to([cur_buf]),
+                                    mbarrier_addr=d_qk == D_V and s_kv >= 65536,
+                                    indexer=[selected_idx[local_row, j] for j in range(4)],
+                                ),
+                            )
+
                 if not should_skip_tma:
-                    part_idx0 = T.meta_var(0)
-                    for local_row in T.unroll(WG1_NUM_LOCAL_ROWS_PER_WARP):
-                        for local_col_inner in T.unroll((D_V // 2) // 64):
-                            local_col: T.let = part_idx0 * ((D_V // 2) // 64) + local_col_inner
-                            smem_row: T.let = wg1_warp_idx * 4 + local_row * WG1_NUM_WARPS * 4
-                            raw_k_nope_offset: T.let = (
-                                cur_buf * B_TOPK * D_V + smem_row * 64 + local_col * B_TOPK * 64
-                            )
-                            k_nope_gather_tile = T.decl_buffer(
-                                (4, 64),
-                                "bfloat16",
-                                k_nope_gemm.data,
-                                elem_offset=k_nope_gemm.elem_offset + raw_k_nope_offset,
-                                scope="shared.dyn",
-                                layout=ComposeLayout(
-                                    SwizzleLayout(3, 3, 3, swizzle_inner=True),
-                                    TileLayout.from_iters([Iter(4, 64, "m"), Iter(64, 1, "m")]),
-                                ),
-                            )
-                            Tx.copy_async(
-                                k_nope_gather_tile[:, :],
-                                kv_nope_tma[:, local_col * 64 : (local_col + 1) * 64],
-                                **_kv_gather_tma(
-                                    mbar=bar_kv_nope_ready_part0.ptr_to([cur_buf]),
-                                    mbarrier_addr=d_qk == D_V and s_kv >= 65536,
-                                    indexer=[selected_idx[local_row, j] for j in range(4)],
-                                ),
-                            )
-                    part_idx1 = T.meta_var(1)
-                    for local_row in T.unroll(WG1_NUM_LOCAL_ROWS_PER_WARP):
-                        for local_col_inner in T.unroll((D_V // 2) // 64):
-                            local_col: T.let = part_idx1 * ((D_V // 2) // 64) + local_col_inner
-                            smem_row: T.let = wg1_warp_idx * 4 + local_row * WG1_NUM_WARPS * 4
-                            raw_k_nope_offset: T.let = (
-                                cur_buf * B_TOPK * D_V + smem_row * 64 + local_col * B_TOPK * 64
-                            )
-                            k_nope_gather_tile = T.decl_buffer(
-                                (4, 64),
-                                "bfloat16",
-                                k_nope_gemm.data,
-                                elem_offset=k_nope_gemm.elem_offset + raw_k_nope_offset,
-                                scope="shared.dyn",
-                                layout=ComposeLayout(
-                                    SwizzleLayout(3, 3, 3, swizzle_inner=True),
-                                    TileLayout.from_iters([Iter(4, 64, "m"), Iter(64, 1, "m")]),
-                                ),
-                            )
-                            Tx.copy_async(
-                                k_nope_gather_tile[:, :],
-                                kv_nope_tma[:, local_col * 64 : (local_col + 1) * 64],
-                                **_kv_gather_tma(
-                                    mbar=bar_kv_nope_ready_part1.ptr_to([cur_buf]),
-                                    mbarrier_addr=d_qk == D_V and s_kv >= 65536,
-                                    indexer=[selected_idx[local_row, j] for j in range(4)],
-                                ),
-                            )
+                    gather_nope_part(0, bar_kv_nope_ready_part0)
+                    gather_nope_part(1, bar_kv_nope_ready_part1)
                 else:
                     for part_idx in T.unroll(2):
                         tx_bytes = T.uint32(
@@ -1001,7 +959,7 @@ def _kernel(
                         l2_evict="L2::evict_normal",
                         prefetch_size="L2::256B",
                     )
-                    is_ks_valid_mask: T.int8 = _pack_valid_mask8(
+                    is_ks_valid_mask: T.int8 = pack_valid_mask8(
                         lane_indices, abs_pos_start, lane_idx, topk_len, s_kv
                     )
 

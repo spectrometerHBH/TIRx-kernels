@@ -9,6 +9,7 @@ from unittest import SkipTest
 import torch
 
 from tirx_kernels.flashmla._gemm import tcgen05_config
+from tirx_kernels.flashmla._mask import pack_valid_mask8
 from tirx_kernels.flashmla._tma import tma_config
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
@@ -245,22 +246,6 @@ def _tirx_args(case: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def _pack_valid_mask8(
-    lane_indices: Any, abs_pos_start: Any, lane_idx: Any, topk_len: Any, s_kv: Any
-) -> Any:
-    terms = []
-    for i in range(8):
-        valid = (
-            (lane_indices[i] >= 0)
-            & (lane_indices[i] < s_kv)
-            & (abs_pos_start + lane_idx * 8 + i < topk_len)
-        )
-        terms.append(T.Select(valid, T.int32(1 << i), T.int32(0)))
-    while len(terms) > 1:
-        terms = [T.bitwise_or(terms[i], terms[i + 1]) for i in range(0, len(terms), 2)]
-    return T.cast(terms[0], "int8")
-
-
 @T.jit
 def _kernel(
     q: T.Buffer((s_q, h_q, d_qk), "bfloat16"),
@@ -460,18 +445,19 @@ def _kernel(
             )
             is_k_valid_lo: T.let = is_k_valid.view("uint32")[cur_buf, valid_word_offset]
             is_k_valid_hi: T.let = is_k_valid.view("uint32")[cur_buf, valid_word_offset + 1]
-            for p_i in T.unroll(P_TMEM_ELEMENTS // 2):
-                invalid_p_predicate: T.let = T.bitwise_and(
-                    T.shift_right(is_k_valid_lo, T.uint32(p_i)), T.uint32(1)
-                ) == T.uint32(0)
-                p[p_i] = T.if_then_else(invalid_p_predicate, T.uint32(0xFF800000), p[p_i])
-            for p_i in T.unroll(P_TMEM_ELEMENTS // 2):
-                invalid_p_predicate: T.let = T.bitwise_and(
-                    T.shift_right(is_k_valid_hi, T.uint32(p_i)), T.uint32(1)
-                ) == T.uint32(0)
-                p[p_i + P_TMEM_ELEMENTS // 2] = T.if_then_else(
-                    invalid_p_predicate, T.uint32(0xFF800000), p[p_i + P_TMEM_ELEMENTS // 2]
-                )
+
+            @T.inline
+            def mask_p_half(valid_word, base):
+                for p_i in T.unroll(P_TMEM_ELEMENTS // 2):
+                    invalid_p_predicate: T.let = T.bitwise_and(
+                        T.shift_right(valid_word, T.uint32(p_i)), T.uint32(1)
+                    ) == T.uint32(0)
+                    p[base + p_i] = T.if_then_else(
+                        invalid_p_predicate, T.uint32(0xFF800000), p[base + p_i]
+                    )
+
+            mask_p_half(is_k_valid_lo, 0)
+            mask_p_half(is_k_valid_hi, P_TMEM_ELEMENTS // 2)
 
             cur_pi_max: T.float32 = T.float32(-float("inf"))
             for p_i in T.unroll(P_TMEM_ELEMENTS):
@@ -1046,7 +1032,7 @@ def _kernel(
                         prefetch_size="L2::256B",
                     )
                     abs_pos_start: T.let = k * B_TOPK
-                    is_ks_valid_mask: T.let = _pack_valid_mask8(
+                    is_ks_valid_mask: T.let = pack_valid_mask8(
                         lane_indices, abs_pos_start, lane_idx, topk_len, s_kv
                     )
                     cur_buf: T.let = k % NUM_BUFS

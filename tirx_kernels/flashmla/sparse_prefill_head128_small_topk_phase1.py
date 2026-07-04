@@ -9,6 +9,7 @@ from unittest import SkipTest
 import torch
 
 from tirx_kernels.flashmla._gemm import tcgen05_config
+from tirx_kernels.flashmla._mask import pack_valid_mask8
 from tirx_kernels.flashmla._tma import tma_config
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
@@ -251,22 +252,6 @@ def _tirx_args(case: dict[str, Any]) -> tuple[Any, ...]:
         case["max_logits"],
         case["lse"],
     )
-
-
-def _pack_valid_mask8(
-    lane_indices: Any, abs_pos_start: Any, lane_idx: Any, topk_len: Any, s_kv: Any
-) -> Any:
-    terms = []
-    for i in range(8):
-        valid = (
-            (lane_indices[i] >= 0)
-            & (lane_indices[i] < s_kv)
-            & (abs_pos_start + lane_idx * 8 + i < topk_len)
-        )
-        terms.append(T.Select(valid, T.int32(1 << i), T.int32(0)))
-    while len(terms) > 1:
-        terms = [T.bitwise_or(terms[i], terms[i + 1]) for i in range(0, len(terms), 2)]
-    return T.cast(terms[0], "int8")
 
 
 @T.jit
@@ -781,7 +766,7 @@ def _kernel(
                             prefetch_size="L2::256B",
                         )
                         abs_pos_start: T.let = k * B_TOPK
-                        mask: T.let = _pack_valid_mask8(
+                        mask: T.let = pack_valid_mask8(
                             lane_indices, abs_pos_start, lane_idx, valid_topk_len, s_kv
                         )
                         index_buf_idx: T.let = valid_rs % NUM_INDEX_BUFS
@@ -861,32 +846,26 @@ def _kernel(
                 p_peer = p_peer_frag.local().view("uint32")
                 bar_QK_done.wait(0, wg3_rs & 1)
                 T.ptx.tcgen05.fence.after_thread_sync()
+
+                @T.inline
+                def load_p(lo_dst, hi_dst):
+                    Tx.wg.copy_async(
+                        lo_dst[:, :],
+                        tmem_ldst[:, tmem_p_col : tmem_p_col + WG3_NUM_ELEMS_PER_THREAD],
+                    )
+                    Tx.wg.copy_async(
+                        hi_dst[:, :],
+                        tmem_ldst[
+                            :,
+                            tmem_p_col + WG3_NUM_ELEMS_PER_THREAD : tmem_p_col
+                            + WG3_NUM_ELEMS_PER_THREAD * 2,
+                        ],
+                    )
+
                 if local_warp_idx < 2:
-                    Tx.wg.copy_async(
-                        p_frag[:, :],
-                        tmem_ldst[:, tmem_p_col : tmem_p_col + WG3_NUM_ELEMS_PER_THREAD],
-                    )
-                    Tx.wg.copy_async(
-                        p_peer_frag[:, :],
-                        tmem_ldst[
-                            :,
-                            tmem_p_col + WG3_NUM_ELEMS_PER_THREAD : tmem_p_col
-                            + WG3_NUM_ELEMS_PER_THREAD * 2,
-                        ],
-                    )
+                    load_p(p_frag, p_peer_frag)
                 else:
-                    Tx.wg.copy_async(
-                        p_peer_frag[:, :],
-                        tmem_ldst[:, tmem_p_col : tmem_p_col + WG3_NUM_ELEMS_PER_THREAD],
-                    )
-                    Tx.wg.copy_async(
-                        p_frag[:, :],
-                        tmem_ldst[
-                            :,
-                            tmem_p_col + WG3_NUM_ELEMS_PER_THREAD : tmem_p_col
-                            + WG3_NUM_ELEMS_PER_THREAD * 2,
-                        ],
-                    )
+                    load_p(p_peer_frag, p_frag)
                 T.ptx.tcgen05.wait.ld()
                 T.ptx.tcgen05.fence.before_thread_sync()
                 bar_P_empty.arrive(0, remote=T.uint32(0))
