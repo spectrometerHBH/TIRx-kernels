@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, fields
+from functools import partial
 from typing import Any
 from unittest import SkipTest
 
 import torch
 
+from tirx_kernels.flashmla._tma import tma_config
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.lang.pipeline import MBarrier, TCGen05Bar, TMABar
-from tvm.tirx.layout import ComposeLayout, Iter, S, SwizzleLayout, TCol, TileLayout, TLane
+from tvm.tirx.layout import ComposeLayout, Iter, R, S, SwizzleLayout, TCol, TileLayout, TLane
 
 B_H = 128
 B_TOPK = 128
@@ -28,22 +30,25 @@ HEAD128_LAUNCH_PARAM_TAGS = (
     "tirx.use_dyn_shared_memory",
 )
 
-TMEM_COL_O = 0
-TMEM_COL_P = 256
-
 NAMED_BARRIER_WG0_SYNC = 0
 
 BF16_BYTES = 2
 D_TQ = 384
-NUM_TQ_TILES = D_TQ // 64
-Q_FULL_DESC_SDO = 64
-K_MAJOR_SWIZZLED_DESC_LDO = 1
 P_TMEM_ELEMENTS = B_TOPK // 2
 B_EPI = 64
 WG1_NUM_WARPS = 4
 WG1_NUM_LOCAL_ROWS_PER_WARP = (B_TOPK // 2) // 4 // WG1_NUM_WARPS
 WG2_NUM_WARPS = 4
 WG2_NUM_LOCAL_ROWS_PER_PART = (B_TOPK // 2) // 4 // WG2_NUM_WARPS
+
+# KV gather4 TMA knobs shared by the gather call sites.
+_kv_gather_tma = partial(
+    tma_config,
+    cta_group=2,
+    cta_mask=T.uint16(1),
+    gather_axis=0,
+    cache_hint=T.uint64(0x14F0000000000000),
+)
 
 
 @dataclass(frozen=True)
@@ -287,7 +292,7 @@ def _kernel(
     d_sq = T.meta_var(d_qk - D_TQ)
     num_sq_tiles = T.meta_var((d_qk - D_TQ) // 64)
     num_qk_tiles = T.meta_var(d_qk // 64)
-    tiled_mma_smem_desc = T.meta_var(
+    mma_smem_desc = T.meta_var(
         "recompute"
         if (d_qk == 512 and s_kv == 8192)
         else "local_hoist"
@@ -333,8 +338,8 @@ def _kernel(
     kv_tma = kv.view(s_kv, d_qk, layout=TileLayout(S[(s_kv, d_qk) : (stride_kv_s_kv, 1)]))
 
     g_indices_base: T.let = s_q_idx * stride_indices_s_q
-    tiled_mma_p_accumulate: T.uint32 = 0
-    tiled_mma_o_accumulate: T.uint32 = 0
+    mma_p_accumulate: T.uint32 = 0
+    mma_o_accumulate: T.uint32 = 0
 
     # CUDA phase1.cuh:87-146.  Warp 0 owns barrier init, Q TMA launch,
     # and the cta_group::2 TMEM allocation.
@@ -369,12 +374,11 @@ def _kernel(
                         cta_idx * (B_H // 2) : (cta_idx + 1) * (B_H // 2),
                         q_tma_tile * 64 : (q_tma_tile + 1) * 64,
                     ],
-                    dispatch="tma",
-                    mbar=bar_prologue_q.ptr_to([0]),
-                    cta_group=2,
-                    cache_hint=T.uint64(0x12F0000000000000),
-                    prefetch_tensormap=True,
-                    tensormap_l2_promotion="L2::256B",
+                    **tma_config(
+                        mbar=bar_prologue_q.ptr_to([0]),
+                        cta_group=2,
+                        cache_hint=T.uint64(0x12F0000000000000),
+                    ),
                 )
 
         T.ptx.tcgen05.alloc(T.address_of(tmem_start_addr[0]), n_cols=512, cta_group=2)
@@ -384,26 +388,24 @@ def _kernel(
     T.cuda.cta_sync()
 
     tmem_pool = T.TMEMPool(pool, total_cols=512, cta_group=2, tmem_addr=tmem_start_addr)
-    tmem_ldst = tmem_pool.alloc((128, 512), "float32", datapath="D")
-    tmem_pool.move_base_to(TMEM_COL_P)
-    tmem_p = tmem_pool.alloc(
-        (B_H // 2, B_TOPK),
-        "float32",
-        layout=TileLayout(S[(B_H // 2, 2, B_TOPK // 2) : (1 @ TLane, 64 @ TLane, 1 @ TCol)]),
-    )
-    q_tmem = tmem_pool.alloc(
-        (B_H // 2, D_TQ), "bfloat16", layout=TileLayout(S[(B_H // 2, D_TQ) : (1 @ TLane, 1 @ TCol)])
-    )
-    tmem_pool.move_base_to(TMEM_COL_O)
-    tmem_o_lo = tmem_pool.alloc(
-        (B_H // 2, D_V // 2),
-        "float32",
-        layout=TileLayout(S[(B_H // 2, 2, D_V // 4) : (1 @ TLane, 64 @ TLane, 1 @ TCol)]),
-    )
-    tmem_o_hi = tmem_pool.alloc(
-        (B_H // 2, D_V // 2),
-        "float32",
-        layout=TileLayout(S[(B_H // 2, 2, D_V // 4) : (1 @ TLane, 64 @ TLane, 1 @ TCol)]),
+    # Full-TMEM overlay for tcgen05.ld/st; aliases every allocation below.
+    tmem_ldst = tmem_pool.view((128, 512), "float32", datapath="D")
+    tmem_o_col = T.meta_var(tmem_pool.offset)
+    tmem_o_lo = tmem_pool.alloc((B_H // 2, D_V // 2), "float32", datapath="B")
+    tmem_o_hi = tmem_pool.alloc((B_H // 2, D_V // 2), "float32", datapath="B")
+    tmem_p_col = T.meta_var(tmem_pool.offset)
+    tmem_p = tmem_pool.alloc((B_H // 2, B_TOPK), "float32", datapath="B")
+    q_tmem_col = T.meta_var(tmem_pool.offset)
+    q_tmem = tmem_pool.alloc((B_H // 2, D_TQ), "bfloat16")
+    # Honest tcgen05.cp footprint view over the q_tmem anchor: the
+    # 64x128b.warpx2::02_13 copy lands rows 0-63 on lanes 0-63 and mirrors
+    # them at lane offset +64, so the copy destination declares that replica.
+    # The MMA descriptors keep addressing the 64-lane anchor above.
+    q_tmem_cp = tmem_pool.view(
+        (B_H // 2, D_TQ),
+        "bfloat16",
+        col=q_tmem_col,
+        layout=TileLayout(S[(B_H // 2, D_TQ) : (1 @ TLane, 1 @ TCol)] + R[2 : 64 @ TLane]),
     )
     s_smem_gemm = s_smem.view(
         B_H // 2, B_TOPK, layout=TileLayout(S[(B_H // 2, B_TOPK // 8, 8) : (8, (B_H // 2) * 8, 1)])
@@ -434,7 +436,7 @@ def _kernel(
             p_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, P_TMEM_ELEMENTS), "uint32")
             Tx.wg.copy_async(
                 p_frag[:, :],
-                tmem_ldst.with_dtype("uint32")[:, TMEM_COL_P : TMEM_COL_P + P_TMEM_ELEMENTS],
+                tmem_ldst.with_dtype("uint32")[:, tmem_p_col : tmem_p_col + P_TMEM_ELEMENTS],
             )
             p = p_frag.local()
             T.ptx.tcgen05.wait.ld()
@@ -442,13 +444,11 @@ def _kernel(
             bar_p_free.arrive(cur_buf, remote=T.uint32(0))
 
             bar_k_valid_ready.wait(cur_buf, cur_phase)
-            valid_word_offset: T.let = T.if_then_else(idx_in_warpgroup >= 64, B_TOPK // 8 // 2, 0)
-            is_k_valid_lo: T.let = T.ptx.ld(
-                is_k_valid.ptr_to([cur_buf, valid_word_offset]), "uint32", "u32", space="shared"
+            valid_word_offset: T.let = T.if_then_else(
+                idx_in_warpgroup >= 64, B_TOPK // 8 // 2 // 4, 0
             )
-            is_k_valid_hi: T.let = T.ptx.ld(
-                is_k_valid.ptr_to([cur_buf, valid_word_offset + 4]), "uint32", "u32", space="shared"
-            )
+            is_k_valid_lo: T.let = is_k_valid.view("uint32")[cur_buf, valid_word_offset]
+            is_k_valid_hi: T.let = is_k_valid.view("uint32")[cur_buf, valid_word_offset + 1]
             for p_i in T.unroll(P_TMEM_ELEMENTS // 2):
                 invalid_p_predicate: T.let = T.bitwise_and(
                     T.shift_right(is_k_valid_lo, T.uint32(p_i)), T.uint32(1)
@@ -512,15 +512,10 @@ def _kernel(
                     + s_store_i * (B_H // 2) * 8
                 )
                 s_pack_offset: T.let = s_store_i * 4
-                T.ptx.st(
-                    s_smem.view("uint32").ptr_to([s_store_offset // 2]),
-                    s_pack[s_pack_offset],
-                    s_pack[s_pack_offset + 1],
-                    s_pack[s_pack_offset + 2],
-                    s_pack[s_pack_offset + 3],
-                    space="shared",
-                    vec="v4",
-                    ptx_type="u32",
+                Tx.copy(
+                    s_smem.view("uint32")[s_store_offset // 2 : s_store_offset // 2 + 4],
+                    s_pack[s_pack_offset : s_pack_offset + 4],
+                    dispatch="vec_128b",
                 )
 
             if (k > 0) & should_scale_o:
@@ -532,7 +527,7 @@ def _kernel(
                     Tx.wg.copy_async(
                         o_rescale_frag[:, :],
                         tmem_ldst[
-                            :, TMEM_COL_O + chunk_idx * 32 : TMEM_COL_O + (chunk_idx + 1) * 32
+                            :, tmem_o_col + chunk_idx * 32 : tmem_o_col + (chunk_idx + 1) * 32
                         ],
                     )
                     T.ptx.tcgen05.wait.ld()
@@ -547,7 +542,7 @@ def _kernel(
                         o_rescale[o_i * 2 + 1] = T.cuda.float2_y(o_scaled_pair)
                     Tx.wg.copy_async(
                         tmem_ldst[
-                            :, TMEM_COL_O + chunk_idx * 32 : TMEM_COL_O + (chunk_idx + 1) * 32
+                            :, tmem_o_col + chunk_idx * 32 : tmem_o_col + (chunk_idx + 1) * 32
                         ],
                         o_rescale_frag[:, :],
                     )
@@ -605,7 +600,7 @@ def _kernel(
             if have_valid_indices:
                 Tx.wg.copy_async(
                     o_epi_frag[:, :],
-                    tmem_ldst[:, TMEM_COL_O + epi_k * B_EPI : TMEM_COL_O + (epi_k + 1) * B_EPI],
+                    tmem_ldst[:, tmem_o_col + epi_k * B_EPI : tmem_o_col + (epi_k + 1) * B_EPI],
                 )
                 T.ptx.tcgen05.wait.ld()
             for o_i in T.unroll(B_EPI // 8):
@@ -618,15 +613,12 @@ def _kernel(
                         T.cuda.float2_x(o_epi_pair), T.cuda.float2_y(o_epi_pair)
                     )
                 o_base_col: T.let = (idx_in_warpgroup // 64) * (D_V // 2) + epi_k * B_EPI + o_i * 8
-                T.ptx.st(
-                    o_smem.view("uint32").ptr_to([idx_in_warpgroup % 64, o_base_col // 2]),
-                    o_epi_bf16[0],
-                    o_epi_bf16[1],
-                    o_epi_bf16[2],
-                    o_epi_bf16[3],
-                    space="shared",
-                    vec="v4",
-                    ptx_type="u32",
+                Tx.copy(
+                    o_smem.view("uint32")[
+                        idx_in_warpgroup % 64, o_base_col // 2 : o_base_col // 2 + 4
+                    ],
+                    o_epi_bf16[0:4],
+                    dispatch="vec_128b",
                 )
 
             T.ptx.fence.proxy_async("shared::cta")
@@ -640,9 +632,7 @@ def _kernel(
                             epi_k * B_EPI : (epi_k + 1) * B_EPI,
                         ],
                         o_smem[:, epi_k * B_EPI : (epi_k + 1) * B_EPI],
-                        dispatch="tma",
-                        prefetch_tensormap=True,
-                        tensormap_l2_promotion="L2::256B",
+                        **tma_config(),
                     )
             if warp_idx == 1:
                 if T.ptx.elect_sync():
@@ -654,9 +644,7 @@ def _kernel(
                             epi_k2 * B_EPI : (epi_k2 + 1) * B_EPI,
                         ],
                         o_smem[:, epi_k2 * B_EPI : (epi_k2 + 1) * B_EPI],
-                        dispatch="tma",
-                        prefetch_tensormap=True,
-                        tensormap_l2_promotion="L2::256B",
+                        **tma_config(),
                     )
 
         if warp_idx == 0:
@@ -735,19 +723,14 @@ def _kernel(
                         Tx.copy_async(
                             k_gather_tile[:, :],
                             kv_tma[:, local_col * 64 : (local_col + 1) * 64],
-                            dispatch="tma",
-                            mbar=bar_k_part0_ready.ptr_to([cur_buf]),
-                            cta_group=2,
-                            cta_mask=T.uint16(1),
-                            cache_hint=T.uint64(0x14F0000000000000),
-                            gather_axis=0,
-                            indexer=[
-                                indices_int4[row, lane]
-                                for row in range(WG1_NUM_LOCAL_ROWS_PER_WARP)
-                                for lane in range(4)
-                            ],
-                            prefetch_tensormap=True,
-                            tensormap_l2_promotion="L2::256B",
+                            **_kv_gather_tma(
+                                mbar=bar_k_part0_ready.ptr_to([cur_buf]),
+                                indexer=[
+                                    indices_int4[row, lane]
+                                    for row in range(WG1_NUM_LOCAL_ROWS_PER_WARP)
+                                    for lane in range(4)
+                                ],
+                            ),
                         )
                 else:
                     T.ptx.mbarrier.complete_tx(
@@ -787,19 +770,14 @@ def _kernel(
                         Tx.copy_async(
                             k_gather_tile[:, :],
                             kv_tma[:, local_col * 64 : (local_col + 1) * 64],
-                            dispatch="tma",
-                            mbar=bar_k_part1_ready.ptr_to([cur_buf]),
-                            cta_group=2,
-                            cta_mask=T.uint16(1),
-                            cache_hint=T.uint64(0x14F0000000000000),
-                            gather_axis=0,
-                            indexer=[
-                                indices_int4[row, lane]
-                                for row in range(WG1_NUM_LOCAL_ROWS_PER_WARP)
-                                for lane in range(4)
-                            ],
-                            prefetch_tensormap=True,
-                            tensormap_l2_promotion="L2::256B",
+                            **_kv_gather_tma(
+                                mbar=bar_k_part1_ready.ptr_to([cur_buf]),
+                                indexer=[
+                                    indices_int4[row, lane]
+                                    for row in range(WG1_NUM_LOCAL_ROWS_PER_WARP)
+                                    for lane in range(4)
+                                ],
+                            ),
                         )
                 else:
                     T.ptx.mbarrier.complete_tx(
@@ -861,19 +839,14 @@ def _kernel(
                     Tx.copy_async(
                         v_gather_tile[:, :],
                         kv_tma[:, src_col : src_col + 64],
-                        dispatch="tma",
-                        mbar=bar_v_part0_ready.ptr_to([cur_buf]),
-                        cta_group=2,
-                        cta_mask=T.uint16(1),
-                        cache_hint=T.uint64(0x14F0000000000000),
-                        gather_axis=0,
-                        indexer=[
-                            token_idxs_part0[row, lane]
-                            for row in range(WG2_NUM_LOCAL_ROWS_PER_PART)
-                            for lane in range(4)
-                        ],
-                        prefetch_tensormap=True,
-                        tensormap_l2_promotion="L2::256B",
+                        **_kv_gather_tma(
+                            mbar=bar_v_part0_ready.ptr_to([cur_buf]),
+                            indexer=[
+                                token_idxs_part0[row, lane]
+                                for row in range(WG2_NUM_LOCAL_ROWS_PER_PART)
+                                for lane in range(4)
+                            ],
+                        ),
                     )
 
                 if k > 0:
@@ -922,19 +895,14 @@ def _kernel(
                     Tx.copy_async(
                         v_gather_tile[:, :],
                         kv_tma[:, src_col : src_col + 64],
-                        dispatch="tma",
-                        mbar=bar_v_part1_ready.ptr_to([cur_buf]),
-                        cta_group=2,
-                        cta_mask=T.uint16(1),
-                        cache_hint=T.uint64(0x14F0000000000000),
-                        gather_axis=0,
-                        indexer=[
-                            token_idxs_part1[row, lane]
-                            for row in range(WG2_NUM_LOCAL_ROWS_PER_PART)
-                            for lane in range(4)
-                        ],
-                        prefetch_tensormap=True,
-                        tensormap_l2_promotion="L2::256B",
+                        **_kv_gather_tma(
+                            mbar=bar_v_part1_ready.ptr_to([cur_buf]),
+                            indexer=[
+                                token_idxs_part1[row, lane]
+                                for row in range(WG2_NUM_LOCAL_ROWS_PER_PART)
+                                for lane in range(4)
+                            ],
+                        ),
                     )
 
     else:
@@ -946,20 +914,11 @@ def _kernel(
                 bar_prologue_q.wait(0, 0)
                 T.ptx.tcgen05.fence.after_thread_sync()
                 Tx.copy_async(
-                    q_tmem[:, :],
+                    q_tmem_cp[:, :],
                     q_full[:, d_sq : d_sq + D_TQ],
                     shape="64x128b",
                     cta_group=2,
                     multicast="warpx2::02_13",
-                    desc_ldo=K_MAJOR_SWIZZLED_DESC_LDO,
-                    desc_sdo=Q_FULL_DESC_SDO,
-                    desc_swizzle=3,
-                    tile_count=NUM_TQ_TILES,
-                    subtile_count=8,
-                    tmem_tile_stride_32b=32,
-                    tmem_subtile_stride_32b=4,
-                    desc_tile_stride_16b=(B_H // 2) * 128 // 16,
-                    desc_subtile_stride_16b=1,
                 )
                 bar_prologue_utccp.arrive(0, cta_group=2, cta_mask=3)
 
@@ -976,18 +935,18 @@ def _kernel(
                             bar_p_free.wait(prev_buf, prev_phase)
                         T.ptx.tcgen05.fence.after_thread_sync()
 
-                        tiled_mma_p_accumulate = T.uint32(0)
+                        mma_p_accumulate = T.uint32(0)
                         if d_sq > 0:
                             Tx.gemm_async(
                                 tmem_p[:, :],
                                 sq_smem[:, :d_sq],
                                 k_smem[:, :d_sq],
-                                accum=tiled_mma_p_accumulate,
+                                accum=mma_p_accumulate,
                                 dispatch="tcgen05",
                                 cta_group=2,
-                                smem_desc=tiled_mma_smem_desc,
+                                smem_desc=mma_smem_desc,
                             )
-                            tiled_mma_p_accumulate = T.uint32(1)
+                            mma_p_accumulate = T.uint32(1)
                         bar_qk_part_done.arrive(cur_buf, cta_group=2, cta_mask=3)
 
                         bar_k_part1_ready.arrive(
@@ -1000,12 +959,12 @@ def _kernel(
                             tmem_p[:, :],
                             q_tmem[:, :D_TQ],
                             k_smem[:, d_sq : d_sq + D_TQ],
-                            accum=tiled_mma_p_accumulate,
+                            accum=mma_p_accumulate,
                             dispatch="tcgen05",
                             cta_group=2,
-                            smem_desc=tiled_mma_smem_desc,
+                            smem_desc=mma_smem_desc,
                         )
-                        tiled_mma_p_accumulate = T.uint32(1)
+                        mma_p_accumulate = T.uint32(1)
                         bar_qk_done.arrive(cur_buf, cta_group=2, cta_mask=3)
 
                     if k > 0:
@@ -1018,28 +977,28 @@ def _kernel(
                         )
                         bar_v_part0_ready.wait(cur_buf_prev, cur_phase_prev)
                         T.ptx.tcgen05.fence.after_thread_sync()
-                        tiled_mma_o_accumulate = T.if_then_else(k == 1, T.uint32(0), T.uint32(1))
+                        mma_o_accumulate = T.if_then_else(k == 1, T.uint32(0), T.uint32(1))
                         Tx.gemm_async(
                             tmem_o_lo[:, :],
                             s_smem_gemm[:, 0 : B_TOPK // 2],
                             v_smem_gemm[0 : B_TOPK // 2, 0 : D_V // 4],
                             transB=True,
-                            accum=tiled_mma_o_accumulate,
+                            accum=mma_o_accumulate,
                             dispatch="tcgen05",
                             cta_group=2,
-                            smem_desc=tiled_mma_smem_desc,
+                            smem_desc=mma_smem_desc,
                         )
                         Tx.gemm_async(
                             tmem_o_hi[:, :],
                             s_smem_gemm[:, 0 : B_TOPK // 2],
                             v_smem_gemm[0 : B_TOPK // 2, D_V // 4 : D_V // 2],
                             transB=True,
-                            accum=tiled_mma_o_accumulate,
+                            accum=mma_o_accumulate,
                             dispatch="tcgen05",
                             cta_group=2,
-                            smem_desc=tiled_mma_smem_desc,
+                            smem_desc=mma_smem_desc,
                         )
-                        tiled_mma_o_accumulate = T.uint32(1)
+                        mma_o_accumulate = T.uint32(1)
                         bar_sv_part_done.arrive(cur_buf_prev, cta_group=2, cta_mask=3)
 
                         bar_v_part1_ready.arrive(
@@ -1052,34 +1011,34 @@ def _kernel(
                             s_smem_gemm[:, B_TOPK // 2 : B_TOPK],
                             v_smem_gemm[B_TOPK // 2 : B_TOPK, 0 : D_V // 4],
                             transB=True,
-                            accum=tiled_mma_o_accumulate,
+                            accum=mma_o_accumulate,
                             dispatch="tcgen05",
                             cta_group=2,
-                            smem_desc=tiled_mma_smem_desc,
+                            smem_desc=mma_smem_desc,
                         )
                         Tx.gemm_async(
                             tmem_o_hi[:, :],
                             s_smem_gemm[:, B_TOPK // 2 : B_TOPK],
                             v_smem_gemm[B_TOPK // 2 : B_TOPK, D_V // 4 : D_V // 2],
                             transB=True,
-                            accum=tiled_mma_o_accumulate,
+                            accum=mma_o_accumulate,
                             dispatch="tcgen05",
                             cta_group=2,
-                            smem_desc=tiled_mma_smem_desc,
+                            smem_desc=mma_smem_desc,
                         )
-                        tiled_mma_o_accumulate = T.uint32(1)
+                        mma_o_accumulate = T.uint32(1)
                         bar_sv_done.arrive(cur_buf_prev, cta_group=2, cta_mask=3)
 
         elif warp_idx == 13:
             if lane_idx < B_TOPK // 8:
                 lane_indices = T.alloc_local((8,), "int32")
                 for k in T.serial(0, num_k_blocks, unroll=False):
-                    T.ptx.ld_global_nc(
-                        indices.ptr_to([g_indices_base + k * B_TOPK + lane_idx * 8]),
-                        "int32",
-                        "s32",
-                        dst=lane_indices.ptr_to([0]),
-                        vec="v8",
+                    row_base: T.let = g_indices_base + k * B_TOPK + lane_idx * 8
+                    Tx.copy(
+                        lane_indices[0:8],
+                        indices[row_base : row_base + 8],
+                        dispatch="vec_256b",
+                        cache="nc",
                         l1_evict="L1::evict_normal",
                         l2_evict="L2::evict_normal",
                         prefetch_size="L2::256B",
