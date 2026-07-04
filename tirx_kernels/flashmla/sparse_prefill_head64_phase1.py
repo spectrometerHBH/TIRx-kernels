@@ -413,29 +413,21 @@ def _kernel(
             T.ptx.fence.mbarrier_init()
 
             if have_rope:
-                for q_rope_tma_tile in T.unroll(Q_ROPE_DIM // 32):
-                    Tx.copy_async(
-                        q_rope[:, q_rope_tma_tile * 32 : (q_rope_tma_tile + 1) * 32],
-                        q[
-                            s_q_idx : s_q_idx + 1,
-                            :,
-                            D_V + q_rope_tma_tile * 32 : D_V + (q_rope_tma_tile + 1) * 32,
-                        ],
-                        **tma_config(
-                            mbar=bar_prologue_q_rope.ptr_to([0]),
-                            cta_group=1,
-                            cache_hint="evict_first",
-                        ),
-                    )
-
-            for q_nope_tma_tile in T.unroll(D_V // 64):
                 Tx.copy_async(
-                    q_nope[:, q_nope_tma_tile * 64 : (q_nope_tma_tile + 1) * 64],
-                    q[s_q_idx : s_q_idx + 1, :, q_nope_tma_tile * 64 : (q_nope_tma_tile + 1) * 64],
+                    q_rope[:, :],
+                    q[s_q_idx : s_q_idx + 1, :, D_V : D_V + Q_ROPE_DIM],
                     **tma_config(
-                        mbar=bar_prologue_q_nope.ptr_to([0]), cta_group=1, cache_hint="evict_first"
+                        mbar=bar_prologue_q_rope.ptr_to([0]), cta_group=1, cache_hint="evict_first"
                     ),
                 )
+
+            Tx.copy_async(
+                q_nope[:, :],
+                q[s_q_idx : s_q_idx + 1, :, 0:D_V],
+                **tma_config(
+                    mbar=bar_prologue_q_nope.ptr_to([0]), cta_group=1, cache_hint="evict_first"
+                ),
+            )
             bar_prologue_utccp_rope.init(1)
             bar_prologue_utccp_nope.init(1)
             if bar_qk_nope_done.leader:

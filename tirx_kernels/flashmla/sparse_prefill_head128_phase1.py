@@ -368,20 +368,15 @@ def _kernel(
 
     if warp_idx == 0:
         if T.ptx.elect_sync():
-            for q_tma_tile in T.unroll(num_qk_tiles):
-                Tx.copy_async(
-                    q_full[:, q_tma_tile * 64 : (q_tma_tile + 1) * 64],
-                    q[
-                        s_q_idx : s_q_idx + 1,
-                        cta_idx * (B_H // 2) : (cta_idx + 1) * (B_H // 2),
-                        q_tma_tile * 64 : (q_tma_tile + 1) * 64,
-                    ],
-                    **tma_config(
-                        mbar=bar_prologue_q.ptr_to([0]),
-                        cta_group=2,
-                        cache_hint=T.uint64(0x12F0000000000000),
-                    ),
-                )
+            Tx.copy_async(
+                q_full[:, :],
+                q[s_q_idx : s_q_idx + 1, cta_idx * (B_H // 2) : (cta_idx + 1) * (B_H // 2), 0:d_qk],
+                **tma_config(
+                    mbar=bar_prologue_q.ptr_to([0]),
+                    cta_group=2,
+                    cache_hint=T.uint64(0x12F0000000000000),
+                ),
+            )
 
         T.ptx.tcgen05.alloc(T.address_of(tmem_start_addr[0]), n_cols=512, cta_group=2)
         T.cuda.trap_when_assert_failed(tmem_start_addr[0] == T.uint32(0))
