@@ -17,7 +17,6 @@ from tvm.script.tirx import tile as Tx
 from tvm.tirx.lang.pipeline import MBarrier, TCGen05Bar, TMABar
 from tvm.tirx.layout import (
     ComposeLayout,
-    Iter,
     S,
     SwizzleLayout,
     TCol,
@@ -793,32 +792,20 @@ def _kernel(
                 @T.inline
                 def gather_nope_part(part_idx, bar):
                     for local_row in T.unroll(WG1_NUM_LOCAL_ROWS_PER_WARP):
-                        for local_col_inner in T.unroll((D_V // 2) // 64):
-                            local_col: T.let = part_idx * ((D_V // 2) // 64) + local_col_inner
-                            smem_row: T.let = wg1_warp_idx * 4 + local_row * WG1_NUM_WARPS * 4
-                            raw_k_nope_offset: T.let = (
-                                cur_buf * B_TOPK * D_V + smem_row * 64 + local_col * B_TOPK * 64
-                            )
-                            k_nope_gather_tile = T.decl_buffer(
-                                (4, 64),
-                                "bfloat16",
-                                k_nope_gemm.data,
-                                elem_offset=k_nope_gemm.elem_offset + raw_k_nope_offset,
-                                scope="shared.dyn",
-                                layout=ComposeLayout(
-                                    SwizzleLayout(3, 3, 3, swizzle_inner=True),
-                                    TileLayout.from_iters([Iter(4, 64, "m"), Iter(64, 1, "m")]),
-                                ),
-                            )
-                            Tx.copy_async(
-                                k_nope_gather_tile[:, :],
-                                kv_nope_tma[:, local_col * 64 : (local_col + 1) * 64],
-                                **_kv_gather_tma(
-                                    mbar=bar.ptr_to([cur_buf]),
-                                    mbarrier_addr=d_qk == D_V and s_kv >= 65536,
-                                    indexer=[selected_idx[local_row, j] for j in range(4)],
-                                ),
-                            )
+                        smem_row: T.let = wg1_warp_idx * 4 + local_row * WG1_NUM_WARPS * 4
+                        Tx.copy_async(
+                            k_nope_gemm[
+                                cur_buf,
+                                smem_row : smem_row + 4,
+                                part_idx * (D_V // 2) : (part_idx + 1) * (D_V // 2),
+                            ],
+                            kv_nope_tma[:, part_idx * (D_V // 2) : (part_idx + 1) * (D_V // 2)],
+                            **_kv_gather_tma(
+                                mbar=bar.ptr_to([cur_buf]),
+                                mbarrier_addr=d_qk == D_V and s_kv >= 65536,
+                                indexer=[selected_idx[local_row, j] for j in range(4)],
+                            ),
+                        )
 
                 if not should_skip_tma:
                     gather_nope_part(0, bar_kv_nope_ready_part0)
