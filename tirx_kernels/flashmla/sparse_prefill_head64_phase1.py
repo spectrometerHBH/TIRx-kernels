@@ -770,14 +770,13 @@ def _kernel(
                 )
                 Tx.copy(selected_idx[:, :], indices_tile[:, :], cache="nc")
 
-                max_idx_buf = T.alloc_local((1,), "int32")
-                min_idx_buf = T.alloc_local((1,), "int32")
-                max_idx_buf[0] = -1
-                min_idx_buf[0] = s_kv
-                Tx.max(max_idx_buf[0:1], selected_idx[:, :], axes=(0, 1), accum=True)
-                Tx.min(min_idx_buf[0:1], selected_idx[:, :], axes=(0, 1), accum=True)
-                max_indices: T.let = max_idx_buf[0]
-                min_indices: T.let = min_idx_buf[0]
+                max_indices: T.int32 = -1
+                min_indices: T.int32 = s_kv
+                for local_row in T.unroll(WG1_NUM_LOCAL_ROWS_PER_WARP):
+                    for j in T.unroll(4):
+                        idx: T.let = selected_idx[local_row, j]
+                        max_indices = T.max(max_indices, idx)
+                        min_indices = T.min(min_indices, idx)
 
                 is_all_rows_invalid: T.let = (min_indices == s_kv) | (max_indices == -1)
                 should_skip_tma: T.let = is_all_rows_invalid & (k >= NUM_BUFS)
