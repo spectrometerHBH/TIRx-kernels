@@ -13,7 +13,17 @@ from tirx_kernels.flashmla._tma import tma_config
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.lang.pipeline import MBarrier, TCGen05Bar, TMABar
-from tvm.tirx.layout import ComposeLayout, Iter, R, S, SwizzleLayout, TCol, TileLayout, TLane
+from tvm.tirx.layout import (
+    ComposeLayout,
+    Iter,
+    R,
+    S,
+    SwizzleLayout,
+    TCol,
+    TileLayout,
+    TLane,
+    tid_in_wg,
+)
 
 B_H = 128
 B_TOPK = 128
@@ -283,6 +293,10 @@ def _kernel(
     cta_idx: T.let = block_idx % 2
     s_q_idx: T.let = block_idx // 2
     thread_idx = T.thread_id([NUM_THREADS])
+    T.warpgroup_id([NUM_THREADS // 128])
+    T.warp_id_in_wg([4])
+    T.lane_id([32])
+    T.thread_id_in_wg([128])
     warp_idx: T.let = T.cuda.__shfl_sync(T.uint32(0xFFFFFFFF), thread_idx // 32, 0, 32)
     lane_idx: T.let = thread_idx % 32
     topk_len: T.let = (
@@ -485,7 +499,27 @@ def _kernel(
             mi = new_max
             li = li * scale_for_old
 
-            s_pack = T.alloc_local((P_TMEM_ELEMENTS // 2,), "uint32")
+            # S frag: warpgroup-distributed (B_H//2, B_TOPK) tile. Thread idx
+            # owns row h = idx % 64 and the k half [64*(idx//64), +64), in
+            # 8-elem chunks -- the ownership produced by the packing loop below.
+            s_frag = T.alloc_buffer(
+                (B_H // 2, B_TOPK),
+                "bfloat16",
+                scope="local",
+                layout=TileLayout(
+                    S[
+                        (B_H // 2, 2, B_TOPK // 16, 8) : (
+                            1 @ tid_in_wg,
+                            (B_H // 2) @ tid_in_wg,
+                            8,
+                            1,
+                        )
+                    ]
+                ),
+            )
+            s_pack = s_frag.local(
+                P_TMEM_ELEMENTS, layout=TileLayout(S[(P_TMEM_ELEMENTS,) : (1,)])
+            ).view("uint32")
             neg_new_max_pair: T.let = T.cuda.make_float2(-new_max, -new_max)
             for s_i in T.unroll(P_TMEM_ELEMENTS // 2):
                 p_pair: T.let = T.cuda.make_float2(
@@ -502,18 +536,7 @@ def _kernel(
                 prev_phase: T.let = ((k - 1) // NUM_BUFS) & 1
                 bar_sv_done.wait(prev_buf, prev_phase)
 
-            for s_store_i in T.unroll(P_TMEM_ELEMENTS // 8):
-                s_store_offset = (
-                    (idx_in_warpgroup % 64) * 8
-                    + (idx_in_warpgroup // 64) * ((B_H // 2) * (B_TOPK // 2))
-                    + s_store_i * (B_H // 2) * 8
-                )
-                s_pack_offset: T.let = s_store_i * 4
-                Tx.copy(
-                    s_smem.view("uint32")[s_store_offset // 2 : s_store_offset // 2 + 4],
-                    s_pack[s_pack_offset : s_pack_offset + 4],
-                    dispatch="vec_128b",
-                )
+            Tx.wg.copy(s_smem_gemm[:, :], s_frag[:, :])
 
             if (k > 0) & should_scale_o:
                 T.ptx.tcgen05.fence.after_thread_sync()

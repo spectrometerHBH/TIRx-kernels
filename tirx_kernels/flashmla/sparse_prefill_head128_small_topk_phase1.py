@@ -13,7 +13,16 @@ from tirx_kernels.flashmla._tma import tma_config
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.lang.pipeline import MBarrier, TCGen05Bar, TMABar
-from tvm.tirx.layout import ComposeLayout, Iter, S, SwizzleLayout, TCol, TileLayout, TLane
+from tvm.tirx.layout import (
+    ComposeLayout,
+    Iter,
+    S,
+    SwizzleLayout,
+    TCol,
+    TileLayout,
+    TLane,
+    tid_in_wg,
+)
 
 B_H = 128
 B_TOPK = 64
@@ -289,6 +298,10 @@ def _kernel(
     T.cta_id_in_cluster([2])
     cta_idx: T.let = block_idx % 2
     thread_idx = T.thread_id([NUM_THREADS])
+    T.warpgroup_id([NUM_THREADS // 128])
+    T.warp_id_in_wg([4])
+    T.lane_id([32])
+    T.thread_id_in_wg([128])
     warp_idx: T.let = T.cuda.__shfl_sync(T.uint32(0xFFFFFFFF), thread_idx // 32, 0, 32)
     lane_idx: T.let = thread_idx % 32
     warpgroup_idx: T.let = T.cuda.__shfl_sync(T.uint32(0xFFFFFFFF), thread_idx // 128, 0, 32)
@@ -830,10 +843,6 @@ def _kernel(
             mi: T.float32 = MAX_INIT_VAL
             li: T.float32 = 0.0
             real_mi: T.float32 = T.float32(-float("inf"))
-            s_smem_base: T.let = (
-                T.if_then_else(local_warp_idx >= 2, (B_H // 2) * (B_TOPK // 2), 0)
-                + (idx_in_warpgroup % 64) * 8
-            )
             scale_pair: T.let = T.cuda.make_float2(sm_scale_div_log2, sm_scale_div_log2)
 
             for k in T.serial(0, wg3_num_k_blocks, unroll=False):
@@ -953,7 +962,29 @@ def _kernel(
                     scale_for_old = T.ptx.exp2(mi - new_max)
                 mi = new_max
 
-                s_pack = T.alloc_local((WG3_NUM_ELEMS_PER_THREAD // 2,), "uint32")
+                # S frag: warpgroup-distributed (B_H//2, B_TOPK) tile. Thread idx
+                # owns row h = idx % 64 and the k half [32*(idx//64), +32), in
+                # 8-elem chunks -- the ownership produced by the packing loop
+                # below.
+                s_frag = T.alloc_buffer(
+                    (B_H // 2, B_TOPK),
+                    "bfloat16",
+                    scope="local",
+                    layout=TileLayout(
+                        S[
+                            (B_H // 2, 2, B_TOPK // 16, 8) : (
+                                1 @ tid_in_wg,
+                                (B_H // 2) @ tid_in_wg,
+                                8,
+                                1,
+                            )
+                        ]
+                    ),
+                )
+                s_pack = s_frag.local(
+                    WG3_NUM_ELEMS_PER_THREAD,
+                    layout=TileLayout(S[(WG3_NUM_ELEMS_PER_THREAD,) : (1,)]),
+                ).view("uint32")
                 cur_sum_pair: T.uint64 = T.cuda.make_float2(T.float32(0.0), T.float32(0.0))
                 neg_new_max_pair: T.let = T.cuda.make_float2(-new_max, -new_max)
                 for s_i in T.unroll(WG3_NUM_ELEMS_PER_THREAD // 2):
@@ -974,14 +1005,7 @@ def _kernel(
                 li = li_tmp
 
                 bar_SV_done.wait(0, (wg3_rs & 1) ^ 1)
-                for s_store_i in T.unroll(WG3_NUM_ELEMS_PER_THREAD // 8):
-                    s_store_offset = s_smem_base + s_store_i * 8 * (B_H // 2)
-                    s_pack_offset: T.let = s_store_i * 4
-                    Tx.copy(
-                        s_smem.view("uint32")[s_store_offset // 2 : s_store_offset // 2 + 4],
-                        s_pack[s_pack_offset : s_pack_offset + 4],
-                        dispatch="vec_128b",
-                    )
+                Tx.wg.copy(s_smem_gemm[:, :], s_frag[:, :])
 
                 if (k > 0) & should_scale_o:
                     T.ptx.tcgen05.fence.after_thread_sync()
