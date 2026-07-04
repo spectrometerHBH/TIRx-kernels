@@ -25,9 +25,6 @@ LN_2 = math.log(2.0)
 
 HEAD64_LAUNCH_PARAM_TAGS = ("blockIdx.x", "threadIdx.x", "tirx.use_dyn_shared_memory")
 
-MMA_P = (B_H, 128, 16)
-MMA_O = (B_H, 256, 16)
-
 NAMED_BARRIER_WG0_SYNC = 0
 NAMED_BARRIER_WG0_WARP02_SYNC = 1
 
@@ -358,15 +355,6 @@ def _kernel(
     # CUDA phase1.cuh:77. h_kv is fixed to 1, so the row pointer is
     # params.indices + s_q_idx * params.stride_indices_s_q.
     g_indices_base: T.let = s_q_idx * stride_indices_s_q
-
-    mma_P = T.meta_var(MMA_P)
-    mma_O = T.meta_var(MMA_O)
-    mma_p_m = T.meta_var(mma_P[0])
-    mma_p_n = T.meta_var(mma_P[1])
-    mma_p_k = T.meta_var(mma_P[2])
-    mma_o_m = T.meta_var(mma_O[0])
-    mma_o_n = T.meta_var(mma_O[1])
-    mma_o_k = T.meta_var(mma_O[2])
     tmem_pool = T.TMEMPool(pool, total_cols=512, cta_group=1, tmem_addr=tmem_start_addr)
     # Full-TMEM overlay for tcgen05.ld/st; aliases every allocation below.
     tmem_ldst = tmem_pool.view((128, 512), "float32", datapath="D")
