@@ -14,7 +14,17 @@ from tvm.backend.cuda.operator.tile_primitive.tma_utils import SwizzleMode
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.lang.pipeline import MBarrier, TCGen05Bar, TMABar
-from tvm.tirx.layout import ComposeLayout, Iter, S, SwizzleLayout, TCol, TileLayout, TLane
+from tvm.tirx.layout import (
+    ComposeLayout,
+    Iter,
+    S,
+    SwizzleLayout,
+    TCol,
+    TileLayout,
+    TLane,
+    laneid,
+    wid_in_wg,
+)
 
 B_H = 64
 B_TOPK = 64
@@ -455,11 +465,6 @@ def _kernel(
         mi: T.float32 = MAX_INIT_VAL
         li: T.float32 = 0.0
         real_mi: T.float32 = T.float32(-float("inf"))
-        s_smem_lane_offset: T.int32 = (
-            lane_idx * 8
-            + T.bitwise_and(warp_idx, T.int32(1)) * (B_H // 2) * 8
-            + (warp_idx // 2) * B_H * (B_TOPK // 2)
-        )
         num_elems_per_thread = T.meta_var(B_TOPK // 2)
 
         # CUDA phase1.cuh:169-244.  Scale/exp loop with helper bodies stepped
@@ -569,7 +574,30 @@ def _kernel(
                 scale_for_old = T.ptx.exp2(mi - new_max)
             mi = new_max
 
-            s_pack = T.alloc_local((num_elems_per_thread // 2,), "uint32")
+            # S frag: warpgroup-distributed (B_H, B_TOPK) tile. Thread (w, l)
+            # owns cols k = (l//8) + 4*(w&1) + 8*j + 32*(w//2), rows
+            # h = 8*(l%8)..+7 -- the ownership produced by the packing loop
+            # below (CUDA phase1.cuh:229-232).
+            s_frag = T.alloc_buffer(
+                (B_H, B_TOPK),
+                "bfloat16",
+                scope="local",
+                layout=TileLayout(
+                    S[
+                        (8, 8, 2, 4, 2, 4) : (
+                            1 @ laneid,
+                            1,
+                            2 @ wid_in_wg,
+                            8,
+                            1 @ wid_in_wg,
+                            8 @ laneid,
+                        )
+                    ]
+                ),
+            )
+            s_pack = s_frag.local(
+                num_elems_per_thread, layout=TileLayout(S[(num_elems_per_thread,) : (1,)])
+            ).view("uint32")
             cur_sum_pair: T.uint64 = T.cuda.make_float2(T.float32(0.0), T.float32(0.0))
             neg_new_max_pair: T.let = T.cuda.make_float2(-new_max, -new_max)
             scale_pair: T.let = T.cuda.make_float2(sm_scale_div_log2, sm_scale_div_log2)
@@ -591,15 +619,8 @@ def _kernel(
                 prev_phase: T.int32 = _ring_phase_parity(k - 1, max_k_blocks)
                 bar_sv_done.wait(prev_buf, prev_phase)
 
-            # CUDA phase1.cuh:229-232 vectorized uint128_t stores to sS_base.
-            for s_store_i in T.unroll(num_elems_per_thread // 8):
-                s_store_offset = s_smem_lane_offset + B_H * 8 * s_store_i
-                s_pack_offset: T.let = s_store_i * 4
-                Tx.copy(
-                    s_q_rope_s.view("uint32")[s_store_offset // 2 : s_store_offset // 2 + 4],
-                    s_pack[s_pack_offset : s_pack_offset + 4],
-                    dispatch="vec_128b",
-                )
+            # CUDA phase1.cuh:229-232 S store (vectorized by the reg copy path).
+            Tx.wg.copy(s_smem_gemm[:, :], s_frag[:, :])
             if (k > 0) & should_scale_o:
                 T.ptx.tcgen05.fence.after_thread_sync()
                 # CUDA common_subroutine.h:147-168 rescale_O.
