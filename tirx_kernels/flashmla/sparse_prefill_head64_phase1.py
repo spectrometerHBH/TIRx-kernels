@@ -760,30 +760,24 @@ def _kernel(
         if T.ptx.elect_sync():
             for k in T.serial(0, num_k_blocks, unroll=False):
                 selected_idx = T.alloc_local((WG1_NUM_LOCAL_ROWS_PER_WARP, 4), "int32")
-                max_indices: T.int32 = -1
-                min_indices: T.int32 = s_kv
+                idx_base: T.let = g_indices_base + k * B_TOPK + wg1_warp_idx * 4
+                indices_tile = T.decl_buffer(
+                    (WG1_NUM_LOCAL_ROWS_PER_WARP, 4),
+                    "int32",
+                    indices.data,
+                    elem_offset=indices.elem_offset + idx_base,
+                    layout=TileLayout(S[(WG1_NUM_LOCAL_ROWS_PER_WARP, 4) : (WG1_NUM_WARPS * 4, 1)]),
+                )
+                Tx.copy(selected_idx[:, :], indices_tile[:, :], cache="nc")
 
-                for local_row in T.unroll(WG1_NUM_LOCAL_ROWS_PER_WARP):
-                    row_base: T.let = (
-                        g_indices_base
-                        + k * B_TOPK
-                        + local_row * WG1_NUM_WARPS * 4
-                        + wg1_warp_idx * 4
-                    )
-                    Tx.copy(
-                        selected_idx[local_row, 0:4],
-                        indices[row_base : row_base + 4],
-                        dispatch="vec_128b",
-                        cache="nc",
-                    )
-                    idx0: T.let = selected_idx[local_row, 0]
-                    idx1: T.let = selected_idx[local_row, 1]
-                    idx2: T.let = selected_idx[local_row, 2]
-                    idx3: T.let = selected_idx[local_row, 3]
-                    local_max: T.let = T.max(T.max(idx0, idx1), T.max(idx2, idx3))
-                    max_indices = T.max(max_indices, local_max)
-                    local_min: T.let = T.min(T.min(idx0, idx1), T.min(idx2, idx3))
-                    min_indices = T.min(min_indices, local_min)
+                max_idx_buf = T.alloc_local((1,), "int32")
+                min_idx_buf = T.alloc_local((1,), "int32")
+                max_idx_buf[0] = -1
+                min_idx_buf[0] = s_kv
+                Tx.max(max_idx_buf[0:1], selected_idx[:, :], axes=(0, 1), accum=True)
+                Tx.min(min_idx_buf[0:1], selected_idx[:, :], axes=(0, 1), accum=True)
+                max_indices: T.let = max_idx_buf[0]
+                min_indices: T.let = min_idx_buf[0]
 
                 is_all_rows_invalid: T.let = (min_indices == s_kv) | (max_indices == -1)
                 should_skip_tma: T.let = is_all_rows_invalid & (k >= NUM_BUFS)
