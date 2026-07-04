@@ -224,53 +224,11 @@ def _reference_sparse_prefill(
     return ref_out.to(torch.bfloat16), ref_max_logits, ref_lse
 
 
-def _make_tirx_launch(case: dict[str, Any]) -> dict[str, Any]:
-    import ctypes
-
-    cfg: SparseFlashMLAPrefillHead128SmallTopKConfig = case["config"]
-    attn_sink_ptr = (
-        ctypes.c_void_p(int(case["attn_sink"].data_ptr()))
-        if cfg.have_attn_sink
-        else ctypes.c_void_p(0)
-    )
-    topk_length_ptr = (
-        ctypes.c_void_p(int(case["topk_length"].data_ptr()))
-        if cfg.have_topk_length
-        else ctypes.c_void_p(0)
-    )
-    return {
-        "case": case,
-        "args": (
-            case["q"],
-            case["kv"].reshape(-1),
-            case["indices"].reshape(-1),
-            attn_sink_ptr,
-            topk_length_ptr,
-            case["out"],
-            case["max_logits"],
-            case["lse"],
-        ),
-    }
-
-
-def _build_tirx_launches(case: dict[str, Any]) -> list[dict[str, Any]]:
-    return [_make_tirx_launch(case)]
-
-
-def _run_tirx_launches(
-    executable: Any, launches: list[dict[str, Any]], *, output_case: dict[str, Any] | None = None
-) -> None:
-    for launch in launches:
-        executable(*launch["args"])
-
-
-def _tirx_benchmark_tensors(
-    case: dict[str, Any], launches: list[dict[str, Any]]
-) -> tuple[Any, ...]:
+def _tirx_args(case: dict[str, Any]) -> tuple[Any, ...]:
     return (
         case["q"],
-        case["kv"],
-        case["indices"],
+        case["kv"].reshape(-1),
+        case["indices"].reshape(-1),
         case["attn_sink"],
         case["topk_length"],
         case["out"],
@@ -300,8 +258,8 @@ def _kernel(
     q: T.Buffer((s_q, h_q, d_qk), "bfloat16"),
     kv: T.Buffer((s_kv * stride_kv_s_kv,), "bfloat16"),
     indices: T.Buffer((s_q * stride_indices_s_q,), "int32"),
-    attn_sink: T.handle("float32"),
-    topk_length: T.handle("int32"),
+    attn_sink: T.Buffer((h_q,), "float32"),
+    topk_length: T.Buffer((s_q,), "int32"),
     out: T.Buffer((s_q, h_q, D_V), "bfloat16"),
     max_logits: T.Buffer((s_q, h_q), "float32"),
     lse: T.Buffer((s_q, h_q), "float32"),
@@ -572,18 +530,12 @@ def _kernel(
                     )
                     T.ptx.cp_async.bulk.commit_group()
 
-        wg0_job_valid = T.local_scalar("int32")
-        wg0_job_valid = 1
-        wg0_job_block_idx = T.local_scalar("int32")
-        wg0_job_block_idx = block_idx
-        wg0_outer_loop_phase = T.local_scalar("int32")
-        wg0_outer_loop_phase = 0
-        last_valid = T.local_scalar("int32")
-        last_valid = 0
-        last_s_q_idx = T.local_scalar("int32")
-        last_s_q_idx = 0
-        last_outer_loop_phase = T.local_scalar("int32")
-        last_outer_loop_phase = 0
+        wg0_job_valid: T.int32 = 1
+        wg0_job_block_idx: T.int32 = block_idx
+        wg0_outer_loop_phase: T.int32 = 0
+        last_valid: T.int32 = 0
+        last_s_q_idx: T.int32 = 0
+        last_outer_loop_phase: T.int32 = 0
 
         while wg0_job_valid != 0:
             wg0_s_q_idx: T.let = wg0_job_block_idx // 2
@@ -624,18 +576,14 @@ def _kernel(
         # Source uses canonical_warp_idx() here, not canonical_warp_idx_sync().
         wg1_warp_idx: T.let = thread_idx // 32 - 4
         if T.ptx.elect_sync():
-            wg1_job_valid = T.local_scalar("int32")
-            wg1_job_valid = 1
-            wg1_job_block_idx = T.local_scalar("int32")
-            wg1_job_block_idx = block_idx
-            wg1_outer_loop_phase = T.local_scalar("int32")
-            wg1_outer_loop_phase = 0
-            wg1_rs = T.local_scalar("int32")
-            wg1_rs = 0
+            wg1_job_valid: T.int32 = 1
+            wg1_job_block_idx: T.int32 = block_idx
+            wg1_outer_loop_phase: T.int32 = 0
+            wg1_rs: T.int32 = 0
             while wg1_job_valid != 0:
                 wg1_s_q_idx: T.let = wg1_job_block_idx // 2
                 wg1_topk_len: T.let = (
-                    T.cuda.ldg(T.handle_add_byte_offset(topk_length, wg1_s_q_idx * 4), "int32")
+                    T.cuda.ldg(topk_length.ptr_to([wg1_s_q_idx]), "int32")
                     if have_topk_length
                     else topk
                 )
@@ -723,18 +671,14 @@ def _kernel(
 
         if (warp_idx == 8) & (cta_idx == 0):
             if T.ptx.elect_sync():
-                umma_job_valid = T.local_scalar("int32")
-                umma_job_valid = 1
-                umma_job_block_idx = T.local_scalar("int32")
-                umma_job_block_idx = block_idx
-                umma_outer_loop_phase = T.local_scalar("int32")
-                umma_outer_loop_phase = 0
-                umma_rs = T.local_scalar("int32")
-                umma_rs = 0
+                umma_job_valid: T.int32 = 1
+                umma_job_block_idx: T.int32 = block_idx
+                umma_outer_loop_phase: T.int32 = 0
+                umma_rs: T.int32 = 0
                 while umma_job_valid != 0:
                     umma_s_q_idx: T.let = umma_job_block_idx // 2
                     umma_topk_len: T.let = (
-                        T.cuda.ldg(T.handle_add_byte_offset(topk_length, umma_s_q_idx * 4), "int32")
+                        T.cuda.ldg(topk_length.ptr_to([umma_s_q_idx]), "int32")
                         if have_topk_length
                         else topk
                     )
@@ -750,18 +694,17 @@ def _kernel(
                             bar_KV_full.arrive(k_buf_idx, tx_count=B_TOPK * D_QK * BF16_BYTES)
                             bar_KV_full.wait(k_buf_idx, k_bar_phase)
                             T.ptx.tcgen05.fence.after_thread_sync()
-                            qk_accumulate = T.alloc_local((1,), "uint32")
-                            qk_accumulate[0] = T.uint32(0)
+                            qk_accumulate: T.uint32 = 0
                             Tx.gemm_async(
                                 tmem_p[:, :],
                                 q_tmem[:, :],
                                 k_smem_gemm[k_buf_idx, :, :],
-                                accum=qk_accumulate[0],
+                                accum=qk_accumulate,
                                 dispatch="tcgen05",
                                 cta_group=2,
                                 smem_desc="local_hoist",
                             )
-                            qk_accumulate[0] = T.uint32(1)
+                            qk_accumulate = T.uint32(1)
                             bar_QK_done.arrive(0, cta_group=2, cta_mask=3)
                             if k == umma_num_k_blocks - 1:
                                 T.ptx.tcgen05.commit(
@@ -777,14 +720,15 @@ def _kernel(
                             if prev_k == 0:
                                 bar_tOut_empty.wait(0, umma_outer_loop_phase ^ 1)
                             T.ptx.tcgen05.fence.after_thread_sync()
-                            o_accumulate = T.alloc_local((1,), "uint32")
-                            o_accumulate[0] = T.if_then_else(prev_k == 0, T.uint32(0), T.uint32(1))
+                            o_accumulate: T.uint32 = T.if_then_else(
+                                prev_k == 0, T.uint32(0), T.uint32(1)
+                            )
                             Tx.gemm_async(
                                 tmem_o_lo[:, :],
                                 s_smem_gemm[:, :],
                                 k_smem_gemm[prev_buf, :, 0 : D_V // 4],
                                 transB=True,
-                                accum=o_accumulate[0],
+                                accum=o_accumulate,
                                 dispatch="tcgen05",
                                 cta_group=2,
                                 smem_desc="local_hoist",
@@ -794,12 +738,12 @@ def _kernel(
                                 s_smem_gemm[:, :],
                                 k_smem_gemm[prev_buf, :, D_V // 4 : D_V // 2],
                                 transB=True,
-                                accum=o_accumulate[0],
+                                accum=o_accumulate,
                                 dispatch="tcgen05",
                                 cta_group=2,
                                 smem_desc="local_hoist",
                             )
-                            o_accumulate[0] = T.uint32(1)
+                            o_accumulate = T.uint32(1)
                             bar_SV_done.arrive(0, cta_group=2, cta_mask=3)
                             bar_KV_empty.arrive(prev_buf, cta_group=2, cta_mask=3)
 
@@ -823,20 +767,14 @@ def _kernel(
         elif warp_idx == 9:
             if lane_idx < B_TOPK // 8:
                 lane_indices = T.alloc_local((8,), "int32")
-                valid_job_valid = T.local_scalar("int32")
-                valid_job_valid = 1
-                valid_job_block_idx = T.local_scalar("int32")
-                valid_job_block_idx = block_idx
-                valid_outer_loop_phase = T.local_scalar("int32")
-                valid_outer_loop_phase = 0
-                valid_rs = T.local_scalar("int32")
-                valid_rs = 0
+                valid_job_valid: T.int32 = 1
+                valid_job_block_idx: T.int32 = block_idx
+                valid_outer_loop_phase: T.int32 = 0
+                valid_rs: T.int32 = 0
                 while valid_job_valid != 0:
                     valid_s_q_idx: T.let = valid_job_block_idx // 2
                     valid_topk_len: T.let = (
-                        T.cuda.ldg(
-                            T.handle_add_byte_offset(topk_length, valid_s_q_idx * 4), "int32"
-                        )
+                        T.cuda.ldg(topk_length.ptr_to([valid_s_q_idx]), "int32")
                         if have_topk_length
                         else topk
                     )
@@ -878,10 +816,8 @@ def _kernel(
         elif warp_idx >= 10:
             if T.ptx.elect_sync():
                 if warp_idx == 10:
-                    clc_job_valid = T.local_scalar("int32")
-                    clc_job_valid = 1
-                    clc_outer_loop_phase = T.local_scalar("int32")
-                    clc_outer_loop_phase = 0
+                    clc_job_valid: T.int32 = 1
+                    clc_outer_loop_phase: T.int32 = 0
                     while clc_job_valid != 0:
                         if cta_idx == 0:
                             bar_clc_empty.wait(0, clc_outer_loop_phase ^ 1)
@@ -905,28 +841,19 @@ def _kernel(
         # CUDA phase1.cuh:788-921. Scale/exp warpgroup.
         T.ptx.setmaxnreg(True, 160)
         local_warp_idx: T.let = warp_idx - 12
-        wg3_job_valid = T.local_scalar("int32")
-        wg3_job_valid = 1
-        wg3_job_block_idx = T.local_scalar("int32")
-        wg3_job_block_idx = block_idx
-        wg3_outer_loop_phase = T.local_scalar("int32")
-        wg3_outer_loop_phase = 0
-        wg3_rs = T.local_scalar("int32")
-        wg3_rs = 0
+        wg3_job_valid: T.int32 = 1
+        wg3_job_block_idx: T.int32 = block_idx
+        wg3_outer_loop_phase: T.int32 = 0
+        wg3_rs: T.int32 = 0
         while wg3_job_valid != 0:
             wg3_s_q_idx: T.let = wg3_job_block_idx // 2
             wg3_topk_len: T.let = (
-                T.cuda.ldg(T.handle_add_byte_offset(topk_length, wg3_s_q_idx * 4), "int32")
-                if have_topk_length
-                else topk
+                T.cuda.ldg(topk_length.ptr_to([wg3_s_q_idx]), "int32") if have_topk_length else topk
             )
             wg3_num_k_blocks: T.let = T.max((wg3_topk_len + B_TOPK - 1) // B_TOPK, 1)
-            mi = T.local_scalar("float32")
-            mi = MAX_INIT_VAL
-            li = T.local_scalar("float32")
-            li = 0.0
-            real_mi = T.local_scalar("float32")
-            real_mi = T.float32(-float("inf"))
+            mi: T.float32 = MAX_INIT_VAL
+            li: T.float32 = 0.0
+            real_mi: T.float32 = T.float32(-float("inf"))
             s_smem_base: T.let = (
                 T.if_then_else(local_warp_idx >= 2, (B_H // 2) * (B_TOPK // 2), 0)
                 + (idx_in_warpgroup % 64) * 8
@@ -1042,8 +969,7 @@ def _kernel(
                     p[exchange_i * 4 + 2] = T.cuda.float_as_uint(T.cuda.float2_x(sum_pair1))
                     p[exchange_i * 4 + 3] = T.cuda.float_as_uint(T.cuda.float2_y(sum_pair1))
 
-                cur_pi_max = T.local_scalar("float32")
-                cur_pi_max = T.float32(-float("inf"))
+                cur_pi_max: T.float32 = T.float32(-float("inf"))
                 for p_i in T.unroll(WG3_NUM_ELEMS_PER_THREAD):
                     cur_pi_max = T.max(cur_pi_max, T.cuda.uint_as_float(p[p_i]))
                 cur_pi_max = cur_pi_max * sm_scale_div_log2
@@ -1054,8 +980,8 @@ def _kernel(
                 should_scale_o: T.let = (
                     T.ptx.any_sync(T.uint32(0xFFFFFFFF), cur_pi_max - mi > 6.0) != 0
                 )
-                new_max = T.local_scalar("float32")
-                scale_for_old = T.local_scalar("float32")
+                new_max: T.float32
+                scale_for_old: T.float32
                 if not should_scale_o:
                     scale_for_old = 1.0
                     new_max = mi
@@ -1065,8 +991,7 @@ def _kernel(
                 mi = new_max
 
                 s_pack = T.alloc_local((WG3_NUM_ELEMS_PER_THREAD // 2,), "uint32")
-                cur_sum_pair = T.local_scalar("uint64")
-                cur_sum_pair = T.cuda.make_float2(T.float32(0.0), T.float32(0.0))
+                cur_sum_pair: T.uint64 = T.cuda.make_float2(T.float32(0.0), T.float32(0.0))
                 neg_new_max_pair: T.let = T.cuda.make_float2(-new_max, -new_max)
                 for s_i in T.unroll(WG3_NUM_ELEMS_PER_THREAD // 2):
                     p_pair: T.let = T.cuda.make_float2(
@@ -1081,9 +1006,9 @@ def _kernel(
                     cur_sum_pair = T.ptx.add_f32x2(cur_sum_pair, s_pair, dps=False)
                     s_pack[s_i] = T.cuda.float22bfloat162_rn(s_x, s_y)
                 cur_sum: T.let = T.cuda.float2_x(cur_sum_pair) + T.cuda.float2_y(cur_sum_pair)
-                li_tmp = T.alloc_local((1,), "float32")
-                T.ptx.fma_f32(T.address_of(li_tmp[0]), li, scale_for_old, cur_sum)
-                li = li_tmp[0]
+                li_tmp: T.float32
+                T.ptx.fma_f32(T.address_of(li_tmp), li, scale_for_old, cur_sum)
+                li = li_tmp
 
                 bar_SV_done.wait(0, (wg3_rs & 1) ^ 1)
                 for s_store_i in T.unroll(WG3_NUM_ELEMS_PER_THREAD // 8):
@@ -1148,8 +1073,7 @@ def _kernel(
             if idx_in_warpgroup < B_H // 2:
                 head_idx: T.let = cta_idx * (B_H // 2) + idx_in_warpgroup
                 attn_sink_log2: T.let = (
-                    T.cuda.ldg(T.handle_add_byte_offset(attn_sink, head_idx * 4), "float32")
-                    * LOG_2_E
+                    T.cuda.ldg(attn_sink.ptr_to([head_idx]), "float32") * LOG_2_E
                     if have_attn_sink
                     else T.float32(-float("inf"))
                 )
@@ -1158,7 +1082,7 @@ def _kernel(
                 )
                 rowwise_li_buf[idx_in_warpgroup] = T.if_then_else(li == 0.0, 0.0, output_scale)
                 bar_li_full.arrive(0)
-                cur_lse = T.local_scalar("float32")
+                cur_lse: T.float32
                 T.ptx.fma_f32(T.address_of(cur_lse), mi, LN_2, T.log(li))
                 cur_lse = T.if_then_else(
                     cur_lse == T.float32(-float("inf")), T.float32(float("inf")), cur_lse
@@ -1211,8 +1135,7 @@ def run_test(**kwargs: Any) -> None:
         raise SkipTest(case["dispatch_reason"])
     prim_func = get_kernel(**kwargs)
     ex = compile_kernel(prim_func)
-    launches = _build_tirx_launches(case)
-    _run_tirx_launches(ex, launches, output_case=case)
+    ex(*_tirx_args(case))
     torch.cuda.synchronize()
     ref_out, ref_max_logits, ref_lse = _reference_sparse_prefill(case)
     torch.testing.assert_close(case["out"], ref_out, rtol=4.01 / 128, atol=5e-3)
@@ -1239,9 +1162,9 @@ def run_bench(
     ex = compile_kernel(prim_func)
 
     # Allocate inputs once, outside the timed region (Triton-standard pure launch).
-    case["launches"] = _build_tirx_launches(case)
+    args = _tirx_args(case)
 
-    funcs = {"tirx": lambda: _run_tirx_launches(ex, case["launches"])}
+    funcs = {"tirx": lambda: ex(*args)}
 
     from tirx_kernels.flashmla._flashmla_bench import flashmla_reference_builder
 

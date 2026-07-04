@@ -30,7 +30,6 @@ HEAD128_LAUNCH_PARAM_TAGS = (
 
 TMEM_COL_O = 0
 TMEM_COL_P = 256
-TMEM_COL_Q = 320
 
 NAMED_BARRIER_WG0_SYNC = 0
 
@@ -216,53 +215,11 @@ def _reference_sparse_prefill(
     return ref_out.to(torch.bfloat16), ref_max_logits, ref_lse
 
 
-def _make_tirx_launch(case: dict[str, Any]) -> dict[str, Any]:
-    import ctypes
-
-    cfg: SparseFlashMLAPrefillHead128Config = case["config"]
-    attn_sink_ptr = (
-        ctypes.c_void_p(int(case["attn_sink"].data_ptr()))
-        if cfg.have_attn_sink
-        else ctypes.c_void_p(0)
-    )
-    topk_length_ptr = (
-        ctypes.c_void_p(int(case["topk_length"].data_ptr()))
-        if cfg.have_topk_length
-        else ctypes.c_void_p(0)
-    )
-    return {
-        "case": case,
-        "args": (
-            case["q"],
-            case["kv"].reshape(-1),
-            case["indices"].reshape(-1),
-            attn_sink_ptr,
-            topk_length_ptr,
-            case["out"],
-            case["max_logits"],
-            case["lse"],
-        ),
-    }
-
-
-def _build_tirx_launches(case: dict[str, Any]) -> list[dict[str, Any]]:
-    return [_make_tirx_launch(case)]
-
-
-def _run_tirx_launches(
-    executable: Any, launches: list[dict[str, Any]], *, output_case: dict[str, Any] | None = None
-) -> None:
-    for launch in launches:
-        executable(*launch["args"])
-
-
-def _tirx_benchmark_tensors(
-    case: dict[str, Any], launches: list[dict[str, Any]]
-) -> tuple[Any, ...]:
+def _tirx_args(case: dict[str, Any]) -> tuple[Any, ...]:
     return (
         case["q"],
-        case["kv"],
-        case["indices"],
+        case["kv"].reshape(-1),
+        case["indices"].reshape(-1),
         case["attn_sink"],
         case["topk_length"],
         case["out"],
@@ -292,8 +249,8 @@ def _kernel(
     q: T.Buffer((s_q, h_q, d_qk), "bfloat16"),
     kv: T.Buffer((s_kv * stride_kv_s_kv,), "bfloat16"),
     indices: T.Buffer((s_q * stride_indices_s_q,), "int32"),
-    attn_sink: T.handle("float32"),
-    topk_length: T.handle("int32"),
+    attn_sink: T.Buffer((h_q,), "float32"),
+    topk_length: T.Buffer((s_q,), "int32"),
     out: T.Buffer((s_q, h_q, D_V), "bfloat16"),
     max_logits: T.Buffer((s_q, h_q), "float32"),
     lse: T.Buffer((s_q, h_q), "float32"),
@@ -322,9 +279,7 @@ def _kernel(
     warp_idx: T.let = T.cuda.__shfl_sync(T.uint32(0xFFFFFFFF), thread_idx // 32, 0, 32)
     lane_idx: T.let = thread_idx % 32
     topk_len: T.let = (
-        T.cuda.ldg(T.handle_add_byte_offset(topk_length, s_q_idx * 4), "int32")
-        if have_topk_length
-        else topk
+        T.cuda.ldg(topk_length.ptr_to([s_q_idx]), "int32") if have_topk_length else topk
     )
     num_k_blocks: T.let = T.max((topk_len + B_TOPK - 1) // B_TOPK, 1)
     warpgroup_idx: T.let = T.cuda.__shfl_sync(T.uint32(0xFFFFFFFF), thread_idx // 128, 0, 32)
@@ -332,7 +287,6 @@ def _kernel(
     d_sq = T.meta_var(d_qk - D_TQ)
     num_sq_tiles = T.meta_var((d_qk - D_TQ) // 64)
     num_qk_tiles = T.meta_var(d_qk // 64)
-    shared_u_elems = T.meta_var((B_H // 2) * d_sq + (D_V // 2) * B_TOPK + (B_TOPK // 2) * d_qk)
     tiled_mma_smem_desc = T.meta_var(
         "recompute"
         if (d_qk == 512 and s_kv == 8192)
@@ -350,13 +304,12 @@ def _kernel(
     q_full = pool.alloc_mma((B_H // 2, d_qk), "bfloat16")
     pool.move_base_to(u_base)
     sq_smem = pool.alloc_mma((B_H // 2, d_sq), "bfloat16")
-    pool.move_base_to(u_base + (B_H // 2) * d_sq * BF16_BYTES)
     v_smem = pool.alloc_mma((D_V // 2, B_TOPK), "bfloat16")
-    pool.move_base_to(u_base + ((B_H // 2) * d_sq + (D_V // 2) * B_TOPK) * BF16_BYTES)
     k_smem = pool.alloc_mma((B_TOPK // 2, d_qk), "bfloat16")
+    u_end = T.meta_var(pool.offset)
     pool.move_base_to(u_base)
     o_smem = pool.alloc_mma((B_H // 2, D_V), "bfloat16")
-    pool.move_base_to(u_base + shared_u_elems * BF16_BYTES)
+    pool.move_base_to(u_end)
     s_smem = pool.alloc(((B_H // 2) * B_TOPK,), "bfloat16")
     is_k_valid = pool.alloc((NUM_BUFS, B_TOPK // 8), "int8")
     bar_prologue_q = TMABar(pool, 1)
@@ -377,15 +330,11 @@ def _kernel(
     rowwise_max_buf = pool.alloc((128,), "float32")
     rowwise_li_buf = pool.alloc((128,), "float32")
     pool.commit()
-    q_tma = q.view(d_qk, h_q, s_q, layout=TileLayout(S[(d_qk, h_q, s_q) : (1, d_qk, h_q * d_qk)]))
-    out_tma = out.view(D_V, h_q, s_q, layout=TileLayout(S[(D_V, h_q, s_q) : (1, D_V, h_q * D_V)]))
     kv_tma = kv.view(s_kv, d_qk, layout=TileLayout(S[(s_kv, d_qk) : (stride_kv_s_kv, 1)]))
 
     g_indices_base: T.let = s_q_idx * stride_indices_s_q
-    tiled_mma_p_accumulate = T.alloc_local((1,), "uint32")
-    tiled_mma_o_accumulate = T.alloc_local((1,), "uint32")
-    tiled_mma_p_accumulate[0] = T.uint32(0)
-    tiled_mma_o_accumulate[0] = T.uint32(0)
+    tiled_mma_p_accumulate: T.uint32 = 0
+    tiled_mma_o_accumulate: T.uint32 = 0
 
     # CUDA phase1.cuh:87-146.  Warp 0 owns barrier init, Q TMA launch,
     # and the cta_group::2 TMEM allocation.
@@ -415,16 +364,15 @@ def _kernel(
             for q_tma_tile in T.unroll(num_qk_tiles):
                 Tx.copy_async(
                     q_full[:, q_tma_tile * 64 : (q_tma_tile + 1) * 64],
-                    q_tma[
-                        q_tma_tile * 64 : (q_tma_tile + 1) * 64,
-                        cta_idx * (B_H // 2) : (cta_idx + 1) * (B_H // 2),
+                    q[
                         s_q_idx : s_q_idx + 1,
+                        cta_idx * (B_H // 2) : (cta_idx + 1) * (B_H // 2),
+                        q_tma_tile * 64 : (q_tma_tile + 1) * 64,
                     ],
                     dispatch="tma",
                     mbar=bar_prologue_q.ptr_to([0]),
                     cta_group=2,
                     cache_hint=T.uint64(0x12F0000000000000),
-                    tensor_map_dim_order="natural",
                     prefetch_tensormap=True,
                     tensormap_l2_promotion="L2::256B",
                 )
@@ -443,7 +391,6 @@ def _kernel(
         "float32",
         layout=TileLayout(S[(B_H // 2, 2, B_TOPK // 2) : (1 @ TLane, 64 @ TLane, 1 @ TCol)]),
     )
-    tmem_pool.move_base_to(TMEM_COL_Q)
     q_tmem = tmem_pool.alloc(
         (B_H // 2, D_TQ), "bfloat16", layout=TileLayout(S[(B_H // 2, D_TQ) : (1 @ TLane, 1 @ TCol)])
     )
@@ -473,12 +420,9 @@ def _kernel(
     if warpgroup_idx == 0:
         # CUDA phase1.cuh:150-386.  Scale/exp warpgroup and epilogue.
         T.ptx.setmaxnreg(True, 144)
-        mi = T.local_scalar("float32")
-        mi = MAX_INIT_VAL
-        li = T.local_scalar("float32")
-        li = 0.0
-        real_mi = T.local_scalar("float32")
-        real_mi = T.float32(-float("inf"))
+        mi: T.float32 = MAX_INIT_VAL
+        li: T.float32 = 0.0
+        real_mi: T.float32 = T.float32(-float("inf"))
         scale_pair: T.let = T.cuda.make_float2(sm_scale_div_log2, sm_scale_div_log2)
 
         for k in T.serial(0, num_k_blocks, unroll=False):
@@ -518,8 +462,7 @@ def _kernel(
                     invalid_p_predicate, T.uint32(0xFF800000), p[p_i + P_TMEM_ELEMENTS // 2]
                 )
 
-            cur_pi_max = T.local_scalar("float32")
-            cur_pi_max = T.float32(-float("inf"))
+            cur_pi_max: T.float32 = T.float32(-float("inf"))
             for p_i in T.unroll(P_TMEM_ELEMENTS):
                 cur_pi_max = T.max(cur_pi_max, T.cuda.uint_as_float(p[p_i]))
             cur_pi_max = cur_pi_max * sm_scale_div_log2
@@ -530,11 +473,12 @@ def _kernel(
             T.ptx.bar.sync(NAMED_BARRIER_WG0_SYNC, 128)
             cur_pi_max = T.max(cur_pi_max, rowwise_max_buf[idx_in_warpgroup ^ 64])
             real_mi = T.max(real_mi, cur_pi_max)
-            should_scale_o = T.local_scalar("bool")
-            should_scale_o = T.ptx.any_sync(T.uint32(0xFFFFFFFF), cur_pi_max - mi > 6.0) != 0
+            should_scale_o: T.bool = (
+                T.ptx.any_sync(T.uint32(0xFFFFFFFF), cur_pi_max - mi > 6.0) != 0
+            )
 
-            new_max = T.local_scalar("float32")
-            scale_for_old = T.local_scalar("float32")
+            new_max: T.float32
+            scale_for_old: T.float32
             if not should_scale_o:
                 scale_for_old = 1.0
                 new_max = mi
@@ -623,7 +567,7 @@ def _kernel(
 
         if idx_in_warpgroup < B_H // 2:
             global_head: T.let = cta_idx * (B_H // 2) + idx_in_warpgroup
-            cur_lse = T.local_scalar("float32")
+            cur_lse: T.float32
             cur_lse_log: T.let = T.log(li)
             T.ptx.fma_f32(T.address_of(cur_lse), mi, LN_2, cur_lse_log)
             cur_lse = T.if_then_else(
@@ -640,17 +584,15 @@ def _kernel(
 
         attn_sink_log2: T.let = (
             T.cuda.ldg(
-                T.handle_add_byte_offset(
-                    attn_sink, (cta_idx * (B_H // 2) + (idx_in_warpgroup % 64)) * 4
-                ),
-                "float32",
+                attn_sink.ptr_to([cta_idx * (B_H // 2) + (idx_in_warpgroup % 64)]), "float32"
             )
             * LOG_2_E
             if have_attn_sink
             else T.float32(-float("inf"))
         )
-        output_scale = T.local_scalar("float32")
-        output_scale = T.cuda.fdividef(T.float32(1.0), li + T.ptx.exp2(attn_sink_log2 - mi))
+        output_scale: T.float32 = T.cuda.fdividef(
+            T.float32(1.0), li + T.ptx.exp2(attn_sink_log2 - mi)
+        )
         o_epi_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, B_EPI), "float32")
         o_epi = o_epi_frag.local()
         have_valid_indices: T.let = T.ptx.any_sync(T.uint32(0xFFFFFFFF), li != 0.0) != 0
@@ -692,14 +634,13 @@ def _kernel(
             if warp_idx == 0:
                 if T.ptx.elect_sync():
                     Tx.copy_async(
-                        out_tma[
-                            epi_k * B_EPI : (epi_k + 1) * B_EPI,
-                            cta_idx * (B_H // 2) : (cta_idx + 1) * (B_H // 2),
+                        out[
                             s_q_idx : s_q_idx + 1,
+                            cta_idx * (B_H // 2) : (cta_idx + 1) * (B_H // 2),
+                            epi_k * B_EPI : (epi_k + 1) * B_EPI,
                         ],
                         o_smem[:, epi_k * B_EPI : (epi_k + 1) * B_EPI],
                         dispatch="tma",
-                        tensor_map_dim_order="natural",
                         prefetch_tensormap=True,
                         tensormap_l2_promotion="L2::256B",
                     )
@@ -707,14 +648,13 @@ def _kernel(
                 if T.ptx.elect_sync():
                     epi_k2: T.let = epi_k + (D_V // B_EPI // 2)
                     Tx.copy_async(
-                        out_tma[
-                            epi_k2 * B_EPI : (epi_k2 + 1) * B_EPI,
-                            cta_idx * (B_H // 2) : (cta_idx + 1) * (B_H // 2),
+                        out[
                             s_q_idx : s_q_idx + 1,
+                            cta_idx * (B_H // 2) : (cta_idx + 1) * (B_H // 2),
+                            epi_k2 * B_EPI : (epi_k2 + 1) * B_EPI,
                         ],
                         o_smem[:, epi_k2 * B_EPI : (epi_k2 + 1) * B_EPI],
                         dispatch="tma",
-                        tensor_map_dim_order="natural",
                         prefetch_tensormap=True,
                         tensormap_l2_promotion="L2::256B",
                     )
@@ -729,10 +669,8 @@ def _kernel(
         if T.ptx.elect_sync():
             for k in T.serial(0, num_k_blocks, unroll=False):
                 indices_int4 = T.alloc_local((WG1_NUM_LOCAL_ROWS_PER_WARP, 4), "int32")
-                max_indices = T.local_scalar("int32")
-                min_indices = T.local_scalar("int32")
-                max_indices = -1
-                min_indices = s_kv
+                max_indices: T.int32 = -1
+                min_indices: T.int32 = s_kv
 
                 for local_row in T.unroll(WG1_NUM_LOCAL_ROWS_PER_WARP):
                     row_base: T.let = (
@@ -1038,18 +976,18 @@ def _kernel(
                             bar_p_free.wait(prev_buf, prev_phase)
                         T.ptx.tcgen05.fence.after_thread_sync()
 
-                        tiled_mma_p_accumulate[0] = T.uint32(0)
+                        tiled_mma_p_accumulate = T.uint32(0)
                         if d_sq > 0:
                             Tx.gemm_async(
                                 tmem_p[:, :],
                                 sq_smem[:, :d_sq],
                                 k_smem[:, :d_sq],
-                                accum=tiled_mma_p_accumulate[0],
+                                accum=tiled_mma_p_accumulate,
                                 dispatch="tcgen05",
                                 cta_group=2,
                                 smem_desc=tiled_mma_smem_desc,
                             )
-                            tiled_mma_p_accumulate[0] = T.uint32(1)
+                            tiled_mma_p_accumulate = T.uint32(1)
                         bar_qk_part_done.arrive(cur_buf, cta_group=2, cta_mask=3)
 
                         bar_k_part1_ready.arrive(
@@ -1062,12 +1000,12 @@ def _kernel(
                             tmem_p[:, :],
                             q_tmem[:, :D_TQ],
                             k_smem[:, d_sq : d_sq + D_TQ],
-                            accum=tiled_mma_p_accumulate[0],
+                            accum=tiled_mma_p_accumulate,
                             dispatch="tcgen05",
                             cta_group=2,
                             smem_desc=tiled_mma_smem_desc,
                         )
-                        tiled_mma_p_accumulate[0] = T.uint32(1)
+                        tiled_mma_p_accumulate = T.uint32(1)
                         bar_qk_done.arrive(cur_buf, cta_group=2, cta_mask=3)
 
                     if k > 0:
@@ -1080,13 +1018,13 @@ def _kernel(
                         )
                         bar_v_part0_ready.wait(cur_buf_prev, cur_phase_prev)
                         T.ptx.tcgen05.fence.after_thread_sync()
-                        tiled_mma_o_accumulate[0] = T.if_then_else(k == 1, T.uint32(0), T.uint32(1))
+                        tiled_mma_o_accumulate = T.if_then_else(k == 1, T.uint32(0), T.uint32(1))
                         Tx.gemm_async(
                             tmem_o_lo[:, :],
                             s_smem_gemm[:, 0 : B_TOPK // 2],
                             v_smem_gemm[0 : B_TOPK // 2, 0 : D_V // 4],
                             transB=True,
-                            accum=tiled_mma_o_accumulate[0],
+                            accum=tiled_mma_o_accumulate,
                             dispatch="tcgen05",
                             cta_group=2,
                             smem_desc=tiled_mma_smem_desc,
@@ -1096,12 +1034,12 @@ def _kernel(
                             s_smem_gemm[:, 0 : B_TOPK // 2],
                             v_smem_gemm[0 : B_TOPK // 2, D_V // 4 : D_V // 2],
                             transB=True,
-                            accum=tiled_mma_o_accumulate[0],
+                            accum=tiled_mma_o_accumulate,
                             dispatch="tcgen05",
                             cta_group=2,
                             smem_desc=tiled_mma_smem_desc,
                         )
-                        tiled_mma_o_accumulate[0] = T.uint32(1)
+                        tiled_mma_o_accumulate = T.uint32(1)
                         bar_sv_part_done.arrive(cur_buf_prev, cta_group=2, cta_mask=3)
 
                         bar_v_part1_ready.arrive(
@@ -1114,7 +1052,7 @@ def _kernel(
                             s_smem_gemm[:, B_TOPK // 2 : B_TOPK],
                             v_smem_gemm[B_TOPK // 2 : B_TOPK, 0 : D_V // 4],
                             transB=True,
-                            accum=tiled_mma_o_accumulate[0],
+                            accum=tiled_mma_o_accumulate,
                             dispatch="tcgen05",
                             cta_group=2,
                             smem_desc=tiled_mma_smem_desc,
@@ -1124,12 +1062,12 @@ def _kernel(
                             s_smem_gemm[:, B_TOPK // 2 : B_TOPK],
                             v_smem_gemm[B_TOPK // 2 : B_TOPK, D_V // 4 : D_V // 2],
                             transB=True,
-                            accum=tiled_mma_o_accumulate[0],
+                            accum=tiled_mma_o_accumulate,
                             dispatch="tcgen05",
                             cta_group=2,
                             smem_desc=tiled_mma_smem_desc,
                         )
-                        tiled_mma_o_accumulate[0] = T.uint32(1)
+                        tiled_mma_o_accumulate = T.uint32(1)
                         bar_sv_done.arrive(cur_buf_prev, cta_group=2, cta_mask=3)
 
         elif warp_idx == 13:
@@ -1188,8 +1126,7 @@ def run_test(**kwargs: Any) -> None:
         raise SkipTest(case["dispatch_reason"])
     prim_func = get_kernel(**kwargs)
     ex = compile_kernel(prim_func)
-    launches = _build_tirx_launches(case)
-    _run_tirx_launches(ex, launches, output_case=case)
+    ex(*_tirx_args(case))
     torch.cuda.synchronize()
     ref_out, ref_max_logits, ref_lse = _reference_sparse_prefill(case)
     torch.testing.assert_close(case["out"], ref_out, rtol=4.01 / 128, atol=5e-3)
@@ -1216,9 +1153,9 @@ def run_bench(
     ex = compile_kernel(prim_func)
 
     # Allocate inputs once, outside the timed region (Triton-standard pure launch).
-    case["launches"] = _build_tirx_launches(case)
+    args = _tirx_args(case)
 
-    funcs = {"tirx": lambda: _run_tirx_launches(ex, case["launches"])}
+    funcs = {"tirx": lambda: ex(*args)}
 
     from tirx_kernels.flashmla._flashmla_bench import flashmla_reference_builder
 

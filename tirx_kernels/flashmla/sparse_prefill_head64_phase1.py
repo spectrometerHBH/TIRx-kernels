@@ -24,8 +24,6 @@ LN_2 = math.log(2.0)
 HEAD64_LAUNCH_PARAM_TAGS = ("blockIdx.x", "threadIdx.x", "tirx.use_dyn_shared_memory")
 
 TMEM_COL_O = 0
-TMEM_COL_Q = 256
-TMEM_COL_Q_ROPE = 384
 TMEM_COL_P = 400
 TILED_MMA_P = (B_H, 128, 16, TMEM_COL_P)
 TILED_MMA_O = (B_H, 256, 16, TMEM_COL_O)
@@ -35,16 +33,11 @@ NAMED_BARRIER_WG0_WARP02_SYNC = 1
 
 BF16_BYTES = 2
 Q_ROPE_DIM = 64
-SHARED_U_BYTES = (B_TOPK * 64 + 2 * B_TOPK * D_V + B_H * D_V) * BF16_BYTES
-K_ROPE_BYTES = B_TOPK * Q_ROPE_DIM * BF16_BYTES
-K_NOPE_OFFSET_BYTES = K_ROPE_BYTES
-Q_NOPE_OFFSET_BYTES = (B_TOPK * 64 + 2 * B_TOPK * D_V) * BF16_BYTES
 # tcgen05 shared-memory descriptors store stride fields in uint128_t units;
 # these values match CuTe make_umma_desc<UMMA::Major::K> for the source layouts.
 K_MAJOR_SWIZZLED_DESC_LDO = 1
 Q_NOPE_DESC_SDO = 64
 Q_ROPE_DESC_SDO = 32
-S_Q_ROPE_BYTES = B_H * B_TOPK * BF16_BYTES
 WG1_NUM_WARPS = 4
 WG1_NUM_LOCAL_ROWS_PER_WARP = (B_TOPK // 4) // WG1_NUM_WARPS
 
@@ -211,40 +204,11 @@ def _reference_sparse_prefill(
     return ref_out.to(torch.bfloat16), ref_max_logits, ref_lse
 
 
-def _make_tirx_launch(case: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "case": case,
-        "args": (
-            case["q"],
-            case["kv"].reshape(-1),
-            case["indices"].reshape(-1),
-            case["attn_sink"],
-            case["topk_length"],
-            case["out"],
-            case["max_logits"],
-            case["lse"],
-        ),
-    }
-
-
-def _build_tirx_launches(case: dict[str, Any]) -> list[dict[str, Any]]:
-    return [_make_tirx_launch(case)]
-
-
-def _run_tirx_launches(
-    executable: Any, launches: list[dict[str, Any]], *, output_case: dict[str, Any] | None = None
-) -> None:
-    for launch in launches:
-        executable(*launch["args"])
-
-
-def _tirx_benchmark_tensors(
-    case: dict[str, Any], launches: list[dict[str, Any]]
-) -> tuple[Any, ...]:
+def _tirx_args(case: dict[str, Any]) -> tuple[Any, ...]:
     return (
         case["q"],
-        case["kv"],
-        case["indices"],
+        case["kv"].reshape(-1),
+        case["indices"].reshape(-1),
         case["attn_sink"],
         case["topk_length"],
         case["out"],
@@ -345,24 +309,30 @@ def _kernel(
     k_rope = pool.alloc_mma(
         (B_TOPK, Q_ROPE_DIM), "bfloat16", swizzle_mode=SwizzleMode.SWIZZLE_64B_ATOM
     )
-    pool.move_base_to(u_base + K_NOPE_OFFSET_BYTES)
+    k_nope_base = T.meta_var(pool.offset)
     k_nope = pool.alloc_mma((NUM_BUFS, B_TOPK, D_V), "bfloat16")
-    pool.move_base_to(u_base + K_NOPE_OFFSET_BYTES)
+    u_end = T.meta_var(pool.offset)
+    # Same bytes as k_nope, refolded to (2*B_TOPK, D_V//2) for the P MMA's B operand.
+    pool.move_base_to(k_nope_base)
     k_nope_tiled_mma = pool.alloc_mma((NUM_BUFS, B_TOPK * 2, D_V // 2), "bfloat16")
-    pool.move_base_to(u_base + Q_NOPE_OFFSET_BYTES)
+    # q_nope aliases the last k_nope stage: Q moves to TMEM before that stage is used.
+    pool.move_base_to(u_end - B_H * D_V * BF16_BYTES)
     q_nope = pool.alloc_mma((B_H, D_V), "bfloat16")
+    # o_smem aliases the front of the region: O is only written in the epilogue.
     pool.move_base_to(u_base)
     o_smem = pool.alloc_mma((B_H, D_V), "bfloat16")
-    pool.move_base_to(u_base + SHARED_U_BYTES)
+    pool.move_base_to(u_end)
 
     p_exchange_buf = pool.alloc((4, 32 * (B_TOPK // 2)), "float32")
     s_q_rope_base = T.meta_var(pool.offset)
     q_rope = pool.alloc_mma(
         (B_H, Q_ROPE_DIM), "bfloat16", swizzle_mode=SwizzleMode.SWIZZLE_64B_ATOM
     )
+    q_rope_end = T.meta_var(pool.offset)
+    # s_q_rope_s aliases q_rope: Q RoPE moves to TMEM before the first S tile is stored.
     pool.move_base_to(s_q_rope_base)
     s_q_rope_s = pool.alloc((B_H * B_TOPK,), "bfloat16")
-    pool.move_base_to(s_q_rope_base + S_Q_ROPE_BYTES)
+    pool.move_base_to(q_rope_end)
 
     is_k_valid = pool.alloc((NUM_BUFS, B_TOPK // 8), "int8")
     bar_prologue_q_nope = TMABar(pool, 1)
@@ -383,8 +353,6 @@ def _kernel(
     rowwise_max_buf = pool.alloc((128,), "float32")
     rowwise_li_buf = pool.alloc((128,), "float32")
     pool.commit()
-    q_tma = q.view(d_qk, h_q, s_q, layout=TileLayout(S[(d_qk, h_q, s_q) : (1, d_qk, h_q * d_qk)]))
-    out_tma = out.view(D_V, h_q, s_q, layout=TileLayout(S[(D_V, h_q, s_q) : (1, D_V, h_q * D_V)]))
     kv_nope_tma = kv.view(s_kv, D_V, layout=TileLayout(S[(s_kv, D_V) : (stride_kv_s_kv, 1)]))
 
     # CUDA phase1.cuh:77. h_kv is fixed to 1, so the row pointer is
@@ -417,11 +385,9 @@ def _kernel(
         "float32",
         layout=TileLayout(S[(B_H, 2, D_V // 4) : (1 @ TLane, 64 @ TLane, 1 @ TCol)]),
     )
-    tmem_pool.move_base_to(TMEM_COL_Q)
     q_nope_tmem = tmem_pool.alloc(
         (B_H, D_V // 2), "bfloat16", layout=TileLayout(S[(B_H, D_V // 2) : (1 @ TLane, 1 @ TCol)])
     )
-    tmem_pool.move_base_to(TMEM_COL_Q_ROPE)
     q_rope_tmem = tmem_pool.alloc(
         (B_H, Q_ROPE_DIM // 2),
         "bfloat16",
@@ -446,10 +412,8 @@ def _kernel(
             TileLayout(S[(NUM_BUFS, B_TOPK, D_V // 64, 64) : (B_TOPK * D_V, 64, B_TOPK * 64, 1)]),
         ),
     )
-    tiled_mma_p_accumulate = T.alloc_local((1,), "uint32")
-    tiled_mma_o_accumulate = T.alloc_local((1,), "uint32")
-    tiled_mma_p_accumulate[0] = T.uint32(0)
-    tiled_mma_o_accumulate[0] = T.uint32(0)
+    tiled_mma_p_accumulate: T.uint32 = 0
+    tiled_mma_o_accumulate: T.uint32 = 0
     tiled_mma_smem_desc = T.meta_var("local_hoist" if (d_qk > D_V and s_kv == 8192) else "hoist")
 
     # CUDA phase1.cuh:100-150.  Warp 0 performs descriptor prefetch, Q TMA
@@ -464,16 +428,15 @@ def _kernel(
                 for q_rope_tma_tile in T.unroll(Q_ROPE_DIM // 32):
                     Tx.copy_async(
                         q_rope[:, q_rope_tma_tile * 32 : (q_rope_tma_tile + 1) * 32],
-                        q_tma[
-                            D_V + q_rope_tma_tile * 32 : D_V + (q_rope_tma_tile + 1) * 32,
-                            :,
+                        q[
                             s_q_idx : s_q_idx + 1,
+                            :,
+                            D_V + q_rope_tma_tile * 32 : D_V + (q_rope_tma_tile + 1) * 32,
                         ],
                         dispatch="tma",
                         mbar=bar_prologue_q_rope.ptr_to([0]),
                         cta_group=1,
                         cache_hint="evict_first",
-                        tensor_map_dim_order="natural",
                         prefetch_tensormap=True,
                         tensormap_l2_promotion="L2::256B",
                     )
@@ -481,14 +444,11 @@ def _kernel(
             for q_nope_tma_tile in T.unroll(D_V // 64):
                 Tx.copy_async(
                     q_nope[:, q_nope_tma_tile * 64 : (q_nope_tma_tile + 1) * 64],
-                    q_tma[
-                        q_nope_tma_tile * 64 : (q_nope_tma_tile + 1) * 64, :, s_q_idx : s_q_idx + 1
-                    ],
+                    q[s_q_idx : s_q_idx + 1, :, q_nope_tma_tile * 64 : (q_nope_tma_tile + 1) * 64],
                     dispatch="tma",
                     mbar=bar_prologue_q_nope.ptr_to([0]),
                     cta_group=1,
                     cache_hint="evict_first",
-                    tensor_map_dim_order="natural",
                     prefetch_tensormap=True,
                     tensormap_l2_promotion="L2::256B",
                 )
@@ -516,12 +476,9 @@ def _kernel(
 
     if warpgroup_idx == 0:
         # CUDA phase1.cuh:152-168.  Scale/exp warpgroup state.
-        mi = T.local_scalar("float32")
-        mi = MAX_INIT_VAL
-        li = T.local_scalar("float32")
-        li = 0.0
-        real_mi = T.local_scalar("float32")
-        real_mi = T.float32(-float("inf"))
+        mi: T.float32 = MAX_INIT_VAL
+        li: T.float32 = 0.0
+        real_mi: T.float32 = T.float32(-float("inf"))
         s_smem_lane_offset: T.int32 = (
             lane_idx * 8
             + T.bitwise_and(warp_idx, T.int32(1)) * (B_H // 2) * 8
@@ -623,8 +580,7 @@ def _kernel(
 
             bar_k_valid_free.arrive(cur_buf)
 
-            cur_pi_max = T.local_scalar("float32")
-            cur_pi_max = T.float32(-float("inf"))
+            cur_pi_max: T.float32 = T.float32(-float("inf"))
             for p_i in T.unroll(num_elems_per_thread):
                 cur_pi_max = T.max(cur_pi_max, p[p_i])
             cur_pi_max = cur_pi_max * sm_scale_div_log2
@@ -632,10 +588,11 @@ def _kernel(
             T.ptx.bar.sync(NAMED_BARRIER_WG0_SYNC, 128)
             cur_pi_max = T.max(cur_pi_max, rowwise_max_buf[idx_in_warpgroup ^ 64])
             real_mi = T.max(real_mi, cur_pi_max)
-            should_scale_o = T.local_scalar("bool")
-            should_scale_o = T.ptx.any_sync(T.uint32(0xFFFFFFFF), cur_pi_max - mi > 6.0) != 0
-            new_max = T.local_scalar("float32")
-            scale_for_old = T.local_scalar("float32")
+            should_scale_o: T.bool = (
+                T.ptx.any_sync(T.uint32(0xFFFFFFFF), cur_pi_max - mi > 6.0) != 0
+            )
+            new_max: T.float32
+            scale_for_old: T.float32
             if not should_scale_o:
                 scale_for_old = 1.0
                 new_max = mi
@@ -645,8 +602,7 @@ def _kernel(
             mi = new_max
 
             s_pack = T.alloc_local((num_elems_per_thread // 2,), "uint32")
-            cur_sum_pair = T.local_scalar("uint64")
-            cur_sum_pair = T.cuda.make_float2(T.float32(0.0), T.float32(0.0))
+            cur_sum_pair: T.uint64 = T.cuda.make_float2(T.float32(0.0), T.float32(0.0))
             neg_new_max_pair: T.let = T.cuda.make_float2(-new_max, -new_max)
             scale_pair: T.let = T.cuda.make_float2(sm_scale_div_log2, sm_scale_div_log2)
             for s_i in T.unroll(num_elems_per_thread // 2):
@@ -658,9 +614,9 @@ def _kernel(
                 cur_sum_pair = T.ptx.add_f32x2(cur_sum_pair, s_pair, dps=False)
                 s_pack[s_i] = T.cuda.float22bfloat162_rn(s_x, s_y)
             cur_sum: T.let = T.cuda.float2_x(cur_sum_pair) + T.cuda.float2_y(cur_sum_pair)
-            li_tmp = T.alloc_local((1,), "float32")
-            T.ptx.fma_f32(li_tmp.ptr_to([0]), li, scale_for_old, cur_sum)
-            li = li_tmp[0]
+            li_tmp: T.float32
+            T.ptx.fma_f32(T.address_of(li_tmp), li, scale_for_old, cur_sum)
+            li = li_tmp
 
             if k > 0:
                 prev_buf: T.int32 = _ring_mod3(k - 1, max_k_blocks)
@@ -733,7 +689,7 @@ def _kernel(
         li = li + rowwise_li_buf[idx_in_warpgroup ^ 64]
 
         if idx_in_warpgroup < B_H:
-            cur_lse = T.local_scalar("float32")
+            cur_lse: T.float32
             cur_lse_log: T.let = T.log(li)
             T.ptx.fma_f32(T.address_of(cur_lse), mi, LN_2, cur_lse_log)
             cur_lse = T.if_then_else(
@@ -753,8 +709,9 @@ def _kernel(
             if have_attn_sink
             else T.float32(-float("inf"))
         )
-        output_scale = T.local_scalar("float32")
-        output_scale = T.cuda.fdividef(T.float32(1.0), li + T.ptx.exp2(attn_sink_log2 - mi))
+        output_scale: T.float32 = T.cuda.fdividef(
+            T.float32(1.0), li + T.ptx.exp2(attn_sink_log2 - mi)
+        )
 
         b_epi = T.meta_var(64)
         o_epi_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, 64), "float32")
@@ -808,14 +765,13 @@ def _kernel(
                         # CUDA phase1.cuh:335-342: first half O TMA store.
                         epi_chunk_idx: T.let = epi_c * (D_V // 2 // b_epi) + epi_k
                         Tx.copy_async(
-                            out_tma[
-                                epi_chunk_idx * b_epi : (epi_chunk_idx + 1) * b_epi,
-                                :,
+                            out[
                                 s_q_idx : s_q_idx + 1,
+                                :,
+                                epi_chunk_idx * b_epi : (epi_chunk_idx + 1) * b_epi,
                             ],
                             o_smem[:, epi_chunk_idx * b_epi : (epi_chunk_idx + 1) * b_epi],
                             dispatch="tma",
-                            tensor_map_dim_order="natural",
                             prefetch_tensormap=True,
                             tensormap_l2_promotion="L2::256B",
                         )
@@ -826,14 +782,13 @@ def _kernel(
                             epi_c * (D_V // 2 // b_epi) + (D_V // b_epi // 4) + epi_k
                         )
                         Tx.copy_async(
-                            out_tma[
-                                epi_chunk_idx * b_epi : (epi_chunk_idx + 1) * b_epi,
-                                :,
+                            out[
                                 s_q_idx : s_q_idx + 1,
+                                :,
+                                epi_chunk_idx * b_epi : (epi_chunk_idx + 1) * b_epi,
                             ],
                             o_smem[:, epi_chunk_idx * b_epi : (epi_chunk_idx + 1) * b_epi],
                             dispatch="tma",
-                            tensor_map_dim_order="natural",
                             prefetch_tensormap=True,
                             tensormap_l2_promotion="L2::256B",
                         )
@@ -852,10 +807,8 @@ def _kernel(
                 selected_idx1 = T.alloc_local((WG1_NUM_LOCAL_ROWS_PER_WARP,), "int32")
                 selected_idx2 = T.alloc_local((WG1_NUM_LOCAL_ROWS_PER_WARP,), "int32")
                 selected_idx3 = T.alloc_local((WG1_NUM_LOCAL_ROWS_PER_WARP,), "int32")
-                max_indices = T.local_scalar("int32")
-                min_indices = T.local_scalar("int32")
-                max_indices = -1
-                min_indices = s_kv
+                max_indices: T.int32 = -1
+                min_indices: T.int32 = s_kv
 
                 for local_row in T.unroll(WG1_NUM_LOCAL_ROWS_PER_WARP):
                     row_base: T.let = (
@@ -1094,12 +1047,12 @@ def _kernel(
                             bar_kv_rope_ready.wait(0, T.bitwise_and(k, T.int32(1)))
                             T.ptx.tcgen05.fence.after_thread_sync()
                             # CUDA phase1.cuh:489 Q RoPE x K RoPE MMA.
-                            tiled_mma_p_accumulate[0] = T.uint32(0)
+                            tiled_mma_p_accumulate = T.uint32(0)
                             Tx.gemm_async(
                                 tmem_p[:, :],
                                 q_rope_tmem[:, :],
                                 k_rope_tiled_mma[:, :],
-                                accum=tiled_mma_p_accumulate[0],
+                                accum=tiled_mma_p_accumulate,
                                 dispatch="tcgen05",
                                 cta_group=1,
                                 smem_desc=tiled_mma_smem_desc,
@@ -1122,7 +1075,7 @@ def _kernel(
                             T.ptx.tcgen05.fence.after_thread_sync()
                             # CUDA phase1.cuh:505-506 Q NoPE x K NoPE MMA.
                             clear_nope_accum: T.let = (not have_rope) & (kv_nope_part_idx == 0)
-                            tiled_mma_p_accumulate[0] = T.if_then_else(
+                            tiled_mma_p_accumulate = T.if_then_else(
                                 clear_nope_accum, T.uint32(0), T.uint32(1)
                             )
                             if use_p_nope_desc:
@@ -1139,7 +1092,7 @@ def _kernel(
                                         kv_nope_part_idx * (D_V // 4) : (kv_nope_part_idx + 1)
                                         * (D_V // 4),
                                     ],
-                                    accum=tiled_mma_p_accumulate[0],
+                                    accum=tiled_mma_p_accumulate,
                                     dispatch="tcgen05",
                                     cta_group=1,
                                     smem_desc=tiled_mma_smem_desc,
@@ -1160,7 +1113,7 @@ def _kernel(
                                         kv_nope_part_idx * (D_V // 4) : (kv_nope_part_idx + 1)
                                         * (D_V // 4),
                                     ],
-                                    accum=tiled_mma_p_accumulate[0],
+                                    accum=tiled_mma_p_accumulate,
                                     dispatch="tcgen05",
                                     cta_group=1,
                                     smem_desc=tiled_mma_smem_desc,
@@ -1173,13 +1126,13 @@ def _kernel(
                         bar_so_ready.wait(0, T.bitwise_and(k - 1, T.int32(1)))
                         T.ptx.tcgen05.fence.after_thread_sync()
                         # CUDA phase1.cuh:521-523 S(i-1) x V(i-1) MMA.
-                        tiled_mma_o_accumulate[0] = T.if_then_else(k == 1, T.uint32(0), T.uint32(1))
+                        tiled_mma_o_accumulate = T.if_then_else(k == 1, T.uint32(0), T.uint32(1))
                         Tx.gemm_async(
                             tmem_o_lo[:, :],
                             s_smem_gemm[:, :],
                             k_nope_gemm[cur_buf_prev, :, 0 : D_V // 2],
                             transB=True,
-                            accum=tiled_mma_o_accumulate[0],
+                            accum=tiled_mma_o_accumulate,
                             dispatch="tcgen05",
                             cta_group=1,
                             smem_desc=tiled_mma_smem_desc,
@@ -1191,14 +1144,14 @@ def _kernel(
                             s_smem_gemm[:, :],
                             k_nope_gemm[cur_buf_prev, :, D_V // 2 : D_V],
                             transB=True,
-                            accum=tiled_mma_o_accumulate[0],
+                            accum=tiled_mma_o_accumulate,
                             dispatch="tcgen05",
                             cta_group=1,
                             smem_desc=tiled_mma_smem_desc,
                             weight_stationary=True,
                             descI=desc_i_o,
                         )
-                        tiled_mma_o_accumulate[0] = T.uint32(1)
+                        tiled_mma_o_accumulate = T.uint32(1)
                         bar_sv_done.arrive(cur_buf_prev)
 
         elif warp_idx == 9:
@@ -1300,8 +1253,7 @@ def run_test(**kwargs: Any) -> None:
     cfg: SparseFlashMLAPrefillHead64Config = case["config"]
     prim_func = get_kernel(**kwargs)
     ex = compile_kernel(prim_func)
-    launches = _build_tirx_launches(case)
-    _run_tirx_launches(ex, launches, output_case=case)
+    ex(*_tirx_args(case))
     torch.cuda.synchronize()
     ref_out, ref_max_logits, ref_lse = _reference_sparse_prefill(case)
     torch.testing.assert_close(case["out"], ref_out, rtol=3.01 / 128, atol=5e-3)
@@ -1326,9 +1278,9 @@ def run_bench(
 
     # Allocate inputs once, outside the timed region (Triton-standard pure launch).
     case = prepare_data(**kwargs)
-    case["launches"] = _build_tirx_launches(case)
+    args = _tirx_args(case)
 
-    funcs = {"tirx": lambda: _run_tirx_launches(ex, case["launches"])}
+    funcs = {"tirx": lambda: ex(*args)}
 
     from tirx_kernels.flashmla._flashmla_bench import flashmla_reference_builder
 
