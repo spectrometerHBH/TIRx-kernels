@@ -926,20 +926,19 @@ def _kernel(
                         T.ptx.tcgen05.fence.after_thread_sync()
                         # CUDA phase1.cuh:521-523 S(i-1) x V(i-1) MMA.
                         mma_o_accumulate = T.if_then_else(k == 1, T.uint32(0), T.uint32(1))
-                        Tx.gemm_async(
-                            tmem_o_lo[:, :],
-                            s_smem_gemm[:, :],
-                            k_nope_gemm[cur_buf_prev, :, 0 : D_V // 2],
-                            transB=True,
-                            **_mma_config(accum=mma_o_accumulate, smem_desc=mma_smem_desc),
-                        )
-                        Tx.gemm_async(
-                            tmem_o_hi[:, :],
-                            s_smem_gemm[:, :],
-                            k_nope_gemm[cur_buf_prev, :, D_V // 2 : D_V],
-                            transB=True,
-                            **_mma_config(accum=mma_o_accumulate, smem_desc=mma_smem_desc),
-                        )
+
+                        @T.inline
+                        def gemm_o(dst, col_lo, col_hi):
+                            Tx.gemm_async(
+                                dst[:, :],
+                                s_smem_gemm[:, :],
+                                k_nope_gemm[cur_buf_prev, :, col_lo:col_hi],
+                                transB=True,
+                                **_mma_config(accum=mma_o_accumulate, smem_desc=mma_smem_desc),
+                            )
+
+                        gemm_o(tmem_o_lo, 0, D_V // 2)
+                        gemm_o(tmem_o_hi, D_V // 2, D_V)
                         mma_o_accumulate = T.uint32(1)
                         bar_sv_done.arrive(cur_buf_prev)
 

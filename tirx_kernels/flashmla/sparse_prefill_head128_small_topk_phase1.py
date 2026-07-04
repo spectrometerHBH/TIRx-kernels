@@ -703,20 +703,19 @@ def _kernel(
                             o_accumulate: T.uint32 = T.if_then_else(
                                 prev_k == 0, T.uint32(0), T.uint32(1)
                             )
-                            Tx.gemm_async(
-                                tmem_o_lo[:, :],
-                                s_smem_gemm[:, :],
-                                k_smem_gemm[prev_buf, :, 0 : D_V // 4],
-                                transB=True,
-                                **_mma_config(accum=o_accumulate),
-                            )
-                            Tx.gemm_async(
-                                tmem_o_hi[:, :],
-                                s_smem_gemm[:, :],
-                                k_smem_gemm[prev_buf, :, D_V // 4 : D_V // 2],
-                                transB=True,
-                                **_mma_config(accum=o_accumulate),
-                            )
+
+                            @T.inline
+                            def gemm_o(dst, col_lo, col_hi):
+                                Tx.gemm_async(
+                                    dst[:, :],
+                                    s_smem_gemm[:, :],
+                                    k_smem_gemm[prev_buf, :, col_lo:col_hi],
+                                    transB=True,
+                                    **_mma_config(accum=o_accumulate),
+                                )
+
+                            gemm_o(tmem_o_lo, 0, D_V // 4)
+                            gemm_o(tmem_o_hi, D_V // 4, D_V // 2)
                             o_accumulate = T.uint32(1)
                             bar_SV_done.arrive(0, cta_group=2, cta_mask=3)
                             bar_KV_empty.arrive(prev_buf, cta_group=2, cta_mask=3)
