@@ -829,18 +829,9 @@ def _kernel(
                     gather_nope_part(0, bar_kv_nope_ready_part0)
                     gather_nope_part(1, bar_kv_nope_ready_part1)
                 else:
-                    for part_idx in T.unroll(2):
-                        tx_bytes = T.uint32(
-                            WG1_NUM_LOCAL_ROWS_PER_WARP * 4 * (D_V // 2) * BF16_BYTES
-                        )
-                        if part_idx == 0:
-                            T.ptx.mbarrier.complete_tx(
-                                bar_kv_nope_ready_part0.ptr_to([cur_buf]), tx_bytes
-                            )
-                        else:
-                            T.ptx.mbarrier.complete_tx(
-                                bar_kv_nope_ready_part1.ptr_to([cur_buf]), tx_bytes
-                            )
+                    tx_bytes = T.uint32(WG1_NUM_LOCAL_ROWS_PER_WARP * 4 * (D_V // 2) * BF16_BYTES)
+                    T.ptx.mbarrier.complete_tx(bar_kv_nope_ready_part0.ptr_to([cur_buf]), tx_bytes)
+                    T.ptx.mbarrier.complete_tx(bar_kv_nope_ready_part1.ptr_to([cur_buf]), tx_bytes)
 
     else:
         # CUDA phase1.cuh:413-572.  MMA warpgroup.  Keep the issue-thread
