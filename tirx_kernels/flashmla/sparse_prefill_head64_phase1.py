@@ -390,10 +390,7 @@ def _kernel(
         ),
     )
     q_rope_tmem_cp = tmem_pool.view(
-        (B_H, 2, Q_ROPE_DIM // 2),
-        "bfloat16",
-        col=q_rope_tmem_col,
-        layout=TileLayout(S[(B_H, 2, Q_ROPE_DIM // 2) : (1 @ TLane, 64 @ TLane, 1 @ TCol)]),
+        (B_H, Q_ROPE_DIM), "bfloat16", col=q_rope_tmem_col, datapath="E"
     )
     tmem_p_col = T.meta_var(tmem_pool.offset)
     tmem_p = tmem_pool.alloc((B_H, B_TOPK * 2), "float32", datapath="E")
@@ -897,9 +894,7 @@ def _kernel(
                     bar_prologue_q_rope.arrive(0, tx_count=B_H * (d_qk - D_V) * BF16_BYTES)
                     bar_prologue_q_rope.wait(0, 0)
                     T.ptx.tcgen05.fence.after_thread_sync()
-                    Tx.copy_async(
-                        q_rope_tmem_cp[:, :, :], q_rope[:, :], shape="128x256b", cta_group=1
-                    )
+                    Tx.copy_async(q_rope_tmem_cp[:, :], q_rope[:, :], shape="128x256b", cta_group=1)
                     bar_prologue_utccp_rope.arrive(0)
 
                 bar_prologue_q_nope.arrive(0, tx_count=B_H * D_V * BF16_BYTES)
