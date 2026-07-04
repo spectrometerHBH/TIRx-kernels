@@ -760,19 +760,21 @@ def _kernel(
         if T.ptx.elect_sync():
             for k in T.serial(0, num_k_blocks, unroll=False):
                 selected_idx = T.alloc_local((WG1_NUM_LOCAL_ROWS_PER_WARP, 4), "int32")
-                idx_base: T.let = g_indices_base + k * B_TOPK + wg1_warp_idx * 4
-                indices_tile = T.decl_buffer(
-                    (WG1_NUM_LOCAL_ROWS_PER_WARP, 4),
-                    "int32",
-                    indices.data,
-                    elem_offset=indices.elem_offset + idx_base,
-                    layout=TileLayout(S[(WG1_NUM_LOCAL_ROWS_PER_WARP, 4) : (WG1_NUM_WARPS * 4, 1)]),
-                )
-                Tx.copy(selected_idx[:, :], indices_tile[:, :], cache="nc")
-
                 max_indices: T.int32 = -1
                 min_indices: T.int32 = s_kv
                 for local_row in T.unroll(WG1_NUM_LOCAL_ROWS_PER_WARP):
+                    row_base: T.let = (
+                        g_indices_base
+                        + k * B_TOPK
+                        + local_row * WG1_NUM_WARPS * 4
+                        + wg1_warp_idx * 4
+                    )
+                    Tx.copy(
+                        selected_idx[local_row, 0:4],
+                        indices[row_base : row_base + 4],
+                        dispatch="vec_128b",
+                        cache="nc",
+                    )
                     for j in T.unroll(4):
                         idx: T.let = selected_idx[local_row, j]
                         max_indices = T.max(max_indices, idx)
