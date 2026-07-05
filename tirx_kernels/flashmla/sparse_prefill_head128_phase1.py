@@ -697,13 +697,11 @@ def _kernel(
                             local_col: T.let = col_start + local_col_inner
                             # Rows interleave as (local_row, warp, lane); this
                             # warp's 16 rows of the local_col 64-column chunk.
-                            k_gather_tile = (
-                                k_smem.unflatten(1, (d_qk // 64, 64))
-                                .select(1, local_col)
-                                .unflatten(0, (WG1_NUM_LOCAL_ROWS_PER_WARP, WG1_NUM_WARPS, 4))
-                                .select(1, wg1_warp_idx)
-                                .flatten(0, 1)
-                            )
+                            # This warp's 16 rows of the local_col 64-col chunk: pick
+                            # the chunk on the col dim and the warp on the row dim.
+                            k_gather_tile = k_smem.tile(1, (-1, 64))[local_col, :].tile(
+                                0, (-1, WG1_NUM_WARPS, 4)
+                            )[:, wg1_warp_idx, :]
                             Tx.copy_async(
                                 k_gather_tile[:, :],
                                 kv_tma[:, local_col * 64 : (local_col + 1) * 64],
@@ -774,14 +772,11 @@ def _kernel(
                         src_col: T.let = local_col * 64 + cta_idx * 256
                         # Rows interleave as (part, local_row, warp, lane); this
                         # warp's 16 rows of the part half, local_col chunk.
-                        v_gather_tile = (
-                            v_smem_gemm.unflatten(1, ((D_V // 2) // 64, 64))
-                            .select(1, local_col)
-                            .unflatten(0, (2, WG2_NUM_LOCAL_ROWS_PER_PART, WG2_NUM_WARPS, 4))
-                            .select(0, part)
-                            .select(1, wg2_warp_idx)
-                            .flatten(0, 1)
-                        )
+                        # This warp's 16 rows of the part half, local_col chunk:
+                        # pick the col chunk, and the part + warp on the row dim.
+                        v_gather_tile = v_smem_gemm.tile(1, (-1, 64))[local_col, :].tile(
+                            0, (2, -1, WG2_NUM_WARPS, 4)
+                        )[part, :, wg2_warp_idx, :]
                         Tx.copy_async(
                             v_gather_tile[:, :],
                             kv_tma[:, src_col : src_col + 64],

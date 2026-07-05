@@ -444,7 +444,10 @@ def _kernel(
                         bar_tQ_empty.wait(0, q_outer_loop_phase ^ 1)
                         T.ptx.tcgen05.fence.after_thread_sync()
                         Tx.copy_async(
-                            q_tmem_cp[:, :, :, :], q_smem[:, :], shape="128x256b", cta_group=2
+                            q_tmem_cp[:, :, :, :],
+                            q_smem.unflatten(1, (D_QK // 128, 2, 64))[:, :, :, :],
+                            shape="128x256b",
+                            cta_group=2,
                         )
                         bar_tQ_full.arrive(0, cta_group=2, cta_mask=3)
 
@@ -590,12 +593,12 @@ def _kernel(
                     src_col: T.let = cta_idx * (D_QK // 2)
                     # Rows interleave as (row_group, warp, pair, lane4); this
                     # warp's 8-row stripes of every 64-column chunk.
-                    k_gather_tile = (
-                        k_smem_gemm_cur.unflatten(1, ((D_QK // 2) // 64, 64))
-                        .unflatten(0, (WG1_ROWS_PER_WARP // 8, 4, 2, 4))
-                        .select(1, wg1_warp_idx)
-                        .flatten(0, 2)
-                    )
+                    # Col dim reshaped to (chunk, 64) for the copy; row dim
+                    # picks this warp's interleaved rows (stripe x pair x lane
+                    # merged) with a rank-preserving tile.
+                    k_gather_tile = k_smem_gemm_cur.unflatten(
+                        1, ((D_QK // 2) // 64, 64)
+                    ).tile(0, (-1, 4, 2, 4))[:, wg1_warp_idx, :, :]
                     Tx.copy_async(
                         k_gather_tile[:, :, :],
                         kv_tma[:, src_col : src_col + D_QK // 2],

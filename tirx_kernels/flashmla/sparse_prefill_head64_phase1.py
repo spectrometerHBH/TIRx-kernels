@@ -392,9 +392,8 @@ def _kernel(
         ),
     )
     # Same bytes with the WG1 gather factorization: rows split into
-    # (stripe, warp, row), warp brought forward, stripe x row remerged so
-    # each (buf, warp) sees its 16 interleaved rows as one axis.
-    k_nope_gather = k_nope_gemm.rearrange("b (s w r) d -> b w (s r) d", w=WG1_NUM_WARPS, r=4)
+    # (stripe, warp, row); each warp's view (its 16 interleaved rows) is
+    # derived per-warp below via k_nope_gemm.tile.
     mma_p_accumulate: T.uint32 = 0
     mma_o_accumulate: T.uint32 = 0
     mma_smem_desc = T.meta_var("local_hoist" if (d_qk > D_V and s_kv == 8192) else "hoist")
@@ -760,6 +759,9 @@ def _kernel(
         # skip decisions are transcribed; gather4 requires explicit TensorMap
         # ABI plumbing and is left at the exact source-order call site.
         wg1_warp_idx: T.let = warp_idx - 4
+        # This warp's 16 interleaved NoPE rows: split the 64-row dim into
+        # (stripe, warp, row) and pick this warp, merging stripe x row.
+        k_nope_warp = k_nope_gemm.tile((1, (-1, WG1_NUM_WARPS, 4)))[:, wg1_warp_idx, :]
         if T.ptx.elect_sync():
             for k in T.serial(0, num_k_blocks, unroll=False):
                 selected_idx = T.alloc_local((WG1_NUM_LOCAL_ROWS_PER_WARP, 4), "int32")
@@ -796,9 +798,8 @@ def _kernel(
                 @T.inline
                 def gather_nope_part(part_idx, bar):
                     Tx.copy_async(
-                        k_nope_gather[
+                        k_nope_warp[
                             cur_buf,
-                            wg1_warp_idx,
                             :,
                             part_idx * (D_V // 2) : (part_idx + 1) * (D_V // 2),
                         ],
@@ -839,7 +840,10 @@ def _kernel(
                 bar_prologue_q_nope.wait(0, 0)
                 T.ptx.tcgen05.fence.after_thread_sync()
                 Tx.copy_async(
-                    q_nope_tmem_cp[:, :, :, :], q_nope[:, :], shape="128x256b", cta_group=1
+                    q_nope_tmem_cp[:, :, :, :],
+                    q_nope.unflatten(1, (D_V // 128, 2, 64))[:, :, :, :],
+                    shape="128x256b",
+                    cta_group=1,
                 )
                 bar_prologue_utccp_nope.arrive(0)
 
