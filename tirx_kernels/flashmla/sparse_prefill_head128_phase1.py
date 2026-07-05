@@ -374,8 +374,6 @@ def _kernel(
     T.cuda.cta_sync()
 
     tmem_pool = T.TMEMPool(pool, total_cols=512, cta_group=2, tmem_addr=tmem_start_addr)
-    # Full-TMEM overlay for tcgen05.ld/st; aliases every allocation below.
-    tmem_ldst = tmem_pool.view((128, 512), "float32", datapath="D")
     # O accumulator: one alloc; logical col halves are the B lo/hi gemm outputs,
     # read back as a (128, D_V//2) datapath-D tile via permute+reshape.
     o_tmem = tmem_pool.alloc(
@@ -429,7 +427,10 @@ def _kernel(
             p_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, P_TMEM_ELEMENTS), "uint32")
             Tx.wg.copy_async(
                 p_frag[:, :],
-                tmem_ldst.with_dtype("uint32")[:, tmem_p_col : tmem_p_col + P_TMEM_ELEMENTS],
+                tmem_p.view(B_H // 2, 2, B_TOPK // 2)
+                .permute(1, 0, 2)
+                .view(128, B_TOPK // 2)
+                .with_dtype("uint32")[:, :],
             )
             p = p_frag.local()
             T.ptx.tcgen05.wait.ld()
