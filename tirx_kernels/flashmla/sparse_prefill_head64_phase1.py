@@ -391,6 +391,14 @@ def _kernel(
             TileLayout(S[(NUM_BUFS, B_TOPK, D_V // 64, 64) : (B_TOPK * D_V, 64, B_TOPK * 64, 1)]),
         ),
     )
+    # Same bytes with the WG1 gather factorization: rows split into
+    # (stripe, warp, row), warp brought forward, stripe x row remerged so
+    # each (buf, warp) sees its 16 interleaved rows as one axis.
+    k_nope_gather = (
+        k_nope_gemm.view(NUM_BUFS, WG1_NUM_LOCAL_ROWS_PER_WARP, WG1_NUM_WARPS, 4, D_V)
+        .permute(0, 2, 1, 3, 4)
+        .view(NUM_BUFS, WG1_NUM_WARPS, WG1_NUM_LOCAL_ROWS_PER_WARP * 4, D_V)
+    )
     mma_p_accumulate: T.uint32 = 0
     mma_o_accumulate: T.uint32 = 0
     mma_smem_desc = T.meta_var("local_hoist" if (d_qk > D_V and s_kv == 8192) else "hoist")
@@ -789,37 +797,15 @@ def _kernel(
                 cur_phase: T.int32 = _ring_phase_parity(k, max_k_blocks)
                 bar_sv_done.wait(cur_buf, T.bitwise_xor(cur_phase, T.int32(1)))
 
-                # This warp's 16 interleaved k_nope rows (4 stripes of 4, stride
-                # 16 rows) as one honest view: gather4 chunks address stripe
-                # starts through the layout; rows within a stripe are written
-                # contiguously by the hardware (row pitch 64 elems = box width).
-                kv_nope_warp = T.decl_buffer(
-                    (WG1_NUM_LOCAL_ROWS_PER_WARP * 4, D_V),
-                    "bfloat16",
-                    k_nope_gemm.data,
-                    elem_offset=k_nope_gemm.elem_offset
-                    + cur_buf * B_TOPK * D_V
-                    + wg1_warp_idx * 4 * 64,
-                    scope="shared.dyn",
-                    layout=ComposeLayout(
-                        SwizzleLayout(3, 3, 3, swizzle_inner=True),
-                        TileLayout(
-                            S[
-                                (WG1_NUM_LOCAL_ROWS_PER_WARP, 4, D_V // 64, 64) : (
-                                    WG1_NUM_WARPS * 4 * 64,
-                                    64,
-                                    B_TOPK * 64,
-                                    1,
-                                )
-                            ]
-                        ),
-                    ),
-                )
-
                 @T.inline
                 def gather_nope_part(part_idx, bar):
                     Tx.copy_async(
-                        kv_nope_warp[:, part_idx * (D_V // 2) : (part_idx + 1) * (D_V // 2)],
+                        k_nope_gather[
+                            cur_buf,
+                            wg1_warp_idx,
+                            :,
+                            part_idx * (D_V // 2) : (part_idx + 1) * (D_V // 2),
+                        ],
                         kv_nope_tma[:, part_idx * (D_V // 2) : (part_idx + 1) * (D_V // 2)],
                         **_kv_gather_tma(
                             mbar=bar.ptr_to([cur_buf]),
