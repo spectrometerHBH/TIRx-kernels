@@ -815,9 +815,9 @@ def _kernel(
 
                 @T.inline
                 def load_p(lo_dst, hi_dst):
-                    p_win = tmem_pool.view(
-                        (128, WG3_NUM_ELEMS_PER_THREAD * 2), "float32", col=tmem_p_col, datapath="D"
-                    )
+                    # datapath-B P read back as (128, B_TOPK) identity: merge the
+                    # two lane-halves into 128 rows.
+                    p_win = tmem_p.view(B_H // 2, 2, B_TOPK).permute(1, 0, 2).view(128, B_TOPK)
                     Tx.wg.copy_async(lo_dst[:, :], p_win.chunk((None, 2))[:, 0])
                     Tx.wg.copy_async(hi_dst[:, :], p_win.chunk((None, 2))[:, 1])
 
