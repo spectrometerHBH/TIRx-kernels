@@ -347,11 +347,17 @@ def _kernel(
     # params.indices + s_q_idx * params.stride_indices_s_q.
     g_indices_base: T.let = s_q_idx * stride_indices_s_q
     tmem_pool = T.TMEMPool(pool, total_cols=512, cta_group=1, tmem_addr=tmem_start_addr)
-    # Full-TMEM overlay for tcgen05.ld/st; aliases every allocation below.
-    tmem_ldst = tmem_pool.view((128, 512), "float32", datapath="D")
-    tmem_o_col = T.meta_var(tmem_pool.offset)
-    tmem_o_lo = tmem_pool.alloc((B_H, D_V // 2), "float32", datapath="E")
-    tmem_o_hi = tmem_pool.alloc((B_H, D_V // 2), "float32", datapath="E")
+    # O accumulator: one alloc. Logical col halves [0:256)/[256:512) are the E
+    # lo/hi gemm outputs (physical col 0-127 / 128-255 via the outer 128@TCol
+    # axis); the whole thing reads back as a plain (128, 256) datapath-D tile.
+    o_tmem = tmem_pool.alloc(
+        (B_H, D_V),
+        "float32",
+        layout=TileLayout(S[(B_H, 2, 2, 128) : (1 @ TLane, 128 @ TCol, 64 @ TLane, 1 @ TCol)]),
+    )
+    tmem_o_lo = o_tmem.sub[:, 0 : D_V // 2]
+    tmem_o_hi = o_tmem.sub[:, D_V // 2 : D_V]
+    o_win = o_tmem.view(B_H, 2, 2, 128).permute(2, 0, 1, 3).view(128, D_V // 2)
     # q_nope / q_rope TMEM: one alloc each, viewed two ways. The batched
     # A[2, M, K] MMA fold (the alloc's own layout; batch == the two 64-lane
     # head-dim halves) and the tcgen05.cp write footprint are permute+reshape
@@ -570,7 +576,6 @@ def _kernel(
                 # CUDA common_subroutine.h:147-168 rescale_O.
                 o_rescale_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, 32), "float32")
                 o_rescale = o_rescale_frag.local()
-                o_win = tmem_pool.view((128, D_V // 2), "float32", col=tmem_o_col, datapath="D")
                 for chunk_idx in T.unroll((D_V // 2) // 32):
                     Tx.wg.copy_async(
                         o_rescale_frag[:, :], o_win.chunk((None, (D_V // 2) // 32))[:, chunk_idx]
@@ -628,24 +633,20 @@ def _kernel(
             for o_zero_i in T.unroll(64):
                 o_epi[o_zero_i] = 0.0
             output_scale = 1.0
-        output_scale_pair: T.let = T.cuda.make_float2(output_scale, output_scale)
         for epi_c in T.unroll(2):
             for epi_k in T.unroll((D_V // 4) // 64):
                 if have_valid_indices:
                     # CUDA phase1.cuh:314-317: TMEM O load/fence.
                     Tx.wg.copy_async(
                         o_epi_frag[:, :],
-                        tmem_ldst.chunk((None, D_V // 64))[:, epi_c * (128 // 64) + epi_k],
+                        o_win.chunk((None, (D_V // 2) // 64))[:, epi_c * 2 + epi_k],
                     )
                     T.ptx.tcgen05.wait.ld()
+                Tx.wg.mul(o_epi_frag[:, :], o_epi_frag[:, :], output_scale)
                 for o_i in T.unroll(64 // 8):
                     o_epi_bf16 = T.alloc_local((4,), "uint32")
                     for o_j in T.unroll(4):
                         o_pair_idx: T.let = o_i * 8 + o_j * 2
-                        o_pair: T.let = T.cuda.make_float2(o_epi[o_pair_idx], o_epi[o_pair_idx + 1])
-                        o_epi_pair: T.let = T.ptx.mul_f32x2(o_pair, output_scale_pair, dps=False)
-                        o_epi[o_pair_idx] = T.cuda.float2_x(o_epi_pair)
-                        o_epi[o_pair_idx + 1] = T.cuda.float2_y(o_epi_pair)
                         o_epi_bf16[o_j] = T.cuda.float22bfloat162_rn(
                             o_epi[o_pair_idx], o_epi[o_pair_idx + 1]
                         )
