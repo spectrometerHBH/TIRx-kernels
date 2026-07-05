@@ -45,9 +45,8 @@ WG1_NUM_WARPS = 4
 WG1_NUM_LOCAL_ROWS_PER_WARP = (B_TOPK // 4) // WG1_NUM_WARPS
 
 # KV gather4 TMA knobs shared by both gather call sites.
-_mma_config = partial(tcgen05_config, cta_group=1, weight_stationary=True)
-# The batched-C P gemms let the dispatch infer .ws from the fold layout.
-_p_config = partial(tcgen05_config, cta_group=1)
+# .ws is inferred from the Layout-E C layout; no weight_stationary flag.
+_mma_config = partial(tcgen05_config, cta_group=1)
 _kv_gather_tma = partial(
     tma_config, cta_group=1, gather_axis=0, cache_hint=T.uint64(0x14F0000000000000)
 )
@@ -879,7 +878,7 @@ def _kernel(
                                 tmem_p_bmm[:, :, :],
                                 q_rope_tmem[:, :],
                                 k_rope_tiled_mma[:, :],
-                                **_p_config(accum=mma_p_accumulate, smem_desc=mma_smem_desc),
+                                **_mma_config(accum=mma_p_accumulate, smem_desc=mma_smem_desc),
                             )
                             bar_qk_rope_done.arrive(0)
 
@@ -913,7 +912,7 @@ def _kernel(
                                     kv_nope_part_idx * (D_V // 4) : (kv_nope_part_idx + 1)
                                     * (D_V // 4),
                                 ],
-                                **_p_config(accum=mma_p_accumulate, smem_desc=mma_smem_desc),
+                                **_mma_config(accum=mma_p_accumulate, smem_desc=mma_smem_desc),
                             )
                         bar_qk_nope_done.arrive(cur_buf)
 
