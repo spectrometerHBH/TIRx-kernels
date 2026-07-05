@@ -2,13 +2,13 @@
   "timestamp": "121",
   "label": "cb2a7638-dirty",
   "git": {
-    "tir": "51d56098-dirty",
-    "tirx-kernels": "cb2a7638-dirty",
+    "tir": "3d26efa6-dirty",
+    "tirx-kernels": "2b5df913-dirty",
     "tirx-bench-ci": null
   },
   "kernel_tree": {
-    "tir:python/tvm/tirx": "0cb9249952e018696851088a17852f4649aac6ae",
-    "tirx-kernels:tirx_kernels": "0fda4e037a45a9be26bd8f1976b25e27476bc0fc"
+    "tir:python/tvm/tirx": "ffa0cdfb31f7bfe1cdc0b87a88c2aad7a8269297",
+    "tirx-kernels:tirx_kernels": "2ae3264beb79e6ebdaa350f5897c9a82dab9bd01"
   },
   "results": [
     {
@@ -2680,9 +2680,9 @@
       "status": "ok",
       "ref_impl": "flashmla",
       "ours_impl": "tirx",
-      "ours_us": 1708.4413720930233,
-      "ref_us": 1699.019346153846,
-      "ratio": 0.9944850165226131
+      "ours_us": 1745.5406032144945,
+      "ref_us": 1767.3244619496854,
+      "ratio": 1.0124797204345033
     },
     {
       "kernel": "sparse_flashmla_prefill_head128_phase1",
@@ -2691,9 +2691,9 @@
       "status": "ok",
       "ref_impl": "flashmla",
       "ours_impl": "tirx",
-      "ours_us": 1818.703025,
-      "ref_us": 1936.1847400000001,
-      "ratio": 1.0645964257963447
+      "ours_us": 1861.320020669056,
+      "ref_us": 1901.3996148661167,
+      "ratio": 1.021532887279993
     },
     {
       "kernel": "sparse_flashmla_prefill_head128_phase1",
@@ -2702,9 +2702,9 @@
       "status": "ok",
       "ref_impl": "flashmla",
       "ours_impl": "tirx",
-      "ours_us": 1676.9131219512194,
-      "ref_us": 1758.1067358490566,
-      "ratio": 1.0484184975566069
+      "ours_us": 1692.0141850733391,
+      "ref_us": 1723.226182479581,
+      "ratio": 1.0184466523280884
     },
     {
       "kernel": "sparse_flashmla_prefill_head128_phase1",
@@ -2713,9 +2713,9 @@
       "status": "ok",
       "ref_impl": "flashmla",
       "ours_impl": "tirx",
-      "ours_us": 1733.5709,
-      "ref_us": 1891.3819791666667,
-      "ratio": 1.091032376677912
+      "ours_us": 1805.0255043720413,
+      "ref_us": 1821.1776296848527,
+      "ratio": 1.0089484194398852
     },
     {
       "kernel": "sparse_flashmla_prefill_head128_phase1",
@@ -2724,9 +2724,9 @@
       "status": "ok",
       "ref_impl": "flashmla",
       "ours_impl": "tirx",
-      "ours_us": 1969.845864864865,
-      "ref_us": 1983.0877872340427,
-      "ratio": 1.0067223139664718
+      "ours_us": 1992.5705438404327,
+      "ref_us": 2004.8073711849956,
+      "ratio": 1.0061412266593974
     },
     {
       "kernel": "sparse_flashmla_prefill_head128_phase1",
@@ -2735,9 +2735,9 @@
       "status": "ok",
       "ref_impl": "flashmla",
       "ours_impl": "tirx",
-      "ours_us": 1703.4233658536587,
-      "ref_us": 1816.4003673469388,
-      "ratio": 1.0663235011084062
+      "ours_us": 1761.9144831578947,
+      "ref_us": 1803.541274244898,
+      "ratio": 1.0236258862078227
     },
     {
       "kernel": "sparse_flashmla_prefill_head128_small_topk_phase1",
@@ -2746,9 +2746,9 @@
       "status": "ok",
       "ref_impl": "flashmla",
       "ours_impl": "tirx",
-      "ours_us": 1110.1777321428572,
-      "ref_us": 1141.2565,
-      "ratio": 1.0279944075235186
+      "ours_us": 1142.0580293135436,
+      "ref_us": 1157.1074842003236,
+      "ratio": 1.0131774870457553
     },
     {
       "kernel": "sparse_flashmla_prefill_head128_small_topk_phase1",
@@ -2757,9 +2757,9 @@
       "status": "ok",
       "ref_impl": "flashmla",
       "ours_impl": "tirx",
-      "ours_us": 1152.522925925926,
-      "ref_us": 1206.7186708860759,
-      "ratio": 1.0470235721485621
+      "ours_us": 1171.0121159302325,
+      "ref_us": 1199.7088807632222,
+      "ratio": 1.0245059504018823
     },
     {
       "kernel": "sparse_flashmla_prefill_head128_small_topk_phase1",
@@ -2768,9 +2768,9 @@
       "status": "ok",
       "ref_impl": "flashmla",
       "ours_impl": "tirx",
-      "ours_us": 1106.483909090909,
-      "ref_us": 1145.3705,
-      "ratio": 1.035144289573122
+      "ours_us": 1140.2870842657342,
+      "ref_us": 1155.1061746212438,
+      "ratio": 1.0129959293234054
     },
     {
       "kernel": "sparse_flashmla_prefill_head64_phase1",
@@ -2779,9 +2779,9 @@
       "status": "ok",
       "ref_impl": "flashmla",
       "ours_impl": "tirx",
-      "ours_us": 374.2908,
-      "ref_us": 379.34391810344823,
-      "ratio": 1.0135005137808577
+      "ours_us": 365.95374523042443,
+      "ref_us": 378.0189499200095,
+      "ratio": 1.0329692067558651
     },
     {
       "kernel": "sparse_flashmla_prefill_head64_phase1",
@@ -2790,9 +2790,9 @@
       "status": "ok",
       "ref_impl": "flashmla",
       "ours_impl": "tirx",
-      "ours_us": 373.758734375,
-      "ref_us": 382.0243813559322,
-      "ratio": 1.0221149266110234
+      "ours_us": 370.7603157101435,
+      "ref_us": 382.55773829452005,
+      "ratio": 1.0318195396985248
     },
     {
       "kernel": "sparse_flashmla_prefill_head64_phase1",
@@ -2801,9 +2801,9 @@
       "status": "ok",
       "ref_impl": "flashmla",
       "ours_impl": "tirx",
-      "ours_us": 375.50293617021276,
-      "ref_us": 389.19908370044055,
-      "ratio": 1.0364741423060921
+      "ours_us": 378.18544982375795,
+      "ref_us": 389.80838642274375,
+      "ratio": 1.0307334314538075
     },
     {
       "kernel": "sparse_flashmla_prefill_head64_phase1",
@@ -2812,9 +2812,9 @@
       "status": "ok",
       "ref_impl": "flashmla",
       "ours_impl": "tirx",
-      "ours_us": 368.5956555555556,
-      "ref_us": 371.3998619246862,
-      "ratio": 1.0076078117765768
+      "ours_us": 362.5877553729841,
+      "ref_us": 375.77233403891614,
+      "ratio": 1.0363624487329128
     },
     {
       "kernel": "sparse_flashmla_prefill_head64_phase1",
@@ -2823,9 +2823,9 @@
       "status": "ok",
       "ref_impl": "flashmla",
       "ours_impl": "tirx",
-      "ours_us": 387.3669390243902,
-      "ref_us": 400.95292477876103,
-      "ratio": 1.0350726517564666
+      "ours_us": 379.3976921920789,
+      "ref_us": 395.764158781055,
+      "ratio": 1.0431380235720837
     },
     {
       "kernel": "sparse_flashmla_prefill_head64_phase1",
@@ -2834,9 +2834,9 @@
       "status": "ok",
       "ref_impl": "flashmla",
       "ours_impl": "tirx",
-      "ours_us": 387.7693804347826,
-      "ref_us": 408.4249495412844,
-      "ratio": 1.0532676641031893
+      "ours_us": 386.7092252634913,
+      "ref_us": 404.05481934038056,
+      "ratio": 1.044854358116413
     },
     {
       "kernel": "sparse_flashmla_prefill_head64_phase1",
@@ -2845,9 +2845,9 @@
       "status": "ok",
       "ref_impl": "flashmla",
       "ours_impl": "tirx",
-      "ours_us": 395.03473033707866,
-      "ref_us": 419.94368663594474,
-      "ratio": 1.0630551047438577
+      "ours_us": 399.52160209156614,
+      "ref_us": 417.2353290955031,
+      "ratio": 1.044337344742318
     },
     {
       "kernel": "sparse_flashmla_prefill_head64_phase1",
@@ -2856,9 +2856,9 @@
       "status": "ok",
       "ref_impl": "flashmla",
       "ours_impl": "tirx",
-      "ours_us": 373.9255,
-      "ref_us": 384.2567574468085,
-      "ratio": 1.0276291866877452
+      "ours_us": 372.722141215685,
+      "ref_us": 383.76238673569054,
+      "ratio": 1.0296205787077641
     }
   ]
 }

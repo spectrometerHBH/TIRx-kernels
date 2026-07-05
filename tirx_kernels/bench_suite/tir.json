@@ -2,13 +2,13 @@
   "timestamp": "121",
   "label": "cb2a7638-dirty",
   "git": {
-    "tir": "51d56098-dirty",
-    "tirx-kernels": "cb2a7638-dirty",
+    "tir": "3d26efa6-dirty",
+    "tirx-kernels": "2b5df913-dirty",
     "tirx-bench-ci": null
   },
   "kernel_tree": {
-    "tir:python/tvm/tirx": "0cb9249952e018696851088a17852f4649aac6ae",
-    "tirx-kernels:tirx_kernels": "0fda4e037a45a9be26bd8f1976b25e27476bc0fc"
+    "tir:python/tvm/tirx": "ffa0cdfb31f7bfe1cdc0b87a88c2aad7a8269297",
+    "tirx-kernels:tirx_kernels": "2ae3264beb79e6ebdaa350f5897c9a82dab9bd01"
   },
   "baselines": {
     "torch": {
@@ -3470,11 +3470,11 @@
       "label": "bench_regular_dqk512_hq128_s4096_kv32768_topk2048",
       "status": "ok",
       "impls": {
-        "tirx": 1708.4413720930233,
-        "flashmla": 1699.019346153846
+        "tirx": 1745.5406032144945,
+        "flashmla": 1767.3244619496854
       },
       "aggregated": {
-        "rounds": 1,
+        "rounds": 5,
         "method": "mean"
       }
     },
@@ -3484,11 +3484,11 @@
       "label": "bench_regular_dqk512_hq128_s4096_kv65536_topk2048",
       "status": "ok",
       "impls": {
-        "tirx": 1818.703025,
-        "flashmla": 1936.1847400000001
+        "tirx": 1861.320020669056,
+        "flashmla": 1901.3996148661167
       },
       "aggregated": {
-        "rounds": 1,
+        "rounds": 5,
         "method": "mean"
       }
     },
@@ -3498,11 +3498,11 @@
       "label": "bench_regular_dqk512_hq128_s4096_kv8192_topk2048",
       "status": "ok",
       "impls": {
-        "tirx": 1676.9131219512194,
-        "flashmla": 1758.1067358490566
+        "tirx": 1692.0141850733391,
+        "flashmla": 1723.226182479581
       },
       "aggregated": {
-        "rounds": 1,
+        "rounds": 5,
         "method": "mean"
       }
     },
@@ -3512,11 +3512,11 @@
       "label": "bench_regular_dqk576_hq128_s4096_kv32768_topk2048",
       "status": "ok",
       "impls": {
-        "tirx": 1733.5709,
-        "flashmla": 1891.3819791666667
+        "tirx": 1805.0255043720413,
+        "flashmla": 1821.1776296848527
       },
       "aggregated": {
-        "rounds": 1,
+        "rounds": 5,
         "method": "mean"
       }
     },
@@ -3526,11 +3526,11 @@
       "label": "bench_regular_dqk576_hq128_s4096_kv65536_topk2048",
       "status": "ok",
       "impls": {
-        "tirx": 1969.845864864865,
-        "flashmla": 1983.0877872340427
+        "tirx": 1992.5705438404327,
+        "flashmla": 2004.8073711849956
       },
       "aggregated": {
-        "rounds": 1,
+        "rounds": 5,
         "method": "mean"
       }
     },
@@ -3540,11 +3540,11 @@
       "label": "bench_regular_dqk576_hq128_s4096_kv8192_topk2048",
       "status": "ok",
       "impls": {
-        "tirx": 1703.4233658536587,
-        "flashmla": 1816.4003673469388
+        "tirx": 1761.9144831578947,
+        "flashmla": 1803.541274244898
       },
       "aggregated": {
-        "rounds": 1,
+        "rounds": 5,
         "method": "mean"
       }
     },
@@ -3554,11 +3554,11 @@
       "label": "bench_smalltopk_dqk512_hq128_s4096_kv32768_topk1280",
       "status": "ok",
       "impls": {
-        "tirx": 1110.1777321428572,
-        "flashmla": 1141.2565
+        "tirx": 1142.0580293135436,
+        "flashmla": 1157.1074842003236
       },
       "aggregated": {
-        "rounds": 1,
+        "rounds": 5,
         "method": "mean"
       }
     },
@@ -3568,11 +3568,11 @@
       "label": "bench_smalltopk_dqk512_hq128_s4096_kv65536_topk1280",
       "status": "ok",
       "impls": {
-        "tirx": 1152.522925925926,
-        "flashmla": 1206.7186708860759
+        "tirx": 1171.0121159302325,
+        "flashmla": 1199.7088807632222
       },
       "aggregated": {
-        "rounds": 1,
+        "rounds": 5,
         "method": "mean"
       }
     },
@@ -3582,11 +3582,11 @@
       "label": "bench_smalltopk_dqk512_hq128_s4096_kv8192_topk1280",
       "status": "ok",
       "impls": {
-        "tirx": 1106.483909090909,
-        "flashmla": 1145.3705
+        "tirx": 1140.2870842657342,
+        "flashmla": 1155.1061746212438
       },
       "aggregated": {
-        "rounds": 1,
+        "rounds": 5,
         "method": "mean"
       }
     },
@@ -3596,11 +3596,11 @@
       "label": "bench_dqk512_hq64_s4096_kv32768_topk512",
       "status": "ok",
       "impls": {
-        "tirx": 374.2908,
-        "flashmla": 379.34391810344823
+        "tirx": 365.95374523042443,
+        "flashmla": 378.0189499200095
       },
       "aggregated": {
-        "rounds": 1,
+        "rounds": 5,
         "method": "mean"
       }
     },
@@ -3610,11 +3610,11 @@
       "label": "bench_dqk512_hq64_s4096_kv49152_topk512",
       "status": "ok",
       "impls": {
-        "tirx": 373.758734375,
-        "flashmla": 382.0243813559322
+        "tirx": 370.7603157101435,
+        "flashmla": 382.55773829452005
       },
       "aggregated": {
-        "rounds": 1,
+        "rounds": 5,
         "method": "mean"
       }
     },
@@ -3624,11 +3624,11 @@
       "label": "bench_dqk512_hq64_s4096_kv65536_topk512",
       "status": "ok",
       "impls": {
-        "tirx": 375.50293617021276,
-        "flashmla": 389.19908370044055
+        "tirx": 378.18544982375795,
+        "flashmla": 389.80838642274375
       },
       "aggregated": {
-        "rounds": 1,
+        "rounds": 5,
         "method": "mean"
       }
     },
@@ -3638,11 +3638,11 @@
       "label": "bench_dqk512_hq64_s4096_kv8192_topk512",
       "status": "ok",
       "impls": {
-        "tirx": 368.5956555555556,
-        "flashmla": 371.3998619246862
+        "tirx": 362.5877553729841,
+        "flashmla": 375.77233403891614
       },
       "aggregated": {
-        "rounds": 1,
+        "rounds": 5,
         "method": "mean"
       }
     },
@@ -3652,11 +3652,11 @@
       "label": "bench_dqk576_hq64_s4096_kv32768_topk512",
       "status": "ok",
       "impls": {
-        "tirx": 387.3669390243902,
-        "flashmla": 400.95292477876103
+        "tirx": 379.3976921920789,
+        "flashmla": 395.764158781055
       },
       "aggregated": {
-        "rounds": 1,
+        "rounds": 5,
         "method": "mean"
       }
     },
@@ -3666,11 +3666,11 @@
       "label": "bench_dqk576_hq64_s4096_kv49152_topk512",
       "status": "ok",
       "impls": {
-        "tirx": 387.7693804347826,
-        "flashmla": 408.4249495412844
+        "tirx": 386.7092252634913,
+        "flashmla": 404.05481934038056
       },
       "aggregated": {
-        "rounds": 1,
+        "rounds": 5,
         "method": "mean"
       }
     },
@@ -3680,11 +3680,11 @@
       "label": "bench_dqk576_hq64_s4096_kv65536_topk512",
       "status": "ok",
       "impls": {
-        "tirx": 395.03473033707866,
-        "flashmla": 419.94368663594474
+        "tirx": 399.52160209156614,
+        "flashmla": 417.2353290955031
       },
       "aggregated": {
-        "rounds": 1,
+        "rounds": 5,
         "method": "mean"
       }
     },
@@ -3694,11 +3694,11 @@
       "label": "bench_dqk576_hq64_s4096_kv8192_topk512",
       "status": "ok",
       "impls": {
-        "tirx": 373.9255,
-        "flashmla": 384.2567574468085
+        "tirx": 372.722141215685,
+        "flashmla": 383.76238673569054
       },
       "aggregated": {
-        "rounds": 1,
+        "rounds": 5,
         "method": "mean"
       }
     }
