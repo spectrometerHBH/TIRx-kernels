@@ -339,11 +339,17 @@ def _kernel(
     )
     kv_tma = kv.view(s_kv, D_QK, layout=TileLayout(S[(s_kv, D_QK) : (stride_kv_s_kv, 1)]))
     tmem_pool = T.TMEMPool(pool, total_cols=512, cta_group=2, tmem_addr=tmem_start_addr)
-    # Full-TMEM overlay for tcgen05.ld/st; aliases every allocation below.
-    tmem_ldst = tmem_pool.view((128, 512), "float32", datapath="D")
-    tmem_o_col = T.meta_var(tmem_pool.offset)
-    tmem_o_lo = tmem_pool.alloc((B_H // 2, D_V // 2), "float32", datapath="B")
-    tmem_o_hi = tmem_pool.alloc((B_H // 2, D_V // 2), "float32", datapath="B")
+    # O accumulator: one alloc; logical col halves are the B lo/hi gemm outputs
+    # (physical col 0-127 / 128-255), read back as a (128, D_V//2) datapath-D
+    # tile via permute+reshape.
+    o_tmem = tmem_pool.alloc(
+        (B_H // 2, D_V),
+        "float32",
+        layout=TileLayout(S[(B_H // 2, 2, 2, 128) : (1 @ TLane, 128 @ TCol, 64 @ TLane, 1 @ TCol)]),
+    )
+    tmem_o_lo = o_tmem.sub[:, 0 : D_V // 2]
+    tmem_o_hi = o_tmem.sub[:, D_V // 2 : D_V]
+    o_win = o_tmem.view(B_H // 2, 2, 2, 128).permute(2, 0, 1, 3).view(128, D_V // 2)
     q_tmem_col = T.meta_var(tmem_pool.offset)
     q_tmem = tmem_pool.alloc((B_H // 2, D_QK // 2), "bfloat16")
     # Honest tcgen05.cp footprint view over the q_tmem anchor: the 128x256b
@@ -459,10 +465,9 @@ def _kernel(
 
             o_epi_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, B_EPI), "float32")
             o_epi = o_epi_frag.local()
-            o_epi_win = tmem_pool.view((128, D_V // 2), "float32", col=tmem_o_col, datapath="D")
             for epi_k in T.unroll((D_V // 2) // B_EPI):
                 Tx.wg.copy_async(
-                    o_epi_frag[:, :], o_epi_win.chunk((None, (D_V // 2) // B_EPI))[:, epi_k]
+                    o_epi_frag[:, :], o_win.chunk((None, (D_V // 2) // B_EPI))[:, epi_k]
                 )
                 T.ptx.tcgen05.wait.ld()
                 if epi_k == 0:
@@ -945,7 +950,6 @@ def _kernel(
                     scale_for_old_pair: T.let = T.cuda.make_float2(scale_for_old, scale_for_old)
                     o_rescale_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, 32), "float32")
                     o_rescale = o_rescale_frag.local()
-                    o_win = tmem_pool.view((128, D_V // 2), "float32", col=tmem_o_col, datapath="D")
                     for chunk_idx in T.unroll((D_V // 2) // 32):
                         Tx.wg.copy_async(
                             o_rescale_frag[:, :],
