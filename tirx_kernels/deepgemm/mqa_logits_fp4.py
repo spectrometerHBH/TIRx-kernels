@@ -711,12 +711,15 @@ def get_kernel(**kwargs: Any):
                 num_kv_stages, num_sfkv, layout=sf_smem_kv_post_layout
             )
             # e8m0 views of the same SF SMEM under the cp (sf_smem) layout, the
-            # SMEM source for T.copy_async into the SF TMEM.
+            # SMEM source for T.copy_async into the SF TMEM. Declared at the
+            # natural (rows=128, SF_K) SF footprint so the copy region matches
+            # the (128, SF_K) SF TMEM tile; the lane/super-block packing lives
+            # in sf_smem_*_cp_layout, not in the buffer shape.
             smem_sf_q_cp = smem_sf_q.view("float8_e8m0fnu").view(
-                num_q_stages, num_sfq, 4, layout=sf_smem_q_cp_layout
+                num_q_stages, 128, num_sfq // 32, layout=sf_smem_q_cp_layout
             )
             smem_sf_kv_cp = smem_sf_kv.view("float8_e8m0fnu").view(
-                num_kv_stages, num_sfkv, 4, layout=sf_smem_kv_cp_layout
+                num_kv_stages, 128, num_sfkv // 32, layout=sf_smem_kv_cp_layout
             )
             # SFA/SFB TMEM views in the dispatcher-canonical sf_tmem_layout (the
             # gemm validator expects sf_per_mma == sf_mma_k = 2 for fp4+e8m0, not
