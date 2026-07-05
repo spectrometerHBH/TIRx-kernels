@@ -46,6 +46,8 @@ WG1_NUM_LOCAL_ROWS_PER_WARP = (B_TOPK // 4) // WG1_NUM_WARPS
 
 # KV gather4 TMA knobs shared by both gather call sites.
 _mma_config = partial(tcgen05_config, cta_group=1, weight_stationary=True)
+# The batched-C P gemms let the dispatch infer .ws from the fold layout.
+_p_config = partial(tcgen05_config, cta_group=1)
 _kv_gather_tma = partial(
     tma_config, cta_group=1, gather_axis=0, cache_hint=T.uint64(0x14F0000000000000)
 )
@@ -378,6 +380,17 @@ def _kernel(
     )
     tmem_p_col = T.meta_var(tmem_pool.offset)
     tmem_p = tmem_pool.alloc((B_H, B_TOPK * 2), "float32", datapath="E")
+    # Honest .ws output view: the M=64 .ws logits gemm produces two batched
+    # 64x64 partials in the two 64-lane halves (SEM-WS-BATCH), reduced by the
+    # readback below. Express the gemm C as C[2, B_H, B_TOPK] so the batch is
+    # explicit rather than hidden in the packed Layout-E N-fold; the dispatch
+    # infers .ws from this fold layout, so no weight_stationary flag is needed.
+    tmem_p_bmm = tmem_pool.view(
+        (2, B_H, B_TOPK),
+        "float32",
+        col=tmem_p_col,
+        layout=TileLayout(S[(2, B_H, B_TOPK) : (64 @ TLane, 1 @ TLane, 1 @ TCol)]),
+    )
     k_rope_tiled_mma = k_rope.view(
         B_TOPK * 2, Q_ROPE_DIM // 2, layout=SwizzleLayout(3, 2, 3, swizzle_inner=True)
     )
@@ -863,10 +876,10 @@ def _kernel(
                             # CUDA phase1.cuh:489 Q RoPE x K RoPE MMA.
                             mma_p_accumulate = T.uint32(0)
                             Tx.gemm_async(
-                                tmem_p[:, :],
+                                tmem_p_bmm[:, :, :],
                                 q_rope_tmem[:, :],
                                 k_rope_tiled_mma[:, :],
-                                **_mma_config(accum=mma_p_accumulate, smem_desc=mma_smem_desc),
+                                **_p_config(accum=mma_p_accumulate, smem_desc=mma_smem_desc),
                             )
                             bar_qk_rope_done.arrive(0)
 
@@ -888,7 +901,7 @@ def _kernel(
                                 clear_nope_accum, T.uint32(0), T.uint32(1)
                             )
                             Tx.gemm_async(
-                                tmem_p[:, :],
+                                tmem_p_bmm[:, :, :],
                                 q_nope_tmem[
                                     :,
                                     kv_nope_part_idx * (D_V // 4) : (kv_nope_part_idx + 1)
@@ -900,7 +913,7 @@ def _kernel(
                                     kv_nope_part_idx * (D_V // 4) : (kv_nope_part_idx + 1)
                                     * (D_V // 4),
                                 ],
-                                **_mma_config(accum=mma_p_accumulate, smem_desc=mma_smem_desc),
+                                **_p_config(accum=mma_p_accumulate, smem_desc=mma_smem_desc),
                             )
                         bar_qk_nope_done.arrive(cur_buf)
 
