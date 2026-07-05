@@ -14,17 +14,7 @@ from tirx_kernels.flashmla._tma import tma_config
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.lang.pipeline import MBarrier, TCGen05Bar, TMABar
-from tvm.tirx.layout import (
-    ComposeLayout,
-    Iter,
-    R,
-    S,
-    SwizzleLayout,
-    TCol,
-    TileLayout,
-    TLane,
-    tid_in_wg,
-)
+from tvm.tirx.layout import ComposeLayout, R, S, SwizzleLayout, TCol, TileLayout, TLane, tid_in_wg
 
 B_H = 128
 B_TOPK = 128
@@ -705,29 +695,14 @@ def _kernel(
                     if not should_skip_tma:
                         for local_col_inner in T.unroll(col_count):
                             local_col: T.let = col_start + local_col_inner
-                            raw_k_offset: T.let = (
-                                wg1_warp_idx * 4 * 64 + local_col * (B_TOPK // 2) * 64
-                            )
-                            k_gather_tile = T.decl_buffer(
-                                (WG1_NUM_LOCAL_ROWS_PER_WARP * 4, 64),
-                                "bfloat16",
-                                k_smem.data,
-                                elem_offset=k_smem.elem_offset + raw_k_offset,
-                                scope="shared.dyn",
-                                layout=ComposeLayout(
-                                    SwizzleLayout(3, 3, 3, swizzle_inner=True),
-                                    TileLayout.from_iters(
-                                        [
-                                            Iter(
-                                                WG1_NUM_LOCAL_ROWS_PER_WARP,
-                                                WG1_NUM_WARPS * 4 * 64,
-                                                "m",
-                                            ),
-                                            Iter(4, 64, "m"),
-                                            Iter(64, 1, "m"),
-                                        ]
-                                    ),
-                                ),
+                            # Rows interleave as (local_row, warp, lane); this
+                            # warp's 16 rows of the local_col 64-column chunk.
+                            k_gather_tile = (
+                                k_smem.unflatten(1, (d_qk // 64, 64))
+                                .select(1, local_col)
+                                .unflatten(0, (WG1_NUM_LOCAL_ROWS_PER_WARP, WG1_NUM_WARPS, 4))
+                                .select(1, wg1_warp_idx)
+                                .flatten(0, 1)
                             )
                             Tx.copy_async(
                                 k_gather_tile[:, :],
@@ -776,7 +751,7 @@ def _kernel(
                     bar_sv_part_done.wait(prev_buf, prev_phase)
 
                 @T.inline
-                def gather_v_part(row_offset, voffset_base, token_buf, bar):
+                def gather_v_part(row_offset, part, token_buf, bar):
                     for local_row_inner in T.unroll(WG2_NUM_LOCAL_ROWS_PER_PART):
                         local_row: T.let = row_offset + local_row_inner
                         row_base: T.let = (
@@ -797,25 +772,15 @@ def _kernel(
                         )
                     for local_col in T.unroll((D_V // 2) // 64):
                         src_col: T.let = local_col * 64 + cta_idx * 256
-                        raw_v_offset: T.let = voffset_base * 64 + local_col * B_TOPK * 64
-                        v_gather_tile = T.decl_buffer(
-                            (WG2_NUM_LOCAL_ROWS_PER_PART * 4, 64),
-                            "bfloat16",
-                            v_smem_gemm.data,
-                            elem_offset=v_smem_gemm.elem_offset + raw_v_offset,
-                            scope="shared.dyn",
-                            layout=ComposeLayout(
-                                SwizzleLayout(3, 3, 3, swizzle_inner=True),
-                                TileLayout.from_iters(
-                                    [
-                                        Iter(
-                                            WG2_NUM_LOCAL_ROWS_PER_PART, WG2_NUM_WARPS * 4 * 64, "m"
-                                        ),
-                                        Iter(4, 64, "m"),
-                                        Iter(64, 1, "m"),
-                                    ]
-                                ),
-                            ),
+                        # Rows interleave as (part, local_row, warp, lane); this
+                        # warp's 16 rows of the part half, local_col chunk.
+                        v_gather_tile = (
+                            v_smem_gemm.unflatten(1, ((D_V // 2) // 64, 64))
+                            .select(1, local_col)
+                            .unflatten(0, (2, WG2_NUM_LOCAL_ROWS_PER_PART, WG2_NUM_WARPS, 4))
+                            .select(0, part)
+                            .select(1, wg2_warp_idx)
+                            .flatten(0, 1)
                         )
                         Tx.copy_async(
                             v_gather_tile[:, :],
@@ -831,19 +796,14 @@ def _kernel(
                         )
 
                 token_idxs_part0 = T.alloc_local((WG2_NUM_LOCAL_ROWS_PER_PART, 4), "int32")
-                gather_v_part(0, wg2_warp_idx * 4, token_idxs_part0, bar_v_part0_ready)
+                gather_v_part(0, 0, token_idxs_part0, bar_v_part0_ready)
 
                 if k > 0:
                     prev_buf: T.let = (k - 1) % NUM_BUFS
                     prev_phase: T.let = ((k - 1) // NUM_BUFS) & 1
                     bar_sv_done.wait(prev_buf, prev_phase)
                 token_idxs_part1 = T.alloc_local((WG2_NUM_LOCAL_ROWS_PER_PART, 4), "int32")
-                gather_v_part(
-                    WG2_NUM_LOCAL_ROWS_PER_PART,
-                    wg2_warp_idx * 4 + WG2_NUM_LOCAL_ROWS_PER_PART * WG2_NUM_WARPS * 4,
-                    token_idxs_part1,
-                    bar_v_part1_ready,
-                )
+                gather_v_part(WG2_NUM_LOCAL_ROWS_PER_PART, 1, token_idxs_part1, bar_v_part1_ready)
 
     else:
         # CUDA phase1.cuh:490-606.  MMA warp and KV-valid loading warp.
