@@ -14,16 +14,7 @@ from tirx_kernels.flashmla._tma import tma_config
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.lang.pipeline import MBarrier, TCGen05Bar, TMABar
-from tvm.tirx.layout import (
-    ComposeLayout,
-    Iter,
-    S,
-    SwizzleLayout,
-    TCol,
-    TileLayout,
-    TLane,
-    tid_in_wg,
-)
+from tvm.tirx.layout import ComposeLayout, S, SwizzleLayout, TCol, TileLayout, TLane, tid_in_wg
 
 B_H = 128
 B_TOPK = 64
@@ -595,37 +586,15 @@ def _kernel(
                             prefetch_size="L2::256B",
                         )
                     bar_KV_empty.wait(k_buf_idx, k_bar_phase ^ 1)
-                    k_smem_gemm_cur = T.decl_buffer(
-                        (B_TOPK, D_QK // 2),
-                        "bfloat16",
-                        k_smem_gemm.data,
-                        elem_offset=k_smem_gemm.elem_offset + k_buf_idx * B_TOPK * (D_QK // 2),
-                        scope="shared.dyn",
-                        layout=ComposeLayout(
-                            SwizzleLayout(3, 3, 3, swizzle_inner=True),
-                            TileLayout(S[(B_TOPK, (D_QK // 2) // 64, 64) : (64, B_TOPK * 64, 1)]),
-                        ),
-                    )
+                    k_smem_gemm_cur = k_smem_gemm.select(0, k_buf_idx)
                     src_col: T.let = cta_idx * (D_QK // 2)
-                    raw_k_offset: T.let = wg1_warp_idx * 8 * 64
-                    k_gather_tile = T.decl_buffer(
-                        (WG1_ROWS_PER_WARP, (D_QK // 2) // 64, 64),
-                        "bfloat16",
-                        k_smem_gemm_cur.data,
-                        elem_offset=k_smem_gemm_cur.elem_offset + raw_k_offset,
-                        scope="shared.dyn",
-                        layout=ComposeLayout(
-                            SwizzleLayout(3, 3, 3, swizzle_inner=True),
-                            TileLayout.from_iters(
-                                [
-                                    Iter(WG1_ROWS_PER_WARP // 8, 4 * 8 * 64, "m"),
-                                    Iter(2, 4 * 64, "m"),
-                                    Iter(4, 64, "m"),
-                                    Iter((D_QK // 2) // 64, B_TOPK * 64, "m"),
-                                    Iter(64, 1, "m"),
-                                ]
-                            ),
-                        ),
+                    # Rows interleave as (row_group, warp, pair, lane4); this
+                    # warp's 8-row stripes of every 64-column chunk.
+                    k_gather_tile = (
+                        k_smem_gemm_cur.unflatten(1, ((D_QK // 2) // 64, 64))
+                        .unflatten(0, (WG1_ROWS_PER_WARP // 8, 4, 2, 4))
+                        .select(1, wg1_warp_idx)
+                        .flatten(0, 2)
                     )
                     Tx.copy_async(
                         k_gather_tile[:, :, :],
