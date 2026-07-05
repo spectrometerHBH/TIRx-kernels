@@ -359,7 +359,7 @@ def _kernel(
         if T.ptx.elect_sync():
             Tx.copy_async(
                 q_full[:, :],
-                q[s_q_idx : s_q_idx + 1, cta_idx * (B_H // 2) : (cta_idx + 1) * (B_H // 2), 0:d_qk],
+                q.chunk((None, 2, None))[s_q_idx, cta_idx, :],
                 **tma_config(
                     mbar=bar_prologue_q.ptr_to([0]),
                     cta_group=2,
@@ -519,12 +519,10 @@ def _kernel(
                 scale_for_old_pair: T.let = T.cuda.make_float2(scale_for_old, scale_for_old)
                 o_rescale_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, 32), "float32")
                 o_rescale = o_rescale_frag.local()
+                o_win = tmem_pool.view((128, D_V // 2), "float32", col=tmem_o_col, datapath="D")
                 for chunk_idx in T.unroll((D_V // 2) // 32):
                     Tx.wg.copy_async(
-                        o_rescale_frag[:, :],
-                        tmem_ldst[
-                            :, tmem_o_col + chunk_idx * 32 : tmem_o_col + (chunk_idx + 1) * 32
-                        ],
+                        o_rescale_frag[:, :], o_win.chunk((None, (D_V // 2) // 32))[:, chunk_idx]
                     )
                     T.ptx.tcgen05.wait.ld()
                     for o_i in T.unroll(16):
@@ -537,10 +535,7 @@ def _kernel(
                         o_rescale[o_i * 2] = T.cuda.float2_x(o_scaled_pair)
                         o_rescale[o_i * 2 + 1] = T.cuda.float2_y(o_scaled_pair)
                     Tx.wg.copy_async(
-                        tmem_ldst[
-                            :, tmem_o_col + chunk_idx * 32 : tmem_o_col + (chunk_idx + 1) * 32
-                        ],
-                        o_rescale_frag[:, :],
+                        o_win.chunk((None, (D_V // 2) // 32))[:, chunk_idx], o_rescale_frag[:, :]
                     )
                     T.ptx.tcgen05.wait.st()
                 T.ptx.tcgen05.fence.before_thread_sync()
@@ -592,11 +587,11 @@ def _kernel(
                 o_epi[o_zero_i] = 0.0
             output_scale = 1.0
         output_scale_pair: T.let = T.cuda.make_float2(output_scale, output_scale)
+        o_epi_win = tmem_pool.view((128, D_V // 2), "float32", col=tmem_o_col, datapath="D")
         for epi_k in T.unroll((D_V // 2) // B_EPI):
             if have_valid_indices:
                 Tx.wg.copy_async(
-                    o_epi_frag[:, :],
-                    tmem_ldst[:, tmem_o_col + epi_k * B_EPI : tmem_o_col + (epi_k + 1) * B_EPI],
+                    o_epi_frag[:, :], o_epi_win.chunk((None, (D_V // 2) // B_EPI))[:, epi_k]
                 )
                 T.ptx.tcgen05.wait.ld()
             for o_i in T.unroll(B_EPI // 8):
@@ -622,24 +617,16 @@ def _kernel(
             if warp_idx == 0:
                 if T.ptx.elect_sync():
                     Tx.copy_async(
-                        out[
-                            s_q_idx : s_q_idx + 1,
-                            cta_idx * (B_H // 2) : (cta_idx + 1) * (B_H // 2),
-                            epi_k * B_EPI : (epi_k + 1) * B_EPI,
-                        ],
-                        o_smem[:, epi_k * B_EPI : (epi_k + 1) * B_EPI],
+                        out.chunk((None, 2, D_V // B_EPI))[s_q_idx, cta_idx, epi_k],
+                        o_smem.chunk((None, D_V // B_EPI))[:, epi_k],
                         **tma_config(),
                     )
             if warp_idx == 1:
                 if T.ptx.elect_sync():
                     epi_k2: T.let = epi_k + (D_V // B_EPI // 2)
                     Tx.copy_async(
-                        out[
-                            s_q_idx : s_q_idx + 1,
-                            cta_idx * (B_H // 2) : (cta_idx + 1) * (B_H // 2),
-                            epi_k2 * B_EPI : (epi_k2 + 1) * B_EPI,
-                        ],
-                        o_smem[:, epi_k2 * B_EPI : (epi_k2 + 1) * B_EPI],
+                        out.chunk((None, 2, D_V // B_EPI))[s_q_idx, cta_idx, epi_k2],
+                        o_smem.chunk((None, D_V // B_EPI))[:, epi_k2],
                         **tma_config(),
                     )
 
@@ -704,7 +691,7 @@ def _kernel(
                             )[:, wg1_warp_idx, :]
                             Tx.copy_async(
                                 k_gather_tile[:, :],
-                                kv_tma[:, local_col * 64 : (local_col + 1) * 64],
+                                kv_tma.chunk((None, d_qk // 64))[:, local_col],
                                 **_kv_gather_tma(
                                     mbar=bar.ptr_to([cur_buf]),
                                     indexer=[

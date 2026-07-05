@@ -425,13 +425,7 @@ def _kernel(
                     T.ptx.cp_async.bulk.wait_group(0)
                     Tx.copy_async(
                         q_smem_tma[:, :, :, :],
-                        q_tma[
-                            :,
-                            cta_idx * (B_H // 2) : (cta_idx + 1) * (B_H // 2),
-                            :,
-                            :,
-                            q_s_q_idx : q_s_q_idx + 1,
-                        ],
+                        q_tma.chunk((None, 2, None, None, None))[:, cta_idx, :, :, q_s_q_idx],
                         **tma_config(
                             mbar=bar_sQ_full.ptr_to([0]),
                             cta_group=2,
@@ -445,7 +439,7 @@ def _kernel(
                         T.ptx.tcgen05.fence.after_thread_sync()
                         Tx.copy_async(
                             q_tmem_cp[:, :, :, :],
-                            q_smem.unflatten(1, (D_QK // 128, 2, 64))[:, :, :, :],
+                            q_smem.view(B_H // 2, D_QK // 128, 2, 64)[:, :, :, :],
                             shape="128x256b",
                             cta_group=2,
                         )
@@ -465,10 +459,10 @@ def _kernel(
 
             o_epi_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, B_EPI), "float32")
             o_epi = o_epi_frag.local()
+            o_epi_win = tmem_pool.view((128, D_V // 2), "float32", col=tmem_o_col, datapath="D")
             for epi_k in T.unroll((D_V // 2) // B_EPI):
                 Tx.wg.copy_async(
-                    o_epi_frag[:, :],
-                    tmem_ldst[:, tmem_o_col + epi_k * B_EPI : tmem_o_col + (epi_k + 1) * B_EPI],
+                    o_epi_frag[:, :], o_epi_win.chunk((None, (D_V // 2) // B_EPI))[:, epi_k]
                 )
                 T.ptx.tcgen05.wait.ld()
                 if epi_k == 0:
@@ -502,11 +496,7 @@ def _kernel(
             if warp_idx == 0:
                 if T.ptx.elect_sync():
                     Tx.copy_async(
-                        out[
-                            o_s_q_idx : o_s_q_idx + 1,
-                            cta_idx * (B_H // 2) : (cta_idx + 1) * (B_H // 2),
-                            :,
-                        ],
+                        out.chunk((None, 2, None))[o_s_q_idx, cta_idx, :],
                         q_smem[:, :],
                         **tma_config(),
                     )
@@ -589,16 +579,16 @@ def _kernel(
                             prefetch_size="L2::256B",
                         )
                     bar_KV_empty.wait(k_buf_idx, k_bar_phase ^ 1)
-                    k_smem_gemm_cur = k_smem_gemm.select(0, k_buf_idx)
+                    k_smem_gemm_cur = k_smem_gemm.sub[k_buf_idx]
                     src_col: T.let = cta_idx * (D_QK // 2)
                     # Rows interleave as (row_group, warp, pair, lane4); this
                     # warp's 8-row stripes of every 64-column chunk.
                     # Col dim reshaped to (chunk, 64) for the copy; row dim
                     # picks this warp's interleaved rows (stripe x pair x lane
                     # merged) with a rank-preserving tile.
-                    k_gather_tile = k_smem_gemm_cur.unflatten(
-                        1, ((D_QK // 2) // 64, 64)
-                    ).tile(0, (-1, 4, 2, 4))[:, wg1_warp_idx, :, :]
+                    k_gather_tile = k_smem_gemm_cur.view(B_TOPK, (D_QK // 2) // 64, 64).tile(
+                        0, (-1, 4, 2, 4)
+                    )[:, wg1_warp_idx, :, :]
                     Tx.copy_async(
                         k_gather_tile[:, :, :],
                         kv_tma[:, src_col : src_col + D_QK // 2],
@@ -820,18 +810,11 @@ def _kernel(
 
                 @T.inline
                 def load_p(lo_dst, hi_dst):
-                    Tx.wg.copy_async(
-                        lo_dst[:, :],
-                        tmem_ldst[:, tmem_p_col : tmem_p_col + WG3_NUM_ELEMS_PER_THREAD],
+                    p_win = tmem_pool.view(
+                        (128, WG3_NUM_ELEMS_PER_THREAD * 2), "float32", col=tmem_p_col, datapath="D"
                     )
-                    Tx.wg.copy_async(
-                        hi_dst[:, :],
-                        tmem_ldst[
-                            :,
-                            tmem_p_col + WG3_NUM_ELEMS_PER_THREAD : tmem_p_col
-                            + WG3_NUM_ELEMS_PER_THREAD * 2,
-                        ],
-                    )
+                    Tx.wg.copy_async(lo_dst[:, :], p_win.chunk((None, 2))[:, 0])
+                    Tx.wg.copy_async(hi_dst[:, :], p_win.chunk((None, 2))[:, 1])
 
                 if local_warp_idx < 2:
                     load_p(p_frag, p_peer_frag)
@@ -962,12 +945,11 @@ def _kernel(
                     scale_for_old_pair: T.let = T.cuda.make_float2(scale_for_old, scale_for_old)
                     o_rescale_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, 32), "float32")
                     o_rescale = o_rescale_frag.local()
+                    o_win = tmem_pool.view((128, D_V // 2), "float32", col=tmem_o_col, datapath="D")
                     for chunk_idx in T.unroll((D_V // 2) // 32):
                         Tx.wg.copy_async(
                             o_rescale_frag[:, :],
-                            tmem_ldst[
-                                :, tmem_o_col + chunk_idx * 32 : tmem_o_col + (chunk_idx + 1) * 32
-                            ],
+                            o_win.chunk((None, (D_V // 2) // 32))[:, chunk_idx],
                         )
                         T.ptx.tcgen05.wait.ld()
                         for o_i in T.unroll(16):
@@ -980,9 +962,7 @@ def _kernel(
                             o_rescale[o_i * 2] = T.cuda.float2_x(o_scaled_pair)
                             o_rescale[o_i * 2 + 1] = T.cuda.float2_y(o_scaled_pair)
                         Tx.wg.copy_async(
-                            tmem_ldst[
-                                :, tmem_o_col + chunk_idx * 32 : tmem_o_col + (chunk_idx + 1) * 32
-                            ],
+                            o_win.chunk((None, (D_V // 2) // 32))[:, chunk_idx],
                             o_rescale_frag[:, :],
                         )
                         T.ptx.tcgen05.wait.st()

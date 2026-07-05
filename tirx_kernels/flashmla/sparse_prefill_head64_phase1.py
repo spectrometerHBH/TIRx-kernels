@@ -358,14 +358,16 @@ def _kernel(
     tmem_o_col = T.meta_var(tmem_pool.offset)
     tmem_o_lo = tmem_pool.alloc((B_H, D_V // 2), "float32", datapath="E")
     tmem_o_hi = tmem_pool.alloc((B_H, D_V // 2), "float32", datapath="E")
+    # Reserve the q_*_tmem TMEM columns; the .ws logits gemms address them via
+    # the honest batched A[2, M, K] fold views below (not the 64-lane anchor),
+    # and the cp footprint views alias the same columns.
     q_nope_tmem_col = T.meta_var(tmem_pool.offset)
-    q_nope_tmem = tmem_pool.alloc((B_H, D_V // 2), "bfloat16")
+    tmem_pool.alloc((B_H, D_V // 2), "bfloat16")
     q_rope_tmem_col = T.meta_var(tmem_pool.offset)
-    q_rope_tmem = tmem_pool.alloc((B_H, Q_ROPE_DIM // 2), "bfloat16")
+    tmem_pool.alloc((B_H, Q_ROPE_DIM // 2), "bfloat16")
     # Honest tcgen05.cp footprint views over the q_*_tmem anchors: the
     # 128x256b copies fold Q's head_dim into even/odd 64-element chunks across
     # the two 64-lane halves — logical (h, d) sits at lane h + 64 * ((d // 64) % 2).
-    # The MMA descriptors keep addressing the 64-lane anchors above.
     q_nope_tmem_cp = tmem_pool.view(
         (B_H, D_V // 128, 2, 64),
         "bfloat16",
@@ -376,6 +378,23 @@ def _kernel(
     )
     q_rope_tmem_cp = tmem_pool.view(
         (B_H, Q_ROPE_DIM), "bfloat16", col=q_rope_tmem_col, datapath="E"
+    )
+    # Honest batched A[2, M, K] fold views (A-side of SEM-WS-BATCH): the M=64
+    # .ws logits gemms read Q from BOTH 64-lane halves (the two head-dim-half
+    # slabs the cp folds above), so the MMA A operand is the batched [2, M, K]
+    # fold (batch == lane-half), not the 64-lane anchor. Physically the same
+    # tmem cells as the cp footprint above (batch b == cp half).
+    q_nope_tmem_bmm = tmem_pool.view(
+        (2, B_H, D_V // 2),
+        "bfloat16",
+        col=q_nope_tmem_col,
+        layout=TileLayout(S[(2, B_H, D_V // 2) : (64 @ TLane, 1 @ TLane, 1 @ TCol)]),
+    )
+    q_rope_tmem_bmm = tmem_pool.view(
+        (2, B_H, Q_ROPE_DIM // 2),
+        "bfloat16",
+        col=q_rope_tmem_col,
+        layout=TileLayout(S[(2, B_H, Q_ROPE_DIM // 2) : (64 @ TLane, 1 @ TLane, 1 @ TCol)]),
     )
     tmem_p_col = T.meta_var(tmem_pool.offset)
     tmem_p = tmem_pool.alloc((B_H, B_TOPK * 2), "float32", datapath="E")
@@ -484,15 +503,11 @@ def _kernel(
 
             @T.inline
             def load_p(lo_dst, hi_dst):
-                Tx.wg.copy_async(
-                    lo_dst[:, :], tmem_ldst[:, tmem_p_col : tmem_p_col + num_elems_per_thread]
+                p_win = tmem_pool.view(
+                    (128, num_elems_per_thread * 2), "float32", col=tmem_p_col, datapath="D"
                 )
-                Tx.wg.copy_async(
-                    hi_dst[:, :],
-                    tmem_ldst[
-                        :, tmem_p_col + num_elems_per_thread : tmem_p_col + num_elems_per_thread * 2
-                    ],
-                )
+                Tx.wg.copy_async(lo_dst[:, :], p_win.chunk((None, 2))[:, 0])
+                Tx.wg.copy_async(hi_dst[:, :], p_win.chunk((None, 2))[:, 1])
 
             if warp_idx < 2:
                 load_p(p_frag, p_peer_frag)
@@ -622,14 +637,13 @@ def _kernel(
                 scale_for_old_pair: T.let = T.cuda.make_float2(scale_for_old, scale_for_old)
                 o_rescale_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, 32), "float32")
                 o_rescale = o_rescale_frag.local()
+                o_win = tmem_pool.view(
+                    (128, rescale_o_d_v // 2), "float32", col=tmem_o_col, datapath="D"
+                )
                 for chunk_idx in T.unroll((rescale_o_d_v // 2) // chunk_size):
                     Tx.wg.copy_async(
                         o_rescale_frag[:, :],
-                        tmem_ldst[
-                            :,
-                            tmem_o_col + chunk_idx * chunk_size : tmem_o_col
-                            + (chunk_idx + 1) * chunk_size,
-                        ],
+                        o_win.chunk((None, (rescale_o_d_v // 2) // chunk_size))[:, chunk_idx],
                     )
                     T.ptx.tcgen05.wait.ld()
                     for o_i in T.unroll(chunk_size // 2):
@@ -642,11 +656,7 @@ def _kernel(
                         o_rescale[o_i * 2] = T.cuda.float2_x(o_scaled_pair)
                         o_rescale[o_i * 2 + 1] = T.cuda.float2_y(o_scaled_pair)
                     Tx.wg.copy_async(
-                        tmem_ldst[
-                            :,
-                            tmem_o_col + chunk_idx * chunk_size : tmem_o_col
-                            + (chunk_idx + 1) * chunk_size,
-                        ],
+                        o_win.chunk((None, (rescale_o_d_v // 2) // chunk_size))[:, chunk_idx],
                         o_rescale_frag[:, :],
                     )
                     T.ptx.tcgen05.wait.st()
@@ -705,9 +715,7 @@ def _kernel(
                     # CUDA phase1.cuh:314-317: TMEM O load/fence.
                     Tx.wg.copy_async(
                         o_epi_frag[:, :],
-                        tmem_ldst[
-                            :, epi_c * 128 + epi_k * b_epi : epi_c * 128 + (epi_k + 1) * b_epi
-                        ],
+                        tmem_ldst.chunk((None, D_V // b_epi))[:, epi_c * (128 // b_epi) + epi_k],
                     )
                     T.ptx.tcgen05.wait.ld()
                 for o_i in T.unroll(b_epi // 8):
@@ -739,12 +747,8 @@ def _kernel(
                         # CUDA phase1.cuh:335-342: first half O TMA store.
                         epi_chunk_idx: T.let = epi_c * (D_V // 2 // b_epi) + epi_k
                         Tx.copy_async(
-                            out[
-                                s_q_idx : s_q_idx + 1,
-                                :,
-                                epi_chunk_idx * b_epi : (epi_chunk_idx + 1) * b_epi,
-                            ],
-                            o_smem[:, epi_chunk_idx * b_epi : (epi_chunk_idx + 1) * b_epi],
+                            out.chunk((None, None, D_V // b_epi))[s_q_idx, :, epi_chunk_idx],
+                            o_smem.chunk((None, D_V // b_epi))[:, epi_chunk_idx],
                             **tma_config(),
                         )
                 if warp_idx == 1:
@@ -754,12 +758,8 @@ def _kernel(
                             epi_c * (D_V // 2 // b_epi) + (D_V // b_epi // 4) + epi_k
                         )
                         Tx.copy_async(
-                            out[
-                                s_q_idx : s_q_idx + 1,
-                                :,
-                                epi_chunk_idx * b_epi : (epi_chunk_idx + 1) * b_epi,
-                            ],
-                            o_smem[:, epi_chunk_idx * b_epi : (epi_chunk_idx + 1) * b_epi],
+                            out.chunk((None, None, D_V // b_epi))[s_q_idx, :, epi_chunk_idx],
+                            o_smem.chunk((None, D_V // b_epi))[:, epi_chunk_idx],
                             **tma_config(),
                         )
 
@@ -779,19 +779,13 @@ def _kernel(
                 selected_idx = T.alloc_local((WG1_NUM_LOCAL_ROWS_PER_WARP, 4), "int32")
                 max_indices: T.int32 = -1
                 min_indices: T.int32 = s_kv
+                # This warp's 16 indices from the (local_row, warp, j) split:
+                # one strided copy (auto-vectorizes to 4x 128b ld.global.nc).
+                idx_block = indices.view(
+                    s_q, stride_indices_s_q // B_TOPK, WG1_NUM_LOCAL_ROWS_PER_WARP, WG1_NUM_WARPS, 4
+                ).sub[s_q_idx, k, :, wg1_warp_idx, :]
+                Tx.copy(selected_idx[:, :], idx_block[:, :], cache="nc")
                 for local_row in T.unroll(WG1_NUM_LOCAL_ROWS_PER_WARP):
-                    row_base: T.let = (
-                        g_indices_base
-                        + k * B_TOPK
-                        + local_row * WG1_NUM_WARPS * 4
-                        + wg1_warp_idx * 4
-                    )
-                    Tx.copy(
-                        selected_idx[local_row, 0:4],
-                        indices[row_base : row_base + 4],
-                        dispatch="vec_128b",
-                        cache="nc",
-                    )
                     for j in T.unroll(4):
                         idx: T.let = selected_idx[local_row, j]
                         max_indices = T.max(max_indices, idx)
@@ -810,12 +804,8 @@ def _kernel(
                 @T.inline
                 def gather_nope_part(part_idx, bar):
                     Tx.copy_async(
-                        k_nope_warp[
-                            cur_buf,
-                            :,
-                            part_idx * (D_V // 2) : (part_idx + 1) * (D_V // 2),
-                        ],
-                        kv_nope_tma[:, part_idx * (D_V // 2) : (part_idx + 1) * (D_V // 2)],
+                        k_nope_warp.chunk((None, None, 2))[cur_buf, :, part_idx],
+                        kv_nope_tma.chunk((None, 2))[:, part_idx],
                         **_kv_gather_tma(
                             mbar=bar.ptr_to([cur_buf]),
                             mbarrier_addr=d_qk == D_V and s_kv >= 65536,
@@ -853,7 +843,7 @@ def _kernel(
                 T.ptx.tcgen05.fence.after_thread_sync()
                 Tx.copy_async(
                     q_nope_tmem_cp[:, :, :, :],
-                    q_nope.unflatten(1, (D_V // 128, 2, 64))[:, :, :, :],
+                    q_nope.view(B_H, D_V // 128, 2, 64)[:, :, :, :],
                     shape="128x256b",
                     cta_group=1,
                 )
@@ -876,7 +866,7 @@ def _kernel(
                             mma_p_accumulate = T.uint32(0)
                             Tx.gemm_async(
                                 tmem_p_bmm[:, :, :],
-                                q_rope_tmem[:, :],
+                                q_rope_tmem_bmm[:, :, :],
                                 k_rope_tiled_mma[:, :],
                                 **_mma_config(accum=mma_p_accumulate, smem_desc=mma_smem_desc),
                             )
@@ -901,16 +891,9 @@ def _kernel(
                             )
                             Tx.gemm_async(
                                 tmem_p_bmm[:, :, :],
-                                q_nope_tmem[
-                                    :,
-                                    kv_nope_part_idx * (D_V // 4) : (kv_nope_part_idx + 1)
-                                    * (D_V // 4),
-                                ],
-                                k_nope_tiled_mma[
-                                    cur_buf,
-                                    :,
-                                    kv_nope_part_idx * (D_V // 4) : (kv_nope_part_idx + 1)
-                                    * (D_V // 4),
+                                q_nope_tmem_bmm.chunk((None, None, 2))[:, :, kv_nope_part_idx],
+                                k_nope_tiled_mma.chunk((None, None, 2))[
+                                    cur_buf, :, kv_nope_part_idx
                                 ],
                                 **_mma_config(accum=mma_p_accumulate, smem_desc=mma_smem_desc),
                             )
@@ -987,18 +970,12 @@ def _kernel(
                     for local_row in T.unroll(rows_per_thread):
                         index = rope_indices[local_row]
                         is_valid_index: T.let = (index >= 0) & (index < s_kv)
+                        kv_off: T.let = index * stride_kv_s_kv + D_V + idx_in_group * 8
                         Tx.copy_async(
-                            k_rope[
-                                group_idx + local_row * num_groups,
-                                idx_in_group * 8 : idx_in_group * 8 + 8,
+                            k_rope.chunk((None, Q_ROPE_DIM // 8))[
+                                group_idx + local_row * num_groups, idx_in_group
                             ],
-                            kv[
-                                index * stride_kv_s_kv + D_V + idx_in_group * 8 : index
-                                * stride_kv_s_kv
-                                + D_V
-                                + idx_in_group * 8
-                                + 8
-                            ],
+                            kv[kv_off : kv_off + 8],
                             dispatch="ldgsts",
                             direct=True,
                             prefetch_size=128,
