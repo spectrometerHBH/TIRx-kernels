@@ -394,11 +394,7 @@ def _kernel(
     # Same bytes with the WG1 gather factorization: rows split into
     # (stripe, warp, row), warp brought forward, stripe x row remerged so
     # each (buf, warp) sees its 16 interleaved rows as one axis.
-    k_nope_gather = (
-        k_nope_gemm.view(NUM_BUFS, WG1_NUM_LOCAL_ROWS_PER_WARP, WG1_NUM_WARPS, 4, D_V)
-        .permute(0, 2, 1, 3, 4)
-        .view(NUM_BUFS, WG1_NUM_WARPS, WG1_NUM_LOCAL_ROWS_PER_WARP * 4, D_V)
-    )
+    k_nope_gather = k_nope_gemm.rearrange("b (s w r) d -> b w (s r) d", w=WG1_NUM_WARPS, r=4)
     mma_p_accumulate: T.uint32 = 0
     mma_o_accumulate: T.uint32 = 0
     mma_smem_desc = T.meta_var("local_hoist" if (d_qk > D_V and s_kv == 8192) else "hoist")
