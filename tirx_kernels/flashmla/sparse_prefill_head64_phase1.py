@@ -628,6 +628,10 @@ def _kernel(
 
         o_epi_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, 64), "float32")
         o_epi = o_epi_frag.local()
+        o_epi_bf16_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, 64), "bfloat16")
+        # O smem viewed the same way as o_tmem: (128, 256) so a (128,64) frag
+        # chunk copies straight in (row r = lane-half*64 + h, col = D_V fold).
+        o_smem_win = o_smem.view(B_H, 2, 2, 128).permute(2, 0, 1, 3).view(128, D_V // 2)
         have_valid_indices: T.let = T.ptx.any_sync(T.uint32(0xFFFFFFFF), li != 0.0) != 0
         if not have_valid_indices:
             for o_zero_i in T.unroll(64):
@@ -643,24 +647,11 @@ def _kernel(
                     )
                     T.ptx.tcgen05.wait.ld()
                 Tx.wg.mul(o_epi_frag[:, :], o_epi_frag[:, :], output_scale)
-                for o_i in T.unroll(64 // 8):
-                    o_epi_bf16 = T.alloc_local((4,), "uint32")
-                    for o_j in T.unroll(4):
-                        o_pair_idx: T.let = o_i * 8 + o_j * 2
-                        o_epi_bf16[o_j] = T.cuda.float22bfloat162_rn(
-                            o_epi[o_pair_idx], o_epi[o_pair_idx + 1]
-                        )
-                    o_store_source_offset = (
-                        epi_c * (D_V // 2) + (idx_in_warpgroup // B_H) * (D_V // 4) + epi_k * 64
-                    )
-                    o_base_col: T.let = o_i * 8 + o_store_source_offset
-                    Tx.copy(
-                        o_smem.view("uint32")[
-                            idx_in_warpgroup % B_H, o_base_col // 2 : o_base_col // 2 + 4
-                        ],
-                        o_epi_bf16[0:4],
-                        dispatch="vec_128b",
-                    )
+                Tx.wg.cast(o_epi_bf16_frag[:, :], o_epi_frag[:, :])
+                Tx.wg.copy(
+                    o_smem_win.chunk((None, (D_V // 2) // 64))[:, epi_c * 2 + epi_k],
+                    o_epi_bf16_frag[:, :],
+                )
                 T.ptx.fence.proxy_async("shared::cta")
                 T.ptx.bar.sync(NAMED_BARRIER_WG0_SYNC, 128)
                 if warp_idx == 0:
