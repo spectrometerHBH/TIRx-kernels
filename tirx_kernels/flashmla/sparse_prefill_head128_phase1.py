@@ -632,35 +632,28 @@ def _kernel(
                 @T.inline
                 def gather_k_part(col_start, col_count, tx_dim, bar):
                     if not should_skip_tma:
-                        # Per-64-col gathers kept separate on purpose -- but note the
-                        # dispatch layer lowers *either* form into the SAME 65
-                        # constant-offset per-atom gather4 TMAs (all smem offsets and
-                        # TensorMap coords are compile-time literals; no runtime address
-                        # math). The only difference is emit order: this explicit
-                        # per-col loop emits col-major, so the gather4s sharing one
-                        # TensorMap coord are adjacent and ptxas hoists the coord setup.
-                        # Folding it into one wide gather emits row-major (every
-                        # neighbouring gather4 has a distinct coord), which ptxas cannot
-                        # reuse -> +15% ALU setup, ~1% slower on kv8192 (ncu; TMA/MMA/
-                        # DRAM work identical). A pure emit-order effect, so keep the
-                        # col-major loop.
-                        for local_col_inner in T.unroll(col_count):
-                            local_col: T.let = col_start + local_col_inner
-                            k_gather_tile = k_smem.tile(1, (-1, 64))[local_col, :].tile(
-                                0, (-1, WG1_NUM_WARPS, 4)
-                            )[:, wg1_warp_idx, :]
-                            Tx.copy_async(
-                                k_gather_tile[:, :],
-                                kv_tma.chunk((None, d_qk // 64))[:, local_col],
-                                **_kv_gather_tma(
-                                    mbar=bar.ptr_to([cur_buf]),
-                                    indexer=[
-                                        indices_int4[row, lane]
-                                        for row in range(WG1_NUM_LOCAL_ROWS_PER_WARP)
-                                        for lane in range(4)
-                                    ],
-                                ),
-                            )
+                        # One wide gather4 over the whole part, like head64/small_topk.
+                        # The dispatch layer splits it into per-atom gather4 TMAs with
+                        # compile-time-constant smem offsets; this was verified (ncu,
+                        # instructions identical per pipe, duration within noise) to be
+                        # equivalent to an explicit per-64-col loop.
+                        # col_start/col_count are concrete meta ints; keep the sub
+                        # bounds concrete so it can honor the 64-col swizzle atom.
+                        k_gather_tile = k_smem.sub[
+                            :, col_start * 64 : col_start * 64 + col_count * 64
+                        ].tile(0, (-1, WG1_NUM_WARPS, 4))[:, wg1_warp_idx, :]
+                        Tx.copy_async(
+                            k_gather_tile[:, :],
+                            kv_tma[:, col_start * 64 : col_start * 64 + col_count * 64],
+                            **_kv_gather_tma(
+                                mbar=bar.ptr_to([cur_buf]),
+                                indexer=[
+                                    indices_int4[row, lane]
+                                    for row in range(WG1_NUM_LOCAL_ROWS_PER_WARP)
+                                    for lane in range(4)
+                                ],
+                            ),
+                        )
                     else:
                         T.ptx.mbarrier.complete_tx(
                             bar.ptr_to([cur_buf]),
@@ -708,26 +701,25 @@ def _kernel(
                         4,
                     ).sub[s_q_idx, k, part, :, wg2_warp_idx, :]
                     Tx.copy(token_buf[:, :], idx_block[:, :], cache="nc")
-                    # Per-64-col gathers kept separate: the col-major emit order lets
-                    # ptxas reuse the shared TensorMap coord setup (see the K-gather
-                    # note -- merging only reorders the identical TMAs, ~1% via ptxas).
-                    for local_col in T.unroll((D_V // 2) // 64):
-                        src_col: T.let = local_col * 64 + cta_idx * 256
-                        v_gather_tile = v_smem_gemm.tile(1, (-1, 64))[local_col, :].tile(
-                            0, (2, -1, WG2_NUM_WARPS, 4)
-                        )[part, :, wg2_warp_idx, :]
-                        Tx.copy_async(
-                            v_gather_tile[:, :],
-                            kv_tma[:, src_col : src_col + 64],
-                            **_kv_gather_tma(
-                                mbar=bar.ptr_to([cur_buf]),
-                                indexer=[
-                                    token_buf[row, lane]
-                                    for row in range(WG2_NUM_LOCAL_ROWS_PER_PART)
-                                    for lane in range(4)
-                                ],
-                            ),
-                        )
+                    # One wide gather4 over all D_V//2 cols, like head64/small_topk
+                    # (dispatch splits it into per-atom TMAs; verified equivalent to a
+                    # per-64-col loop via ncu -- see the K-gather note).
+                    src0: T.let = cta_idx * 256
+                    v_gather_tile = v_smem_gemm.tile(0, (2, -1, WG2_NUM_WARPS, 4))[
+                        part, :, wg2_warp_idx, :
+                    ]
+                    Tx.copy_async(
+                        v_gather_tile[:, :],
+                        kv_tma[:, src0 : src0 + (D_V // 2)],
+                        **_kv_gather_tma(
+                            mbar=bar.ptr_to([cur_buf]),
+                            indexer=[
+                                token_buf[row, lane]
+                                for row in range(WG2_NUM_LOCAL_ROWS_PER_PART)
+                                for lane in range(4)
+                            ],
+                        ),
+                    )
 
                 token_idxs_part0 = T.alloc_local((WG2_NUM_LOCAL_ROWS_PER_PART, 4), "int32")
                 gather_v_part(0, 0, token_idxs_part0, bar_v_part0_ready)
