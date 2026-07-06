@@ -250,10 +250,10 @@ def _kernel(
     lane_id = T.lane_id([32])
     tid_in_wg = T.thread_id_in_wg([128])
     pool = T.SMEMPool()
-    Q_smem = pool.alloc_mma((SMEM_PIPE_DEPTH_Q, BLK_M, HEAD_DIM), "float16")
-    K_smem = pool.alloc_mma((SMEM_PIPE_DEPTH_KV, BLK_N, HEAD_DIM), "float16")
+    Q_smem = pool.alloc_tcgen05_mma_AB((SMEM_PIPE_DEPTH_Q, BLK_M, HEAD_DIM), "float16")
+    K_smem = pool.alloc_tcgen05_mma_AB((SMEM_PIPE_DEPTH_KV, BLK_N, HEAD_DIM), "float16")
     V_smem = K_smem.view(SMEM_PIPE_DEPTH_KV, BLK_N, HEAD_DIM)
-    O_smem = pool.alloc_mma((TMEM_PIPE_DEPTH, BLK_M, HEAD_DIM), "float16")
+    O_smem = pool.alloc_tcgen05_mma_AB((TMEM_PIPE_DEPTH, BLK_M, HEAD_DIM), "float16")
     sScale = pool.alloc((SSCALE_TOTAL_SIZE,), "float32", align=1024)
     tmem_addr = pool.alloc([1], "uint32")
     ACC_SCALE_BASE: T.let = 0

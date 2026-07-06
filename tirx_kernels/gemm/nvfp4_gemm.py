@@ -326,8 +326,8 @@ def _kernel(
     b_n = T.meta_var(cta_n * MMA_N + id_in_pair * CTA_N)
     d_n = T.meta_var(cta_n * MMA_N)
     pool = T.SMEMPool()
-    A_smem_packed = pool.alloc_mma((PIPE_DEPTH, CTA_M, CTA_K // 2), "uint8")
-    B_smem_packed = pool.alloc_mma((PIPE_DEPTH, CTA_N, CTA_K // 2), "uint8")
+    A_smem_packed = pool.alloc_tcgen05_mma_AB((PIPE_DEPTH, CTA_M, CTA_K // 2), "uint8")
+    B_smem_packed = pool.alloc_tcgen05_mma_AB((PIPE_DEPTH, CTA_N, CTA_K // 2), "uint8")
     SFA_smem = pool.alloc(
         (PIPE_DEPTH, CTA_M, SF_CTA_K),
         "uint8",
@@ -340,7 +340,7 @@ def _kernel(
         layout=sf_smem_layout(SFB_N, 16, sf_per_mma=4, pipe_depth=PIPE_DEPTH),
         align=1024,
     )
-    output_smem = pool.alloc_mma(
+    output_smem = pool.alloc_tcgen05_mma_AB(
         (WB_PIPE_DEPTH, CTA_M, EPI_TILE), "bfloat16", swizzle_mode=D_SWIZZLE_MODE
     )
     tmem_addr = pool.alloc([1], "uint32", align=4)

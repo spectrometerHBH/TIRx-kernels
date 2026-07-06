@@ -11,10 +11,11 @@ import torch
 from tirx_kernels.flashmla._gemm import tcgen05_config
 from tirx_kernels.flashmla._mask import pack_valid_mask8
 from tirx_kernels.flashmla._tma import tma_config
+from tvm.backend.cuda.operator.tile_primitive.tma_utils import SwizzleMode
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.lang.pipeline import MBarrier, TCGen05Bar, TMABar
-from tvm.tirx.layout import ComposeLayout, S, SwizzleLayout, TileLayout, tid_in_wg
+from tvm.tirx.layout import ComposeLayout, S, SwizzleLayout, TileLayout, laneid, wid_in_wg
 
 B_H = 128
 B_TOPK = 64
@@ -284,9 +285,11 @@ def _kernel(
     idx_in_warpgroup: T.let = thread_idx % 128
 
     pool = T.SMEMPool()
-    q_smem = pool.alloc_mma((B_H // 2, D_QK), "bfloat16")
-    k_smem = pool.alloc_mma((NUM_K_BUFS * B_TOPK, D_QK // 2), "bfloat16")
-    s_smem = pool.alloc(((B_H // 2) * B_TOPK,), "bfloat16")
+    q_smem = pool.alloc_tcgen05_mma_AB((B_H // 2, D_QK), "bfloat16")
+    k_smem = pool.alloc_tcgen05_mma_AB((NUM_K_BUFS * B_TOPK, D_QK // 2), "bfloat16")
+    s_smem_gemm = pool.alloc_tcgen05_mma_AB(
+        (B_H // 2, B_TOPK), "bfloat16", swizzle_mode=SwizzleMode.SWIZZLE_NONE
+    )
     p_exchange = pool.alloc((4, (B_H // 2 // 2) * (B_TOPK // 2)), "uint32")
     rowwise_max_buf = pool.alloc((128,), "float32")
     rowwise_li_buf = pool.alloc((128,), "float32")
@@ -335,7 +338,7 @@ def _kernel(
     # O accumulator: one alloc; logical col halves are the B lo/hi gemm outputs
     # (physical col 0-127 / 128-255), read back as a (128, D_V//2) datapath-D
     # tile via permute+reshape.
-    o_tmem = tmem_pool.alloc_mma_D(
+    o_tmem = tmem_pool.alloc_tcgen05_mma_D(
         (B_H // 2, D_V), "float32", M=128, cta_group=2, group=(2, 2, 128)
     )
     tmem_o_lo = o_tmem.sub[:, 0 : D_V // 2]
@@ -349,13 +352,12 @@ def _kernel(
     # per-CTA K gather half — unlike head64, whose Q lands uninterleaved and
     # folds to even/odd 64-chunk sets. QK passes the full banked A tile so the
     # dispatch can validate both lane halves explicitly.
-    q_tmem_fold = tmem_pool.alloc_mma_A((2, B_H // 2, D_QK // 2), "bfloat16", M=128, cta_group=2)
+    q_tmem_fold = tmem_pool.alloc_tcgen05_mma_A(
+        (2, B_H // 2, D_QK // 2), "bfloat16", M=128, cta_group=2
+    )
     q_tmem_cp = q_tmem_fold.rearrange("b h (dc di) -> h dc b di", di=64)
     tmem_p_col = T.meta_var(tmem_pool.offset)
-    tmem_p = tmem_pool.alloc_mma_D((B_H // 2, B_TOPK * 2), "float32", M=128, cta_group=2)
-    s_smem_gemm = s_smem.rearrange(
-        "(chunk row eight) -> row (chunk eight)", chunk=B_TOPK // 8, row=B_H // 2, eight=8
-    )
+    tmem_p = tmem_pool.alloc_tcgen05_mma_D((B_H // 2, B_TOPK * 2), "float32", M=128, cta_group=2)
     k_smem_gemm = k_smem.view(
         NUM_K_BUFS,
         B_TOPK,
@@ -884,20 +886,10 @@ def _kernel(
                     "bfloat16",
                     scope="local",
                     layout=TileLayout(
-                        S[
-                            (B_H // 2, 2, B_TOPK // 16, 8) : (
-                                1 @ tid_in_wg,
-                                (B_H // 2) @ tid_in_wg,
-                                8,
-                                1,
-                            )
-                        ]
+                        S[(2, 32, 2, B_TOPK // 2) : (1 @ wid_in_wg, 1 @ laneid, 2 @ wid_in_wg, 1)]
                     ),
                 )
-                s_pack = s_frag.local(
-                    WG3_NUM_ELEMS_PER_THREAD,
-                    layout=TileLayout(S[(WG3_NUM_ELEMS_PER_THREAD,) : (1,)]),
-                ).view("uint32")
+                s_pack = s_frag.local().view("uint32")
                 cur_sum_pair: T.uint64 = T.cuda.make_float2(T.float32(0.0), T.float32(0.0))
                 neg_new_max_pair: T.let = T.cuda.make_float2(-new_max, -new_max)
                 for s_i in T.unroll(WG3_NUM_ELEMS_PER_THREAD // 2):

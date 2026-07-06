@@ -15,7 +15,7 @@ from tvm.backend.cuda.operator.tile_primitive.tma_utils import SwizzleMode
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.lang.pipeline import MBarrier, TCGen05Bar, TMABar
-from tvm.tirx.layout import S, SwizzleLayout, TCol, TileLayout, TLane, laneid, wid_in_wg
+from tvm.tirx.layout import S, SwizzleLayout, TileLayout, laneid, wid_in_wg
 
 B_H = 64
 B_TOPK = 64
@@ -291,35 +291,37 @@ def _kernel(
     # storage legalization before there is any copy/MMA/store to bind them to.
     pool = T.SMEMPool()
     u_base = T.meta_var(pool.offset)
-    k_rope = pool.alloc_mma(
+    k_rope = pool.alloc_tcgen05_mma_AB(
         (B_TOPK, Q_ROPE_DIM), "bfloat16", swizzle_mode=SwizzleMode.SWIZZLE_64B_ATOM
     )
     k_rope_tiled_mma = k_rope.view(
         B_TOPK * 2, Q_ROPE_DIM // 2, layout=SwizzleLayout(3, 2, 3, swizzle_inner=True)
     )
     k_nope_base = T.meta_var(pool.offset)
-    k_nope = pool.alloc_mma((NUM_BUFS, B_TOPK, D_V), "bfloat16")
+    k_nope = pool.alloc_tcgen05_mma_AB((NUM_BUFS, B_TOPK, D_V), "bfloat16")
     u_end = T.meta_var(pool.offset)
     # Same bytes as k_nope, refolded to (2*B_TOPK, D_V//2) for the P MMA's B operand.
     pool.move_base_to(k_nope_base)
-    k_nope_tiled_mma = pool.alloc_mma((NUM_BUFS, B_TOPK * 2, D_V // 2), "bfloat16")
+    k_nope_tiled_mma = pool.alloc_tcgen05_mma_AB((NUM_BUFS, B_TOPK * 2, D_V // 2), "bfloat16")
     # q_nope aliases the last k_nope stage: Q moves to TMEM before that stage is used.
     pool.move_base_to(u_end - B_H * D_V * BF16_BYTES)
-    q_nope = pool.alloc_mma((B_H, D_V), "bfloat16")
+    q_nope = pool.alloc_tcgen05_mma_AB((B_H, D_V), "bfloat16")
     # o_smem aliases the front of the region: O is only written in the epilogue.
     pool.move_base_to(u_base)
-    o_smem = pool.alloc_mma((B_H, D_V), "bfloat16")
+    o_smem = pool.alloc_tcgen05_mma_AB((B_H, D_V), "bfloat16")
     pool.move_base_to(u_end)
 
     p_exchange_buf = pool.alloc((4, 32 * (B_TOPK // 2)), "float32")
     s_q_rope_base = T.meta_var(pool.offset)
-    q_rope = pool.alloc_mma(
+    q_rope = pool.alloc_tcgen05_mma_AB(
         (B_H, Q_ROPE_DIM), "bfloat16", swizzle_mode=SwizzleMode.SWIZZLE_64B_ATOM
     )
     q_rope_end = T.meta_var(pool.offset)
     # s_smem_gemm aliases q_rope: Q RoPE moves to TMEM before the first S tile is stored.
     pool.move_base_to(s_q_rope_base)
-    s_smem_gemm = pool.alloc_mma((B_H, B_TOPK), "bfloat16", swizzle_mode=SwizzleMode.SWIZZLE_NONE)
+    s_smem_gemm = pool.alloc_tcgen05_mma_AB(
+        (B_H, B_TOPK), "bfloat16", swizzle_mode=SwizzleMode.SWIZZLE_NONE
+    )
     pool.move_base_to(q_rope_end)
 
     is_k_valid = pool.alloc((NUM_BUFS, B_TOPK // 8), "int8")
@@ -350,7 +352,7 @@ def _kernel(
     # O accumulator: one alloc. Logical col halves [0:256)/[256:512) are the E
     # lo/hi gemm outputs (physical col 0-127 / 128-255 via the outer 128@TCol
     # axis); the whole thing reads back as a plain (128, 256) datapath-D tile.
-    o_tmem = tmem_pool.alloc_mma_D(
+    o_tmem = tmem_pool.alloc_tcgen05_mma_D(
         (B_H, D_V), "float32", M=64, cta_group=1, ws=True, group=(2, 2, 128)
     )
     tmem_o_lo = o_tmem.sub[:, 0 : D_V // 2]
@@ -362,20 +364,22 @@ def _kernel(
     # views of the same columns -- the cp 128x256b copies fold Q's head_dim
     # into even/odd 64-element chunks across the two halves (logical (h, d) at
     # lane h + 64 * ((d // 64) % 2)).
-    q_nope_tmem_bmm = tmem_pool.alloc_mma_A(
+    q_nope_tmem_bmm = tmem_pool.alloc_tcgen05_mma_A(
         (2, B_H, D_V // 2), "bfloat16", M=64, cta_group=1, ws=True
     )
     # cp footprint = split bmm's head_dim into (d//64, d%64) and move the
     # lane-half batch inward: bmm[b, h, d] == cp[h, d//64, b, d%64].
     q_nope_tmem_cp = q_nope_tmem_bmm.rearrange("b h (dc di) -> h dc b di", di=64)
-    q_rope_tmem_bmm = tmem_pool.alloc_mma_A(
+    q_rope_tmem_bmm = tmem_pool.alloc_tcgen05_mma_A(
         (2, B_H, Q_ROPE_DIM // 2), "bfloat16", M=64, cta_group=1, ws=True
     )
     q_rope_tmem_cp = q_rope_tmem_bmm.rearrange("b h k -> h (b k)")
     tmem_p_col = T.meta_var(tmem_pool.offset)
     # .ws logits gemm C: two batched 64x64 lane-half partials, C[2, B_H, B_TOPK]
     # (dispatch infers .ws from this fold layout; no weight_stationary flag).
-    tmem_p_bmm = tmem_pool.alloc_mma_D((2, B_H, B_TOPK), "float32", M=64, cta_group=1, ws=True)
+    tmem_p_bmm = tmem_pool.alloc_tcgen05_mma_D(
+        (2, B_H, B_TOPK), "float32", M=64, cta_group=1, ws=True
+    )
     # k_nope's WG1 gather factorization (rows -> stripe/warp/row) is
     # derived per-warp below via k_nope.tile.
     mma_p_accumulate: T.uint32 = 0

@@ -11,10 +11,11 @@ import torch
 from tirx_kernels.flashmla._gemm import tcgen05_config
 from tirx_kernels.flashmla._mask import pack_valid_mask8
 from tirx_kernels.flashmla._tma import tma_config
+from tvm.backend.cuda.operator.tile_primitive.tma_utils import SwizzleMode
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.lang.pipeline import MBarrier, TCGen05Bar, TMABar
-from tvm.tirx.layout import ComposeLayout, S, SwizzleLayout, TileLayout, tid_in_wg
+from tvm.tirx.layout import ComposeLayout, S, SwizzleLayout, TileLayout, laneid, wid_in_wg
 
 B_H = 128
 B_TOPK = 128
@@ -297,16 +298,18 @@ def _kernel(
     # union offsets: q_full, {sq, v, k}, and o alias the same base.
     pool = T.SMEMPool()
     u_base = T.meta_var(pool.offset)
-    q_full = pool.alloc_mma((B_H // 2, d_qk), "bfloat16")
+    q_full = pool.alloc_tcgen05_mma_AB((B_H // 2, d_qk), "bfloat16")
     pool.move_base_to(u_base)
-    sq_smem = pool.alloc_mma((B_H // 2, d_sq), "bfloat16")
-    v_smem = pool.alloc_mma((D_V // 2, B_TOPK), "bfloat16")
-    k_smem = pool.alloc_mma((B_TOPK // 2, d_qk), "bfloat16")
+    sq_smem = pool.alloc_tcgen05_mma_AB((B_H // 2, d_sq), "bfloat16")
+    v_smem = pool.alloc_tcgen05_mma_AB((D_V // 2, B_TOPK), "bfloat16")
+    k_smem = pool.alloc_tcgen05_mma_AB((B_TOPK // 2, d_qk), "bfloat16")
     u_end = T.meta_var(pool.offset)
     pool.move_base_to(u_base)
-    o_smem = pool.alloc_mma((B_H // 2, D_V), "bfloat16")
+    o_smem = pool.alloc_tcgen05_mma_AB((B_H // 2, D_V), "bfloat16")
     pool.move_base_to(u_end)
-    s_smem = pool.alloc(((B_H // 2) * B_TOPK,), "bfloat16")
+    s_smem_gemm = pool.alloc_tcgen05_mma_AB(
+        (B_H // 2, B_TOPK), "bfloat16", swizzle_mode=SwizzleMode.SWIZZLE_NONE
+    )
     is_k_valid = pool.alloc((NUM_BUFS, B_TOPK // 8), "int8")
     bar_prologue_q = TMABar(pool, 1)
     bar_prologue_utccp = TCGen05Bar(pool, 1)
@@ -376,23 +379,20 @@ def _kernel(
     tmem_pool = T.TMEMPool(pool, total_cols=512, cta_group=2, tmem_addr=tmem_start_addr)
     # O accumulator: one alloc; logical col halves are the B lo/hi gemm outputs,
     # read back as a (128, D_V//2) datapath-D tile via permute+reshape.
-    o_tmem = tmem_pool.alloc_mma_D(
+    o_tmem = tmem_pool.alloc_tcgen05_mma_D(
         (B_H // 2, D_V), "float32", M=128, cta_group=2, group=(2, 2, 128)
     )
     tmem_o_lo = o_tmem.sub[:, 0 : D_V // 2]
     tmem_o_hi = o_tmem.sub[:, D_V // 2 : D_V]
     o_win = o_tmem.rearrange("h (a b c) -> (b h) (a c)", a=2, b=2, c=128)
     tmem_p_col = T.meta_var(tmem_pool.offset)
-    tmem_p = tmem_pool.alloc_mma_D((B_H // 2, B_TOPK), "float32", M=128, cta_group=2)
+    tmem_p = tmem_pool.alloc_tcgen05_mma_D((B_H // 2, B_TOPK), "float32", M=128, cta_group=2)
     # Qt TMEM at its real 128-lane footprint: the 64x128b.warpx2::02_13 copy
     # lands rows 0-63 on lanes 0-63 AND mirrors them at lane offset +64, so
     # the alloc declares that replica (R[2 : 64 @ TLane]). The MMA dispatcher
     # validates this explicit A-side footprint while the instruction operand
     # still addresses the anchor cell.
-    q_tmem = tmem_pool.alloc_mma_A((B_H // 2, D_TQ), "bfloat16", M=128, cta_group=2)
-    s_smem_gemm = s_smem.rearrange(
-        "(chunk row eight) -> row (chunk eight)", chunk=B_TOPK // 8, row=B_H // 2, eight=8
-    )
+    q_tmem = tmem_pool.alloc_tcgen05_mma_A((B_H // 2, D_TQ), "bfloat16", M=128, cta_group=2)
     v_smem_gemm = v_smem.view(
         B_TOPK,
         D_V // 2,
@@ -479,19 +479,10 @@ def _kernel(
                 "bfloat16",
                 scope="local",
                 layout=TileLayout(
-                    S[
-                        (B_H // 2, 2, B_TOPK // 16, 8) : (
-                            1 @ tid_in_wg,
-                            (B_H // 2) @ tid_in_wg,
-                            8,
-                            1,
-                        )
-                    ]
+                    S[(2, 32, 2, B_TOPK // 2) : (1 @ wid_in_wg, 1 @ laneid, 2 @ wid_in_wg, 1)]
                 ),
             )
-            s_pack = s_frag.local(
-                P_TMEM_ELEMENTS, layout=TileLayout(S[(P_TMEM_ELEMENTS,) : (1,)])
-            ).view("uint32")
+            s_pack = s_frag.local().view("uint32")
             neg_new_max_pair: T.let = T.cuda.make_float2(-new_max, -new_max)
             for s_i in T.unroll(P_TMEM_ELEMENTS // 2):
                 p_pair: T.let = T.cuda.make_float2(
@@ -616,34 +607,22 @@ def _kernel(
                 max_indices: T.int32 = -1
                 min_indices: T.int32 = s_kv
 
+                # This CTA's topk half (cta_idx), split (local_row, warp, j): one
+                # strided nc copy (auto-vectorizes to 4x v4 ld.global.nc), like head64.
+                idx_block = indices.view(
+                    s_q,
+                    stride_indices_s_q // B_TOPK,
+                    2,
+                    WG1_NUM_LOCAL_ROWS_PER_WARP,
+                    WG1_NUM_WARPS,
+                    4,
+                ).sub[s_q_idx, k, cta_idx, :, wg1_warp_idx, :]
+                Tx.copy(indices_int4[:, :], idx_block[:, :], cache="nc")
                 for local_row in T.unroll(WG1_NUM_LOCAL_ROWS_PER_WARP):
-                    row_base: T.let = (
-                        g_indices_base
-                        + k * B_TOPK
-                        + cta_idx * (B_TOPK // 2)
-                        + (local_row * WG1_NUM_WARPS + wg1_warp_idx) * 4
-                    )
-                    T.cuda.ldg(
-                        indices.ptr_to([row_base]),
-                        "int32",
-                        dst=(
-                            indices_int4.ptr_to([local_row, 0]),
-                            indices_int4.ptr_to([local_row, 1]),
-                            indices_int4.ptr_to([local_row, 2]),
-                            indices_int4.ptr_to([local_row, 3]),
-                        ),
-                        vec="v4",
-                    )
-                    local_max: T.let = T.max(
-                        T.max(indices_int4[local_row, 0], indices_int4[local_row, 1]),
-                        T.max(indices_int4[local_row, 2], indices_int4[local_row, 3]),
-                    )
-                    local_min: T.let = T.min(
-                        T.min(indices_int4[local_row, 0], indices_int4[local_row, 1]),
-                        T.min(indices_int4[local_row, 2], indices_int4[local_row, 3]),
-                    )
-                    max_indices = T.max(max_indices, local_max)
-                    min_indices = T.min(min_indices, local_min)
+                    for j in T.unroll(4):
+                        idx: T.let = indices_int4[local_row, j]
+                        max_indices = T.max(max_indices, idx)
+                        min_indices = T.min(min_indices, idx)
 
                 is_all_rows_invalid: T.let = (min_indices == s_kv) | (max_indices == -1)
                 should_skip_tma: T.let = is_all_rows_invalid & (k >= NUM_BUFS)
@@ -653,12 +632,11 @@ def _kernel(
                 @T.inline
                 def gather_k_part(col_start, col_count, tx_dim, bar):
                     if not should_skip_tma:
+                        # Per-64-col gathers (kept separate on purpose: the many
+                        # small gather4 TMAs overlap in the pipeline; merging into
+                        # one wide gather measurably regressed head128 ~1%).
                         for local_col_inner in T.unroll(col_count):
                             local_col: T.let = col_start + local_col_inner
-                            # Rows interleave as (local_row, warp, lane); this
-                            # warp's 16 rows of the local_col 64-column chunk.
-                            # This warp's 16 rows of the local_col 64-col chunk: pick
-                            # the chunk on the col dim and the warp on the row dim.
                             k_gather_tile = k_smem.tile(1, (-1, 64))[local_col, :].tile(
                                 0, (-1, WG1_NUM_WARPS, 4)
                             )[:, wg1_warp_idx, :]
@@ -710,30 +688,20 @@ def _kernel(
 
                 @T.inline
                 def gather_v_part(row_offset, part, token_buf, bar):
-                    for local_row_inner in T.unroll(WG2_NUM_LOCAL_ROWS_PER_PART):
-                        local_row: T.let = row_offset + local_row_inner
-                        row_base: T.let = (
-                            g_indices_base
-                            + k * B_TOPK
-                            + (local_row * WG2_NUM_WARPS + wg2_warp_idx) * 4
-                        )
-                        T.cuda.ldg(
-                            indices.ptr_to([row_base]),
-                            "int32",
-                            dst=(
-                                token_buf.ptr_to([local_row_inner, 0]),
-                                token_buf.ptr_to([local_row_inner, 1]),
-                                token_buf.ptr_to([local_row_inner, 2]),
-                                token_buf.ptr_to([local_row_inner, 3]),
-                            ),
-                            vec="v4",
-                        )
+                    # V loads all 128 tokens; the two parts map to an extent-2
+                    # axis indexed by part. One strided nc copy, like head64.
+                    idx_block = indices.view(
+                        s_q,
+                        stride_indices_s_q // B_TOPK,
+                        2,
+                        WG2_NUM_LOCAL_ROWS_PER_PART,
+                        WG2_NUM_WARPS,
+                        4,
+                    ).sub[s_q_idx, k, part, :, wg2_warp_idx, :]
+                    Tx.copy(token_buf[:, :], idx_block[:, :], cache="nc")
+                    # Per-64-col gathers kept separate (pipeline overlap; see K-gather note).
                     for local_col in T.unroll((D_V // 2) // 64):
                         src_col: T.let = local_col * 64 + cta_idx * 256
-                        # Rows interleave as (part, local_row, warp, lane); this
-                        # warp's 16 rows of the part half, local_col chunk.
-                        # This warp's 16 rows of the part half, local_col chunk:
-                        # pick the col chunk, and the part + warp on the row dim.
                         v_gather_tile = v_smem_gemm.tile(1, (-1, 64))[local_col, :].tile(
                             0, (2, -1, WG2_NUM_WARPS, 4)
                         )[part, :, wg2_warp_idx, :]

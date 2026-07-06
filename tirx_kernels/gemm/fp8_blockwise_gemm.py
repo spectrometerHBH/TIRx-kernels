@@ -270,9 +270,11 @@ def _kernel(
         (TMEM_DEPTH, BLK_SFB, 4 * K_ITERS), "float8_e8m0fnu", sf_per_mma=1, sf_reuse=K_ITERS
     )
     pool.move_base_to(1024)
-    A_smem = pool.alloc_mma((SMEM_DEPTH, BLK_M, BLK_K), "float8_e4m3fn")
-    B_smem = pool.alloc_mma((SMEM_DEPTH, BLK_N, BLK_K), "float8_e4m3fn")
-    D_smem = pool.alloc_mma((TMEM_DEPTH, D_SMEM_M, D_SMEM_N), "bfloat16", swizzle_mode=D_SWIZZLE)
+    A_smem = pool.alloc_tcgen05_mma_AB((SMEM_DEPTH, BLK_M, BLK_K), "float8_e4m3fn")
+    B_smem = pool.alloc_tcgen05_mma_AB((SMEM_DEPTH, BLK_N, BLK_K), "float8_e4m3fn")
+    D_smem = pool.alloc_tcgen05_mma_AB(
+        (TMEM_DEPTH, D_SMEM_M, D_SMEM_N), "bfloat16", swizzle_mode=D_SWIZZLE
+    )
     SFA_smem = pool.alloc((SMEM_DEPTH, BLK_SFA), "uint32")
     SFB_smem = pool.alloc((SMEM_DEPTH, BLK_SFB), "uint32")
     pool.commit()

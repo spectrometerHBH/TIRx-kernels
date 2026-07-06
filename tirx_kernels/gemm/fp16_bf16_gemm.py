@@ -151,9 +151,9 @@ def _kernel(
     # Teardown handshake: 1-arrival cross-CTA mbarrier (OVERLAP) vs the full cluster_sync.
     tmem_fin = Pipeline(pool, 1, full="mbar", empty="mbar", init_full=1)
     pool.move_base_to(1024)
-    Asmem = pool.alloc_mma((PIPE_DEPTH, NUM_CONSUMER, BLK_M, BLK_K), ab_type)
-    Bsmem = pool.alloc_mma((PIPE_DEPTH, BLK_N, BLK_K), ab_type)
-    Dsmem = pool.alloc_mma(
+    Asmem = pool.alloc_tcgen05_mma_AB((PIPE_DEPTH, NUM_CONSUMER, BLK_M, BLK_K), ab_type)
+    Bsmem = pool.alloc_tcgen05_mma_AB((PIPE_DEPTH, BLK_N, BLK_K), ab_type)
+    Dsmem = pool.alloc_tcgen05_mma_AB(
         (NUM_CONSUMER, NUM_D_TILES, BLK_M, EPI_N),
         ab_type,
         swizzle_mode=_swizzle_for_row_bytes(EPI_N * (ab_type.bits // 8)),
