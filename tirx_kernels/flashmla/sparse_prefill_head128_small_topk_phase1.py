@@ -14,7 +14,7 @@ from tirx_kernels.flashmla._tma import tma_config
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.lang.pipeline import MBarrier, TCGen05Bar, TMABar
-from tvm.tirx.layout import ComposeLayout, S, SwizzleLayout, TCol, TileLayout, TLane, tid_in_wg
+from tvm.tirx.layout import ComposeLayout, S, SwizzleLayout, TileLayout, tid_in_wg
 
 B_H = 128
 B_TOPK = 64
@@ -312,15 +312,8 @@ def _kernel(
     clc_response = pool.alloc((4,), "uint32", align=16)
     tmem_start_addr = pool.alloc((1,), "uint32", align=4)
     pool.commit()
-    q_tma = q.view(
-        64,
-        h_q,
-        2,
-        D_QK // 64 // 2,
-        s_q,
-        layout=TileLayout(
-            S[(64, h_q, 2, D_QK // 64 // 2, s_q) : (1, D_QK, D_QK // 2, 64, h_q * D_QK)]
-        ),
+    q_tma = q.rearrange(
+        "s h (half chunk inner) -> inner h half chunk s", half=2, chunk=D_QK // 64 // 2, inner=64
     )
     # Q lands in smem with the two head-dim halves interleaved per 64-element
     # chunk (chunk order d0 c0 d1 c1 ... with c = half, d = chunk-in-half), the
@@ -342,33 +335,26 @@ def _kernel(
     # O accumulator: one alloc; logical col halves are the B lo/hi gemm outputs
     # (physical col 0-127 / 128-255), read back as a (128, D_V//2) datapath-D
     # tile via permute+reshape.
-    o_tmem = tmem_pool.alloc(
-        (B_H // 2, D_V),
-        "float32",
-        layout=TileLayout(S[(B_H // 2, 2, 2, 128) : (1 @ TLane, 128 @ TCol, 64 @ TLane, 1 @ TCol)]),
+    o_tmem = tmem_pool.alloc_mma_D(
+        (B_H // 2, D_V), "float32", M=128, cta_group=2, group=(2, 2, 128)
     )
     tmem_o_lo = o_tmem.sub[:, 0 : D_V // 2]
     tmem_o_hi = o_tmem.sub[:, D_V // 2 : D_V]
-    o_win = o_tmem.view(B_H // 2, 2, 2, 128).permute(2, 0, 1, 3).view(128, D_V // 2)
+    o_win = o_tmem.rearrange("h (a b c) -> (b h) (a c)", a=2, b=2, c=128)
     # Q TMEM: one alloc at its real 128-lane footprint — the batched [2, M, K]
     # head-dim fold (batch == lane-half). q_smem_tma interleaves the original
     # D halves before tcgen05.cp, so after the q_smem.view(64,4,2,64) ->
     # q_tmem_cp copy, q_tmem_fold[b, h, k] holds original Q[h, 256*b + k]:
     # lane-half b is the CONTIGUOUS D half [256b, 256b+256) — matching the
     # per-CTA K gather half — unlike head64, whose Q lands uninterleaved and
-    # folds to even/odd 64-chunk sets. The MMA keeps addressing the 64-lane
-    # anchor (lane-half 0) via sub[0].
-    q_tmem_fold = tmem_pool.alloc(
-        (2, B_H // 2, D_QK // 2),
-        "bfloat16",
-        layout=TileLayout(S[(2, B_H // 2, D_QK // 2) : (64 @ TLane, 1 @ TLane, 1 @ TCol)]),
-    )
-    q_tmem_cp = q_tmem_fold.view(2, B_H // 2, D_QK // 128, 64).permute(1, 2, 0, 3)
-    q_tmem = q_tmem_fold.sub[0]
+    # folds to even/odd 64-chunk sets. QK passes the full banked A tile so the
+    # dispatch can validate both lane halves explicitly.
+    q_tmem_fold = tmem_pool.alloc_mma_A((2, B_H // 2, D_QK // 2), "bfloat16", M=128, cta_group=2)
+    q_tmem_cp = q_tmem_fold.rearrange("b h (dc di) -> h dc b di", di=64)
     tmem_p_col = T.meta_var(tmem_pool.offset)
-    tmem_p = tmem_pool.alloc((B_H // 2, B_TOPK * 2), "float32", datapath="B")
-    s_smem_gemm = s_smem.view(
-        B_H // 2, B_TOPK, layout=TileLayout(S[(B_H // 2, B_TOPK // 8, 8) : (8, (B_H // 2) * 8, 1)])
+    tmem_p = tmem_pool.alloc_mma_D((B_H // 2, B_TOPK * 2), "float32", M=128, cta_group=2)
+    s_smem_gemm = s_smem.rearrange(
+        "(chunk row eight) -> row (chunk eight)", chunk=B_TOPK // 8, row=B_H // 2, eight=8
     )
     k_smem_gemm = k_smem.view(
         NUM_K_BUFS,
@@ -456,7 +442,6 @@ def _kernel(
         def perform_o_copy_out(o_s_q_idx, o_outer_loop_phase, is_last_o: T.constexpr):
             bar_li_full.wait(0, o_outer_loop_phase)
             output_scale: T.let = rowwise_li_buf[idx_in_warpgroup % 64]
-            output_scale_pair: T.let = T.cuda.make_float2(output_scale, output_scale)
             bar_li_empty.arrive(0)
 
             bar_tOut_full.wait(0, o_outer_loop_phase)
@@ -466,6 +451,8 @@ def _kernel(
 
             o_epi_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, B_EPI), "float32")
             o_epi = o_epi_frag.local()
+            o_epi_bf16_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, B_EPI), "bfloat16")
+            q_smem_win = q_smem.rearrange("h (b r) -> (b h) r", b=2)
             for epi_k in T.unroll((D_V // 2) // B_EPI):
                 Tx.wg.copy_async(
                     o_epi_frag[:, :], o_win.chunk((None, (D_V // 2) // B_EPI))[:, epi_k]
@@ -478,24 +465,11 @@ def _kernel(
                         bar_tQ_full.wait(0, o_outer_loop_phase ^ 1)
                 if epi_k == ((D_V // 2) // B_EPI) - 1:
                     bar_tOut_empty.arrive(0, remote=T.uint32(0))
-                for o_i in T.unroll(B_EPI // 8):
-                    o_epi_bf16 = T.alloc_local((4,), "uint32")
-                    for o_j in T.unroll(4):
-                        o_pair_idx: T.let = o_i * 8 + o_j * 2
-                        o_pair: T.let = T.cuda.make_float2(o_epi[o_pair_idx], o_epi[o_pair_idx + 1])
-                        o_scaled_pair: T.let = T.ptx.mul_f32x2(o_pair, output_scale_pair, dps=False)
-                        o_epi_bf16[o_j] = T.cuda.float22bfloat162_rn(
-                            T.cuda.float2_x(o_scaled_pair), T.cuda.float2_y(o_scaled_pair)
-                        )
-                    o_base_col: T.let = (idx_in_warpgroup // 64) * (D_V // 2) + epi_k * B_EPI
-                    q_smem_col: T.let = o_base_col + o_i * 8
-                    Tx.copy(
-                        q_smem.view("uint32")[
-                            idx_in_warpgroup % 64, q_smem_col // 2 : q_smem_col // 2 + 4
-                        ],
-                        o_epi_bf16[0:4],
-                        dispatch="vec_128b",
-                    )
+                Tx.wg.mul(o_epi_frag[:, :], o_epi_frag[:, :], output_scale)
+                Tx.wg.cast(o_epi_bf16_frag[:, :], o_epi_frag[:, :])
+                Tx.wg.copy(
+                    q_smem_win.chunk((None, (D_V // 2) // B_EPI))[:, epi_k], o_epi_bf16_frag[:, :]
+                )
 
             T.ptx.fence.proxy_async("shared::cta")
             T.ptx.bar.sync(NAMED_BARRIER_WG0_SYNC, 128)
@@ -648,7 +622,7 @@ def _kernel(
                             qk_accumulate: T.uint32 = 0
                             Tx.gemm_async(
                                 tmem_p[:, :],
-                                q_tmem[:, :],
+                                q_tmem_fold[:, :, :],
                                 k_smem_gemm[k_buf_idx, :, :],
                                 **_mma_config(accum=qk_accumulate),
                             )
@@ -818,7 +792,7 @@ def _kernel(
                 def load_p(lo_dst, hi_dst):
                     # datapath-B P read back as (128, B_TOPK) identity: merge the
                     # two lane-halves into 128 rows.
-                    p_win = tmem_p.view(B_H // 2, 2, B_TOPK).permute(1, 0, 2).view(128, B_TOPK)
+                    p_win = tmem_p.rearrange("h (b t) -> (b h) t", b=2)
                     Tx.wg.copy_async(lo_dst[:, :], p_win.chunk((None, 2))[:, 0])
                     Tx.wg.copy_async(hi_dst[:, :], p_win.chunk((None, 2))[:, 1])
 
@@ -948,24 +922,14 @@ def _kernel(
 
                 if (k > 0) & should_scale_o:
                     T.ptx.tcgen05.fence.after_thread_sync()
-                    scale_for_old_pair: T.let = T.cuda.make_float2(scale_for_old, scale_for_old)
                     o_rescale_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, 32), "float32")
-                    o_rescale = o_rescale_frag.local()
                     for chunk_idx in T.unroll((D_V // 2) // 32):
                         Tx.wg.copy_async(
                             o_rescale_frag[:, :],
                             o_win.chunk((None, (D_V // 2) // 32))[:, chunk_idx],
                         )
                         T.ptx.tcgen05.wait.ld()
-                        for o_i in T.unroll(16):
-                            o_pair: T.let = T.cuda.make_float2(
-                                o_rescale[o_i * 2], o_rescale[o_i * 2 + 1]
-                            )
-                            o_scaled_pair: T.let = T.ptx.mul_f32x2(
-                                o_pair, scale_for_old_pair, dps=False
-                            )
-                            o_rescale[o_i * 2] = T.cuda.float2_x(o_scaled_pair)
-                            o_rescale[o_i * 2 + 1] = T.cuda.float2_y(o_scaled_pair)
+                        Tx.wg.mul(o_rescale_frag[:, :], o_rescale_frag[:, :], scale_for_old)
                         Tx.wg.copy_async(
                             o_win.chunk((None, (D_V // 2) // 32))[:, chunk_idx],
                             o_rescale_frag[:, :],

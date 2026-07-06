@@ -350,42 +350,32 @@ def _kernel(
     # O accumulator: one alloc. Logical col halves [0:256)/[256:512) are the E
     # lo/hi gemm outputs (physical col 0-127 / 128-255 via the outer 128@TCol
     # axis); the whole thing reads back as a plain (128, 256) datapath-D tile.
-    o_tmem = tmem_pool.alloc(
-        (B_H, D_V),
-        "float32",
-        layout=TileLayout(S[(B_H, 2, 2, 128) : (1 @ TLane, 128 @ TCol, 64 @ TLane, 1 @ TCol)]),
+    o_tmem = tmem_pool.alloc_mma_D(
+        (B_H, D_V), "float32", M=64, cta_group=1, ws=True, group=(2, 2, 128)
     )
     tmem_o_lo = o_tmem.sub[:, 0 : D_V // 2]
     tmem_o_hi = o_tmem.sub[:, D_V // 2 : D_V]
-    o_win = o_tmem.view(B_H, 2, 2, 128).permute(2, 0, 1, 3).view(128, D_V // 2)
+    o_win = o_tmem.rearrange("h (a b c) -> (b h) (a c)", a=2, b=2, c=128)
     # q_nope / q_rope TMEM: one alloc each, viewed two ways. The batched
     # A[2, M, K] MMA fold (the alloc's own layout; batch == the two 64-lane
     # head-dim halves) and the tcgen05.cp write footprint are permute+reshape
     # views of the same columns -- the cp 128x256b copies fold Q's head_dim
     # into even/odd 64-element chunks across the two halves (logical (h, d) at
     # lane h + 64 * ((d // 64) % 2)).
-    q_nope_tmem_bmm = tmem_pool.alloc(
-        (2, B_H, D_V // 2),
-        "bfloat16",
-        layout=TileLayout(S[(2, B_H, D_V // 2) : (64 @ TLane, 1 @ TLane, 1 @ TCol)]),
+    q_nope_tmem_bmm = tmem_pool.alloc_mma_A(
+        (2, B_H, D_V // 2), "bfloat16", M=64, cta_group=1, ws=True
     )
     # cp footprint = split bmm's head_dim into (d//64, d%64) and move the
     # lane-half batch inward: bmm[b, h, d] == cp[h, d//64, b, d%64].
-    q_nope_tmem_cp = q_nope_tmem_bmm.view(2, B_H, D_V // 128, 64).permute(1, 2, 0, 3)
-    q_rope_tmem_bmm = tmem_pool.alloc(
-        (2, B_H, Q_ROPE_DIM // 2),
-        "bfloat16",
-        layout=TileLayout(S[(2, B_H, Q_ROPE_DIM // 2) : (64 @ TLane, 1 @ TLane, 1 @ TCol)]),
+    q_nope_tmem_cp = q_nope_tmem_bmm.rearrange("b h (dc di) -> h dc b di", di=64)
+    q_rope_tmem_bmm = tmem_pool.alloc_mma_A(
+        (2, B_H, Q_ROPE_DIM // 2), "bfloat16", M=64, cta_group=1, ws=True
     )
-    q_rope_tmem_cp = q_rope_tmem_bmm.permute(1, 0, 2).view(B_H, Q_ROPE_DIM)
+    q_rope_tmem_cp = q_rope_tmem_bmm.rearrange("b h k -> h (b k)")
     tmem_p_col = T.meta_var(tmem_pool.offset)
     # .ws logits gemm C: two batched 64x64 lane-half partials, C[2, B_H, B_TOPK]
     # (dispatch infers .ws from this fold layout; no weight_stationary flag).
-    tmem_p_bmm = tmem_pool.alloc(
-        (2, B_H, B_TOPK),
-        "float32",
-        layout=TileLayout(S[(2, B_H, B_TOPK) : (64 @ TLane, 1 @ TLane, 1 @ TCol)]),
-    )
+    tmem_p_bmm = tmem_pool.alloc_mma_D((2, B_H, B_TOPK), "float32", M=64, cta_group=1, ws=True)
     # k_nope's WG1 gather factorization (rows -> stripe/warp/row) is
     # derived per-warp below via k_nope.tile.
     mma_p_accumulate: T.uint32 = 0
@@ -463,7 +453,7 @@ def _kernel(
 
             @T.inline
             def load_p(lo_dst, hi_dst):
-                p_win = tmem_p_bmm.view(128, B_TOPK)
+                p_win = tmem_p_bmm.rearrange("b h t -> (b h) t")
                 Tx.wg.copy_async(lo_dst[:, :], p_win.chunk((None, 2))[:, 0])
                 Tx.wg.copy_async(hi_dst[:, :], p_win.chunk((None, 2))[:, 1])
 
