@@ -386,16 +386,14 @@ def _kernel(
     o_win = o_tmem.view(B_H // 2, 2, 2, 128).permute(2, 0, 1, 3).view(128, D_V // 2)
     tmem_p_col = T.meta_var(tmem_pool.offset)
     tmem_p = tmem_pool.alloc((B_H // 2, B_TOPK), "float32", datapath="B")
-    q_tmem_col = T.meta_var(tmem_pool.offset)
     q_tmem = tmem_pool.alloc((B_H // 2, D_TQ), "bfloat16")
-    # Honest tcgen05.cp footprint view over the q_tmem anchor: the
-    # 64x128b.warpx2::02_13 copy lands rows 0-63 on lanes 0-63 and mirrors
-    # them at lane offset +64, so the copy destination declares that replica.
-    # The MMA descriptors keep addressing the 64-lane anchor above.
-    q_tmem_cp = tmem_pool.view(
-        (B_H // 2, D_TQ),
-        "bfloat16",
-        col=q_tmem_col,
+    # cp write footprint of q_tmem: the 64x128b.warpx2::02_13 copy lands rows
+    # 0-63 on lanes 0-63 and mirrors them at lane offset +64, so the copy
+    # destination is the same buffer with that replica declared. The MMA
+    # descriptors keep addressing the 64-lane anchor.
+    q_tmem_cp = q_tmem.view(
+        B_H // 2,
+        D_TQ,
         layout=TileLayout(S[(B_H // 2, D_TQ) : (1 @ TLane, 1 @ TCol)] + R[2 : 64 @ TLane]),
     )
     s_smem_gemm = s_smem.view(

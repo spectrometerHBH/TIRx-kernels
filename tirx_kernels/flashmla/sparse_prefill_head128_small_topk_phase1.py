@@ -350,20 +350,18 @@ def _kernel(
     tmem_o_lo = o_tmem.sub[:, 0 : D_V // 2]
     tmem_o_hi = o_tmem.sub[:, D_V // 2 : D_V]
     o_win = o_tmem.view(B_H // 2, 2, 2, 128).permute(2, 0, 1, 3).view(128, D_V // 2)
-    q_tmem_col = T.meta_var(tmem_pool.offset)
-    q_tmem = tmem_pool.alloc((B_H // 2, D_QK // 2), "bfloat16")
-    # Honest tcgen05.cp footprint view over the q_tmem anchor: the 128x256b
-    # copy folds Q's head_dim into even/odd 64-element chunks across the two
-    # 64-lane halves — logical (h, d) sits at lane h + 64 * ((d // 64) % 2).
-    # The MMA descriptors keep addressing the 64-lane anchor above.
-    q_tmem_cp = tmem_pool.view(
-        (B_H // 2, D_QK // 128, 2, 64),
+    # Q TMEM: one alloc at its real 128-lane footprint — the batched [2, M, K]
+    # head-dim fold (batch == lane-half; even 64-chunks of head_dim in lanes
+    # 0-63, odd in 64-127). The cp write footprint is a permute+reshape view
+    # (logical (h, d) at lane h + 64 * ((d // 64) % 2)), and the MMA keeps
+    # addressing the 64-lane anchor (lane-half 0) via sub[0].
+    q_tmem_fold = tmem_pool.alloc(
+        (2, B_H // 2, D_QK // 2),
         "bfloat16",
-        col=q_tmem_col,
-        layout=TileLayout(
-            S[(B_H // 2, D_QK // 128, 2, 64) : (1 @ TLane, 64 @ TCol, 64 @ TLane, 1 @ TCol)]
-        ),
+        layout=TileLayout(S[(2, B_H // 2, D_QK // 2) : (64 @ TLane, 1 @ TLane, 1 @ TCol)]),
     )
+    q_tmem_cp = q_tmem_fold.view(2, B_H // 2, D_QK // 128, 64).permute(1, 2, 0, 3)
+    q_tmem = q_tmem_fold.sub[0]
     tmem_p_col = T.meta_var(tmem_pool.offset)
     tmem_p = tmem_pool.alloc((B_H // 2, B_TOPK * 2), "float32", datapath="B")
     s_smem_gemm = s_smem.view(
