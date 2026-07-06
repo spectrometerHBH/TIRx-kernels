@@ -351,10 +351,13 @@ def _kernel(
     tmem_o_hi = o_tmem.sub[:, D_V // 2 : D_V]
     o_win = o_tmem.view(B_H // 2, 2, 2, 128).permute(2, 0, 1, 3).view(128, D_V // 2)
     # Q TMEM: one alloc at its real 128-lane footprint — the batched [2, M, K]
-    # head-dim fold (batch == lane-half; even 64-chunks of head_dim in lanes
-    # 0-63, odd in 64-127). The cp write footprint is a permute+reshape view
-    # (logical (h, d) at lane h + 64 * ((d // 64) % 2)), and the MMA keeps
-    # addressing the 64-lane anchor (lane-half 0) via sub[0].
+    # head-dim fold (batch == lane-half). q_smem_tma interleaves the original
+    # D halves before tcgen05.cp, so after the q_smem.view(64,4,2,64) ->
+    # q_tmem_cp copy, q_tmem_fold[b, h, k] holds original Q[h, 256*b + k]:
+    # lane-half b is the CONTIGUOUS D half [256b, 256b+256) — matching the
+    # per-CTA K gather half — unlike head64, whose Q lands uninterleaved and
+    # folds to even/odd 64-chunk sets. The MMA keeps addressing the 64-lane
+    # anchor (lane-half 0) via sub[0].
     q_tmem_fold = tmem_pool.alloc(
         (2, B_H // 2, D_QK // 2),
         "bfloat16",
