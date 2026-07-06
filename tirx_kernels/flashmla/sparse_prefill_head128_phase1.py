@@ -632,15 +632,18 @@ def _kernel(
                 @T.inline
                 def gather_k_part(col_start, col_count, tx_dim, bar):
                     if not should_skip_tma:
-                        # Per-64-col gathers kept separate on purpose. k_smem uses a
-                        # 128B swizzle whose atom spans exactly 64 bf16 cols, so each
-                        # 64-col gather lands on one atom and its smem destination
-                        # address is a compile-time constant. Merging into one wide
-                        # gather makes the destination span several swizzle atoms; the
-                        # non-linear atom boundaries force ptxas to emit runtime integer
-                        # address arithmetic (ncu: +15% ALU / +6% total instructions,
-                        # DRAM bytes and TMA/MMA work unchanged), regressing kv8192 by
-                        # ~1%. Keep one gather4 per atom.
+                        # Per-64-col gathers kept separate on purpose -- but note the
+                        # dispatch layer lowers *either* form into the SAME 65
+                        # constant-offset per-atom gather4 TMAs (all smem offsets and
+                        # TensorMap coords are compile-time literals; no runtime address
+                        # math). The only difference is emit order: this explicit
+                        # per-col loop emits col-major, so the gather4s sharing one
+                        # TensorMap coord are adjacent and ptxas hoists the coord setup.
+                        # Folding it into one wide gather emits row-major (every
+                        # neighbouring gather4 has a distinct coord), which ptxas cannot
+                        # reuse -> +15% ALU setup, ~1% slower on kv8192 (ncu; TMA/MMA/
+                        # DRAM work identical). A pure emit-order effect, so keep the
+                        # col-major loop.
                         for local_col_inner in T.unroll(col_count):
                             local_col: T.let = col_start + local_col_inner
                             k_gather_tile = k_smem.tile(1, (-1, 64))[local_col, :].tile(
@@ -705,9 +708,9 @@ def _kernel(
                         4,
                     ).sub[s_q_idx, k, part, :, wg2_warp_idx, :]
                     Tx.copy(token_buf[:, :], idx_block[:, :], cache="nc")
-                    # Per-64-col gathers kept separate: one gather4 per 128B swizzle
-                    # atom so smem destinations stay compile-time constant (see the
-                    # K-gather note for the ncu breakdown of why merging regresses).
+                    # Per-64-col gathers kept separate: the col-major emit order lets
+                    # ptxas reuse the shared TensorMap coord setup (see the K-gather
+                    # note -- merging only reorders the identical TMAs, ~1% via ptxas).
                     for local_col in T.unroll((D_V // 2) // 64):
                         src_col: T.let = local_col * 64 + cta_idx * 256
                         v_gather_tile = v_smem_gemm.tile(1, (-1, 64))[local_col, :].tile(
