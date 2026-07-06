@@ -270,10 +270,8 @@ def _kernel(
 ):
     T.device_entry()
     T.attr({"tirx.launch_bounds_min_blocks_per_sm": 1})
-    # CUDA_TRANSCRIBE_START: sparse_attn_fwd_kernel lines 65-71.
-    # Transcription note: match upstream FlashMLA phase1's one-CTA-per-query-row launch.
-    # Transcription note: preserve upstream source-order roles; warp 0 owns Q TMA,
-    # warps 0-1 own O TMA, and warpgroup 0 also owns softmax/epilogue CUDA-core work.
+    # CUDA_TRANSCRIBE_START: sparse_attn_fwd_kernel lines 65-71. One CTA per query row;
+    # warp 0 owns Q TMA, warps 0-1 own O TMA, warpgroup 0 also does softmax/epilogue.
     s_q_idx = T.cta_id([s_q])
     warpgroup_idx = T.warpgroup_id([3])
     warp_idx_in_wg = T.warp_id_in_wg([4])
@@ -285,10 +283,8 @@ def _kernel(
     num_k_blocks: T.let = T.max((topk_len + B_TOPK - 1) // B_TOPK, 1)
     have_rope = T.meta_var(d_qk == 576)
 
-    # CUDA phase1.cuh:73-78, config.h:111-139.  Preserve the SharedMemoryPlan
-    # storage offsets now, but instantiate bf16 MMA views only when their CUDA
-    # use sites are transcribed.  Declaring unused bf16 views trips TIRx BF16
-    # storage legalization before there is any copy/MMA/store to bind them to.
+    # CUDA phase1.cuh:73-78, config.h:111-139. Reserve SharedMemoryPlan offsets now;
+    # instantiate bf16 MMA views only at their use sites (unused ones trip BF16 legalization).
     pool = T.SMEMPool()
     u_base = T.meta_var(pool.offset)
     k_rope = pool.alloc_tcgen05_mma_AB(
@@ -349,21 +345,16 @@ def _kernel(
     # params.indices + s_q_idx * params.stride_indices_s_q.
     g_indices_base: T.let = s_q_idx * stride_indices_s_q
     tmem_pool = T.TMEMPool(pool, total_cols=512, cta_group=1, tmem_addr=tmem_start_addr)
-    # O accumulator: one alloc. Logical col halves [0:256)/[256:512) are the E
-    # lo/hi gemm outputs (physical col 0-127 / 128-255 via the outer 128@TCol
-    # axis); the whole thing reads back as a plain (128, 256) datapath-D tile.
+    # O accumulator: one alloc. Col halves [0:256)/[256:512) = E lo/hi gemm outputs;
+    # reads back as a plain (128, 256) datapath-D tile.
     o_tmem = tmem_pool.alloc_tcgen05_mma_D(
         (B_H, D_V), "float32", M=64, cta_group=1, ws=True, group=(2, 2, 128)
     )
     tmem_o_lo = o_tmem.sub[:, 0 : D_V // 2]
     tmem_o_hi = o_tmem.sub[:, D_V // 2 : D_V]
     o_win = o_tmem.rearrange("h (a b c) -> (b h) (a c)", a=2, b=2, c=128)
-    # q_nope / q_rope TMEM: one alloc each, viewed two ways. The batched
-    # A[2, M, K] MMA fold (the alloc's own layout; batch == the two 64-lane
-    # head-dim halves) and the tcgen05.cp write footprint are permute+reshape
-    # views of the same columns -- the cp 128x256b copies fold Q's head_dim
-    # into even/odd 64-element chunks across the two halves (logical (h, d) at
-    # lane h + 64 * ((d // 64) % 2)).
+    # q_nope / q_rope TMEM: one alloc each; the batched A[2,M,K] MMA fold and the tcgen05.cp
+    # write are permute/reshape of the same cols (cp folds head_dim into even/odd 64-chunks).
     q_nope_tmem_bmm = tmem_pool.alloc_tcgen05_mma_A(
         (2, B_H, D_V // 2), "bfloat16", M=64, cta_group=1, ws=True
     )
@@ -438,9 +429,8 @@ def _kernel(
         li: T.float32 = 0.0
         real_mi: T.float32 = T.float32(-float("inf"))
 
-        # CUDA phase1.cuh:169-244.  Scale/exp loop with helper bodies stepped
-        # into source order: P TMEM read/mask/reduce, row max, S generation,
-        # S shared store, and conditional O rescale.
+        # CUDA phase1.cuh:169-244. Scale/exp loop: P TMEM read/mask/reduce, row max,
+        # S generation, S shared store, conditional O rescale.
         for k in T.serial(0, num_k_blocks, unroll=False):
             T.ptx.bar.sync(NAMED_BARRIER_WG0_WARP02_SYNC + T.bitwise_and(warp_idx, T.int32(1)), 64)
             cur_buf: T.int32 = _ring_mod3(k, max_k_blocks)
@@ -671,9 +661,8 @@ def _kernel(
             T.ptx.tcgen05.dealloc(T.uint32(0), n_cols=512, cta_group=1)
 
     elif warpgroup_idx == 1:
-        # CUDA phase1.cuh:358-412.  KV NoPE producer.  Scalar index loads and
-        # skip decisions are transcribed; gather4 requires explicit TensorMap
-        # ABI plumbing and is left at the exact source-order call site.
+        # CUDA phase1.cuh:358-412. KV NoPE producer. Scalar index loads + skip
+        # decisions transcribed; gather4 kept at its source-order call site.
         wg1_warp_idx: T.let = warp_idx - 4
         # This warp's 16 interleaved NoPE rows: split the 64-row dim into
         # (stripe, warp, row) and pick this warp, merging stripe x row.
@@ -730,9 +719,8 @@ def _kernel(
                     T.ptx.mbarrier.complete_tx(bar_kv_nope_ready_part1.ptr_to([cur_buf]), tx_bytes)
 
     else:
-        # CUDA phase1.cuh:413-572.  MMA warpgroup.  Keep the issue-thread
-        # control flow source-ordered; materialize tcgen05.cp/gemm_async and
-        # cp.async data paths after the exact SMEM/TMEM views are introduced.
+        # CUDA phase1.cuh:413-572. MMA warpgroup. Keep issue-thread control flow
+        # source-ordered; materialize tcgen05.cp/gemm_async + cp.async paths later.
         if warp_idx == 8:
             if T.ptx.elect_sync():
                 if have_rope:

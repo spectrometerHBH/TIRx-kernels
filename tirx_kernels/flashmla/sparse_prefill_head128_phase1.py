@@ -261,9 +261,8 @@ def _kernel(
 ):
     T.device_entry()
     T.attr({"tirx.launch_bounds_min_blocks_per_sm": 1})
-    # CUDA_TRANSCRIBE_START: run_fwd_phase1_kernel line 622, then sparse_attn_fwd_kernel_devfunc line 68.
-    # Transcription note: match upstream FlashMLA phase1's one CTA pair per query-row launch.
-    # Transcription note: preserve upstream source-order roles and mixed TMA/MMA/softmax warp layout.
+    # CUDA_TRANSCRIBE_START: run_fwd_phase1_kernel line 622, then sparse_attn_fwd_kernel_devfunc
+    # line 68. One CTA pair per query-row; upstream source-order TMA/MMA/softmax warp layout.
     block_idx = T.cta_id([2 * s_q])
     T.cta_id_in_cluster([2])
     cta_idx: T.let = block_idx % 2
@@ -387,11 +386,8 @@ def _kernel(
     o_win = o_tmem.rearrange("h (a b c) -> (b h) (a c)", a=2, b=2, c=128)
     tmem_p_col = T.meta_var(tmem_pool.offset)
     tmem_p = tmem_pool.alloc_tcgen05_mma_D((B_H // 2, B_TOPK), "float32", M=128, cta_group=2)
-    # Qt TMEM at its real 128-lane footprint: the 64x128b.warpx2::02_13 copy
-    # lands rows 0-63 on lanes 0-63 AND mirrors them at lane offset +64, so
-    # the alloc declares that replica (R[2 : 64 @ TLane]). The MMA dispatcher
-    # validates this explicit A-side footprint while the instruction operand
-    # still addresses the anchor cell.
+    # Qt TMEM at real 128-lane footprint: the 64x128b.warpx2::02_13 copy mirrors rows 0-63 to
+    # lane +64, so the alloc declares that replica (R[2:64@TLane]); MMA validates it at the anchor.
     q_tmem = tmem_pool.alloc_tcgen05_mma_A((B_H // 2, D_TQ), "bfloat16", M=128, cta_group=2)
     v_smem_gemm = v_smem.view(
         B_TOPK,
@@ -471,9 +467,8 @@ def _kernel(
             mi = new_max
             li = li * scale_for_old
 
-            # S frag: warpgroup-distributed (B_H//2, B_TOPK) tile. Thread idx
-            # owns row h = idx % 64 and the k half [64*(idx//64), +64), in
-            # 8-elem chunks -- the ownership produced by the packing loop below.
+            # S frag: warpgroup-distributed (B_H//2, B_TOPK) tile. Thread idx owns row h = idx%64
+            # and k half [64*(idx//64), +64) in 8-elem chunks (from the packing loop below).
             s_frag = T.alloc_buffer(
                 (B_H // 2, B_TOPK),
                 "bfloat16",
@@ -632,13 +627,8 @@ def _kernel(
                 @T.inline
                 def gather_k_part(col_start, col_count, tx_dim, bar):
                     if not should_skip_tma:
-                        # One wide gather4 over the whole part, like head64/small_topk.
-                        # The dispatch layer splits it into per-atom gather4 TMAs with
-                        # compile-time-constant smem offsets; this was verified (ncu,
-                        # instructions identical per pipe, duration within noise) to be
-                        # equivalent to an explicit per-64-col loop.
-                        # col_start/col_count are concrete meta ints; keep the sub
-                        # bounds concrete so it can honor the 64-col swizzle atom.
+                        # One wide gather4 (like head64/small_topk); dispatch splits into per-atom
+                        # TMAs, ncu-verified = per-64-col loop. Keep sub bounds concrete for swizzle.
                         k_gather_tile = k_smem.sub[
                             :, col_start * 64 : col_start * 64 + col_count * 64
                         ].tile(0, (-1, WG1_NUM_WARPS, 4))[:, wg1_warp_idx, :]
@@ -701,9 +691,8 @@ def _kernel(
                         4,
                     ).sub[s_q_idx, k, part, :, wg2_warp_idx, :]
                     Tx.copy(token_buf[:, :], idx_block[:, :], cache="nc")
-                    # One wide gather4 over all D_V//2 cols, like head64/small_topk
-                    # (dispatch splits it into per-atom TMAs; verified equivalent to a
-                    # per-64-col loop via ncu -- see the K-gather note).
+                    # One wide gather4 over all D_V//2 cols (like head64/small_topk); dispatch splits
+                    # into per-atom TMAs, ncu-verified equal to a per-64-col loop (see K-gather note).
                     src0: T.let = cta_idx * 256
                     v_gather_tile = v_smem_gemm.tile(0, (2, -1, WG2_NUM_WARPS, 4))[
                         part, :, wg2_warp_idx, :

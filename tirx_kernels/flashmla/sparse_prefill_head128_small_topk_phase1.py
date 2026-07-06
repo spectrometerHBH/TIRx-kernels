@@ -318,11 +318,8 @@ def _kernel(
     q_tma = q.rearrange(
         "s h (half chunk inner) -> inner h half chunk s", half=2, chunk=D_QK // 64 // 2, inner=64
     )
-    # Q lands in smem with the two head-dim halves interleaved per 64-element
-    # chunk (chunk order d0 c0 d1 c1 ... with c = half, d = chunk-in-half), the
-    # arrangement the tcgen05.cp 128x256b fold below consumes.  Declaring the
-    # true placement lets the default TMA planner derive the FlashMLA 5D Q
-    # descriptor dim order from this layout.
+    # Q lands in smem with head-dim halves interleaved per 64-elem chunk (d0 c0 d1 c1..., c=half,
+    # d=chunk-in-half), consumed by the tcgen05.cp fold below; lets the TMA planner derive the 5D Q dims.
     q_smem_tma = q_smem.view(
         64,
         B_H // 2,
@@ -335,23 +332,16 @@ def _kernel(
     )
     kv_tma = kv.view(s_kv, D_QK, layout=TileLayout(S[(s_kv, D_QK) : (stride_kv_s_kv, 1)]))
     tmem_pool = T.TMEMPool(pool, total_cols=512, cta_group=2, tmem_addr=tmem_start_addr)
-    # O accumulator: one alloc; logical col halves are the B lo/hi gemm outputs
-    # (physical col 0-127 / 128-255), read back as a (128, D_V//2) datapath-D
-    # tile via permute+reshape.
+    # O accumulator: one alloc; col halves = B lo/hi gemm outputs (physical col 0-127/128-255),
+    # read back as a (128, D_V//2) datapath-D tile via permute+reshape.
     o_tmem = tmem_pool.alloc_tcgen05_mma_D(
         (B_H // 2, D_V), "float32", M=128, cta_group=2, group=(2, 2, 128)
     )
     tmem_o_lo = o_tmem.sub[:, 0 : D_V // 2]
     tmem_o_hi = o_tmem.sub[:, D_V // 2 : D_V]
     o_win = o_tmem.rearrange("h (a b c) -> (b h) (a c)", a=2, b=2, c=128)
-    # Q TMEM: one alloc at its real 128-lane footprint — the batched [2, M, K]
-    # head-dim fold (batch == lane-half). q_smem_tma interleaves the original
-    # D halves before tcgen05.cp, so after the q_smem.view(64,4,2,64) ->
-    # q_tmem_cp copy, q_tmem_fold[b, h, k] holds original Q[h, 256*b + k]:
-    # lane-half b is the CONTIGUOUS D half [256b, 256b+256) — matching the
-    # per-CTA K gather half — unlike head64, whose Q lands uninterleaved and
-    # folds to even/odd 64-chunk sets. QK passes the full banked A tile so the
-    # dispatch can validate both lane halves explicitly.
+    # Q TMEM: one alloc at real 128-lane footprint, batched [2,M,K] head-dim fold (batch==lane-half);
+    # q_tmem_fold[b,h,k]=Q[h,256b+k], lane-half b = contiguous D half [256b,+256) matching K gather.
     q_tmem_fold = tmem_pool.alloc_tcgen05_mma_A(
         (2, B_H // 2, D_QK // 2), "bfloat16", M=128, cta_group=2
     )
@@ -563,11 +553,8 @@ def _kernel(
                     bar_KV_empty.wait(k_buf_idx, k_bar_phase ^ 1)
                     k_smem_gemm_cur = k_smem_gemm.sub[k_buf_idx]
                     src_col: T.let = cta_idx * (D_QK // 2)
-                    # Rows interleave as (row_group, warp, pair, lane4); this
-                    # warp's 8-row stripes of every 64-column chunk.
-                    # Col dim reshaped to (chunk, 64) for the copy; row dim
-                    # picks this warp's interleaved rows (stripe x pair x lane
-                    # merged) with a rank-preserving tile.
+                    # Rows interleave (row_group, warp, pair, lane4): this warp's 8-row stripes of each
+                    # 64-col chunk. Col reshaped to (chunk,64); row picks this warp's rows via rank-preserving tile.
                     k_gather_tile = k_smem_gemm_cur.view(B_TOPK, (D_QK // 2) // 64, 64).tile(
                         0, (-1, 4, 2, 4)
                     )[:, wg1_warp_idx, :, :]
@@ -877,10 +864,8 @@ def _kernel(
                     scale_for_old = T.ptx.exp2(mi - new_max)
                 mi = new_max
 
-                # S frag: warpgroup-distributed (B_H//2, B_TOPK) tile. Thread idx
-                # owns row h = idx % 64 and the k half [32*(idx//64), +32), in
-                # 8-elem chunks -- the ownership produced by the packing loop
-                # below.
+                # S frag: warpgroup-distributed (B_H//2, B_TOPK) tile. Thread idx owns row h = idx%64
+                # and k half [32*(idx//64), +32) in 8-elem chunks (from the packing loop below).
                 s_frag = T.alloc_buffer(
                     (B_H // 2, B_TOPK),
                     "bfloat16",
