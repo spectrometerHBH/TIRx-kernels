@@ -386,15 +386,17 @@ def _kernel(
     o_win = o_tmem.view(B_H // 2, 2, 2, 128).permute(2, 0, 1, 3).view(128, D_V // 2)
     tmem_p_col = T.meta_var(tmem_pool.offset)
     tmem_p = tmem_pool.alloc((B_H // 2, B_TOPK), "float32", datapath="B")
-    q_tmem = tmem_pool.alloc((B_H // 2, D_TQ), "bfloat16")
-    # cp write footprint of q_tmem: the 64x128b.warpx2::02_13 copy lands rows
-    # 0-63 on lanes 0-63 and mirrors them at lane offset +64, so the copy
-    # destination is the same buffer with that replica declared. The MMA
-    # descriptors keep addressing the 64-lane anchor.
-    q_tmem_cp = q_tmem.view(
-        B_H // 2,
-        D_TQ,
+    # Qt TMEM at its real 128-lane footprint: the 64x128b.warpx2::02_13 copy
+    # lands rows 0-63 on lanes 0-63 AND mirrors them at lane offset +64, so
+    # the alloc declares that replica (R[2 : 64 @ TLane]). The MMA descriptors
+    # address the 64-lane anchor view below.
+    q_tmem_cp = tmem_pool.alloc(
+        (B_H // 2, D_TQ),
+        "bfloat16",
         layout=TileLayout(S[(B_H // 2, D_TQ) : (1 @ TLane, 1 @ TCol)] + R[2 : 64 @ TLane]),
+    )
+    q_tmem = q_tmem_cp.view(
+        B_H // 2, D_TQ, layout=TileLayout(S[(B_H // 2, D_TQ) : (1 @ TLane, 1 @ TCol)])
     )
     s_smem_gemm = s_smem.view(
         B_H // 2, B_TOPK, layout=TileLayout(S[(B_H // 2, B_TOPK // 8, 8) : (8, (B_H // 2) * 8, 1)])
