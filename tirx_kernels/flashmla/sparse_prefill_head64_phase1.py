@@ -36,7 +36,6 @@ WG1_NUM_WARPS = 4
 WG1_NUM_LOCAL_ROWS_PER_WARP = (B_TOPK // 4) // WG1_NUM_WARPS
 
 # KV gather4 TMA knobs shared by both gather call sites.
-# .ws is inferred from the Layout-E C layout; no weight_stationary flag.
 _mma_config = partial(tcgen05_config, cta_group=1)
 _kv_gather_tma = partial(
     tma_config, cta_group=1, gather_axis=0, cache_hint=T.uint64(0x14F0000000000000)
@@ -290,13 +289,9 @@ def _kernel(
     k_rope = pool.alloc_tcgen05_mma_AB(
         (B_TOPK, Q_ROPE_DIM), "bfloat16", swizzle_mode=SwizzleMode.SWIZZLE_64B_ATOM
     )
-    # The *_tiled_mma refolds stay next to their allocs: the gemm B-operand
-    # descriptor is hoisted to wherever the view is declared, and it must land
-    # outside the MMA loop.
+    # *_tiled_mma refolds stay here: the gemm B-operand descriptor hoists to the decl site.
     k_rope_tiled_mma = k_rope.rearrange("r (h c) -> (h r) c", h=2)
     k_nope = pool.alloc_tcgen05_mma_AB((NUM_BUFS, B_TOPK, D_V), "bfloat16")
-    # Same bytes refolded to (2*B_TOPK, D_V//2) for the P MMA's B operand: K's
-    # even/odd 64-col chunks land in the two row halves.
     k_nope_tiled_mma = k_nope.rearrange("b r (dc h ci) -> b (h r) (dc ci)", dc=4, h=2, ci=64)
     u_end = T.meta_var(pool.offset)
     # q_nope aliases the last k_nope stage: Q moves to TMEM before that stage is used.
@@ -350,8 +345,6 @@ def _kernel(
         (B_H, D_V), "float32", M=64, cta_group=1, ws=True, group=(2, 2, 128)
     )
     o_win = o_tmem.rearrange("h (a b c) -> (b h) (a c)", a=2, b=2, c=128)
-    # q_nope / q_rope TMEM: one alloc each; the batched A[2,M,K] MMA fold and the tcgen05.cp
-    # write are permute/reshape of the same cols (cp folds head_dim into even/odd 64-chunks).
     q_nope_tmem_bmm = tmem_pool.alloc_tcgen05_mma_A(
         (2, B_H, D_V // 2), "bfloat16", M=64, cta_group=1, ws=True
     )
@@ -359,13 +352,10 @@ def _kernel(
         (2, B_H, Q_ROPE_DIM // 2), "bfloat16", M=64, cta_group=1, ws=True
     )
     tmem_p_col = T.meta_var(tmem_pool.offset)
-    # .ws logits gemm C: two batched 64x64 lane-half partials, C[2, B_H, B_TOPK]
-    # (dispatch infers .ws from this fold layout; no weight_stationary flag).
+    # .ws logits gemm C: two batched 64x64 lane-half partials.
     tmem_p_bmm = tmem_pool.alloc_tcgen05_mma_D(
         (2, B_H, B_TOPK), "float32", M=64, cta_group=1, ws=True
     )
-    # k_nope's WG1 gather factorization (rows -> stripe/warp/row) is
-    # derived per-warp below via k_nope.tile.
     mma_p_accumulate: T.uint32 = 0
     mma_o_accumulate: T.uint32 = 0
     mma_smem_desc = T.meta_var("local_hoist" if (d_qk > D_V and s_kv == 8192) else "hoist")
@@ -731,8 +721,6 @@ def _kernel(
                 bar_prologue_q_nope.arrive(0, tx_count=B_H * D_V * BF16_BYTES)
                 bar_prologue_q_nope.wait(0, 0)
                 T.ptx.tcgen05.fence.after_thread_sync()
-                # cp footprint = split bmm's head_dim into (d//64, d%64) and move the
-                # lane-half batch inward: bmm[b, h, d] == cp[h, d//64, b, d%64].
                 q_nope_tmem_cp = q_nope_tmem_bmm.rearrange("b h (dc di) -> h dc b di", di=64)
                 Tx.copy_async(
                     q_nope_tmem_cp[:, :, :, :],

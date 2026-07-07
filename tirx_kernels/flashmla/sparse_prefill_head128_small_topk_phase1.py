@@ -374,9 +374,7 @@ def _kernel(
             if warp_idx == 0:
                 if T.ptx.elect_sync():
                     T.ptx.cp_async.bulk.wait_group(0)
-                    # Q lands in smem with head-dim halves interleaved per 64-elem chunk
-                    # (d0 c0 d1 c1...), consumed by the tcgen05.cp fold below; the true
-                    # placement lets the TMA planner derive the 5D Q descriptor dims.
+                    # Q's head-dim halves interleave per 64-elem chunk, matching the cp fold.
                     q_tma = q.rearrange(
                         "s h (half chunk inner) -> inner h half chunk s",
                         half=2,
