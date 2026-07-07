@@ -973,6 +973,12 @@ def _as_tvm_tensor(value, dev):
     return tvm.runtime.tensor(value, dev)
 
 
+def _as_cuda_tensor(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().cuda()
+    return torch.from_numpy(np.asarray(value)).cuda()
+
+
 def _make_tir_case(
     *,
     batch_size: int,
@@ -1015,12 +1021,40 @@ def _make_tir_case(
         "residual": [],
         "gating_output": [],
         "topk_reduce_output": [],
+        "graph_reset": {
+            "residual_source": _as_cuda_tensor(data["residual"]),
+            "residual": [],
+            "gating_output": [],
+            "topk_reduce_output": [],
+        },
     }
+    for name in (
+        "output",
+        "topk_weights",
+        "topk_indices",
+        "sorted_token_ids",
+        "expert_ids",
+        "num_valid_tokens",
+        "num_tokens_post_pad",
+        "cumsum_buffer",
+        "reordered_hidden_state",
+        "gate_up_output",
+        "silu_mul_output",
+        "etensor_workspace",
+        "profiler_buffer",
+    ):
+        case["graph_reset"].setdefault("zero", []).append(torch.from_dlpack(case[name]))
 
     for _ in range(launch_slots):
-        case["residual"].append(_as_tvm_tensor(data["residual"], dev))
-        case["gating_output"].append(_as_tvm_tensor(data["gating_output"], dev))
-        case["topk_reduce_output"].append(_as_tvm_tensor(data["topk_reduce_output"], dev))
+        residual = _as_tvm_tensor(data["residual"], dev)
+        gating_output = _as_tvm_tensor(data["gating_output"], dev)
+        topk_reduce_output = _as_tvm_tensor(data["topk_reduce_output"], dev)
+        case["residual"].append(residual)
+        case["gating_output"].append(gating_output)
+        case["topk_reduce_output"].append(topk_reduce_output)
+        case["graph_reset"]["residual"].append(torch.from_dlpack(residual))
+        case["graph_reset"]["gating_output"].append(torch.from_dlpack(gating_output))
+        case["graph_reset"]["topk_reduce_output"].append(torch.from_dlpack(topk_reduce_output))
 
     if scheduler in _STATIC_QUEUE_SCHEDULERS:
         exec_queue = generate_exec_queue_moe(
@@ -1034,10 +1068,26 @@ def _make_tir_case(
         case["queue_tasks"] = []
         case["queue_head"] = []
         case["queue_tail"] = []
+        case["graph_reset"].update(
+            {
+                "queue_tasks_source": _as_cuda_tensor(exec_queue.tasks.copy()),
+                "queue_head_source": _as_cuda_tensor(exec_queue.head.copy()),
+                "queue_tail_source": _as_cuda_tensor(exec_queue.tail.copy()),
+                "queue_tasks": [],
+                "queue_head": [],
+                "queue_tail": [],
+            }
+        )
         for _ in range(launch_slots):
-            case["queue_tasks"].append(tvm.runtime.tensor(exec_queue.tasks.copy(), dev))
-            case["queue_head"].append(tvm.runtime.tensor(exec_queue.head.copy(), dev))
-            case["queue_tail"].append(tvm.runtime.tensor(exec_queue.tail.copy(), dev))
+            queue_tasks = tvm.runtime.tensor(exec_queue.tasks.copy(), dev)
+            queue_head = tvm.runtime.tensor(exec_queue.head.copy(), dev)
+            queue_tail = tvm.runtime.tensor(exec_queue.tail.copy(), dev)
+            case["queue_tasks"].append(queue_tasks)
+            case["queue_head"].append(queue_head)
+            case["queue_tail"].append(queue_tail)
+            case["graph_reset"]["queue_tasks"].append(torch.from_dlpack(queue_tasks))
+            case["graph_reset"]["queue_head"].append(torch.from_dlpack(queue_head))
+            case["graph_reset"]["queue_tail"].append(torch.from_dlpack(queue_tail))
 
     byte_tensors = [
         case["hidden_state"],
@@ -1068,6 +1118,26 @@ def _make_tir_case(
     case["byte_tensors"] = byte_tensors
     case["max_num_tokens_padded"] = max_num_tokens_padded
     return case
+
+
+def _reset_tir_case_for_cuda_graph(case):
+    idx = case["cursor"]
+    if idx >= case["launch_slots"]:
+        raise RuntimeError(
+            f"MegaKernelMOE benchmark exhausted launch slots "
+            f"({case['launch_slots']}); increase warmup/repeat slot allocation"
+        )
+
+    reset = case["graph_reset"]
+    for tensor in reset.get("zero", []):
+        tensor.zero_()
+    reset["residual"][idx].copy_(reset["residual_source"])
+    reset["gating_output"][idx].zero_()
+    reset["topk_reduce_output"][idx].zero_()
+    if case["scheduler"] not in _STATIC_QUEUE_SCHEDULERS:
+        reset["queue_tasks"][idx].copy_(reset["queue_tasks_source"])
+        reset["queue_head"][idx].copy_(reset["queue_head_source"])
+        reset["queue_tail"][idx].copy_(reset["queue_tail_source"])
 
 
 def _run_tir_case(case):
@@ -1458,8 +1528,13 @@ def run_bench(
             flashinfer_runner = run
         return flashinfer_runner
 
+    def run_tir():
+        return _run_tir_case(case["tir"])
+
+    run_tir.graph_reset = lambda: _reset_tir_case_for_cuda_graph(case["tir"])
+
     result = bench(
-        {"tir": lambda: _run_tir_case(case["tir"])},
+        {"tir": run_tir},
         warmup=warmup,
         repeat=repeat,
         timer=timer,
