@@ -18,7 +18,6 @@
 
 from __future__ import annotations
 
-import sys
 from unittest import SkipTest
 
 import numpy as np
@@ -1394,65 +1393,56 @@ def run_bench(
 ):
     _require_cuda_sm100()
     _check_scheduler(scheduler)
-    from tvm.tirx.bench import bench, bench_impls_mode
-
-    if timer == "cudagraph_proton":
-        print(
-            "megakernel_moe: cudagraph_proton is unavailable because the "
-            "dynamic scheduler queue and reduction workspaces are mutated across "
-            "launches; using proton instead",
-            file=sys.stderr,
-        )
-        timer = "proton"
+    from tvm.tirx.bench import bench
 
     compile_schedulers = [scheduler]
-    if _needs_unfused_reference(scheduler) and bench_impls_mode() != "baseline":
+    if _needs_unfused_reference(scheduler):
         compile_schedulers.append("unfused")
     mk, libs = _compile_moe_schedulers(
         tuple(compile_schedulers), batch_size, world_size, profiler_on
     )
 
     _reset_prepare_data_cache()
-    mode = bench_impls_mode()
     data = dict(prepare_data(batch_size, mk))
     case = {"batch_size": batch_size, "cpu_data": data}
     launch_slots = 0
     tir_runtime_estimate_us = None
 
-    if mode != "baseline":
-        probe_case = _make_tir_case(
-            batch_size=batch_size,
-            mk=mk,
-            lib=libs[scheduler],
-            scheduler=scheduler,
-            data=data,
-            launch_slots=8,
-        )
-        tir_runtime_estimate_us = _estimate_tir_runtime_us(probe_case)
-        launch_slots = _estimate_bench_launch_slots(
-            tir_runtime_estimate_us, warmup, repeat, rounds, preflight_launches=1
-        )
-        del probe_case
-        torch.cuda.empty_cache()
+    probe_case = _make_tir_case(
+        batch_size=batch_size,
+        mk=mk,
+        lib=libs[scheduler],
+        scheduler=scheduler,
+        data=data,
+        launch_slots=8,
+    )
+    tir_runtime_estimate_us = _estimate_tir_runtime_us(probe_case)
+    launch_slots = _estimate_bench_launch_slots(
+        tir_runtime_estimate_us, warmup, repeat, rounds, preflight_launches=1
+    )
+    if timer == "cudagraph_proton":
+        launch_slots *= 4
+    del probe_case
+    torch.cuda.empty_cache()
 
-        case["tir"] = _make_tir_case(
+    case["tir"] = _make_tir_case(
+        batch_size=batch_size,
+        mk=mk,
+        lib=libs[scheduler],
+        scheduler=scheduler,
+        data=data,
+        launch_slots=launch_slots,
+    )
+    if _needs_unfused_reference(scheduler):
+        case["tir_reference"] = _make_tir_case(
             batch_size=batch_size,
             mk=mk,
-            lib=libs[scheduler],
-            scheduler=scheduler,
+            lib=libs["unfused"],
+            scheduler="unfused",
             data=data,
-            launch_slots=launch_slots,
+            launch_slots=2,
         )
-        if _needs_unfused_reference(scheduler):
-            case["tir_reference"] = _make_tir_case(
-                batch_size=batch_size,
-                mk=mk,
-                lib=libs["unfused"],
-                scheduler="unfused",
-                data=data,
-                launch_slots=2,
-            )
-        _validate_tir_case(case, mk, check_torch=batch_size <= max(_TEST_BATCH_SIZES))
+    _validate_tir_case(case, mk, check_torch=batch_size <= max(_TEST_BATCH_SIZES))
 
     flashinfer_runner = None
     validation = {}
@@ -1479,7 +1469,7 @@ def run_bench(
         **kwargs,
     )
 
-    if mode == "all" and flashinfer_runner is not None and "tir" in case:
+    if flashinfer_runner is not None and "tir" in case:
         try:
             validation["tir_vs_flashinfer_full"] = _validate_tir_matches_flashinfer(
                 case, mk, lambda _: flashinfer_runner()
