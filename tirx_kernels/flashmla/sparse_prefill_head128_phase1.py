@@ -15,7 +15,7 @@ from tvm.backend.cuda.operator.tile_primitive.tma_utils import SwizzleMode
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.lang.pipeline import MBarrier, TCGen05Bar, TMABar
-from tvm.tirx.layout import ComposeLayout, S, SwizzleLayout, TileLayout, laneid, wid_in_wg
+from tvm.tirx.layout import S, TileLayout, laneid, wid_in_wg
 
 B_H = 128
 B_TOPK = 128
@@ -298,8 +298,10 @@ def _kernel(
     pool = T.SMEMPool()
     u_base = T.meta_var(pool.offset)
     q_full = pool.alloc_tcgen05_mma_AB((B_H // 2, d_qk), "bfloat16")
-    pool.move_base_to(u_base)
-    sq_smem = pool.alloc_tcgen05_mma_AB((B_H // 2, d_sq), "bfloat16")
+    # sQ is just q_full's first d_sq cols (a contiguous prefix under the 64-col
+    # swizzle chunks); v/k reuse the D_TQ tail once Q has moved to TMEM.
+    sq_smem = q_full.sub[:, :d_sq]
+    pool.move_base_to(u_base + (B_H // 2) * d_sq * BF16_BYTES)
     v_smem = pool.alloc_tcgen05_mma_AB((D_V // 2, B_TOPK), "bfloat16")
     k_smem = pool.alloc_tcgen05_mma_AB((B_TOPK // 2, d_qk), "bfloat16")
     u_end = T.meta_var(pool.offset)
@@ -384,19 +386,11 @@ def _kernel(
     tmem_o_lo = o_tmem.sub[:, 0 : D_V // 2]
     tmem_o_hi = o_tmem.sub[:, D_V // 2 : D_V]
     o_win = o_tmem.rearrange("h (a b c) -> (b h) (a c)", a=2, b=2, c=128)
-    tmem_p_col = T.meta_var(tmem_pool.offset)
     tmem_p = tmem_pool.alloc_tcgen05_mma_D((B_H // 2, B_TOPK), "float32", M=128, cta_group=2)
     # Qt TMEM at real 128-lane footprint: the 64x128b.warpx2::02_13 copy mirrors rows 0-63 to
     # lane +64, so the alloc declares that replica (R[2:64@TLane]); MMA validates it at the anchor.
     q_tmem = tmem_pool.alloc_tcgen05_mma_A((B_H // 2, D_TQ), "bfloat16", M=128, cta_group=2)
-    v_smem_gemm = v_smem.view(
-        B_TOPK,
-        D_V // 2,
-        layout=ComposeLayout(
-            SwizzleLayout(3, 3, 3, swizzle_inner=True),
-            TileLayout(S[(B_TOPK, (D_V // 2) // 64, 64) : (64, B_TOPK * 64, 1)]),
-        ),
-    )
+    v_smem_gemm = v_smem.rearrange("(x r) (z kl) -> r (z x kl)", x=2, z=2, kl=64)
 
     if warpgroup_idx == 0:
         # CUDA phase1.cuh:150-386.  Scale/exp warpgroup and epilogue.

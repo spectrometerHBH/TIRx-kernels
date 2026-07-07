@@ -15,7 +15,7 @@ from tvm.backend.cuda.operator.tile_primitive.tma_utils import SwizzleMode
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.lang.pipeline import MBarrier, TCGen05Bar, TMABar
-from tvm.tirx.layout import ComposeLayout, S, SwizzleLayout, TileLayout, laneid, wid_in_wg
+from tvm.tirx.layout import S, TileLayout, laneid, wid_in_wg
 
 B_H = 128
 B_TOPK = 64
@@ -320,16 +320,7 @@ def _kernel(
     )
     # Q lands in smem with head-dim halves interleaved per 64-elem chunk (d0 c0 d1 c1..., c=half,
     # d=chunk-in-half), consumed by the tcgen05.cp fold below; lets the TMA planner derive the 5D Q dims.
-    q_smem_tma = q_smem.view(
-        64,
-        B_H // 2,
-        2,
-        D_QK // 64 // 2,
-        layout=ComposeLayout(
-            SwizzleLayout(3, 3, 3, swizzle_inner=True),
-            TileLayout(S[(64, B_H // 2, 2, D_QK // 64 // 2) : (1, 64, 4096, 4096 * 2)]),
-        ),
-    )
+    q_smem_tma = q_smem.rearrange("m (chunk c d0) -> d0 m c chunk", chunk=D_QK // 64 // 2, c=2)
     kv_tma = kv.view(s_kv, D_QK, layout=TileLayout(S[(s_kv, D_QK) : (stride_kv_s_kv, 1)]))
     tmem_pool = T.TMEMPool(pool, total_cols=512, cta_group=2, tmem_addr=tmem_start_addr)
     # O accumulator: one alloc; col halves = B lo/hi gemm outputs (physical col 0-127/128-255),
@@ -348,23 +339,8 @@ def _kernel(
     q_tmem_cp = q_tmem_fold.rearrange("b h (dc di) -> h dc b di", di=64)
     tmem_p_col = T.meta_var(tmem_pool.offset)
     tmem_p = tmem_pool.alloc_tcgen05_mma_D((B_H // 2, B_TOPK * 2), "float32", M=128, cta_group=2)
-    k_smem_gemm = k_smem.view(
-        NUM_K_BUFS,
-        B_TOPK,
-        D_QK // 2,
-        layout=ComposeLayout(
-            SwizzleLayout(3, 3, 3, swizzle_inner=True),
-            TileLayout(
-                S[
-                    (NUM_K_BUFS, B_TOPK, (D_QK // 2) // 64, 64) : (
-                        B_TOPK * (D_QK // 2),
-                        64,
-                        B_TOPK * 64,
-                        1,
-                    )
-                ]
-            ),
-        ),
+    k_smem_gemm = k_smem.rearrange(
+        "(kh row) (buf kl) -> buf row (kh kl)", kh=(D_QK // 2) // 64, buf=NUM_K_BUFS, kl=64
     )
 
     if warp_idx == 1:

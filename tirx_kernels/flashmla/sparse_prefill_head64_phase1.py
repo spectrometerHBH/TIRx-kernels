@@ -15,7 +15,7 @@ from tvm.backend.cuda.operator.tile_primitive.tma_utils import SwizzleMode
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.lang.pipeline import MBarrier, TCGen05Bar, TMABar
-from tvm.tirx.layout import S, SwizzleLayout, TileLayout, laneid, wid_in_wg
+from tvm.tirx.layout import S, TileLayout, laneid, wid_in_wg
 
 B_H = 64
 B_TOPK = 64
@@ -290,15 +290,12 @@ def _kernel(
     k_rope = pool.alloc_tcgen05_mma_AB(
         (B_TOPK, Q_ROPE_DIM), "bfloat16", swizzle_mode=SwizzleMode.SWIZZLE_64B_ATOM
     )
-    k_rope_tiled_mma = k_rope.view(
-        B_TOPK * 2, Q_ROPE_DIM // 2, layout=SwizzleLayout(3, 2, 3, swizzle_inner=True)
-    )
-    k_nope_base = T.meta_var(pool.offset)
+    k_rope_tiled_mma = k_rope.rearrange("r (h c) -> (h r) c", h=2)
     k_nope = pool.alloc_tcgen05_mma_AB((NUM_BUFS, B_TOPK, D_V), "bfloat16")
     u_end = T.meta_var(pool.offset)
-    # Same bytes as k_nope, refolded to (2*B_TOPK, D_V//2) for the P MMA's B operand.
-    pool.move_base_to(k_nope_base)
-    k_nope_tiled_mma = pool.alloc_tcgen05_mma_AB((NUM_BUFS, B_TOPK * 2, D_V // 2), "bfloat16")
+    # Same bytes refolded to (2*B_TOPK, D_V//2) for the P MMA's B operand: K's even/odd
+    # 64-col chunks land in the two row halves.
+    k_nope_tiled_mma = k_nope.rearrange("b r (dc h ci) -> b (h r) (dc ci)", dc=4, h=2, ci=64)
     # q_nope aliases the last k_nope stage: Q moves to TMEM before that stage is used.
     pool.move_base_to(u_end - B_H * D_V * BF16_BYTES)
     q_nope = pool.alloc_tcgen05_mma_AB((B_H, D_V), "bfloat16")
@@ -615,7 +612,7 @@ def _kernel(
         o_epi_bf16_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, 64), "bfloat16")
         # O smem viewed the same way as o_tmem: (128, 256) so a (128,64) frag
         # chunk copies straight in (row r = lane-half*64 + h, col = D_V fold).
-        o_smem_win = o_smem.view(B_H, 2, 2, 128).permute(2, 0, 1, 3).view(128, D_V // 2)
+        o_smem_win = o_smem.rearrange("h (a b c) -> (b h) (a c)", a=2, b=2, c=128)
         have_valid_indices: T.let = T.ptx.any_sync(T.uint32(0xFFFFFFFF), li != 0.0) != 0
         if not have_valid_indices:
             for o_zero_i in T.unroll(64):
