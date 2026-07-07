@@ -315,28 +315,18 @@ def _kernel(
     clc_response = pool.alloc((4,), "uint32", align=16)
     tmem_start_addr = pool.alloc((1,), "uint32", align=4)
     pool.commit()
-    q_tma = q.rearrange(
-        "s h (half chunk inner) -> inner h half chunk s", half=2, chunk=D_QK // 64 // 2, inner=64
-    )
-    # Q lands in smem with head-dim halves interleaved per 64-elem chunk (d0 c0 d1 c1..., c=half,
-    # d=chunk-in-half), consumed by the tcgen05.cp fold below; lets the TMA planner derive the 5D Q dims.
-    q_smem_tma = q_smem.rearrange("m (chunk c d0) -> d0 m c chunk", chunk=D_QK // 64 // 2, c=2)
-    kv_tma = kv.view(s_kv, D_QK, layout=TileLayout(S[(s_kv, D_QK) : (stride_kv_s_kv, 1)]))
     tmem_pool = T.TMEMPool(pool, total_cols=512, cta_group=2, tmem_addr=tmem_start_addr)
     # O accumulator: one alloc; col halves = B lo/hi gemm outputs (physical col 0-127/128-255),
     # read back as a (128, D_V//2) datapath-D tile via permute+reshape.
     o_tmem = tmem_pool.alloc_tcgen05_mma_D(
         (B_H // 2, D_V), "float32", M=128, cta_group=2, group=(2, 2, 128)
     )
-    tmem_o_lo = o_tmem.sub[:, 0 : D_V // 2]
-    tmem_o_hi = o_tmem.sub[:, D_V // 2 : D_V]
     o_win = o_tmem.rearrange("h (a b c) -> (b h) (a c)", a=2, b=2, c=128)
     # Q TMEM: one alloc at real 128-lane footprint, batched [2,M,K] head-dim fold (batch==lane-half);
     # q_tmem_fold[b,h,k]=Q[h,256b+k], lane-half b = contiguous D half [256b,+256) matching K gather.
     q_tmem_fold = tmem_pool.alloc_tcgen05_mma_A(
         (2, B_H // 2, D_QK // 2), "bfloat16", M=128, cta_group=2
     )
-    q_tmem_cp = q_tmem_fold.rearrange("b h (dc di) -> h dc b di", di=64)
     tmem_p_col = T.meta_var(tmem_pool.offset)
     tmem_p = tmem_pool.alloc_tcgen05_mma_D((B_H // 2, B_TOPK * 2), "float32", M=128, cta_group=2)
     k_smem_gemm = k_smem.rearrange(
@@ -384,6 +374,18 @@ def _kernel(
             if warp_idx == 0:
                 if T.ptx.elect_sync():
                     T.ptx.cp_async.bulk.wait_group(0)
+                    # Q lands in smem with head-dim halves interleaved per 64-elem chunk
+                    # (d0 c0 d1 c1...), consumed by the tcgen05.cp fold below; the true
+                    # placement lets the TMA planner derive the 5D Q descriptor dims.
+                    q_tma = q.rearrange(
+                        "s h (half chunk inner) -> inner h half chunk s",
+                        half=2,
+                        chunk=D_QK // 64 // 2,
+                        inner=64,
+                    )
+                    q_smem_tma = q_smem.rearrange(
+                        "m (chunk c d0) -> d0 m c chunk", chunk=D_QK // 64 // 2, c=2
+                    )
                     Tx.copy_async(
                         q_smem_tma[:, :, :, :],
                         q_tma.chunk((None, 2, None, None, None))[:, cta_idx, :, :, q_s_q_idx],
@@ -398,6 +400,7 @@ def _kernel(
                         bar_sQ_full.wait(0, q_outer_loop_phase)
                         bar_tQ_empty.wait(0, q_outer_loop_phase ^ 1)
                         T.ptx.tcgen05.fence.after_thread_sync()
+                        q_tmem_cp = q_tmem_fold.rearrange("b h (dc di) -> h dc b di", di=64)
                         Tx.copy_async(
                             q_tmem_cp[:, :, :, :],
                             q_smem.view(B_H // 2, D_QK // 128, 2, 64)[:, :, :, :],
@@ -534,6 +537,9 @@ def _kernel(
                     k_gather_tile = k_smem_gemm_cur.view(B_TOPK, (D_QK // 2) // 64, 64).tile(
                         0, (-1, 4, 2, 4)
                     )[:, wg1_warp_idx, :, :]
+                    kv_tma = kv.view(
+                        s_kv, D_QK, layout=TileLayout(S[(s_kv, D_QK) : (stride_kv_s_kv, 1)])
+                    )
                     Tx.copy_async(
                         k_gather_tile[:, :, :],
                         kv_tma[:, src_col : src_col + D_QK // 2],
@@ -621,8 +627,8 @@ def _kernel(
                                     **_mma_config(accum=o_accumulate),
                                 )
 
-                            gemm_o(tmem_o_lo, 0, D_V // 4)
-                            gemm_o(tmem_o_hi, D_V // 4, D_V // 2)
+                            gemm_o(o_tmem.sub[:, 0 : D_V // 2], 0, D_V // 4)
+                            gemm_o(o_tmem.sub[:, D_V // 2 : D_V], D_V // 4, D_V // 2)
                             o_accumulate = T.uint32(1)
                             bar_SV_done.arrive(0, cta_group=2, cta_mask=3)
                             bar_KV_empty.arrive(prev_buf, cta_group=2, cta_mask=3)

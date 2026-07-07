@@ -298,9 +298,8 @@ def _kernel(
     pool = T.SMEMPool()
     u_base = T.meta_var(pool.offset)
     q_full = pool.alloc_tcgen05_mma_AB((B_H // 2, d_qk), "bfloat16")
-    # sQ is just q_full's first d_sq cols (a contiguous prefix under the 64-col
-    # swizzle chunks); v/k reuse the D_TQ tail once Q has moved to TMEM.
-    sq_smem = q_full.sub[:, :d_sq]
+    # sQ stays live as q_full's first d_sq cols (a contiguous prefix under the
+    # 64-col swizzle chunks); v/k reuse the D_TQ tail once Q has moved to TMEM.
     pool.move_base_to(u_base + (B_H // 2) * d_sq * BF16_BYTES)
     v_smem = pool.alloc_tcgen05_mma_AB((D_V // 2, B_TOPK), "bfloat16")
     k_smem = pool.alloc_tcgen05_mma_AB((B_TOPK // 2, d_qk), "bfloat16")
@@ -746,6 +745,7 @@ def _kernel(
 
                         mma_p_accumulate = T.uint32(0)
                         if d_sq > 0:
+                            sq_smem = q_full.sub[:, :d_sq]
                             Tx.gemm_async(
                                 tmem_p[:, :],
                                 sq_smem[:, :d_sq],

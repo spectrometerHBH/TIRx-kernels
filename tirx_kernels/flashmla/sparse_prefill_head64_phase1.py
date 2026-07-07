@@ -290,12 +290,15 @@ def _kernel(
     k_rope = pool.alloc_tcgen05_mma_AB(
         (B_TOPK, Q_ROPE_DIM), "bfloat16", swizzle_mode=SwizzleMode.SWIZZLE_64B_ATOM
     )
+    # The *_tiled_mma refolds stay next to their allocs: the gemm B-operand
+    # descriptor is hoisted to wherever the view is declared, and it must land
+    # outside the MMA loop.
     k_rope_tiled_mma = k_rope.rearrange("r (h c) -> (h r) c", h=2)
     k_nope = pool.alloc_tcgen05_mma_AB((NUM_BUFS, B_TOPK, D_V), "bfloat16")
-    u_end = T.meta_var(pool.offset)
-    # Same bytes refolded to (2*B_TOPK, D_V//2) for the P MMA's B operand: K's even/odd
-    # 64-col chunks land in the two row halves.
+    # Same bytes refolded to (2*B_TOPK, D_V//2) for the P MMA's B operand: K's
+    # even/odd 64-col chunks land in the two row halves.
     k_nope_tiled_mma = k_nope.rearrange("b r (dc h ci) -> b (h r) (dc ci)", dc=4, h=2, ci=64)
+    u_end = T.meta_var(pool.offset)
     # q_nope aliases the last k_nope stage: Q moves to TMEM before that stage is used.
     pool.move_base_to(u_end - B_H * D_V * BF16_BYTES)
     q_nope = pool.alloc_tcgen05_mma_AB((B_H, D_V), "bfloat16")
@@ -336,7 +339,6 @@ def _kernel(
     rowwise_max_buf = pool.alloc((128,), "float32")
     rowwise_li_buf = pool.alloc((128,), "float32")
     pool.commit()
-    kv_nope_tma = kv.view(s_kv, D_V, layout=TileLayout(S[(s_kv, D_V) : (stride_kv_s_kv, 1)]))
 
     # CUDA phase1.cuh:77. h_kv is fixed to 1, so the row pointer is
     # params.indices + s_q_idx * params.stride_indices_s_q.
@@ -347,21 +349,15 @@ def _kernel(
     o_tmem = tmem_pool.alloc_tcgen05_mma_D(
         (B_H, D_V), "float32", M=64, cta_group=1, ws=True, group=(2, 2, 128)
     )
-    tmem_o_lo = o_tmem.sub[:, 0 : D_V // 2]
-    tmem_o_hi = o_tmem.sub[:, D_V // 2 : D_V]
     o_win = o_tmem.rearrange("h (a b c) -> (b h) (a c)", a=2, b=2, c=128)
     # q_nope / q_rope TMEM: one alloc each; the batched A[2,M,K] MMA fold and the tcgen05.cp
     # write are permute/reshape of the same cols (cp folds head_dim into even/odd 64-chunks).
     q_nope_tmem_bmm = tmem_pool.alloc_tcgen05_mma_A(
         (2, B_H, D_V // 2), "bfloat16", M=64, cta_group=1, ws=True
     )
-    # cp footprint = split bmm's head_dim into (d//64, d%64) and move the
-    # lane-half batch inward: bmm[b, h, d] == cp[h, d//64, b, d%64].
-    q_nope_tmem_cp = q_nope_tmem_bmm.rearrange("b h (dc di) -> h dc b di", di=64)
     q_rope_tmem_bmm = tmem_pool.alloc_tcgen05_mma_A(
         (2, B_H, Q_ROPE_DIM // 2), "bfloat16", M=64, cta_group=1, ws=True
     )
-    q_rope_tmem_cp = q_rope_tmem_bmm.rearrange("b h k -> h (b k)")
     tmem_p_col = T.meta_var(tmem_pool.offset)
     # .ws logits gemm C: two batched 64x64 lane-half partials, C[2, B_H, B_TOPK]
     # (dispatch infers .ws from this fold layout; no weight_stationary flag).
@@ -691,6 +687,10 @@ def _kernel(
                 cur_phase: T.int32 = _ring_phase_parity(k, max_k_blocks)
                 bar_sv_done.wait(cur_buf, T.bitwise_xor(cur_phase, T.int32(1)))
 
+                kv_nope_tma = kv.view(
+                    s_kv, D_V, layout=TileLayout(S[(s_kv, D_V) : (stride_kv_s_kv, 1)])
+                )
+
                 @T.inline
                 def gather_nope_part(part_idx, bar):
                     Tx.copy_async(
@@ -724,12 +724,16 @@ def _kernel(
                     bar_prologue_q_rope.arrive(0, tx_count=B_H * (d_qk - D_V) * BF16_BYTES)
                     bar_prologue_q_rope.wait(0, 0)
                     T.ptx.tcgen05.fence.after_thread_sync()
+                    q_rope_tmem_cp = q_rope_tmem_bmm.rearrange("b h k -> h (b k)")
                     Tx.copy_async(q_rope_tmem_cp[:, :], q_rope[:, :], shape="128x256b", cta_group=1)
                     bar_prologue_utccp_rope.arrive(0)
 
                 bar_prologue_q_nope.arrive(0, tx_count=B_H * D_V * BF16_BYTES)
                 bar_prologue_q_nope.wait(0, 0)
                 T.ptx.tcgen05.fence.after_thread_sync()
+                # cp footprint = split bmm's head_dim into (d//64, d%64) and move the
+                # lane-half batch inward: bmm[b, h, d] == cp[h, d//64, b, d%64].
+                q_nope_tmem_cp = q_nope_tmem_bmm.rearrange("b h (dc di) -> h dc b di", di=64)
                 Tx.copy_async(
                     q_nope_tmem_cp[:, :, :, :],
                     q_nope.view(B_H, D_V // 128, 2, 64)[:, :, :, :],
@@ -805,8 +809,8 @@ def _kernel(
                                 **_mma_config(accum=mma_o_accumulate, smem_desc=mma_smem_desc),
                             )
 
-                        gemm_o(tmem_o_lo, 0, D_V // 2)
-                        gemm_o(tmem_o_hi, D_V // 2, D_V)
+                        gemm_o(o_tmem.sub[:, 0 : D_V // 2], 0, D_V // 2)
+                        gemm_o(o_tmem.sub[:, D_V // 2 : D_V], D_V // 2, D_V)
                         mma_o_accumulate = T.uint32(1)
                         bar_sv_done.arrive(cur_buf_prev)
 
