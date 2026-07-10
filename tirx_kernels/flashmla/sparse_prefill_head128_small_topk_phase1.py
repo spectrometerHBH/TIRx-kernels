@@ -29,7 +29,7 @@ MAX_INIT_VAL = -1.0e30
 LOG_2_E = math.log2(math.e)
 LN_2 = math.log(2.0)
 
-SMALL_TOPK_HEAD128_LAUNCH_PARAM_TAGS = (
+LAUNCH_TAGS = (
     "blockIdx.x",
     "clusterCtaIdx.x",
     "threadIdx.x",
@@ -40,12 +40,12 @@ SMALL_TOPK_HEAD128_LAUNCH_PARAM_TAGS = (
 BF16_BYTES = 2
 B_EPI = 64
 
-NAMED_BARRIER_WG0_SYNC = 0
-NAMED_BARRIER_WG2_SYNC = 1
-NAMED_BARRIER_WG2_WARP02_SYNC = 2
+BAR_WG0_SYNC = 0
+BAR_WG2_SYNC = 1
+BAR_WG2_WARP02 = 2
 
 WG1_ROWS_PER_WARP = B_TOPK // 4
-WG3_NUM_ELEMS_PER_THREAD = B_TOPK // 2
+WG3_ELEMS_PER_THREAD = B_TOPK // 2
 
 # KV gather4 TMA knobs shared by the gather call sites.
 _mma_config = partial(tcgen05_config, cta_group=2, smem_desc="local_hoist")
@@ -441,7 +441,7 @@ def _kernel(
                 )
 
             T.ptx.fence.proxy_async("shared::cta")
-            T.ptx.bar.sync(NAMED_BARRIER_WG0_SYNC, 128)
+            T.ptx.bar.sync(BAR_WG0_SYNC, 128)
             if warp_idx == 0:
                 if T.ptx.elect_sync():
                     Tx.copy_async(
@@ -485,7 +485,7 @@ def _kernel(
             if warp_idx == 0:
                 if T.ptx.elect_sync():
                     T.ptx.cp_async.bulk.wait_group(0)
-            T.ptx.bar.sync(NAMED_BARRIER_WG0_SYNC, 128)
+            T.ptx.bar.sync(BAR_WG0_SYNC, 128)
             perform_o_copy_out(last_s_q_idx, last_outer_loop_phase, True)
 
         if warp_idx == 0:
@@ -746,11 +746,9 @@ def _kernel(
                 index_buf_idx: T.let = wg3_rs % NUM_INDEX_BUFS
                 index_bar_phase: T.let = (wg3_rs // NUM_INDEX_BUFS) & 1
                 bar_valid_coord_scales_full.wait(index_buf_idx, index_bar_phase)
-                p_frag = T.alloc_tcgen05_ldst_frag(
-                    "32x32b", (128, WG3_NUM_ELEMS_PER_THREAD), "float32"
-                )
+                p_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, WG3_ELEMS_PER_THREAD), "float32")
                 p_peer_frag = T.alloc_tcgen05_ldst_frag(
-                    "32x32b", (128, WG3_NUM_ELEMS_PER_THREAD), "float32"
+                    "32x32b", (128, WG3_ELEMS_PER_THREAD), "float32"
                 )
                 p = p_frag.local().view("uint32")
                 p_peer = p_peer_frag.local().view("uint32")
@@ -774,16 +772,16 @@ def _kernel(
                 bar_P_empty.arrive(0, remote=T.uint32(0))
 
                 valid_word_offset: T.let = T.if_then_else(
-                    local_warp_idx >= 2, WG3_NUM_ELEMS_PER_THREAD // 32, 0
+                    local_warp_idx >= 2, WG3_ELEMS_PER_THREAD // 32, 0
                 )
                 is_k_valid_u32: T.let = is_k_valid.view("uint32")[index_buf_idx, valid_word_offset]
-                for p_i in T.unroll(WG3_NUM_ELEMS_PER_THREAD):
+                for p_i in T.unroll(WG3_ELEMS_PER_THREAD):
                     invalid_p_predicate: T.let = T.bitwise_and(
                         T.shift_right(is_k_valid_u32, T.uint32(p_i)), T.uint32(1)
                     ) == T.uint32(0)
                     p[p_i] = T.if_then_else(invalid_p_predicate, T.uint32(0xFF800000), p[p_i])
 
-                for exchange_i in T.unroll(WG3_NUM_ELEMS_PER_THREAD // 4):
+                for exchange_i in T.unroll(WG3_ELEMS_PER_THREAD // 4):
                     exchange_offset = exchange_i * 32 * 4 + lane_idx * 4
                     p_peer_offset: T.let = exchange_i * 4
                     Tx.copy(
@@ -791,8 +789,8 @@ def _kernel(
                         p_peer[p_peer_offset : p_peer_offset + 4],
                         dispatch="vec_128b",
                     )
-                T.ptx.bar.sync(NAMED_BARRIER_WG2_WARP02_SYNC + (local_warp_idx & 1), 64)
-                for exchange_i in T.unroll(WG3_NUM_ELEMS_PER_THREAD // 4):
+                T.ptx.bar.sync(BAR_WG2_WARP02 + (local_warp_idx & 1), 64)
+                for exchange_i in T.unroll(WG3_ELEMS_PER_THREAD // 4):
                     exchange_offset = exchange_i * 32 * 4 + lane_idx * 4
                     p_exchange_tmp = T.alloc_local((4,), "uint32")
                     Tx.copy(
@@ -824,11 +822,11 @@ def _kernel(
                     p[exchange_i * 4 + 3] = T.cuda.float_as_uint(T.cuda.float2_y(sum_pair1))
 
                 cur_pi_max: T.float32 = T.float32(-float("inf"))
-                for p_i in T.unroll(WG3_NUM_ELEMS_PER_THREAD):
+                for p_i in T.unroll(WG3_ELEMS_PER_THREAD):
                     cur_pi_max = T.max(cur_pi_max, T.cuda.uint_as_float(p[p_i]))
                 cur_pi_max = cur_pi_max * sm_scale_div_log2
                 rowwise_max_buf[idx_in_warpgroup] = cur_pi_max
-                T.ptx.bar.sync(NAMED_BARRIER_WG2_WARP02_SYNC + (local_warp_idx & 1), 64)
+                T.ptx.bar.sync(BAR_WG2_WARP02 + (local_warp_idx & 1), 64)
                 cur_pi_max = T.max(cur_pi_max, rowwise_max_buf[idx_in_warpgroup ^ 64])
                 real_mi = T.max(real_mi, cur_pi_max)
                 should_scale_o: T.let = (
@@ -857,7 +855,7 @@ def _kernel(
                 s_pack = s_frag.local().view("uint32")
                 cur_sum_pair: T.uint64 = T.cuda.make_float2(T.float32(0.0), T.float32(0.0))
                 neg_new_max_pair: T.let = T.cuda.make_float2(-new_max, -new_max)
-                for s_i in T.unroll(WG3_NUM_ELEMS_PER_THREAD // 2):
+                for s_i in T.unroll(WG3_ELEMS_PER_THREAD // 2):
                     p_pair: T.let = T.cuda.make_float2(
                         T.cuda.uint_as_float(p[s_i * 2]), T.cuda.uint_as_float(p[s_i * 2 + 1])
                     )
@@ -905,7 +903,7 @@ def _kernel(
 
             bar_li_empty.wait(0, wg3_outer_loop_phase ^ 1)
             rowwise_li_buf[idx_in_warpgroup ^ 64] = li
-            T.ptx.bar.sync(NAMED_BARRIER_WG2_SYNC, 128)
+            T.ptx.bar.sync(BAR_WG2_SYNC, 128)
             li = li + rowwise_li_buf[idx_in_warpgroup]
 
             if idx_in_warpgroup < B_H // 2:
@@ -958,7 +956,7 @@ def get_kernel(**kwargs: Any):
         have_topk_length=cfg.have_topk_length,
         sm_scale_div_log2=(1.0 / math.sqrt(cfg.d_qk)) * LOG_2_E,
     )
-    return kernel.with_attr("tirx.kernel_launch_params", list(SMALL_TOPK_HEAD128_LAUNCH_PARAM_TAGS))
+    return kernel.with_attr("tirx.kernel_launch_params", list(LAUNCH_TAGS))
 
 
 def run_test(**kwargs: Any) -> None:

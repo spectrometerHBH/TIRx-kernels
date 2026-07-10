@@ -26,23 +26,18 @@ MAX_INIT_VAL = -1.0e30
 LOG_2_E = math.log2(math.e)
 LN_2 = math.log(2.0)
 
-HEAD128_LAUNCH_PARAM_TAGS = (
-    "blockIdx.x",
-    "clusterCtaIdx.x",
-    "threadIdx.x",
-    "tirx.use_dyn_shared_memory",
-)
+LAUNCH_TAGS = ("blockIdx.x", "clusterCtaIdx.x", "threadIdx.x", "tirx.use_dyn_shared_memory")
 
-NAMED_BARRIER_WG0_SYNC = 0
+BAR_WG0_SYNC = 0
 
 BF16_BYTES = 2
 D_TQ = 384
-P_TMEM_ELEMENTS = B_TOPK // 2
+P_TMEM_COLS = B_TOPK // 2
 B_EPI = 64
 WG1_NUM_WARPS = 4
-WG1_NUM_LOCAL_ROWS_PER_WARP = (B_TOPK // 2) // 4 // WG1_NUM_WARPS
+WG1_ROWS_PER_WARP = (B_TOPK // 2) // 4 // WG1_NUM_WARPS
 WG2_NUM_WARPS = 4
-WG2_NUM_LOCAL_ROWS_PER_PART = (B_TOPK // 2) // 4 // WG2_NUM_WARPS
+WG2_ROWS_PER_PART = (B_TOPK // 2) // 4 // WG2_NUM_WARPS
 
 # KV gather4 TMA knobs shared by the gather call sites.
 _mma_config = partial(tcgen05_config, cta_group=2)
@@ -405,7 +400,7 @@ def _kernel(
             bar_qk_done.wait(cur_buf, cur_phase)
             T.ptx.tcgen05.fence.after_thread_sync()
 
-            p_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, P_TMEM_ELEMENTS), "uint32")
+            p_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, P_TMEM_COLS), "uint32")
             Tx.wg.copy_async(
                 p_frag[:, :], tmem_p.rearrange("h (b t) -> (b h) t", b=2).with_dtype("uint32")[:, :]
             )
@@ -423,7 +418,7 @@ def _kernel(
 
             @T.inline
             def mask_p_half(valid_word, base):
-                for p_i in T.unroll(P_TMEM_ELEMENTS // 2):
+                for p_i in T.unroll(P_TMEM_COLS // 2):
                     invalid_p_predicate: T.let = T.bitwise_and(
                         T.shift_right(valid_word, T.uint32(p_i)), T.uint32(1)
                     ) == T.uint32(0)
@@ -432,17 +427,17 @@ def _kernel(
                     )
 
             mask_p_half(is_k_valid_lo, 0)
-            mask_p_half(is_k_valid_hi, P_TMEM_ELEMENTS // 2)
+            mask_p_half(is_k_valid_hi, P_TMEM_COLS // 2)
 
             cur_pi_max: T.float32 = T.float32(-float("inf"))
-            for p_i in T.unroll(P_TMEM_ELEMENTS):
+            for p_i in T.unroll(P_TMEM_COLS):
                 cur_pi_max = T.max(cur_pi_max, T.cuda.uint_as_float(p[p_i]))
             cur_pi_max = cur_pi_max * sm_scale_div_log2
             bar_k_valid_free.arrive(cur_buf)
 
-            T.ptx.bar.sync(NAMED_BARRIER_WG0_SYNC, 128)
+            T.ptx.bar.sync(BAR_WG0_SYNC, 128)
             rowwise_max_buf[idx_in_warpgroup] = cur_pi_max
-            T.ptx.bar.sync(NAMED_BARRIER_WG0_SYNC, 128)
+            T.ptx.bar.sync(BAR_WG0_SYNC, 128)
             cur_pi_max = T.max(cur_pi_max, rowwise_max_buf[idx_in_warpgroup ^ 64])
             real_mi = T.max(real_mi, cur_pi_max)
             should_scale_o: T.bool = (
@@ -472,7 +467,7 @@ def _kernel(
             )
             s_pack = s_frag.local().view("uint32")
             neg_new_max_pair: T.let = T.cuda.make_float2(-new_max, -new_max)
-            for s_i in T.unroll(P_TMEM_ELEMENTS // 2):
+            for s_i in T.unroll(P_TMEM_COLS // 2):
                 p_pair: T.let = T.cuda.make_float2(
                     T.cuda.uint_as_float(p[s_i * 2]), T.cuda.uint_as_float(p[s_i * 2 + 1])
                 )
@@ -512,7 +507,7 @@ def _kernel(
             mi = T.float32(-float("inf"))
 
         rowwise_li_buf[idx_in_warpgroup] = li
-        T.ptx.bar.sync(NAMED_BARRIER_WG0_SYNC, 128)
+        T.ptx.bar.sync(BAR_WG0_SYNC, 128)
         li = li + rowwise_li_buf[idx_in_warpgroup ^ 64]
 
         if idx_in_warpgroup < B_H // 2:
@@ -565,7 +560,7 @@ def _kernel(
             )
 
             T.ptx.fence.proxy_async("shared::cta")
-            T.ptx.bar.sync(NAMED_BARRIER_WG0_SYNC, 128)
+            T.ptx.bar.sync(BAR_WG0_SYNC, 128)
             if warp_idx == 0:
                 if T.ptx.elect_sync():
                     Tx.copy_async(
@@ -591,22 +586,17 @@ def _kernel(
         wg1_warp_idx: T.let = warp_idx - 4
         if T.ptx.elect_sync():
             for k in T.serial(0, num_k_blocks, unroll=False):
-                indices_int4 = T.alloc_local((WG1_NUM_LOCAL_ROWS_PER_WARP, 4), "int32")
+                indices_int4 = T.alloc_local((WG1_ROWS_PER_WARP, 4), "int32")
                 max_indices: T.int32 = -1
                 min_indices: T.int32 = s_kv
 
                 # This CTA's topk half (cta_idx), split (local_row, warp, j): one
                 # strided nc copy (auto-vectorizes to 4x v4 ld.global.nc), like head64.
                 idx_block = indices.view(
-                    s_q,
-                    stride_indices_s_q // B_TOPK,
-                    2,
-                    WG1_NUM_LOCAL_ROWS_PER_WARP,
-                    WG1_NUM_WARPS,
-                    4,
+                    s_q, stride_indices_s_q // B_TOPK, 2, WG1_ROWS_PER_WARP, WG1_NUM_WARPS, 4
                 ).sub[s_q_idx, k, cta_idx, :, wg1_warp_idx, :]
                 Tx.copy(indices_int4[:, :], idx_block[:, :], cache="nc")
-                for local_row in T.unroll(WG1_NUM_LOCAL_ROWS_PER_WARP):
+                for local_row in T.unroll(WG1_ROWS_PER_WARP):
                     for j in T.unroll(4):
                         idx: T.let = indices_int4[local_row, j]
                         max_indices = T.max(max_indices, idx)
@@ -632,7 +622,7 @@ def _kernel(
                                 mbar=bar.ptr_to([cur_buf]),
                                 indexer=[
                                     indices_int4[row, lane]
-                                    for row in range(WG1_NUM_LOCAL_ROWS_PER_WARP)
+                                    for row in range(WG1_ROWS_PER_WARP)
                                     for lane in range(4)
                                 ],
                             ),
@@ -640,7 +630,7 @@ def _kernel(
                     else:
                         T.ptx.mbarrier.complete_tx(
                             bar.ptr_to([cur_buf]),
-                            T.uint32(WG1_NUM_LOCAL_ROWS_PER_WARP * 4 * tx_dim * BF16_BYTES),
+                            T.uint32(WG1_ROWS_PER_WARP * 4 * tx_dim * BF16_BYTES),
                             remote=T.uint32(0),
                             pred=T.uint32(1),
                         )
@@ -676,12 +666,7 @@ def _kernel(
                     # V loads all 128 tokens; the two parts map to an extent-2
                     # axis indexed by part. One strided nc copy, like head64.
                     idx_block = indices.view(
-                        s_q,
-                        stride_indices_s_q // B_TOPK,
-                        2,
-                        WG2_NUM_LOCAL_ROWS_PER_PART,
-                        WG2_NUM_WARPS,
-                        4,
+                        s_q, stride_indices_s_q // B_TOPK, 2, WG2_ROWS_PER_PART, WG2_NUM_WARPS, 4
                     ).sub[s_q_idx, k, part, :, wg2_warp_idx, :]
                     Tx.copy(token_buf[:, :], idx_block[:, :], cache="nc")
                     # One wide gather4 over all D_V//2 cols (like head64/small_topk); dispatch splits
@@ -697,21 +682,21 @@ def _kernel(
                             mbar=bar.ptr_to([cur_buf]),
                             indexer=[
                                 token_buf[row, lane]
-                                for row in range(WG2_NUM_LOCAL_ROWS_PER_PART)
+                                for row in range(WG2_ROWS_PER_PART)
                                 for lane in range(4)
                             ],
                         ),
                     )
 
-                token_idxs_part0 = T.alloc_local((WG2_NUM_LOCAL_ROWS_PER_PART, 4), "int32")
+                token_idxs_part0 = T.alloc_local((WG2_ROWS_PER_PART, 4), "int32")
                 gather_v_part(0, 0, token_idxs_part0, bar_v_part0_ready)
 
                 if k > 0:
                     prev_buf: T.let = (k - 1) % NUM_BUFS
                     prev_phase: T.let = ((k - 1) // NUM_BUFS) & 1
                     bar_sv_done.wait(prev_buf, prev_phase)
-                token_idxs_part1 = T.alloc_local((WG2_NUM_LOCAL_ROWS_PER_PART, 4), "int32")
-                gather_v_part(WG2_NUM_LOCAL_ROWS_PER_PART, 1, token_idxs_part1, bar_v_part1_ready)
+                token_idxs_part1 = T.alloc_local((WG2_ROWS_PER_PART, 4), "int32")
+                gather_v_part(WG2_ROWS_PER_PART, 1, token_idxs_part1, bar_v_part1_ready)
 
     else:
         # CUDA phase1.cuh:490-606.  MMA warp and KV-valid loading warp.
@@ -861,7 +846,7 @@ def get_kernel(**kwargs: Any):
         have_topk_length=cfg.have_topk_length,
         sm_scale_div_log2=(1.0 / math.sqrt(cfg.d_qk)) * LOG_2_E,
     )
-    return kernel.with_attr("tirx.kernel_launch_params", list(HEAD128_LAUNCH_PARAM_TAGS))
+    return kernel.with_attr("tirx.kernel_launch_params", list(LAUNCH_TAGS))
 
 
 def run_test(**kwargs: Any) -> None:
