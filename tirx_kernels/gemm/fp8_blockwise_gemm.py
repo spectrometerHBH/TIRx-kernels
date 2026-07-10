@@ -257,11 +257,9 @@ def _kernel(
         empty_phase_offset=1,
         leader=barrier_leader,
     )
-    # ``datapath="D"`` documents that the MMA writes Layout D (M=128 full
-    # datapath, identity row→lane) — the downstream ``.16x256b`` M=128
-    # epilogue readback structurally checks this and would reject e.g. a
-    # Layout F acc here. See PTX ISA §9.7.16.10.5.
-    acc_buf = tmem_pool.alloc((128, TMEM_DEPTH * MMA_N), "float32", datapath="D")
+    acc_buf = tmem_pool.alloc_tcgen05_mma_D(
+        (128, TMEM_DEPTH * MMA_N), "float32", M=128 * CTA_GROUP, cta_group=CTA_GROUP
+    )
     acc = T.meta_var(T.TMEMStages(acc_buf, col_start=0, width=MMA_N, stages=TMEM_DEPTH))
     SFA_tmem = tmem_pool.alloc_sf(
         (TMEM_DEPTH, BLK_SFA, 4 * K_ITERS), "float8_e8m0fnu", sf_per_mma=1, sf_reuse=K_ITERS
