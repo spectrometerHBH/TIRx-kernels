@@ -260,7 +260,7 @@ def _kernel(
     acc_buf = tmem_pool.alloc_tcgen05_mma_D(
         (128, TMEM_DEPTH * MMA_N), "float32", M=128 * CTA_GROUP, cta_group=CTA_GROUP
     )
-    acc = T.meta_var(T.TMEMStages(acc_buf, col_start=0, width=MMA_N, stages=TMEM_DEPTH))
+    acc = T.meta_var(acc_buf.rearrange("m (s n) -> s m n", s=TMEM_DEPTH))
     SFA_tmem = tmem_pool.alloc_sf(
         (TMEM_DEPTH, BLK_SFA, 4 * K_ITERS), "float8_e8m0fnu", sf_per_mma=1, sf_reuse=K_ITERS
     )
@@ -393,7 +393,7 @@ def _kernel(
                     Tx.copy_async(SFB_tmem[tmem_idx], SFB_smem_fp8[ks], cta_group=CTA_GROUP)
                 if SWAP_AB:
                     Tx.gemm_async(
-                        acc[tmem_idx],
+                        acc[tmem_idx, :, :],
                         B_smem[ks],
                         A_smem[ks],
                         SFA=SFB_tmem[tmem_idx],
@@ -404,7 +404,7 @@ def _kernel(
                     )
                 else:
                     Tx.gemm_async(
-                        acc[tmem_idx],
+                        acc[tmem_idx, :, :],
                         A_smem[ks],
                         B_smem[ks],
                         SFA=SFA_tmem[tmem_idx],
@@ -456,7 +456,7 @@ def _kernel(
                 if SWAP_AB:
                     for atom_m in T.unroll(2):
                         col_st: T.let = ot * 16 + atom_m * 8
-                        Tx.wg.copy_async(swap_frag[:, :], acc[tmem_idx, col_st : col_st + 8])
+                        Tx.wg.copy_async(swap_frag[:, :], acc[tmem_idx, :, col_st : col_st + 8])
                         T.ptx.tcgen05.wait.ld()
                         Tx.wg.cast(swap_bf16, swap_frag)
                         rs = T.meta_var(atom_m * 8)
@@ -469,7 +469,7 @@ def _kernel(
                     for ki in T.unroll(EPI_TILE // TMEM_LD_SIZE):
                         Dreg = T.wg_reg_tile(TMEM_LD_SIZE)
                         acc_n = T.meta_var(ot * EPI_TILE + ki * TMEM_LD_SIZE)
-                        Tx.wg.copy_async(Dreg, acc[tmem_idx, acc_n : acc_n + TMEM_LD_SIZE])
+                        Tx.wg.copy_async(Dreg, acc[tmem_idx, :, acc_n : acc_n + TMEM_LD_SIZE])
                         T.ptx.tcgen05.wait.ld()
                         Dreg_bf16 = T.wg_reg_tile(TMEM_LD_SIZE, dtype="bfloat16")
                         Tx.wg.cast(Dreg_bf16, Dreg)
