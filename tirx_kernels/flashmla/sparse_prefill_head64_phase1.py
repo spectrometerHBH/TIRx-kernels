@@ -715,7 +715,7 @@ def _kernel(
                     bar_prologue_q_rope.wait(0, 0)
                     T.ptx.tcgen05.fence.after_thread_sync()
                     q_rope_tmem_cp = q_rope_tmem_bmm.rearrange("b h k -> h (b k)")
-                    Tx.copy_async(q_rope_tmem_cp[:, :], q_rope[:, :], shape="128x256b", cta_group=1)
+                    Tx.copy_async(q_rope_tmem_cp[:, :], q_rope[:, :])
                     bar_prologue_utccp_rope.arrive(0)
 
                 bar_prologue_q_nope.arrive(0, tx_count=B_H * D_V * BF16_BYTES)
