@@ -1,6 +1,18 @@
-# SGLang production-shaped FP8 paged MQA logits comparison.
-# Runs TIRx, DeepGEMM, and the optional SGLang CuTeDSL reference.
-# Keep this exploratory sweep separate from the pinned default workload set.
+# SGLang upstream default benchmark configuration:
+#   batch_size: 1, 2, 4, 6, 8, 10, 12, 14, 16
+#   next_n: 1, 2, 4, 6
+#   context_len: 4096, 10240, 32768, 81920, 131072
+#   num_heads: 32; head_dim: 128; block_kv: 64; output_dtype: float32
+#   varlen: false; use_cuda_graph: true
+# Its Cartesian product contains 180 configs; extending num_heads to 32 and 64
+# contains 360 configs.
+#
+# This file is a curated 80-config, kernel-only Proton subset:
+#   decode: H=(32,64) x B=(1,2,4,8,16) x all five context lengths = 50
+#   target verify: H=(32,64) x N=(2,4,6) x these paired (B, context) points = 30
+#     (1,4096), (2,131072), (6,10240), (10,32768), (16,81920)
+# It runs TIRx, DeepGEMM, and the optional SGLang CuTeDSL reference. Keep this
+# exploratory subset separate from the pinned default workload set.
 
 defaults:
   timer: proton

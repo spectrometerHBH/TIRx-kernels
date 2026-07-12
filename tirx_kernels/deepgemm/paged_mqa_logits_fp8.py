@@ -179,6 +179,21 @@ DSA_INDEXER_LIKE_COVERAGE = [
     )
 ]
 
+# Complete upstream defaults from
+# benchmark/kernels/deepseek/benchmark_cute_dsl_fp8_paged_mqa_logits.py:
+#   batch_size = (1, 2, 4, 6, 8, 10, 12, 14, 16)
+#   next_n = (1, 2, 4, 6)
+#   context_len = (4096, 10240, 32768, 81920, 131072)
+#   num_heads = 32, head_dim = 128, block_kv = 64, output_dtype = float32
+#   varlen = False, use_cuda_graph = True
+# The Cartesian product contains 9 * 4 * 5 = 180 configs. Extending the same
+# grid to num_heads = (32, 64) contains 360 configs.
+#
+# SGLANG_BENCH_CONFIGS is currently a curated 80-config kernel-only subset:
+#   decode: H=(32,64) x B=(1,2,4,8,16) x every context_len = 50
+#   target verify: H=(32,64) x next_n=(2,4,6) x the five paired (B, pages)
+#                  points below = 30
+# max_num_pages is context_len / page_size, with page_size fixed at 64.
 _SGLANG_CONTEXT_PAGES = (64, 160, 512, 1280, 2048)
 _SGLANG_TARGET_VERIFY_POINTS = ((1, 64), (2, 2048), (6, 160), (10, 512), (16, 1280))
 
