@@ -10,7 +10,7 @@ import torch
 
 from tirx_kernels.flashmla._gemm import tcgen05_config
 from tirx_kernels.flashmla._mask import pack_valid_mask8
-from tirx_kernels.flashmla._tma import tma_config
+from tirx_kernels.flashmla._tma import leader_mbar, tma_config
 from tvm.backend.cuda.operator.tile_primitive.tma_utils import SwizzleMode
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
@@ -359,7 +359,7 @@ def _kernel(
                 q_full[:, :],
                 q.chunk((None, 2, None))[s_q_idx, cta_idx, :],
                 **tma_config(
-                    mbar=bar_prologue_q.ptr_to([0]),
+                    mbar=leader_mbar(bar_prologue_q.ptr_to([0])),
                     cta_group=2,
                     cache_hint=T.uint64(0x12F0000000000000),
                 ),
@@ -619,7 +619,7 @@ def _kernel(
                             k_gather_tile[:, :],
                             kv_tma[:, col_start * 64 : col_start * 64 + col_count * 64],
                             **_kv_gather_tma(
-                                mbar=bar.ptr_to([cur_buf]),
+                                mbar=leader_mbar(bar.ptr_to([cur_buf])),
                                 indexer=[
                                     indices_int4[row, lane]
                                     for row in range(WG1_ROWS_PER_WARP)
@@ -679,7 +679,7 @@ def _kernel(
                         v_gather_tile[:, :],
                         kv_tma[:, src0 : src0 + (D_V // 2)],
                         **_kv_gather_tma(
-                            mbar=bar.ptr_to([cur_buf]),
+                            mbar=leader_mbar(bar.ptr_to([cur_buf])),
                             indexer=[
                                 token_buf[row, lane]
                                 for row in range(WG2_ROWS_PER_PART)

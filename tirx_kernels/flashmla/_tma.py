@@ -4,6 +4,14 @@ from __future__ import annotations
 
 from typing import Any
 
+from tvm.script import tirx as T
+
+
+def leader_mbar(bar_ptr: Any) -> Any:
+    # cta_group::2 completion routes to the CTA the mbar names; map to the pair
+    # leader (rank 0) so both CTAs' issues aggregate on one barrier.
+    return T.reinterpret("handle", T.ptx.map_shared_rank(bar_ptr, 0))
+
 
 def tma_config(
     *,
