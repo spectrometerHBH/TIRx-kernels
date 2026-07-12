@@ -54,6 +54,7 @@ _kv_gather_tma = partial(
     cta_group=2,
     cta_mask=T.uint16(1),
     gather_axis=0,
+    dst_gather_axis=0,
     cache_hint=T.uint64(0x14F0000000000000),
 )
 

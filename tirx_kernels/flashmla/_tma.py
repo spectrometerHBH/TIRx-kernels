@@ -21,6 +21,7 @@ def tma_config(
     cache_hint: Any = None,
     mbarrier_addr: Any = None,
     gather_axis: int | None = None,
+    dst_gather_axis: int | None = None,
     indexer: list[Any] | None = None,
     prefetch_tensormap: bool = True,
     tensormap_l2_promotion: str = "L2::256B",
@@ -51,6 +52,7 @@ def tma_config(
         ("cache_hint", cache_hint),
         ("mbarrier_addr", mbarrier_addr),
         ("gather_axis", gather_axis),
+        ("dst_gather_axis", dst_gather_axis),
         ("indexer", indexer),
     ):
         if value is not None:
