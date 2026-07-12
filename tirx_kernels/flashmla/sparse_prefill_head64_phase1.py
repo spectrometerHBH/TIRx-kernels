@@ -38,7 +38,11 @@ WG1_ROWS_PER_WARP = (B_TOPK // 4) // WG1_NUM_WARPS
 # KV gather4 TMA knobs shared by both gather call sites.
 _mma_config = partial(tcgen05_config, cta_group=1)
 _kv_gather_tma = partial(
-    tma_config, cta_group=1, gather_axis=0, dst_gather_axis=1, cache_hint=T.uint64(0x14F0000000000000)
+    tma_config,
+    cta_group=1,
+    gather_axis=0,
+    dst_gather_axis=1,
+    cache_hint=T.uint64(0x14F0000000000000),
 )
 
 
