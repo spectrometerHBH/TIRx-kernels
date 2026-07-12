@@ -1725,7 +1725,7 @@ def _sglang_cutedsl_available() -> bool:
     return find_spec("sglang") is not None and find_spec("cutlass") is not None
 
 
-def _make_sglang_cutedsl_runner(data: dict[str, Any]) -> tuple[Any, dict[str, int]]:
+def _make_sglang_cutedsl_runner(data: dict[str, Any]) -> Any:
     config: PagedMQALogitsFP8Config = data["config"]
     if config.context_pattern == "random_2d" and config.next_n > 1:
         raise ValueError(
@@ -1772,7 +1772,7 @@ def _make_sglang_cutedsl_runner(data: dict[str, Any]) -> tuple[Any, dict[str, in
             output_dtype=output_dtype,
         )
 
-    return _run, {"expand_factor": expand_factor, "atom": atom}
+    return _run
 
 
 def _allocate_logits(config: PagedMQALogitsFP8Config) -> torch.Tensor:
@@ -2025,7 +2025,7 @@ def run_test(**kwargs: Any) -> None:
             f"TIRx diff {tirx_diff:.6g} is worse than DeepGEMM diff {deepgemm_diff:.6g}"
         )
     if config.context_pattern.startswith("sglang_") and _sglang_cutedsl_available():
-        cutedsl_runner, _ = _make_sglang_cutedsl_runner(data)
+        cutedsl_runner = _make_sglang_cutedsl_runner(data)
         cutedsl_logits = cutedsl_runner()
         torch.cuda.synchronize()
         _assert_correct(data, cutedsl_logits, name="SGLang CuTeDSL")
@@ -2060,20 +2060,16 @@ def run_bench(**kwargs: Any) -> dict[str, Any]:
     max_diff = _assert_valid_correct(data, tirx_logits, deepgemm_logits, name="TIRx vs DeepGEMM")
     torch.cuda.empty_cache()
 
-    reference_diffs: dict[str, float] = {}
-    reference_metadata: dict[str, dict[str, int]] = {}
-
     def _deepgemm():
         return lambda: _run_deepgemm_paged_mqa(data, clean_logits=False)
 
     def _sglang_cutedsl():
-        cutedsl_runner, metadata = _make_sglang_cutedsl_runner(data)
+        cutedsl_runner = _make_sglang_cutedsl_runner(data)
         cutedsl_logits = cutedsl_runner()
         torch.cuda.synchronize()
-        reference_diffs["sglang_cutedsl_vs_deepgemm"] = _assert_valid_correct(
+        _assert_valid_correct(
             data, cutedsl_logits, deepgemm_logits, name="SGLang CuTeDSL vs DeepGEMM"
         )
-        reference_metadata["sglang_cutedsl"] = metadata
         return cutedsl_runner
 
     result = bench(
@@ -2086,8 +2082,6 @@ def run_bench(**kwargs: Any) -> dict[str, Any]:
         references={"deepgemm": _deepgemm, "sglang_cutedsl": _sglang_cutedsl},
     )
     result["max_diff"] = max_diff
-    result["reference_diffs"] = reference_diffs
-    result["reference_metadata"] = reference_metadata
     return result
 
 
