@@ -58,7 +58,7 @@ class BarMMA2TMA(Barriers):
 class BarLD2MMA(Barriers):
     @T.inline
     def arrive(self, idx):
-        T.ptx.mbarrier.arrive(self.mbar.ptr_to([idx]), cta_id=0, pred=True)
+        T.ptx.mbarrier.arrive(self.mbar.ptr_to([idx]), remote=0, pred=True)
 
 
 class GemmTile(Tile):
@@ -557,19 +557,6 @@ class GemmTile(Tile):
                             self.phase[0] = self.phase[0] ^ 1
                 T.ptx.bar.sync(13, 64)
             elif warp_id == 0:
-                descI: T.uint32
-                T.ptx.tcgen05.encode_instr_descriptor(
-                    T.address_of(descI),
-                    d_dtype="float32",
-                    a_dtype=self.a_type,
-                    b_dtype=self.b_type,
-                    M=self.MMA_N,
-                    N=self.MMA_M,
-                    K=self.MMA_K,
-                    trans_a=False,
-                    trans_b=False,
-                    n_cta_groups=KernelConfig.CTA_GROUP,
-                )
 
                 @T.inline
                 def mbar_try_wait(idx, phase):
@@ -592,7 +579,6 @@ class GemmTile(Tile):
                         accum=acc,
                         dispatch="tcgen05",
                         cta_group=KernelConfig.CTA_GROUP,
-                        descI=descI,
                     )
                     if self.profiler_on:
                         profiler.end(ProfileEventType.MMA, lane_id == 0)
