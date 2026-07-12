@@ -3,7 +3,7 @@
     "BLOCK_SIZE_M": 16,
     "BLOCK_SIZE_N": 32,
     "BLOCK_SIZE_K": 128,
-    "GROUP_SIZE_M": 32,
+    "GROUP_SIZE_M": 16,
     "num_warps": 4,
     "num_stages": 4
   },

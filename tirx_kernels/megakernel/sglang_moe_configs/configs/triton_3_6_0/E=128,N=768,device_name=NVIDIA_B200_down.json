@@ -11,10 +11,10 @@
   "8": {
     "BLOCK_SIZE_M": 16,
     "BLOCK_SIZE_N": 128,
-    "BLOCK_SIZE_K": 256,
-    "GROUP_SIZE_M": 1,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 32,
     "num_warps": 4,
-    "num_stages": 2,
+    "num_stages": 3,
     "USE_TMA": true
   },
   "32": {
