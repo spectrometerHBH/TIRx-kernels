@@ -1,8 +1,8 @@
 # bench-suite baseline view: `baseline.json`
 
-- Timestamp: `121`
-- Label:     `cb2a7638-dirty`
-- Git:       `{'tir': '3d26efa6-dirty', 'tirx-kernels': '2b5df913-dirty', 'tirx-bench-ci': None}`
+- Timestamp: `163`
+- Label:     `5ec3e10a`
+- Git:       `{'tir': 'f2214f20', 'tirx-kernels': '5ec3e10a', 'tirx-bench-ci': None}`
 - Workloads: 259 ok, 0 failed
 
 Each row shows our impl's time (tir/tirx) and every reference impl, with ref/ours where ref = fastest non-ours impl. Higher ratio = ours is faster.
@@ -11,306 +11,306 @@ Each row shows our impl's time (tir/tirx) and every reference impl, with ref/our
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
 |---|---|---:|---|---:|---:|---|
-| `s2048_skv4096_h64_d128_bf16_compressed_cp` | tirx | 42.4598 | deepgemm | 41.8267 | 0.985 | — |
-| `s2048_skv4096_h64_d128_bf16_compressed_nocp` | tirx | 55.6399 | deepgemm | 54.4135 | 0.978 | — |
-| `s2048_skv4096_h64_d128_bf16_dense_cp` | tirx | 42.5336 | deepgemm | 40.9525 | 0.963 | — |
-| `s2048_skv4096_h64_d128_bf16_dense_nocp` | tirx | 55.7432 | deepgemm | 52.9635 | 0.950 | — |
-| `s2048_skv4096_h64_d128_f32_compressed_cp` | tirx | 41.4287 | deepgemm | 43.5333 | 1.051 | — |
-| `s2048_skv4096_h64_d128_f32_compressed_nocp` | tirx | 54.2862 | deepgemm | 57.0471 | 1.051 | — |
-| `s2048_skv4096_h64_d128_f32_dense_cp` | tirx | 40.9842 | deepgemm | 39.2352 | 0.957 | — |
-| `s2048_skv4096_h64_d128_f32_dense_nocp` | tirx | 53.5868 | deepgemm | 50.8791 | 0.949 | — |
-| `s2048_skv8192_h64_d128_bf16_compressed_cp` | tirx | 75.2619 | deepgemm | 72.8948 | 0.969 | — |
-| `s2048_skv8192_h64_d128_bf16_compressed_nocp` | tirx | 116.1340 | deepgemm | 111.1040 | 0.957 | — |
-| `s2048_skv8192_h64_d128_bf16_dense_cp` | tirx | 75.2587 | deepgemm | 71.1154 | 0.945 | — |
-| `s2048_skv8192_h64_d128_bf16_dense_nocp` | tirx | 115.6379 | deepgemm | 108.2213 | 0.936 | — |
-| `s2048_skv8192_h64_d128_f32_compressed_cp` | tirx | 73.3461 | deepgemm | 76.4114 | 1.042 | — |
-| `s2048_skv8192_h64_d128_f32_compressed_nocp` | tirx | 114.1203 | deepgemm | 117.7857 | 1.032 | — |
-| `s2048_skv8192_h64_d128_f32_dense_cp` | tirx | 72.0895 | deepgemm | 68.0596 | 0.944 | — |
-| `s2048_skv8192_h64_d128_f32_dense_nocp` | tirx | 110.4869 | deepgemm | 103.5819 | 0.938 | — |
-| `s4096_skv4096_h64_d128_bf16_compressed_cp` | tirx | 74.1822 | deepgemm | 74.3536 | 1.002 | — |
-| `s4096_skv4096_h64_d128_bf16_compressed_nocp` | tirx | 73.9630 | deepgemm | 74.2531 | 1.004 | — |
-| `s4096_skv4096_h64_d128_bf16_dense_cp` | tirx | 74.6696 | deepgemm | 72.7652 | 0.974 | — |
-| `s4096_skv4096_h64_d128_bf16_dense_nocp` | tirx | 74.7328 | deepgemm | 72.8468 | 0.975 | — |
-| `s4096_skv4096_h64_d128_f32_compressed_cp` | tirx | 71.6966 | deepgemm | 76.1820 | 1.063 | — |
-| `s4096_skv4096_h64_d128_f32_compressed_nocp` | tirx | 72.0743 | deepgemm | 76.4724 | 1.061 | — |
-| `s4096_skv4096_h64_d128_f32_dense_cp` | tirx | 71.5979 | deepgemm | 68.6218 | 0.958 | — |
-| `s4096_skv4096_h64_d128_f32_dense_nocp` | tirx | 71.6523 | deepgemm | 68.6329 | 0.958 | — |
-| `s4096_skv8192_h64_d128_bf16_compressed_cp` | tirx | 134.4507 | deepgemm | 131.0205 | 0.974 | — |
-| `s4096_skv8192_h64_d128_bf16_compressed_nocp` | tirx | 193.6365 | deepgemm | 187.0589 | 0.966 | — |
-| `s4096_skv8192_h64_d128_bf16_dense_cp` | tirx | 134.5889 | deepgemm | 127.6599 | 0.949 | — |
-| `s4096_skv8192_h64_d128_bf16_dense_nocp` | tirx | 192.8499 | deepgemm | 181.2399 | 0.940 | — |
-| `s4096_skv8192_h64_d128_f32_compressed_cp` | tirx | 131.6639 | deepgemm | 137.6949 | 1.046 | — |
-| `s4096_skv8192_h64_d128_f32_compressed_nocp` | tirx | 188.8640 | deepgemm | 196.5835 | 1.041 | — |
-| `s4096_skv8192_h64_d128_f32_dense_cp` | tirx | 128.8373 | deepgemm | 121.5175 | 0.943 | — |
-| `s4096_skv8192_h64_d128_f32_dense_nocp` | tirx | 184.5801 | deepgemm | 173.2425 | 0.939 | — |
+| `s2048_skv4096_h64_d128_bf16_compressed_cp` | tirx | 42.7153 | deepgemm | 42.0984 | 0.986 | — |
+| `s2048_skv4096_h64_d128_bf16_compressed_nocp` | tirx | 55.9352 | deepgemm | 54.8431 | 0.980 | — |
+| `s2048_skv4096_h64_d128_bf16_dense_cp` | tirx | 42.7827 | deepgemm | 41.1750 | 0.962 | — |
+| `s2048_skv4096_h64_d128_bf16_dense_nocp` | tirx | 56.1704 | deepgemm | 53.5631 | 0.954 | — |
+| `s2048_skv4096_h64_d128_f32_compressed_cp` | tirx | 41.5035 | deepgemm | 43.5758 | 1.050 | — |
+| `s2048_skv4096_h64_d128_f32_compressed_nocp` | tirx | 54.2564 | deepgemm | 56.8055 | 1.047 | — |
+| `s2048_skv4096_h64_d128_f32_dense_cp` | tirx | 40.9614 | deepgemm | 39.2701 | 0.959 | — |
+| `s2048_skv4096_h64_d128_f32_dense_nocp` | tirx | 53.1524 | deepgemm | 50.4953 | 0.950 | — |
+| `s2048_skv8192_h64_d128_bf16_compressed_cp` | tirx | 74.7531 | deepgemm | 72.5006 | 0.970 | — |
+| `s2048_skv8192_h64_d128_bf16_compressed_nocp` | tirx | 116.2610 | deepgemm | 111.4883 | 0.959 | — |
+| `s2048_skv8192_h64_d128_bf16_dense_cp` | tirx | 75.4455 | deepgemm | 71.2678 | 0.945 | — |
+| `s2048_skv8192_h64_d128_bf16_dense_nocp` | tirx | 115.2981 | deepgemm | 107.7645 | 0.935 | — |
+| `s2048_skv8192_h64_d128_f32_compressed_cp` | tirx | 73.9053 | deepgemm | 76.9218 | 1.041 | — |
+| `s2048_skv8192_h64_d128_f32_compressed_nocp` | tirx | 114.2421 | deepgemm | 117.8966 | 1.032 | — |
+| `s2048_skv8192_h64_d128_f32_dense_cp` | tirx | 72.0730 | deepgemm | 67.9335 | 0.943 | — |
+| `s2048_skv8192_h64_d128_f32_dense_nocp` | tirx | 111.1615 | deepgemm | 104.0997 | 0.936 | — |
+| `s4096_skv4096_h64_d128_bf16_compressed_cp` | tirx | 74.4961 | deepgemm | 74.5966 | 1.001 | — |
+| `s4096_skv4096_h64_d128_bf16_compressed_nocp` | tirx | 74.4294 | deepgemm | 74.5942 | 1.002 | — |
+| `s4096_skv4096_h64_d128_bf16_dense_cp` | tirx | 75.1588 | deepgemm | 73.1997 | 0.974 | — |
+| `s4096_skv4096_h64_d128_bf16_dense_nocp` | tirx | 74.6318 | deepgemm | 72.6019 | 0.973 | — |
+| `s4096_skv4096_h64_d128_f32_compressed_cp` | tirx | 72.5012 | deepgemm | 77.0097 | 1.062 | — |
+| `s4096_skv4096_h64_d128_f32_compressed_nocp` | tirx | 72.1898 | deepgemm | 76.6127 | 1.061 | — |
+| `s4096_skv4096_h64_d128_f32_dense_cp` | tirx | 72.2620 | deepgemm | 69.2900 | 0.959 | — |
+| `s4096_skv4096_h64_d128_f32_dense_nocp` | tirx | 71.7013 | deepgemm | 68.7001 | 0.958 | — |
+| `s4096_skv8192_h64_d128_bf16_compressed_cp` | tirx | 134.7801 | deepgemm | 131.0728 | 0.972 | — |
+| `s4096_skv8192_h64_d128_bf16_compressed_nocp` | tirx | 196.1438 | deepgemm | 188.9575 | 0.963 | — |
+| `s4096_skv8192_h64_d128_bf16_dense_cp` | tirx | 133.5682 | deepgemm | 127.1602 | 0.952 | — |
+| `s4096_skv8192_h64_d128_bf16_dense_nocp` | tirx | 195.3114 | deepgemm | 183.3781 | 0.939 | — |
+| `s4096_skv8192_h64_d128_f32_compressed_cp` | tirx | 131.8065 | deepgemm | 137.4618 | 1.043 | — |
+| `s4096_skv8192_h64_d128_f32_compressed_nocp` | tirx | 190.3468 | deepgemm | 197.7031 | 1.039 | — |
+| `s4096_skv8192_h64_d128_f32_dense_cp` | tirx | 128.8372 | deepgemm | 121.5097 | 0.943 | — |
+| `s4096_skv8192_h64_d128_f32_dense_nocp` | tirx | 186.0951 | deepgemm | 174.6044 | 0.938 | — |
 ## deepgemm_sm100_fp4_paged_mqa_logits
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
 |---|---|---:|---|---:|---:|---|
-| `b16_n1_mp128_ps32_h64_d128_bf16_fixed` | tirx | 5.5246 | deepgemm | 5.5426 | 1.003 | — |
-| `b16_n1_mp128_ps32_h64_d128_f32_fixed` | tirx | 5.7904 | deepgemm | 5.8057 | 1.003 | — |
-| `b16_n1_mp128_ps64_h64_d128_bf16_fixed` | tirx | 6.3654 | deepgemm | 6.3888 | 1.004 | — |
-| `b16_n1_mp128_ps64_h64_d128_f32_fixed` | tirx | 6.1057 | deepgemm | 6.1414 | 1.006 | — |
-| `b16_n1_mp1_ps32_h64_d128_bf16_fixed` | tirx | 4.3586 | deepgemm | 4.6851 | 1.075 | — |
-| `b16_n1_mp1_ps32_h64_d128_f32_fixed` | tirx | 5.1782 | deepgemm | 5.7518 | 1.111 | — |
-| `b16_n1_mp1_ps64_h64_d128_bf16_fixed` | tirx | 4.9541 | deepgemm | 5.4846 | 1.107 | — |
-| `b16_n1_mp1_ps64_h64_d128_f32_fixed` | tirx | 4.3572 | deepgemm | 4.6894 | 1.076 | — |
-| `b16_n1_mp32_ps32_h64_d128_bf16_fixed` | tirx | 5.3112 | deepgemm | 5.3316 | 1.004 | — |
-| `b16_n1_mp32_ps32_h64_d128_f32_fixed` | tirx | 4.9235 | deepgemm | 4.8086 | 0.977 | — |
-| `b16_n1_mp32_ps64_h64_d128_bf16_fixed` | tirx | 5.3172 | deepgemm | 5.3528 | 1.007 | — |
-| `b16_n1_mp32_ps64_h64_d128_f32_fixed` | tirx | 5.3135 | deepgemm | 5.3618 | 1.009 | — |
-| `b16_n1_mp8_ps32_h64_d128_bf16_fixed` | tirx | 4.7230 | deepgemm | 4.7352 | 1.003 | — |
-| `b16_n1_mp8_ps32_h64_d128_f32_fixed` | tirx | 4.6620 | deepgemm | 4.6982 | 1.008 | — |
-| `b16_n1_mp8_ps64_h64_d128_bf16_fixed` | tirx | 4.7211 | deepgemm | 4.7645 | 1.009 | — |
-| `b16_n1_mp8_ps64_h64_d128_f32_fixed` | tirx | 4.7250 | deepgemm | 4.7685 | 1.009 | — |
-| `b1_n1_mp128_ps32_h64_d128_bf16_fixed` | tirx | 4.5801 | deepgemm | 4.6040 | 1.005 | — |
-| `b1_n1_mp128_ps32_h64_d128_f32_fixed` | tirx | 4.6488 | deepgemm | 4.6773 | 1.006 | — |
-| `b1_n1_mp128_ps64_h64_d128_bf16_fixed` | tirx | 4.6660 | deepgemm | 4.7271 | 1.013 | — |
-| `b1_n1_mp128_ps64_h64_d128_f32_fixed` | tirx | 4.6952 | deepgemm | 4.7204 | 1.005 | — |
-| `b1_n1_mp1_ps32_h64_d128_bf16_fixed` | tirx | 4.3167 | deepgemm | 4.6932 | 1.087 | — |
-| `b1_n1_mp1_ps32_h64_d128_f32_fixed` | tirx | 4.3106 | deepgemm | 4.6843 | 1.087 | — |
-| `b1_n1_mp1_ps64_h64_d128_bf16_fixed` | tirx | 4.3340 | deepgemm | 4.6978 | 1.084 | — |
-| `b1_n1_mp1_ps64_h64_d128_f32_fixed` | tirx | 4.7838 | deepgemm | 5.4038 | 1.130 | — |
-| `b1_n1_mp32_ps32_h64_d128_bf16_fixed` | tirx | 5.0962 | deepgemm | 5.3594 | 1.052 | — |
-| `b1_n1_mp32_ps32_h64_d128_f32_fixed` | tirx | 5.0952 | deepgemm | 5.3456 | 1.049 | — |
-| `b1_n1_mp32_ps64_h64_d128_bf16_fixed` | tirx | 4.5081 | deepgemm | 4.5532 | 1.010 | — |
-| `b1_n1_mp32_ps64_h64_d128_f32_fixed` | tirx | 4.5370 | deepgemm | 4.5919 | 1.012 | — |
-| `b1_n1_mp8_ps32_h64_d128_bf16_fixed` | tirx | 4.7094 | deepgemm | 4.8427 | 1.028 | — |
-| `b1_n1_mp8_ps32_h64_d128_f32_fixed` | tirx | 4.6505 | deepgemm | 4.8252 | 1.038 | — |
-| `b1_n1_mp8_ps64_h64_d128_bf16_fixed` | tirx | 5.0426 | deepgemm | 5.3801 | 1.067 | — |
-| `b1_n1_mp8_ps64_h64_d128_f32_fixed` | tirx | 4.5312 | deepgemm | 4.7171 | 1.041 | — |
-| `b2_n1_mp128_ps32_h64_d128_bf16_fixed` | tirx | 4.6544 | deepgemm | 4.6801 | 1.006 | — |
-| `b2_n1_mp128_ps32_h64_d128_f32_fixed` | tirx | 4.6964 | deepgemm | 4.7057 | 1.002 | — |
-| `b2_n1_mp128_ps64_h64_d128_bf16_fixed` | tirx | 4.7057 | deepgemm | 4.7258 | 1.004 | — |
-| `b2_n1_mp128_ps64_h64_d128_f32_fixed` | tirx | 4.7650 | deepgemm | 4.8008 | 1.008 | — |
-| `b2_n1_mp1_ps32_h64_d128_bf16_fixed` | tirx | 4.2318 | deepgemm | 4.4379 | 1.049 | — |
-| `b2_n1_mp1_ps32_h64_d128_f32_fixed` | tirx | 4.2238 | deepgemm | 4.4502 | 1.054 | — |
-| `b2_n1_mp1_ps64_h64_d128_bf16_fixed` | tirx | 4.2417 | deepgemm | 4.4368 | 1.046 | — |
-| `b2_n1_mp1_ps64_h64_d128_f32_fixed` | tirx | 4.2240 | deepgemm | 4.4519 | 1.054 | — |
-| `b2_n1_mp32_ps32_h64_d128_bf16_fixed` | tirx | 5.1340 | deepgemm | 5.3967 | 1.051 | — |
-| `b2_n1_mp32_ps32_h64_d128_f32_fixed` | tirx | 4.7488 | deepgemm | 4.7540 | 1.001 | — |
-| `b2_n1_mp32_ps64_h64_d128_bf16_fixed` | tirx | 5.1581 | deepgemm | 5.4644 | 1.059 | — |
-| `b2_n1_mp32_ps64_h64_d128_f32_fixed` | tirx | 4.5079 | deepgemm | 4.5427 | 1.008 | — |
-| `b2_n1_mp8_ps32_h64_d128_bf16_fixed` | tirx | 4.5445 | deepgemm | 4.5624 | 1.004 | — |
-| `b2_n1_mp8_ps32_h64_d128_f32_fixed` | tirx | 5.0335 | deepgemm | 5.3174 | 1.056 | — |
-| `b2_n1_mp8_ps64_h64_d128_bf16_fixed` | tirx | 4.5303 | deepgemm | 4.5651 | 1.008 | — |
-| `b2_n1_mp8_ps64_h64_d128_f32_fixed` | tirx | 4.5357 | deepgemm | 4.5698 | 1.008 | — |
-| `b4_n1_mp128_ps32_h64_d128_bf16_fixed` | tirx | 4.9441 | deepgemm | 4.9820 | 1.008 | — |
-| `b4_n1_mp128_ps32_h64_d128_f32_fixed` | tirx | 5.2130 | deepgemm | 5.2467 | 1.006 | — |
-| `b4_n1_mp128_ps64_h64_d128_bf16_fixed` | tirx | 5.2510 | deepgemm | 5.2977 | 1.009 | — |
-| `b4_n1_mp128_ps64_h64_d128_f32_fixed` | tirx | 5.2198 | deepgemm | 5.2798 | 1.012 | — |
-| `b4_n1_mp1_ps32_h64_d128_bf16_fixed` | tirx | 4.3209 | deepgemm | 4.8934 | 1.132 | — |
-| `b4_n1_mp1_ps32_h64_d128_f32_fixed` | tirx | 4.3114 | deepgemm | 4.8862 | 1.133 | — |
-| `b4_n1_mp1_ps64_h64_d128_bf16_fixed` | tirx | 4.2834 | deepgemm | 4.7868 | 1.118 | — |
-| `b4_n1_mp1_ps64_h64_d128_f32_fixed` | tirx | 4.2893 | deepgemm | 4.8345 | 1.127 | — |
-| `b4_n1_mp32_ps32_h64_d128_bf16_fixed` | tirx | 4.8403 | deepgemm | 4.8591 | 1.004 | — |
-| `b4_n1_mp32_ps32_h64_d128_f32_fixed` | tirx | 4.7869 | deepgemm | 5.0746 | 1.060 | — |
-| `b4_n1_mp32_ps64_h64_d128_bf16_fixed` | tirx | 4.9158 | deepgemm | 4.9527 | 1.008 | — |
-| `b4_n1_mp32_ps64_h64_d128_f32_fixed` | tirx | 4.9073 | deepgemm | 4.9407 | 1.007 | — |
-| `b4_n1_mp8_ps32_h64_d128_bf16_fixed` | tirx | 4.7130 | deepgemm | 4.9923 | 1.059 | — |
-| `b4_n1_mp8_ps32_h64_d128_f32_fixed` | tirx | 4.7313 | deepgemm | 4.7790 | 1.010 | — |
-| `b4_n1_mp8_ps64_h64_d128_bf16_fixed` | tirx | 4.7853 | deepgemm | 4.8336 | 1.010 | — |
-| `b4_n1_mp8_ps64_h64_d128_f32_fixed` | tirx | 4.6404 | deepgemm | 4.9424 | 1.065 | — |
-| `b8_n1_mp128_ps32_h64_d128_bf16_fixed` | tirx | 4.9978 | deepgemm | 5.0098 | 1.002 | — |
-| `b8_n1_mp128_ps32_h64_d128_f32_fixed` | tirx | 5.1416 | deepgemm | 5.1794 | 1.007 | — |
-| `b8_n1_mp128_ps64_h64_d128_bf16_fixed` | tirx | 5.5304 | deepgemm | 5.5713 | 1.007 | — |
-| `b8_n1_mp128_ps64_h64_d128_f32_fixed` | tirx | 5.5149 | deepgemm | 5.5533 | 1.007 | — |
-| `b8_n1_mp1_ps32_h64_d128_bf16_fixed` | tirx | 4.2723 | deepgemm | 4.5951 | 1.076 | — |
-| `b8_n1_mp1_ps32_h64_d128_f32_fixed` | tirx | 4.6580 | deepgemm | 5.2329 | 1.123 | — |
-| `b8_n1_mp1_ps64_h64_d128_bf16_fixed` | tirx | 4.2493 | deepgemm | 4.4353 | 1.044 | — |
-| `b8_n1_mp1_ps64_h64_d128_f32_fixed` | tirx | 4.2547 | deepgemm | 4.4742 | 1.052 | — |
-| `b8_n1_mp32_ps32_h64_d128_bf16_fixed` | tirx | 4.7104 | deepgemm | 4.7247 | 1.003 | — |
-| `b8_n1_mp32_ps32_h64_d128_f32_fixed` | tirx | 4.7314 | deepgemm | 4.7791 | 1.010 | — |
-| `b8_n1_mp32_ps64_h64_d128_bf16_fixed` | tirx | 5.2007 | deepgemm | 5.3282 | 1.025 | — |
-| `b8_n1_mp32_ps64_h64_d128_f32_fixed` | tirx | 5.1798 | deepgemm | 5.2977 | 1.023 | — |
-| `b8_n1_mp8_ps32_h64_d128_bf16_fixed` | tirx | 4.6226 | deepgemm | 4.6469 | 1.005 | — |
-| `b8_n1_mp8_ps32_h64_d128_f32_fixed` | tirx | 4.5850 | deepgemm | 4.6160 | 1.007 | — |
-| `b8_n1_mp8_ps64_h64_d128_bf16_fixed` | tirx | 4.6514 | deepgemm | 4.7041 | 1.011 | — |
-| `b8_n1_mp8_ps64_h64_d128_f32_fixed` | tirx | 4.6094 | deepgemm | 4.6572 | 1.010 | — |
+| `b16_n1_mp128_ps32_h64_d128_bf16_fixed` | tirx | 5.5807 | deepgemm | 5.6068 | 1.005 | — |
+| `b16_n1_mp128_ps32_h64_d128_f32_fixed` | tirx | 5.9024 | deepgemm | 5.9418 | 1.007 | — |
+| `b16_n1_mp128_ps64_h64_d128_bf16_fixed` | tirx | 6.4774 | deepgemm | 6.5147 | 1.006 | — |
+| `b16_n1_mp128_ps64_h64_d128_f32_fixed` | tirx | 6.3587 | deepgemm | 6.3598 | 1.000 | — |
+| `b16_n1_mp1_ps32_h64_d128_bf16_fixed` | tirx | 5.1442 | deepgemm | 5.6750 | 1.103 | — |
+| `b16_n1_mp1_ps32_h64_d128_f32_fixed` | tirx | 4.4625 | deepgemm | 4.7824 | 1.072 | — |
+| `b16_n1_mp1_ps64_h64_d128_bf16_fixed` | tirx | 4.5899 | deepgemm | 5.1214 | 1.116 | — |
+| `b16_n1_mp1_ps64_h64_d128_f32_fixed` | tirx | 4.4629 | deepgemm | 4.7867 | 1.073 | — |
+| `b16_n1_mp32_ps32_h64_d128_bf16_fixed` | tirx | 5.2098 | deepgemm | 5.2350 | 1.005 | — |
+| `b16_n1_mp32_ps32_h64_d128_f32_fixed` | tirx | 5.2710 | deepgemm | 5.2989 | 1.005 | — |
+| `b16_n1_mp32_ps64_h64_d128_bf16_fixed` | tirx | 5.2924 | deepgemm | 5.3189 | 1.005 | — |
+| `b16_n1_mp32_ps64_h64_d128_f32_fixed` | tirx | 5.2305 | deepgemm | 5.2705 | 1.008 | — |
+| `b16_n1_mp8_ps32_h64_d128_bf16_fixed` | tirx | 4.8671 | deepgemm | 4.9047 | 1.008 | — |
+| `b16_n1_mp8_ps32_h64_d128_f32_fixed` | tirx | 4.8483 | deepgemm | 5.1627 | 1.065 | — |
+| `b16_n1_mp8_ps64_h64_d128_bf16_fixed` | tirx | 4.7859 | deepgemm | 5.0501 | 1.055 | — |
+| `b16_n1_mp8_ps64_h64_d128_f32_fixed` | tirx | 4.7044 | deepgemm | 4.7452 | 1.009 | — |
+| `b1_n1_mp128_ps32_h64_d128_bf16_fixed` | tirx | 4.8025 | deepgemm | 4.8352 | 1.007 | — |
+| `b1_n1_mp128_ps32_h64_d128_f32_fixed` | tirx | 4.6599 | deepgemm | 4.6868 | 1.006 | — |
+| `b1_n1_mp128_ps64_h64_d128_bf16_fixed` | tirx | 4.6174 | deepgemm | 4.6648 | 1.010 | — |
+| `b1_n1_mp128_ps64_h64_d128_f32_fixed` | tirx | 4.6602 | deepgemm | 4.6885 | 1.006 | — |
+| `b1_n1_mp1_ps32_h64_d128_bf16_fixed` | tirx | 4.3908 | deepgemm | 4.7562 | 1.083 | — |
+| `b1_n1_mp1_ps32_h64_d128_f32_fixed` | tirx | 4.6435 | deepgemm | 5.0323 | 1.084 | — |
+| `b1_n1_mp1_ps64_h64_d128_bf16_fixed` | tirx | 4.2941 | deepgemm | 4.6846 | 1.091 | — |
+| `b1_n1_mp1_ps64_h64_d128_f32_fixed` | tirx | 4.6314 | deepgemm | 5.0243 | 1.085 | — |
+| `b1_n1_mp32_ps32_h64_d128_bf16_fixed` | tirx | 4.7800 | deepgemm | 4.8150 | 1.007 | — |
+| `b1_n1_mp32_ps32_h64_d128_f32_fixed` | tirx | 4.7347 | deepgemm | 4.7960 | 1.013 | — |
+| `b1_n1_mp32_ps64_h64_d128_bf16_fixed` | tirx | 4.5554 | deepgemm | 4.8227 | 1.059 | — |
+| `b1_n1_mp32_ps64_h64_d128_f32_fixed` | tirx | 4.7228 | deepgemm | 5.0023 | 1.059 | — |
+| `b1_n1_mp8_ps32_h64_d128_bf16_fixed` | tirx | 4.6251 | deepgemm | 4.7476 | 1.026 | — |
+| `b1_n1_mp8_ps32_h64_d128_f32_fixed` | tirx | 4.7857 | deepgemm | 5.1115 | 1.068 | — |
+| `b1_n1_mp8_ps64_h64_d128_bf16_fixed` | tirx | 4.6618 | deepgemm | 4.9850 | 1.069 | — |
+| `b1_n1_mp8_ps64_h64_d128_f32_fixed` | tirx | 4.7743 | deepgemm | 4.9423 | 1.035 | — |
+| `b2_n1_mp128_ps32_h64_d128_bf16_fixed` | tirx | 4.8185 | deepgemm | 4.8739 | 1.011 | — |
+| `b2_n1_mp128_ps32_h64_d128_f32_fixed` | tirx | 4.8753 | deepgemm | 4.9217 | 1.010 | — |
+| `b2_n1_mp128_ps64_h64_d128_bf16_fixed` | tirx | 4.8756 | deepgemm | 5.1551 | 1.057 | — |
+| `b2_n1_mp128_ps64_h64_d128_f32_fixed` | tirx | 4.8049 | deepgemm | 4.8320 | 1.006 | — |
+| `b2_n1_mp1_ps32_h64_d128_bf16_fixed` | tirx | 4.4510 | deepgemm | 4.7491 | 1.067 | — |
+| `b2_n1_mp1_ps32_h64_d128_f32_fixed` | tirx | 4.6174 | deepgemm | 5.1133 | 1.107 | — |
+| `b2_n1_mp1_ps64_h64_d128_bf16_fixed` | tirx | 4.2802 | deepgemm | 4.5799 | 1.070 | — |
+| `b2_n1_mp1_ps64_h64_d128_f32_fixed` | tirx | 4.6808 | deepgemm | 5.2024 | 1.111 | — |
+| `b2_n1_mp32_ps32_h64_d128_bf16_fixed` | tirx | 4.7278 | deepgemm | 4.9722 | 1.052 | — |
+| `b2_n1_mp32_ps32_h64_d128_f32_fixed` | tirx | 4.7091 | deepgemm | 4.7579 | 1.010 | — |
+| `b2_n1_mp32_ps64_h64_d128_bf16_fixed` | tirx | 4.7823 | deepgemm | 4.8516 | 1.014 | — |
+| `b2_n1_mp32_ps64_h64_d128_f32_fixed` | tirx | 4.7523 | deepgemm | 5.0222 | 1.057 | — |
+| `b2_n1_mp8_ps32_h64_d128_bf16_fixed` | tirx | 4.5010 | deepgemm | 4.4822 | 0.996 | — |
+| `b2_n1_mp8_ps32_h64_d128_f32_fixed` | tirx | 4.7322 | deepgemm | 4.8068 | 1.016 | — |
+| `b2_n1_mp8_ps64_h64_d128_bf16_fixed` | tirx | 4.6657 | deepgemm | 4.9106 | 1.052 | — |
+| `b2_n1_mp8_ps64_h64_d128_f32_fixed` | tirx | 4.7012 | deepgemm | 4.7743 | 1.016 | — |
+| `b4_n1_mp128_ps32_h64_d128_bf16_fixed` | tirx | 5.2175 | deepgemm | 5.2436 | 1.005 | — |
+| `b4_n1_mp128_ps32_h64_d128_f32_fixed` | tirx | 4.9681 | deepgemm | 4.9943 | 1.005 | — |
+| `b4_n1_mp128_ps64_h64_d128_bf16_fixed` | tirx | 5.3085 | deepgemm | 5.3680 | 1.011 | — |
+| `b4_n1_mp128_ps64_h64_d128_f32_fixed` | tirx | 5.2479 | deepgemm | 5.3070 | 1.011 | — |
+| `b4_n1_mp1_ps32_h64_d128_bf16_fixed` | tirx | 4.6249 | deepgemm | 5.1670 | 1.117 | — |
+| `b4_n1_mp1_ps32_h64_d128_f32_fixed` | tirx | 4.3053 | deepgemm | 4.8834 | 1.134 | — |
+| `b4_n1_mp1_ps64_h64_d128_bf16_fixed` | tirx | 4.6540 | deepgemm | 5.2040 | 1.118 | — |
+| `b4_n1_mp1_ps64_h64_d128_f32_fixed` | tirx | 4.2745 | deepgemm | 4.4586 | 1.043 | — |
+| `b4_n1_mp32_ps32_h64_d128_bf16_fixed` | tirx | 4.6337 | deepgemm | 4.6662 | 1.007 | — |
+| `b4_n1_mp32_ps32_h64_d128_f32_fixed` | tirx | 5.1435 | deepgemm | 5.3926 | 1.048 | — |
+| `b4_n1_mp32_ps64_h64_d128_bf16_fixed` | tirx | 4.7032 | deepgemm | 4.7239 | 1.004 | — |
+| `b4_n1_mp32_ps64_h64_d128_f32_fixed` | tirx | 4.8571 | deepgemm | 5.1342 | 1.057 | — |
+| `b4_n1_mp8_ps32_h64_d128_bf16_fixed` | tirx | 4.7173 | deepgemm | 4.9801 | 1.056 | — |
+| `b4_n1_mp8_ps32_h64_d128_f32_fixed` | tirx | 4.7341 | deepgemm | 4.7820 | 1.010 | — |
+| `b4_n1_mp8_ps64_h64_d128_bf16_fixed` | tirx | 4.7647 | deepgemm | 4.8095 | 1.009 | — |
+| `b4_n1_mp8_ps64_h64_d128_f32_fixed` | tirx | 4.5320 | deepgemm | 4.5604 | 1.006 | — |
+| `b8_n1_mp128_ps32_h64_d128_bf16_fixed` | tirx | 4.9052 | deepgemm | 5.2172 | 1.064 | — |
+| `b8_n1_mp128_ps32_h64_d128_f32_fixed` | tirx | 5.2985 | deepgemm | 5.3699 | 1.013 | — |
+| `b8_n1_mp128_ps64_h64_d128_bf16_fixed` | tirx | 5.5635 | deepgemm | 5.6094 | 1.008 | — |
+| `b8_n1_mp128_ps64_h64_d128_f32_fixed` | tirx | 5.4697 | deepgemm | 5.5226 | 1.010 | — |
+| `b8_n1_mp1_ps32_h64_d128_bf16_fixed` | tirx | 4.5274 | deepgemm | 4.8666 | 1.075 | — |
+| `b8_n1_mp1_ps32_h64_d128_f32_fixed` | tirx | 4.4189 | deepgemm | 4.7203 | 1.068 | — |
+| `b8_n1_mp1_ps64_h64_d128_bf16_fixed` | tirx | 4.2809 | deepgemm | 4.8595 | 1.135 | — |
+| `b8_n1_mp1_ps64_h64_d128_f32_fixed` | tirx | 4.3869 | deepgemm | 4.9202 | 1.122 | — |
+| `b8_n1_mp32_ps32_h64_d128_bf16_fixed` | tirx | 4.7830 | deepgemm | 4.7779 | 0.999 | — |
+| `b8_n1_mp32_ps32_h64_d128_f32_fixed` | tirx | 5.2386 | deepgemm | 5.3179 | 1.015 | — |
+| `b8_n1_mp32_ps64_h64_d128_bf16_fixed` | tirx | 4.9528 | deepgemm | 4.9909 | 1.008 | — |
+| `b8_n1_mp32_ps64_h64_d128_f32_fixed` | tirx | 4.8306 | deepgemm | 4.8464 | 1.003 | — |
+| `b8_n1_mp8_ps32_h64_d128_bf16_fixed` | tirx | 5.1218 | deepgemm | 5.3698 | 1.048 | — |
+| `b8_n1_mp8_ps32_h64_d128_f32_fixed` | tirx | 4.7650 | deepgemm | 5.0352 | 1.057 | — |
+| `b8_n1_mp8_ps64_h64_d128_bf16_fixed` | tirx | 4.6411 | deepgemm | 4.6789 | 1.008 | — |
+| `b8_n1_mp8_ps64_h64_d128_f32_fixed` | tirx | 4.7631 | deepgemm | 4.8436 | 1.017 | — |
 ## deepgemm_sm100_fp8_mqa_logits
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
 |---|---|---:|---|---:|---:|---|
-| `s2048_skv4096_h64_d128_bf16_compressed_cp` | tirx | 43.2367 | deepgemm | 44.8829 | 1.038 | — |
-| `s2048_skv4096_h64_d128_bf16_compressed_nocp` | tirx | 56.6371 | deepgemm | 58.3084 | 1.030 | — |
-| `s2048_skv4096_h64_d128_bf16_dense_cp` | tirx | 42.8894 | deepgemm | 42.2019 | 0.984 | — |
-| `s2048_skv4096_h64_d128_bf16_dense_nocp` | tirx | 56.4706 | deepgemm | 55.6460 | 0.985 | — |
-| `s2048_skv4096_h64_d128_f32_compressed_cp` | tirx | 43.3446 | deepgemm | 44.6351 | 1.030 | — |
-| `s2048_skv4096_h64_d128_f32_compressed_nocp` | tirx | 56.4136 | deepgemm | 58.1625 | 1.031 | — |
-| `s2048_skv4096_h64_d128_f32_dense_cp` | tirx | 42.7242 | deepgemm | 41.6104 | 0.974 | — |
-| `s2048_skv4096_h64_d128_f32_dense_nocp` | tirx | 56.3324 | deepgemm | 54.7785 | 0.972 | — |
-| `s2048_skv8192_h64_d128_bf16_compressed_cp` | tirx | 76.0274 | deepgemm | 78.0064 | 1.026 | — |
-| `s2048_skv8192_h64_d128_bf16_compressed_nocp` | tirx | 114.7197 | deepgemm | 120.6304 | 1.052 | — |
-| `s2048_skv8192_h64_d128_bf16_dense_cp` | tirx | 74.4817 | deepgemm | 74.5032 | 1.000 | — |
-| `s2048_skv8192_h64_d128_bf16_dense_nocp` | tirx | 114.7676 | deepgemm | 114.7454 | 1.000 | — |
-| `s2048_skv8192_h64_d128_f32_compressed_cp` | tirx | 76.3288 | deepgemm | 77.5976 | 1.017 | — |
-| `s2048_skv8192_h64_d128_f32_compressed_nocp` | tirx | 116.7965 | deepgemm | 120.2671 | 1.030 | — |
-| `s2048_skv8192_h64_d128_f32_dense_cp` | tirx | 74.3637 | deepgemm | 73.4574 | 0.988 | — |
-| `s2048_skv8192_h64_d128_f32_dense_nocp` | tirx | 115.7477 | deepgemm | 112.6860 | 0.974 | — |
-| `s4096_skv4096_h64_d128_bf16_compressed_cp` | tirx | 75.7840 | deepgemm | 79.3970 | 1.048 | — |
-| `s4096_skv4096_h64_d128_bf16_compressed_nocp` | tirx | 75.9310 | deepgemm | 79.1240 | 1.042 | — |
-| `s4096_skv4096_h64_d128_bf16_dense_cp` | tirx | 75.1144 | deepgemm | 73.6916 | 0.981 | — |
-| `s4096_skv4096_h64_d128_bf16_dense_nocp` | tirx | 75.1137 | deepgemm | 74.0107 | 0.985 | — |
-| `s4096_skv4096_h64_d128_f32_compressed_cp` | tirx | 75.9145 | deepgemm | 79.0995 | 1.042 | — |
-| `s4096_skv4096_h64_d128_f32_compressed_nocp` | tirx | 76.1778 | deepgemm | 79.0002 | 1.037 | — |
-| `s4096_skv4096_h64_d128_f32_dense_cp` | tirx | 75.1860 | deepgemm | 72.5095 | 0.964 | — |
-| `s4096_skv4096_h64_d128_f32_dense_nocp` | tirx | 75.0545 | deepgemm | 72.3152 | 0.964 | — |
-| `s4096_skv8192_h64_d128_bf16_compressed_cp` | tirx | 136.4134 | deepgemm | 142.0493 | 1.041 | — |
-| `s4096_skv8192_h64_d128_bf16_compressed_nocp` | tirx | 197.7501 | deepgemm | 207.0028 | 1.047 | — |
-| `s4096_skv8192_h64_d128_bf16_dense_cp` | tirx | 134.6607 | deepgemm | 132.8556 | 0.987 | — |
-| `s4096_skv8192_h64_d128_bf16_dense_nocp` | tirx | 194.5994 | deepgemm | 193.0987 | 0.992 | — |
-| `s4096_skv8192_h64_d128_f32_compressed_cp` | tirx | 136.1688 | deepgemm | 142.8017 | 1.049 | — |
-| `s4096_skv8192_h64_d128_f32_compressed_nocp` | tirx | 198.9675 | deepgemm | 206.6323 | 1.039 | — |
-| `s4096_skv8192_h64_d128_f32_dense_cp` | tirx | 133.5498 | deepgemm | 130.3368 | 0.976 | — |
-| `s4096_skv8192_h64_d128_f32_dense_nocp` | tirx | 197.3128 | deepgemm | 190.5352 | 0.966 | — |
+| `s2048_skv4096_h64_d128_bf16_compressed_cp` | tirx | 42.8572 | deepgemm | 44.5161 | 1.039 | — |
+| `s2048_skv4096_h64_d128_bf16_compressed_nocp` | tirx | 57.1172 | deepgemm | 58.1696 | 1.018 | — |
+| `s2048_skv4096_h64_d128_bf16_dense_cp` | tirx | 43.2241 | deepgemm | 42.5748 | 0.985 | — |
+| `s2048_skv4096_h64_d128_bf16_dense_nocp` | tirx | 56.1657 | deepgemm | 55.3137 | 0.985 | — |
+| `s2048_skv4096_h64_d128_f32_compressed_cp` | tirx | 43.1997 | deepgemm | 44.7633 | 1.036 | — |
+| `s2048_skv4096_h64_d128_f32_compressed_nocp` | tirx | 57.1400 | deepgemm | 58.0942 | 1.017 | — |
+| `s2048_skv4096_h64_d128_f32_dense_cp` | tirx | 42.8315 | deepgemm | 41.8194 | 0.976 | — |
+| `s2048_skv4096_h64_d128_f32_dense_nocp` | tirx | 55.3553 | deepgemm | 53.5322 | 0.967 | — |
+| `s2048_skv8192_h64_d128_bf16_compressed_cp` | tirx | 74.8012 | deepgemm | 77.8311 | 1.041 | — |
+| `s2048_skv8192_h64_d128_bf16_compressed_nocp` | tirx | 117.2636 | deepgemm | 120.9458 | 1.031 | — |
+| `s2048_skv8192_h64_d128_bf16_dense_cp` | tirx | 73.3090 | deepgemm | 72.9854 | 0.996 | — |
+| `s2048_skv8192_h64_d128_bf16_dense_nocp` | tirx | 114.7257 | deepgemm | 114.9091 | 1.002 | — |
+| `s2048_skv8192_h64_d128_f32_compressed_cp` | tirx | 75.7118 | deepgemm | 77.9454 | 1.030 | — |
+| `s2048_skv8192_h64_d128_f32_compressed_nocp` | tirx | 116.3664 | deepgemm | 121.5902 | 1.045 | — |
+| `s2048_skv8192_h64_d128_f32_dense_cp` | tirx | 74.2522 | deepgemm | 72.8133 | 0.981 | — |
+| `s2048_skv8192_h64_d128_f32_dense_nocp` | tirx | 115.6440 | deepgemm | 113.1928 | 0.979 | — |
+| `s4096_skv4096_h64_d128_bf16_compressed_cp` | tirx | 75.8224 | deepgemm | 79.1568 | 1.044 | — |
+| `s4096_skv4096_h64_d128_bf16_compressed_nocp` | tirx | 76.2796 | deepgemm | 80.0003 | 1.049 | — |
+| `s4096_skv4096_h64_d128_bf16_dense_cp` | tirx | 75.2108 | deepgemm | 73.7631 | 0.981 | — |
+| `s4096_skv4096_h64_d128_bf16_dense_nocp` | tirx | 75.3117 | deepgemm | 74.3656 | 0.987 | — |
+| `s4096_skv4096_h64_d128_f32_compressed_cp` | tirx | 75.9823 | deepgemm | 78.8656 | 1.038 | — |
+| `s4096_skv4096_h64_d128_f32_compressed_nocp` | tirx | 75.8781 | deepgemm | 78.9897 | 1.041 | — |
+| `s4096_skv4096_h64_d128_f32_dense_cp` | tirx | 75.7590 | deepgemm | 73.1679 | 0.966 | — |
+| `s4096_skv4096_h64_d128_f32_dense_nocp` | tirx | 75.0381 | deepgemm | 72.3321 | 0.964 | — |
+| `s4096_skv8192_h64_d128_bf16_compressed_cp` | tirx | 136.5032 | deepgemm | 143.5287 | 1.051 | — |
+| `s4096_skv8192_h64_d128_bf16_compressed_nocp` | tirx | 196.4188 | deepgemm | 208.7397 | 1.063 | — |
+| `s4096_skv8192_h64_d128_bf16_dense_cp` | tirx | 135.4681 | deepgemm | 131.3605 | 0.970 | — |
+| `s4096_skv8192_h64_d128_bf16_dense_nocp` | tirx | 195.7225 | deepgemm | 193.6134 | 0.989 | — |
+| `s4096_skv8192_h64_d128_f32_compressed_cp` | tirx | 136.4931 | deepgemm | 143.4408 | 1.051 | — |
+| `s4096_skv8192_h64_d128_f32_compressed_nocp` | tirx | 198.7638 | deepgemm | 209.1734 | 1.052 | — |
+| `s4096_skv8192_h64_d128_f32_dense_cp` | tirx | 136.2379 | deepgemm | 127.4390 | 0.935 | — |
+| `s4096_skv8192_h64_d128_f32_dense_nocp` | tirx | 196.4166 | deepgemm | 189.6027 | 0.965 | — |
 ## deepgemm_sm100_fp8_paged_mqa_logits
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
 |---|---|---:|---|---:|---:|---|
-| `b16_n1_mp128_ps64_h64_d128_bf16_fixed` | tirx | 6.7739 | deepgemm | 6.7599 | 0.998 | — |
-| `b16_n1_mp128_ps64_h64_d128_f32_fixed` | tirx | 7.0251 | deepgemm | 7.0163 | 0.999 | — |
-| `b16_n1_mp1_ps64_h64_d128_bf16_fixed` | tirx | 4.4765 | deepgemm | 4.5267 | 1.011 | — |
-| `b16_n1_mp1_ps64_h64_d128_f32_fixed` | tirx | 4.4973 | deepgemm | 4.4946 | 0.999 | — |
-| `b16_n1_mp32_ps64_h64_d128_bf16_fixed` | tirx | 5.3600 | deepgemm | 5.3991 | 1.007 | — |
-| `b16_n1_mp32_ps64_h64_d128_f32_fixed` | tirx | 5.4878 | deepgemm | 5.5031 | 1.003 | — |
-| `b16_n1_mp8_ps64_h64_d128_bf16_fixed` | tirx | 5.3105 | deepgemm | 5.3767 | 1.012 | — |
-| `b16_n1_mp8_ps64_h64_d128_f32_fixed` | tirx | 4.7440 | deepgemm | 4.7669 | 1.005 | — |
-| `b1_n1_mp128_ps64_h64_d128_bf16_fixed` | tirx | 4.9611 | deepgemm | 5.2041 | 1.049 | — |
-| `b1_n1_mp128_ps64_h64_d128_f32_fixed` | tirx | 4.9416 | deepgemm | 5.1968 | 1.052 | — |
-| `b1_n1_mp1_ps64_h64_d128_bf16_fixed` | tirx | 4.6505 | deepgemm | 4.8963 | 1.053 | — |
-| `b1_n1_mp1_ps64_h64_d128_f32_fixed` | tirx | 4.6474 | deepgemm | 4.8911 | 1.052 | — |
-| `b1_n1_mp32_ps64_h64_d128_bf16_fixed` | tirx | 4.7081 | deepgemm | 4.9602 | 1.054 | — |
-| `b1_n1_mp32_ps64_h64_d128_f32_fixed` | tirx | 4.7903 | deepgemm | 5.0269 | 1.049 | — |
-| `b1_n1_mp8_ps64_h64_d128_bf16_fixed` | tirx | 4.7657 | deepgemm | 5.2990 | 1.112 | — |
-| `b1_n1_mp8_ps64_h64_d128_f32_fixed` | tirx | 4.7575 | deepgemm | 4.7887 | 1.007 | — |
-| `b2_n1_mp128_ps64_h64_d128_bf16_fixed` | tirx | 5.1130 | deepgemm | 5.3931 | 1.055 | — |
-| `b2_n1_mp128_ps64_h64_d128_f32_fixed` | tirx | 4.9724 | deepgemm | 5.1980 | 1.045 | — |
-| `b2_n1_mp1_ps64_h64_d128_bf16_fixed` | tirx | 4.5746 | deepgemm | 4.8618 | 1.063 | — |
-| `b2_n1_mp1_ps64_h64_d128_f32_fixed` | tirx | 4.5643 | deepgemm | 4.8575 | 1.064 | — |
-| `b2_n1_mp32_ps64_h64_d128_bf16_fixed` | tirx | 4.7589 | deepgemm | 5.0467 | 1.060 | — |
-| `b2_n1_mp32_ps64_h64_d128_f32_fixed` | tirx | 4.7952 | deepgemm | 5.0867 | 1.061 | — |
-| `b2_n1_mp8_ps64_h64_d128_bf16_fixed` | tirx | 4.6460 | deepgemm | 4.9318 | 1.062 | — |
-| `b2_n1_mp8_ps64_h64_d128_f32_fixed` | tirx | 4.7669 | deepgemm | 4.7954 | 1.006 | — |
-| `b4_n1_mp128_ps64_h64_d128_bf16_fixed` | tirx | 5.3689 | deepgemm | 5.3787 | 1.002 | — |
-| `b4_n1_mp128_ps64_h64_d128_f32_fixed` | tirx | 4.9118 | deepgemm | 4.9041 | 0.998 | — |
-| `b4_n1_mp1_ps64_h64_d128_bf16_fixed` | tirx | 4.3919 | deepgemm | 4.4046 | 1.003 | — |
-| `b4_n1_mp1_ps64_h64_d128_f32_fixed` | tirx | 4.3649 | deepgemm | 4.3961 | 1.007 | — |
-| `b4_n1_mp32_ps64_h64_d128_bf16_fixed` | tirx | 4.7270 | deepgemm | 4.7451 | 1.004 | — |
-| `b4_n1_mp32_ps64_h64_d128_f32_fixed` | tirx | 4.7078 | deepgemm | 4.7392 | 1.007 | — |
-| `b4_n1_mp8_ps64_h64_d128_bf16_fixed` | tirx | 5.0769 | deepgemm | 5.3177 | 1.047 | — |
-| `b4_n1_mp8_ps64_h64_d128_f32_fixed` | tirx | 5.0932 | deepgemm | 5.3377 | 1.048 | — |
-| `b8_n1_mp128_ps64_h64_d128_bf16_fixed` | tirx | 5.8325 | deepgemm | 5.8564 | 1.004 | — |
-| `b8_n1_mp128_ps64_h64_d128_f32_fixed` | tirx | 6.2541 | deepgemm | 6.2468 | 0.999 | — |
-| `b8_n1_mp1_ps64_h64_d128_bf16_fixed` | tirx | 4.4646 | deepgemm | 4.4705 | 1.001 | — |
-| `b8_n1_mp1_ps64_h64_d128_f32_fixed` | tirx | 4.9751 | deepgemm | 5.2508 | 1.055 | — |
-| `b8_n1_mp32_ps64_h64_d128_bf16_fixed` | tirx | 5.0635 | deepgemm | 5.1000 | 1.007 | — |
-| `b8_n1_mp32_ps64_h64_d128_f32_fixed` | tirx | 5.2189 | deepgemm | 5.2529 | 1.007 | — |
-| `b8_n1_mp8_ps64_h64_d128_bf16_fixed` | tirx | 4.6838 | deepgemm | 4.7173 | 1.007 | — |
-| `b8_n1_mp8_ps64_h64_d128_f32_fixed` | tirx | 4.6195 | deepgemm | 4.6380 | 1.004 | — |
+| `b16_n1_mp128_ps64_h64_d128_bf16_fixed` | tirx | 6.8409 | deepgemm | 6.8397 | 1.000 | — |
+| `b16_n1_mp128_ps64_h64_d128_f32_fixed` | tirx | 7.0550 | deepgemm | 7.0578 | 1.000 | — |
+| `b16_n1_mp1_ps64_h64_d128_bf16_fixed` | tirx | 4.4870 | deepgemm | 4.4927 | 1.001 | — |
+| `b16_n1_mp1_ps64_h64_d128_f32_fixed` | tirx | 4.6856 | deepgemm | 4.7418 | 1.012 | — |
+| `b16_n1_mp32_ps64_h64_d128_bf16_fixed` | tirx | 5.3929 | deepgemm | 5.4318 | 1.007 | — |
+| `b16_n1_mp32_ps64_h64_d128_f32_fixed` | tirx | 5.5660 | deepgemm | 5.5849 | 1.003 | — |
+| `b16_n1_mp8_ps64_h64_d128_bf16_fixed` | tirx | 4.7838 | deepgemm | 4.7591 | 0.995 | — |
+| `b16_n1_mp8_ps64_h64_d128_f32_fixed` | tirx | 4.8026 | deepgemm | 4.7693 | 0.993 | — |
+| `b1_n1_mp128_ps64_h64_d128_bf16_fixed` | tirx | 4.7059 | deepgemm | 4.7197 | 1.003 | — |
+| `b1_n1_mp128_ps64_h64_d128_f32_fixed` | tirx | 4.9299 | deepgemm | 5.1556 | 1.046 | — |
+| `b1_n1_mp1_ps64_h64_d128_bf16_fixed` | tirx | 5.1067 | deepgemm | 5.3739 | 1.052 | — |
+| `b1_n1_mp1_ps64_h64_d128_f32_fixed` | tirx | 4.5055 | deepgemm | 4.6637 | 1.035 | — |
+| `b1_n1_mp32_ps64_h64_d128_bf16_fixed` | tirx | 4.7292 | deepgemm | 4.9879 | 1.055 | — |
+| `b1_n1_mp32_ps64_h64_d128_f32_fixed` | tirx | 5.1891 | deepgemm | 5.4250 | 1.045 | — |
+| `b1_n1_mp8_ps64_h64_d128_bf16_fixed` | tirx | 5.0346 | deepgemm | 5.2671 | 1.046 | — |
+| `b1_n1_mp8_ps64_h64_d128_f32_fixed` | tirx | 4.5010 | deepgemm | 4.5012 | 1.000 | — |
+| `b2_n1_mp128_ps64_h64_d128_bf16_fixed` | tirx | 5.2053 | deepgemm | 5.1961 | 0.998 | — |
+| `b2_n1_mp128_ps64_h64_d128_f32_fixed` | tirx | 4.7397 | deepgemm | 4.7408 | 1.000 | — |
+| `b2_n1_mp1_ps64_h64_d128_bf16_fixed` | tirx | 4.5587 | deepgemm | 4.8153 | 1.056 | — |
+| `b2_n1_mp1_ps64_h64_d128_f32_fixed` | tirx | 4.9637 | deepgemm | 5.1270 | 1.033 | — |
+| `b2_n1_mp32_ps64_h64_d128_bf16_fixed` | tirx | 4.7726 | deepgemm | 5.0031 | 1.048 | — |
+| `b2_n1_mp32_ps64_h64_d128_f32_fixed` | tirx | 4.8914 | deepgemm | 4.8966 | 1.001 | — |
+| `b2_n1_mp8_ps64_h64_d128_bf16_fixed` | tirx | 4.7694 | deepgemm | 4.9793 | 1.044 | — |
+| `b2_n1_mp8_ps64_h64_d128_f32_fixed` | tirx | 4.7445 | deepgemm | 4.9772 | 1.049 | — |
+| `b4_n1_mp128_ps64_h64_d128_bf16_fixed` | tirx | 5.3274 | deepgemm | 5.3291 | 1.000 | — |
+| `b4_n1_mp128_ps64_h64_d128_f32_fixed` | tirx | 5.3018 | deepgemm | 5.3329 | 1.006 | — |
+| `b4_n1_mp1_ps64_h64_d128_bf16_fixed` | tirx | 4.6258 | deepgemm | 4.8340 | 1.045 | — |
+| `b4_n1_mp1_ps64_h64_d128_f32_fixed` | tirx | 4.6141 | deepgemm | 4.8269 | 1.046 | — |
+| `b4_n1_mp32_ps64_h64_d128_bf16_fixed` | tirx | 4.7392 | deepgemm | 4.7290 | 0.998 | — |
+| `b4_n1_mp32_ps64_h64_d128_f32_fixed` | tirx | 4.9639 | deepgemm | 4.9794 | 1.003 | — |
+| `b4_n1_mp8_ps64_h64_d128_bf16_fixed` | tirx | 4.7873 | deepgemm | 4.7982 | 1.002 | — |
+| `b4_n1_mp8_ps64_h64_d128_f32_fixed` | tirx | 4.5708 | deepgemm | 4.5596 | 0.998 | — |
+| `b8_n1_mp128_ps64_h64_d128_bf16_fixed` | tirx | 5.9221 | deepgemm | 5.8666 | 0.991 | — |
+| `b8_n1_mp128_ps64_h64_d128_f32_fixed` | tirx | 6.2933 | deepgemm | 6.2560 | 0.994 | — |
+| `b8_n1_mp1_ps64_h64_d128_bf16_fixed` | tirx | 4.4943 | deepgemm | 4.4485 | 0.990 | — |
+| `b8_n1_mp1_ps64_h64_d128_f32_fixed` | tirx | 4.4863 | deepgemm | 4.4393 | 0.990 | — |
+| `b8_n1_mp32_ps64_h64_d128_bf16_fixed` | tirx | 5.2806 | deepgemm | 5.5331 | 1.048 | — |
+| `b8_n1_mp32_ps64_h64_d128_f32_fixed` | tirx | 5.2886 | deepgemm | 5.5569 | 1.051 | — |
+| `b8_n1_mp8_ps64_h64_d128_bf16_fixed` | tirx | 4.8467 | deepgemm | 4.8685 | 1.005 | — |
+| `b8_n1_mp8_ps64_h64_d128_f32_fixed` | tirx | 4.6270 | deepgemm | 4.6047 | 0.995 | — |
 ## deepgemm_sm100_tf32_hc_prenorm_gemm
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
 |---|---|---:|---|---:|---:|---|
-| `m137_n24_k7680_s16` | tirx | 5.7587 | deepgemm | 5.4783 | 0.951 | — |
-| `m13_n24_k7168_s1` | tirx | 24.3605 | deepgemm | 21.4179 | 0.879 | — |
-| `m4096_n24_k28672_s16` | tirx | 65.3296 | deepgemm | 63.2366 | 0.968 | — |
-| `m4096_n24_k7168_s1` | tirx | 25.8323 | deepgemm | 23.7160 | 0.918 | — |
+| `m137_n24_k7680_s16` | tirx | 5.8711 | deepgemm | 5.5825 | 0.951 | — |
+| `m13_n24_k7168_s1` | tirx | 24.3509 | deepgemm | 21.4310 | 0.880 | — |
+| `m4096_n24_k28672_s16` | tirx | 65.2296 | deepgemm | 63.2815 | 0.970 | — |
+| `m4096_n24_k7168_s1` | tirx | 25.9377 | deepgemm | 23.7780 | 0.917 | — |
 ## flash_attention4
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
 |---|---|---:|---|---:|---:|---|
-| `s1024_h32kv16` | tir | 19.8096 | flashattn_sm100 | 20.0760 | 1.013 | — |
-| `s1024_h32kv16_causal` | tir | 20.4283 | flashattn_sm100 | 20.2782 | 0.993 | — |
-| `s1024_h32kv32` | tir | 20.1870 | flashattn_sm100 | 20.4458 | 1.013 | — |
-| `s1024_h32kv32_causal` | tir | 20.8159 | flashattn_sm100 | 21.3923 | 1.028 | — |
-| `s1024_h32kv4` | tir | 19.2540 | flashattn_sm100 | 19.7927 | 1.028 | — |
-| `s1024_h32kv4_causal` | tir | 19.5308 | flashattn_sm100 | 20.0070 | 1.024 | — |
-| `s1024_h32kv8` | tir | 19.5045 | flashattn_sm100 | 19.5702 | 1.003 | — |
-| `s1024_h32kv8_causal` | tir | 19.6599 | flashattn_sm100 | 19.7318 | 1.004 | — |
-| `s2048_h32kv16` | tir | 57.3001 | flashattn_sm100 | 57.6297 | 1.006 | — |
-| `s2048_h32kv16_causal` | tir | 36.2646 | flashattn_sm100 | 38.4182 | 1.059 | — |
-| `s2048_h32kv32` | tir | 59.4427 | flashattn_sm100 | 59.7341 | 1.005 | — |
-| `s2048_h32kv32_causal` | tir | 40.4139 | flashattn_sm100 | 40.0659 | 0.991 | — |
-| `s2048_h32kv4` | tir | 55.4590 | flashattn_sm100 | 56.1430 | 1.012 | — |
-| `s2048_h32kv4_causal` | tir | 35.1132 | flashattn_sm100 | 37.7379 | 1.075 | — |
-| `s2048_h32kv8` | tir | 56.1573 | flashattn_sm100 | 56.9796 | 1.015 | — |
-| `s2048_h32kv8_causal` | tir | 35.4236 | flashattn_sm100 | 37.8938 | 1.070 | — |
-| `s4096_h32kv16` | tir | 213.4413 | flashattn_sm100 | 212.4653 | 0.995 | — |
-| `s4096_h32kv16_causal` | tir | 111.9785 | flashattn_sm100 | 117.6295 | 1.050 | — |
-| `s4096_h32kv32` | tir | 214.2722 | flashattn_sm100 | 217.6024 | 1.016 | — |
-| `s4096_h32kv32_causal` | tir | 121.5008 | flashattn_sm100 | 120.1768 | 0.989 | — |
-| `s4096_h32kv4` | tir | 205.9919 | flashattn_sm100 | 210.2510 | 1.021 | — |
-| `s4096_h32kv4_causal` | tir | 109.2315 | flashattn_sm100 | 115.9414 | 1.061 | — |
-| `s4096_h32kv8` | tir | 206.8473 | flashattn_sm100 | 208.3275 | 1.007 | — |
-| `s4096_h32kv8_causal` | tir | 110.3818 | flashattn_sm100 | 115.4242 | 1.046 | — |
-| `s8192_h32kv16` | tir | 767.7250 | flashattn_sm100 | 752.4508 | 0.980 | — |
-| `s8192_h32kv16_causal` | tir | 465.8747 | flashattn_sm100 | 413.8001 | 0.888 | — |
-| `s8192_h32kv32` | tir | 782.5778 | flashattn_sm100 | 769.3423 | 0.983 | — |
-| `s8192_h32kv32_causal` | tir | 436.0990 | flashattn_sm100 | 430.6355 | 0.987 | — |
-| `s8192_h32kv4` | tir | 772.7373 | flashattn_sm100 | 768.1529 | 0.994 | — |
-| `s8192_h32kv4_causal` | tir | 404.4490 | flashattn_sm100 | 415.1800 | 1.027 | — |
-| `s8192_h32kv8` | tir | 765.2810 | flashattn_sm100 | 776.3060 | 1.014 | — |
-| `s8192_h32kv8_causal` | tir | 400.9411 | flashattn_sm100 | 419.6447 | 1.047 | — |
+| `s1024_h32kv16` | tir | 19.8835 | flashattn_sm100 | 19.9337 | 1.003 | — |
+| `s1024_h32kv16_causal` | tir | 20.6334 | flashattn_sm100 | 20.2033 | 0.979 | — |
+| `s1024_h32kv32` | tir | 20.3027 | flashattn_sm100 | 20.4006 | 1.005 | — |
+| `s1024_h32kv32_causal` | tir | 21.0393 | flashattn_sm100 | 21.5295 | 1.023 | — |
+| `s1024_h32kv4` | tir | 19.2423 | flashattn_sm100 | 19.6791 | 1.023 | — |
+| `s1024_h32kv4_causal` | tir | 19.0394 | flashattn_sm100 | 19.8235 | 1.041 | — |
+| `s1024_h32kv8` | tir | 19.5983 | flashattn_sm100 | 19.6776 | 1.004 | — |
+| `s1024_h32kv8_causal` | tir | 19.5914 | flashattn_sm100 | 19.7005 | 1.006 | — |
+| `s2048_h32kv16` | tir | 57.3689 | flashattn_sm100 | 58.0667 | 1.012 | — |
+| `s2048_h32kv16_causal` | tir | 36.2113 | flashattn_sm100 | 38.7562 | 1.070 | — |
+| `s2048_h32kv32` | tir | 59.0573 | flashattn_sm100 | 59.6443 | 1.010 | — |
+| `s2048_h32kv32_causal` | tir | 40.7151 | flashattn_sm100 | 40.2601 | 0.989 | — |
+| `s2048_h32kv4` | tir | 55.3133 | flashattn_sm100 | 56.0365 | 1.013 | — |
+| `s2048_h32kv4_causal` | tir | 34.9291 | flashattn_sm100 | 38.0276 | 1.089 | — |
+| `s2048_h32kv8` | tir | 56.8599 | flashattn_sm100 | 57.7193 | 1.015 | — |
+| `s2048_h32kv8_causal` | tir | 35.0958 | flashattn_sm100 | 37.8379 | 1.078 | — |
+| `s4096_h32kv16` | tir | 209.9647 | flashattn_sm100 | 214.7269 | 1.023 | — |
+| `s4096_h32kv16_causal` | tir | 112.1895 | flashattn_sm100 | 114.4095 | 1.020 | — |
+| `s4096_h32kv32` | tir | 215.8534 | flashattn_sm100 | 219.9906 | 1.019 | — |
+| `s4096_h32kv32_causal` | tir | 122.9837 | flashattn_sm100 | 121.3282 | 0.987 | — |
+| `s4096_h32kv4` | tir | 208.1472 | flashattn_sm100 | 210.9866 | 1.014 | — |
+| `s4096_h32kv4_causal` | tir | 108.7540 | flashattn_sm100 | 115.6559 | 1.063 | — |
+| `s4096_h32kv8` | tir | 206.0879 | flashattn_sm100 | 211.6114 | 1.027 | — |
+| `s4096_h32kv8_causal` | tir | 109.4769 | flashattn_sm100 | 116.9152 | 1.068 | — |
+| `s8192_h32kv16` | tir | 765.7912 | flashattn_sm100 | 759.8214 | 0.992 | — |
+| `s8192_h32kv16_causal` | tir | 467.3904 | flashattn_sm100 | 429.1735 | 0.918 | — |
+| `s8192_h32kv32` | tir | 786.8265 | flashattn_sm100 | 803.3429 | 1.021 | — |
+| `s8192_h32kv32_causal` | tir | 436.8399 | flashattn_sm100 | 434.9412 | 0.996 | — |
+| `s8192_h32kv4` | tir | 753.1620 | flashattn_sm100 | 771.7754 | 1.025 | — |
+| `s8192_h32kv4_causal` | tir | 408.1656 | flashattn_sm100 | 412.5219 | 1.011 | — |
+| `s8192_h32kv8` | tir | 766.9759 | flashattn_sm100 | 772.4355 | 1.007 | — |
+| `s8192_h32kv8_causal` | tir | 411.0292 | flashattn_sm100 | 424.4889 | 1.033 | — |
 ## fp16_bf16_gemm
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
 |---|---|---:|---|---:|---:|---|
-| `bf16_1024x1024x1024` | tir | 6.7977 | deepgemm-cublaslt | 5.9876 | 0.881 | deepgemm-bf16=7.9204, torch-cublas=6.0023 |
-| `bf16_16384x16384x16384` | tir | 5606.5364 | torch-cublas | 5587.3767 | 0.997 | deepgemm-bf16=6748.0801, deepgemm-cublaslt=5611.5691 |
-| `bf16_2048x2048x2048` | tir | 16.3830 | deepgemm-cublaslt | 15.6939 | 0.958 | deepgemm-bf16=18.5112, torch-cublas=15.7318 |
-| `bf16_4096x4096x4096` | tir | 93.4358 | torch-cublas | 89.9932 | 0.963 | deepgemm-bf16=91.2166, deepgemm-cublaslt=90.3658 |
-| `bf16_8192x8192x8192` | tir | 679.0821 | deepgemm-cublaslt | 673.2049 | 0.991 | deepgemm-bf16=674.1139, torch-cublas=730.1406 |
-| `fp16_1024x1024x1024` | tir | 6.9652 | deepgemm-cublaslt | 6.0668 | 0.871 | torch-cublas=6.0743 |
-| `fp16_16384x16384x16384` | tir | 5713.6190 | deepgemm-cublaslt | 5683.7476 | 0.995 | torch-cublas=5832.5427 |
-| `fp16_2048x2048x2048` | tir | 16.5389 | torch-cublas | 15.8654 | 0.959 | deepgemm-cublaslt=15.8686 |
-| `fp16_4096x4096x4096` | tir | 93.9727 | torch-cublas | 92.0741 | 0.980 | deepgemm-cublaslt=92.9098 |
-| `fp16_8192x8192x8192` | tir | 741.7718 | deepgemm-cublaslt | 760.2102 | 1.025 | torch-cublas=778.0312 |
+| `bf16_1024x1024x1024` | tir | 6.8238 | deepgemm-cublaslt | 5.9957 | 0.879 | deepgemm-bf16=7.9026, torch-cublas=5.9980 |
+| `bf16_16384x16384x16384` | tir | 5895.4776 | torch-cublas | 5584.0874 | 0.947 | deepgemm-bf16=6640.1869, deepgemm-cublaslt=5635.9764 |
+| `bf16_2048x2048x2048` | tir | 16.3996 | deepgemm-cublaslt | 15.6963 | 0.957 | deepgemm-bf16=18.4549, torch-cublas=15.6990 |
+| `bf16_4096x4096x4096` | tir | 92.1395 | deepgemm-cublaslt | 87.2592 | 0.947 | deepgemm-bf16=90.4326, torch-cublas=88.0935 |
+| `bf16_8192x8192x8192` | tir | 683.4882 | deepgemm-cublaslt | 695.3538 | 1.017 | deepgemm-bf16=716.4311, torch-cublas=712.0333 |
+| `fp16_1024x1024x1024` | tir | 6.9865 | torch-cublas | 6.0781 | 0.870 | deepgemm-cublaslt=6.0931 |
+| `fp16_16384x16384x16384` | tir | 5600.6920 | torch-cublas | 5745.2317 | 1.026 | deepgemm-cublaslt=5994.3154 |
+| `fp16_2048x2048x2048` | tir | 16.5632 | torch-cublas | 16.0245 | 0.967 | deepgemm-cublaslt=16.0295 |
+| `fp16_4096x4096x4096` | tir | 95.6247 | deepgemm-cublaslt | 91.1782 | 0.954 | torch-cublas=91.4866 |
+| `fp16_8192x8192x8192` | tir | 732.3880 | deepgemm-cublaslt | 739.0783 | 1.009 | torch-cublas=763.0512 |
 ## fp8_blockwise_gemm
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
 |---|---|---:|---|---:|---:|---|
-| `deepgemm_m4096_n2112_k7168` | tir | 50.4992 | deepgemm | 50.7831 | 1.006 | — |
-| `deepgemm_m4096_n24576_k1536` | tir | 113.3228 | deepgemm | 114.1334 | 1.007 | — |
-| `deepgemm_m4096_n32768_k512` | tir | 68.8340 | deepgemm | 72.6083 | 1.055 | — |
-| `deepgemm_m4096_n4096_k7168` | tir | 81.2952 | deepgemm | 81.0871 | 0.997 | — |
-| `deepgemm_m4096_n576_k7168` | tir | 20.0076 | deepgemm | 20.4505 | 1.022 | — |
-| `deepgemm_m4096_n7168_k16384` | tir | 340.1152 | deepgemm | 333.0350 | 0.979 | — |
-| `deepgemm_m4096_n7168_k2048` | tir | 43.1832 | deepgemm | 43.6777 | 1.011 | — |
+| `deepgemm_m4096_n2112_k7168` | tir | 50.3019 | deepgemm | 50.7254 | 1.008 | — |
+| `deepgemm_m4096_n24576_k1536` | tir | 116.0582 | deepgemm | 116.5337 | 1.004 | — |
+| `deepgemm_m4096_n32768_k512` | tir | 67.2035 | deepgemm | 72.3361 | 1.076 | — |
+| `deepgemm_m4096_n4096_k7168` | tir | 82.8899 | deepgemm | 82.5567 | 0.996 | — |
+| `deepgemm_m4096_n576_k7168` | tir | 20.0296 | deepgemm | 20.4921 | 1.023 | — |
+| `deepgemm_m4096_n7168_k16384` | tir | 336.4848 | deepgemm | 336.0582 | 0.999 | — |
+| `deepgemm_m4096_n7168_k2048` | tir | 42.8906 | deepgemm | 43.2909 | 1.009 | — |
 ## nvfp4_gemm
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
 |---|---|---:|---|---:|---:|---|
-| `1024x1024x1024` | tir | 5.4714 | flashinfer | 4.5010 | 0.823 | cublaslt_nvfp4=4.5685 |
-| `16384x16384x16384` | tir | 1490.2281 | cublaslt_nvfp4 | 1428.0843 | 0.958 | flashinfer=1447.4385 |
-| `2048x2048x2048` | tir | 8.4138 | cublaslt_nvfp4 | 7.5407 | 0.896 | flashinfer=7.6777 |
-| `4096x4096x4096` | tir | 29.6078 | cublaslt_nvfp4 | 28.8391 | 0.974 | flashinfer=29.9187 |
-| `8192x8192x8192` | tir | 177.4519 | cublaslt_nvfp4 | 179.1572 | 1.010 | flashinfer=181.3831 |
+| `1024x1024x1024` | tir | 5.2126 | flashinfer | 4.4804 | 0.860 | cublaslt_nvfp4=4.5215 |
+| `16384x16384x16384` | tir | 1452.6373 | flashinfer | 1398.3717 | 0.963 | cublaslt_nvfp4=1405.9607 |
+| `2048x2048x2048` | tir | 8.5739 | cublaslt_nvfp4 | 7.4706 | 0.871 | flashinfer=7.5880 |
+| `4096x4096x4096` | tir | 29.6593 | cublaslt_nvfp4 | 28.7817 | 0.970 | flashinfer=30.0261 |
+| `8192x8192x8192` | tir | 175.4952 | flashinfer | 184.8774 | 1.053 | cublaslt_nvfp4=188.2353 |
 ## sparse_flashmla_prefill_head128_phase1
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
 |---|---|---:|---|---:|---:|---|
-| `bench_regular_dqk512_hq128_s4096_kv32768_topk2048` | tirx | 1745.5406 | flashmla | 1767.3245 | 1.012 | — |
-| `bench_regular_dqk512_hq128_s4096_kv65536_topk2048` | tirx | 1861.3200 | flashmla | 1901.3996 | 1.022 | — |
-| `bench_regular_dqk512_hq128_s4096_kv8192_topk2048` | tirx | 1692.0142 | flashmla | 1723.2262 | 1.018 | — |
-| `bench_regular_dqk576_hq128_s4096_kv32768_topk2048` | tirx | 1805.0255 | flashmla | 1821.1776 | 1.009 | — |
-| `bench_regular_dqk576_hq128_s4096_kv65536_topk2048` | tirx | 1992.5705 | flashmla | 2004.8074 | 1.006 | — |
-| `bench_regular_dqk576_hq128_s4096_kv8192_topk2048` | tirx | 1761.9145 | flashmla | 1803.5413 | 1.024 | — |
+| `bench_regular_dqk512_hq128_s4096_kv32768_topk2048` | tirx | 1624.1453 | flashmla | 1774.6467 | 1.093 | — |
+| `bench_regular_dqk512_hq128_s4096_kv65536_topk2048` | tirx | 1795.7931 | flashmla | 1899.9648 | 1.058 | — |
+| `bench_regular_dqk512_hq128_s4096_kv8192_topk2048` | tirx | 1704.9224 | flashmla | 1758.6548 | 1.032 | — |
+| `bench_regular_dqk576_hq128_s4096_kv32768_topk2048` | tirx | 1803.4952 | flashmla | 1831.0718 | 1.015 | — |
+| `bench_regular_dqk576_hq128_s4096_kv65536_topk2048` | tirx | 1971.9645 | flashmla | 2018.3973 | 1.024 | — |
+| `bench_regular_dqk576_hq128_s4096_kv8192_topk2048` | tirx | 1690.7523 | flashmla | 1803.9114 | 1.067 | — |
 ## sparse_flashmla_prefill_head128_small_topk_phase1
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
 |---|---|---:|---|---:|---:|---|
-| `bench_smalltopk_dqk512_hq128_s4096_kv32768_topk1280` | tirx | 1142.0580 | flashmla | 1157.1075 | 1.013 | — |
-| `bench_smalltopk_dqk512_hq128_s4096_kv65536_topk1280` | tirx | 1171.0121 | flashmla | 1199.7089 | 1.025 | — |
-| `bench_smalltopk_dqk512_hq128_s4096_kv8192_topk1280` | tirx | 1140.2871 | flashmla | 1155.1062 | 1.013 | — |
+| `bench_smalltopk_dqk512_hq128_s4096_kv32768_topk1280` | tirx | 1105.8868 | flashmla | 1164.5153 | 1.053 | — |
+| `bench_smalltopk_dqk512_hq128_s4096_kv65536_topk1280` | tirx | 1126.6650 | flashmla | 1180.8836 | 1.048 | — |
+| `bench_smalltopk_dqk512_hq128_s4096_kv8192_topk1280` | tirx | 1079.1054 | flashmla | 1152.0631 | 1.068 | — |
 ## sparse_flashmla_prefill_head64_phase1
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
 |---|---|---:|---|---:|---:|---|
-| `bench_dqk512_hq64_s4096_kv32768_topk512` | tirx | 365.9537 | flashmla | 378.0189 | 1.033 | — |
-| `bench_dqk512_hq64_s4096_kv49152_topk512` | tirx | 370.7603 | flashmla | 382.5577 | 1.032 | — |
-| `bench_dqk512_hq64_s4096_kv65536_topk512` | tirx | 378.1854 | flashmla | 389.8084 | 1.031 | — |
-| `bench_dqk512_hq64_s4096_kv8192_topk512` | tirx | 362.5878 | flashmla | 375.7723 | 1.036 | — |
-| `bench_dqk576_hq64_s4096_kv32768_topk512` | tirx | 379.3977 | flashmla | 395.7642 | 1.043 | — |
-| `bench_dqk576_hq64_s4096_kv49152_topk512` | tirx | 386.7092 | flashmla | 404.0548 | 1.045 | — |
-| `bench_dqk576_hq64_s4096_kv65536_topk512` | tirx | 399.5216 | flashmla | 417.2353 | 1.044 | — |
-| `bench_dqk576_hq64_s4096_kv8192_topk512` | tirx | 372.7221 | flashmla | 383.7624 | 1.030 | — |
+| `bench_dqk512_hq64_s4096_kv32768_topk512` | tirx | 380.4536 | flashmla | 380.2676 | 1.000 | — |
+| `bench_dqk512_hq64_s4096_kv49152_topk512` | tirx | 367.8164 | flashmla | 385.2372 | 1.047 | — |
+| `bench_dqk512_hq64_s4096_kv65536_topk512` | tirx | 370.0584 | flashmla | 389.4789 | 1.052 | — |
+| `bench_dqk512_hq64_s4096_kv8192_topk512` | tirx | 364.4971 | flashmla | 373.7882 | 1.025 | — |
+| `bench_dqk576_hq64_s4096_kv32768_topk512` | tirx | 377.2035 | flashmla | 395.2780 | 1.048 | — |
+| `bench_dqk576_hq64_s4096_kv49152_topk512` | tirx | 381.1478 | flashmla | 409.9546 | 1.076 | — |
+| `bench_dqk576_hq64_s4096_kv65536_topk512` | tirx | 387.7999 | flashmla | 422.3270 | 1.089 | — |
+| `bench_dqk576_hq64_s4096_kv8192_topk512` | tirx | 368.3422 | flashmla | 385.6752 | 1.047 | — |
