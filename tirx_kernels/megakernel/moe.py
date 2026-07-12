@@ -1258,6 +1258,63 @@ def _compute_reference_routing(ref_case, mk: MegaKernelMOE):
     )
 
 
+def _build_sglang_full_reference(mk: MegaKernelMOE):
+    try:
+        import importlib
+        import os
+
+        os.environ.setdefault(
+            "SGLANG_MOE_CONFIG_DIR", os.path.join(os.path.dirname(__file__), "sglang_moe_configs")
+        )
+
+        triton_compiler = importlib.import_module("triton.compiler.compiler")
+        if not hasattr(triton_compiler, "triton_key"):
+            triton_key = triton_compiler.get_cache_key.__globals__.get("triton_key")
+            if triton_key is not None:
+                triton_compiler.triton_key = triton_key
+
+        from sglang.srt.layers.moe import MoeRunnerConfig
+        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
+        from sglang.srt.layers.moe.topk import StandardTopKOutput
+        from sglang.srt.runtime_context import get_server_args
+        from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+    except (ImportError, AttributeError) as err:
+        raise RuntimeError(f"sglang full MoE reference is unavailable: {err}") from err
+
+    try:
+        get_server_args()
+    except ValueError:
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+
+    moe_config = MoeRunnerConfig(
+        num_experts=mk.NUM_EXPERTS,
+        num_local_experts=mk.NUM_EXPERTS,
+        hidden_size=mk.HIDDEN_SIZE,
+        intermediate_size_per_partition=mk.INTERMEDIATE_SIZE,
+        top_k=mk.NUM_EXPERTS_PER_TOK,
+        params_dtype=torch.float16,
+        inplace=False,
+    )
+
+    def run(case):
+        ref_case = _ensure_reference_cuda_case(case, mk)
+        gating_output, topk_weights, topk_indices = _compute_reference_routing(ref_case, mk)
+        topk_output = StandardTopKOutput(
+            topk_weights=topk_weights, topk_ids=topk_indices, router_logits=gating_output
+        )
+        out = fused_moe(
+            ref_case["hidden_state"],
+            ref_case["grp_gate_up_weight"],
+            ref_case["grp_down_weight"],
+            topk_output,
+            moe_config,
+        )
+        ref_case["sglang_full_output"] = out
+        return out
+
+    return run
+
+
 def _build_flashinfer_full_reference(batch_size: int, mk: MegaKernelMOE):
     try:
         import os
@@ -1358,13 +1415,13 @@ def _validate_tir_case(case, mk: MegaKernelMOE, *, check_torch: bool = True):
     return out
 
 
-def _validate_tir_matches_flashinfer(case, mk: MegaKernelMOE, flashinfer_run):
+def _validate_tir_matches_reference(case, mk: MegaKernelMOE, reference_run):
     out = case["tir"].get("last_output")
     if out is None:
         out_np = _validate_tir_case(case, mk)
     else:
         out_np = out.numpy()
-    ref_np = flashinfer_run(case).detach().cpu().numpy()
+    ref_np = reference_run(case).detach().cpu().numpy()
     np.testing.assert_allclose(out_np, ref_np, rtol=2e-2, atol=1e-2)
     abs_diff = np.abs(out_np.astype(np.float32) - ref_np.astype(np.float32))
     return {
@@ -1514,8 +1571,20 @@ def run_bench(
         )
     _validate_tir_case(case, mk, check_torch=batch_size <= max(_TEST_BATCH_SIZES))
 
+    sglang_runner = None
     flashinfer_runner = None
     validation = {}
+
+    def build_sglang_full():
+        nonlocal sglang_runner
+        if sglang_runner is None:
+            runner = _build_sglang_full_reference(mk)
+
+            def run():
+                return runner(case)
+
+            sglang_runner = run
+        return sglang_runner
 
     def build_flashinfer_full():
         nonlocal flashinfer_runner
@@ -1538,7 +1607,7 @@ def run_bench(
         warmup=warmup,
         repeat=repeat,
         timer=timer,
-        references={"flashinfer_full": build_flashinfer_full},
+        references={"sglang_full": build_sglang_full, "flashinfer_full": build_flashinfer_full},
         rounds=rounds,
         round_cooldown_s=round_cooldown_s,
         **kwargs,
@@ -1546,11 +1615,18 @@ def run_bench(
 
     if flashinfer_runner is not None and "tir" in case:
         try:
-            validation["tir_vs_flashinfer_full"] = _validate_tir_matches_flashinfer(
+            validation["tir_vs_flashinfer_full"] = _validate_tir_matches_reference(
                 case, mk, lambda _: flashinfer_runner()
             )
         except Exception as err:
             validation["tir_vs_flashinfer_full_error"] = str(err)
+    if sglang_runner is not None and "tir" in case:
+        try:
+            validation["tir_vs_sglang_full"] = _validate_tir_matches_reference(
+                case, mk, lambda _: sglang_runner()
+            )
+        except Exception as err:
+            validation["tir_vs_sglang_full_error"] = str(err)
 
     result.setdefault("metadata", {})
     result["metadata"].update(
@@ -1560,6 +1636,8 @@ def run_bench(
             "world_size": world_size,
             "config": MEGAKERNEL_MOE_BENCH_CONFIG["CONFIG_NAME"],
             "benchmark_scope": "full_moe_router_plus_expert",
+            "sglang_router": "torch_fp32_mm_softmax_topk",
+            "sglang_weight_layout": "grp_gate_up_weight",
             "flashinfer_router": "torch_fp32_mm_softmax_topk",
             "flashinfer_weight_layout": "grp_up_gate_weight",
             "launch_slots": launch_slots,

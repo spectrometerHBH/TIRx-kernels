@@ -43,6 +43,41 @@ The benchmark shape is Qwen3-30B-A3B MoE:
 Shapes in this document use logical valid ranges.  Allocated workspaces usually
 use `TP_MAX`, while runtime work only covers `TP`.
 
+## SGLang Source Baseline
+
+The optional SGLang fused-MoE baseline is imported lazily from a source
+checkout.  It does not require installing the `sglang` package:
+
+```bash
+export WORKSPACE=/path/to/workspace
+export SGLANG_PATH=$HOME/kernel-libs/sglang
+export PYTHONPATH="${SGLANG_PATH}/python:${WORKSPACE}/tirx-kernels:${WORKSPACE}/tvm/python"
+export TVM_LIBRARY_PATH="${WORKSPACE}/tvm/build/lib"
+
+python -m tirx_kernels.bench \
+  --kernel megakernel_moe \
+  --config moe_a3b_bs1_static \
+  --timer proton \
+  --warmup 30 \
+  --repeat 10
+```
+
+SGLang module import, runtime-context setup, and Triton JIT compilation happen
+outside the timed region.  The timed `sglang_full` callable includes the same
+FP32 router matmul, softmax, top-k, and expert computation as the full TIRx MoE
+scope.  Both implementations receive the same logical input and weights.  The
+result metadata includes `tir_vs_sglang_full`; treat a missing or failed
+validation as a benchmark failure.
+
+The module includes B200 configs under `sglang_moe_configs/` for SGLang commit
+`96a04cb13f9c3ed86028e090784a9eb059cf5318` and Triton 3.6.0.  They were generated
+with SGLang's separated fused-MoE tuner over its complete 1920-config search
+space for `B = [1, 8, 32, 128, 512, 1024, 2048, 4096]`.  Tuning used 100
+fixed-seed, uniformly routed top-k tensors with distinct expert IDs per token.
+The two config files independently select gate/up and down-projection settings,
+including the down TMA decision.  Set `SGLANG_MOE_CONFIG_DIR` to override the
+packaged configs with a retuned directory for another GPU or Triton version.
+
 ## Forward Pipeline
 
 The logical computation is:
