@@ -6105,7 +6105,6 @@ CONFIGS = [
         "label": "t8192_m8192_h7168_i3072_e384_k6_g6",
     },
 ]
-BENCH_CONFIGS = CONFIGS
 
 
 def _make_config(
