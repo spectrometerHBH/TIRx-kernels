@@ -25,6 +25,12 @@ import numpy as np
 import torch
 
 import tvm
+from tirx_kernels.megakernel.dsl import (
+    MoeLowerer,
+    build_moe_graph,
+    make_moe_plan,
+    policy_for_scheduler,
+)
 from tirx_kernels.megakernel.tile_tasks import (
     CountAndSortExpertTokens,
     GemmTile,
@@ -57,9 +63,12 @@ KERNEL_META = {"name": "megakernel_moe", "category": "megakernel", "compute_capa
 
 _SUPPORTED_SCHEDULERS = ("static", "dynamic", "unfused")
 _STATIC_QUEUE_SCHEDULERS = ("static", "unfused")
-_TEST_BATCH_SIZES = (1, 128)
+_SUPPORTED_LOWERINGS = ("dsl", "manual")
+_DEFAULT_LOWERING = "dsl"
+_TEST_BATCH_SIZES = (1, 4, 128, 512, 2048)
 _BENCH_BATCH_SIZES = (1, 8, 32, 128, 512, 1024, 2048, 4096)
 _BENCH_LAUNCH_SLOT_HEADROOM = 1.25
+_TORCH_REFERENCE_MAX_BATCH_SIZE = 128
 
 CONFIGS = [
     {
@@ -92,6 +101,29 @@ class MegaKernelMOE(MegaKernelWrapper):
         self.NUM_EXPERTS = config.get("NUM_EXPERTS", None)
         self.NUM_EXPERTS_PER_TOK = config.get("NUM_EXPERTS_PER_TOK", None)
         self.GATING_SPLIT_K_FACTOR = config.get("GATING_SPLIT_K_FACTOR", None)
+
+    def get_normalized_plan(self, scheduler: str):
+        batch_size = getattr(self, "_compile_batch_size", 1)
+        return make_moe_plan(self.config, batch_size, scheduler)
+
+    def _make_dsl_lowerer(self, scheduler: str):
+        batch_size = getattr(self, "_compile_batch_size", 1)
+        lowerer = MoeLowerer(policy_for_scheduler(scheduler), owner=self)
+        build_moe_graph(self.config, batch_size).lower(lowerer)
+        return lowerer
+
+    def get_module(self, scheduler: str, lowering: str = _DEFAULT_LOWERING):
+        _check_scheduler(scheduler)
+        _check_lowering(lowering)
+        previous = getattr(self, "_active_lowering", None)
+        self._active_lowering = lowering
+        try:
+            return super().get_module(scheduler)
+        finally:
+            if previous is None:
+                del self._active_lowering
+            else:
+                self._active_lowering = previous
 
     def _set_tiles(self, batch_size, low_batch):
         self.gate = self._add_tile(
@@ -546,6 +578,8 @@ class MegaKernelMOE(MegaKernelWrapper):
         is_dynamic_sch,
         Semaphore: type[static_scheduler.Semaphore | dynamic_scheduler.Semaphore],
         Scheduler: type[static_scheduler.StaticTileScheduler | dynamic_scheduler.DynamicTileScheduler],
+        lowering,
+        dsl_lowerer,
     ):
         # initialize tile
         self.set_tiles(batch_size, low_batch)
@@ -570,13 +604,16 @@ class MegaKernelMOE(MegaKernelWrapper):
         self.class_init_all(self.smem_manager)
 
         # initialize event tensors
-        self.set_events(
-            is_dynamic_sch,
-            batch_size,
-            Semaphore,
-            etensor_workspace_global,
-            unfused,
-        )
+        if lowering == "dsl":
+            dsl_lowerer.init_events(Semaphore, etensor_workspace_global)
+        else:
+            self.set_events(
+                is_dynamic_sch,
+                batch_size,
+                Semaphore,
+                etensor_workspace_global,
+                unfused,
+            )
 
         # initialize tile scheduler and smem_manager
         if not is_dynamic_sch:
@@ -587,25 +624,50 @@ class MegaKernelMOE(MegaKernelWrapper):
 
         topk_ids_flattened = topk_indices_global.view(-1)
         topk_weights_flattened = topk_weights_global.view(-1)
+        dsl_context = Tx.meta_var({
+            "hidden_state": hidden_state_global,
+            "residual": residual_global,
+            "output": output_global,
+            "gate_weight": gate_weight_global,
+            "gate_up_weight": grp_gate_up_weight_global,
+            "down_weight": grp_down_weight_global,
+            "gating_output": gating_output_global,
+            "topk_weights": topk_weights_global,
+            "topk_indices": topk_indices_global,
+            "topk_indices_flat": topk_ids_flattened,
+            "topk_weights_flat": topk_weights_flattened,
+            "sorted_token_ids": sorted_token_ids_global,
+            "expert_ids": expert_ids_global,
+            "num_valid_tokens": num_valid_tokens_global,
+            "num_tokens_post_pad": num_tokens_post_pad_global,
+            "cumsum_buffer": cumsum_buffer_global,
+            "reordered_hidden_state": reordered_hidden_state_global,
+            "gate_up_output": gate_up_output_global,
+            "silu_mul_output": silu_mul_output_global,
+            "topk_reduce_output": topk_reduce_output_global,
+        })
         while self.tile_scheduler.valid():
-            if self.tile_scheduler.task_type == JobType.MOE_GATING.value:
-                self.task_impl_moe_gating(hidden_state_global, gate_weight_global, gating_output_global, is_dynamic_sch)
-            elif self.tile_scheduler.task_type == JobType.MOE_TOPK_SOFTMAX.value:
-                self.task_impl_moe_topk_softmax(gating_output_global, topk_weights_global, topk_indices_global, is_dynamic_sch, renormalize=False)
-            elif self.tile_scheduler.task_type == JobType.MOE_ALIGN.value:
-                self.task_impl_moe_align(topk_ids_flattened, sorted_token_ids_global, expert_ids_global, num_tokens_post_pad_global, cumsum_buffer_global, num_valid_tokens_global, down_proj_task_size, is_dynamic_sch)
-            elif self.tile_scheduler.task_type == JobType.MOE_COUNT_AND_SORT.value:
-                self.task_impl_moe_count_and_sort(topk_ids_flattened, sorted_token_ids_global, cumsum_buffer_global, hidden_state_global, reordered_hidden_state_global, num_tokens_post_pad_global, is_dynamic_sch)
-            elif self.tile_scheduler.task_type == JobType.MOE_GROUP_GEMM_GATE_UP_SILU.value:
-                self.task_impl_moe_group_gemm_gate_up_silu(reordered_hidden_state_global, grp_gate_up_weight_global, silu_mul_output_global, topk_weights_flattened, sorted_token_ids_global, expert_ids_global, num_valid_tokens_global, num_tokens_post_pad_global, unfused, down_proj_task_size, is_dynamic_sch)
-            elif self.tile_scheduler.task_type == JobType.MOE_GROUP_GEMM_DOWN.value:
-                self.task_impl_moe_group_gemm_down(silu_mul_output_global, grp_down_weight_global, topk_reduce_output_global, expert_ids_global, topk_weights_flattened, sorted_token_ids_global, num_valid_tokens_global, num_tokens_post_pad_global, unfused, down_proj_task_size, is_dynamic_sch)
-            elif self.tile_scheduler.task_type == JobType.INIT_ETENSOR.value:
-                self.task_impl_init_etensor(is_dynamic_sch)
-            elif self.tile_scheduler.task_type == JobType.WAIT_ETENSOR_INIT.value:
-                self.task_impl_wait_etensor_init_complete(is_dynamic_sch)
+            if lowering == "dsl":
+                dsl_lowerer.dispatch_loop_body(dsl_context)
             else:
-                Tx.cuda.trap_when_assert_failed(False)
+                if self.tile_scheduler.task_type == JobType.MOE_GATING.value:
+                    self.task_impl_moe_gating(hidden_state_global, gate_weight_global, gating_output_global, is_dynamic_sch)
+                elif self.tile_scheduler.task_type == JobType.MOE_TOPK_SOFTMAX.value:
+                    self.task_impl_moe_topk_softmax(gating_output_global, topk_weights_global, topk_indices_global, is_dynamic_sch, renormalize=False)
+                elif self.tile_scheduler.task_type == JobType.MOE_ALIGN.value:
+                    self.task_impl_moe_align(topk_ids_flattened, sorted_token_ids_global, expert_ids_global, num_tokens_post_pad_global, cumsum_buffer_global, num_valid_tokens_global, down_proj_task_size, is_dynamic_sch)
+                elif self.tile_scheduler.task_type == JobType.MOE_COUNT_AND_SORT.value:
+                    self.task_impl_moe_count_and_sort(topk_ids_flattened, sorted_token_ids_global, cumsum_buffer_global, hidden_state_global, reordered_hidden_state_global, num_tokens_post_pad_global, is_dynamic_sch)
+                elif self.tile_scheduler.task_type == JobType.MOE_GROUP_GEMM_GATE_UP_SILU.value:
+                    self.task_impl_moe_group_gemm_gate_up_silu(reordered_hidden_state_global, grp_gate_up_weight_global, silu_mul_output_global, topk_weights_flattened, sorted_token_ids_global, expert_ids_global, num_valid_tokens_global, num_tokens_post_pad_global, unfused, down_proj_task_size, is_dynamic_sch)
+                elif self.tile_scheduler.task_type == JobType.MOE_GROUP_GEMM_DOWN.value:
+                    self.task_impl_moe_group_gemm_down(silu_mul_output_global, grp_down_weight_global, topk_reduce_output_global, expert_ids_global, topk_weights_flattened, sorted_token_ids_global, num_valid_tokens_global, num_tokens_post_pad_global, unfused, down_proj_task_size, is_dynamic_sch)
+                elif self.tile_scheduler.task_type == JobType.INIT_ETENSOR.value:
+                    self.task_impl_init_etensor(is_dynamic_sch)
+                elif self.tile_scheduler.task_type == JobType.WAIT_ETENSOR_INIT.value:
+                    self.task_impl_wait_etensor_init_complete(is_dynamic_sch)
+                else:
+                    Tx.cuda.trap_when_assert_failed(False)
             self.smem_manager.exit_tile_runtime()
             self.tile_scheduler.next_tile()
         if self.profiler_on:
@@ -618,6 +680,9 @@ class MegaKernelMOE(MegaKernelWrapper):
     #       but it requires change on engine side
     def get_func_static(self, unfused=False):
         compile_batch_size = getattr(self, "_compile_batch_size", 1)
+        lowering = getattr(self, "_active_lowering", _DEFAULT_LOWERING)
+        scheduler_name = "unfused" if unfused else "static"
+        dsl_lowerer = self._make_dsl_lowerer(scheduler_name) if lowering == "dsl" else None
 
         # fmt: off
         @Tx.prim_func
@@ -702,7 +767,8 @@ class MegaKernelMOE(MegaKernelWrapper):
                     cumsum_buffer_global, reordered_hidden_state_global, gate_up_output_global, silu_mul_output_global, topk_reduce_output_global,
                     etensor_workspace_global,
                     profiler_buffer, exec_queue, None, None, None, 1, low_batch, unfused,
-                    False, static_scheduler.Semaphore, static_scheduler.StaticTileScheduler
+                    False, static_scheduler.Semaphore, static_scheduler.StaticTileScheduler,
+                    lowering, dsl_lowerer
                 )
 
             if compile_batch_size >= 2048:
@@ -716,6 +782,8 @@ class MegaKernelMOE(MegaKernelWrapper):
 
     def get_func_dynamic(self):
         compile_batch_size = getattr(self, "_compile_batch_size", 1)
+        lowering = getattr(self, "_active_lowering", _DEFAULT_LOWERING)
+        dsl_lowerer = self._make_dsl_lowerer("dynamic") if lowering == "dsl" else None
 
         # fmt: off
         @Tx.prim_func
@@ -804,7 +872,8 @@ class MegaKernelMOE(MegaKernelWrapper):
                     cumsum_buffer_global, reordered_hidden_state_global, gate_up_output_global, silu_mul_output_global, topk_reduce_output_global,
                     etensor_workspace_global,
                     profiler_buffer, None, queue_tasks_global, queue_head_global, queue_tail_global, down_proj_task_size, low_batch, False,
-                    True, dynamic_scheduler.Semaphore, dynamic_scheduler.DynamicTileScheduler
+                    True, dynamic_scheduler.Semaphore, dynamic_scheduler.DynamicTileScheduler,
+                    lowering, dsl_lowerer
                 )
 
             if compile_batch_size >= 2048:
@@ -935,19 +1004,31 @@ def _check_scheduler(scheduler: str):
         )
 
 
+def _check_lowering(lowering: str):
+    if lowering not in _SUPPORTED_LOWERINGS:
+        raise ValueError(
+            f"Unsupported lowering {lowering!r}; expected one of {_SUPPORTED_LOWERINGS}"
+        )
+
+
 def _needs_unfused_reference(scheduler: str) -> bool:
     return scheduler in ("static", "dynamic")
 
 
 def _compile_moe_schedulers(
-    schedulers: tuple[str, ...], batch_size: int, world_size: int, profiler_on: bool
+    schedulers: tuple[str, ...],
+    batch_size: int,
+    world_size: int,
+    profiler_on: bool,
+    lowering: str = _DEFAULT_LOWERING,
 ) -> tuple[MegaKernelMOE, dict[str, tvm.runtime.Module]]:
     if world_size != 1:
         raise SkipTest("tirx-kernels MegaKernelMOE benchmark currently supports world_size=1")
     for scheduler in schedulers:
         _check_scheduler(scheduler)
+    _check_lowering(lowering)
 
-    key = (schedulers, batch_size, world_size, profiler_on)
+    key = (schedulers, batch_size, world_size, profiler_on, lowering)
     cached = _COMPILE_CACHE.get(key)
     if cached is not None:
         return cached
@@ -958,7 +1039,7 @@ def _compile_moe_schedulers(
     mk._compile_batch_size = batch_size
     libs = {}
     for scheduler in schedulers:
-        _, libs[scheduler] = get_source(mk.get_module(scheduler))
+        _, libs[scheduler] = get_source(mk.get_module(scheduler, lowering=lowering))
     _COMPILE_CACHE[key] = (mk, libs)
     return mk, libs
 
@@ -983,7 +1064,9 @@ def _make_tir_case(
     scheduler: str,
     data: dict[str, torch.Tensor],
     launch_slots: int,
+    lowering: str = _DEFAULT_LOWERING,
 ):
+    _check_lowering(lowering)
     dev = tvm.cuda(0)
     max_num_tokens_padded = get_max_num_tokens_padded(
         batch_size, mk.NUM_EXPERTS_PER_TOK, mk.NUM_EXPERTS, mk.MOE_M_PAD_SIZE
@@ -991,6 +1074,7 @@ def _make_tir_case(
     case = {
         "kernel": lib["main"],
         "scheduler": scheduler,
+        "lowering": lowering,
         "cursor": 0,
         "launch_slots": launch_slots,
         "hidden_state": _as_tvm_tensor(data["hidden_state"], dev),
@@ -1053,14 +1137,20 @@ def _make_tir_case(
         case["graph_reset"]["topk_reduce_output"].append(torch.from_dlpack(topk_reduce_output))
 
     if scheduler in _STATIC_QUEUE_SCHEDULERS:
-        exec_queue = generate_exec_queue_moe(
-            batch_size, mk.config, mk.num_etensors[False], "static"
-        )
+        if lowering == "dsl":
+            exec_queue = mk.get_normalized_plan(scheduler).make_static_queue()
+        else:
+            exec_queue = generate_exec_queue_moe(
+                batch_size, mk.config, mk.num_etensors[False], "static"
+            )
         case["exec_queue"] = tvm.runtime.tensor(exec_queue, dev)
     else:
-        exec_queue = generate_exec_queue_moe(
-            batch_size, mk.config, mk.num_etensors[True], "dynamic"
-        )
+        if lowering == "dsl":
+            exec_queue = mk.get_normalized_plan(scheduler).make_dynamic_queue()
+        else:
+            exec_queue = generate_exec_queue_moe(
+                batch_size, mk.config, mk.num_etensors[True], "dynamic"
+            )
         case["queue_tasks"] = []
         case["queue_head"] = []
         case["queue_tail"] = []
@@ -1429,15 +1519,41 @@ def _validate_tir_matches_reference(case, mk: MegaKernelMOE, reference_run):
     }
 
 
-def run_test(batch_size: int, scheduler: str, world_size: int = 1, profiler_on: bool = False):
+def run_test(
+    batch_size: int,
+    scheduler: str,
+    world_size: int = 1,
+    profiler_on: bool = False,
+    lowering: str = _DEFAULT_LOWERING,
+    compare_manual: bool = True,
+    repeats: int = 1,
+):
     _require_cuda_sm100()
     _check_scheduler(scheduler)
-    compile_schedulers = [scheduler]
-    if _needs_unfused_reference(scheduler):
-        compile_schedulers.append("unfused")
-    mk, libs = _compile_moe_schedulers(
-        tuple(compile_schedulers), batch_size, world_size, profiler_on
-    )
+    _check_lowering(lowering)
+    if repeats <= 0:
+        raise ValueError("repeats must be positive")
+    manual_reference = lowering == "dsl" and compare_manual
+    if manual_reference:
+        mk, libs = _compile_moe_schedulers(
+            (scheduler,), batch_size, world_size, profiler_on, lowering="dsl"
+        )
+        reference_mk, reference_libs = _compile_moe_schedulers(
+            (scheduler,), batch_size, world_size, profiler_on, lowering="manual"
+        )
+        reference_scheduler = scheduler
+        reference_lowering = "manual"
+    else:
+        compile_schedulers = [scheduler]
+        if _needs_unfused_reference(scheduler):
+            compile_schedulers.append("unfused")
+        mk, libs = _compile_moe_schedulers(
+            tuple(compile_schedulers), batch_size, world_size, profiler_on, lowering=lowering
+        )
+        reference_mk = mk
+        reference_libs = libs
+        reference_scheduler = "unfused"
+        reference_lowering = lowering
 
     _reset_prepare_data_cache()
     data = dict(prepare_data(batch_size, mk))
@@ -1450,19 +1566,27 @@ def run_test(batch_size: int, scheduler: str, world_size: int = 1, profiler_on: 
             lib=libs[scheduler],
             scheduler=scheduler,
             data=data,
-            launch_slots=2,
+            launch_slots=repeats,
+            lowering=lowering,
         ),
     }
-    if _needs_unfused_reference(scheduler):
+    if manual_reference or _needs_unfused_reference(scheduler):
         case["tir_reference"] = _make_tir_case(
             batch_size=batch_size,
-            mk=mk,
-            lib=libs["unfused"],
-            scheduler="unfused",
+            mk=reference_mk,
+            lib=reference_libs[reference_scheduler],
+            scheduler=reference_scheduler,
             data=data,
-            launch_slots=2,
+            launch_slots=repeats,
+            lowering=reference_lowering,
         )
-    _validate_tir_case(case, mk)
+    for iteration in range(repeats):
+        _reset_tir_case_for_cuda_graph(case["tir"])
+        if "tir_reference" in case:
+            _reset_tir_case_for_cuda_graph(case["tir_reference"])
+        _validate_tir_case(
+            case, mk, check_torch=iteration == 0 and batch_size <= _TORCH_REFERENCE_MAX_BATCH_SIZE
+        )
     torch.cuda.synchronize()
 
 
@@ -1509,6 +1633,7 @@ def run_bench(
     scheduler: str | None = None,
     world_size: int = 1,
     profiler_on: bool = False,
+    lowering: str = _DEFAULT_LOWERING,
     warmup: int | None = None,
     repeat: int | None = None,
     timer: str | None = None,
@@ -1522,7 +1647,10 @@ def run_bench(
     schedulers = (scheduler,) if scheduler is not None else _SUPPORTED_SCHEDULERS
     for scheduler_name in schedulers:
         _check_scheduler(scheduler_name)
-    mk, libs = _compile_moe_schedulers(tuple(schedulers), batch_size, world_size, profiler_on)
+    _check_lowering(lowering)
+    mk, libs = _compile_moe_schedulers(
+        tuple(schedulers), batch_size, world_size, profiler_on, lowering=lowering
+    )
 
     _reset_prepare_data_cache()
     data = dict(prepare_data(batch_size, mk))
@@ -1538,6 +1666,7 @@ def run_bench(
             scheduler=scheduler_name,
             data=data,
             launch_slots=8,
+            lowering=lowering,
         )
         tir_runtime_estimate_us[scheduler_name] = _estimate_tir_runtime_us(probe_case)
         launch_slots[scheduler_name] = _estimate_bench_launch_slots(
@@ -1556,6 +1685,7 @@ def run_bench(
             scheduler=scheduler_name,
             data=data,
             launch_slots=launch_slots[scheduler_name],
+            lowering=lowering,
         )
         for scheduler_name in schedulers
     }
@@ -1563,7 +1693,9 @@ def run_bench(
         validation_case = {**case, "tir": tir_cases[scheduler_name]}
         if scheduler_name != "unfused" and "unfused" in tir_cases:
             validation_case["tir_reference"] = tir_cases["unfused"]
-        _validate_tir_case(validation_case, mk, check_torch=batch_size <= max(_TEST_BATCH_SIZES))
+        _validate_tir_case(
+            validation_case, mk, check_torch=batch_size <= _TORCH_REFERENCE_MAX_BATCH_SIZE
+        )
 
     sglang_runner = None
     flashinfer_runner = None
@@ -1641,6 +1773,7 @@ def run_bench(
             "our_impls": list(tir_impls),
             "batch_size": batch_size,
             "world_size": world_size,
+            "lowering": lowering,
             "config": MEGAKERNEL_MOE_BENCH_CONFIG["CONFIG_NAME"],
             "benchmark_scope": "full_moe_router_plus_expert",
             "sglang_router": "torch_fp32_mm_softmax_topk",
