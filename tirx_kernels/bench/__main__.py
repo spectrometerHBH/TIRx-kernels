@@ -68,18 +68,18 @@ def main():
         help="Independent benchmark rounds inside one process (default 1)",
     )
     parser.add_argument(
-        "--round-cooldown",
+        "--cooldown",
         type=float,
         default=1.0,
-        help="Seconds to sleep between in-bench rounds (default 1.0)",
+        help="Seconds to sleep before every implementation (default 1.0)",
     )
     args = parser.parse_args()
 
     if args.rounds < 1:
         print("ERROR: --rounds must be >= 1", file=sys.stderr)
         sys.exit(2)
-    if args.round_cooldown < 0:
-        print("ERROR: --round-cooldown must be >= 0", file=sys.stderr)
+    if args.cooldown < 0:
+        print("ERROR: --cooldown must be >= 0", file=sys.stderr)
         sys.exit(2)
 
     if args.json or args.json_file:
@@ -107,7 +107,7 @@ def main():
     results = []
 
     for name, mod in sorted(all_kernels.items()):
-        configs = getattr(mod, "CONFIGS", [])
+        configs = getattr(mod, "BENCH_CONFIGS", getattr(mod, "CONFIGS", []))
         for cfg in configs:
             label = cfg.get("label", "default")
             if args.config and label != args.config:
@@ -122,7 +122,7 @@ def main():
                     repeat=args.repeat,
                     timer=args.timer,
                     rounds=args.rounds,
-                    round_cooldown=args.round_cooldown,
+                    cooldown=args.cooldown,
                 )
                 results.append(result)
             except SkipTest as exc:
