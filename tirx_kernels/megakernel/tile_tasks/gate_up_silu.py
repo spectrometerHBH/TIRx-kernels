@@ -14,6 +14,8 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+"""Gate/up projection with a fused SiLU tile task."""
+
 from tirx_kernels.megakernel.utils.base import SmemManager
 from tirx_kernels.megakernel.utils.config import KernelConfig, ProfileEventType
 from tirx_kernels.megakernel.utils.utils import silu
