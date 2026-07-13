@@ -677,9 +677,9 @@ class MegaKernelWrapper:
             raise ValueError(f"Unsupported scheduler: {scheduler}")
 
     def get_module(self, scheduler: Literal["static", "dynamic", "unfused"]):
-        @I.ir_module(tirx=True)
+        @I.ir_module
         class Module:
-            @T.prim_func(tirx=True)
+            @T.prim_func
             def main():
                 pass
 

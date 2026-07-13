@@ -549,66 +549,66 @@ class MegaKernelMOE(MegaKernelWrapper):
         self.set_tiles(batch_size, low_batch)
         self.host_init_all()
 
-        with Tx.kernel():
-            cta_id = Tx.cta_id([KernelConfig.SM_NUMBER])
-            warp_id = Tx.warp_id([KernelConfig.WARP_NUMBER * KernelConfig.WG_NUMBER])
-            wg_id = Tx.warpgroup_id([KernelConfig.WG_NUMBER])
-            tid = Tx.thread_id([KernelConfig.NUM_THREADS])
-            tid_in_wg = Tx.thread_id_in_wg([128])
-            lane_id = Tx.lane_id([32])
-            Tx.alloc_buffer([1], "uint32", scope="local", align=8)
-            Tx.alloc_buffer([1], "uint64", scope="local", align=8)
-            self.init_profiler(profiler_buffer)
-            buf = Tx.alloc_buffer([KernelConfig.MAX_SMEM_SIZE], "uint8", scope="shared.dyn")
-            # initialize smem manager
-            self.set_smem_manager(KernelConfig.MAX_SMEM_SIZE, 16384, buf.data)
+        Tx.device_entry()
+        cta_id = Tx.cta_id([KernelConfig.SM_NUMBER])
+        warp_id = Tx.warp_id([KernelConfig.WARP_NUMBER * KernelConfig.WG_NUMBER])
+        wg_id = Tx.warpgroup_id([KernelConfig.WG_NUMBER])
+        tid = Tx.thread_id([KernelConfig.NUM_THREADS])
+        tid_in_wg = Tx.thread_id_in_wg([128])
+        lane_id = Tx.lane_id([32])
+        Tx.alloc_buffer([1], "uint32", scope="local", align=8)
+        Tx.alloc_buffer([1], "uint64", scope="local", align=8)
+        self.init_profiler(profiler_buffer)
+        buf = Tx.alloc_buffer([KernelConfig.MAX_SMEM_SIZE], "uint8", scope="shared.dyn")
+        # initialize smem manager
+        self.set_smem_manager(KernelConfig.MAX_SMEM_SIZE, 16384, buf.data)
 
-            # initialize device
-            self.device_init_all(self.smem_manager)
-            self.class_init_all(self.smem_manager)
+        # initialize device
+        self.device_init_all(self.smem_manager)
+        self.class_init_all(self.smem_manager)
 
-            # initialize event tensors
-            self.set_events(
-                is_dynamic_sch,
-                batch_size,
-                Semaphore,
-                etensor_workspace_global,
-                unfused,
-            )
+        # initialize event tensors
+        self.set_events(
+            is_dynamic_sch,
+            batch_size,
+            Semaphore,
+            etensor_workspace_global,
+            unfused,
+        )
 
-            # initialize tile scheduler and smem_manager
-            if not is_dynamic_sch:
-                self.init_tile_scheduler(False, Scheduler, "moe", exec_queue, self.smem_manager)
+        # initialize tile scheduler and smem_manager
+        if not is_dynamic_sch:
+            self.init_tile_scheduler(False, Scheduler, "moe", exec_queue, self.smem_manager)
+        else:
+            self.init_tile_scheduler(True, Scheduler, exec_task, exec_head, exec_tail, self.smem_manager, self.profiler)
+        self.smem_manager.init()
+
+        topk_ids_flattened = topk_indices_global.view(-1)
+        topk_weights_flattened = topk_weights_global.view(-1)
+        while self.tile_scheduler.valid():
+            if self.tile_scheduler.task_type == JobType.MOE_GATING.value:
+                self.task_impl_moe_gating(hidden_state_global, gate_weight_global, gating_output_global, is_dynamic_sch)
+            elif self.tile_scheduler.task_type == JobType.MOE_TOPK_SOFTMAX.value:
+                self.task_impl_moe_topk_softmax(gating_output_global, topk_weights_global, topk_indices_global, is_dynamic_sch, renormalize=False)
+            elif self.tile_scheduler.task_type == JobType.MOE_ALIGN.value:
+                self.task_impl_moe_align(topk_ids_flattened, sorted_token_ids_global, expert_ids_global, num_tokens_post_pad_global, cumsum_buffer_global, num_valid_tokens_global, down_proj_task_size, is_dynamic_sch)
+            elif self.tile_scheduler.task_type == JobType.MOE_COUNT_AND_SORT.value:
+                self.task_impl_moe_count_and_sort(topk_ids_flattened, sorted_token_ids_global, cumsum_buffer_global, hidden_state_global, reordered_hidden_state_global, num_tokens_post_pad_global, is_dynamic_sch)
+            elif self.tile_scheduler.task_type == JobType.MOE_GROUP_GEMM_GATE_UP_SILU.value:
+                self.task_impl_moe_group_gemm_gate_up_silu(reordered_hidden_state_global, grp_gate_up_weight_global, silu_mul_output_global, topk_weights_flattened, sorted_token_ids_global, expert_ids_global, num_valid_tokens_global, num_tokens_post_pad_global, unfused, down_proj_task_size, is_dynamic_sch)
+            elif self.tile_scheduler.task_type == JobType.MOE_GROUP_GEMM_DOWN.value:
+                self.task_impl_moe_group_gemm_down(silu_mul_output_global, grp_down_weight_global, topk_reduce_output_global, expert_ids_global, topk_weights_flattened, sorted_token_ids_global, num_valid_tokens_global, num_tokens_post_pad_global, unfused, down_proj_task_size, is_dynamic_sch)
+            elif self.tile_scheduler.task_type == JobType.INIT_ETENSOR.value:
+                self.task_impl_init_etensor(is_dynamic_sch)
+            elif self.tile_scheduler.task_type == JobType.WAIT_ETENSOR_INIT.value:
+                self.task_impl_wait_etensor_init_complete(is_dynamic_sch)
             else:
-                self.init_tile_scheduler(True, Scheduler, exec_task, exec_head, exec_tail, self.smem_manager, self.profiler)
-            self.smem_manager.init()
-
-            topk_ids_flattened = topk_indices_global.view(-1)
-            topk_weights_flattened = topk_weights_global.view(-1)
-            while self.tile_scheduler.valid():
-                if self.tile_scheduler.task_type == JobType.MOE_GATING.value:
-                    self.task_impl_moe_gating(hidden_state_global, gate_weight_global, gating_output_global, is_dynamic_sch)
-                elif self.tile_scheduler.task_type == JobType.MOE_TOPK_SOFTMAX.value:
-                    self.task_impl_moe_topk_softmax(gating_output_global, topk_weights_global, topk_indices_global, is_dynamic_sch, renormalize=False)
-                elif self.tile_scheduler.task_type == JobType.MOE_ALIGN.value:
-                    self.task_impl_moe_align(topk_ids_flattened, sorted_token_ids_global, expert_ids_global, num_tokens_post_pad_global, cumsum_buffer_global, num_valid_tokens_global, down_proj_task_size, is_dynamic_sch)
-                elif self.tile_scheduler.task_type == JobType.MOE_COUNT_AND_SORT.value:
-                    self.task_impl_moe_count_and_sort(topk_ids_flattened, sorted_token_ids_global, cumsum_buffer_global, hidden_state_global, reordered_hidden_state_global, num_tokens_post_pad_global, is_dynamic_sch)
-                elif self.tile_scheduler.task_type == JobType.MOE_GROUP_GEMM_GATE_UP_SILU.value:
-                    self.task_impl_moe_group_gemm_gate_up_silu(reordered_hidden_state_global, grp_gate_up_weight_global, silu_mul_output_global, topk_weights_flattened, sorted_token_ids_global, expert_ids_global, num_valid_tokens_global, num_tokens_post_pad_global, unfused, down_proj_task_size, is_dynamic_sch)
-                elif self.tile_scheduler.task_type == JobType.MOE_GROUP_GEMM_DOWN.value:
-                    self.task_impl_moe_group_gemm_down(silu_mul_output_global, grp_down_weight_global, topk_reduce_output_global, expert_ids_global, topk_weights_flattened, sorted_token_ids_global, num_valid_tokens_global, num_tokens_post_pad_global, unfused, down_proj_task_size, is_dynamic_sch)
-                elif self.tile_scheduler.task_type == JobType.INIT_ETENSOR.value:
-                    self.task_impl_init_etensor(is_dynamic_sch)
-                elif self.tile_scheduler.task_type == JobType.WAIT_ETENSOR_INIT.value:
-                    self.task_impl_wait_etensor_init_complete(is_dynamic_sch)
-                else:
-                    Tx.cuda.trap_when_assert_failed(False)
-                self.smem_manager.exit_tile_runtime()
-                self.tile_scheduler.next_tile()
-            if self.profiler_on:
-                self.profiler.finalize(lane_id == 0)
-            self.class_finalize_all()
+                Tx.cuda.trap_when_assert_failed(False)
+            self.smem_manager.exit_tile_runtime()
+            self.tile_scheduler.next_tile()
+        if self.profiler_on:
+            self.profiler.finalize(lane_id == 0)
+        self.class_finalize_all()
 
     # fmt: on
 
@@ -618,7 +618,7 @@ class MegaKernelMOE(MegaKernelWrapper):
         compile_batch_size = getattr(self, "_compile_batch_size", 1)
 
         # fmt: off
-        @Tx.prim_func(tirx=True)
+        @Tx.prim_func
         def main(
             # input and output
             hidden_state_ptr: Tx.handle, # input: read-only
@@ -716,7 +716,7 @@ class MegaKernelMOE(MegaKernelWrapper):
         compile_batch_size = getattr(self, "_compile_batch_size", 1)
 
         # fmt: off
-        @Tx.prim_func(tirx=True)
+        @Tx.prim_func
         def main(
             # input and output
             hidden_state_ptr: Tx.handle, # input: read-only
