@@ -5918,10 +5918,6 @@ CONFIGS = [
         "fast_math": 1,
         "label": "p1_tok192_h1024_i512_e2_k2_bm192",
     },
-]
-
-
-BENCH_CONFIGS = [
     {
         "num_processes": 1,
         "num_max_tokens_per_rank": 64,
@@ -6115,6 +6111,7 @@ BENCH_CONFIGS = [
         "label": "t8192_m8192_h7168_i3072_e384_k6_g6",
     },
 ]
+BENCH_CONFIGS = CONFIGS
 
 
 def _make_config(
