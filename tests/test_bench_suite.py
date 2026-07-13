@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from tirx_kernels.bench_suite import run
+from tirx_kernels.bench_suite.baseline_view import render_markdown
 from tirx_kernels.bench_suite.ratio_diff import build_report
 from tirx_kernels.megakernel.moe import BENCH_CONFIGS as MEGAKERNEL_MOE_BENCH_CONFIGS
 
@@ -61,6 +62,68 @@ def test_ratio_report_keeps_grouped_tir_schedulers_out_of_references() -> None:
     assert "| megakernel_moe | moe_a3b_bs1_all | tir_static | sglang_full |" in report
     assert "| megakernel_moe | moe_a3b_bs1_all | tir_dynamic | sglang_full |" in report
     assert "| megakernel_moe | moe_a3b_bs1_all | tir_unfused | sglang_full |" in report
+
+
+def test_baseline_view_renders_grouped_implementations_in_one_row() -> None:
+    payload = {
+        "timestamp": "now",
+        "label": "test",
+        "git": {},
+        "results": [
+            {
+                "kernel": "megakernel_moe",
+                "label": "moe_a3b_bs128_all",
+                "status": "ok",
+                "impls": {
+                    "tir_static": 20.0,
+                    "tir_dynamic": 21.0,
+                    "tir_unfused": 22.0,
+                    "sglang_full": 23.0,
+                    "flashinfer_full": 24.0,
+                },
+            },
+            {
+                "kernel": "megakernel_moe",
+                "label": "moe_a3b_bs1_all",
+                "status": "ok",
+                "impls": {
+                    "tir_static": 10.0,
+                    "tir_dynamic": 11.0,
+                    "tir_unfused": 12.0,
+                    "sglang_full": 13.0,
+                    "flashinfer_full": 14.0,
+                },
+            },
+        ],
+    }
+
+    markdown = render_markdown(payload, "test.json")
+
+    assert (
+        "| config | tir_static (µs) | tir_dynamic (µs) | tir_unfused (µs) | "
+        "sglang_full (µs) | flashinfer_full (µs) |" in markdown
+    )
+    assert "| `moe_a3b_bs1_all` | 10.0000 | 11.0000 | 12.0000 | 13.0000 | 14.0000 |" in markdown
+    assert markdown.count("`moe_a3b_bs1_all`") == 1
+    assert markdown.index("`moe_a3b_bs1_all`") < markdown.index("`moe_a3b_bs128_all`")
+
+
+def test_baseline_view_keeps_single_tir_ratio_table() -> None:
+    payload = {
+        "results": [
+            {
+                "kernel": "gemm",
+                "label": "m1024",
+                "status": "ok",
+                "impls": {"tir": 10.0, "reference": 12.0},
+            }
+        ]
+    }
+
+    markdown = render_markdown(payload, "test.json")
+
+    assert "| config | ours impl | ours (µs) | ref impl |" in markdown
+    assert "| `m1024` | tir | 10.0000 | reference | 12.0000 | 1.200 | — |" in markdown
 
 
 def test_load_workloads_accepts_multigpu_megamoe(tmp_path: Path) -> None:
