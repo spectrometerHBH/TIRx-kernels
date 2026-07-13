@@ -137,8 +137,8 @@ class GroupGEMMTile(GemmTile):
                         (token_linear[0] if self.acc_output else token_linear[0] // self.top_k),
                         stage_k + col : stage_k + col + vec_len,
                     ],
-                    dispatch="non-bulk-copy",
-                    vec_len=vec_len,
+                    dispatch="ldgsts",
+                    direct=True,
                 )
             else:
                 for v in T.serial(vec_len):

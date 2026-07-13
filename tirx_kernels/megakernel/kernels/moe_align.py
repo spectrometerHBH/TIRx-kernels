@@ -221,8 +221,8 @@ class CountAndSortExpertTokens(Tile):
                 Tx.thread.copy_async(
                     self.fetched_data[i, tid, :],
                     data[idx[0] // self.topk, col_idx[0] : col_idx[0] + self.VEC_SIZE],
-                    dispatch="non-bulk-copy",
-                    vec_len=self.VEC_SIZE,
+                    dispatch="ldgsts",
+                    direct=True,
                 )
             T.ptx.cp_async.commit_group()
             idx[0] += KernelConfig.SM_NUMBER
@@ -233,8 +233,8 @@ class CountAndSortExpertTokens(Tile):
                 Tx.thread.copy_async(
                     self.fetched_data[cp_pipe_idx, tid, :],
                     data[idx[0] // self.topk, col_idx[0] : col_idx[0] + self.VEC_SIZE],
-                    dispatch="non-bulk-copy",
-                    vec_len=self.VEC_SIZE,
+                    dispatch="ldgsts",
+                    direct=True,
                 )
             T.ptx.cp_async.commit_group()
             T.ptx.cp_async.wait_group(self.PIPE_DEPTH - 1)
