@@ -71,14 +71,8 @@ CONFIGS = [
 ]
 
 BENCH_CONFIGS = [
-    {
-        "label": f"moe_a3b_bs{batch_size}_{scheduler}",
-        "batch_size": batch_size,
-        "scheduler": scheduler,
-        "world_size": 1,
-    }
+    {"label": f"moe_a3b_bs{batch_size}_all", "batch_size": batch_size, "world_size": 1}
     for batch_size in _BENCH_BATCH_SIZES
-    for scheduler in _SUPPORTED_SCHEDULERS
 ]
 
 _COMPILE_CACHE = {}
@@ -1508,7 +1502,7 @@ def _estimate_bench_launch_slots(
 
 def run_bench(
     batch_size: int,
-    scheduler: str,
+    scheduler: str | None = None,
     world_size: int = 1,
     profiler_on: bool = False,
     warmup: int | None = None,
@@ -1519,57 +1513,53 @@ def run_bench(
     **kwargs,
 ):
     _require_cuda_sm100()
-    _check_scheduler(scheduler)
     from tvm.tirx.bench import bench
 
-    compile_schedulers = [scheduler]
-    if _needs_unfused_reference(scheduler):
-        compile_schedulers.append("unfused")
-    mk, libs = _compile_moe_schedulers(
-        tuple(compile_schedulers), batch_size, world_size, profiler_on
-    )
+    schedulers = (scheduler,) if scheduler is not None else _SUPPORTED_SCHEDULERS
+    for scheduler_name in schedulers:
+        _check_scheduler(scheduler_name)
+    mk, libs = _compile_moe_schedulers(tuple(schedulers), batch_size, world_size, profiler_on)
 
     _reset_prepare_data_cache()
     data = dict(prepare_data(batch_size, mk))
     case = {"batch_size": batch_size, "cpu_data": data}
-    launch_slots = 0
-    tir_runtime_estimate_us = None
+    launch_slots: dict[str, int] = {}
+    tir_runtime_estimate_us: dict[str, float] = {}
 
-    probe_case = _make_tir_case(
-        batch_size=batch_size,
-        mk=mk,
-        lib=libs[scheduler],
-        scheduler=scheduler,
-        data=data,
-        launch_slots=8,
-    )
-    tir_runtime_estimate_us = _estimate_tir_runtime_us(probe_case)
-    launch_slots = _estimate_bench_launch_slots(
-        tir_runtime_estimate_us, warmup, repeat, rounds, preflight_launches=1
-    )
-    if timer == "cudagraph_proton":
-        launch_slots *= 4
-    del probe_case
-    torch.cuda.empty_cache()
-
-    case["tir"] = _make_tir_case(
-        batch_size=batch_size,
-        mk=mk,
-        lib=libs[scheduler],
-        scheduler=scheduler,
-        data=data,
-        launch_slots=launch_slots,
-    )
-    if _needs_unfused_reference(scheduler):
-        case["tir_reference"] = _make_tir_case(
+    for scheduler_name in schedulers:
+        probe_case = _make_tir_case(
             batch_size=batch_size,
             mk=mk,
-            lib=libs["unfused"],
-            scheduler="unfused",
+            lib=libs[scheduler_name],
+            scheduler=scheduler_name,
             data=data,
-            launch_slots=2,
+            launch_slots=8,
         )
-    _validate_tir_case(case, mk, check_torch=batch_size <= max(_TEST_BATCH_SIZES))
+        tir_runtime_estimate_us[scheduler_name] = _estimate_tir_runtime_us(probe_case)
+        launch_slots[scheduler_name] = _estimate_bench_launch_slots(
+            tir_runtime_estimate_us[scheduler_name], warmup, repeat, rounds, preflight_launches=1
+        )
+        if timer == "cudagraph_proton":
+            launch_slots[scheduler_name] *= 4
+        del probe_case
+    torch.cuda.empty_cache()
+
+    tir_cases = {
+        scheduler_name: _make_tir_case(
+            batch_size=batch_size,
+            mk=mk,
+            lib=libs[scheduler_name],
+            scheduler=scheduler_name,
+            data=data,
+            launch_slots=launch_slots[scheduler_name],
+        )
+        for scheduler_name in schedulers
+    }
+    for scheduler_name in schedulers:
+        validation_case = {**case, "tir": tir_cases[scheduler_name]}
+        if scheduler_name != "unfused" and "unfused" in tir_cases:
+            validation_case["tir_reference"] = tir_cases["unfused"]
+        _validate_tir_case(validation_case, mk, check_torch=batch_size <= max(_TEST_BATCH_SIZES))
 
     sglang_runner = None
     flashinfer_runner = None
@@ -1597,13 +1587,22 @@ def run_bench(
             flashinfer_runner = run
         return flashinfer_runner
 
-    def run_tir():
-        return _run_tir_case(case["tir"])
+    def make_tir_runner(tir_case):
+        def run_tir():
+            return _run_tir_case(tir_case)
 
-    run_tir.graph_reset = lambda: _reset_tir_case_for_cuda_graph(case["tir"])
+        run_tir.graph_reset = lambda: _reset_tir_case_for_cuda_graph(tir_case)
+        return run_tir
+
+    tir_impls = {
+        ("tir" if scheduler is not None else f"tir_{scheduler_name}"): make_tir_runner(
+            tir_cases[scheduler_name]
+        )
+        for scheduler_name in schedulers
+    }
 
     result = bench(
-        {"tir": run_tir},
+        tir_impls,
         warmup=warmup,
         repeat=repeat,
         timer=timer,
@@ -1613,25 +1612,29 @@ def run_bench(
         **kwargs,
     )
 
-    if flashinfer_runner is not None and "tir" in case:
-        try:
-            validation["tir_vs_flashinfer_full"] = _validate_tir_matches_reference(
-                case, mk, lambda _: flashinfer_runner()
-            )
-        except Exception as err:
-            validation["tir_vs_flashinfer_full_error"] = str(err)
-    if sglang_runner is not None and "tir" in case:
-        try:
-            validation["tir_vs_sglang_full"] = _validate_tir_matches_reference(
-                case, mk, lambda _: sglang_runner()
-            )
-        except Exception as err:
-            validation["tir_vs_sglang_full_error"] = str(err)
+    baseline_errors = result.get("errors") or {}
+    if baseline_errors:
+        details = "; ".join(f"{name}: {error}" for name, error in baseline_errors.items())
+        raise RuntimeError(f"MegaKernelMOE benchmark requires both full references: {details}")
+    if sglang_runner is None or flashinfer_runner is None:
+        raise RuntimeError("MegaKernelMOE benchmark requires both full references")
+
+    for scheduler_name in schedulers:
+        impl_name = "tir" if scheduler is not None else f"tir_{scheduler_name}"
+        validation_case = {**case, "tir": tir_cases[scheduler_name]}
+        validation[f"{impl_name}_vs_flashinfer_full"] = _validate_tir_matches_reference(
+            validation_case, mk, lambda _: flashinfer_runner()
+        )
+        validation[f"{impl_name}_vs_sglang_full"] = _validate_tir_matches_reference(
+            validation_case, mk, lambda _: sglang_runner()
+        )
 
     result.setdefault("metadata", {})
     result["metadata"].update(
         {
-            "scheduler": scheduler,
+            "scheduler": scheduler if scheduler is not None else "all",
+            "schedulers": list(schedulers),
+            "our_impls": list(tir_impls),
             "batch_size": batch_size,
             "world_size": world_size,
             "config": MEGAKERNEL_MOE_BENCH_CONFIG["CONFIG_NAME"],
@@ -1640,8 +1643,10 @@ def run_bench(
             "sglang_weight_layout": "grp_gate_up_weight",
             "flashinfer_router": "torch_fp32_mm_softmax_topk",
             "flashinfer_weight_layout": "grp_up_gate_weight",
-            "launch_slots": launch_slots,
-            "tir_runtime_estimate_us": tir_runtime_estimate_us,
+            "launch_slots": launch_slots if scheduler is None else launch_slots[scheduler],
+            "tir_runtime_estimate_us": (
+                tir_runtime_estimate_us if scheduler is None else tir_runtime_estimate_us[scheduler]
+            ),
         }
     )
     if validation:

@@ -18,7 +18,10 @@ import json
 import sys
 from pathlib import Path
 
-OUR_IMPLS = {"tir", "tirx"}
+try:
+    from tirx_kernels.bench_suite.impls import is_our_impl, our_impls
+except ModuleNotFoundError:  # Support `python tirx_kernels/bench_suite/baseline_view.py`.
+    from impls import is_our_impl, our_impls
 
 
 def main() -> None:
@@ -51,25 +54,24 @@ def main() -> None:
         default_out = here / "baseline.md"
     results = payload.get("results") or []
 
+    ok_results = [r for r in results if r.get("status") == "ok"]
     rows = []
-    for r in results:
-        if r.get("status") != "ok":
-            continue
+    for r in ok_results:
         impls = r.get("impls") or {}
-        ours = next((i for i in OUR_IMPLS if i in impls), None)
-        refs = {i: us for i, us in impls.items() if i not in OUR_IMPLS and us > 0}
+        refs = {i: us for i, us in impls.items() if not is_our_impl(i) and us > 0}
         ref = min(refs, key=lambda k: refs[k]) if refs else None
-        ratio = refs[ref] / impls[ours] if (ours and ref and impls[ours] > 0) else None
-        rows.append(
-            {
-                "kernel": r["kernel"],
-                "config": r.get("label") or r.get("config"),
-                "impls": impls,
-                "ours": ours,
-                "ref": ref,
-                "ratio": ratio,
-            }
-        )
+        for ours in our_impls(impls) or [None]:
+            ratio = refs[ref] / impls[ours] if (ours and ref and impls[ours] > 0) else None
+            rows.append(
+                {
+                    "kernel": r["kernel"],
+                    "config": r.get("label") or r.get("config"),
+                    "impls": impls,
+                    "ours": ours,
+                    "ref": ref,
+                    "ratio": ratio,
+                }
+            )
 
     failed = [r for r in results if r.get("status") != "ok"]
 
@@ -79,10 +81,10 @@ def main() -> None:
     lines.append(f"- Timestamp: `{payload.get('timestamp')}`")
     lines.append(f"- Label:     `{payload.get('label')}`")
     lines.append(f"- Git:       `{payload.get('git')}`")
-    lines.append(f"- Workloads: {len(rows)} ok, {len(failed)} failed")
+    lines.append(f"- Workloads: {len(ok_results)} ok, {len(failed)} failed")
     lines.append("")
     lines.append(
-        "Each row shows our impl's time (tir/tirx) and every reference "
+        "Each row shows one TIR/TIRx implementation's time and every reference "
         "impl, with ref/ours where ref = fastest non-ours impl. "
         "Higher ratio = ours is faster."
     )
@@ -104,7 +106,7 @@ def main() -> None:
         ref_us = r["impls"].get(r["ref"], float("nan")) if r["ref"] else float("nan")
         ratio_s = f"{r['ratio']:.3f}" if r["ratio"] is not None else "—"
         others = sorted(
-            (i, us) for i, us in r["impls"].items() if i not in OUR_IMPLS and i != r["ref"]
+            (i, us) for i, us in r["impls"].items() if not is_our_impl(i) and i != r["ref"]
         )
         others_s = ", ".join(f"{i}={us:.4f}" for i, us in others) or "—"
         lines.append(

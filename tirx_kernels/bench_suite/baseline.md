@@ -2,10 +2,10 @@
 
 - Timestamp: `163`
 - Label:     `5ec3e10a`
-- Git:       `{'tir': 'f2214f20', 'tirx-kernels': '5ec3e10a', 'tirx-bench-ci': None}`
-- Workloads: 259 ok, 0 failed
+- Git:       `{'tir': '62fc55f9', 'tirx-kernels': 'fdcc24d8-dirty', 'tirx-bench-ci': None}`
+- Workloads: 267 ok, 0 failed
 
-Each row shows our impl's time (tir/tirx) and every reference impl, with ref/ours where ref = fastest non-ours impl. Higher ratio = ours is faster.
+Each row shows one TIR/TIRx implementation's time and every reference impl, with ref/ours where ref = fastest non-ours impl. Higher ratio = ours is faster.
 
 ## deepgemm_sm100_fp4_mqa_logits
 
@@ -276,6 +276,34 @@ Each row shows our impl's time (tir/tirx) and every reference impl, with ref/our
 | `deepgemm_m4096_n576_k7168` | tir | 20.0296 | deepgemm | 20.4921 | 1.023 | — |
 | `deepgemm_m4096_n7168_k16384` | tir | 336.4848 | deepgemm | 336.0582 | 0.999 | — |
 | `deepgemm_m4096_n7168_k2048` | tir | 42.8906 | deepgemm | 43.2909 | 1.009 | — |
+## megakernel_moe
+
+| config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
+|---|---|---:|---|---:|---:|---|
+| `moe_a3b_bs1024_all` | tir_static | 252.4850 | flashinfer_full | 338.8048 | 1.342 | sglang_full=377.9917 |
+| `moe_a3b_bs1024_all` | tir_dynamic | 252.3479 | flashinfer_full | 338.8048 | 1.343 | sglang_full=377.9917 |
+| `moe_a3b_bs1024_all` | tir_unfused | 271.7742 | flashinfer_full | 338.8048 | 1.247 | sglang_full=377.9917 |
+| `moe_a3b_bs128_all` | tir_static | 224.3021 | flashinfer_full | 258.6643 | 1.153 | sglang_full=258.7940 |
+| `moe_a3b_bs128_all` | tir_dynamic | 220.4371 | flashinfer_full | 258.6643 | 1.173 | sglang_full=258.7940 |
+| `moe_a3b_bs128_all` | tir_unfused | 231.1820 | flashinfer_full | 258.6643 | 1.119 | sglang_full=258.7940 |
+| `moe_a3b_bs1_all` | tir_static | 34.0248 | sglang_full | 55.9373 | 1.644 | flashinfer_full=63.8725 |
+| `moe_a3b_bs1_all` | tir_dynamic | 38.3974 | sglang_full | 55.9373 | 1.457 | flashinfer_full=63.8725 |
+| `moe_a3b_bs1_all` | tir_unfused | 35.7114 | sglang_full | 55.9373 | 1.566 | flashinfer_full=63.8725 |
+| `moe_a3b_bs2048_all` | tir_static | 338.9925 | flashinfer_full | 416.0192 | 1.227 | sglang_full=456.8172 |
+| `moe_a3b_bs2048_all` | tir_dynamic | 335.4930 | flashinfer_full | 416.0192 | 1.240 | sglang_full=456.8172 |
+| `moe_a3b_bs2048_all` | tir_unfused | 351.3748 | flashinfer_full | 416.0192 | 1.184 | sglang_full=456.8172 |
+| `moe_a3b_bs32_all` | tir_static | 205.2653 | sglang_full | 238.0147 | 1.160 | flashinfer_full=240.3113 |
+| `moe_a3b_bs32_all` | tir_dynamic | 203.8599 | sglang_full | 238.0147 | 1.168 | flashinfer_full=240.3113 |
+| `moe_a3b_bs32_all` | tir_unfused | 206.4944 | sglang_full | 238.0147 | 1.153 | flashinfer_full=240.3113 |
+| `moe_a3b_bs4096_all` | tir_static | 525.5962 | flashinfer_full | 599.7899 | 1.141 | sglang_full=664.1469 |
+| `moe_a3b_bs4096_all` | tir_dynamic | 534.2915 | flashinfer_full | 599.7899 | 1.123 | sglang_full=664.1469 |
+| `moe_a3b_bs4096_all` | tir_unfused | 534.8386 | flashinfer_full | 599.7899 | 1.121 | sglang_full=664.1469 |
+| `moe_a3b_bs512_all` | tir_static | 238.8456 | flashinfer_full | 297.4227 | 1.245 | sglang_full=309.8942 |
+| `moe_a3b_bs512_all` | tir_dynamic | 231.1713 | flashinfer_full | 297.4227 | 1.287 | sglang_full=309.8942 |
+| `moe_a3b_bs512_all` | tir_unfused | 244.9784 | flashinfer_full | 297.4227 | 1.214 | sglang_full=309.8942 |
+| `moe_a3b_bs8_all` | tir_static | 102.5422 | sglang_full | 144.9019 | 1.413 | flashinfer_full=151.2682 |
+| `moe_a3b_bs8_all` | tir_dynamic | 103.3668 | sglang_full | 144.9019 | 1.402 | flashinfer_full=151.2682 |
+| `moe_a3b_bs8_all` | tir_unfused | 110.6494 | sglang_full | 144.9019 | 1.310 | flashinfer_full=151.2682 |
 ## nvfp4_gemm
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |

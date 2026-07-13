@@ -6,6 +6,61 @@ from pathlib import Path
 import pytest
 
 from tirx_kernels.bench_suite import run
+from tirx_kernels.bench_suite.ratio_diff import build_report
+from tirx_kernels.megakernel.moe import BENCH_CONFIGS as MEGAKERNEL_MOE_BENCH_CONFIGS
+
+
+def test_default_workloads_include_full_megakernel_moe_sweep() -> None:
+    workloads = run.load_workloads(run.DEFAULT_WORKLOADS)
+    megakernel_moe_workloads = [w for w in workloads if w["kernel"] == "megakernel_moe"]
+
+    assert {w["config"] for w in megakernel_moe_workloads} == {
+        config["label"] for config in MEGAKERNEL_MOE_BENCH_CONFIGS
+    }
+    assert all(w["num_gpus"] == 1 for w in megakernel_moe_workloads)
+    assert all("timer" not in w for w in megakernel_moe_workloads)
+
+
+def test_ratio_report_keeps_grouped_tir_schedulers_out_of_references() -> None:
+    baseline = {
+        "results": [
+            {
+                "kernel": "megakernel_moe",
+                "label": "moe_a3b_bs1_all",
+                "status": "ok",
+                "impls": {
+                    "tir_static": 10.0,
+                    "tir_dynamic": 11.0,
+                    "tir_unfused": 12.0,
+                    "sglang_full": 13.0,
+                    "flashinfer_full": 14.0,
+                },
+            }
+        ]
+    }
+    current = {
+        "results": [
+            {
+                "kernel": "megakernel_moe",
+                "label": "moe_a3b_bs1_all",
+                "status": "ok",
+                "impls": {
+                    "tir_static": 10.0,
+                    "tir_dynamic": 11.0,
+                    "tir_unfused": 12.0,
+                    "sglang_full": 13.0,
+                    "flashinfer_full": 14.0,
+                },
+            }
+        ]
+    }
+
+    report, regressions = build_report(baseline, current)
+
+    assert regressions == 0
+    assert "| megakernel_moe | moe_a3b_bs1_all | tir_static | sglang_full |" in report
+    assert "| megakernel_moe | moe_a3b_bs1_all | tir_dynamic | sglang_full |" in report
+    assert "| megakernel_moe | moe_a3b_bs1_all | tir_unfused | sglang_full |" in report
 
 
 def test_load_workloads_accepts_multigpu_megamoe(tmp_path: Path) -> None:

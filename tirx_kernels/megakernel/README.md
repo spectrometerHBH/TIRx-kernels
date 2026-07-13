@@ -56,18 +56,17 @@ export TVM_LIBRARY_PATH="${WORKSPACE}/tvm/build/lib"
 
 python -m tirx_kernels.bench \
   --kernel megakernel_moe \
-  --config moe_a3b_bs1_static \
-  --timer proton \
-  --warmup 30 \
-  --repeat 10
+  --config moe_a3b_bs1_all
 ```
 
 SGLang module import, runtime-context setup, and Triton JIT compilation happen
 outside the timed region.  The timed `sglang_full` callable includes the same
 FP32 router matmul, softmax, top-k, and expert computation as the full TIRx MoE
 scope.  Both implementations receive the same logical input and weights.  The
-result metadata includes `tir_vs_sglang_full`; treat a missing or failed
-validation as a benchmark failure.
+result metadata includes one validation record per scheduler; treat a missing or
+failed validation as a benchmark failure. The grouped benchmark compiles static,
+dynamic, and unfused once and measures them against the same logical input and
+the same SGLang and FlashInfer references.
 
 The module includes B200 configs under `sglang_moe_configs/` for SGLang commit
 `96a04cb13f9c3ed86028e090784a9eb059cf5318` and Triton 3.6.0.  They were generated
