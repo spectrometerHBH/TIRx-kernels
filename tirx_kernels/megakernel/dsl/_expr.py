@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Small, inspectable expression language used by the megakernel DSL."""
+"""Private expression language used while normalizing MoE lowering plans."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ class UnresolvedExpression(ValueError):
 
 
 class Expr:
-    """Base class for the deliberately narrow MoE expression language."""
+    """Base class for the deliberately narrow private MoE expression language."""
 
     def evaluate(self, env: Mapping[str, Any]) -> Any:
         raise NotImplementedError
@@ -224,7 +224,7 @@ def as_expr(value: ExprLike) -> Expr:
         return value
     if isinstance(value, bool) or not isinstance(value, int):
         if callable(value):
-            raise TypeError("callables are not valid DSL expressions")
+            raise TypeError("callables are not valid lowering expressions")
         raise TypeError(f"expected an integer or Expr, got {type(value).__name__}")
     return ConstExpr(value)
 
