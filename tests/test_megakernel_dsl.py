@@ -23,7 +23,7 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-import tirx_kernels.megakernel.dsl as moe_dsl
+import tirx_kernels.megakernel.dsl as megakernel_dsl
 import tvm.megakernel.dsl as tvm_dsl
 from tirx_kernels.megakernel.dsl import (
     AlignTileImpl,
@@ -113,7 +113,7 @@ def test_public_spec_types_are_tvm_owned_and_legacy_model_is_removed():
         "TileImpl",
         "KernelSpec",
     ):
-        assert getattr(moe_dsl, name) is getattr(tvm_dsl, name)
+        assert getattr(megakernel_dsl, name) is getattr(tvm_dsl, name)
 
     for removed in (
         "TaskSpec",
@@ -126,7 +126,7 @@ def test_public_spec_types_are_tvm_owned_and_legacy_model_is_removed():
         "ScalarLoadExpr",
         "TileIndexExpr",
     ):
-        assert not hasattr(moe_dsl, removed)
+        assert not hasattr(megakernel_dsl, removed)
     assert importlib.util.find_spec("tirx_kernels.megakernel.dsl.expr") is None
 
 
@@ -392,7 +392,7 @@ def test_unfused_collapses_gate_up_coordinates_only_in_physical_plan():
     spec = build_moe_graph(MEGAKERNEL_MOE_BENCH_CONFIG, 512)
     assert _tile(spec, "gate_up_silu").notifies[0].coord_map(7, 0, 0) == (7,)
     assert _tile(spec, "down").waits[0].coord_map(7, 0, 0) == (7,)
-    plan = MoeLowerer(moe_dsl.UnfusedPolicy()).lower(spec)
+    plan = MoeLowerer(megakernel_dsl.UnfusedPolicy()).lower(spec)
     assert plan.tile("gate_up_silu").notifies[0].coord == (ConstExpr(0),)
     assert plan.tile("down").waits[0].coord == (ConstExpr(0),)
 
