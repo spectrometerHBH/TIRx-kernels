@@ -893,14 +893,22 @@ def run_bench(
 
     funcs = {"tirx": lambda: ex(*args)}
 
-    from tirx_kernels.flashmla._trtllm_gen_bench import flashmla_bench_references
+    from tirx_kernels.flashmla._flashmla_bench import flashmla_reference_builder
+    from tirx_kernels.flashmla._trtllm_gen_bench import (
+        trtllm_gen_config_compatible,
+        trtllm_gen_reference_builder,
+    )
+
+    references = {"flashmla": lambda: flashmla_reference_builder(case)}
+    if trtllm_gen_config_compatible(case["config"]):
+        references["trtllm_gen"] = lambda: trtllm_gen_reference_builder(case)
 
     return bench(
         funcs,
         warmup=warmup,
         repeat=repeat,
         timer=timer,
-        references=flashmla_bench_references(case),
+        references=references,
         rounds=_rounds,
         cooldown_s=_cooldown_s,
     )

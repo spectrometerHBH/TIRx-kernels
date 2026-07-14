@@ -30,6 +30,6 @@ def run_flashmla_sparse_prefill(case: dict[str, Any]):
     return out
 
 
-def flashmla_reference_builder() -> Callable[[dict[str, Any]], Any]:
+def flashmla_reference_builder(case: dict[str, Any]) -> Callable[[], Any]:
     _import_flash_mla()
-    return run_flashmla_sparse_prefill
+    return lambda: run_flashmla_sparse_prefill(case)
