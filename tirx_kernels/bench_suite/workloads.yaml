@@ -11,6 +11,10 @@ defaults:
   # Override warmup/repeat/timer per-workload only for a specific exception.
 
 workloads:
+  # ── gemm_comm
+  - {kernel: allgather_gemm, config: tp4_m8192_n65536_k8192_fp16_dynamic, timer: event, num_gpus: 4}
+  - {kernel: gemm_reduce_scatter, config: tp4_m8192_n5120_k25600_fp16_dynamic, timer: event, num_gpus: 4}
+
   # ── megakernel_moe
   # Qwen3-30B-A3B full MoE: router + expert dispatch and compute. One process
   # compiles and times static, dynamic, and unfused on the same logical input.
