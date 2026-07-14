@@ -1,26 +1,33 @@
-# MegaKernelMOE Task Reference
+# MegaKernelMOE Tile Reference
 
 This document describes the current `MegaKernelMOE` as a set of operators.
-Read each task the same way you would read a PyTorch operator reference:
+Read each logical tile stage the same way you would read a PyTorch operator reference:
 
 ```python
 output = op(input0, input1, ...)
 ```
 
-For each task, the signature says what tensors it consumes and returns.  The
+For each stage, the signature says what tensors it consumes and returns.  The
 `Scheduler edge` section says which event makes the consumer safe to run, and
 the `Tile instances` section says how that logical op is split into
 `(m_idx, n_idx, k_idx)` work items.
 
-The current code does not have a standalone `TaskSpec` class.  The operator
-contract is implemented by:
+The logical contract is the TVM-owned `tvm.megakernel.dsl.KernelSpec` returned
+by `build_moe_graph`.  Its six `TileSpec` objects directly hold concrete
+`TileImpl` adapters, while MoE-specific lowering owns physical synchronization
+and scheduling:
 
-- `MegaKernelMOE.task_impl_*`: passes tensors into the tile and issues
-  `wait` / `notify` / `pre_notify_and_push`;
-- `MegaKernelMOE._set_events`: allocates dependency counters;
-- `generate_exec_queue_moe`: creates the static queue and the dynamic initial
-  queue;
-- `Tile.run(m_idx, n_idx, k_idx, ...)`: implements one task instance.
+- `build_moe_graph`: records tensors, five logical events, and wait/notify
+  coordinate maps;
+- the six MoE `TileImpl` adapters: invoke existing tile-task compute only;
+- `StaticPolicy`, `UnfusedPolicy`, and `DynamicPolicy`: create the physical
+  event, queue, runtime initialization, and dispatch plans;
+- `MoeLowerer`: emits those plans through the existing TIRX ABI.
+
+The Stage-1 planning artifact is
+[`workflow/qwen3_30b_a3b_moe_stage1.yaml`](workflow/qwen3_30b_a3b_moe_stage1.yaml).
+The hand-written `task_impl_moe_*`, `_set_events`, and queue generation path is
+retained as the explicit `manual` fallback and A/B oracle.
 
 ## Notation
 
@@ -144,10 +151,10 @@ route_weight = topk_weights[token_id, route_slot]
 
 Padding rows use sentinel `T`.
 
-## How Tasks Connect
+## How Tiles Connect
 
-Two task specs connect when the producer's return value is a named input in the
-consumer's signature, and the consumer waits on the event notified by the
+Two logical tiles connect when the producer's return value is a named input in
+the consumer's signature, and the consumer waits on the event notified by the
 producer.
 
 Example:
@@ -171,7 +178,7 @@ The connection is valid because:
 
 That is the contract every producer/consumer pair must satisfy.
 
-## Task Reference
+## Tile Reference
 
 ### `moe_gating`
 
