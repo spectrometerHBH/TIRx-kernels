@@ -16,11 +16,16 @@
 # under the License.
 from __future__ import annotations
 
+import ctypes
 import inspect
+import json
 import os
+import sys
+from types import SimpleNamespace
 
 import pytest
 
+from tirx_kernels.deepgemm._loader import _import_deep_gemm_distribution
 from tirx_kernels.deepgemm.mega_moe import (
     MegaMoeConfig,
     _aggregate_rank_results,
@@ -30,11 +35,24 @@ from tirx_kernels.deepgemm.mega_moe import (
     _get_mega_moe_cuda_compile_mode,
     _get_num_bytes_per_pull,
     _get_num_experts_per_wave_for_mega_moe,
+    _make_symm_buffer_descriptor,
     _run_worker,
+    _SymBufferDescriptor,
     get_deepgemm_launch_config,
     get_deepgemm_workspace_layout,
     run_bench,
 )
+
+
+class _FakeDistribution:
+    def __init__(self, root, version: str = "2.6.1+test") -> None:
+        self.root = root
+        self.version = version
+
+    def read_text(self, name: str) -> str | None:
+        if name != "direct_url.json":
+            return None
+        return json.dumps({"url": self.root.as_uri(), "dir_info": {"editable": True}})
 
 
 def _rank_result(tirx: list[float], deepgemm: list[float]) -> dict:
@@ -45,6 +63,61 @@ def _rank_result(tirx: list[float], deepgemm: list[float]) -> dict:
         "errors": {},
         "deepgemm_max_abs_diff": 0.0,
     }
+
+
+def test_deepgemm_loader_prefers_editable_distribution(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package_root = tmp_path / "deep_gemm"
+    package_root.mkdir()
+    module_file = package_root / "__init__.py"
+    module_file.write_text("")
+    distribution = _FakeDistribution(tmp_path)
+    extension = SimpleNamespace(get_ring_limit_for_mega_moe=lambda *args: (0, 0))
+    module = SimpleNamespace(__version__="2.6.1", __file__=str(module_file), _C=extension)
+
+    monkeypatch.delitem(sys.modules, "deep_gemm", raising=False)
+    monkeypatch.setattr(
+        "tirx_kernels.deepgemm._loader.importlib.metadata.distribution", lambda name: distribution
+    )
+
+    def fake_import(name: str):
+        assert name == "deep_gemm"
+        assert sys.path[0] == str(tmp_path)
+        return module
+
+    monkeypatch.setattr("tirx_kernels.deepgemm._loader.importlib.import_module", fake_import)
+
+    loaded, version = _import_deep_gemm_distribution(
+        required_extension_symbols=("get_ring_limit_for_mega_moe",)
+    )
+
+    assert loaded is module
+    assert version == "2.6.1+test"
+    assert str(tmp_path) not in sys.path
+
+
+def test_deepgemm_loader_rejects_shadow_distribution_version(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package_root = tmp_path / "deep_gemm"
+    package_root.mkdir()
+    module_file = package_root / "__init__.py"
+    module_file.write_text("")
+    distribution = _FakeDistribution(tmp_path)
+    extension = SimpleNamespace(get_ring_limit_for_mega_moe=lambda *args: (0, 0))
+    module = SimpleNamespace(__version__="0.1.3", __file__=str(module_file), _C=extension)
+
+    monkeypatch.delitem(sys.modules, "deep_gemm", raising=False)
+    monkeypatch.setattr(
+        "tirx_kernels.deepgemm._loader.importlib.metadata.distribution", lambda name: distribution
+    )
+    monkeypatch.setattr(
+        "tirx_kernels.deepgemm._loader.importlib.import_module", lambda name: module
+    )
+
+    with pytest.raises(RuntimeError, match="package collision"):
+        _import_deep_gemm_distribution()
 
 
 def test_aggregate_rank_results_takes_slowest_rank_per_round() -> None:
@@ -129,6 +202,23 @@ def test_decode_launch_uses_bk256_and_chunked_pull(monkeypatch: pytest.MonkeyPat
     assert launch.num_bytes_per_pull == 3584
 
 
+def test_sym_buffer_descriptor_matches_deepgemm_abi() -> None:
+    case = SimpleNamespace(
+        rank_idx=1,
+        symm_buffer=SimpleNamespace(
+            buffer=SimpleNamespace(data_ptr=lambda: 1200),
+            handle=SimpleNamespace(buffer_ptrs=(1000, 1200)),
+        ),
+    )
+
+    descriptor = _make_symm_buffer_descriptor(case)
+
+    assert ctypes.sizeof(_SymBufferDescriptor) == 592
+    assert descriptor.base == 1200
+    assert descriptor.rank_idx == 1
+    assert tuple(descriptor.offsets[:3]) == (-200, 0, 0)
+
+
 @pytest.mark.parametrize(
     (
         "num_processes",
@@ -203,9 +293,12 @@ def test_mega_moe_cuda_compile_mode_defaults_to_nvcc(monkeypatch: pytest.MonkeyP
 
 def test_cuda_compile_mode_context_restores_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TVM_CUDA_COMPILE_MODE", "nvrtc")
+    monkeypatch.setenv("TVM_CUDA_USE_FAST_MATH", "0")
     with _cuda_compile_mode("nvcc"):
         assert os.environ["TVM_CUDA_COMPILE_MODE"] == "nvcc"
+        assert os.environ["TVM_CUDA_USE_FAST_MATH"] == "0"
     assert os.environ["TVM_CUDA_COMPILE_MODE"] == "nvrtc"
+    assert os.environ["TVM_CUDA_USE_FAST_MATH"] == "0"
 
 
 def test_mega_moe_bench_inherits_shared_defaults() -> None:
