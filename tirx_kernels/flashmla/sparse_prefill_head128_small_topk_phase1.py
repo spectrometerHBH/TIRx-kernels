@@ -1003,18 +1003,14 @@ def run_bench(
 
     funcs = {"tirx": lambda: ex(*args)}
 
-    from tirx_kernels.flashmla._flashmla_bench import flashmla_reference_builder
-
-    def _flashmla_ref():
-        run = flashmla_reference_builder()
-        return lambda: run(case)
+    from tirx_kernels.flashmla._trtllm_gen_bench import flashmla_bench_references
 
     return bench(
         funcs,
         warmup=warmup,
         repeat=repeat,
         timer=timer,
-        references={"flashmla": _flashmla_ref},
+        references=flashmla_bench_references(case),
         rounds=_rounds,
         cooldown_s=_cooldown_s,
     )
