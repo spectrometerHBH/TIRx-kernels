@@ -29,6 +29,26 @@ The Stage-1 planning artifact is
 The hand-written `task_impl_moe_*`, `_set_events`, and queue generation path is
 retained as the explicit `manual` fallback and A/B oracle.
 
+## Runnable MoE DSL Example
+
+The complete six-stage DSL authoring source is
+[`build_moe_graph`](dsl/moe_dsl.py).  It creates the tensors and five logical
+events, then connects six concrete `TileImpl` objects with fluent
+`read`/`write`/`wait`/`notify` calls.  Scheduler fields are intentionally absent
+from this graph.
+
+The executable example builds and validates that exact production graph rather
+than maintaining a second copy:
+
+```bash
+PYTHONPATH=/path/to/tvm/python:. \
+python -m tirx_kernels.megakernel.examples.moe_dsl \
+  --batch-size 128 --scheduler dynamic
+```
+
+Omit `--scheduler` to inspect only the logical DSL.  Selecting `static`,
+`unfused`, or `dynamic` additionally shows the private physical-plan boundary.
+
 ## Notation
 
 The benchmark shape is Qwen3-30B-A3B MoE:
