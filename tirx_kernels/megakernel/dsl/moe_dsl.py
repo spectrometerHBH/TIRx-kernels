@@ -27,11 +27,13 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from functools import reduce
+from itertools import product
 from operator import mul
 from typing import Any
 
 import numpy as np
 
+from tirx_kernels.megakernel.utils.base import SemaphoreBase
 from tirx_kernels.megakernel.utils.config import JobType, KernelConfig
 from tirx_kernels.megakernel.utils.dynamic_scheduler import DynamicTileScheduler, MPMCQueueHost
 from tirx_kernels.megakernel.utils.static_scheduler import StaticTileScheduler
@@ -45,7 +47,17 @@ from tirx_kernels.megakernel.utils.utils import (
 )
 from tvm.script import tirx as T
 
-from .expr import ConstExpr, Expr, ScalarLoadExpr, TileIndexExpr, VarExpr, ceildiv
+from .expr import (
+    BinaryExpr,
+    CeilDivExpr,
+    ConstExpr,
+    Expr,
+    ScalarLoadExpr,
+    TileIndexExpr,
+    VarExpr,
+    ceildiv,
+    walk_expr,
+)
 from .spec import (
     DispatchSpec,
     EventSpec,
@@ -73,6 +85,34 @@ _EVENT_ATTRS = {
     "gate_up_done": "evt_group_gemm_gate_up",
     "down_dispatch_done": "evt_group_gemm_down",
 }
+_STEP_PRE_NOTIFY = "pre_notify"
+_STEP_WAIT = "wait"
+_STEP_RUN = "run"
+_STEP_CTA_SYNC = "cta_sync"
+_STEP_RUNTIME_EVENT_INIT = "runtime_event_init"
+_STEP_POST_NOTIFY = "post_notify"
+_EXECUTION_STEPS = {
+    _STEP_PRE_NOTIFY,
+    _STEP_WAIT,
+    _STEP_RUN,
+    _STEP_CTA_SYNC,
+    _STEP_RUNTIME_EVENT_INIT,
+    _STEP_POST_NOTIFY,
+}
+_PACKED_INDEX_LIMITS = (MAX_M_IDX, MAX_N_IDX, MAX_K_IDX)
+_SCOPE_WIDTHS = {
+    "thread": 1,
+    "warp": 32,
+    "warpgroup": KernelConfig.NUM_THREADS // KernelConfig.WG_NUMBER,
+    "cta": KernelConfig.NUM_THREADS,
+}
+_SCOPE_INSTANCES = {
+    "thread": KernelConfig.NUM_THREADS,
+    "warp": KernelConfig.WARP_NUMBER * KernelConfig.WG_NUMBER,
+    "warpgroup": KernelConfig.WG_NUMBER,
+    "cta": 1,
+}
+_SCOPE_ORDER = {"thread": 0, "warp": 1, "warpgroup": 2, "cta": 3}
 
 
 def _max_rows(batch_size: int) -> int:
@@ -268,23 +308,63 @@ def build_moe_graph(config: Mapping[str, Any], batch_size: int) -> KernelSpec:
 
 
 @dataclass(frozen=True)
+class RuntimeEventInitPlan:
+    """A post-tile store of a raw dynamic semaphore value."""
+
+    task: str
+    value: Expr
+    scope: str = "thread"
+    scope_id: int = 0
+    after_step: str = _STEP_CTA_SYNC
+
+
+@dataclass(frozen=True)
 class EventPlan:
     name: str
     shape: tuple[int, ...]
     init_count: int | None
     workspace_offset: int
-    runtime_init_task: str | None = None
+    runtime_init: RuntimeEventInitPlan | None = None
 
     @property
     def size(self) -> int:
         return reduce(mul, self.shape, 1)
+
+    @property
+    def runtime_init_task(self) -> str | None:
+        return None if self.runtime_init is None else self.runtime_init.task
 
 
 @dataclass(frozen=True)
 class TaskPlan:
     spec: TaskSpec
     upper_bounds: tuple[int, int, int]
+    scheduled_extents: tuple[Expr, Expr, Expr]
     scheduled_upper_bounds: tuple[int, int, int]
+    execution_steps: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class DispatchPlan:
+    """A dispatch rule plus statically proven trigger, count, and index ranges."""
+
+    rule: DispatchSpec
+    trigger_upper_bound: int
+    count_lower_bound: int
+    count_upper_bound: int
+    enqueue_upper_bound: int
+    event_coord_bounds: tuple[tuple[int, int], ...]
+    tile_index_bounds: tuple[tuple[int, int], tuple[int, int], tuple[int, int]]
+
+
+@dataclass(frozen=True)
+class DynamicProtocolPlan:
+    """Scheduler constants required by the dynamic two-phase semaphore protocol."""
+
+    pre_decrement: int
+    post_decrement: int
+    scheduler_warp: int
+    queue_discipline: str
 
 
 @dataclass(frozen=True)
@@ -309,7 +389,7 @@ class NormalizedPlan:
     unfused: bool
     events: tuple[EventPlan, ...]
     tasks: tuple[TaskPlan, ...]
-    dispatch_rules: tuple[DispatchSpec, ...]
+    dispatch_plans: tuple[DispatchPlan, ...]
     central_tasks: tuple[HostTask, ...]
     seed_tasks: tuple[HostTask, ...]
     down_coalescing: int
@@ -317,8 +397,7 @@ class NormalizedPlan:
     queue_capacity: int
     queue_upper_bound: int
     persistent_ctas: int
-    pre_before_wait: bool
-    fifo_drain: bool
+    protocol: DynamicProtocolPlan | None
 
     @property
     def user_events(self) -> tuple[EventPlan, ...]:
@@ -328,6 +407,56 @@ class NormalizedPlan:
     def workspace_size(self) -> int:
         return sum(event.size for event in self.events)
 
+    @property
+    def dispatch_rules(self) -> tuple[DispatchSpec, ...]:
+        return tuple(dispatch.rule for dispatch in self.dispatch_plans)
+
+    @property
+    def pre_before_wait(self) -> bool:
+        if not self.is_dynamic:
+            return True
+        for task in self.tasks:
+            steps = task.execution_steps
+            if steps.count(_STEP_PRE_NOTIFY) != 1 or steps.count(_STEP_RUN) != 1:
+                return False
+            pre_index = steps.index(_STEP_PRE_NOTIFY)
+            if pre_index > steps.index(_STEP_RUN):
+                return False
+            if _STEP_WAIT in steps and pre_index > steps.index(_STEP_WAIT):
+                return False
+        return True
+
+    @property
+    def post_after_run(self) -> bool:
+        for task in self.tasks:
+            steps = task.execution_steps
+            has_post = _STEP_POST_NOTIFY in steps
+            if has_post != bool(task.spec.notifies):
+                return False
+            if has_post and steps.index(_STEP_POST_NOTIFY) < steps.index(_STEP_RUN):
+                return False
+        return True
+
+    @property
+    def fifo_drain(self) -> bool:
+        if not self.is_dynamic or self.protocol is None:
+            return True
+        terminal = [
+            dispatch for dispatch in self.dispatch_plans if dispatch.rule.target_task is None
+        ]
+        if len(terminal) != 1:
+            return False
+        dispatch = terminal[0]
+        source = self.task(dispatch.rule.source_task)
+        return (
+            self.protocol.queue_discipline == "fifo"
+            and dispatch.trigger_upper_bound == 1
+            and dispatch.count_lower_bound == self.persistent_ctas
+            and dispatch.count_upper_bound == self.persistent_ctas
+            and not source.spec.notifies
+            and _STEP_POST_NOTIFY not in source.execution_steps
+        )
+
     def event(self, name: str) -> EventPlan:
         return next(event for event in self.events if event.name == name)
 
@@ -336,6 +465,177 @@ class NormalizedPlan:
 
     def dispatch(self, source_task: str) -> DispatchSpec:
         return next(rule for rule in self.dispatch_rules if rule.source_task == source_task)
+
+    def dispatch_plan(self, source_task: str) -> DispatchPlan:
+        return next(
+            dispatch for dispatch in self.dispatch_plans if dispatch.rule.source_task == source_task
+        )
+
+    def validate(self) -> NormalizedPlan:
+        offset = 0
+        runtime_inits: dict[str, list[EventPlan]] = {}
+        for event in self.events:
+            if event.workspace_offset != offset:
+                raise ValueError(f"event {event.name!r} has a non-contiguous workspace offset")
+            offset += event.size
+            if event.runtime_init is not None:
+                runtime_inits.setdefault(event.runtime_init.task, []).append(event)
+
+        task_names = {task.spec.name for task in self.tasks}
+        if set(runtime_inits) - task_names:
+            raise ValueError("runtime event initialization references an unknown task")
+        if any(len(events) > 1 for events in runtime_inits.values()):
+            raise ValueError("a task may initialize at most one runtime event in the MoE MVP")
+        for task in self.tasks:
+            steps = task.execution_steps
+            if any(step not in _EXECUTION_STEPS for step in steps) or len(steps) != len(set(steps)):
+                raise ValueError(f"task {task.spec.name!r} has an invalid execution plan")
+            if steps.count(_STEP_RUN) != 1:
+                raise ValueError(f"task {task.spec.name!r} must execute its tile exactly once")
+            if (_STEP_WAIT in steps) != bool(task.spec.waits):
+                raise ValueError(f"task {task.spec.name!r} wait step does not match its waits")
+            if _STEP_WAIT in steps and steps.index(_STEP_WAIT) > steps.index(_STEP_RUN):
+                raise ValueError(f"task {task.spec.name!r} must wait before tile execution")
+            if (_STEP_POST_NOTIFY in steps) != bool(task.spec.notifies):
+                raise ValueError(f"task {task.spec.name!r} post step does not match its notifies")
+            if (_STEP_RUNTIME_EVENT_INIT in steps) != (
+                task.spec.tile_binding.implementation == "align"
+            ):
+                raise ValueError(
+                    f"task {task.spec.name!r} has an invalid runtime initialization slot"
+                )
+            if task.spec.tile_binding.implementation == "align":
+                if _STEP_CTA_SYNC not in steps or steps.index(_STEP_CTA_SYNC) < steps.index(
+                    _STEP_RUN
+                ):
+                    raise ValueError("align must synchronize the CTA after tile execution")
+                if steps.index(_STEP_RUNTIME_EVENT_INIT) < steps.index(_STEP_CTA_SYNC):
+                    raise ValueError("align event initialization must follow CTA synchronization")
+                if _STEP_POST_NOTIFY in steps and steps.index(_STEP_POST_NOTIFY) < steps.index(
+                    _STEP_RUNTIME_EVENT_INIT
+                ):
+                    raise ValueError("align must initialize runtime events before completion")
+            elif _STEP_CTA_SYNC in steps:
+                raise ValueError(f"task {task.spec.name!r} has an unsupported CTA synchronization")
+            for event in runtime_inits.get(task.spec.name, ()):
+                runtime_init = event.runtime_init
+                if runtime_init is None or runtime_init.after_step not in steps:
+                    raise ValueError(f"event {event.name!r} has an invalid runtime initialization")
+                if steps.index(_STEP_RUNTIME_EVENT_INIT) <= steps.index(runtime_init.after_step):
+                    raise ValueError(
+                        f"event {event.name!r} must be initialized after {runtime_init.after_step}"
+                    )
+                if _STEP_POST_NOTIFY in steps and steps.index(
+                    _STEP_RUNTIME_EVENT_INIT
+                ) > steps.index(_STEP_POST_NOTIFY):
+                    raise ValueError(
+                        f"event {event.name!r} must be initialized before task completion"
+                    )
+
+        if not self.post_after_run:
+            raise ValueError("post notification must execute after tile execution")
+        _validate_task_event_accesses(self.spec, self.tasks, self.events)
+        _validate_event_notification_counts(self.spec, self.tasks, self.events)
+
+        if self.is_dynamic:
+            if self.central_tasks or not self.seed_tasks:
+                raise ValueError("dynamic plan must use seed tasks instead of a central queue")
+            expected_seed = tuple(
+                [
+                    HostTask(JobType.INIT_ETENSOR.value, event_idx, 0, 0)
+                    for event_idx in range(len(self.events))
+                ]
+                + _enumerate_task(self.task("gating"))
+            )
+            if self.seed_tasks != expected_seed:
+                raise ValueError("dynamic seed must contain only event-init and gating tasks")
+            if self.protocol is None:
+                raise ValueError("dynamic plan is missing its semaphore protocol")
+            if (
+                self.protocol.pre_decrement != 1
+                or self.protocol.post_decrement != SemaphoreBase.base
+                or self.protocol.scheduler_warp != DynamicTileScheduler.scheduler_warp
+                or self.protocol.scheduler_warp != 7
+            ):
+                raise ValueError("dynamic plan does not match the two-phase scheduler protocol")
+            if (
+                len(self.dispatch_plans) != len(task_names)
+                or {dispatch.rule.source_task for dispatch in self.dispatch_plans} != task_names
+            ):
+                raise ValueError("dynamic plan does not have one dispatch rule per task")
+            expected_dispatch = _normalize_dispatch(
+                self.spec, self.tasks, self.dispatch_rules, self.events
+            )
+            if self.dispatch_plans != expected_dispatch:
+                raise ValueError("dynamic dispatch bounds do not match their expressions")
+            _validate_dynamic_protocol_links(self.tasks, self.dispatch_plans)
+            _validate_dispatch_coverage(self.spec, self.tasks, self.dispatch_plans)
+            expected_queue_bound = len(self.seed_tasks) + sum(
+                dispatch.enqueue_upper_bound for dispatch in self.dispatch_plans
+            )
+            if self.queue_upper_bound != expected_queue_bound:
+                raise ValueError("dynamic queue upper bound is not derived from dispatch rules")
+            if self.queue_upper_bound > self.queue_capacity:
+                raise ValueError(
+                    f"dynamic queue upper bound {self.queue_upper_bound} exceeds capacity "
+                    f"{self.queue_capacity}"
+                )
+            if self.persistent_ctas != KernelConfig.SM_NUMBER or self.persistent_ctas != 148:
+                raise ValueError("dynamic plan violates persistent CTA saturation")
+            if (
+                self.dispatch_plan("gating").count_lower_bound != self.persistent_ctas
+                or self.dispatch_plan("gating").count_upper_bound != self.persistent_ctas
+                or self.dispatch_plan("align").count_lower_bound != self.persistent_ctas
+                or self.dispatch_plan("align").count_upper_bound != self.persistent_ctas
+            ):
+                raise ValueError("dynamic plan violates topk/count-sort saturation fanout")
+            if not self.pre_before_wait:
+                raise ValueError("dynamic pre-notification must execute before wait and run")
+            if not self.fifo_drain:
+                raise ValueError("dynamic plan does not provide a FIFO terminal drain")
+
+            down_event = self.event("down_dispatch_done")
+            runtime_init = down_event.runtime_init
+            expected_value = (
+                ConstExpr(self.protocol.pre_decrement + self.protocol.post_decrement)
+                * self.task("down").scheduled_extents[0]
+                * self.down_dispatch_groups
+            )
+            if (
+                runtime_init is None
+                or runtime_init.task != "align"
+                or runtime_init.scope != "thread"
+                or runtime_init.scope_id != 0
+                or runtime_init.value != expected_value
+            ):
+                raise ValueError("dynamic down event has an invalid runtime initialization")
+        else:
+            if self.dispatch_plans or self.seed_tasks or self.protocol is not None:
+                raise ValueError("static plan contains dynamic scheduling state")
+            if any(_STEP_PRE_NOTIFY in task.execution_steps for task in self.tasks):
+                raise ValueError("static task cannot contain a pre-notification step")
+            if runtime_inits:
+                raise ValueError("static plan cannot contain runtime event initialization")
+            expected_central = [
+                HostTask(JobType.INIT_ETENSOR.value, event_idx, 0, 0)
+                for event_idx in range(len(self.events))
+            ]
+            expected_central.extend(_enumerate_task(self.task("gating")))
+            expected_central.extend(
+                HostTask(JobType.WAIT_ETENSOR_INIT.value, cta, 0, 0)
+                for cta in range(self.persistent_ctas)
+            )
+            for task in self.tasks:
+                if task.spec.name != "gating":
+                    expected_central.extend(_enumerate_task(task))
+            if self.central_tasks != tuple(expected_central):
+                raise ValueError("static central queue does not match the normalized tasks")
+            queue_columns = (
+                len(self.central_tasks) + self.persistent_ctas - 1
+            ) // self.persistent_ctas + 1
+            if self.queue_upper_bound != queue_columns or queue_columns > self.queue_capacity:
+                raise ValueError("static queue bound does not match its central task plan")
+        return self
 
     def make_static_queue(self) -> np.ndarray:
         if self.is_dynamic:
@@ -373,14 +673,31 @@ class NormalizedPlan:
                     "init_count": event.init_count,
                     "offset": event.workspace_offset,
                     "runtime_init_task": event.runtime_init_task,
+                    "runtime_init": (
+                        None
+                        if event.runtime_init is None
+                        else {
+                            "task": event.runtime_init.task,
+                            "value": event.runtime_init.value.to_data(),
+                            "scope": event.runtime_init.scope,
+                            "scope_id": event.runtime_init.scope_id,
+                            "after_step": event.runtime_init.after_step,
+                        }
+                    ),
                 }
                 for event in self.events
             ],
             "tasks": [
                 {
                     "name": task.spec.name,
+                    "job_type": task.spec.tile_binding.job_type,
+                    "implementation": task.spec.tile_binding.implementation,
                     "upper_bounds": task.upper_bounds,
+                    "scheduled_extents": [extent.to_data() for extent in task.scheduled_extents],
                     "scheduled_upper_bounds": task.scheduled_upper_bounds,
+                    "execution_steps": task.execution_steps,
+                    "reads": list(task.spec.reads),
+                    "writes": list(task.spec.writes),
                     "waits": [
                         {
                             "event": wait.event,
@@ -406,19 +723,29 @@ class NormalizedPlan:
                 for task in self.tasks
             ],
             "central_task_count": len(self.central_tasks),
+            "central_tasks": [task.as_manual_tuple() for task in self.central_tasks],
             "seed_tasks": [task.as_manual_tuple() for task in self.seed_tasks],
             "dispatch": [
                 {
-                    "source_task": rule.source_task,
-                    "event": rule.event,
-                    "target_task": rule.target_task,
-                    "count": rule.count.to_data(),
-                    "tile_indices": [index.to_data() for index in rule.tile_indices],
-                    "push_level": rule.push_level,
-                    "pre_scope": rule.pre_scope,
-                    "pre_scope_id": rule.pre_scope_id,
+                    "source_task": dispatch.rule.source_task,
+                    "event": dispatch.rule.event,
+                    "event_coord": [coord.to_data() for coord in dispatch.rule.event_coord],
+                    "target_task": dispatch.rule.target_task,
+                    "count": dispatch.rule.count.to_data(),
+                    "tile_indices": [index.to_data() for index in dispatch.rule.tile_indices],
+                    "push_level": dispatch.rule.push_level,
+                    "pre_scope": dispatch.rule.pre_scope,
+                    "pre_scope_id": dispatch.rule.pre_scope_id,
+                    "pre_count": dispatch.rule.pre_count.to_data(),
+                    "rank": dispatch.rule.rank,
+                    "trigger_upper_bound": dispatch.trigger_upper_bound,
+                    "count_lower_bound": dispatch.count_lower_bound,
+                    "count_upper_bound": dispatch.count_upper_bound,
+                    "enqueue_upper_bound": dispatch.enqueue_upper_bound,
+                    "event_coord_bounds": dispatch.event_coord_bounds,
+                    "tile_index_bounds": dispatch.tile_index_bounds,
                 }
-                for rule in self.dispatch_rules
+                for dispatch in self.dispatch_plans
             ],
             "down_coalescing": self.down_coalescing,
             "down_dispatch_groups": self.down_dispatch_groups,
@@ -426,7 +753,18 @@ class NormalizedPlan:
             "queue_upper_bound": self.queue_upper_bound,
             "persistent_ctas": self.persistent_ctas,
             "pre_before_wait": self.pre_before_wait,
+            "post_after_run": self.post_after_run,
             "fifo_drain": self.fifo_drain,
+            "protocol": (
+                None
+                if self.protocol is None
+                else {
+                    "pre_decrement": self.protocol.pre_decrement,
+                    "post_decrement": self.protocol.post_decrement,
+                    "scheduler_warp": self.protocol.scheduler_warp,
+                    "queue_discipline": self.protocol.queue_discipline,
+                }
+            ),
         }
 
 
@@ -440,8 +778,30 @@ def _evaluate(expr: Expr, env: Mapping[str, int], label: str) -> int:
     return value
 
 
+def _execution_steps(task: TaskSpec, *, is_dynamic: bool, runtime_init: bool) -> tuple[str, ...]:
+    steps = []
+    if is_dynamic:
+        steps.append(_STEP_PRE_NOTIFY)
+    if task.waits:
+        steps.append(_STEP_WAIT)
+    steps.append(_STEP_RUN)
+    if task.tile_binding.implementation == "align":
+        steps.append(_STEP_CTA_SYNC)
+        steps.append(_STEP_RUNTIME_EVENT_INIT)
+    elif runtime_init:
+        raise ValueError("only the align task may initialize a runtime event in the MoE MVP")
+    if task.notifies:
+        steps.append(_STEP_POST_NOTIFY)
+    return tuple(steps)
+
+
 def _normalize_tasks(
-    spec: KernelSpec, *, unfused: bool, down_coalescing: int
+    spec: KernelSpec,
+    *,
+    is_dynamic: bool,
+    unfused: bool,
+    down_coalescing: int,
+    runtime_init_tasks: set[str],
 ) -> tuple[TaskPlan, ...]:
     plans = []
     for task in spec.tasks:
@@ -468,14 +828,34 @@ def _normalize_tasks(
             _evaluate(bound, spec.compile_env, f"task {task.name} upper bound")
             for bound in task.domain.upper_bounds
         )
+        scheduled_extents = normalized.domain.extents
         scheduled = upper
         if task.name == "down" and down_coalescing != 1:
+            scheduled_extents = (
+                normalized.domain.extents[0],
+                normalized.domain.extents[1] // down_coalescing,
+                normalized.domain.extents[2],
+            )
             scheduled = (upper[0], upper[1] // down_coalescing, upper[2])
-        plans.append(TaskPlan(normalized, upper, scheduled))
+        plans.append(
+            TaskPlan(
+                normalized,
+                upper,
+                scheduled_extents,
+                scheduled,
+                _execution_steps(
+                    normalized,
+                    is_dynamic=is_dynamic,
+                    runtime_init=normalized.name in runtime_init_tasks,
+                ),
+            )
+        )
     return tuple(plans)
 
 
-def _event_plans(spec: KernelSpec, *, is_dynamic: bool, unfused: bool) -> tuple[EventPlan, ...]:
+def _event_plans(
+    spec: KernelSpec, *, is_dynamic: bool, unfused: bool, down_dispatch_groups: int
+) -> tuple[EventPlan, ...]:
     offset = 0
     plans = []
     max_rows = _max_rows(spec.compile_env["B"])
@@ -489,14 +869,19 @@ def _event_plans(spec: KernelSpec, *, is_dynamic: bool, unfused: bool) -> tuple[
             if event.init_count is None
             else _evaluate(event.init_count, spec.compile_env, f"event {event.name} count")
         )
-        runtime_init_task = None
+        runtime_init = None
         if event.name == "gate_up_done" and unfused:
             shape = (1,)
             count = max_rows * 12
         if event.name == "down_dispatch_done" and is_dynamic:
             count = None
-            runtime_init_task = "align"
-        plan = EventPlan(event.name, shape, count, offset, runtime_init_task)
+            runtime_rows = next(task for task in spec.tasks if task.name == "down").domain.extents[
+                0
+            ]
+            runtime_init = RuntimeEventInitPlan(
+                "align", ConstExpr(SemaphoreBase.base + 1) * runtime_rows * down_dispatch_groups
+            )
+        plan = EventPlan(event.name, shape, count, offset, runtime_init)
         plans.append(plan)
         offset += plan.size
     if not is_dynamic:
@@ -526,6 +911,418 @@ def _validate_packed_tasks(tasks: tuple[TaskPlan, ...]):
             raise ValueError(f"task {task.spec.name!r} overflows packed tile indices")
 
 
+def _known_extent_bounds(tasks: tuple[TaskPlan, ...]) -> dict[Expr, int]:
+    bounds: dict[Expr, int] = {}
+    for task in tasks:
+        for extent, upper_bound in zip(
+            task.scheduled_extents, task.scheduled_upper_bounds, strict=True
+        ):
+            if isinstance(extent, ConstExpr):
+                continue
+            bounds[extent] = min(bounds.get(extent, upper_bound), upper_bound)
+    return bounds
+
+
+def _expr_interval(
+    expr: Expr,
+    *,
+    compile_env: Mapping[str, int],
+    known_bounds: Mapping[Expr, int],
+    tile_bounds: Mapping[str, tuple[int, int, int]],
+    var_bounds: Mapping[str, tuple[int, int]] | None = None,
+) -> tuple[int, int]:
+    """Conservatively bound a narrow DSL expression for host-side validation."""
+
+    if expr in known_bounds:
+        return (0, known_bounds[expr])
+    if isinstance(expr, ConstExpr):
+        return (expr.value, expr.value)
+    if isinstance(expr, VarExpr):
+        if var_bounds is not None and expr.name in var_bounds:
+            return var_bounds[expr.name]
+        if expr.name in compile_env:
+            value = compile_env[expr.name]
+            return (value, value)
+        raise ValueError(f"expression variable {expr.name!r} does not have a validated range")
+    if isinstance(expr, TileIndexExpr):
+        if expr.task not in tile_bounds:
+            raise ValueError(f"tile index for {expr.task!r} does not have a validated range")
+        return (0, tile_bounds[expr.task][expr.axis] - 1)
+    if isinstance(expr, ScalarLoadExpr):
+        raise ValueError(f"runtime scalar {expr.tensor!r} does not have a validated range")
+
+    if not isinstance(expr, BinaryExpr | CeilDivExpr):
+        raise TypeError(f"unsupported expression node {type(expr).__name__}")
+    lhs_lo, lhs_hi = _expr_interval(
+        expr.lhs,
+        compile_env=compile_env,
+        known_bounds=known_bounds,
+        tile_bounds=tile_bounds,
+        var_bounds=var_bounds,
+    )
+    rhs_lo, rhs_hi = _expr_interval(
+        expr.rhs,
+        compile_env=compile_env,
+        known_bounds=known_bounds,
+        tile_bounds=tile_bounds,
+        var_bounds=var_bounds,
+    )
+    if isinstance(expr, CeilDivExpr):
+        if rhs_lo <= 0:
+            raise ValueError("ceildiv divisor does not have a positive validated range")
+        quotients = tuple(
+            (lhs + rhs - 1) // rhs for lhs in (lhs_lo, lhs_hi) for rhs in (rhs_lo, rhs_hi)
+        )
+        return (min(quotients), max(quotients))
+    if expr.op == "+":
+        return (lhs_lo + rhs_lo, lhs_hi + rhs_hi)
+    if expr.op == "-":
+        return (lhs_lo - rhs_hi, lhs_hi - rhs_lo)
+    if expr.op == "*":
+        products = (lhs_lo * rhs_lo, lhs_lo * rhs_hi, lhs_hi * rhs_lo, lhs_hi * rhs_hi)
+        return (min(products), max(products))
+    if rhs_lo <= 0:
+        raise ValueError(f"{expr.op} divisor does not have a positive validated range")
+    if expr.op == "//":
+        quotients = (lhs_lo // rhs_lo, lhs_lo // rhs_hi, lhs_hi // rhs_lo, lhs_hi // rhs_hi)
+        return (min(quotients), max(quotients))
+    return (0, max(abs(rhs_lo), abs(rhs_hi)) - 1)
+
+
+def _validate_scope(
+    owner: str, scope: str, scope_id: int, count_bounds: tuple[int, int], rank: int
+):
+    if rank != -1:
+        raise ValueError(f"{owner} uses a cross-rank notification outside the MoE DSL MVP")
+    if (
+        isinstance(scope_id, bool)
+        or not isinstance(scope_id, int)
+        or scope_id < -1
+        or scope_id >= _SCOPE_INSTANCES[scope]
+    ):
+        raise ValueError(f"{owner} has an invalid {scope} scope id {scope_id!r}")
+    count_lo, count_hi = count_bounds
+    if count_lo < 0 or count_hi <= 0 or count_hi > _SCOPE_WIDTHS[scope]:
+        raise ValueError(
+            f"{owner} notification count range {count_bounds} exceeds its {scope} scope"
+        )
+
+
+def _event_coord_bounds(
+    owner: str,
+    event: EventPlan,
+    coord: tuple[Expr, ...],
+    *,
+    compile_env: Mapping[str, int],
+    known_bounds: Mapping[Expr, int],
+    tile_bounds: Mapping[str, tuple[int, int, int]],
+) -> tuple[tuple[int, int], ...]:
+    bounds = tuple(
+        _expr_interval(
+            index, compile_env=compile_env, known_bounds=known_bounds, tile_bounds=tile_bounds
+        )
+        for index in coord
+    )
+    for axis, ((lower, upper), extent) in enumerate(zip(bounds, event.shape, strict=True)):
+        if lower < 0 or upper >= extent:
+            raise ValueError(
+                f"{owner} event coordinate axis {axis} is outside event {event.name!r}"
+            )
+    return bounds
+
+
+def _validate_task_event_accesses(
+    spec: KernelSpec, tasks: tuple[TaskPlan, ...], events: tuple[EventPlan, ...]
+):
+    event_map = {event.name: event for event in events}
+    tile_bounds = {task.spec.name: task.scheduled_upper_bounds for task in tasks}
+    known_bounds = _known_extent_bounds(tasks)
+    for task in tasks:
+        for wait in task.spec.waits:
+            if (
+                isinstance(wait.mask, bool)
+                or not isinstance(wait.mask, int)
+                or not 0 <= wait.mask <= 0xFFFFFFFF
+            ):
+                raise ValueError(f"task {task.spec.name!r} has an invalid wait mask")
+            _event_coord_bounds(
+                f"task {task.spec.name!r}",
+                event_map[wait.event],
+                wait.coord,
+                compile_env=spec.compile_env,
+                known_bounds=known_bounds,
+                tile_bounds=tile_bounds,
+            )
+        for notify in task.spec.notifies:
+            if not isinstance(notify.release, bool):
+                raise ValueError(f"task {task.spec.name!r} has a non-boolean release flag")
+            _event_coord_bounds(
+                f"task {task.spec.name!r}",
+                event_map[notify.event],
+                notify.coord,
+                compile_env=spec.compile_env,
+                known_bounds=known_bounds,
+                tile_bounds=tile_bounds,
+            )
+            count_bounds = _expr_interval(
+                notify.count,
+                compile_env=spec.compile_env,
+                known_bounds=known_bounds,
+                tile_bounds=tile_bounds,
+            )
+            _validate_scope(
+                f"task {task.spec.name!r}", notify.scope, notify.scope_id, count_bounds, notify.rank
+            )
+
+
+def _validate_event_notification_counts(
+    spec: KernelSpec, tasks: tuple[TaskPlan, ...], events: tuple[EventPlan, ...]
+):
+    event_map = {event.name: event for event in events}
+    tile_bounds = {task.spec.name: task.scheduled_upper_bounds for task in tasks}
+    known_bounds = _known_extent_bounds(tasks)
+    for task in tasks:
+        task_volume = reduce(mul, task.scheduled_upper_bounds, 1)
+        for notify in task.spec.notifies:
+            event = event_map[notify.event]
+            if event.init_count is None:
+                raise ValueError(
+                    f"event {event.name!r} is notified without an initialization count"
+                )
+            coord_bounds = _event_coord_bounds(
+                f"task {task.spec.name!r}",
+                event,
+                notify.coord,
+                compile_env=spec.compile_env,
+                known_bounds=known_bounds,
+                tile_bounds=tile_bounds,
+            )
+            coord_count = reduce(mul, (upper - lower + 1 for lower, upper in coord_bounds), 1)
+            count_bounds = _expr_interval(
+                notify.count,
+                compile_env=spec.compile_env,
+                known_bounds=known_bounds,
+                tile_bounds=tile_bounds,
+            )
+            if count_bounds[0] != count_bounds[1] or task_volume % coord_count:
+                raise ValueError(
+                    f"task {task.spec.name!r} notification coverage is not statically uniform"
+                )
+            scope_multiplier = _SCOPE_INSTANCES[notify.scope] if notify.scope_id == -1 else 1
+            expected_count = task_volume // coord_count * count_bounds[0] * scope_multiplier
+            if expected_count != event.init_count:
+                raise ValueError(
+                    f"event {event.name!r} expects {event.init_count} notifications per "
+                    f"coordinate, but task {task.spec.name!r} provides {expected_count}"
+                )
+
+
+def _normalize_dispatch(
+    spec: KernelSpec,
+    tasks: tuple[TaskPlan, ...],
+    rules: tuple[DispatchSpec, ...],
+    events: tuple[EventPlan, ...],
+) -> tuple[DispatchPlan, ...]:
+    task_map = {task.spec.name: task for task in tasks}
+    event_map = {event.name: event for event in events}
+    tile_bounds = {task.spec.name: task.scheduled_upper_bounds for task in tasks}
+    known_bounds = _known_extent_bounds(tasks)
+    plans = []
+    for rule in rules:
+        count_lo, count_hi = _expr_interval(
+            rule.count,
+            compile_env=spec.compile_env,
+            known_bounds=known_bounds,
+            tile_bounds=tile_bounds,
+        )
+        if count_lo < 0 or count_hi <= 0:
+            raise ValueError(f"dynamic rule for {rule.source_task!r} has an invalid count range")
+        pre_count_bounds = _expr_interval(
+            rule.pre_count,
+            compile_env=spec.compile_env,
+            known_bounds=known_bounds,
+            tile_bounds=tile_bounds,
+        )
+        _validate_scope(
+            f"dynamic rule for {rule.source_task!r}",
+            rule.pre_scope,
+            rule.pre_scope_id,
+            pre_count_bounds,
+            rule.rank,
+        )
+        if _SCOPE_ORDER[rule.push_level] > _SCOPE_ORDER[rule.pre_scope]:
+            raise ValueError(
+                f"dynamic rule for {rule.source_task!r} cannot push at {rule.push_level} "
+                f"from {rule.pre_scope}"
+            )
+
+        event = event_map[rule.event]
+        event_coord_bounds = _event_coord_bounds(
+            f"dynamic rule for {rule.source_task!r}",
+            event,
+            rule.event_coord,
+            compile_env=spec.compile_env,
+            known_bounds=known_bounds,
+            tile_bounds=tile_bounds,
+        )
+
+        tile_index_bounds = tuple(
+            _expr_interval(
+                index,
+                compile_env=spec.compile_env,
+                known_bounds=known_bounds,
+                tile_bounds=tile_bounds,
+                var_bounds={"push_idx": (0, count_hi - 1)},
+            )
+            for index in rule.tile_indices
+        )
+        target = None if rule.target_task is None else task_map[rule.target_task]
+        target_job = JobType.END.value if target is None else target.spec.tile_binding.job_type
+        if not 0 <= target_job < MAX_TASK_TYPE:
+            raise ValueError(f"dynamic rule for {rule.source_task!r} overflows packed task type")
+        for axis, ((lower, upper), limit) in enumerate(
+            zip(tile_index_bounds, _PACKED_INDEX_LIMITS, strict=True)
+        ):
+            if lower < 0 or upper >= limit:
+                raise ValueError(
+                    f"dynamic rule for {rule.source_task!r} overflows packed tile indices"
+                )
+            if target is not None and upper >= target.scheduled_upper_bounds[axis]:
+                raise ValueError(
+                    f"dynamic rule for {rule.source_task!r} maps outside target task "
+                    f"{rule.target_task!r} axis {axis}"
+                )
+
+        trigger_upper_bound = reduce(
+            mul, (upper - lower + 1 for lower, upper in event_coord_bounds), 1
+        )
+        plans.append(
+            DispatchPlan(
+                rule,
+                trigger_upper_bound,
+                count_lo,
+                count_hi,
+                trigger_upper_bound * count_hi,
+                event_coord_bounds,
+                tile_index_bounds,
+            )
+        )
+    return tuple(plans)
+
+
+def _validate_dynamic_protocol_links(
+    tasks: tuple[TaskPlan, ...], dispatch_plans: tuple[DispatchPlan, ...]
+):
+    task_map = {task.spec.name: task for task in tasks}
+    for dispatch in dispatch_plans:
+        rule = dispatch.rule
+        source = task_map[rule.source_task]
+        if rule.target_task is None:
+            if source.spec.notifies:
+                raise ValueError(
+                    f"terminal task {source.spec.name!r} must only pre-notify its drain event"
+                )
+            continue
+        if len(source.spec.notifies) != 1:
+            raise ValueError(
+                f"dynamic task {source.spec.name!r} must have one completion notification"
+            )
+        notify = source.spec.notifies[0]
+        pre_scope_multiplier = _SCOPE_INSTANCES[rule.pre_scope] if rule.pre_scope_id == -1 else 1
+        post_scope_multiplier = _SCOPE_INSTANCES[notify.scope] if notify.scope_id == -1 else 1
+        if (
+            notify.event != rule.event
+            or notify.coord != rule.event_coord
+            or notify.count != rule.pre_count
+            or notify.rank != rule.rank
+            or pre_scope_multiplier != post_scope_multiplier
+        ):
+            raise ValueError(
+                f"dynamic task {source.spec.name!r} pre/post notifications are inconsistent"
+            )
+
+
+def _validate_dispatch_coverage(
+    spec: KernelSpec, tasks: tuple[TaskPlan, ...], dispatch_plans: tuple[DispatchPlan, ...]
+):
+    """Prove that every non-seed task is pushed exactly once at its upper bound."""
+
+    task_map = {task.spec.name: task for task in tasks}
+    incoming: dict[str, int] = {}
+    for dispatch in dispatch_plans:
+        rule = dispatch.rule
+        if rule.target_task is None:
+            continue
+        incoming[rule.target_task] = incoming.get(rule.target_task, 0) + 1
+
+        if any(isinstance(node, TileIndexExpr) for node in walk_expr(rule.count)):
+            raise ValueError(
+                f"dynamic rule for {rule.source_task!r} has a tile-dependent push count"
+            )
+        event_tile_axes: dict[int, int] = {}
+        for coord_axis, coord in enumerate(rule.event_coord):
+            tile_nodes = [node for node in walk_expr(coord) if isinstance(node, TileIndexExpr)]
+            if any(isinstance(node, ScalarLoadExpr) for node in walk_expr(coord)):
+                raise ValueError(
+                    f"dynamic rule for {rule.source_task!r} has a runtime event coordinate"
+                )
+            if tile_nodes:
+                if len(tile_nodes) != 1 or coord != tile_nodes[0]:
+                    raise ValueError(
+                        f"dynamic rule for {rule.source_task!r} event coordinate is not "
+                        "directly enumerable"
+                    )
+                tile_axis = tile_nodes[0].axis
+                if tile_axis in event_tile_axes.values():
+                    raise ValueError(
+                        f"dynamic rule for {rule.source_task!r} repeats a source tile axis"
+                    )
+                event_tile_axes[coord_axis] = tile_axis
+
+        for index in rule.tile_indices:
+            for node in walk_expr(index):
+                if isinstance(node, ScalarLoadExpr):
+                    raise ValueError(
+                        f"dynamic rule for {rule.source_task!r} has a runtime tile mapping"
+                    )
+                if isinstance(node, TileIndexExpr) and node.axis not in event_tile_axes.values():
+                    raise ValueError(
+                        f"dynamic rule for {rule.source_task!r} maps a source tile axis "
+                        "that is not fixed by its event coordinate"
+                    )
+
+        generated = []
+        coord_ranges = [range(lower, upper + 1) for lower, upper in dispatch.event_coord_bounds]
+        for event_coord in product(*coord_ranges):
+            source_tile = [0, 0, 0]
+            for coord_axis, tile_axis in event_tile_axes.items():
+                source_tile[tile_axis] = event_coord[coord_axis]
+            for push_idx in range(dispatch.count_upper_bound):
+                env = {
+                    "vars": {**spec.compile_env, "push_idx": push_idx},
+                    "tiles": {rule.source_task: tuple(source_tile)},
+                }
+                generated.append(tuple(index.evaluate(env) for index in rule.tile_indices))
+
+        target = task_map[rule.target_task]
+        expected = set(
+            product(*(range(upper_bound) for upper_bound in target.scheduled_upper_bounds))
+        )
+        if (
+            len(generated) != dispatch.enqueue_upper_bound
+            or len(generated) != len(set(generated))
+            or set(generated) != expected
+        ):
+            raise ValueError(
+                f"dynamic rule for {rule.source_task!r} does not cover target task "
+                f"{rule.target_task!r} exactly once"
+            )
+
+    expected_targets = {task.spec.name for task in tasks if task.spec.name != "gating"}
+    if set(incoming) != expected_targets or any(count != 1 for count in incoming.values()):
+        raise ValueError("dynamic dispatch graph must have one incoming rule per non-seed task")
+
+
 class MoePolicy:
     name = "base"
     is_dynamic = False
@@ -543,8 +1340,14 @@ class StaticPolicy(MoePolicy):
 
     def normalize(self, spec: KernelSpec) -> NormalizedPlan:
         spec.validate()
-        events = _event_plans(spec, is_dynamic=False, unfused=self.unfused)
-        tasks = _normalize_tasks(spec, unfused=self.unfused, down_coalescing=1)
+        events = _event_plans(spec, is_dynamic=False, unfused=self.unfused, down_dispatch_groups=16)
+        tasks = _normalize_tasks(
+            spec,
+            is_dynamic=False,
+            unfused=self.unfused,
+            down_coalescing=1,
+            runtime_init_tasks=set(),
+        )
         _validate_packed_tasks(tasks)
         by_name = {task.spec.name: task for task in tasks}
         central = [
@@ -556,32 +1359,34 @@ class StaticPolicy(MoePolicy):
             HostTask(JobType.WAIT_ETENSOR_INIT.value, cta, 0, 0)
             for cta in range(KernelConfig.SM_NUMBER)
         )
-        for name in ("topk", "align", "count_sort", "gate_up_silu", "down"):
-            central.extend(_enumerate_task(by_name[name]))
+        for task in tasks:
+            if task.spec.name != "gating":
+                central.extend(_enumerate_task(task))
         queue_columns = (len(central) + KernelConfig.SM_NUMBER - 1) // KernelConfig.SM_NUMBER + 1
-        capacity = self.queue_capacity or StaticTileScheduler.MAX_TASKS
+        capacity = (
+            StaticTileScheduler.MAX_TASKS if self.queue_capacity is None else self.queue_capacity
+        )
         if capacity != StaticTileScheduler.MAX_TASKS or queue_columns > capacity:
             raise ValueError(
                 f"static host queue requires {queue_columns} columns, capacity is {capacity}"
             )
         return NormalizedPlan(
-            spec,
-            self.name,
-            False,
-            self.unfused,
-            events,
-            tasks,
-            (),
-            tuple(central),
-            (),
-            1,
-            16,
-            capacity,
-            len(central),
-            KernelConfig.SM_NUMBER,
-            True,
-            True,
-        )
+            spec=spec,
+            policy_name=self.name,
+            is_dynamic=False,
+            unfused=self.unfused,
+            events=events,
+            tasks=tasks,
+            dispatch_plans=(),
+            central_tasks=tuple(central),
+            seed_tasks=(),
+            down_coalescing=1,
+            down_dispatch_groups=16,
+            queue_capacity=capacity,
+            queue_upper_bound=queue_columns,
+            persistent_ctas=KernelConfig.SM_NUMBER,
+            protocol=None,
+        ).validate()
 
 
 class UnfusedPolicy(StaticPolicy):
@@ -604,8 +1409,6 @@ class DynamicPolicy(MoePolicy):
 
     def normalize(self, spec: KernelSpec) -> NormalizedPlan:
         spec.validate()
-        if any(notify.release for task in spec.tasks for notify in task.notifies):
-            raise ValueError("dynamic notification release is outside the MoE DSL MVP")
         batch_size = spec.compile_env["B"]
         expected_coalescing = 1 if batch_size < 4 else 4
         coalescing = expected_coalescing if self.down_coalescing is None else self.down_coalescing
@@ -616,73 +1419,66 @@ class DynamicPolicy(MoePolicy):
         capacity = self.queue_capacity
         if capacity is None or capacity <= 0 or capacity & (capacity - 1):
             raise ValueError("dynamic queue capacity must be a positive power of two")
-        events = _event_plans(spec, is_dynamic=True, unfused=False)
-        tasks = _normalize_tasks(spec, unfused=False, down_coalescing=coalescing)
+        down_dispatch_groups = 16 // coalescing
+        events = _event_plans(
+            spec, is_dynamic=True, unfused=False, down_dispatch_groups=down_dispatch_groups
+        )
+        tasks = _normalize_tasks(
+            spec,
+            is_dynamic=True,
+            unfused=False,
+            down_coalescing=coalescing,
+            runtime_init_tasks={
+                event.runtime_init.task for event in events if event.runtime_init is not None
+            },
+        )
         _validate_packed_tasks(tasks)
-        dispatch = tuple(
-            replace(rule, count=ConstExpr(16 // coalescing))
+        dispatch_rules = tuple(
+            replace(rule, count=ConstExpr(down_dispatch_groups))
             if rule.source_task == "gate_up_silu"
             else rule
             for rule in spec.dynamic_dispatch
         )
+        dispatch_plans = _normalize_dispatch(spec, tasks, dispatch_rules, events)
         by_name = {task.spec.name: task for task in tasks}
         seed = [
             HostTask(JobType.INIT_ETENSOR.value, event_idx, 0, 0)
             for event_idx in range(len(events))
         ]
         seed.extend(_enumerate_task(by_name["gating"]))
-        queue_upper_bound = (
-            len(seed)
-            + 148
-            + 1
-            + 148
-            + reduce(mul, by_name["gate_up_silu"].scheduled_upper_bounds, 1)
-            + reduce(mul, by_name["down"].scheduled_upper_bounds, 1)
-            + 148
+        queue_upper_bound = len(seed) + sum(
+            dispatch.enqueue_upper_bound for dispatch in dispatch_plans
         )
         if queue_upper_bound > capacity:
             raise ValueError(
                 f"dynamic queue upper bound {queue_upper_bound} exceeds capacity {capacity}"
             )
-        fanout = {
-            rule.source_task: _evaluate(rule.count, spec.compile_env, "dispatch count")
-            for rule in dispatch
-            if not any(isinstance(node, ScalarLoadExpr) for node in _walk(rule.count))
-        }
-        if (
-            KernelConfig.SM_NUMBER != 148
-            or fanout.get("gating") != 148
-            or fanout.get("align") != 148
-            or fanout.get("down") != 148
-        ):
-            raise ValueError("dynamic policy violates persistent CTA saturation invariants")
+        if capacity != DynamicTileScheduler.MAX_TASKS:
+            raise ValueError(
+                f"dynamic queue capacity must remain {DynamicTileScheduler.MAX_TASKS}; got {capacity}"
+            )
         return NormalizedPlan(
-            spec,
-            self.name,
-            True,
-            False,
-            events,
-            tasks,
-            dispatch,
-            (),
-            tuple(seed),
-            coalescing,
-            16 // coalescing,
-            capacity,
-            queue_upper_bound,
-            KernelConfig.SM_NUMBER,
-            True,
-            True,
-        )
-
-
-def _walk(expr: Expr):
-    yield expr
-    if hasattr(expr, "lhs"):
-        yield from _walk(expr.lhs)
-        yield from _walk(expr.rhs)
-    elif isinstance(expr, ScalarLoadExpr):
-        yield from _walk(expr.index)
+            spec=spec,
+            policy_name=self.name,
+            is_dynamic=True,
+            unfused=False,
+            events=events,
+            tasks=tasks,
+            dispatch_plans=dispatch_plans,
+            central_tasks=(),
+            seed_tasks=tuple(seed),
+            down_coalescing=coalescing,
+            down_dispatch_groups=down_dispatch_groups,
+            queue_capacity=capacity,
+            queue_upper_bound=queue_upper_bound,
+            persistent_ctas=KernelConfig.SM_NUMBER,
+            protocol=DynamicProtocolPlan(
+                pre_decrement=1,
+                post_decrement=SemaphoreBase.base,
+                scheduler_warp=DynamicTileScheduler.scheduler_warp,
+                queue_discipline="fifo",
+            ),
+        ).validate()
 
 
 def policy_for_scheduler(scheduler: str) -> MoePolicy:
@@ -820,10 +1616,12 @@ class MoeLowerer:
                 )
 
             if plan.is_dynamic:
-                if notify.release:
-                    raise ValueError("dynamic notification release is outside the MoE DSL MVP")
                 self.owner.tile_scheduler.notify(
-                    event, notify_fn, scope=notify.scope, scope_id=notify.scope_id
+                    event,
+                    notify_fn,
+                    scope=notify.scope,
+                    scope_id=notify.scope_id,
+                    release=notify.release,
                 )
             else:
                 self.owner.tile_scheduler.notify(
@@ -947,33 +1745,76 @@ class MoeLowerer:
             raise ValueError(f"unknown opaque tile implementation {implementation!r}")
 
     @T.inline
-    def _emit_align_task(self, task: TaskPlan, context, is_dynamic):
-        plan = T.meta_var(self._require_plan())
+    def _emit_runtime_event_init(
+        self, task, context, event_name, runtime_init, runtime_init_scope_id, tid
+    ):
+        if tid == runtime_init_scope_id:
+            if runtime_init is not None:
+                self._event(event_name).sem[0] = runtime_init.value.lower(
+                    self._expr_env(task, context)
+                )
+
+    @T.inline
+    def _emit_align_task(
+        self,
+        task,
+        context,
+        emit_pre,
+        emit_wait,
+        emit_init,
+        runtime_event_name,
+        runtime_init,
+        runtime_init_scope_id,
+        emit_post,
+    ):
         tid = T.thread_id([KernelConfig.NUM_THREADS])
-        if is_dynamic:
+        if emit_pre:
             self._emit_pre_notify(task, context)
-        self._emit_waits(task, context)
+        if emit_wait:
+            self._emit_waits(task, context)
         self._run_opaque_tile(task, context)
         T.cuda.cta_sync()
-        if tid == 0:
-            if is_dynamic:
-                self._event("down_dispatch_done").sem[0] = (
-                    (self._event("down_dispatch_done").base + 1)
-                    * (context["num_tokens_post_pad"][0] // 128)
-                    * plan.down_dispatch_groups
-                )
-        self._emit_notifies(task, context)
+        if emit_init:
+            self._emit_runtime_event_init(
+                task, context, runtime_event_name, runtime_init, runtime_init_scope_id, tid
+            )
+        if emit_post:
+            self._emit_notifies(task, context)
 
     def _emit_task(self, task: TaskPlan, context):
-        plan = self._require_plan()
         if task.spec.name == "align":
-            self._emit_align_task(task, context, plan.is_dynamic)
+            steps = task.execution_steps
+            runtime_events = [
+                event
+                for event in self._require_plan().events
+                if event.runtime_init is not None and event.runtime_init.task == task.spec.name
+            ]
+            if len(runtime_events) > 1:
+                raise ValueError("a task may initialize at most one runtime event in the MoE MVP")
+            runtime_event = runtime_events[0] if runtime_events else None
+            self._emit_align_task(
+                task,
+                context,
+                _STEP_PRE_NOTIFY in steps,
+                _STEP_WAIT in steps,
+                _STEP_RUNTIME_EVENT_INIT in steps,
+                None if runtime_event is None else runtime_event.name,
+                None if runtime_event is None else runtime_event.runtime_init,
+                0 if runtime_event is None else runtime_event.runtime_init.scope_id,
+                _STEP_POST_NOTIFY in steps,
+            )
             return
-        if plan.is_dynamic:
-            self._emit_pre_notify(task, context)
-        self._emit_waits(task, context)
-        self._run_opaque_tile(task, context)
-        self._emit_notifies(task, context)
+        for step in task.execution_steps:
+            if step == _STEP_PRE_NOTIFY:
+                self._emit_pre_notify(task, context)
+            elif step == _STEP_WAIT:
+                self._emit_waits(task, context)
+            elif step == _STEP_RUN:
+                self._run_opaque_tile(task, context)
+            elif step == _STEP_POST_NOTIFY:
+                self._emit_notifies(task, context)
+            else:
+                raise ValueError(f"unsupported execution step {step!r} for task {task.spec.name!r}")
 
     def dispatch_loop_body(self, context):
         """Emit the task-type dispatch chain from normalized task bindings."""

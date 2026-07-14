@@ -147,6 +147,7 @@ def test_graph_wait_notify_and_dispatch_scopes():
 def test_policy_event_layout_and_domains(batch_size):
     max_rows = _max_rows(batch_size)
     relaxed_rows = batch_size * 8 // 128 + 129
+    expected_q = 1 if batch_size < 4 else 4
     static = make_moe_plan(MEGAKERNEL_MOE_BENCH_CONFIG, batch_size, "static")
     unfused = make_moe_plan(MEGAKERNEL_MOE_BENCH_CONFIG, batch_size, "unfused")
     dynamic = make_moe_plan(MEGAKERNEL_MOE_BENCH_CONFIG, batch_size, "dynamic")
@@ -171,6 +172,11 @@ def test_policy_event_layout_and_domains(batch_size):
     assert dynamic.event("gate_up_done").shape == (relaxed_rows,)
     assert dynamic.event("down_dispatch_done").init_count is None
     assert dynamic.event("down_dispatch_done").runtime_init_task == "align"
+    runtime_init = dynamic.event("down_dispatch_done").runtime_init
+    assert runtime_init is not None
+    assert runtime_init.value.evaluate({"tensors": {"num_tokens_post_pad": [max_rows * 128]}}) == (
+        2**16 + 1
+    ) * max_rows * (16 // expected_q)
     assert [event.workspace_offset for event in static.events] == [
         0,
         1,
@@ -185,12 +191,35 @@ def test_policy_event_layout_and_domains(batch_size):
 
     assert static.task("gate_up_silu").upper_bounds == (max_rows, 12, 1)
     assert static.task("down").upper_bounds == (max_rows, 16, 1)
-    expected_q = 1 if batch_size < 4 else 4
     assert dynamic.down_coalescing == expected_q
     assert dynamic.task("down").scheduled_upper_bounds == (max_rows, 16 // expected_q, 1)
     assert dynamic.persistent_ctas == 148
     assert dynamic.pre_before_wait
+    assert dynamic.post_after_run
     assert dynamic.fifo_drain
+    assert dynamic.task("align").execution_steps == (
+        "pre_notify",
+        "wait",
+        "run",
+        "cta_sync",
+        "runtime_event_init",
+        "post_notify",
+    )
+    assert dynamic.task("down").execution_steps == ("pre_notify", "wait", "run")
+    assert static.task("align").execution_steps == (
+        "wait",
+        "run",
+        "cta_sync",
+        "runtime_event_init",
+        "post_notify",
+    )
+    assert dynamic.protocol is not None
+    assert (dynamic.protocol.pre_decrement, dynamic.protocol.post_decrement) == (1, 2**16)
+    assert dynamic.protocol.scheduler_warp == 7
+    normalized = dynamic.normalized_data()
+    assert normalized["events"][-1]["runtime_init"]["value"] == runtime_init.value.to_data()
+    assert normalized["tasks"][2]["execution_steps"] == dynamic.task("align").execution_steps
+    assert normalized["dispatch"][0]["enqueue_upper_bound"] == 148
 
 
 @pytest.mark.parametrize("scheduler", ["static", "unfused"])
@@ -220,6 +249,9 @@ def test_dynamic_seed_and_push_mapping(batch_size):
     assert int(queue.tail[0]) == len(plan.seed_tasks)
     assert plan.queue_capacity == 32768
     assert plan.queue_upper_bound <= plan.queue_capacity
+    assert plan.queue_upper_bound == len(plan.seed_tasks) + sum(
+        dispatch.enqueue_upper_bound for dispatch in plan.dispatch_plans
+    )
     manual_queue = generate_exec_queue_moe(
         batch_size, MEGAKERNEL_MOE_BENCH_CONFIG, len(plan.events), "dynamic"
     )
@@ -243,6 +275,74 @@ def test_dynamic_seed_and_push_mapping(batch_size):
     assert tuple(index.evaluate(gate_env) for index in gate_rule.tile_indices) == (11, 3, 0)
     assert plan.dispatch("down").target_task is None
     assert plan.dispatch("down").count.evaluate(graph.compile_env) == 148
+
+
+def test_normalized_plan_rejects_unproven_dynamic_invariants():
+    plan = make_moe_plan(MEGAKERNEL_MOE_BENCH_CONFIG, 512, "dynamic")
+
+    align = plan.task("align")
+    reordered_align = replace(
+        align,
+        execution_steps=(
+            "wait",
+            "pre_notify",
+            "run",
+            "cta_sync",
+            "runtime_event_init",
+            "post_notify",
+        ),
+    )
+    reordered_tasks = tuple(
+        reordered_align if task.spec.name == "align" else task for task in plan.tasks
+    )
+    with pytest.raises(ValueError, match="pre-notification"):
+        replace(plan, tasks=reordered_tasks).validate()
+
+    late_wait = replace(
+        align,
+        execution_steps=(
+            "pre_notify",
+            "run",
+            "wait",
+            "cta_sync",
+            "runtime_event_init",
+            "post_notify",
+        ),
+    )
+    late_wait_tasks = tuple(late_wait if task.spec.name == "align" else task for task in plan.tasks)
+    with pytest.raises(ValueError, match="wait before"):
+        replace(plan, tasks=late_wait_tasks).validate()
+
+    with pytest.raises(ValueError, match="derived from dispatch"):
+        replace(plan, queue_upper_bound=plan.queue_upper_bound + 1).validate()
+
+    down_event = plan.event("down_dispatch_done")
+    assert down_event.runtime_init is not None
+    invalid_event = replace(
+        down_event, runtime_init=replace(down_event.runtime_init, value=ConstExpr(1))
+    )
+    invalid_events = tuple(
+        invalid_event if event.name == "down_dispatch_done" else event for event in plan.events
+    )
+    with pytest.raises(ValueError, match="invalid runtime initialization"):
+        replace(plan, events=invalid_events).validate()
+
+    terminal = plan.dispatch_plan("down")
+    invalid_terminal = replace(
+        terminal,
+        rule=replace(terminal.rule, count=ConstExpr(147)),
+        count_lower_bound=147,
+        count_upper_bound=147,
+        enqueue_upper_bound=147,
+    )
+    invalid_dispatch = tuple(
+        invalid_terminal if dispatch.rule.source_task == "down" else dispatch
+        for dispatch in plan.dispatch_plans
+    )
+    with pytest.raises(ValueError, match="FIFO terminal drain"):
+        replace(
+            plan, dispatch_plans=invalid_dispatch, queue_upper_bound=plan.queue_upper_bound - 1
+        ).validate()
 
 
 def test_unfused_collapses_gate_up_coordinates():
@@ -389,6 +489,8 @@ def test_policy_rejects_coalescing_capacity_and_packed_overflow():
         graph.lower(MoeLowerer(DynamicPolicy(down_coalescing=1)))
     with pytest.raises(ValueError, match="exceeds capacity"):
         graph.lower(MoeLowerer(DynamicPolicy(queue_capacity=512)))
+    with pytest.raises(ValueError, match="must remain 32768"):
+        graph.lower(MoeLowerer(DynamicPolicy(queue_capacity=65536)))
     with pytest.raises(ValueError, match="columns"):
         graph.lower(MoeLowerer(StaticPolicy(queue_capacity=1)))
 
@@ -398,3 +500,102 @@ def test_policy_rejects_coalescing_capacity_and_packed_overflow():
     )
     with pytest.raises(ValueError, match="packed tile indices"):
         overflow.lower(MoeLowerer(StaticPolicy()))
+
+    dynamic_overflow = replace(
+        graph,
+        dynamic_dispatch=tuple(
+            replace(rule, tile_indices=(ConstExpr(MAX_M_IDX), ConstExpr(0), ConstExpr(0)))
+            if rule.source_task == "down"
+            else rule
+            for rule in graph.dynamic_dispatch
+        ),
+    )
+    with pytest.raises(ValueError, match="packed tile indices"):
+        dynamic_overflow.lower(MoeLowerer(DynamicPolicy()))
+
+
+def test_policy_rejects_unbounded_dispatch_and_event_coordinates():
+    graph = build_moe_graph(MEGAKERNEL_MOE_BENCH_CONFIG, 512)
+    runtime_scalar = next(
+        tensor for tensor in graph.tensors if tensor.name == "num_tokens_post_pad"
+    ).scalar(0)
+    unbounded_count = replace(
+        graph,
+        dynamic_dispatch=tuple(
+            replace(rule, count=runtime_scalar * 12) if rule.source_task == "count_sort" else rule
+            for rule in graph.dynamic_dispatch
+        ),
+    )
+    with pytest.raises(ValueError, match="does not have a validated range"):
+        unbounded_count.lower(MoeLowerer(DynamicPolicy()))
+
+    invalid_coord = replace(
+        graph,
+        dynamic_dispatch=tuple(
+            replace(rule, event_coord=(ConstExpr(10_000),))
+            if rule.source_task == "gate_up_silu"
+            else rule
+            for rule in graph.dynamic_dispatch
+        ),
+    )
+    with pytest.raises(ValueError, match="event coordinate"):
+        invalid_coord.lower(MoeLowerer(DynamicPolicy()))
+
+    duplicate_mapping = replace(
+        graph,
+        dynamic_dispatch=tuple(
+            replace(rule, tile_indices=(ConstExpr(0), ConstExpr(0), ConstExpr(0)))
+            if rule.source_task == "gating"
+            else rule
+            for rule in graph.dynamic_dispatch
+        ),
+    )
+    with pytest.raises(ValueError, match="cover target task"):
+        duplicate_mapping.lower(MoeLowerer(DynamicPolicy()))
+
+
+def test_dynamic_policy_preserves_release_notifications():
+    graph = build_moe_graph(MEGAKERNEL_MOE_BENCH_CONFIG, 128)
+    gating = next(task for task in graph.tasks if task.name == "gating")
+    graph = _replace_task(
+        graph, "gating", notifies=tuple(replace(notify, release=True) for notify in gating.notifies)
+    )
+    plan = graph.lower(MoeLowerer(DynamicPolicy()))
+    assert plan.task("gating").spec.notifies[0].release
+
+
+def test_policy_rejects_invalid_notification_protocol():
+    graph = build_moe_graph(MEGAKERNEL_MOE_BENCH_CONFIG, 128)
+    align = next(task for task in graph.tasks if task.name == "align")
+    oversized = _replace_task(
+        graph,
+        "align",
+        notifies=tuple(replace(notify, count=ConstExpr(2)) for notify in align.notifies),
+    )
+    with pytest.raises(ValueError, match="exceeds its thread scope"):
+        oversized.lower(MoeLowerer(DynamicPolicy()))
+
+    gating = next(task for task in graph.tasks if task.name == "gating")
+    all_warpgroups = _replace_task(
+        graph, "gating", notifies=tuple(replace(notify, scope_id=-1) for notify in gating.notifies)
+    )
+    with pytest.raises(ValueError, match="notifications per coordinate"):
+        all_warpgroups.lower(MoeLowerer(DynamicPolicy()))
+
+    cross_rank = _replace_task(
+        graph, "gating", notifies=tuple(replace(notify, rank=0) for notify in gating.notifies)
+    )
+    with pytest.raises(ValueError, match="cross-rank"):
+        cross_rank.lower(MoeLowerer(DynamicPolicy()))
+
+    mismatched = replace(
+        graph,
+        dynamic_dispatch=tuple(
+            replace(rule, event_coord=(ConstExpr(0),))
+            if rule.source_task == "gate_up_silu"
+            else rule
+            for rule in graph.dynamic_dispatch
+        ),
+    )
+    with pytest.raises(ValueError, match="pre/post notifications are inconsistent"):
+        mismatched.lower(MoeLowerer(DynamicPolicy()))

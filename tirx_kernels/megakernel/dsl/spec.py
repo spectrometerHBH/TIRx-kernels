@@ -357,6 +357,12 @@ class KernelSpec:
                 self._validate_event_coord(task.name, wait.event, wait.coord, event_map)
                 if wait.level not in _WAIT_LEVELS:
                     raise ValueError(f"task {task.name!r} has invalid wait level {wait.level!r}")
+                if (
+                    isinstance(wait.mask, bool)
+                    or not isinstance(wait.mask, int)
+                    or not 0 <= wait.mask <= 0xFFFFFFFF
+                ):
+                    raise ValueError(f"task {task.name!r} has an invalid wait mask")
                 self._validate_tile_refs(task.name, wait.coord)
             for notify in task.notifies:
                 self._validate_event_coord(task.name, notify.event, notify.coord, event_map)
@@ -364,6 +370,12 @@ class KernelSpec:
                     raise ValueError(
                         f"task {task.name!r} has invalid notify scope {notify.scope!r}"
                     )
+                if notify.rank != -1:
+                    raise ValueError(
+                        f"task {task.name!r} uses a cross-rank notification outside the DSL MVP"
+                    )
+                if not isinstance(notify.release, bool):
+                    raise ValueError(f"task {task.name!r} has a non-boolean release flag")
                 self._validate_tile_refs(task.name, (*notify.coord, notify.count))
                 producers[notify.event].add(task.name)
 
@@ -378,6 +390,11 @@ class KernelSpec:
                 raise ValueError(f"dynamic rule for {rule.source_task!r} must map three tile axes")
             if rule.push_level not in _NOTIFY_SCOPES or rule.pre_scope not in _NOTIFY_SCOPES:
                 raise ValueError(f"dynamic rule for {rule.source_task!r} has an invalid scope")
+            if rule.rank != -1:
+                raise ValueError(
+                    f"dynamic rule for {rule.source_task!r} uses a cross-rank notification "
+                    "outside the DSL MVP"
+                )
             self._validate_tile_refs(
                 rule.source_task,
                 (*rule.event_coord, *rule.tile_indices, rule.count, rule.pre_count),
