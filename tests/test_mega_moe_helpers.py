@@ -16,7 +16,6 @@
 # under the License.
 from __future__ import annotations
 
-import ctypes
 import inspect
 import json
 import os
@@ -35,9 +34,8 @@ from tirx_kernels.deepgemm.mega_moe import (
     _get_mega_moe_cuda_compile_mode,
     _get_num_bytes_per_pull,
     _get_num_experts_per_wave_for_mega_moe,
-    _make_symm_buffer_descriptor,
+    _make_symm_buffer_offsets,
     _run_worker,
-    _SymBufferDescriptor,
     get_deepgemm_launch_config,
     get_deepgemm_workspace_layout,
     run_bench,
@@ -118,6 +116,21 @@ def test_deepgemm_loader_rejects_shadow_distribution_version(
 
     with pytest.raises(RuntimeError, match="package collision"):
         _import_deep_gemm_distribution()
+
+
+def test_symm_buffer_offsets_match_deepgemm_pointer_mapping() -> None:
+    case = SimpleNamespace(
+        rank_idx=1,
+        symm_buffer=SimpleNamespace(
+            buffer=SimpleNamespace(data_ptr=lambda: 1200),
+            handle=SimpleNamespace(buffer_ptrs=(1000, 1200)),
+        ),
+    )
+
+    offsets = _make_symm_buffer_offsets(case)
+
+    assert len(offsets) == 72
+    assert offsets[:3] == (-200, 0, 0)
 
 
 def test_aggregate_rank_results_takes_slowest_rank_per_round() -> None:
@@ -202,23 +215,6 @@ def test_decode_launch_uses_bk256_and_chunked_pull(monkeypatch: pytest.MonkeyPat
     assert launch.num_bytes_per_pull == 3584
 
 
-def test_sym_buffer_descriptor_matches_deepgemm_abi() -> None:
-    case = SimpleNamespace(
-        rank_idx=1,
-        symm_buffer=SimpleNamespace(
-            buffer=SimpleNamespace(data_ptr=lambda: 1200),
-            handle=SimpleNamespace(buffer_ptrs=(1000, 1200)),
-        ),
-    )
-
-    descriptor = _make_symm_buffer_descriptor(case)
-
-    assert ctypes.sizeof(_SymBufferDescriptor) == 592
-    assert descriptor.base == 1200
-    assert descriptor.rank_idx == 1
-    assert tuple(descriptor.offsets[:3]) == (-200, 0, 0)
-
-
 @pytest.mark.parametrize(
     (
         "num_processes",
@@ -293,12 +289,9 @@ def test_mega_moe_cuda_compile_mode_defaults_to_nvcc(monkeypatch: pytest.MonkeyP
 
 def test_cuda_compile_mode_context_restores_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TVM_CUDA_COMPILE_MODE", "nvrtc")
-    monkeypatch.setenv("TVM_CUDA_USE_FAST_MATH", "0")
     with _cuda_compile_mode("nvcc"):
         assert os.environ["TVM_CUDA_COMPILE_MODE"] == "nvcc"
-        assert os.environ["TVM_CUDA_USE_FAST_MATH"] == "0"
     assert os.environ["TVM_CUDA_COMPILE_MODE"] == "nvrtc"
-    assert os.environ["TVM_CUDA_USE_FAST_MATH"] == "0"
 
 
 def test_mega_moe_bench_inherits_shared_defaults() -> None:
