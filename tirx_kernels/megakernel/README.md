@@ -17,12 +17,16 @@ by `build_moe_graph`.  Its six `TileSpec` objects directly hold concrete
 `TileImpl` adapters, while MoE-specific lowering owns physical synchronization
 and scheduling:
 
-- `build_moe_graph`: records tensors, five logical events, and wait/notify
-  coordinate maps;
+- [`build_moe_graph`](dsl/moe_spec.py): records tensors, five logical events,
+  and wait/notify coordinate maps;
 - the six MoE `TileImpl` adapters: invoke existing tile-task compute only;
-- `StaticPolicy`, `UnfusedPolicy`, and `DynamicPolicy`: create the physical
-  event, queue, runtime initialization, and dispatch plans;
-- `MoeLowerer`: emits those plans through the existing TIRX ABI.
+- [`model.py`](dsl/lowering/model.py) and
+  [`normalize.py`](dsl/lowering/normalize.py): own private physical plans,
+  symbolic bounds, and strict validation;
+- [`StaticPolicy`, `UnfusedPolicy`, and `DynamicPolicy`](dsl/lowering/policies.py):
+  create physical event, queue, runtime initialization, and dispatch plans;
+- [`MoeLowerer`](dsl/lowering/lowerer.py): emits those plans through the existing
+  TIRX ABI.
 
 The Stage-1 planning artifact is
 [`workflow/qwen3_30b_a3b_moe_stage1.yaml`](workflow/qwen3_30b_a3b_moe_stage1.yaml).
@@ -32,7 +36,7 @@ retained as the explicit `manual` fallback and A/B oracle.
 ## Runnable MoE DSL Example
 
 The complete six-stage DSL authoring source is
-[`build_moe_graph`](dsl/moe_dsl.py).  It creates the tensors and five logical
+[`build_moe_graph`](dsl/moe_spec.py).  It creates the tensors and five logical
 events, then connects six concrete `TileImpl` objects with fluent
 `read`/`write`/`wait`/`notify` calls.  Scheduler fields are intentionally absent
 from this graph.
