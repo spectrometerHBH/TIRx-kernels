@@ -35,18 +35,16 @@ retained as the explicit `manual` fallback and A/B oracle.
 
 ## Runnable MoE DSL Example
 
-The complete six-stage DSL authoring source is
-[`build_moe_graph`](dsl/moe_spec.py).  It creates the tensors and five logical
-events, then connects six concrete `TileImpl` objects with fluent
-`read`/`write`/`wait`/`notify` calls.  Scheduler fields are intentionally absent
-from this graph.
-
-The executable example builds and validates that exact production graph rather
-than maintaining a second copy:
+[`examples/moe.py`](examples/moe.py) is a standalone example containing the
+complete six-stage `KernelSpec` construction. It creates the tensors and five
+logical events, then connects six concrete `TileImpl` objects with fluent
+`read`/`write`/`wait`/`notify` calls. Scheduler fields are intentionally absent
+from the logical graph. A parity test keeps the standalone example aligned with
+the production [`build_moe_graph`](dsl/moe_spec.py) definition.
 
 ```bash
 PYTHONPATH=/path/to/tvm/python:. \
-python -m tirx_kernels.megakernel.examples.moe_dsl \
+python -m tirx_kernels.megakernel.examples.moe \
   --batch-size 128 --scheduler dynamic
 ```
 
