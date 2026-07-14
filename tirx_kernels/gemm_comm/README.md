@@ -53,6 +53,19 @@ system-scope release/acquire ordering. TP4 ReduceScatter uses NVLS
 same fused queue and a local vectorized writeback. There is no host peer
 transfer, staging buffer, or separate reduction kernel.
 
+## Megakernel DSL
+
+Both workloads have scheduler-independent `tvm.megakernel.dsl.KernelSpec`
+graphs under `tirx_kernels.gemm_comm.dsl`. Concrete `TileImpl` objects hold the
+communication and GEMM TileTasks; the policy layer owns rank-aware task ordering
+and queue assignment. Standalone examples contain the complete DSL construction
+for each workload and are parity-tested against those production graphs.
+
+```bash
+python -m tirx_kernels.megakernel.examples.allgather_gemm --scheduler dynamic
+python -m tirx_kernels.megakernel.examples.gemm_reduce_scatter --scheduler dynamic
+```
+
 ## Validation and benchmarking
 
 GEMM+ReduceScatter correctness checks every rank's full partial GEMM and local
