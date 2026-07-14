@@ -336,6 +336,7 @@ class DynamicTileScheduler(TileSchedulerBase):
         scope: Literal["thread", "warp", "warpgroup", "cta"] = "thread",
         scope_id=0,
         pre_notify=False,
+        release=False,
     ):
         # Notes: Here each thread will notify only at most one time,
         #        and the tids of the threads involved among scope in the notification process start from 0 and increment sequentially.
@@ -395,7 +396,7 @@ class DynamicTileScheduler(TileSchedulerBase):
             if self.debug:
                 T.cuda.trap_when_assert_failed(notify_num <= max_notify_num_map[scope])
             if idx[1] < notify_num:
-                evt.semaphore_notify(*coord, pre_notify=pre_notify, rank=rank)
+                evt.semaphore_notify(*coord, pre_notify=pre_notify, rank=rank, release=release)
 
     def _enqueue(self, idx, func_trigger_list, push_level):
         if not isinstance(func_trigger_list, list):
