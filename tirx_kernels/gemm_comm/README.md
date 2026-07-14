@@ -40,13 +40,13 @@ outputs are reset independently on every rank before each measured launch.
 Both workloads have scheduler-independent `tvm.megakernel.dsl.KernelSpec`
 graphs under `tirx_kernels.gemm_comm.dsl`. Concrete `TileImpl` objects hold the
 AllGather, GEMM, ReduceScatter transfer, and reduction TileTasks; the policy
-layer owns rank-aware task ordering and queue assignment.
+layer owns rank-aware task ordering and queue assignment. Standalone examples
+contain the complete DSL construction for each workload and are parity-tested
+against those production graphs.
 
 ```bash
-python -m tirx_kernels.gemm_comm.examples.gemm_comm_dsl \
-  --workload allgather_gemm --scheduler dynamic
-python -m tirx_kernels.gemm_comm.examples.gemm_comm_dsl \
-  --workload gemm_reduce_scatter --scheduler static
+python -m tirx_kernels.megakernel.examples.allgather_gemm --scheduler dynamic
+python -m tirx_kernels.megakernel.examples.gemm_reduce_scatter --scheduler static
 ```
 
 AllGather+GEMM lowers both static grid-stride and dynamic MPMC policies through

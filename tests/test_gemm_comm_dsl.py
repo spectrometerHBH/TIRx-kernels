@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Mapping
 
 import numpy as np
@@ -30,7 +31,12 @@ from tirx_kernels.gemm_comm.dsl import (
     build_gemm_reduce_scatter_graph,
     policy_for_scheduler,
 )
-from tirx_kernels.gemm_comm.examples.gemm_comm_dsl import main
+from tirx_kernels.megakernel.examples.allgather_gemm import build_example as build_allgather_example
+from tirx_kernels.megakernel.examples.allgather_gemm import main as allgather_main
+from tirx_kernels.megakernel.examples.gemm_reduce_scatter import (
+    build_example as build_reduce_scatter_example,
+)
+from tirx_kernels.megakernel.examples.gemm_reduce_scatter import main as reduce_scatter_main
 from tvm.megakernel.dsl import TileImpl
 
 _FORBIDDEN = {
@@ -56,6 +62,68 @@ def _keys(value):
     elif isinstance(value, tuple | list):
         for item in value:
             yield from _keys(item)
+
+
+def _shape_signature(shape):
+    if isinstance(shape, tuple | list):
+        return tuple(shape)
+    return (shape,)
+
+
+def _dependency_signature(dependency):
+    samples = ((0, 0, 0), (1, 2, 3), (7, 5, 3))
+    coord_map = dependency.coord_map
+    coordinates = tuple(tuple(coord_map(*sample)) for sample in samples)
+    return (dependency.event.name, coordinates, dependency.attrs)
+
+
+def _graph_signature(spec):
+    return {
+        "name": spec.name,
+        "attrs": spec.attrs,
+        "tensors": tuple(
+            (name, _shape_signature(tensor.shape), tensor.dtype)
+            for name, tensor in spec.tensors.items()
+        ),
+        "events": tuple(
+            (name, _shape_signature(event.shape), event.init_count, event.dtype, event.attrs)
+            for name, event in spec.events.items()
+        ),
+        "tiles": tuple(
+            (
+                tile.name,
+                type(tile.impl).__name__,
+                tuple(tile.tile_num),
+                tuple(tensor.name for tensor in tile.reads),
+                tuple(tensor.name for tensor in tile.writes),
+                tuple(_dependency_signature(dependency) for dependency in tile.waits),
+                tuple(_dependency_signature(dependency) for dependency in tile.notifies),
+                tile.attrs,
+            )
+            for tile in spec.tiles
+        ),
+    }
+
+
+@pytest.mark.parametrize(
+    "example_builder,production_builder,production_name",
+    [
+        (build_allgather_example, build_allgather_gemm_graph, "build_allgather_gemm_graph"),
+        (
+            build_reduce_scatter_example,
+            build_gemm_reduce_scatter_graph,
+            "build_gemm_reduce_scatter_graph",
+        ),
+    ],
+)
+def test_standalone_examples_contain_complete_dsl_and_match_production_graphs(
+    example_builder, production_builder, production_name
+) -> None:
+    source = inspect.getsource(example_builder)
+    assert "KernelSpec(" in source
+    assert ".tile(" in source
+    assert production_name not in source
+    assert _graph_signature(example_builder()) == _graph_signature(production_builder().validate())
 
 
 @pytest.mark.parametrize(
@@ -139,14 +207,14 @@ def test_reduce_scatter_dynamic_plan_is_explicit_but_not_mislowered() -> None:
 
 
 @pytest.mark.parametrize(
-    "workload,scheduler,expected",
+    "entrypoint,scheduler,expected",
     [
-        ("allgather_gemm", "dynamic", "physical scheduler: mpmc_queue"),
-        ("allgather_gemm", "static", "physical scheduler: rank_aware_grid_stride"),
-        ("gemm_reduce_scatter", "static", "lowerable: true"),
-        ("gemm_reduce_scatter", "dynamic", "lowerable: false"),
+        (allgather_main, "dynamic", "physical scheduler: mpmc_queue"),
+        (allgather_main, "static", "physical scheduler: rank_aware_grid_stride"),
+        (reduce_scatter_main, "static", "lowerable: true"),
+        (reduce_scatter_main, "dynamic", "lowerable: false"),
     ],
 )
-def test_dsl_example_entrypoint(workload: str, scheduler: str, expected: str, capsys) -> None:
-    main(["--workload", workload, "--scheduler", scheduler])
+def test_dsl_example_entrypoint(entrypoint, scheduler: str, expected: str, capsys) -> None:
+    entrypoint(["--scheduler", scheduler])
     assert expected in capsys.readouterr().out
