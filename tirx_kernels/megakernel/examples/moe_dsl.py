@@ -24,7 +24,7 @@ Run from the tirx-kernels checkout with the paired TVM checkout on
         --batch-size 128 --scheduler dynamic
 
 The complete authoring source is ``build_moe_graph`` in
-``tirx_kernels.megakernel.dsl.moe_dsl``.  This executable deliberately calls
+``tirx_kernels.megakernel.dsl.moe_spec``.  This executable deliberately calls
 that function instead of copying the graph, so the example and production
 lowering always consume the same ``KernelSpec``.
 """

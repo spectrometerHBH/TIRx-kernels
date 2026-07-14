@@ -14,79 +14,43 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""TVM-native logical DSL and MoE-specific lowering policies."""
 
-from tvm.megakernel.dsl import (
-    CoordMapType,
-    DependencySpec,
-    EventSpec,
-    ExprLike,
-    KernelSpec,
-    ShapeType,
-    TensorSpec,
-    TileImpl,
-    TileNumType,
-    TileSpec,
-    VarSpec,
-)
+"""Private MoE lowering models, policies, validation, and TIRX emission."""
 
-from .lowering import (
+from .lowerer import MoeLowerer
+from .model import (
     DynamicDispatchPlan,
-    DynamicPolicy,
     DynamicProtocolPlan,
     EventPlan,
-    MoeLowerer,
     MoeLoweringEnv,
     NormalizedPlan,
     NotifyPlan,
-    StaticPolicy,
     TilePlan,
-    UnfusedPolicy,
     WaitPlan,
+)
+from .policies import (
+    DynamicPolicy,
+    MoePolicy,
+    StaticPolicy,
+    UnfusedPolicy,
     make_moe_plan,
     policy_for_scheduler,
 )
-from .moe_spec import build_moe_graph
-from .tile_impl import (
-    AlignTileImpl,
-    CountSortTileImpl,
-    DownTileImpl,
-    GateUpSiluTileImpl,
-    GatingTileImpl,
-    TopkTileImpl,
-)
 
 __all__ = [
-    "AlignTileImpl",
-    "CoordMapType",
-    "CountSortTileImpl",
-    "DependencySpec",
-    "DownTileImpl",
     "DynamicDispatchPlan",
     "DynamicPolicy",
     "DynamicProtocolPlan",
     "EventPlan",
-    "EventSpec",
-    "ExprLike",
-    "GateUpSiluTileImpl",
-    "GatingTileImpl",
-    "KernelSpec",
     "MoeLowerer",
     "MoeLoweringEnv",
+    "MoePolicy",
     "NormalizedPlan",
     "NotifyPlan",
-    "ShapeType",
     "StaticPolicy",
-    "TensorSpec",
-    "TileImpl",
-    "TileNumType",
     "TilePlan",
-    "TileSpec",
-    "TopkTileImpl",
     "UnfusedPolicy",
-    "VarSpec",
     "WaitPlan",
-    "build_moe_graph",
     "make_moe_plan",
     "policy_for_scheduler",
 ]
