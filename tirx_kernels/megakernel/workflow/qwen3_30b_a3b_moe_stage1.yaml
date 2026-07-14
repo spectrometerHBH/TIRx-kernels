@@ -1,0 +1,295 @@
+tiles:
+  gating:
+    source_stage: gating_output = hidden_state @ gate_weight.T
+    purpose: compute split-K expert logits
+    tile_impl: GatingTileImpl
+    tile_num: [GATING_M_TILES, 1, 4]
+    index_axes: [m, n, k]
+    reads: [hidden_state, gate_weight]
+    writes: [gating_output]
+
+  topk:
+    source_stage: topk_weights, topk_indices = topk(gating_output)
+    purpose: select experts and routing weights
+    tile_impl: TopkTileImpl
+    tile_num: [PERSISTENT_CTAS, 1, 1]
+    index_axes: [m, n, k]
+    reads: [gating_output]
+    writes: [topk_weights, topk_indices]
+
+  align:
+    source_stage: align tokens by expert
+    purpose: produce padded routing metadata
+    tile_impl: AlignTileImpl
+    tile_num: [1, 1, 1]
+    index_axes: [m, n, k]
+    reads: [topk_indices]
+    writes:
+      - sorted_token_ids
+      - expert_ids
+      - num_valid_tokens
+      - num_tokens_post_pad
+      - cumsum_buffer
+
+  count_sort:
+    source_stage: reorder hidden states by expert
+    purpose: count and scatter routed tokens
+    tile_impl: CountSortTileImpl
+    tile_num: [PERSISTENT_CTAS, 1, 1]
+    index_axes: [m, n, k]
+    reads:
+      - topk_indices
+      - sorted_token_ids
+      - cumsum_buffer
+      - hidden_state
+      - num_tokens_post_pad
+    writes: [reordered_hidden_state]
+
+  gate_up_silu:
+    source_stage: silu(gate) * up
+    purpose: compute routed gate-up projections and SiLU
+    tile_impl: GateUpSiluTileImpl
+    tile_num: [routed_rows, 12, 1]
+    index_axes: [m, n, k]
+    reads:
+      - reordered_hidden_state
+      - gate_up_weight
+      - topk_weights
+      - sorted_token_ids
+      - expert_ids
+      - num_valid_tokens
+      - num_tokens_post_pad
+    writes: [silu_mul_output]
+
+  down:
+    source_stage: topk_reduce_output = down(silu_mul_output)
+    purpose: compute and accumulate routed down projections
+    tile_impl: DownTileImpl
+    tile_num: [routed_rows, 16, 1]
+    index_axes: [m, n, k]
+    reads:
+      - silu_mul_output
+      - down_weight
+      - expert_ids
+      - topk_weights
+      - sorted_token_ids
+      - num_valid_tokens
+      - num_tokens_post_pad
+    writes: [topk_reduce_output]
+
+tensors:
+  hidden_state:
+    role: input
+    producer: null
+    consumers: [gating, count_sort]
+    shape: [B, 2048]
+    dtype: float16
+  residual:
+    role: input
+    producer: null
+    consumers: []
+    shape: [B, 2048]
+    dtype: float16
+  output:
+    role: output
+    producer: null
+    consumers: []
+    shape: [B, 2048]
+    dtype: float16
+  gate_weight:
+    role: input
+    producer: null
+    consumers: [gating]
+    shape: [128, 2048]
+    dtype: float16
+  gate_up_weight:
+    role: input
+    producer: null
+    consumers: [gate_up_silu]
+    shape: [128, 1536, 2048]
+    dtype: float16
+  down_weight:
+    role: input
+    producer: null
+    consumers: [down]
+    shape: [128, 2048, 768]
+    dtype: float16
+  gating_output:
+    role: intermediate
+    producer: gating
+    consumers: [topk]
+    shape: [B, 128]
+    dtype: float32
+  topk_weights:
+    role: intermediate
+    producer: topk
+    consumers: [gate_up_silu, down]
+    shape: [B, 8]
+    dtype: float32
+  topk_indices:
+    role: intermediate
+    producer: topk
+    consumers: [align, count_sort]
+    shape: [B, 8]
+    dtype: int32
+  sorted_token_ids:
+    role: intermediate
+    producer: align
+    consumers: [count_sort, gate_up_silu, down]
+    shape: [MAX_TOKENS_PADDED]
+    dtype: int32
+  expert_ids:
+    role: intermediate
+    producer: align
+    consumers: [gate_up_silu, down]
+    shape: [RMAX]
+    dtype: int32
+  num_valid_tokens:
+    role: intermediate
+    producer: align
+    consumers: [gate_up_silu, down]
+    shape: [RMAX]
+    dtype: int32
+  num_tokens_post_pad:
+    role: intermediate
+    producer: align
+    consumers: [count_sort, gate_up_silu, down]
+    shape: [1]
+    dtype: int32
+  cumsum_buffer:
+    role: intermediate
+    producer: align
+    consumers: [count_sort]
+    shape: [129]
+    dtype: int32
+  reordered_hidden_state:
+    role: intermediate
+    producer: count_sort
+    consumers: [gate_up_silu]
+    shape: [MAX_TOKENS_PADDED, 2048]
+    dtype: float16
+  silu_mul_output:
+    role: intermediate
+    producer: gate_up_silu
+    consumers: [down]
+    shape: [MAX_TOKENS_PADDED, 768]
+    dtype: float16
+  topk_reduce_output:
+    role: output
+    producer: down
+    consumers: []
+    shape: [B, 2048]
+    dtype: float16
+
+events:
+  gating_done:
+    kind: count
+    shape: [1]
+    init: GATING_SPLIT_K_FACTOR * GATING_M_TILES
+    dtype: int32
+    meaning: all split-K gating tiles are complete
+  topk_done:
+    kind: count
+    shape: [1]
+    init: PERSISTENT_CTAS
+    dtype: int32
+    meaning: all persistent top-k tiles are complete
+  align_done:
+    kind: count
+    shape: [1]
+    init: 1
+    dtype: int32
+    meaning: token-to-expert alignment metadata is ready
+  count_sort_done:
+    kind: count
+    shape: [1]
+    init: PERSISTENT_CTAS
+    dtype: int32
+    meaning: all count-and-sort tiles are complete
+  gate_up_done:
+    kind: count
+    shape: [MAX_BLOCKS_PADDED_RELAXED]
+    init: 12
+    dtype: int32
+    meaning: all gate-up projections for one routed row are complete
+
+dependencies:
+  - producer: gating
+    consumer: topk
+    tensor: gating_output
+    event: gating_done
+    relation: all split-K gating tiles precede top-k
+    notify:
+      tile: gating
+      coord_map: [0]
+    wait:
+      tile: topk
+      coord_map: [0]
+      expected: GATING_SPLIT_K_FACTOR * GATING_M_TILES
+
+  - producer: topk
+    consumer: align
+    tensor: topk_indices
+    event: topk_done
+    relation: all persistent top-k tiles precede alignment
+    notify:
+      tile: topk
+      coord_map: [0]
+    wait:
+      tile: align
+      coord_map: [0]
+      expected: PERSISTENT_CTAS
+
+  - producer: align
+    consumer: count_sort
+    tensor: sorted_token_ids
+    event: align_done
+    relation: alignment metadata precedes token scattering
+    notify:
+      tile: align
+      coord_map: [0]
+    wait:
+      tile: count_sort
+      coord_map: [0]
+      expected: 1
+
+  - producer: count_sort
+    consumer: gate_up_silu
+    tensor: reordered_hidden_state
+    event: count_sort_done
+    relation: all reordered hidden-state tiles precede gate-up
+    notify:
+      tile: count_sort
+      coord_map: [0]
+    wait:
+      tile: gate_up_silu
+      coord_map: [0]
+      expected: PERSISTENT_CTAS
+
+  - producer: gate_up_silu
+    consumer: down
+    tensor: silu_mul_output
+    event: gate_up_done
+    relation: producer.m == consumer.m, all producer.n
+    notify:
+      tile: gate_up_silu
+      coord_map: [m]
+    wait:
+      tile: down
+      coord_map: [m]
+      expected: 12
+
+validation:
+  status: pass
+  checks:
+    - six source stages are preserved in order
+    - every tile has exactly three index axes
+    - every tensor consumer has a producer or reads an input
+    - five logical events connect the five stage boundaries
+    - every wait and notify coordinate rank matches its event rank
+    - routed_rows is produced by align before gate-up and down
+  assumptions:
+    - B is a positive compile-time batch size
+    - routed_rows is num_tokens_post_pad[0] divided by 128
+    - world size is one and the target is NVIDIA B200
+  questions: []

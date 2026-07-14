@@ -39,7 +39,7 @@ def _normalize_cuda_source(source: str) -> str:
     return " ".join(source.split())
 
 
-@pytest.mark.parametrize("batch_size", [1, 4, 128, 512, 2048])
+@pytest.mark.parametrize("batch_size", [1, 4, 128, 512, 2048, 4096])
 @pytest.mark.parametrize("scheduler", ["static", "unfused", "dynamic"])
 def test_manual_and_dsl_are_structurally_equal(batch_size, scheduler):
     manual = _build_module(batch_size, scheduler, "manual")
@@ -47,7 +47,7 @@ def test_manual_and_dsl_are_structurally_equal(batch_size, scheduler):
     tvm.ir.assert_structural_equal(manual, dsl, map_free_vars=True)
 
 
-@pytest.mark.parametrize("batch_size", [1, 4, 128, 512, 2048])
+@pytest.mark.parametrize("batch_size", [1, 4, 128, 512, 2048, 4096])
 @pytest.mark.parametrize("scheduler", ["static", "unfused", "dynamic"])
 def test_manual_and_dsl_generate_identical_cuda(batch_size, scheduler):
     manual_source, manual_lib = get_source(_build_module(batch_size, scheduler, "manual"))
