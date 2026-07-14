@@ -17,15 +17,61 @@
 
 """CPU checks for the runnable MoE DSL example."""
 
+import inspect
+
 import pytest
 
 from tirx_kernels.megakernel import dsl
-from tirx_kernels.megakernel.examples.moe_dsl import (
-    build_example,
-    describe_graph,
-    describe_plan,
-    main,
-)
+from tirx_kernels.megakernel.dsl import KernelSpec, VarSpec, build_moe_graph
+from tirx_kernels.megakernel.examples.moe import build_example, describe_graph, describe_plan, main
+from tirx_kernels.megakernel.utils.config import MEGAKERNEL_MOE_BENCH_CONFIG
+
+
+def _extent_signature(extent):
+    if isinstance(extent, VarSpec):
+        return ("var", extent.name)
+    return extent
+
+
+def _shape_signature(shape):
+    if isinstance(shape, tuple | list):
+        return tuple(_extent_signature(extent) for extent in shape)
+    return (_extent_signature(shape),)
+
+
+def _dependency_signature(dependency):
+    samples = ((0, 0, 0), (1, 2, 3), (7, 5, 3))
+    coord_map = dependency.coord_map
+    coordinates = tuple(tuple(coord_map(*sample)) for sample in samples)
+    return (dependency.event.name, coordinates, dependency.attrs)
+
+
+def _graph_signature(spec: KernelSpec):
+    return {
+        "name": spec.name,
+        "attrs": spec.attrs,
+        "tensors": tuple(
+            (name, _shape_signature(tensor.shape), tensor.dtype)
+            for name, tensor in spec.tensors.items()
+        ),
+        "events": tuple(
+            (name, _shape_signature(event.shape), event.init_count, event.dtype, event.attrs)
+            for name, event in spec.events.items()
+        ),
+        "tiles": tuple(
+            (
+                tile.name,
+                type(tile.impl).__name__,
+                tuple(_extent_signature(extent) for extent in tile.tile_num),
+                tuple(tensor.name for tensor in tile.reads),
+                tuple(tensor.name for tensor in tile.writes),
+                tuple(_dependency_signature(dependency) for dependency in tile.waits),
+                tuple(_dependency_signature(dependency) for dependency in tile.notifies),
+                tile.attrs,
+            )
+            for tile in spec.tiles
+        ),
+    }
 
 
 def test_moe_dsl_public_api_uses_split_modules():
@@ -33,6 +79,17 @@ def test_moe_dsl_public_api_uses_split_modules():
     assert dsl.MoeLoweringEnv.__module__.endswith(".lowering.model")
     assert dsl.DynamicPolicy.__module__.endswith(".lowering.policies")
     assert dsl.MoeLowerer.__module__.endswith(".lowering.lowerer")
+
+
+def test_example_contains_complete_dsl_and_matches_production_graph():
+    source = inspect.getsource(build_example)
+    assert "KernelSpec(" in source
+    assert ".tile(" in source
+    assert "build_moe_graph" not in source
+
+    example = build_example(128)
+    production = build_moe_graph(MEGAKERNEL_MOE_BENCH_CONFIG, 128).validate()
+    assert _graph_signature(example) == _graph_signature(production)
 
 
 def test_example_describes_the_complete_logical_graph():
