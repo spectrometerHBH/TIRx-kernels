@@ -109,7 +109,7 @@ class MegaKernelMOE(MegaKernelWrapper):
     def _make_dsl_lowerer(self, scheduler: str):
         batch_size = getattr(self, "_compile_batch_size", 1)
         lowerer = MoeLowerer(policy_for_scheduler(scheduler), owner=self)
-        build_moe_graph(self.config, batch_size).lower(lowerer)
+        lowerer.lower(build_moe_graph(self.config, batch_size))
         return lowerer
 
     def get_module(self, scheduler: str, lowering: str = _DEFAULT_LOWERING):
@@ -582,7 +582,10 @@ class MegaKernelMOE(MegaKernelWrapper):
         dsl_lowerer,
     ):
         # initialize tile
-        self.set_tiles(batch_size, low_batch)
+        if lowering == "dsl":
+            dsl_lowerer.register_tiles()
+        else:
+            self.set_tiles(batch_size, low_batch)
         self.host_init_all()
 
         Tx.device_entry()
