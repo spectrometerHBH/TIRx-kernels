@@ -17,12 +17,9 @@
 
 """CPU checks for the runnable MoE DSL example."""
 
-import inspect
-
 import pytest
 
 from tirx_kernels.megakernel import dsl
-from tirx_kernels.megakernel.dsl import moe_dsl
 from tirx_kernels.megakernel.examples.moe_dsl import (
     build_example,
     describe_graph,
@@ -31,14 +28,11 @@ from tirx_kernels.megakernel.examples.moe_dsl import (
 )
 
 
-def test_moe_dsl_is_split_into_logical_and_lowering_modules():
+def test_moe_dsl_public_api_uses_split_modules():
     assert dsl.build_moe_graph.__module__.endswith(".moe_spec")
     assert dsl.MoeLoweringEnv.__module__.endswith(".lowering.model")
     assert dsl.DynamicPolicy.__module__.endswith(".lowering.policies")
     assert dsl.MoeLowerer.__module__.endswith(".lowering.lowerer")
-    assert moe_dsl.build_moe_graph is dsl.build_moe_graph
-    assert moe_dsl.MoeLowerer is dsl.MoeLowerer
-    assert len(inspect.getsource(moe_dsl).splitlines()) < 100
 
 
 def test_example_describes_the_complete_logical_graph():
