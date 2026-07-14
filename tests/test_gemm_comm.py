@@ -44,8 +44,10 @@ def test_tuned_tp4_configs_are_explicit() -> None:
             "K": 8192,
             "world_size": 4,
             "dtype": "float16",
-            "label": "tp4_m8192_n65536_k8192_fp16",
+            "scheduler": scheduler,
+            "label": f"tp4_m8192_n65536_k8192_fp16_{scheduler}",
         }
+        for scheduler in ("static", "dynamic")
     ]
     assert gemm_reduce_scatter.CONFIGS == [
         {
@@ -54,7 +56,8 @@ def test_tuned_tp4_configs_are_explicit() -> None:
             "K": 49152,
             "world_size": 4,
             "dtype": "float16",
-            "label": "tp4_m16384_n12288_k49152_fp16",
+            "scheduler": "static",
+            "label": "tp4_m16384_n12288_k49152_fp16_static",
         }
     ]
 
