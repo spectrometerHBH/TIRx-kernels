@@ -119,9 +119,9 @@ Each `workloads.yaml` entry requires `kernel` and `config`. Optional fields are
 the acquired physical indices as an ordered, comma-separated
 `CUDA_VISIBLE_DEVICES` value and all assigned cards are monitored for interference.
 
-MegaMoE entries use `timer: megamoe`, which invokes the dedicated DeepGEMM
-`bench_kineto` protocol. Do not set `warmup` or `repeat` for this timer because
-the protocol fixes its own 30-test schedule.
+Distributed entries use `timer: kineto`, which invokes the shared paired,
+cold-cache, slowest-rank protocol in `tvm.tirx.bench`. Do not set `warmup` or
+`repeat` because this timer fixes its own 30-warmup and 30-sample schedule.
 
 The suite exports an absolute `TIRX_BENCH_CACHE_DIR` under `.bench-suite/cache/`.
 Reference adapters may use it for version/GPU-qualified autotune caches, but must

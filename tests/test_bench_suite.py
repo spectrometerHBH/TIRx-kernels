@@ -79,7 +79,9 @@ def test_default_workloads_do_not_override_standard_timer_budgets() -> None:
     workloads = run.load_workloads(run.DEFAULT_WORKLOADS)
 
     for workload in workloads:
-        if workload.get("timer") == "megamoe":
+        if workload.get("timer") == "kineto":
+            assert "warmup" not in workload
+            assert "repeat" not in workload
             continue
         assert "warmup" not in workload
         assert "repeat" not in workload
@@ -190,7 +192,7 @@ def test_baseline_view_keeps_single_tir_ratio_table() -> None:
     assert "| `m1024` | tir | 10.0000 | reference | 12.0000 | 1.200 | — |" in markdown
 
 
-def test_load_workloads_accepts_multigpu_megamoe(tmp_path: Path) -> None:
+def test_load_workloads_accepts_multigpu_kineto(tmp_path: Path) -> None:
     workloads = tmp_path / "workloads.yaml"
     workloads.write_text(
         """
@@ -198,7 +200,7 @@ defaults: {}
 workloads:
   - kernel: deepgemm_fp8_fp4_mega_moe
     config: t64_m64_h7168_i3072_e384_k6_g6
-    timer: megamoe
+    timer: kineto
     num_gpus: 6
 """
     )
@@ -207,7 +209,7 @@ workloads:
         {
             "kernel": "deepgemm_fp8_fp4_mega_moe",
             "config": "t64_m64_h7168_i3072_e384_k6_g6",
-            "timer": "megamoe",
+            "timer": "kineto",
             "num_gpus": 6,
         }
     ]
@@ -224,17 +226,18 @@ def test_load_workloads_rejects_invalid_gpu_count(tmp_path: Path, num_gpus) -> N
         run.load_workloads(workloads)
 
 
-def test_load_workloads_rejects_megamoe_budget_override(tmp_path: Path) -> None:
+def test_load_workloads_has_no_timer_specific_budget_special_case(tmp_path: Path) -> None:
     workloads = tmp_path / "workloads.yaml"
     workloads.write_text(
         """
 workloads:
-  - {kernel: kernel, config: config, timer: megamoe, warmup: 10}
+  - {kernel: kernel, config: config, timer: kineto, warmup: 10}
 """
     )
 
-    with pytest.raises(ValueError, match="fixed DeepGEMM protocol"):
-        run.load_workloads(workloads)
+    assert run.load_workloads(workloads) == [
+        {"kernel": "kernel", "config": "config", "timer": "kineto", "warmup": 10, "num_gpus": 1}
+    ]
 
 
 def test_gpu_pool_acquires_and_releases_multiple_cards_atomically(
@@ -308,7 +311,7 @@ def test_active_strangers_are_merged_across_assigned_gpus(monkeypatch: pytest.Mo
     assert run._active_strangers_on_gpus(("0", "2"), {999}, 0.0) == {101: 4.0, 202: 3.0}
 
 
-def test_run_one_passes_multigpu_assignment_to_megamoe(
+def test_run_one_passes_multigpu_assignment_to_distributed_kineto(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class FakePool:
@@ -360,7 +363,7 @@ def test_run_one_passes_multigpu_assignment_to_megamoe(
         {
             "kernel": "deepgemm_fp8_fp4_mega_moe",
             "config": "t64_m64_h7168_i3072_e384_k6_g2",
-            "timer": "megamoe",
+            "timer": "kineto",
             "num_gpus": 2,
         },
         pool,
@@ -379,7 +382,7 @@ def test_run_one_passes_multigpu_assignment_to_megamoe(
     assert captured["env"]["CUDA_VISIBLE_DEVICES"] == "2,4"
     assert Path(captured["env"]["TIRX_BENCH_CACHE_DIR"]).name == "cache"
     assert Path(captured["env"]["TIRX_BENCH_CACHE_DIR"]).is_absolute()
-    assert captured["cmd"][captured["cmd"].index("--timer") + 1] == "megamoe"
+    assert captured["cmd"][captured["cmd"].index("--timer") + 1] == "kineto"
     assert captured["cmd"][captured["cmd"].index("--cooldown") + 1] == "0"
     assert "--round-cooldown" not in captured["cmd"]
     assert pool.released == ("2", "4")

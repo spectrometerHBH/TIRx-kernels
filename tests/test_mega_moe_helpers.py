@@ -25,7 +25,6 @@ import pytest
 from tirx_kernels.deepgemm.mega_moe import (
     MegaMoeConfig,
     _aggregate_rank_results,
-    _bench_megamoe_mode,
     _cuda_compile_mode,
     _get_block_config_for_mega_moe,
     _get_mega_moe_cuda_compile_mode,
@@ -233,44 +232,10 @@ def test_mega_moe_bench_inherits_shared_defaults() -> None:
     assert "bench_tk" not in inspect.getsource(_run_worker)
 
 
-def test_megamoe_timer_wraps_deepgemm_bench_kineto(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = []
-    sleeps = []
-
-    monkeypatch.setattr("tirx_kernels.deepgemm.mega_moe.time.sleep", sleeps.append)
-
-    def fake_barrier() -> None:
-        pass
-
-    def fake_between_impls() -> None:
-        pass
-
-    def fake_bench_kineto(fn, kernel_names, num_tests=30, barrier=None) -> tuple[float, float]:
-        assert kernel_names in (
-            ("mega_moe_kernel", "sm100_fp8_fp4_mega_moe_impl"),
-            ("sm100_fp8_fp4_mega_moe_impl", "mega_moe_kernel"),
-        )
-        assert barrier is fake_barrier
-        fn()
-        return (0.001, 0.001)
-
-    result = _bench_megamoe_mode(
-        {"tirx": lambda: calls.append("tirx"), "deepgemm": lambda: calls.append("deepgemm")},
-        {"tirx": "mega_moe_kernel", "deepgemm": "sm100_fp8_fp4_mega_moe_impl"},
-        fake_bench_kineto,
-        fake_barrier,
-        fake_between_impls,
-        rounds=2,
-        cooldown_s=0.25,
-    )
-
-    assert calls == ["tirx", "deepgemm", "deepgemm", "tirx"]
-    assert sleeps == [0.25]
-    assert result["timer"] == "megamoe"
-    assert result["round_samples"] == {"tirx": [1000.0, 1000.0], "deepgemm": [1000.0, 1000.0]}
-    assert result["benchmark_protocol"]["num_tests"] == 30
-    assert result["benchmark_protocol"]["round_cooldown_s"] == 0.25
-    assert result["benchmark_protocol"]["round_orders"] == [
-        ["tirx", "deepgemm"],
-        ["deepgemm", "tirx"],
-    ]
+def test_megamoe_uses_shared_distributed_kineto_timer() -> None:
+    source = inspect.getsource(_run_worker)
+    assert "DistributedBenchContext" in source
+    assert "distributed=distributed" in source
+    assert 'prepare={"tirx": prepare_tirx, "deepgemm": prepare_deepgemm}' in source
+    assert "bench_kineto" not in source
+    assert 'timer == "megamoe"' not in source

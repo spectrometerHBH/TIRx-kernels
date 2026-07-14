@@ -110,13 +110,6 @@ def load_workloads(path: Path) -> list[dict]:
         if type(num_gpus) is not int or num_gpus < 1:
             raise ValueError(f"workload num_gpus must be a positive integer: {workload}")
         workload["num_gpus"] = num_gpus
-        if workload.get("timer") == "megamoe" and (
-            workload.get("warmup") is not None or workload.get("repeat") is not None
-        ):
-            raise ValueError(
-                "timer='megamoe' uses a fixed DeepGEMM protocol and cannot override "
-                f"warmup/repeat: {workload}"
-            )
         out.append(workload)
     return out
 
@@ -1497,7 +1490,11 @@ def main() -> None:
         "--cooldown",
         type=float,
         default=DEFAULT_COOLDOWN_S,
-        help=f"Seconds to sleep before every implementation (default {DEFAULT_COOLDOWN_S:g}).",
+        help=(
+            "Timer cooldown in seconds: local timers apply it before each implementation; "
+            "distributed Kineto applies it between paired rounds "
+            f"(default {DEFAULT_COOLDOWN_S:g})."
+        ),
     )
     ap.add_argument(
         "--cpu-workers",

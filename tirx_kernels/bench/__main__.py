@@ -58,12 +58,12 @@ def main():
     parser.add_argument(
         "--timer",
         type=str,
-        choices=("event", "proton", "cudagraph_proton", "megamoe"),
+        choices=("event", "proton", "cudagraph_proton", "kineto"),
         default=None,
         help="Override the kernel module's benchmark timer: 'event' = do_bench, "
         "'proton' = do_bench_proton, 'cudagraph_proton' = "
-        "do_bench_cudagraph_proton [NVIDIA], 'megamoe' = DeepGEMM bench_kineto "
-        "protocol for MegaMoE",
+        "do_bench_cudagraph_proton [NVIDIA], 'kineto' = fixed distributed "
+        "Kineto protocol",
     )
     parser.add_argument(
         "--rounds",
@@ -78,7 +78,8 @@ def main():
         type=float,
         default=DEFAULT_BENCH_COOLDOWN_S,
         help=(
-            "Seconds before every implementation in every round "
+            "Timer cooldown in seconds: local timers apply it before each "
+            "implementation; distributed Kineto applies it between paired rounds "
             f"(default {DEFAULT_BENCH_COOLDOWN_S:g})"
         ),
     )
