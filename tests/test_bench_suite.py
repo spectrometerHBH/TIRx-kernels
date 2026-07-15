@@ -11,6 +11,7 @@ from tirx_kernels.bench_suite import run
 from tirx_kernels.bench_suite.baseline_view import render_markdown
 from tirx_kernels.bench_suite.ratio_diff import build_report
 from tirx_kernels.megakernel.moe import BENCH_CONFIGS as MEGAKERNEL_MOE_BENCH_CONFIGS
+from tirx_kernels.megakernel.moe import _estimate_bench_launch_slots
 
 
 def test_default_workloads_include_full_megakernel_moe_sweep() -> None:
@@ -33,6 +34,17 @@ def test_bench_suite_defaults_to_five_round_arithmetic_mean() -> None:
     assert row["impls"] == {"tirx": 22.0}
     assert row["aggregated"] == {"rounds": 5, "method": "mean"}
     assert row["status"] == "ok"
+
+
+def test_megakernel_moe_launch_slots_include_runtime_estimate_headroom() -> None:
+    slots = _estimate_bench_launch_slots(
+        runtime_us=1000.0, warmup=None, repeat=None, rounds=5, preflight_launches=1
+    )
+
+    # Defaults produce 25 warmup and 100 repeat launches.  Capacity includes
+    # 25% headroom on those runtime-derived loops, while keeping the one-call
+    # setup, five-call estimate, and final guard unchanged.
+    assert slots == 1 + 5 * (1 + 5 + 157) + 16
 
 
 def test_ratio_report_keeps_grouped_tir_schedulers_out_of_references() -> None:
