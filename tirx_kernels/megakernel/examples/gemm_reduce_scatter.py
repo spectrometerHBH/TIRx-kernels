@@ -47,11 +47,11 @@ def build_example() -> KernelSpec:
     kernel = KernelSpec(
         "gemm_reduce_scatter", attrs={"source": "SM100 TP4 GEMM and ReduceScatter overlap pipeline"}
     )
-    local_a = kernel.input("local_a", (impl.M, impl.K), impl.a_type)
-    local_weight = kernel.input("local_weight", (impl.N, impl.K), impl.b_type)
-    partial = kernel.intermediate("partial", (impl.M, impl.N), impl.d_type)
-    staging = kernel.intermediate("staging", (impl.WORLD_SIZE, impl.LOCAL_M, impl.N), impl.d_type)
-    output = kernel.output("output", (impl.LOCAL_M, impl.N), impl.d_type)
+    local_a = kernel.tensor("local_a", (impl.M, impl.K), impl.a_type)
+    local_weight = kernel.tensor("local_weight", (impl.N, impl.K), impl.b_type)
+    partial = kernel.tensor("partial", (impl.M, impl.N), impl.d_type)
+    staging = kernel.tensor("staging", (impl.WORLD_SIZE, impl.LOCAL_M, impl.N), impl.d_type)
+    output = kernel.tensor("output", (impl.LOCAL_M, impl.N), impl.d_type)
     partial_ready = kernel.event(
         "partial_shard_ready",
         (impl.WORLD_SIZE,),
@@ -68,36 +68,36 @@ def build_example() -> KernelSpec:
     (
         kernel.tile(
             "partial_gemm",
-            impl=impl.PartialGemmTileImpl(),
+            impl=impl.PartialGemmTileImpl(
+                {"local_a": local_a, "local_weight": local_weight, "partial": partial}
+            ),
             tile_num=(m_clusters, n_clusters, 1),
+            reads=[local_a, local_weight],
+            writes=[partial],
             attrs={"purpose": "compute one cluster of the rank-local partial product"},
-        )
-        .read(local_a, local_weight)
-        .write(partial)
-        .notify(partial_ready, lambda m, n, k: (m // local_m_clusters,))
+        ).notify(partial_ready, lambda m, n, k: (m // local_m_clusters,))
     )
     (
         kernel.tile(
             "transfer",
-            impl=impl.ReduceScatterTileImpl(),
+            impl=impl.ReduceScatterTileImpl({"partial": partial, "staging": staging}),
             tile_num=(impl.WORLD_SIZE, impl.WORLD_SIZE, 1),
+            reads=[partial],
+            writes=[staging],
             attrs={"purpose": "move one source partial shard to one destination rank"},
         )
-        .read(partial)
-        .write(staging)
         .wait(partial_ready, lambda source, destination, k: (destination,))
         .notify(staging_ready, lambda source, destination, k: (destination,))
     )
     (
         kernel.tile(
             "reduce",
-            impl=impl.ReduceSumTileImpl(),
+            impl=impl.ReduceSumTileImpl({"staging": staging, "output": output}),
             tile_num=(impl.WORLD_SIZE, impl.LOCAL_M // impl.BLK_M_RS, impl.N // impl.BLK_N_RS),
+            reads=[staging],
+            writes=[output],
             attrs={"purpose": "sum source-rank partials for one destination output tile"},
-        )
-        .read(staging)
-        .write(output)
-        .wait(staging_ready, lambda destination, m, n: (destination,))
+        ).wait(staging_ready, lambda destination, m, n: (destination,))
     )
     return kernel.validate()
 
@@ -107,8 +107,8 @@ def describe_graph(spec: KernelSpec) -> str:
 
     lines = [f"kernel: {spec.name}", f"logical events: {', '.join(spec.events)}", "tiles:"]
     for tile in spec.tiles:
-        waits = ", ".join(dependency.event.name for dependency in tile.waits) or "-"
-        notifies = ", ".join(dependency.event.name for dependency in tile.notifies) or "-"
+        waits = ", ".join(event.name for event, _ in tile.waits) or "-"
+        notifies = ", ".join(event.name for event, _ in tile.notifies) or "-"
         lines.append(
             f"  - {tile.name}: {type(tile.impl).__name__} "
             f"tile_num={tuple(tile.tile_num)} waits={waits} notifies={notifies}"

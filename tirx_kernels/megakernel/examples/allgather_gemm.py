@@ -44,10 +44,10 @@ def build_example() -> KernelSpec:
     kernel = KernelSpec(
         "allgather_gemm", attrs={"source": "SM100 TP4 AllGather and GEMM overlap pipeline"}
     )
-    local_a = kernel.input("local_a", (impl.LOCAL_M, impl.K), impl.a_type)
-    local_weight = kernel.input("local_weight", (impl.LOCAL_N, impl.K), impl.b_type)
-    gathered_a = kernel.intermediate("gathered_a", (impl.M, impl.K), impl.a_type)
-    output = kernel.output("output", (impl.M, impl.LOCAL_N), impl.d_type)
+    local_a = kernel.tensor("local_a", (impl.LOCAL_M, impl.K), impl.a_type)
+    local_weight = kernel.tensor("local_weight", (impl.LOCAL_N, impl.K), impl.b_type)
+    gathered_a = kernel.tensor("gathered_a", (impl.M, impl.K), impl.a_type)
+    output = kernel.tensor("output", (impl.M, impl.LOCAL_N), impl.d_type)
     shard_ready = kernel.event(
         "shard_ready",
         (impl.WORLD_SIZE,),
@@ -58,24 +58,29 @@ def build_example() -> KernelSpec:
     (
         kernel.tile(
             "allgather",
-            impl=impl.AllGatherTileImpl(),
+            impl=impl.AllGatherTileImpl({"local_a": local_a, "gathered_a": gathered_a}),
             tile_num=(impl.WORLD_SIZE, 1, 1),
+            reads=[local_a],
+            writes=[gathered_a],
             attrs={"purpose": "publish every source activation shard to all ranks"},
-        )
-        .read(local_a)
-        .write(gathered_a)
-        .notify(shard_ready, lambda m, n, k: (m,))
+        ).notify(shard_ready, lambda m, n, k: (m,))
     )
     (
         kernel.tile(
             "gemm",
-            impl=impl.AllGatherGemmTileImpl(),
+            impl=impl.AllGatherGemmTileImpl(
+                {
+                    "local_a": local_a,
+                    "local_weight": local_weight,
+                    "gathered_a": gathered_a,
+                    "output": output,
+                }
+            ),
             tile_num=(impl.GEMM_M_CLUSTERS, impl.GEMM_N_CLUSTERS, 1),
+            reads=[local_a, gathered_a, local_weight],
+            writes=[output],
             attrs={"purpose": "multiply one gathered activation cluster by local weights"},
-        )
-        .read(local_a, gathered_a, local_weight)
-        .write(output)
-        .wait(shard_ready, lambda m, n, k: (m // impl.LOCAL_GEMM_M_CLUSTERS,))
+        ).wait(shard_ready, lambda m, n, k: (m // impl.LOCAL_GEMM_M_CLUSTERS,))
     )
     return kernel.validate()
 
@@ -85,8 +90,8 @@ def describe_graph(spec: KernelSpec) -> str:
 
     lines = [f"kernel: {spec.name}", f"logical events: {', '.join(spec.events)}", "tiles:"]
     for tile in spec.tiles:
-        waits = ", ".join(dependency.event.name for dependency in tile.waits) or "-"
-        notifies = ", ".join(dependency.event.name for dependency in tile.notifies) or "-"
+        waits = ", ".join(event.name for event, _ in tile.waits) or "-"
+        notifies = ", ".join(event.name for event, _ in tile.notifies) or "-"
         lines.append(
             f"  - {tile.name}: {type(tile.impl).__name__} "
             f"tile_num={tuple(tile.tile_num)} waits={waits} notifies={notifies}"
