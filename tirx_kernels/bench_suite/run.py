@@ -37,6 +37,8 @@ from typing import ClassVar
 
 import yaml
 
+from tirx_kernels.bench import DEFAULT_COOLDOWN_S, DEFAULT_ROUNDS
+
 try:
     from tirx_kernels.bench_suite.impls import our_impls
 except ModuleNotFoundError:  # Support `python tirx_kernels/bench_suite/run.py`.
@@ -60,8 +62,6 @@ POLL_INTERVAL = 5.0  # seconds between GPU re-checks when none is free
 MONITOR_INTERVAL = 0.5  # seconds between nvidia-smi polls during a workload
 # 0 means auto: one worker per probe-OK GPU (see main()).
 DEFAULT_CPU_WORKERS = 0
-DEFAULT_COOLDOWN_S = 1.0
-DEFAULT_ROUNDS = 5
 DEFAULT_UTIL_THRESHOLD = 0.0  # % GPU util above which a card counts as busy.
 DEFAULT_MEM_THRESHOLD = 0.0  # % compute-app memory above which a card counts as busy.
 
@@ -714,6 +714,13 @@ def run_one(
 
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = gpu_csv
+    # Reference-library autotune caches must survive the per-workload scratch
+    # cwd and must be populated before timing. Individual adapters use
+    # per-op/per-shape files below this absolute directory, so concurrent suite
+    # workers do not overwrite one another's selections.
+    cache_dir = (log_dir.parent / "cache").resolve()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    env["TIRX_BENCH_CACHE_DIR"] = str(cache_dir)
 
     # Each workload gets its own scratch cwd so concurrent runs don't race on
     # proton's <proton_name>.hatchet file.
@@ -1260,7 +1267,7 @@ def load_baseline(path=None):
 
 
 def _finalize_bench_record(row: dict, *, rounds: int) -> None:
-    """Validate round samples and write their arithmetic mean in microseconds."""
+    """Validate in-bench round samples and write aggregated impl times (microseconds)."""
     samples = row.get("round_samples")
     if not samples:
         impls = row.get("impls") or {}
@@ -1475,8 +1482,8 @@ def main() -> None:
         "--rounds",
         type=int,
         default=DEFAULT_ROUNDS,
-        help=f"In-bench rounds per workload subprocess (default {DEFAULT_ROUNDS}). Compile once, "
-        "then warmup+repeat each round; failed jobs are requeued until ok.",
+        help=f"Independent standard-timer samples per workload (default {DEFAULT_ROUNDS}). "
+        "Compile/prepare once; each round cools down and runs a complete timer call.",
     )
     ap.add_argument(
         "--cooldown",
@@ -1614,7 +1621,8 @@ def main() -> None:
     _repo_git = collect_repo_git()
     label = args.label or _repo_git.get("tirx-kernels") or _repo_git.get("tir") or "local"
     agg_note = (
-        f", {args.rounds} in-bench round(s), aggregate=mean, cooldown={args.cooldown:g}s"
+        f", {args.rounds} standard-timer round(s), aggregate=mean, "
+        f"cooldown={args.cooldown:g}s before every impl/round"
         if args.rounds > 1 or args.cooldown > 0
         else ""
     )

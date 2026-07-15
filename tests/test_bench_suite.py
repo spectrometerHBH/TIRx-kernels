@@ -15,6 +15,21 @@ from tirx_kernels.megakernel.moe import BENCH_CONFIGS as MEGAKERNEL_MOE_BENCH_CO
 from tirx_kernels.megakernel.moe import _estimate_bench_launch_slots
 
 
+def test_bench_suite_standard_sampling_defaults() -> None:
+    assert run.DEFAULT_ROUNDS == 5
+    assert run.DEFAULT_COOLDOWN_S == 1.0
+
+
+def test_finalize_bench_record_uses_all_rounds_arithmetic_mean() -> None:
+    row = {"round_samples": {"tir": [1.0, 2.0, 100.0], "reference": [4.0, 5.0, 6.0]}}
+
+    run._finalize_bench_record(row, rounds=3)
+
+    assert row["status"] == "ok"
+    assert row["impls"] == {"tir": 103.0 / 3.0, "reference": 5.0}
+    assert row["aggregated"] == {"rounds": 3, "method": "mean"}
+
+
 def test_default_workloads_include_full_megakernel_moe_sweep() -> None:
     workloads = run.load_workloads(run.DEFAULT_WORKLOADS)
     megakernel_moe_workloads = [w for w in workloads if w["kernel"] == "megakernel_moe"]
@@ -46,6 +61,17 @@ def test_megakernel_moe_launch_slots_include_runtime_estimate_headroom() -> None
     # 25% headroom on those runtime-derived loops, while keeping the one-call
     # setup, five-call estimate, and final guard unchanged.
     assert slots == 1 + 5 * (1 + 5 + 157) + 16
+
+
+def test_default_workloads_do_not_override_standard_timer_budgets() -> None:
+    workloads = run.load_workloads(run.DEFAULT_WORKLOADS)
+
+    for workload in workloads:
+        if workload.get("timer") == "megamoe":
+            continue
+        assert "warmup" not in workload
+        assert "repeat" not in workload
+        assert "timer" not in workload
 
 
 def test_ratio_report_keeps_grouped_tir_schedulers_out_of_references() -> None:
@@ -433,6 +459,8 @@ def test_run_one_passes_multigpu_assignment_to_megamoe(
     assert record["round_samples"] == {"deepgemm": [10.0, 11.0], "tirx": [9.5, 10.5]}
     assert captured["gpu_indices"] == ("2", "4")
     assert captured["env"]["CUDA_VISIBLE_DEVICES"] == "2,4"
+    assert Path(captured["env"]["TIRX_BENCH_CACHE_DIR"]).name == "cache"
+    assert Path(captured["env"]["TIRX_BENCH_CACHE_DIR"]).is_absolute()
     assert captured["cmd"][captured["cmd"].index("--timer") + 1] == "megamoe"
     assert captured["cmd"][captured["cmd"].index("--cooldown") + 1] == "0"
     assert "--round-cooldown" not in captured["cmd"]
