@@ -49,10 +49,15 @@ class _GemmCommHostBackend(MegakernelBackend):
     def __init__(self, bindings: GemmCommRuntimeBindings):
         self.bindings = bindings
 
+    def begin_device_region(self, plan, region) -> None:
+        del plan
+        entrypoint = region.attrs.get("entrypoint")
+        if not isinstance(entrypoint, str) or not entrypoint:
+            raise ValueError(f"device region {region.name!r} has no backend entrypoint")
+        self.bindings.launch_device(entrypoint)
+
     def emit_device_action(self, action, context) -> None:
-        if isinstance(action, RunAction):
-            self.bindings.launch_device(action.tile.impl.entrypoint)
-        elif isinstance(action, FetchGuardAction | MidBodyPortAction):
+        if isinstance(action, RunAction | FetchGuardAction | MidBodyPortAction):
             # These actions are realized inside their device kernel and do not
             # add a host-side synchronization point.
             return

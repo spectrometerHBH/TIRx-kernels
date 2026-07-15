@@ -23,7 +23,7 @@ from tvm.megakernel.dsl import KernelSpec
 
 from .. import allgather_gemm as ag_kernel
 from .. import gemm_reduce_scatter as rs_kernel
-from .model import GemmCommPlan, PhysicalTask, RankSchedule
+from .model import GemmCommPlan, PhysicalTask, RankSchedule, RegionEntrypoint
 from .specs import build_allgather_gemm_graph, build_gemm_reduce_scatter_graph
 
 
@@ -52,6 +52,18 @@ def _reduce_scatter_tasks(rank: int) -> tuple[PhysicalTask, ...]:
             for m_idx in range(begin, end):
                 tasks.append(PhysicalTask("partial_gemm", m_idx, n_idx))
     return tuple(tasks)
+
+
+_ALLGATHER_REGION_ENTRYPOINTS = (
+    RegionEntrypoint("allgather_host", ag_kernel.ALLGATHER_HOST_ENTRYPOINT),
+    RegionEntrypoint("gemm_device", ag_kernel.GEMM_DEVICE_ENTRYPOINT),
+)
+
+_REDUCE_SCATTER_REGION_ENTRYPOINTS = (
+    RegionEntrypoint("partial_gemm_device", rs_kernel.PARTIAL_GEMM_DEVICE_ENTRYPOINT),
+    RegionEntrypoint("reduce_scatter_host", rs_kernel.REDUCE_SCATTER_HOST_ENTRYPOINT),
+    RegionEntrypoint("reduce_device", rs_kernel.REDUCE_SUM_DEVICE_ENTRYPOINT),
+)
 
 
 def _distribute_static(
@@ -89,6 +101,7 @@ class StaticPolicy(GemmCommPolicy):
                 rank_schedules=schedules,
                 physical_scheduler="rank_aware_grid_stride",
                 launch_steps=(("allgather", "gemm"),),
+                region_entrypoints=_ALLGATHER_REGION_ENTRYPOINTS,
             )
         elif spec.name == "gemm_reduce_scatter":
             clusters = rs_kernel.GEMM_SMS // rs_kernel.CLUSTER_M
@@ -105,6 +118,7 @@ class StaticPolicy(GemmCommPolicy):
                 rank_schedules=schedules,
                 physical_scheduler="rank_aware_group_major",
                 launch_steps=(("partial_gemm", "transfer"), ("reduce",)),
+                region_entrypoints=_REDUCE_SCATTER_REGION_ENTRYPOINTS,
             )
         else:
             raise ValueError(f"unsupported distributed GEMM graph: {spec.name!r}")
@@ -129,6 +143,7 @@ class DynamicPolicy(GemmCommPolicy):
                 rank_schedules=schedules,
                 physical_scheduler="mpmc_queue",
                 launch_steps=(("allgather", "gemm"),),
+                region_entrypoints=_ALLGATHER_REGION_ENTRYPOINTS,
             )
         elif spec.name == "gemm_reduce_scatter":
             schedules = tuple(
@@ -148,6 +163,7 @@ class DynamicPolicy(GemmCommPolicy):
                 rank_schedules=schedules,
                 physical_scheduler="planned_mpmc_queue",
                 launch_steps=(("partial_gemm", "transfer"), ("reduce",)),
+                region_entrypoints=_REDUCE_SCATTER_REGION_ENTRYPOINTS,
                 lowerable=False,
                 unsupported_reason=reason,
             )

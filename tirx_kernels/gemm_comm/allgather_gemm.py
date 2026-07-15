@@ -49,6 +49,9 @@ class ProfileEventType(Enum):
 
 event_type_names = ["gemm", "ag", "fetch"]
 
+ALLGATHER_HOST_ENTRYPOINT = "runtime.disco.transfer_to_peers_all_gather"
+GEMM_DEVICE_ENTRYPOINT = "test_mma_ss_tma_2sm_persistent"
+
 # M, N, K = 16384, 49152, 12288
 M, N, K = 8192, 8192 * 8, 8192
 
@@ -661,9 +664,6 @@ def skip():
 class AllGatherTileImpl(TileImpl):
     """Launch the existing host-side AllGather transfer stage."""
 
-    execution_space = "host"
-    entrypoint = "runtime.disco.transfer_to_peers_all_gather"
-
     def __init__(self, tensor_specs):
         super().__init__()
         self.tensor_specs = dict(tensor_specs)
@@ -674,9 +674,6 @@ class AllGatherTileImpl(TileImpl):
 
 class AllGatherGemmTileImpl(TileImpl):
     """Execute one GEMM cluster after its AllGather shard becomes ready."""
-
-    execution_space = "device"
-    entrypoint = "test_mma_ss_tma_2sm_persistent"
 
     def __init__(self, tensor_specs=None):
         super().__init__()

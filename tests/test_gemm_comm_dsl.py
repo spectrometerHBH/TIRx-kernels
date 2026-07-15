@@ -48,7 +48,12 @@ from tirx_kernels.megakernel.examples.gemm_reduce_scatter import (
 )
 from tirx_kernels.megakernel.examples.gemm_reduce_scatter import main as reduce_scatter_main
 from tvm.megakernel.dsl import TileImpl
-from tvm.megakernel.transform import FetchGuardAction, HostEdgeAction, MidBodyPortAction
+from tvm.megakernel.transform import (
+    FetchGuardAction,
+    HostCallAction,
+    HostEdgeAction,
+    MidBodyPortAction,
+)
 
 _allgather_gemm_runner = importlib.import_module("tirx_kernels.gemm_comm._allgather_gemm_runner")
 _gemm_reduce_scatter_runner = importlib.import_module(
@@ -201,6 +206,10 @@ def test_logical_graphs_use_concrete_kernel_tile_impls_without_scheduler_attrs(
     builder, tile_names, event_names
 ) -> None:
     spec = builder().validate()
+    execution = policy_for_scheduler("static").normalize(spec).execution_plan()
+    device_tile_names = {
+        program.tile.name for region in execution.device_regions for program in region.tile_programs
+    }
     assert [tile.name for tile in spec.tiles] == tile_names
     assert list(spec.events) == event_names
     assert all(isinstance(tile.impl, TileImpl) for tile in spec.tiles)
@@ -211,10 +220,12 @@ def test_logical_graphs_use_concrete_kernel_tile_impls_without_scheduler_attrs(
     }
     for tile in spec.tiles:
         source = _tile_run_source(tile.impl)
-        if tile.impl.execution_space == "device":
+        if tile.name in device_tile_names:
             assert "T." in source or "Tx." in source
         else:
             assert "GemmCommHostExecutor" in source
+        assert not hasattr(tile.impl, "execution_space")
+        assert not hasattr(tile.impl, "entrypoint")
 
     attrs = [spec.attrs]
     attrs.extend(event.attrs for event in spec.events.values())
@@ -232,11 +243,45 @@ def test_logical_graphs_use_concrete_kernel_tile_impls_without_scheduler_attrs(
 )
 def test_lowerer_binds_and_executes_attached_device_tile_impls(builder, scheduler) -> None:
     spec = builder()
-    device_impls = [tile.impl for tile in spec.tiles if tile.impl.execution_space == "device"]
     lowered = GemmCommLowerer(policy_for_scheduler(scheduler)).lower(spec)
+    device_impls = [
+        program.tile.impl
+        for region in lowered.execution.device_regions
+        for program in region.tile_programs
+    ]
 
     assert lowered.module is not None
     assert all(tile_impl._resources_initialized for tile_impl in device_impls)
+
+
+@pytest.mark.parametrize(
+    "builder,scheduler",
+    [
+        (build_allgather_gemm_graph, "static"),
+        (build_allgather_gemm_graph, "dynamic"),
+        (build_gemm_reduce_scatter_graph, "static"),
+    ],
+)
+def test_region_entrypoints_are_owned_by_policy(builder, scheduler) -> None:
+    spec = builder()
+    lowered = GemmCommLowerer(policy_for_scheduler(scheduler)).lower(spec, plan_only=True)
+
+    assert lowered.device_entrypoints == tuple(
+        region.attrs["entrypoint"] for region in lowered.execution.device_regions
+    )
+    assert lowered.host_entrypoints == tuple(
+        action.name
+        for region in lowered.execution.host_regions
+        for action in region.actions
+        if isinstance(action, HostCallAction)
+    )
+    assert all(
+        not hasattr(tile.impl, "execution_space") and not hasattr(tile.impl, "entrypoint")
+        for tile in spec.tiles
+    )
+
+    with pytest.raises(ValueError, match="entrypoint"):
+        replace(lowered.plan, region_entrypoints=lowered.plan.region_entrypoints[:-1]).validate()
 
 
 @pytest.mark.parametrize("scheduler", ["static", "dynamic"])

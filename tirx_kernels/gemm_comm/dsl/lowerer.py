@@ -25,7 +25,7 @@ from typing import Any
 import numpy as np
 
 from tvm.megakernel.dsl import KernelSpec
-from tvm.megakernel.transform import ExecutionPlan
+from tvm.megakernel.transform import ExecutionPlan, HostCallAction
 
 from .. import allgather_gemm as ag_kernel
 from .model import GemmCommPlan
@@ -56,10 +56,13 @@ class GemmCommLowerer:
             raise NotImplementedError(plan.unsupported_reason)
 
         device_entrypoints = tuple(
-            tile.impl.entrypoint for tile in spec.tiles if tile.impl.execution_space == "device"
+            region.attrs["entrypoint"] for region in execution.device_regions
         )
         host_entrypoints = tuple(
-            tile.impl.entrypoint for tile in spec.tiles if tile.impl.execution_space == "host"
+            action.name
+            for region in execution.host_regions
+            for action in region.actions
+            if isinstance(action, HostCallAction)
         )
         module = None
         if not plan_only:

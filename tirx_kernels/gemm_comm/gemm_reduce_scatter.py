@@ -47,6 +47,10 @@ class ProfileEventType(Enum):
 
 event_type_names = ["gemm", "rs", "wait", "accum", "put", "signal"]
 
+REDUCE_SCATTER_HOST_ENTRYPOINT = "runtime.disco.transfer_to_peers_reduce_scatter"
+PARTIAL_GEMM_DEVICE_ENTRYPOINT = "test_mma_ss_tma_2sm_persistent"
+REDUCE_SUM_DEVICE_ENTRYPOINT = "reduce_sum"
+
 
 d_type, a_type, b_type = "float16", "float16", "float16"
 nbytes = 2
@@ -275,9 +279,6 @@ D_layout = T.ComposeLayout(
 class ReduceScatterTileImpl(TileImpl):
     """Launch the existing host-side ReduceScatter transfer stage."""
 
-    execution_space = "host"
-    entrypoint = "runtime.disco.transfer_to_peers_reduce_scatter"
-
     def __init__(self, tensor_specs):
         super().__init__()
         self.tensor_specs = dict(tensor_specs)
@@ -339,9 +340,6 @@ class PartialReadyPortProgram:
 
 class PartialGemmTileImpl(TileImpl):
     """Execute one rank-local GEMM cluster across the persistent warp roles."""
-
-    execution_space = "device"
-    entrypoint = "test_mma_ss_tma_2sm_persistent"
 
     def __init__(self, tensor_specs=None):
         super().__init__()
@@ -538,11 +536,7 @@ class PartialGemmTileImpl(TileImpl):
     def build_module(self, execution_plan: ExecutionPlan):
         """Build both device regions attached to this execution plan."""
 
-        reduce_impls = [
-            tile.impl
-            for tile in execution_plan.kernel.tiles
-            if tile.impl.entrypoint == "reduce_sum"
-        ]
+        reduce_impls = [tile.impl for tile in execution_plan.kernel.tiles if tile.name == "reduce"]
         if len(reduce_impls) != 1:
             raise ValueError("GEMM+ReduceScatter requires exactly one reduce device region")
         return build_kernel(self, reduce_impls[0], execution_plan=execution_plan)
@@ -699,9 +693,6 @@ class PartialGemmTileImpl(TileImpl):
 
 class ReduceSumTileImpl(TileImpl):
     """Reduce one local output tile across all source ranks."""
-
-    execution_space = "device"
-    entrypoint = "reduce_sum"
 
     def __init__(self, tensor_specs=None):
         super().__init__()
