@@ -18,16 +18,18 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from pathlib import Path
 
 import pytest
 import torch
 
 import tvm
+from tirx_kernels.flashmla import profile_sparse_prefill
 from tirx_kernels.flashmla import sparse_prefill_head64_phase1 as head64
 from tirx_kernels.flashmla import sparse_prefill_head128_phase1 as head128
 from tirx_kernels.flashmla import sparse_prefill_head128_small_topk_phase1 as head128_small
-from tvm.tirx.bench import IketProfiler
+from tvm.tirx.cuda.iket import IketProfiler, IketProfileResult
 
 CASES = (
     (head64, {"s_q": 1, "s_kv": 8192, "topk": 512, "d_qk": 576, "h_q": 64}),
@@ -64,6 +66,39 @@ def test_sparse_flashmla_declares_expected_warp_uniform_ranges(module, config) -
     assert declarations == set(module.IKET_EVENT_NAMES)
     assert "profiler_buffer" not in script
     assert "clock64" not in script
+
+
+def test_sparse_flashmla_profile_driver_uses_orchestrator_defaults(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    captured = {}
+
+    def fake_run(main, **kwargs):
+        captured.update(main=main, kwargs=kwargs)
+        return IketProfileResult(
+            output_dir=Path(kwargs["output_dir"]),
+            postprocess=kwargs["postprocess"],
+            json_traces=(tmp_path / "trace.json",),
+            perfetto_traces=(tmp_path / "trace.pftrace",),
+            html_reports=(tmp_path / "trace.html",),
+        )
+
+    monkeypatch.setattr(profile_sparse_prefill.iket, "run", fake_run)
+    monkeypatch.setattr(sys, "argv", ["profile_sparse_prefill"])
+    profile_sparse_prefill.main()
+
+    assert captured["main"].func is profile_sparse_prefill._profile_workload
+    assert captured["kwargs"] == {
+        "output_dir": "/tmp/flashmla-iket",
+        "postprocess": "all",
+        "clobber": True,
+        "timeout": 600.0,
+        "keep": False,
+        "max_ts_cnt_per_warp": None,
+    }
+    output = capsys.readouterr().out
+    assert "IKET output directory: /tmp/flashmla-iket" in output
+    assert f"IKET artifact: {tmp_path / 'trace.json'}" in output
 
 
 @pytest.mark.parametrize(("module", "config"), CASES)

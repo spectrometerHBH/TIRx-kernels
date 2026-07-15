@@ -10,7 +10,8 @@ import tvm
 import tvm.testing
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
-from tvm.tirx.bench import IketProfiler, bench
+from tvm.tirx.bench import bench
+from tvm.tirx.cuda.iket import IketProfiler
 from tvm.tirx.lang.pipeline import MBarrier, Pipeline, PipelineState, TCGen05Bar
 from tvm.tirx.lang.tile_scheduler import FlashAttentionLinearScheduler, FlashAttentionLPTScheduler
 from tvm.tirx.layout import wg_local_layout

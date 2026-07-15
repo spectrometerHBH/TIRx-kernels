@@ -14,7 +14,7 @@ from tirx_kernels.flashmla._tma import tma_config
 from tvm.backend.cuda.operator.tile_primitive.tma_utils import SwizzleMode
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
-from tvm.tirx.bench import IketProfiler
+from tvm.tirx.cuda.iket import IketProfiler
 from tvm.tirx.lang.pipeline import MBarrier, TCGen05Bar, TMABar
 from tvm.tirx.layout import S, TileLayout, laneid, wid_in_wg
 

@@ -18,14 +18,16 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from pathlib import Path
 
 import pytest
 import torch
 
 import tvm
+from tirx_kernels.attention import profile_flash_attention4
 from tirx_kernels.attention.flash_attention4 import IKET_EVENT_NAMES, get_flash_attention4_kernel
-from tvm.tirx.bench import IketProfiler
+from tvm.tirx.cuda.iket import IketProfiler, IketProfileResult
 
 EXPECTED_RANGES = set(IKET_EVENT_NAMES[:11])
 EXPECTED_MARKS = set(IKET_EVENT_NAMES[11:])
@@ -63,6 +65,45 @@ def test_flash_attention4_has_four_argument_abi_and_expected_annotations() -> No
     assert len(IKET_EVENT_NAMES) == 18
     assert "profiler_buffer" not in script
     assert "clock64" not in script
+
+
+def test_iket_profiler_is_not_exported_from_generic_bench_module() -> None:
+    import tvm.tirx.bench as bench
+
+    assert not hasattr(bench, "IketProfiler")
+
+
+def test_flash_attention4_profile_driver_uses_orchestrator_defaults(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    captured = {}
+
+    def fake_run(main, **kwargs):
+        captured.update(main=main, kwargs=kwargs)
+        return IketProfileResult(
+            output_dir=Path(kwargs["output_dir"]),
+            postprocess=kwargs["postprocess"],
+            json_traces=(tmp_path / "trace.json",),
+            perfetto_traces=(tmp_path / "trace.pftrace",),
+            html_reports=(tmp_path / "trace.html",),
+        )
+
+    monkeypatch.setattr(profile_flash_attention4.iket, "run", fake_run)
+    monkeypatch.setattr(sys, "argv", ["profile_flash_attention4"])
+    profile_flash_attention4.main()
+
+    assert captured["main"].func is profile_flash_attention4._profile_workload
+    assert captured["kwargs"] == {
+        "output_dir": "/tmp/fa4-iket",
+        "postprocess": "all",
+        "clobber": True,
+        "timeout": 600.0,
+        "keep": False,
+        "max_ts_cnt_per_warp": None,
+    }
+    output = capsys.readouterr().out
+    assert "IKET output directory: /tmp/fa4-iket" in output
+    assert f"IKET artifact: {tmp_path / 'trace.json'}" in output
 
 
 def test_flash_attention4_strip_and_official_metadata_on_sm100() -> None:

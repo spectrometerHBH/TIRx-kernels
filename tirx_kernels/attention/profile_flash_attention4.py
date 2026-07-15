@@ -17,26 +17,24 @@
 
 Example::
 
-  TVM_IKET_OFFICIAL_PROFILE=cutlass-4.6.1 \
-    run-iket --output-dir /tmp/fa4-iket --clobber \
-      profile --postprocess all -- \
-      python -m tirx_kernels.attention.profile_flash_attention4 \
-        --seq-len 1024 --causal
+  python -m tirx_kernels.attention.profile_flash_attention4 \
+    --seq-len 1024 --causal
 
 The script launches only the target FA4 kernel.  Correctness and ordinary
 kernel benchmarks remain in flash_attention4.run_test and run_bench; trace
-allocation, patching, timing, and postprocessing are owned by run-iket.
+allocation, patching, timing, and postprocessing remain owned by run-iket.
 """
 
 from __future__ import annotations
 
 import argparse
+from functools import partial
 
 import torch
 
 import tvm
 from tirx_kernels.attention.flash_attention4 import get_flash_attention4_kernel, prepare_data
-from tvm.tirx.bench import IketProfiler
+from tvm.tirx.cuda import iket
 
 
 def _parse_args() -> argparse.Namespace:
@@ -53,11 +51,18 @@ def _parse_args() -> argparse.Namespace:
         default=1,
         help="Number of traced FA4 launches; setup and compilation remain outside the loop",
     )
+    parser.add_argument("--output-dir", default="/tmp/fa4-iket")
+    parser.add_argument(
+        "--postprocess", choices=("perfetto", "json", "html", "none", "all"), default="all"
+    )
+    parser.add_argument("--clobber", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--timeout", type=float, default=600.0)
+    parser.add_argument("--keep", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--max-ts-cnt-per-warp", type=int, default=None)
     return parser.parse_args()
 
 
-def main() -> None:
-    args = _parse_args()
+def _profile_workload(args: argparse.Namespace) -> None:
     if args.repeat <= 0:
         raise ValueError("--repeat must be positive")
 
@@ -70,7 +75,7 @@ def main() -> None:
         args.head_dim,
         is_causal=args.causal,
     )
-    executable = IketProfiler().compile(
+    executable = iket.IketProfiler().compile(
         tvm.IRModule({"main": func}),
         target=tvm.target.Target({"kind": "cuda", "arch": "sm_100a"}),
         tir_pipeline="tirx",
@@ -94,6 +99,26 @@ def main() -> None:
     for _ in range(args.repeat):
         executable(q, k, v, out)
     torch.cuda.synchronize()
+
+
+def _print_result(result: iket.IketProfileResult) -> None:
+    print(f"IKET output directory: {result.output_dir}")
+    for path in (*result.json_traces, *result.perfetto_traces, *result.html_reports):
+        print(f"IKET artifact: {path}")
+
+
+def main() -> None:
+    args = _parse_args()
+    result = iket.run(
+        partial(_profile_workload, args),
+        output_dir=args.output_dir,
+        postprocess=args.postprocess,
+        clobber=args.clobber,
+        timeout=args.timeout,
+        keep=args.keep,
+        max_ts_cnt_per_warp=args.max_ts_cnt_per_warp,
+    )
+    _print_result(result)
 
 
 if __name__ == "__main__":

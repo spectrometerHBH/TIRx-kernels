@@ -17,10 +17,7 @@
 
 Example::
 
-  TVM_IKET_OFFICIAL_PROFILE=cutlass-4.6.1 \
-    run-iket --output-dir /tmp/flashmla-iket --clobber \
-      profile --postprocess all -- \
-      python -m tirx_kernels.flashmla.profile_sparse_prefill
+  python -m tirx_kernels.flashmla.profile_sparse_prefill
 
 The default workload launches one readable representative of each dispatch:
 head64, regular head128, and small-topk head128.  Compilation and allocation
@@ -30,6 +27,7 @@ remain outside the traced launch loop; run-iket owns patching and trace output.
 from __future__ import annotations
 
 import argparse
+from functools import partial
 from types import ModuleType
 from typing import Any
 
@@ -39,7 +37,7 @@ import tvm
 from tirx_kernels.flashmla import sparse_prefill_head64_phase1 as head64
 from tirx_kernels.flashmla import sparse_prefill_head128_phase1 as head128
 from tirx_kernels.flashmla import sparse_prefill_head128_small_topk_phase1 as head128_small
-from tvm.tirx.bench import IketProfiler
+from tvm.tirx.cuda import iket
 
 
 def _parse_args() -> argparse.Namespace:
@@ -55,6 +53,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--repeat", type=int, default=1, help="Traced launches per selected implementation"
     )
+    parser.add_argument("--output-dir", default="/tmp/flashmla-iket")
+    parser.add_argument(
+        "--postprocess", choices=("perfetto", "json", "html", "none", "all"), default="all"
+    )
+    parser.add_argument("--clobber", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--timeout", type=float, default=600.0)
+    parser.add_argument("--keep", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--max-ts-cnt-per-warp", type=int, default=None)
     return parser.parse_args()
 
 
@@ -108,8 +114,7 @@ def _launch_args(case: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def main() -> None:
-    args = _parse_args()
+def _profile_workload(args: argparse.Namespace) -> None:
     if args.s_q <= 0:
         raise ValueError("--s-q must be positive")
     if args.s_kv <= 0:
@@ -120,17 +125,36 @@ def main() -> None:
     target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
     launches = []
     for name, module, config in _configs(args):
-        executable = IketProfiler().compile(
+        executable = iket.IketProfiler().compile(
             tvm.IRModule({"main": module.get_kernel(**config)}), target=target, tir_pipeline="tirx"
         )
         case = module.prepare_data(**config)
         launches.append((name, executable, _launch_args(case)))
 
-    for name, executable, launch_args in launches:
+    for _name, executable, launch_args in launches:
         for _ in range(args.repeat):
             executable(*launch_args)
-        print(f"profiled {name}: {args.repeat} launch(es)")
     torch.cuda.synchronize()
+
+
+def _print_result(result: iket.IketProfileResult) -> None:
+    print(f"IKET output directory: {result.output_dir}")
+    for path in (*result.json_traces, *result.perfetto_traces, *result.html_reports):
+        print(f"IKET artifact: {path}")
+
+
+def main() -> None:
+    args = _parse_args()
+    result = iket.run(
+        partial(_profile_workload, args),
+        output_dir=args.output_dir,
+        postprocess=args.postprocess,
+        clobber=args.clobber,
+        timeout=args.timeout,
+        keep=args.keep,
+        max_ts_cnt_per_warp=args.max_ts_cnt_per_warp,
+    )
+    _print_result(result)
 
 
 if __name__ == "__main__":
