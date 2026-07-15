@@ -207,6 +207,10 @@ def test_six_concrete_tile_impls_directly_extend_tasks_and_hold_tensor_specs():
     assert all(not hasattr(tile.impl, "tile_task") for tile in spec.tiles)
     assert all(tile.impl.tensor_bindings for tile in spec.tiles)
     assert all(not hasattr(tile.impl, "bind_context") for tile in spec.tiles)
+    assert all(
+        "_MoeTileImpl" not in {base.__name__ for base in type(tile.impl).__mro__}
+        for tile in spec.tiles
+    )
     assert len({tile.impl.job_type for tile in spec.tiles}) == 6
     for tile in spec.tiles:
         source = inspect.getsource(type(tile.impl).run)
