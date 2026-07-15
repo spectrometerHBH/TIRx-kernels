@@ -34,9 +34,7 @@ export SGLANG_PATH=/path/to/sglang
 export PYTHONPATH="${SGLANG_PATH}/python:${PYTHONPATH}"
 
 python -m tirx_kernels.bench_suite \
-  --workloads tirx_kernels/bench_suite/workloads_sglang_fp8_paged_mqa.yaml \
-  --rounds 5 \
-  --bench-aggregate trimmed_mean
+  --workloads tirx_kernels/bench_suite/workloads_sglang_fp8_paged_mqa.yaml
 ```
 
 This is a kernel-only Proton comparison: Q/context reshaping, schedule metadata,
@@ -96,19 +94,17 @@ python tirx_kernels/bench_suite/promote_baseline.py \
   .bench-suite/runs/<id>.json --merge
 ```
 
-Before merge, add `--rounds 5` and promote.
+The suite always defaults to five in-bench rounds and reports their arithmetic mean.
 
 ### Refresh the pinned baseline (rare)
 
 ```bash
-python -m tirx_kernels.bench_suite --rounds 5 --bench-aggregate trimmed_mean
+python -m tirx_kernels.bench_suite
 python tirx_kernels/bench_suite/promote_baseline.py .bench-suite/runs/<id>.json --merge
 ```
 
 `promote_baseline.py <run>.json --merge` patches the ok rows from a run JSON into
-`baseline.json` by `(kernel, config)` and regenerates `baseline.md`. Use
-`--rounds 5 --bench-aggregate trimmed_mean` for a promoted baseline (drops the
-fastest and slowest round).
+`baseline.json` by `(kernel, config)` and regenerates `baseline.md`.
 
 Spot-check one workload: `python -m tirx_kernels.bench --kernel ... --config ... --rounds 5`
 
@@ -127,14 +123,13 @@ the protocol fixes its own 30-test schedule.
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--rounds N` | `1` | In-bench rounds (warmup+repeat each) per subprocess |
+| `--rounds N` | `5` | In-bench rounds (warmup+repeat each) per subprocess |
 | `--cooldown` | `1.0` | Seconds before every implementation in every round |
-| `--bench-aggregate` | `mean` | `mean`, `median`, or `trimmed_mean` over round samples |
 | `--cpu-workers` | `0` (= GPU count) | Concurrent workload workers (capped at GPU count) |
 | `--util-threshold` | `0` | Skip GPUs with SM utilization above this percent |
 | `--mem-threshold` | `0` | Skip GPUs with compute-app memory-used percent above this percent |
 
-Promoted baselines often use **trimmed_mean ×5** (`--rounds 5 --bench-aggregate trimmed_mean`).
+All run and promoted-baseline values use the arithmetic mean over the round samples.
 
 ## Ratio rules
 

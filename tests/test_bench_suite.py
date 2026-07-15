@@ -24,6 +24,17 @@ def test_default_workloads_include_full_megakernel_moe_sweep() -> None:
     assert all("timer" not in w for w in megakernel_moe_workloads)
 
 
+def test_bench_suite_defaults_to_five_round_arithmetic_mean() -> None:
+    row = {"round_samples": {"tirx": [1.0, 2.0, 3.0, 4.0, 100.0]}}
+
+    run._finalize_bench_record(row, rounds=run.DEFAULT_ROUNDS)
+
+    assert run.DEFAULT_ROUNDS == 5
+    assert row["impls"] == {"tirx": 22.0}
+    assert row["aggregated"] == {"rounds": 5, "method": "mean"}
+    assert row["status"] == "ok"
+
+
 def test_ratio_report_keeps_grouped_tir_schedulers_out_of_references() -> None:
     baseline = {
         "results": [
@@ -385,7 +396,6 @@ def test_run_scheduled_jobs_stops_after_first_failure(
         tmp_path,
         rounds=1,
         cooldown=0,
-        bench_aggregate="mean",
         cpu_workers=1,
     )
 
@@ -420,7 +430,6 @@ def test_run_scheduled_jobs_retries_interference(
         tmp_path,
         rounds=1,
         cooldown=0,
-        bench_aggregate="mean",
         cpu_workers=1,
     )
 
@@ -464,7 +473,6 @@ def test_run_scheduled_jobs_cancels_inflight_work(
         tmp_path,
         rounds=1,
         cooldown=0,
-        bench_aggregate="mean",
         cpu_workers=2,
     )
 
