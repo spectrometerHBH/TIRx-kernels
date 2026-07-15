@@ -9,7 +9,6 @@ import pytest
 
 from tirx_kernels.bench_suite import run
 from tirx_kernels.bench_suite.baseline_view import render_markdown
-from tirx_kernels.bench_suite.promote_baseline import slim_baseline_row
 from tirx_kernels.bench_suite.ratio_diff import build_report
 from tirx_kernels.megakernel.moe import BENCH_CONFIGS as MEGAKERNEL_MOE_BENCH_CONFIGS
 from tirx_kernels.megakernel.moe import _estimate_bench_launch_slots
@@ -114,63 +113,6 @@ def test_ratio_report_keeps_grouped_tir_schedulers_out_of_references() -> None:
     assert "| megakernel_moe | moe_a3b_bs1_all | tir_static | sglang_full |" in report
     assert "| megakernel_moe | moe_a3b_bs1_all | tir_dynamic | sglang_full |" in report
     assert "| megakernel_moe | moe_a3b_bs1_all | tir_unfused | sglang_full |" in report
-
-
-def test_ratio_report_rejects_mismatched_round_protocol() -> None:
-    baseline = {
-        "results": [
-            {
-                "kernel": "gemm",
-                "label": "m1024",
-                "status": "ok",
-                "impls": {"tir": 10.0, "reference": 12.0},
-                "aggregated": {"rounds": 1, "method": "mean"},
-            }
-        ]
-    }
-    current = {
-        "results": [
-            {
-                "kernel": "gemm",
-                "label": "m1024",
-                "status": "ok",
-                "impls": {"tir": 11.0, "reference": 12.0},
-                "aggregated": {"rounds": 5, "method": "mean"},
-            }
-        ]
-    }
-
-    report, regressions = build_report(baseline, current)
-
-    assert regressions == 0
-    assert "0 comparable implementation/reference measurements" in report
-    assert "benchmark protocol mismatch: rounds: baseline=1, current=5" in report
-    assert "| gemm | m1024 | tir | reference |" not in report
-
-
-def test_slim_baseline_row_preserves_benchmark_protocol() -> None:
-    row = {
-        "kernel": "gemm",
-        "config": "m1024",
-        "status": "ok",
-        "impls": {"tir": 10.0, "reference": 12.0},
-        "timer": "proton",
-        "benchmark_protocol": {
-            "warmup": 25,
-            "repeat": 100,
-            "cooldown_s": 1.0,
-            "rounds": 5,
-            "order": ["tir", "reference"],
-        },
-        "round_samples": {"tir": [10.0] * 5, "reference": [12.0] * 5},
-        "aggregated": {"rounds": 5, "method": "mean"},
-    }
-
-    slimmed = slim_baseline_row(row)
-
-    assert slimmed["timer"] == "proton"
-    assert slimmed["benchmark_protocol"] == row["benchmark_protocol"]
-    assert "round_samples" not in slimmed
 
 
 def test_baseline_view_renders_grouped_implementations_in_one_row() -> None:

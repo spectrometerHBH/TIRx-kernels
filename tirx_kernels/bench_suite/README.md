@@ -150,10 +150,6 @@ remain in the run JSON for variance and outlier inspection.
 - **ratio** = ref/ours (>1 means ours is faster).
 - **ratio Δ** in `bench.md` = current ratio vs the baseline ratio (computed from
   `baseline.json`'s ours + ref impls).
-- Baseline and current rows must use the same recorded benchmark protocol
-  (including rounds, aggregation, timer, budgets, cooldown, and implementation
-  order when those fields are available). Mismatches are reported as **not
-  comparable**, never as performance regressions or improvements.
 
 ## Outputs
 

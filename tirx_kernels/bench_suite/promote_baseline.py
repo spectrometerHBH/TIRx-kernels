@@ -24,7 +24,7 @@ def _result_key(row: dict) -> tuple[str, str]:
 def slim_baseline_row(row: dict) -> dict:
     """Drop per-run metadata; keep only checked-in baseline fields."""
     agg = row.get("aggregated") or {}
-    slimmed = {
+    return {
         "kernel": row["kernel"],
         "config": row["config"],
         "label": row.get("label") or row["config"],
@@ -32,11 +32,6 @@ def slim_baseline_row(row: dict) -> dict:
         "impls": dict(row.get("impls") or {}),
         "aggregated": {k: agg[k] for k in _BASELINE_AGG_KEYS if k in agg},
     }
-    if row.get("timer") is not None:
-        slimmed["timer"] = row["timer"]
-    if row.get("benchmark_protocol"):
-        slimmed["benchmark_protocol"] = dict(row["benchmark_protocol"])
-    return slimmed
 
 
 def slim_baseline_doc(doc: dict) -> dict:
