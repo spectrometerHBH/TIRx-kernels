@@ -23,9 +23,8 @@ import sys
 import traceback
 from unittest import SkipTest
 
-from tirx_kernels.bench import DEFAULT_COOLDOWN_S, DEFAULT_ROUNDS
 from tirx_kernels.registry import discover_kernels, load_kernel
-from tirx_kernels.runner import run_kernel_bench
+from tirx_kernels.runner import DEFAULT_BENCH_COOLDOWN_S, DEFAULT_BENCH_ROUNDS, run_kernel_bench
 
 
 def _get_bench_configs(mod):
@@ -69,14 +68,19 @@ def main():
     parser.add_argument(
         "--rounds",
         type=int,
-        default=DEFAULT_ROUNDS,
-        help=f"Independent standard-timer calls inside one process (default {DEFAULT_ROUNDS})",
+        default=DEFAULT_BENCH_ROUNDS,
+        help=(
+            f"Independent standard-timer calls inside one process (default {DEFAULT_BENCH_ROUNDS})"
+        ),
     )
     parser.add_argument(
         "--cooldown",
         type=float,
-        default=DEFAULT_COOLDOWN_S,
-        help=f"Seconds before every implementation in every round (default {DEFAULT_COOLDOWN_S:g})",
+        default=DEFAULT_BENCH_COOLDOWN_S,
+        help=(
+            "Seconds before every implementation in every round "
+            f"(default {DEFAULT_BENCH_COOLDOWN_S:g})"
+        ),
     )
     args = parser.parse_args()
 

@@ -37,7 +37,8 @@ from typing import ClassVar
 
 import yaml
 
-from tirx_kernels.bench import DEFAULT_COOLDOWN_S, DEFAULT_ROUNDS
+from tirx_kernels.runner import DEFAULT_BENCH_COOLDOWN_S as DEFAULT_COOLDOWN_S
+from tirx_kernels.runner import DEFAULT_BENCH_ROUNDS as DEFAULT_ROUNDS
 
 try:
     from tirx_kernels.bench_suite.impls import our_impls

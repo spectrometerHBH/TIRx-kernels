@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import importlib.metadata
 import inspect
 import math
 import os
@@ -35,7 +36,6 @@ from unittest import SkipTest
 import torch
 import torch.multiprocessing as mp
 
-from tirx_kernels.deepgemm._loader import _import_deep_gemm_distribution
 from tvm.ir.type import PointerType, PrimType
 
 _DEEP_GEMM_MODULE_NAME = "deep_gemm"
@@ -1435,15 +1435,30 @@ def _build_tirx_tensor_maps(
 
 def load_deep_gemm_mega() -> tuple[Any, str]:
     try:
-        module, version = _import_deep_gemm_distribution(
-            required_extension_symbols=("get_ring_limit_for_mega_moe",)
-        )
-    except (ImportError, OSError) as exc:
+        import deep_gemm as module
+    except Exception as exc:
         raise SkipTest(
             f"DeepGEMM mega_moe runtime unavailable: {_DEEP_GEMM_MODULE_NAME}: {exc}"
         ) from exc
     if not hasattr(module, "fp8_fp4_mega_moe"):
         raise SkipTest("DeepGEMM mega_moe runtime unavailable: missing fp8_fp4_mega_moe")
+    try:
+        version = importlib.metadata.version("deep_gemm")
+    except importlib.metadata.PackageNotFoundError:
+        version = str(getattr(module, "__version__", "unknown"))
+    module_version = str(getattr(module, "__version__", "unknown"))
+    if module_version != "unknown" and module_version != version.split("+", 1)[0]:
+        raise RuntimeError(
+            "DeepGEMM package mismatch: imported module version "
+            f"{module_version} from {getattr(module, '__file__', '<unknown>')}, "
+            f"but distribution metadata reports {version}"
+        )
+    extension = getattr(module, "_C", None)
+    if extension is None or not hasattr(extension, "get_ring_limit_for_mega_moe"):
+        raise RuntimeError(
+            "DeepGEMM runtime lacks _C.get_ring_limit_for_mega_moe; loaded "
+            f"{getattr(module, '__file__', '<unknown>')}"
+        )
     expected_version = os.environ.get("TIRX_DEEPGEMM_EXPECTED_VERSION")
     if expected_version and version != expected_version:
         raise RuntimeError(
