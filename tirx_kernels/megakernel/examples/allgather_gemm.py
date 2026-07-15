@@ -23,17 +23,18 @@ Run from the tirx-kernels checkout with the paired TVM checkout on
     python -m tirx_kernels.megakernel.examples.allgather_gemm \
         --scheduler dynamic
 
-The complete ``KernelSpec`` construction is visible in this file.  It does not
-call the production ``build_allgather_gemm_graph`` helper.
+The complete logical ``KernelSpec`` construction is visible in this file.  It
+does not call the production ``build_allgather_gemm_graph`` helper.  The
+attached concrete ``TileImpl`` classes live beside the complete kernel in
+``tirx_kernels.gemm_comm.allgather_gemm``.
 """
 
 from __future__ import annotations
 
 import argparse
 
-from tirx_kernels.gemm_comm import _allgather_gemm_impl as impl
+from tirx_kernels.gemm_comm import allgather_gemm as impl
 from tirx_kernels.gemm_comm.dsl import GemmCommLowerer, policy_for_scheduler
-from tirx_kernels.gemm_comm.dsl.tile_impl import AllGatherGemmTileImpl, AllGatherTileImpl
 from tvm.megakernel.dsl import KernelSpec
 
 
@@ -57,7 +58,7 @@ def build_example() -> KernelSpec:
     (
         kernel.tile(
             "allgather",
-            impl=AllGatherTileImpl(),
+            impl=impl.AllGatherTileImpl(),
             tile_num=(impl.WORLD_SIZE, 1, 1),
             attrs={"purpose": "publish every source activation shard to all ranks"},
         )
@@ -68,7 +69,7 @@ def build_example() -> KernelSpec:
     (
         kernel.tile(
             "gemm",
-            impl=AllGatherGemmTileImpl(),
+            impl=impl.AllGatherGemmTileImpl(),
             tile_num=(impl.GEMM_M_CLUSTERS, impl.GEMM_N_CLUSTERS, 1),
             attrs={"purpose": "multiply one gathered activation cluster by local weights"},
         )

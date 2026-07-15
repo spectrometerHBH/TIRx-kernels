@@ -124,7 +124,7 @@ class GemmCommPlan:
             _validate_attrs(event.attrs, owner=f"event {event.name!r} attrs")
         for tile in self.spec.tiles:
             _validate_attrs(tile.attrs, owner=f"tile {tile.name!r} attrs")
-            for attribute in ("implementation", "job_type", "tile_task"):
+            for attribute in ("execution_space", "entrypoint", "bind_context", "run"):
                 if not hasattr(tile.impl, attribute):
                     raise TypeError(
                         f"tile {tile.name!r} has an incompatible distributed GEMM TileImpl"

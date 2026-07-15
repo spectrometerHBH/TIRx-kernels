@@ -38,24 +38,34 @@ outputs are reset independently on every rank before each measured launch.
 ## Megakernel DSL
 
 Both workloads have scheduler-independent `tvm.megakernel.dsl.KernelSpec`
-graphs under `tirx_kernels.gemm_comm.dsl`. Concrete `TileImpl` objects hold the
-AllGather, GEMM, ReduceScatter transfer, and reduction TileTasks; the policy
-layer owns rank-aware task ordering and queue assignment. Standalone examples
-contain the complete DSL construction for each workload and are parity-tested
-against those production graphs.
+graphs under `tirx_kernels.gemm_comm.dsl`. The complete kernels and their
+concrete implementations live together:
+
+- `allgather_gemm.py`: `AllGatherTileImpl` and
+  `AllGatherGemmTileImpl`.
+- `gemm_reduce_scatter.py`: `PartialGemmTileImpl`,
+  `ReduceScatterTileImpl`, and `ReduceSumTileImpl`.
+
+The TVM `TileImpl.run(m, n, k)` API is the only task boundary; tirx-kernels
+does not define another task model. The persistent kernels call those methods
+directly for every scheduled tile, including the independent TMA, MMA,
+epilogue, load, and reduction warp roles. The policy layer owns only rank-aware
+ordering and queue assignment. Standalone examples contain the complete
+logical DSL construction and are parity-tested against the production graphs.
 
 ```bash
 python -m tirx_kernels.megakernel.examples.allgather_gemm --scheduler dynamic
 python -m tirx_kernels.megakernel.examples.gemm_reduce_scatter --scheduler static
 ```
 
-AllGather+GEMM lowers both static grid-stride and dynamic MPMC policies through
-the same two-CTA GEMM TileImpl. GEMM+ReduceScatter lowers its existing static
-rank-aware policy. Its dynamic policy is normalized and fully coverage-checked,
-but physical lowering intentionally raises: the current TMA, MMA, and epilogue
-roles advance independently, so a CTA-wide dequeue would serialize the
-inter-tile pipeline. The implementation-preserving path remains the default
-until a pipelined multi-role dynamic dequeue is available.
+AllGather+GEMM lowers the same concrete GEMM TileImpl through both static
+grid-stride and dynamic MPMC policies. GEMM+ReduceScatter lowers its concrete
+partial-GEMM and reduction TileImpls through the existing static rank-aware
+pipeline. Its dynamic policy is normalized and fully coverage-checked, but
+physical lowering intentionally raises: the TMA, MMA, and epilogue roles
+advance independently, so a CTA-wide dequeue would serialize the inter-tile
+pipeline. The implementation-preserving path remains the default until a
+pipelined multi-role dynamic dequeue is available.
 
 `get_kernel(..., use_dsl=False)` keeps an explicit manual oracle for structural
 and code-generation A/B checks.
