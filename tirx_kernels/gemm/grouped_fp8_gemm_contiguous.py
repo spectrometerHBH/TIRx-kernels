@@ -709,12 +709,16 @@ def _pack_b_scales_for_tir(scale: torch.Tensor, N: int) -> torch.Tensor:
 
 
 def _configure_deepgemm(deep_gemm) -> None:
-    alignment = int(deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout())
+    # This kernel and its grouped-layout input are specialized for 240-row
+    # alignment.  Newer DeepGEMM releases may recommend a different default,
+    # but the runtime still supports the explicit alignment required for this
+    # like-for-like comparison.
+    deep_gemm.set_mk_alignment_for_contiguous_layout(CONTIGUOUS_M_ALIGNMENT)
+    alignment = int(deep_gemm.get_mk_alignment_for_contiguous_layout())
     if alignment != CONTIGUOUS_M_ALIGNMENT:
         raise RuntimeError(
             f"expected DeepGEMM contiguous alignment {CONTIGUOUS_M_ALIGNMENT}, got {alignment}"
         )
-    deep_gemm.set_mk_alignment_for_contiguous_layout(alignment)
 
 
 def _prepare_deepgemm_case(deep_gemm, data: dict) -> dict:

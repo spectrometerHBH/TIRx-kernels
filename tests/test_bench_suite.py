@@ -29,6 +29,19 @@ def test_finalize_bench_record_uses_all_rounds_arithmetic_mean() -> None:
     assert row["aggregated"] == {"rounds": 3, "method": "mean"}
 
 
+def test_finalize_bench_record_rejects_baseline_errors() -> None:
+    row = {
+        "impls": {"tir": 10.0},
+        "round_samples": {"tir": [10.0] * 5},
+        "errors": {"deepgemm": "setup failed"},
+    }
+
+    run._finalize_bench_record(row, rounds=5)
+
+    assert row["status"] == "FAIL"
+    assert row["error"] == "baseline error(s): deepgemm: setup failed"
+
+
 def test_default_workloads_include_full_megakernel_moe_sweep() -> None:
     workloads = run.load_workloads(run.DEFAULT_WORKLOADS)
     megakernel_moe_workloads = [w for w in workloads if w["kernel"] == "megakernel_moe"]

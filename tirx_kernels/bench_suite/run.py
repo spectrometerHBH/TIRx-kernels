@@ -1116,6 +1116,7 @@ def write_run(
 BASELINE_IMPL_BY_KERNEL = {
     "fp16_bf16_gemm": "torch-cublas",
     "fp8_blockwise_gemm": "deepgemm",
+    "grouped_fp8_gemm_contiguous": "deepgemm",
     "nvfp4_gemm": "flashinfer",
     "flash_attention4": "flashattn_sm100",
     "deepgemm_sm100_fp8_mqa_logits": "deepgemm",
@@ -1269,6 +1270,12 @@ def load_baseline(path=None):
 
 def _finalize_bench_record(row: dict, *, rounds: int) -> None:
     """Validate in-bench round samples and write aggregated impl times (microseconds)."""
+    baseline_errors = row.get("errors") or {}
+    if baseline_errors:
+        details = "; ".join(f"{name}: {error}" for name, error in baseline_errors.items())
+        row["status"] = "FAIL"
+        row["error"] = f"baseline error(s): {details}"
+        return
     samples = row.get("round_samples")
     if not samples:
         impls = row.get("impls") or {}
