@@ -53,7 +53,9 @@ def _sources(root) -> str:
 
 
 def _require_sm100() -> None:
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
+    if not torch.cuda.is_available() or not tvm.cuda(0).exist:
+        pytest.skip("sparse FlashMLA IKET verification requires CUDA in both PyTorch and TVM")
+    if torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("sparse FlashMLA IKET verification requires an SM100 GPU")
 
 
