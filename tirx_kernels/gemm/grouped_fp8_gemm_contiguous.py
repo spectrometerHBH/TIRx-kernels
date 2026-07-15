@@ -257,9 +257,11 @@ def _kernel(
         (TMEM_DEPTH, BLK_SFB, 4 * K_ITERS), "float8_e8m0fnu", sf_per_mma=1, sf_reuse=K_ITERS
     )
     pool.move_base_to(1024)
-    A_smem = pool.alloc_mma((SMEM_DEPTH, BLK_M, BLK_K), "float8_e4m3fn")
-    B_smem = pool.alloc_mma((SMEM_DEPTH, BLK_N, BLK_K), "float8_e4m3fn")
-    D_smem = pool.alloc_mma((TMEM_DEPTH, D_SMEM_M, D_SMEM_N), "bfloat16", swizzle_mode=D_SWIZZLE)
+    A_smem = pool.alloc_tcgen05_mma_AB((SMEM_DEPTH, BLK_M, BLK_K), "float8_e4m3fn")
+    B_smem = pool.alloc_tcgen05_mma_AB((SMEM_DEPTH, BLK_N, BLK_K), "float8_e4m3fn")
+    D_smem = pool.alloc_tcgen05_mma_AB(
+        (TMEM_DEPTH, D_SMEM_M, D_SMEM_N), "bfloat16", swizzle_mode=D_SWIZZLE
+    )
     SFA_smem = pool.alloc((SMEM_DEPTH, BLK_SFA), "uint32")
     SFB_smem = pool.alloc((SMEM_DEPTH, BLK_SFB), "uint32")
     pool.commit()
@@ -383,7 +385,7 @@ def _kernel(
                     Tx.warp.permute_layout(SFA_smem_post[ks, :], SFA_smem[ks, :])
                     Tx.warp.permute_layout(SFB_smem_post[ks, :], SFB_smem[ks, :])
                     T.ptx.fence.proxy_async("shared::cta")
-                trans_done.arrive(ks, cta_id=0)
+                trans_done.arrive(ks, remote=0)
 
             @T.inline
             def trans_iter():
@@ -428,7 +430,6 @@ def _kernel(
                             accum=accum,
                             dispatch="tcgen05",
                             cta_group=CTA_GROUP,
-                            pred=mma_issue,
                         )
                     else:
                         Tx.gemm_async(
@@ -440,18 +441,18 @@ def _kernel(
                             accum=accum,
                             dispatch="tcgen05",
                             cta_group=CTA_GROUP,
-                            pred=mma_issue,
                         )
 
                 mma_issue = T.ptx.elect_sync()
-                if copy_sf:
-                    if mma_issue:
+                if mma_issue:
+                    if copy_sf:
                         Tx.copy_async(SFA_tmem[tmem_idx], SFA_smem_fp8[ks], cta_group=CTA_GROUP)
                         Tx.copy_async(SFB_tmem[tmem_idx], SFB_smem_fp8[ks], cta_group=CTA_GROUP)
-                gemm_with_sf(sf_off)
+                    gemm_with_sf(sf_off)
                 accum = 1
                 T.cuda.warp_sync()
-                smem_pipe.empty.arrive(ks, cta_group=CTA_GROUP, cta_mask=CTA_MASK, pred=mma_issue)
+                if mma_issue:
+                    smem_pipe.empty.arrive(ks, cta_group=CTA_GROUP, cta_mask=CTA_MASK)
                 T.cuda.warp_sync()
 
             @T.inline
@@ -470,9 +471,8 @@ def _kernel(
                     mma_state.advance()
                     mma(mma_state.stage, 3 * K_ITERS, False)
                     mma_state.advance()
-                tmem_pipe.full.arrive(
-                    tmem_idx, cta_group=CTA_GROUP, cta_mask=CTA_MASK, pred=mma_issue
-                )
+                if mma_issue:
+                    tmem_pipe.full.arrive(tmem_idx, cta_group=CTA_GROUP, cta_mask=CTA_MASK)
                 T.cuda.warp_sync()
 
             while tile_scheduler.valid():
@@ -524,7 +524,7 @@ def _kernel(
                             D_smem[stage, :, ki * TMEM_LD_SIZE : (ki + 1) * TMEM_LD_SIZE], Dreg_bf16
                         )
                 if ot == STORE_TILES - 1:
-                    tmem_pipe.empty.arrive(tmem_idx, cta_id=0)
+                    tmem_pipe.empty.arrive(tmem_idx, remote=0)
                 T.ptx.fence.proxy_async("shared::cta")
                 T.cuda.warpgroup_sync(10)
                 d_m: T.let = m_idx * DG_BLOCK_M + (ot * 16 if SWAP_AB else 0)
