@@ -17,16 +17,26 @@
 
 from __future__ import annotations
 
+import hashlib
+import importlib
 import inspect
+import json
+import re
 from collections.abc import Mapping
+from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
 import pytest
+import tvm_ffi
 
+import tirx_kernels.gemm_comm.allgather_gemm as allgather_gemm
+import tirx_kernels.gemm_comm.gemm_reduce_scatter as gemm_reduce_scatter
 import tvm
-from tirx_kernels.gemm_comm import allgather_gemm, gemm_reduce_scatter
 from tirx_kernels.gemm_comm.dsl import (
+    GemmCommHostExecutor,
     GemmCommLowerer,
+    GemmCommRuntimeBindings,
     build_allgather_gemm_graph,
     build_gemm_reduce_scatter_graph,
     policy_for_scheduler,
@@ -38,6 +48,12 @@ from tirx_kernels.megakernel.examples.gemm_reduce_scatter import (
 )
 from tirx_kernels.megakernel.examples.gemm_reduce_scatter import main as reduce_scatter_main
 from tvm.megakernel.dsl import TileImpl
+from tvm.megakernel.transform import FetchGuardAction, HostEdgeAction, MidBodyPortAction
+
+_allgather_gemm_runner = importlib.import_module("tirx_kernels.gemm_comm._allgather_gemm_runner")
+_gemm_reduce_scatter_runner = importlib.import_module(
+    "tirx_kernels.gemm_comm._gemm_reduce_scatter_runner"
+)
 
 _FORBIDDEN = {
     "dispatch",
@@ -52,6 +68,9 @@ _FORBIDDEN = {
     "scope",
     "scope_id",
 }
+_GOLDEN = json.loads(Path(__file__).with_name("megakernel_oracles.json").read_text())["oracles"][
+    "gemm_comm"
+]["cases"]
 
 
 def _keys(value):
@@ -72,9 +91,9 @@ def _shape_signature(shape):
 
 def _dependency_signature(dependency):
     samples = ((0, 0, 0), (1, 2, 3), (7, 5, 3))
-    coord_map = dependency.coord_map
+    event, coord_map = dependency
     coordinates = tuple(tuple(coord_map(*sample)) for sample in samples)
-    return (dependency.event.name, coordinates, dependency.attrs)
+    return (event.name, coordinates)
 
 
 def _graph_signature(spec):
@@ -110,6 +129,40 @@ def _tile_run_source(tile_impl):
     closure = inspect.getclosurevars(run).nonlocals
     inline = closure.get("obj")
     return inspect.getsource(inline.func if inline is not None else run)
+
+
+def _inline_source(function):
+    inline = inspect.getclosurevars(function).nonlocals.get("obj")
+    return inspect.getsource(inline.func if inline is not None else function)
+
+
+def _cuda_sha256(module) -> str:
+    sources = []
+    previous_postproc = tvm.get_global_func("tvm_callback_cuda_postproc", allow_missing=True)
+
+    @tvm.register_global_func("tvm_callback_cuda_postproc", override=True)
+    def capture_source(code, target):
+        del target
+        sources.append(code)
+        return code
+
+    try:
+        tvm.compile(module, target=tvm.target.Target("cuda"), tir_pipeline="tirx")
+    except RuntimeError:
+        # NVSHMEM headers and libraries are runtime-environment dependencies;
+        # CUDA source is already complete when that external compilation fails.
+        if not sources:
+            raise
+    finally:
+        tvm.register_global_func(
+            "tvm_callback_cuda_postproc",
+            previous_postproc or (lambda code, target: code),
+            override=True,
+        )
+
+    source = re.sub(r"\b(?:i|v)_\d+\b", "generated_symbol", sources[-1])
+    source = " ".join(source.split())
+    return hashlib.sha256(source.encode()).hexdigest()
 
 
 @pytest.mark.parametrize(
@@ -161,7 +214,7 @@ def test_logical_graphs_use_concrete_kernel_tile_impls_without_scheduler_attrs(
         if tile.impl.execution_space == "device":
             assert "T." in source or "Tx." in source
         else:
-            assert "_transfer" in source
+            assert "GemmCommHostExecutor" in source
 
     attrs = [spec.attrs]
     attrs.extend(event.attrs for event in spec.events.values())
@@ -183,7 +236,7 @@ def test_lowerer_binds_and_executes_attached_device_tile_impls(builder, schedule
     lowered = GemmCommLowerer(policy_for_scheduler(scheduler)).lower(spec)
 
     assert lowered.module is not None
-    assert all(tile_impl._bound for tile_impl in device_impls)
+    assert all(tile_impl._resources_initialized for tile_impl in device_impls)
 
 
 @pytest.mark.parametrize("scheduler", ["static", "dynamic"])
@@ -210,16 +263,116 @@ def test_dynamic_allgather_queue_is_generated_from_dsl_and_matches_manual_oracle
 
 
 @pytest.mark.parametrize("scheduler", ["static", "dynamic"])
+def test_allgather_shard_ready_is_bound_to_fetch_before_publish(scheduler: str) -> None:
+    plan = policy_for_scheduler(scheduler).normalize(build_allgather_gemm_graph())
+    execution = plan.execution_plan()
+    fetch = execution.device_regions[0].fetch_program.actions
+    assert len(fetch) == 1 and isinstance(fetch[0], FetchGuardAction)
+    assert execution.edge_bindings[0].location == "fetch_guard"
+
+    if scheduler == "dynamic":
+        source = _inline_source(allgather_gemm.GEMMMPMCQueue.dequeue)
+        assert source.index("fetch_program.emit") < source.index("while_ld_global_acquire")
+    else:
+        source = _inline_source(allgather_gemm.SingleStaticTileScheduler._update_current_tile)
+        assert source.index("fetch_program.emit") < source.index("self.fetched_task_type[0] = -1")
+
+
+def test_allgather_fetch_predicate_is_authoritative() -> None:
+    plan = policy_for_scheduler("dynamic").normalize(build_allgather_gemm_graph())
+    execution = plan.execution_plan()
+    region = execution.device_regions[0]
+    action = replace(region.fetch_program.actions[0], predicate="invalid_mutated_predicate")
+    execution = replace(
+        execution,
+        device_regions=(
+            replace(region, fetch_program=replace(region.fetch_program, actions=(action,))),
+        ),
+    )
+
+    with pytest.raises(tvm.error.DiagnosticError, match="invalid_mutated_predicate"):
+        allgather_gemm.build_kernel("dynamic", execution_plan=execution)
+
+
+def test_reduce_scatter_private_port_and_host_completion_order() -> None:
+    plan = policy_for_scheduler("static").normalize(build_gemm_reduce_scatter_graph())
+    execution = plan.execution_plan()
+    partial_program = execution.device_regions[0].tile_programs[0]
+    assert any(isinstance(action, MidBodyPortAction) for action in partial_program.actions)
+    assert any(
+        isinstance(action, HostEdgeAction)
+        for region in execution.host_regions
+        for action in region.actions
+    )
+
+    source = _tile_run_source(
+        next(tile.impl for tile in plan.spec.tiles if tile.name == "partial_gemm")
+    )
+    assert source.rindex("partial_ready_port.emit") < source.rindex("mma2ld_pipe.advance")
+
+    trace = []
+    bindings = GemmCommRuntimeBindings(
+        launch_device=lambda name: trace.append(("device", name)),
+        launch_host=lambda name: trace.append(("host", name)),
+        communication_barrier=lambda: trace.append(("barrier",)),
+        communication_to_compute_sync=lambda: trace.append(("sync",)),
+    )
+    GemmCommHostExecutor(bindings).execute(plan)
+    assert trace == [
+        ("device", "test_mma_ss_tma_2sm_persistent"),
+        ("host", "runtime.disco.transfer_to_peers_reduce_scatter"),
+        ("barrier",),
+        ("sync",),
+        ("device", "reduce_sum"),
+    ]
+
+
+def test_production_launches_use_region_executor_and_tileimpl_resource_hooks() -> None:
+    allgather_launch = inspect.getsource(_allgather_gemm_runner._Case.launch)
+    reduce_scatter_launch = inspect.getsource(_gemm_reduce_scatter_runner._Case.launch)
+    assert "GemmCommHostExecutor" in allgather_launch
+    assert "GemmCommHostExecutor" in reduce_scatter_launch
+
+    ag_storage = _inline_source(allgather_gemm.AllGatherGemmTileImpl.init_storage)
+    ag_device_init = _inline_source(allgather_gemm.AllGatherGemmTileImpl.device_init)
+    partial_storage = _inline_source(gemm_reduce_scatter.PartialGemmTileImpl.init_storage)
+    reduce_storage = _inline_source(gemm_reduce_scatter.ReduceSumTileImpl.init_storage)
+    assert "T.decl_buffer" in ag_storage and "BarTMA2MMA" in ag_device_init
+    assert "T.decl_buffer" in partial_storage and "TMA2MMAPipeline" in partial_storage
+    assert "T.decl_buffer" in reduce_storage and "ReducePipe" in reduce_storage
+    assert "init_instance_resources" not in inspect.getsource(allgather_gemm.build_kernel)
+    assert "init_instance_resources" not in inspect.getsource(gemm_reduce_scatter.build_kernel)
+
+
+@pytest.mark.parametrize("scheduler", ["static", "dynamic"])
 def test_allgather_dsl_and_manual_paths_emit_identical_ir(scheduler: str) -> None:
-    dsl_kernel = allgather_gemm.get_kernel(scheduler=scheduler, use_dsl=True)
-    manual_kernel = allgather_gemm.get_kernel(scheduler=scheduler, use_dsl=False)
+    dsl_kernel = allgather_gemm.get_kernel(scheduler=scheduler)
+    manual_kernel = _allgather_gemm_runner._get_manual_oracle_kernel(scheduler)
     tvm.ir.assert_structural_equal(dsl_kernel, manual_kernel, map_free_vars=True)
+    expected = _GOLDEN[f"allgather_gemm_{scheduler}"]["structural_hash"]
+    assert tvm_ffi.structural_hash(dsl_kernel, map_free_vars=True) == expected
+    assert tvm_ffi.structural_hash(manual_kernel, map_free_vars=True) == expected
 
 
 def test_reduce_scatter_static_dsl_preserves_existing_ir() -> None:
-    dsl_module = gemm_reduce_scatter.get_kernel(scheduler="static", use_dsl=True)
-    manual_module = gemm_reduce_scatter.get_kernel(scheduler="static", use_dsl=False)
+    dsl_module = gemm_reduce_scatter.get_kernel(scheduler="static")
+    manual_module = _gemm_reduce_scatter_runner._get_manual_oracle_kernel("static")
     tvm.ir.assert_structural_equal(dsl_module, manual_module, map_free_vars=True)
+    expected = _GOLDEN["gemm_reduce_scatter_static"]["structural_hash"]
+    assert tvm_ffi.structural_hash(dsl_module, map_free_vars=True) == expected
+    assert tvm_ffi.structural_hash(manual_module, map_free_vars=True) == expected
+
+
+@pytest.mark.parametrize(
+    "case_name,builder",
+    [
+        ("allgather_gemm_static", lambda: allgather_gemm.get_kernel(scheduler="static")),
+        ("allgather_gemm_dynamic", lambda: allgather_gemm.get_kernel(scheduler="dynamic")),
+        ("gemm_reduce_scatter_static", lambda: gemm_reduce_scatter.get_kernel(scheduler="static")),
+    ],
+)
+def test_gemm_comm_cuda_matches_frozen_oracle(case_name, builder) -> None:
+    assert _cuda_sha256(builder()) == _GOLDEN[case_name]["cuda_sha256"]
 
 
 def test_reduce_scatter_dynamic_plan_is_explicit_but_not_mislowered() -> None:

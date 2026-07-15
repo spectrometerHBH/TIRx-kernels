@@ -73,18 +73,22 @@ def get_kernel(
     world_size: int = impl.WORLD_SIZE,
     dtype: str = "float16",
     scheduler: str = "static",
-    use_dsl: bool = True,
     **_kwargs: Any,
 ):
     _check_config(M, N, K, world_size, dtype)
     _check_scheduler(scheduler)
-    if use_dsl:
-        from .dsl import GemmCommLowerer, build_gemm_reduce_scatter_graph, policy_for_scheduler
+    from .dsl import GemmCommLowerer, build_gemm_reduce_scatter_graph, policy_for_scheduler
 
-        lowered = GemmCommLowerer(policy_for_scheduler(scheduler)).lower(
-            build_gemm_reduce_scatter_graph()
-        )
-        return lowered.module
+    lowered = GemmCommLowerer(policy_for_scheduler(scheduler)).lower(
+        build_gemm_reduce_scatter_graph()
+    )
+    return lowered.module
+
+
+def _get_manual_oracle_kernel(scheduler: str):
+    """Return the private pre-migration static oracle."""
+
+    _check_scheduler(scheduler)
     if scheduler != "static":
         raise NotImplementedError("the implementation-preserving manual path is static only")
     return impl.ReduceScatter
@@ -120,6 +124,7 @@ class _Case:
     staging: Any
     out: Any
     profiler: Any
+    plan: Any
 
     def reset(self) -> None:
         fill_ranked(self.semaphore, impl.WORLD_SIZE, (impl.WORLD_SIZE,), "uint64")
@@ -129,28 +134,53 @@ class _Case:
         sync_compute_to_communication(self.runtime)
 
     def launch(self) -> None:
-        self.module["test_mma_ss_tma_2sm_persistent"](
-            self.A, self.B, self.gemm_out, self.semaphore, self.out, self.profiler
-        )
-        self.runtime.session.get_global_func("runtime.disco.transfer_to_peers_reduce_scatter")(
-            self.semaphore,
-            self.gemm_out,
-            self.staging,
-            self.runtime.communication_stream,
-            impl.M,
-            impl.N,
-            impl.BLK_M,
-            impl.BLK_N,
-            impl.WORLD_SIZE,
-        )
-        self.runtime.session.get_global_func("runtime.disco.nvshmem.barrier_all_on_stream")(
-            self.runtime.communication_stream
-        )
-        sync_communication_to_compute(self.runtime)
-        self.module["reduce_sum"](self.staging, self.out)
+        from .dsl import GemmCommHostExecutor, GemmCommRuntimeBindings
+
+        def launch_device(name):
+            if name == "test_mma_ss_tma_2sm_persistent":
+                self.module[name](
+                    self.A, self.B, self.gemm_out, self.semaphore, self.out, self.profiler
+                )
+            elif name == "reduce_sum":
+                self.module[name](self.staging, self.out)
+            else:
+                raise ValueError(f"unsupported ReduceScatter device region {name!r}")
+
+        def launch_host(name):
+            if name != "runtime.disco.transfer_to_peers_reduce_scatter":
+                raise ValueError(f"unsupported ReduceScatter host region {name!r}")
+            self.runtime.session.get_global_func(name)(
+                self.semaphore,
+                self.gemm_out,
+                self.staging,
+                self.runtime.communication_stream,
+                impl.M,
+                impl.N,
+                impl.BLK_M,
+                impl.BLK_N,
+                impl.WORLD_SIZE,
+            )
+
+        def communication_barrier():
+            self.runtime.session.get_global_func("runtime.disco.nvshmem.barrier_all_on_stream")(
+                self.runtime.communication_stream
+            )
+
+        GemmCommHostExecutor(
+            GemmCommRuntimeBindings(
+                launch_device=launch_device,
+                launch_host=launch_host,
+                communication_barrier=communication_barrier,
+                communication_to_compute_sync=lambda: sync_communication_to_compute(self.runtime),
+            )
+        ).execute(self.plan)
 
 
-def _allocate_case(runtime: DistributedRuntime, module: Any, data: dict[str, np.ndarray]) -> _Case:
+def _allocate_case(
+    runtime: DistributedRuntime, module: Any, data: dict[str, np.ndarray], scheduler: str
+) -> _Case:
+    from .dsl import build_gemm_reduce_scatter_graph, policy_for_scheduler
+
     session = runtime.session
     A = session.empty((impl.M, impl.K), impl.a_type)
     B = session.empty((impl.N, impl.K), impl.b_type)
@@ -167,6 +197,7 @@ def _allocate_case(runtime: DistributedRuntime, module: Any, data: dict[str, np.
         staging=symmetric_empty(session, (impl.WORLD_SIZE, impl.LOCAL_M, impl.N), impl.d_type),
         out=session.empty((impl.LOCAL_M, impl.N), impl.d_type),
         profiler=session.empty((impl.PROFILER_BUFFER_SIZE,), "uint64"),
+        plan=policy_for_scheduler(scheduler).normalize(build_gemm_reduce_scatter_graph()),
     )
     case.reset()
     session._sync_all()
@@ -201,7 +232,6 @@ def run_test(
     dtype: str = "float16",
     seed: int = 42,
     scheduler: str = "static",
-    use_dsl: bool = True,
     **_kwargs: Any,
 ) -> None:
     """Compile, launch on four GPUs, and validate GEMM and ReduceScatter."""
@@ -211,10 +241,9 @@ def run_test(
     data = prepare_data(M, N, K, world_size, dtype, seed=seed)
     with create_runtime(world_size) as runtime:
         with load_module(
-            runtime.session,
-            get_kernel(M, N, K, world_size, dtype, scheduler=scheduler, use_dsl=use_dsl),
+            runtime.session, get_kernel(M, N, K, world_size, dtype, scheduler=scheduler)
         ) as module:
-            case = _allocate_case(runtime, module, data)
+            case = _allocate_case(runtime, module, data, scheduler)
             case.prepare()
             case.launch()
             runtime.session._sync_all()
@@ -236,7 +265,6 @@ def run_bench(
     baseline_timeout: float = 900.0,
     cublasmp_algo: str = "split_p2p",
     scheduler: str = "static",
-    use_dsl: bool = True,
     **_kwargs: Any,
 ) -> dict[str, Any]:
     """Benchmark the full GEMM + transfer + reduction pipeline."""
@@ -246,10 +274,9 @@ def run_bench(
     data = prepare_data(M, N, K, world_size, dtype)
     with create_runtime(world_size) as runtime:
         with load_module(
-            runtime.session,
-            get_kernel(M, N, K, world_size, dtype, scheduler=scheduler, use_dsl=use_dsl),
+            runtime.session, get_kernel(M, N, K, world_size, dtype, scheduler=scheduler)
         ) as module:
-            case = _allocate_case(runtime, module, data)
+            case = _allocate_case(runtime, module, data, scheduler)
             tirx_result = benchmark_slowest_rank(
                 runtime.session,
                 reset=case.reset,

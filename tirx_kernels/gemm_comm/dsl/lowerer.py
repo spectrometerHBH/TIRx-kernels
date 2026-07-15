@@ -25,9 +25,9 @@ from typing import Any
 import numpy as np
 
 from tvm.megakernel.dsl import KernelSpec
+from tvm.megakernel.transform import ExecutionPlan
 
 from .. import allgather_gemm as ag_kernel
-from .. import gemm_reduce_scatter as rs_kernel
 from .model import GemmCommPlan
 from .policies import GemmCommPolicy
 
@@ -40,6 +40,7 @@ class LoweredGemmComm:
     module: Any | None
     device_entrypoints: tuple[str, ...]
     host_entrypoints: tuple[str, ...]
+    execution: ExecutionPlan
 
 
 class GemmCommLowerer:
@@ -50,6 +51,7 @@ class GemmCommLowerer:
 
     def lower(self, spec: KernelSpec, *, plan_only: bool = False) -> LoweredGemmComm:
         plan = self.policy.normalize(spec)
+        execution = plan.execution_plan()
         if not plan.lowerable and not plan_only:
             raise NotImplementedError(plan.unsupported_reason)
 
@@ -60,32 +62,16 @@ class GemmCommLowerer:
             tile.impl.entrypoint for tile in spec.tiles if tile.impl.execution_space == "host"
         )
         module = None
-        if not plan_only and plan.workload == "allgather_gemm":
-            gemm_impls = [
-                tile.impl
+        if not plan_only:
+            builders = [
+                tile.impl.build_module
                 for tile in spec.tiles
-                if isinstance(tile.impl, ag_kernel.AllGatherGemmTileImpl)
+                if callable(getattr(tile.impl, "build_module", None))
             ]
-            if len(gemm_impls) != 1:
-                raise ValueError("AllGather+GEMM requires exactly one concrete GEMM TileImpl")
-            module = ag_kernel.build_kernel(plan.policy_name, tile_impl=gemm_impls[0])
-        elif not plan_only and plan.workload == "gemm_reduce_scatter":
-            partial_impls = [
-                tile.impl
-                for tile in spec.tiles
-                if isinstance(tile.impl, rs_kernel.PartialGemmTileImpl)
-            ]
-            reduce_impls = [
-                tile.impl
-                for tile in spec.tiles
-                if isinstance(tile.impl, rs_kernel.ReduceSumTileImpl)
-            ]
-            if len(partial_impls) != 1 or len(reduce_impls) != 1:
-                raise ValueError(
-                    "GEMM+ReduceScatter requires concrete partial GEMM and reduce TileImpls"
-                )
-            module = rs_kernel.build_kernel(partial_impls[0], reduce_impls[0])
-        return LoweredGemmComm(plan, module, device_entrypoints, host_entrypoints)
+            if len(builders) != 1:
+                raise ValueError("a distributed execution plan requires exactly one module backend")
+            module = builders[0](execution)
+        return LoweredGemmComm(plan, module, device_entrypoints, host_entrypoints, execution)
 
 
 def make_allgather_dynamic_queue(

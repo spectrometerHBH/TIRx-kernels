@@ -19,6 +19,7 @@
 
 from ..allgather_gemm import AllGatherGemmTileImpl, AllGatherTileImpl
 from ..gemm_reduce_scatter import PartialGemmTileImpl, ReduceScatterTileImpl, ReduceSumTileImpl
+from .host import GemmCommHostExecutor, GemmCommRuntimeBindings
 from .lowerer import GemmCommLowerer, LoweredGemmComm, make_allgather_dynamic_queue
 from .model import GemmCommPlan, PhysicalTask, RankSchedule
 from .policies import DynamicPolicy, StaticPolicy, make_plan, policy_for_scheduler
@@ -28,8 +29,10 @@ __all__ = [
     "AllGatherGemmTileImpl",
     "AllGatherTileImpl",
     "DynamicPolicy",
+    "GemmCommHostExecutor",
     "GemmCommLowerer",
     "GemmCommPlan",
+    "GemmCommRuntimeBindings",
     "LoweredGemmComm",
     "PartialGemmTileImpl",
     "PhysicalTask",
