@@ -33,20 +33,14 @@ from tirx_kernels.megakernel.utils.dynamic_scheduler import DynamicTileScheduler
 from tirx_kernels.megakernel.utils.static_scheduler import StaticTileScheduler
 from tirx_kernels.megakernel.utils.utils import pack_into_32bit
 from tvm.megakernel.transform import (
-    BarrierAction,
-    DeviceRegionPlan,
-    EdgeBindingPlan,
+    BarrierStep,
     ExecutionPlan,
-    NotifyAction,
-    ProfileAction,
-    QueuePushAction,
-    RunAction,
-    RuntimeEventInitAction,
-    SmemEnterAction,
-    SmemExitAction,
-    TileActionProgram,
-    WaitAction,
-    logical_edges,
+    NotifyStep,
+    QueuePushStep,
+    RunStep,
+    RuntimeEventInitStep,
+    TileProgram,
+    WaitStep,
 )
 
 from .._expr import ConstExpr, Expr, ScalarLoadExpr, TileIndexExpr, as_expr, walk_expr
@@ -249,23 +243,11 @@ class MoeLoweringEnv:
 
 
 @dataclass(frozen=True)
-class RuntimeEventInitPlan:
-    """A post-tile store of a raw dynamic semaphore value."""
-
-    tile: str
-    value: Expr
-    scope: str = "thread"
-    scope_id: int = 0
-    after_barrier: str = "cta"
-
-
-@dataclass(frozen=True)
 class EventPlan:
     name: str
     shape: tuple[int, ...]
     init_count: int | None
     workspace_offset: int
-    runtime_init: RuntimeEventInitPlan | None = None
     logical_spec: EventSpec | None = None
 
     @property
@@ -273,52 +255,34 @@ class EventPlan:
         return reduce(mul, self.shape, 1)
 
     @property
-    def runtime_init_tile(self) -> str | None:
-        return None if self.runtime_init is None else self.runtime_init.tile
-
-    @property
     def is_logical(self) -> bool:
         return self.logical_spec is not None
 
 
-@dataclass(frozen=True)
-class WaitPlan:
-    logical_spec: DependencyType
-    event: str
-    coord: tuple[Expr, ...]
-    level: str
-    mask: int = 0xFFFFFFFF
+@dataclass(frozen=True, kw_only=True)
+class MoeTileProgram(TileProgram):
+    """One MoE tile's complete physical program and proven task bounds."""
 
-
-@dataclass(frozen=True)
-class NotifyPlan:
-    logical_spec: DependencyType
-    event: str
-    coord: tuple[Expr, ...]
-    scope: str
-    scope_id: int
-    count: Expr = field(default_factory=lambda: ConstExpr(1))
-    rank: int = -1
-    release: bool = False
-
-
-@dataclass(frozen=True)
-class TilePlan:
-    spec: TileSpec
     runtime_extents: tuple[Expr, Expr, Expr]
     upper_bounds: tuple[int, int, int]
     scheduled_extents: tuple[Expr, Expr, Expr]
     scheduled_upper_bounds: tuple[int, int, int]
-    waits: tuple[WaitPlan, ...]
-    notifies: tuple[NotifyPlan, ...]
 
     @property
     def implementation(self) -> str:
-        return self.spec.impl.implementation
+        return self.tile.impl.implementation
 
     @property
     def job_type(self) -> int:
-        return self.spec.impl.job_type
+        return self.tile.impl.job_type
+
+    @property
+    def waits(self) -> tuple[WaitStep, ...]:
+        return tuple(step for step in self.steps if isinstance(step, WaitStep))
+
+    @property
+    def notifies(self) -> tuple[NotifyStep, ...]:
+        return tuple(step for step in self.steps if isinstance(step, NotifyStep))
 
 
 @dataclass(frozen=True)
@@ -336,9 +300,9 @@ class _DynamicDispatchRule:
     rank: int = -1
 
 
-@dataclass(frozen=True)
-class DynamicDispatchPlan:
-    """A dispatch rule plus statically proven trigger, count, and index ranges."""
+@dataclass(frozen=True, kw_only=True)
+class DynamicDispatchStep(QueuePushStep):
+    """A physical dispatch step with statically proven trigger and index ranges."""
 
     rule: _DynamicDispatchRule
     trigger_upper_bound: int
@@ -375,14 +339,12 @@ class HostTask:
 
 @dataclass(frozen=True)
 class NormalizedPlan:
-    spec: KernelSpec
+    execution: ExecutionPlan
     env: MoeLoweringEnv
     policy_name: str
     is_dynamic: bool
     unfused: bool
     events: tuple[EventPlan, ...]
-    tiles: tuple[TilePlan, ...]
-    dispatch_plans: tuple[DynamicDispatchPlan, ...]
     central_tasks: tuple[HostTask, ...]
     seed_tasks: tuple[HostTask, ...]
     down_coalescing: int
@@ -392,118 +354,25 @@ class NormalizedPlan:
     persistent_ctas: int
     protocol: DynamicProtocolPlan | None
 
-    def execution_plan(self) -> ExecutionPlan:
-        """Materialize the policy's ordered physical action programs."""
+    @property
+    def spec(self) -> KernelSpec:
+        return self.execution.kernel
 
-        edges = logical_edges(self.spec)
-        by_producer_event: dict[tuple[str, int], list] = {}
-        by_consumer_event: dict[tuple[str, int], list] = {}
-        for edge in edges:
-            by_producer_event.setdefault((edge.producer, id(edge.event)), []).append(edge)
-            by_consumer_event.setdefault((edge.consumer, id(edge.event)), []).append(edge)
+    @property
+    def programs(self) -> tuple[MoeTileProgram, ...]:
+        if len(self.execution.device_regions) != 1:
+            raise ValueError("MoE execution must contain exactly one device region")
+        programs = self.execution.device_regions[0].tile_programs
+        if not all(isinstance(program, MoeTileProgram) for program in programs):
+            raise TypeError("MoE execution contains a non-MoE tile program")
+        return programs
 
-        programs = []
-        for tile in self.tiles:
-            actions = []
-            if self.is_dynamic:
-                outgoing = tuple(edge for edge in edges if edge.producer == tile.spec.name)
-                actions.append(
-                    QueuePushAction(edges=outgoing, payload=self.dispatch_plan(tile.spec.name))
-                )
-            for wait in tile.waits:
-                event, coord_map = wait.logical_spec
-                actions.append(
-                    WaitAction(
-                        tuple(by_consumer_event[(tile.spec.name, id(event))]),
-                        event,
-                        coord_map,
-                        level=wait.level,
-                        mask=wait.mask,
-                        payload=wait,
-                    )
-                )
-            actions.extend(
-                (
-                    SmemEnterAction(tile.spec),
-                    ProfileAction("begin", event=tile.spec.impl.profile_event_type, payload=tile),
-                )
-            )
-            predicate = None
-            if tile.implementation in ("gate_up_silu", "down"):
-                predicate = "dynamic_or_routed_row"
-            actions.append(
-                RunAction(
-                    tile.spec,
-                    predicate=predicate,
-                    repeat=self.down_coalescing if tile.implementation == "down" else 1,
-                    index_map="expand_down_n" if tile.implementation == "down" else None,
-                    payload=tile,
-                )
-            )
-            actions.append(
-                ProfileAction("end", event=tile.spec.impl.profile_event_type, payload=tile)
-            )
-            if tile.implementation == "align":
-                actions.append(BarrierAction("cta"))
-                runtime_events = tuple(
-                    event
-                    for event in self.events
-                    if event.runtime_init is not None and event.runtime_init.tile == tile.spec.name
-                )
-                if len(runtime_events) > 1:
-                    raise ValueError("a tile may initialize at most one runtime event")
-                if runtime_events:
-                    runtime_event = runtime_events[0]
-                    runtime_init = runtime_event.runtime_init
-                    actions.append(
-                        RuntimeEventInitAction(
-                            runtime_event,
-                            runtime_init.value,
-                            predicate=(runtime_init.scope, runtime_init.scope_id),
-                            payload=runtime_init,
-                        )
-                    )
-                else:
-                    actions.append(
-                        RuntimeEventInitAction(None, None, predicate=("thread", 0), payload=None)
-                    )
-            for notify in tile.notifies:
-                event, coord_map = notify.logical_spec
-                actions.append(
-                    NotifyAction(
-                        tuple(by_producer_event[(tile.spec.name, id(event))]),
-                        event,
-                        coord_map,
-                        scope=notify.scope,
-                        scope_id=notify.scope_id,
-                        count=notify.count,
-                        rank=notify.rank,
-                        release=notify.release,
-                        payload=notify,
-                    )
-                )
-            actions.append(SmemExitAction(tile.spec))
-            programs.append(TileActionProgram(tile.spec, tuple(actions)))
+    @property
+    def tiles(self) -> tuple[MoeTileProgram, ...]:
+        return self.programs
 
-        region_name = "moe_device"
-        return ExecutionPlan(
-            kernel=self.spec,
-            device_regions=(
-                DeviceRegionPlan(
-                    region_name, tile_programs=tuple(programs), attrs={"schedule": self.policy_name}
-                ),
-            ),
-            edge_bindings=tuple(
-                EdgeBindingPlan(edge, "tile_action", region_name) for edge in edges
-            ),
-            attrs={"normalized_plan": self},
-        ).validate()
-
-    def action_program(self, tile_name: str) -> TileActionProgram:
-        """Return one tile program from the validated execution plan."""
-
-        region = self.execution_plan().device_regions[0]
-        return next(program for program in region.tile_programs if program.tile.name == tile_name)
+    def program(self, tile_name: str) -> MoeTileProgram:
+        return next(program for program in self.programs if program.tile.name == tile_name)
 
     @property
     def user_events(self) -> tuple[EventPlan, ...]:
@@ -514,22 +383,53 @@ class NormalizedPlan:
         return sum(event.size for event in self.events)
 
     @property
+    def dispatch_steps(self) -> tuple[DynamicDispatchStep, ...]:
+        return tuple(
+            step
+            for program in self.programs
+            for step in program.steps
+            if isinstance(step, DynamicDispatchStep)
+        )
+
+    @property
     def dispatch_rules(self) -> tuple[_DynamicDispatchRule, ...]:
-        return tuple(dispatch.rule for dispatch in self.dispatch_plans)
+        return tuple(step.rule for step in self.dispatch_steps)
+
+    def runtime_init_step(self, event_name: str) -> RuntimeEventInitStep | None:
+        matching = tuple(
+            step
+            for program in self.programs
+            for step in program.steps
+            if isinstance(step, RuntimeEventInitStep)
+            and isinstance(step.event, EventPlan)
+            and step.event.name == event_name
+        )
+        if len(matching) > 1:
+            raise ValueError(f"event {event_name!r} has multiple runtime initialization steps")
+        return None if not matching else matching[0]
+
+    def runtime_init_tile(self, event_name: str) -> str | None:
+        for program in self.programs:
+            if any(
+                isinstance(step, RuntimeEventInitStep)
+                and isinstance(step.event, EventPlan)
+                and step.event.name == event_name
+                for step in program.steps
+            ):
+                return program.tile.name
+        return None
 
     @property
     def pre_before_wait(self) -> bool:
         if not self.is_dynamic:
             return True
-        for program in self.execution_plan().device_regions[0].tile_programs:
-            actions = program.actions
+        for program in self.programs:
+            steps = program.steps
             pre = [
-                index for index, action in enumerate(actions) if isinstance(action, QueuePushAction)
+                index for index, step in enumerate(steps) if isinstance(step, DynamicDispatchStep)
             ]
-            runs = [index for index, action in enumerate(actions) if isinstance(action, RunAction)]
-            waits = [
-                index for index, action in enumerate(actions) if isinstance(action, WaitAction)
-            ]
+            runs = [index for index, step in enumerate(steps) if isinstance(step, RunStep)]
+            waits = [index for index, step in enumerate(steps) if isinstance(step, WaitStep)]
             if len(pre) != 1 or len(runs) != 1:
                 return False
             if pre[0] > runs[0]:
@@ -540,15 +440,11 @@ class NormalizedPlan:
 
     @property
     def post_after_run(self) -> bool:
-        for tile, program in zip(
-            self.tiles, self.execution_plan().device_regions[0].tile_programs, strict=True
-        ):
-            actions = program.actions
-            posts = [
-                index for index, action in enumerate(actions) if isinstance(action, NotifyAction)
-            ]
-            runs = [index for index, action in enumerate(actions) if isinstance(action, RunAction)]
-            if bool(posts) != bool(tile.notifies):
+        for program in self.programs:
+            steps = program.steps
+            posts = [index for index, step in enumerate(steps) if isinstance(step, NotifyStep)]
+            runs = [index for index, step in enumerate(steps) if isinstance(step, RunStep)]
+            if bool(posts) != bool(program.notifies):
                 return False
             if posts and min(posts) < runs[0]:
                 return False
@@ -558,13 +454,11 @@ class NormalizedPlan:
     def fifo_drain(self) -> bool:
         if not self.is_dynamic or self.protocol is None:
             return True
-        terminal = [
-            dispatch for dispatch in self.dispatch_plans if dispatch.rule.target_tile is None
-        ]
+        terminal = [step for step in self.dispatch_steps if step.rule.target_tile is None]
         if len(terminal) != 1:
             return False
         dispatch = terminal[0]
-        source = self.tile(dispatch.rule.source_tile)
+        source = self.program(dispatch.rule.source_tile)
         return (
             self.protocol.queue_discipline == "fifo"
             and dispatch.trigger_upper_bound == 1
@@ -576,16 +470,14 @@ class NormalizedPlan:
     def event(self, name: str) -> EventPlan:
         return next(event for event in self.events if event.name == name)
 
-    def tile(self, name: str) -> TilePlan:
-        return next(tile for tile in self.tiles if tile.spec.name == name)
+    def tile(self, name: str) -> MoeTileProgram:
+        return self.program(name)
 
     def dispatch(self, source_tile: str) -> _DynamicDispatchRule:
         return next(rule for rule in self.dispatch_rules if rule.source_tile == source_tile)
 
-    def dispatch_plan(self, source_tile: str) -> DynamicDispatchPlan:
-        return next(
-            dispatch for dispatch in self.dispatch_plans if dispatch.rule.source_tile == source_tile
-        )
+    def dispatch_step(self, source_tile: str) -> DynamicDispatchStep:
+        return next(step for step in self.dispatch_steps if step.rule.source_tile == source_tile)
 
     def validate(self) -> NormalizedPlan:
         # Imported lazily to keep the immutable plan model independent from
@@ -599,73 +491,76 @@ class NormalizedPlan:
             _validate_tile_event_accesses,
         )
 
+        self.execution.validate()
+        if self.execution.kernel is not self.env.spec:
+            raise ValueError("normalized execution belongs to a different KernelSpec")
+        programs = self.programs
         offset = 0
-        runtime_inits: dict[str, list[EventPlan]] = {}
         for event in self.events:
             if event.workspace_offset != offset:
                 raise ValueError(f"event {event.name!r} has a non-contiguous workspace offset")
             offset += event.size
-            if event.runtime_init is not None:
-                runtime_inits.setdefault(event.runtime_init.tile, []).append(event)
 
-        tile_names = {tile.spec.name for tile in self.tiles}
-        if set(runtime_inits) - tile_names:
-            raise ValueError("runtime event initialization references an unknown tile")
-        if any(len(events) > 1 for events in runtime_inits.values()):
+        event_ids = {id(event) for event in self.events}
+        runtime_inits: dict[str, list[tuple[EventPlan, RuntimeEventInitStep, int]]] = {}
+        for program in programs:
+            for index, step in enumerate(program.steps):
+                if not isinstance(step, RuntimeEventInitStep) or step.event is None:
+                    continue
+                if not isinstance(step.event, EventPlan) or id(step.event) not in event_ids:
+                    raise ValueError("runtime event initialization references an unknown event")
+                runtime_inits.setdefault(program.tile.name, []).append((step.event, step, index))
+
+        tile_names = {program.tile.name for program in programs}
+        if tile_names != {tile.name for tile in self.spec.tiles}:
+            raise ValueError("MoE execution programs do not match the logical tiles")
+        if any(len(entries) > 1 for entries in runtime_inits.values()):
             raise ValueError("a task may initialize at most one runtime event in the MoE MVP")
-        execution_plan = self.execution_plan()
-        programs = execution_plan.device_regions[0].tile_programs
-        for tile, program in zip(self.tiles, programs, strict=True):
-            actions = program.actions
-            runs = [index for index, action in enumerate(actions) if isinstance(action, RunAction)]
-            waits = [
-                index for index, action in enumerate(actions) if isinstance(action, WaitAction)
+        for program in programs:
+            steps = program.steps
+            runs = [index for index, step in enumerate(steps) if isinstance(step, RunStep)]
+            waits = [index for index, step in enumerate(steps) if isinstance(step, WaitStep)]
+            notifies = [index for index, step in enumerate(steps) if isinstance(step, NotifyStep)]
+            barriers = [index for index, step in enumerate(steps) if isinstance(step, BarrierStep)]
+            runtime_steps = [
+                index for index, step in enumerate(steps) if isinstance(step, RuntimeEventInitStep)
             ]
-            notifies = [
-                index for index, action in enumerate(actions) if isinstance(action, NotifyAction)
-            ]
-            barriers = [
-                index for index, action in enumerate(actions) if isinstance(action, BarrierAction)
-            ]
-            runtime_actions = [
-                index
-                for index, action in enumerate(actions)
-                if isinstance(action, RuntimeEventInitAction)
-            ]
+            tile_name = program.tile.name
+            if program.smem_scope != "run_to_end":
+                raise ValueError(f"tile {tile_name!r} must use run_to_end shared memory")
             if len(runs) != 1:
-                raise ValueError(f"tile {tile.spec.name!r} must execute exactly once")
-            if bool(waits) != bool(tile.waits) or len(waits) != len(tile.waits):
-                raise ValueError(f"tile {tile.spec.name!r} wait step does not match its waits")
+                raise ValueError(f"tile {tile_name!r} must execute exactly once")
+            if len(waits) != len(program.tile.waits):
+                raise ValueError(f"tile {tile_name!r} wait steps do not match its logical waits")
             if waits and max(waits) > runs[0]:
-                raise ValueError(f"tile {tile.spec.name!r} must wait before execution")
-            if bool(notifies) != bool(tile.notifies) or len(notifies) != len(tile.notifies):
-                raise ValueError(f"tile {tile.spec.name!r} post step does not match its notifies")
-            if tile.implementation == "align":
+                raise ValueError(f"tile {tile_name!r} must wait before execution")
+            if len(notifies) != len(program.tile.notifies):
+                raise ValueError(
+                    f"tile {tile_name!r} notify steps do not match its logical notifies"
+                )
+            if program.implementation == "align":
                 if len(barriers) != 1 or barriers[0] < runs[0]:
                     raise ValueError("align must synchronize the CTA after tile execution")
-                if runtime_inits and (
-                    len(runtime_actions) != 1 or runtime_actions[0] < barriers[0]
-                ):
+                if runtime_inits and (len(runtime_steps) != 1 or runtime_steps[0] < barriers[0]):
                     raise ValueError("align event initialization must follow CTA synchronization")
-                if runtime_actions and notifies and min(notifies) < runtime_actions[0]:
+                if runtime_steps and notifies and min(notifies) < runtime_steps[0]:
                     raise ValueError("align must initialize runtime events before completion")
-            elif barriers or runtime_actions:
-                raise ValueError(f"tile {tile.spec.name!r} has an unsupported CTA synchronization")
-            for event in runtime_inits.get(tile.spec.name, ()):
-                runtime_init = event.runtime_init
-                if runtime_init is None or runtime_init.after_barrier != "cta":
-                    raise ValueError(f"event {event.name!r} has an invalid runtime initialization")
-                if runtime_actions[0] <= barriers[0]:
+            elif barriers or runtime_steps:
+                raise ValueError(f"tile {tile_name!r} has an unsupported CTA synchronization")
+            for event, runtime_init, runtime_index in runtime_inits.get(tile_name, ()):
+                if runtime_index <= barriers[0]:
                     raise ValueError(f"event {event.name!r} must be initialized after cta barrier")
-                if notifies and runtime_actions[0] > min(notifies):
+                if notifies and runtime_index > min(notifies):
                     raise ValueError(
                         f"event {event.name!r} must be initialized before task completion"
                     )
+                if runtime_init.scope != "thread" or runtime_init.scope_id != 0:
+                    raise ValueError(f"event {event.name!r} has an invalid runtime initialization")
 
         if not self.post_after_run:
             raise ValueError("post notification must execute after tile execution")
-        _validate_tile_event_accesses(self.env, self.tiles, self.events)
-        _validate_event_notification_counts(self.env, self.tiles, self.events)
+        _validate_tile_event_accesses(self.env, programs, self.events)
+        _validate_event_notification_counts(self.env, programs, self.events)
 
         if self.is_dynamic:
             if self.central_tasks or not self.seed_tasks:
@@ -689,19 +584,19 @@ class NormalizedPlan:
             ):
                 raise ValueError("dynamic plan does not match the two-phase scheduler protocol")
             if (
-                len(self.dispatch_plans) != len(tile_names)
-                or {dispatch.rule.source_tile for dispatch in self.dispatch_plans} != tile_names
+                len(self.dispatch_steps) != len(tile_names)
+                or {step.rule.source_tile for step in self.dispatch_steps} != tile_names
             ):
                 raise ValueError("dynamic plan does not have one dispatch rule per task")
             expected_dispatch = _normalize_dispatch(
-                self.env, self.tiles, self.dispatch_rules, self.events
+                self.env, programs, self.dispatch_rules, self.events
             )
-            if self.dispatch_plans != expected_dispatch:
+            if self.dispatch_steps != expected_dispatch:
                 raise ValueError("dynamic dispatch bounds do not match their expressions")
-            _validate_dynamic_protocol_links(self.tiles, self.dispatch_plans)
-            _validate_dispatch_coverage(self.env, self.tiles, self.dispatch_plans)
+            _validate_dynamic_protocol_links(programs, self.dispatch_steps)
+            _validate_dispatch_coverage(self.env, programs, self.dispatch_steps)
             expected_queue_bound = len(self.seed_tasks) + sum(
-                dispatch.enqueue_upper_bound for dispatch in self.dispatch_plans
+                step.enqueue_upper_bound for step in self.dispatch_steps
             )
             if self.queue_upper_bound != expected_queue_bound:
                 raise ValueError("dynamic queue upper bound is not derived from dispatch rules")
@@ -713,10 +608,10 @@ class NormalizedPlan:
             if self.persistent_ctas != KernelConfig.SM_NUMBER or self.persistent_ctas != 148:
                 raise ValueError("dynamic plan violates persistent CTA saturation")
             if (
-                self.dispatch_plan("gating").count_lower_bound != self.persistent_ctas
-                or self.dispatch_plan("gating").count_upper_bound != self.persistent_ctas
-                or self.dispatch_plan("align").count_lower_bound != self.persistent_ctas
-                or self.dispatch_plan("align").count_upper_bound != self.persistent_ctas
+                self.dispatch_step("gating").count_lower_bound != self.persistent_ctas
+                or self.dispatch_step("gating").count_upper_bound != self.persistent_ctas
+                or self.dispatch_step("align").count_lower_bound != self.persistent_ctas
+                or self.dispatch_step("align").count_upper_bound != self.persistent_ctas
             ):
                 raise ValueError("dynamic plan violates topk/count-sort saturation fanout")
             if not self.pre_before_wait:
@@ -725,7 +620,7 @@ class NormalizedPlan:
                 raise ValueError("dynamic plan does not provide a FIFO terminal drain")
 
             down_event = self.event("down_dispatch_done")
-            runtime_init = down_event.runtime_init
+            runtime_init = self.runtime_init_step(down_event.name)
             expected_value = (
                 ConstExpr(self.protocol.pre_decrement + self.protocol.post_decrement)
                 * self.tile("down").scheduled_extents[0]
@@ -733,21 +628,15 @@ class NormalizedPlan:
             )
             if (
                 runtime_init is None
-                or runtime_init.tile != "align"
+                or self.runtime_init_tile(down_event.name) != "align"
                 or runtime_init.scope != "thread"
                 or runtime_init.scope_id != 0
                 or runtime_init.value != expected_value
             ):
                 raise ValueError("dynamic down event has an invalid runtime initialization")
         else:
-            if self.dispatch_plans or self.seed_tasks or self.protocol is not None:
+            if self.dispatch_steps or self.seed_tasks or self.protocol is not None:
                 raise ValueError("static plan contains dynamic scheduling state")
-            if any(
-                isinstance(action, QueuePushAction)
-                for program in programs
-                for action in program.actions
-            ):
-                raise ValueError("static task cannot contain a pre-notification step")
             if runtime_inits:
                 raise ValueError("static plan cannot contain runtime event initialization")
             expected_central = [
@@ -759,9 +648,9 @@ class NormalizedPlan:
                 HostTask(JobType.WAIT_ETENSOR_INIT.value, cta, 0, 0)
                 for cta in range(self.persistent_ctas)
             )
-            for tile in self.tiles:
-                if tile.spec.name != "gating":
-                    expected_central.extend(_enumerate_tile(tile))
+            for program in programs:
+                if program.tile.name != "gating":
+                    expected_central.extend(_enumerate_tile(program))
             if self.central_tasks != tuple(expected_central):
                 raise ValueError("static central queue does not match the normalized tasks")
             queue_columns = (
@@ -807,16 +696,15 @@ class NormalizedPlan:
                     "init_count": event.init_count,
                     "offset": event.workspace_offset,
                     "logical": event.is_logical,
-                    "runtime_init_tile": event.runtime_init_tile,
+                    "runtime_init_tile": self.runtime_init_tile(event.name),
                     "runtime_init": (
                         None
-                        if event.runtime_init is None
+                        if self.runtime_init_step(event.name) is None
                         else {
-                            "tile": event.runtime_init.tile,
-                            "value": event.runtime_init.value.to_data(),
-                            "scope": event.runtime_init.scope,
-                            "scope_id": event.runtime_init.scope_id,
-                            "after_barrier": event.runtime_init.after_barrier,
+                            "tile": self.runtime_init_tile(event.name),
+                            "value": self.runtime_init_step(event.name).value.to_data(),
+                            "scope": self.runtime_init_step(event.name).scope,
+                            "scope_id": self.runtime_init_step(event.name).scope_id,
                         }
                     ),
                 }
@@ -824,42 +712,40 @@ class NormalizedPlan:
             ],
             "tiles": [
                 {
-                    "name": tile.spec.name,
-                    "job_type": tile.job_type,
-                    "implementation": tile.implementation,
-                    "upper_bounds": tile.upper_bounds,
-                    "runtime_extents": [extent.to_data() for extent in tile.runtime_extents],
-                    "scheduled_extents": [extent.to_data() for extent in tile.scheduled_extents],
-                    "scheduled_upper_bounds": tile.scheduled_upper_bounds,
-                    "actions": [
-                        type(action).__name__
-                        for action in self.action_program(tile.spec.name).actions
-                    ],
-                    "reads": [tensor.name for tensor in tile.spec.reads],
-                    "writes": [tensor.name for tensor in tile.spec.writes],
+                    "name": program.tile.name,
+                    "job_type": program.job_type,
+                    "implementation": program.implementation,
+                    "upper_bounds": program.upper_bounds,
+                    "runtime_extents": [extent.to_data() for extent in program.runtime_extents],
+                    "scheduled_extents": [extent.to_data() for extent in program.scheduled_extents],
+                    "scheduled_upper_bounds": program.scheduled_upper_bounds,
+                    "smem_scope": program.smem_scope,
+                    "steps": [type(step).__name__ for step in program.steps],
+                    "reads": [tensor.name for tensor in program.tile.reads],
+                    "writes": [tensor.name for tensor in program.tile.writes],
                     "waits": [
                         {
-                            "event": wait.event,
-                            "coord": [coord.to_data() for coord in wait.coord],
+                            "event": wait.event.name,
+                            "coord": [coord.to_data() for coord in wait.coord_map],
                             "level": wait.level,
                             "mask": wait.mask,
                         }
-                        for wait in tile.waits
+                        for wait in program.waits
                     ],
                     "notifies": [
                         {
-                            "event": notify.event,
-                            "coord": [coord.to_data() for coord in notify.coord],
+                            "event": notify.event.name,
+                            "coord": [coord.to_data() for coord in notify.coord_map],
                             "scope": notify.scope,
                             "scope_id": notify.scope_id,
                             "count": notify.count.to_data(),
                             "rank": notify.rank,
                             "release": notify.release,
                         }
-                        for notify in tile.notifies
+                        for notify in program.notifies
                     ],
                 }
-                for tile in self.tiles
+                for program in self.programs
             ],
             "central_task_count": len(self.central_tasks),
             "central_tasks": [task.as_manual_tuple() for task in self.central_tasks],
@@ -884,7 +770,7 @@ class NormalizedPlan:
                     "event_coord_bounds": dispatch.event_coord_bounds,
                     "tile_index_bounds": dispatch.tile_index_bounds,
                 }
-                for dispatch in self.dispatch_plans
+                for dispatch in self.dispatch_steps
             ],
             "down_coalescing": self.down_coalescing,
             "down_dispatch_groups": self.down_dispatch_groups,

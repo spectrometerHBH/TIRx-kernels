@@ -26,11 +26,13 @@ from tirx_kernels.megakernel.utils.base import SemaphoreBase
 from tirx_kernels.megakernel.utils.config import JobType, KernelConfig
 from tirx_kernels.megakernel.utils.dynamic_scheduler import DynamicTileScheduler
 from tirx_kernels.megakernel.utils.static_scheduler import StaticTileScheduler
+from tvm.megakernel.transform import DeviceRegionPlan, ExecutionPlan
 
 from ..moe_spec import build_moe_graph
 from ..spec import KernelSpec
 from .model import DynamicProtocolPlan, HostTask, MoeLoweringEnv, NormalizedPlan
 from .normalize import (
+    _attach_dispatch_steps,
     _dynamic_dispatch_rules,
     _enumerate_tile,
     _event_plans,
@@ -58,12 +60,12 @@ class StaticPolicy(MoePolicy):
 
     def normalize(self, spec: KernelSpec) -> NormalizedPlan:
         env = MoeLoweringEnv(spec)
-        events = _event_plans(env, is_dynamic=False, unfused=self.unfused, down_dispatch_groups=16)
+        events = _event_plans(env, is_dynamic=False, unfused=self.unfused)
         tiles = _normalize_tiles(
-            env, is_dynamic=False, unfused=self.unfused, down_coalescing=1, runtime_init_tiles=set()
+            env, is_dynamic=False, unfused=self.unfused, down_coalescing=1, events=events
         )
         _validate_packed_tiles(tiles)
-        by_name = {tile.spec.name: tile for tile in tiles}
+        by_name = {tile.tile.name: tile for tile in tiles}
         central = [
             HostTask(JobType.INIT_ETENSOR.value, event_idx, 0, 0)
             for event_idx in range(len(events))
@@ -74,7 +76,7 @@ class StaticPolicy(MoePolicy):
             for cta in range(KernelConfig.SM_NUMBER)
         )
         for tile in tiles:
-            if tile.spec.name != "gating":
+            if tile.tile.name != "gating":
                 central.extend(_enumerate_tile(tile))
         queue_columns = (len(central) + KernelConfig.SM_NUMBER - 1) // KernelConfig.SM_NUMBER + 1
         capacity = (
@@ -84,15 +86,19 @@ class StaticPolicy(MoePolicy):
             raise ValueError(
                 f"static host queue requires {queue_columns} columns, capacity is {capacity}"
             )
+        execution = ExecutionPlan(
+            kernel=spec,
+            device_regions=(
+                DeviceRegionPlan("moe_device", tile_programs=tiles, attrs={"schedule": self.name}),
+            ),
+        ).validate()
         return NormalizedPlan(
-            spec=spec,
+            execution=execution,
             env=env,
             policy_name=self.name,
             is_dynamic=False,
             unfused=self.unfused,
             events=events,
-            tiles=tiles,
-            dispatch_plans=(),
             central_tasks=tuple(central),
             seed_tasks=(),
             down_coalescing=1,
@@ -135,30 +141,23 @@ class DynamicPolicy(MoePolicy):
         if capacity is None or capacity <= 0 or capacity & (capacity - 1):
             raise ValueError("dynamic queue capacity must be a positive power of two")
         down_dispatch_groups = 16 // coalescing
-        events = _event_plans(
-            env, is_dynamic=True, unfused=False, down_dispatch_groups=down_dispatch_groups
-        )
+        events = _event_plans(env, is_dynamic=True, unfused=False)
         tiles = _normalize_tiles(
-            env,
-            is_dynamic=True,
-            unfused=False,
-            down_coalescing=coalescing,
-            runtime_init_tiles={
-                event.runtime_init.tile for event in events if event.runtime_init is not None
-            },
+            env, is_dynamic=True, unfused=False, down_coalescing=coalescing, events=events
         )
         _validate_packed_tiles(tiles)
         dispatch_rules = _dynamic_dispatch_rules(env, down_dispatch_groups)
         _validate_policy_edges(tiles, dispatch_rules)
-        dispatch_plans = _normalize_dispatch(env, tiles, dispatch_rules, events)
-        by_name = {tile.spec.name: tile for tile in tiles}
+        dispatch_steps = _normalize_dispatch(env, tiles, dispatch_rules, events)
+        tiles = _attach_dispatch_steps(tiles, dispatch_steps)
+        by_name = {tile.tile.name: tile for tile in tiles}
         seed = [
             HostTask(JobType.INIT_ETENSOR.value, event_idx, 0, 0)
             for event_idx in range(len(events))
         ]
         seed.extend(_enumerate_tile(by_name["gating"]))
         queue_upper_bound = len(seed) + sum(
-            dispatch.enqueue_upper_bound for dispatch in dispatch_plans
+            dispatch.enqueue_upper_bound for dispatch in dispatch_steps
         )
         if queue_upper_bound > capacity:
             raise ValueError(
@@ -168,15 +167,19 @@ class DynamicPolicy(MoePolicy):
             raise ValueError(
                 f"dynamic queue capacity must remain {DynamicTileScheduler.MAX_TASKS}; got {capacity}"
             )
+        execution = ExecutionPlan(
+            kernel=spec,
+            device_regions=(
+                DeviceRegionPlan("moe_device", tile_programs=tiles, attrs={"schedule": self.name}),
+            ),
+        ).validate()
         return NormalizedPlan(
-            spec=spec,
+            execution=execution,
             env=env,
             policy_name=self.name,
             is_dynamic=True,
             unfused=False,
             events=events,
-            tiles=tiles,
-            dispatch_plans=dispatch_plans,
             central_tasks=(),
             seed_tasks=tuple(seed),
             down_coalescing=coalescing,

@@ -28,6 +28,14 @@ from operator import mul
 from tirx_kernels.megakernel.utils.base import SemaphoreBase
 from tirx_kernels.megakernel.utils.config import JobType, KernelConfig
 from tirx_kernels.megakernel.utils.utils import MAX_K_IDX, MAX_M_IDX, MAX_N_IDX, MAX_TASK_TYPE
+from tvm.megakernel.transform import (
+    BarrierStep,
+    NotifyStep,
+    RunStep,
+    RuntimeEventInitStep,
+    WaitStep,
+    logical_edges,
+)
 
 from .._expr import (
     BinaryExpr,
@@ -42,14 +50,11 @@ from .._expr import (
 from ..spec import TileSpec
 from ._constants import _PACKED_INDEX_LIMITS, _SCOPE_INSTANCES, _SCOPE_ORDER, _SCOPE_WIDTHS
 from .model import (
-    DynamicDispatchPlan,
+    DynamicDispatchStep,
     EventPlan,
     HostTask,
     MoeLoweringEnv,
-    NotifyPlan,
-    RuntimeEventInitPlan,
-    TilePlan,
-    WaitPlan,
+    MoeTileProgram,
     _DynamicDispatchRule,
 )
 
@@ -80,25 +85,30 @@ _NOTIFY_SCOPE_BY_TILE = {
 }
 
 
-def _logical_dependency_plans(
-    env: MoeLoweringEnv, tile: TileSpec
-) -> tuple[tuple[WaitPlan, ...], tuple[NotifyPlan, ...]]:
+def _logical_dependency_steps(
+    env: MoeLoweringEnv,
+    tile: TileSpec,
+    event_map: Mapping[str, EventPlan],
+    by_producer_event,
+    by_consumer_event,
+) -> tuple[tuple[WaitStep, ...], tuple[NotifyStep, ...]]:
     waits = tuple(
-        WaitPlan(
-            logical_spec=dependency,
-            event=dependency[0].name,
-            coord=env.coord(tile, dependency),
+        WaitStep(
+            event_map[dependency[0].name],
+            env.coord(tile, dependency),
             level=_WAIT_LEVEL_BY_TILE[tile.name],
+            edges=tuple(by_consumer_event[(tile.name, id(dependency[0]))]),
         )
         for dependency in tile.waits
     )
     notifies = tuple(
-        NotifyPlan(
-            logical_spec=dependency,
-            event=dependency[0].name,
-            coord=env.coord(tile, dependency),
+        NotifyStep(
+            event_map[dependency[0].name],
+            env.coord(tile, dependency),
             scope=_NOTIFY_SCOPE_BY_TILE[tile.name][0],
             scope_id=_NOTIFY_SCOPE_BY_TILE[tile.name][1],
+            count=ConstExpr(1),
+            edges=tuple(by_producer_event[(tile.name, id(dependency[0]))]),
         )
         for dependency in tile.notifies
     )
@@ -111,19 +121,32 @@ def _normalize_tiles(
     is_dynamic: bool,
     unfused: bool,
     down_coalescing: int,
-    runtime_init_tiles: set[str],
-) -> tuple[TilePlan, ...]:
+    events: tuple[EventPlan, ...],
+) -> tuple[MoeTileProgram, ...]:
+    event_map = {event.name: event for event in events}
+    edges = logical_edges(env.spec)
+    by_producer_event: dict[tuple[str, int], list] = {}
+    by_consumer_event: dict[tuple[str, int], list] = {}
+    for edge in edges:
+        by_producer_event.setdefault((edge.producer, id(edge.event)), []).append(edge)
+        by_consumer_event.setdefault((edge.consumer, id(edge.event)), []).append(edge)
     plans = []
     for tile in env.spec.tiles:
-        waits, notifies = _logical_dependency_plans(env, tile)
+        waits, notifies = _logical_dependency_steps(
+            env, tile, event_map, by_producer_event, by_consumer_event
+        )
         if unfused and tile.name == "gate_up_silu":
             notifies = tuple(
-                replace(notify, coord=(ConstExpr(0),)) if notify.event == "gate_up_done" else notify
+                replace(notify, coord_map=(ConstExpr(0),))
+                if notify.event.name == "gate_up_done"
+                else notify
                 for notify in notifies
             )
         elif unfused and tile.name == "down":
             waits = tuple(
-                replace(wait, coord=(ConstExpr(0),)) if wait.event == "gate_up_done" else wait
+                replace(wait, coord_map=(ConstExpr(0),))
+                if wait.event.name == "gate_up_done"
+                else wait
                 for wait in waits
             )
         runtime_extents = tuple(env.extent(extent) for extent in tile.tile_num)
@@ -137,23 +160,47 @@ def _normalize_tiles(
                 runtime_extents[2],
             )
             scheduled = (upper[0], upper[1] // down_coalescing, upper[2])
+        predicate = (
+            "dynamic_or_routed_row"
+            if tile.impl.implementation in ("gate_up_silu", "down")
+            else None
+        )
+        steps = [*waits]
+        steps.append(
+            RunStep(
+                predicate=predicate,
+                repeat=down_coalescing if tile.impl.implementation == "down" else 1,
+                index_map="expand_down_n" if tile.impl.implementation == "down" else None,
+                profile_event=tile.impl.profile_event_type,
+            )
+        )
+        if tile.impl.implementation == "align":
+            steps.append(BarrierStep("cta"))
+            runtime_event = event_map["down_dispatch_done"] if is_dynamic else None
+            runtime_value = (
+                ConstExpr(SemaphoreBase.base + 1) * env.routed_rows * (16 // down_coalescing)
+                if is_dynamic
+                else None
+            )
+            steps.append(
+                RuntimeEventInitStep(runtime_event, runtime_value, scope="thread", scope_id=0)
+            )
+        steps.extend(notifies)
         plans.append(
-            TilePlan(
-                spec=tile,
+            MoeTileProgram(
+                tile=tile,
+                steps=tuple(steps),
+                smem_scope="run_to_end",
                 runtime_extents=runtime_extents,
                 upper_bounds=upper,
                 scheduled_extents=scheduled_extents,
                 scheduled_upper_bounds=scheduled,
-                waits=waits,
-                notifies=notifies,
             )
         )
     return tuple(plans)
 
 
-def _event_plans(
-    env: MoeLoweringEnv, *, is_dynamic: bool, unfused: bool, down_dispatch_groups: int
-) -> tuple[EventPlan, ...]:
+def _event_plans(env: MoeLoweringEnv, *, is_dynamic: bool, unfused: bool) -> tuple[EventPlan, ...]:
     offset = 0
     plans = []
     for event in env.spec.events.values():
@@ -172,19 +219,11 @@ def _event_plans(
         plans.append(plan)
         offset += plan.size
 
-    runtime_init = None
     down_count = env.rmax * 16
     if is_dynamic:
         down_count = None
-        runtime_init = RuntimeEventInitPlan(
-            "align", ConstExpr(SemaphoreBase.base + 1) * env.routed_rows * down_dispatch_groups
-        )
     down_event = EventPlan(
-        name="down_dispatch_done",
-        shape=(1,),
-        init_count=down_count,
-        workspace_offset=offset,
-        runtime_init=runtime_init,
+        name="down_dispatch_done", shape=(1,), init_count=down_count, workspace_offset=offset
     )
     plans.append(down_event)
     offset += down_event.size
@@ -196,7 +235,7 @@ def _event_plans(
     return tuple(plans)
 
 
-def _enumerate_tile(tile: TilePlan) -> list[HostTask]:
+def _enumerate_tile(tile: MoeTileProgram) -> list[HostTask]:
     result = []
     for m_idx in range(tile.scheduled_upper_bounds[0]):
         for n_idx in range(tile.scheduled_upper_bounds[1]):
@@ -205,17 +244,17 @@ def _enumerate_tile(tile: TilePlan) -> list[HostTask]:
     return result
 
 
-def _validate_packed_tiles(tiles: tuple[TilePlan, ...]):
+def _validate_packed_tiles(tiles: tuple[MoeTileProgram, ...]):
     for tile in tiles:
         job_type = tile.job_type
         m_extent, n_extent, k_extent = tile.scheduled_upper_bounds
         if not 0 <= job_type < MAX_TASK_TYPE:
-            raise ValueError(f"tile {tile.spec.name!r} overflows packed task type")
+            raise ValueError(f"tile {tile.tile.name!r} overflows packed task type")
         if m_extent > MAX_M_IDX or n_extent > MAX_N_IDX or k_extent > MAX_K_IDX:
-            raise ValueError(f"tile {tile.spec.name!r} overflows packed tile indices")
+            raise ValueError(f"tile {tile.tile.name!r} overflows packed tile indices")
 
 
-def _known_extent_bounds(tiles: tuple[TilePlan, ...]) -> dict[Expr, int]:
+def _known_extent_bounds(tiles: tuple[MoeTileProgram, ...]) -> dict[Expr, int]:
     bounds: dict[Expr, int] = {}
     for tile in tiles:
         for extent, upper_bound in zip(
@@ -336,10 +375,10 @@ def _event_coord_bounds(
 
 
 def _validate_tile_event_accesses(
-    env: MoeLoweringEnv, tiles: tuple[TilePlan, ...], events: tuple[EventPlan, ...]
+    env: MoeLoweringEnv, tiles: tuple[MoeTileProgram, ...], events: tuple[EventPlan, ...]
 ):
     event_map = {event.name: event for event in events}
-    tile_bounds = {tile.spec.name: tile.scheduled_upper_bounds for tile in tiles}
+    tile_bounds = {tile.tile.name: tile.scheduled_upper_bounds for tile in tiles}
     known_bounds = _known_extent_bounds(tiles)
     for tile in tiles:
         for wait in tile.waits:
@@ -348,22 +387,22 @@ def _validate_tile_event_accesses(
                 or not isinstance(wait.mask, int)
                 or not 0 <= wait.mask <= 0xFFFFFFFF
             ):
-                raise ValueError(f"tile {tile.spec.name!r} has an invalid wait mask")
+                raise ValueError(f"tile {tile.tile.name!r} has an invalid wait mask")
             _event_coord_bounds(
-                f"tile {tile.spec.name!r}",
-                event_map[wait.event],
-                wait.coord,
+                f"tile {tile.tile.name!r}",
+                event_map[wait.event.name],
+                wait.coord_map,
                 compile_env=env.compile_env,
                 known_bounds=known_bounds,
                 tile_bounds=tile_bounds,
             )
         for notify in tile.notifies:
             if not isinstance(notify.release, bool):
-                raise ValueError(f"tile {tile.spec.name!r} has a non-boolean release flag")
+                raise ValueError(f"tile {tile.tile.name!r} has a non-boolean release flag")
             _event_coord_bounds(
-                f"tile {tile.spec.name!r}",
-                event_map[notify.event],
-                notify.coord,
+                f"tile {tile.tile.name!r}",
+                event_map[notify.event.name],
+                notify.coord_map,
                 compile_env=env.compile_env,
                 known_bounds=known_bounds,
                 tile_bounds=tile_bounds,
@@ -375,28 +414,28 @@ def _validate_tile_event_accesses(
                 tile_bounds=tile_bounds,
             )
             _validate_scope(
-                f"tile {tile.spec.name!r}", notify.scope, notify.scope_id, count_bounds, notify.rank
+                f"tile {tile.tile.name!r}", notify.scope, notify.scope_id, count_bounds, notify.rank
             )
 
 
 def _validate_event_notification_counts(
-    env: MoeLoweringEnv, tiles: tuple[TilePlan, ...], events: tuple[EventPlan, ...]
+    env: MoeLoweringEnv, tiles: tuple[MoeTileProgram, ...], events: tuple[EventPlan, ...]
 ):
     event_map = {event.name: event for event in events}
-    tile_bounds = {tile.spec.name: tile.scheduled_upper_bounds for tile in tiles}
+    tile_bounds = {tile.tile.name: tile.scheduled_upper_bounds for tile in tiles}
     known_bounds = _known_extent_bounds(tiles)
     for tile in tiles:
         tile_volume = reduce(mul, tile.scheduled_upper_bounds, 1)
         for notify in tile.notifies:
-            event = event_map[notify.event]
+            event = event_map[notify.event.name]
             if event.init_count is None:
                 raise ValueError(
                     f"event {event.name!r} is notified without an initialization count"
                 )
             coord_bounds = _event_coord_bounds(
-                f"tile {tile.spec.name!r}",
+                f"tile {tile.tile.name!r}",
                 event,
-                notify.coord,
+                notify.coord_map,
                 compile_env=env.compile_env,
                 known_bounds=known_bounds,
                 tile_bounds=tile_bounds,
@@ -410,27 +449,30 @@ def _validate_event_notification_counts(
             )
             if count_bounds[0] != count_bounds[1] or tile_volume % coord_count:
                 raise ValueError(
-                    f"tile {tile.spec.name!r} notification coverage is not statically uniform"
+                    f"tile {tile.tile.name!r} notification coverage is not statically uniform"
                 )
             scope_multiplier = _SCOPE_INSTANCES[notify.scope] if notify.scope_id == -1 else 1
             expected_count = tile_volume // coord_count * count_bounds[0] * scope_multiplier
             if expected_count != event.init_count:
                 raise ValueError(
                     f"event {event.name!r} expects {event.init_count} notifications per "
-                    f"coordinate, but tile {tile.spec.name!r} provides {expected_count}"
+                    f"coordinate, but tile {tile.tile.name!r} provides {expected_count}"
                 )
 
 
 def _normalize_dispatch(
     env: MoeLoweringEnv,
-    tiles: tuple[TilePlan, ...],
+    tiles: tuple[MoeTileProgram, ...],
     rules: tuple[_DynamicDispatchRule, ...],
     events: tuple[EventPlan, ...],
-) -> tuple[DynamicDispatchPlan, ...]:
-    tile_map = {tile.spec.name: tile for tile in tiles}
+) -> tuple[DynamicDispatchStep, ...]:
+    tile_map = {tile.tile.name: tile for tile in tiles}
     event_map = {event.name: event for event in events}
-    tile_bounds = {tile.spec.name: tile.scheduled_upper_bounds for tile in tiles}
+    tile_bounds = {tile.tile.name: tile.scheduled_upper_bounds for tile in tiles}
     known_bounds = _known_extent_bounds(tiles)
+    outgoing_edges: dict[str, list] = {}
+    for edge in logical_edges(env.spec):
+        outgoing_edges.setdefault(edge.producer, []).append(edge)
     plans = []
     for rule in rules:
         count_lo, count_hi = _expr_interval(
@@ -501,61 +543,76 @@ def _normalize_dispatch(
             mul, (upper - lower + 1 for lower, upper in event_coord_bounds), 1
         )
         plans.append(
-            DynamicDispatchPlan(
-                rule,
-                trigger_upper_bound,
-                count_lo,
-                count_hi,
-                trigger_upper_bound * count_hi,
-                event_coord_bounds,
-                tile_index_bounds,
+            DynamicDispatchStep(
+                rule=rule,
+                trigger_upper_bound=trigger_upper_bound,
+                count_lower_bound=count_lo,
+                count_upper_bound=count_hi,
+                enqueue_upper_bound=trigger_upper_bound * count_hi,
+                event_coord_bounds=event_coord_bounds,
+                tile_index_bounds=tile_index_bounds,
+                edges=tuple(outgoing_edges.get(rule.source_tile, ())),
             )
         )
     return tuple(plans)
 
 
+def _attach_dispatch_steps(
+    programs: tuple[MoeTileProgram, ...], dispatch_steps: tuple[DynamicDispatchStep, ...]
+) -> tuple[MoeTileProgram, ...]:
+    """Place each dynamic dispatch at the start of its source tile program."""
+
+    by_source = {step.rule.source_tile: step for step in dispatch_steps}
+    if len(by_source) != len(programs):
+        raise ValueError("dynamic plan must have one dispatch step per tile program")
+    return tuple(
+        replace(program, steps=(by_source[program.tile.name], *program.steps))
+        for program in programs
+    )
+
+
 def _validate_dynamic_protocol_links(
-    tiles: tuple[TilePlan, ...], dispatch_plans: tuple[DynamicDispatchPlan, ...]
+    tiles: tuple[MoeTileProgram, ...], dispatch_steps: tuple[DynamicDispatchStep, ...]
 ):
-    tile_map = {tile.spec.name: tile for tile in tiles}
-    for dispatch in dispatch_plans:
+    tile_map = {tile.tile.name: tile for tile in tiles}
+    for dispatch in dispatch_steps:
         rule = dispatch.rule
         source = tile_map[rule.source_tile]
         if rule.target_tile is None:
             if source.notifies:
                 raise ValueError(
-                    f"terminal tile {source.spec.name!r} must only pre-notify its drain event"
+                    f"terminal tile {source.tile.name!r} must only pre-notify its drain event"
                 )
             continue
         if len(source.notifies) != 1:
             raise ValueError(
-                f"dynamic tile {source.spec.name!r} must have one completion notification"
+                f"dynamic tile {source.tile.name!r} must have one completion notification"
             )
         notify = source.notifies[0]
         pre_scope_multiplier = _SCOPE_INSTANCES[rule.pre_scope] if rule.pre_scope_id == -1 else 1
         post_scope_multiplier = _SCOPE_INSTANCES[notify.scope] if notify.scope_id == -1 else 1
         if (
-            notify.event != rule.event
-            or notify.coord != rule.event_coord
+            notify.event.name != rule.event
+            or notify.coord_map != rule.event_coord
             or notify.count != rule.pre_count
             or notify.rank != rule.rank
             or pre_scope_multiplier != post_scope_multiplier
         ):
             raise ValueError(
-                f"dynamic tile {source.spec.name!r} pre/post notifications are inconsistent"
+                f"dynamic tile {source.tile.name!r} pre/post notifications are inconsistent"
             )
 
 
 def _validate_dispatch_coverage(
     env: MoeLoweringEnv,
-    tiles: tuple[TilePlan, ...],
-    dispatch_plans: tuple[DynamicDispatchPlan, ...],
+    tiles: tuple[MoeTileProgram, ...],
+    dispatch_steps: tuple[DynamicDispatchStep, ...],
 ):
     """Prove that every non-seed tile is pushed exactly once at its upper bound."""
 
-    tile_map = {tile.spec.name: tile for tile in tiles}
+    tile_map = {tile.tile.name: tile for tile in tiles}
     incoming: dict[str, int] = {}
-    for dispatch in dispatch_plans:
+    for dispatch in dispatch_steps:
         rule = dispatch.rule
         if rule.target_tile is None:
             continue
@@ -624,7 +681,7 @@ def _validate_dispatch_coverage(
                 f"{rule.target_tile!r} exactly once"
             )
 
-    expected_targets = {tile.spec.name for tile in tiles if tile.spec.name != "gating"}
+    expected_targets = {tile.tile.name for tile in tiles if tile.tile.name != "gating"}
     if set(incoming) != expected_targets or any(count != 1 for count in incoming.values()):
         raise ValueError("dynamic dispatch graph must have one incoming rule per non-seed tile")
 
@@ -701,10 +758,12 @@ def _dynamic_dispatch_rules(
     )
 
 
-def _validate_policy_edges(tiles: tuple[TilePlan, ...], rules: tuple[_DynamicDispatchRule, ...]):
+def _validate_policy_edges(
+    tiles: tuple[MoeTileProgram, ...], rules: tuple[_DynamicDispatchRule, ...]
+):
     """Prove each non-terminal policy transition implements one logical edge."""
 
-    tile_map = {tile.spec.name: tile for tile in tiles}
+    tile_map = {tile.tile.name: tile for tile in tiles}
     for rule in rules:
         source = tile_map[rule.source_tile]
         if rule.target_tile is None:
@@ -712,8 +771,10 @@ def _validate_policy_edges(tiles: tuple[TilePlan, ...], rules: tuple[_DynamicDis
                 raise ValueError("terminal dynamic rule must use the synthesized drain event")
             continue
         target = tile_map[rule.target_tile]
-        matching_notifies = [notify for notify in source.notifies if notify.event == rule.event]
-        matching_waits = [wait for wait in target.waits if wait.event == rule.event]
+        matching_notifies = [
+            notify for notify in source.notifies if notify.event.name == rule.event
+        ]
+        matching_waits = [wait for wait in target.waits if wait.event.name == rule.event]
         if len(matching_notifies) != 1 or len(matching_waits) != 1:
             raise ValueError(
                 f"dynamic rule {rule.source_tile!r} -> {rule.target_tile!r} "
@@ -721,7 +782,11 @@ def _validate_policy_edges(tiles: tuple[TilePlan, ...], rules: tuple[_DynamicDis
             )
         notify = matching_notifies[0]
         wait = matching_waits[0]
-        if notify.logical_spec[0] is not wait.logical_spec[0] or notify.coord != rule.event_coord:
+        if (
+            notify.event is not wait.event
+            or not set(notify.edges) & set(wait.edges)
+            or notify.coord_map != rule.event_coord
+        ):
             raise ValueError(
                 f"dynamic rule for {rule.source_tile!r} is inconsistent with its logical edge"
             )

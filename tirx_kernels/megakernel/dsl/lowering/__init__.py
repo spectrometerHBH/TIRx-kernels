@@ -19,14 +19,12 @@
 
 from .lowerer import MoeLowerer
 from .model import (
-    DynamicDispatchPlan,
+    DynamicDispatchStep,
     DynamicProtocolPlan,
     EventPlan,
     MoeLoweringEnv,
+    MoeTileProgram,
     NormalizedPlan,
-    NotifyPlan,
-    TilePlan,
-    WaitPlan,
 )
 from .policies import (
     DynamicPolicy,
@@ -38,19 +36,17 @@ from .policies import (
 )
 
 __all__ = [
-    "DynamicDispatchPlan",
+    "DynamicDispatchStep",
     "DynamicPolicy",
     "DynamicProtocolPlan",
     "EventPlan",
     "MoeLowerer",
     "MoeLoweringEnv",
     "MoePolicy",
+    "MoeTileProgram",
     "NormalizedPlan",
-    "NotifyPlan",
     "StaticPolicy",
-    "TilePlan",
     "UnfusedPolicy",
-    "WaitPlan",
     "make_moe_plan",
     "policy_for_scheduler",
 ]
