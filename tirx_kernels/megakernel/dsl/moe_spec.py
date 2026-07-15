@@ -22,7 +22,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from .spec import KernelSpec, VarSpec
+from .spec import KernelSpec
 from .tile_impl import (
     AlignTileImpl,
     CountSortTileImpl,
@@ -69,30 +69,28 @@ def build_moe_graph(config: Mapping[str, Any], batch_size: int) -> KernelSpec:
     max_rows = _max_rows(batch_size)
     max_tokens = max_rows * 128
     relaxed_rows = batch_size * 8 // 128 + 129
-    routed_rows = VarSpec("routed_rows")
     kernel = KernelSpec(
         "qwen3_30b_a3b_moe", attrs={"source": "Qwen3-30B-A3B six-stage MoE pipeline"}
     )
+    routed_rows = kernel.var("routed_rows")
 
-    hidden_state = kernel.input("hidden_state", (batch_size, 2048), "float16")
-    kernel.input("residual", (batch_size, 2048), "float16")
-    kernel.output("output", (batch_size, 2048), "float16")
-    gate_weight = kernel.input("gate_weight", (128, 2048), "float16")
-    gate_up_weight = kernel.input("gate_up_weight", (128, 1536, 2048), "float16")
-    down_weight = kernel.input("down_weight", (128, 2048, 768), "float16")
-    gating_output = kernel.intermediate("gating_output", (batch_size, 128), "float32")
-    topk_weights = kernel.intermediate("topk_weights", (batch_size, 8), "float32")
-    topk_indices = kernel.intermediate("topk_indices", (batch_size, 8), "int32")
-    sorted_token_ids = kernel.intermediate("sorted_token_ids", (max_tokens,), "int32")
-    expert_ids = kernel.intermediate("expert_ids", (max_rows,), "int32")
-    num_valid_tokens = kernel.intermediate("num_valid_tokens", (max_rows,), "int32")
-    num_tokens_post_pad = kernel.intermediate("num_tokens_post_pad", (1,), "int32")
-    cumsum_buffer = kernel.intermediate("cumsum_buffer", (129,), "int32")
-    reordered_hidden_state = kernel.intermediate(
-        "reordered_hidden_state", (max_tokens, 2048), "float16"
-    )
-    silu_mul_output = kernel.intermediate("silu_mul_output", (max_tokens, 768), "float16")
-    topk_reduce_output = kernel.output("topk_reduce_output", (batch_size, 2048), "float16")
+    hidden_state = kernel.tensor("hidden_state", (batch_size, 2048), "float16")
+    kernel.tensor("residual", (batch_size, 2048), "float16")
+    kernel.tensor("output", (batch_size, 2048), "float16")
+    gate_weight = kernel.tensor("gate_weight", (128, 2048), "float16")
+    gate_up_weight = kernel.tensor("gate_up_weight", (128, 1536, 2048), "float16")
+    down_weight = kernel.tensor("down_weight", (128, 2048, 768), "float16")
+    gating_output = kernel.tensor("gating_output", (batch_size, 128), "float32")
+    topk_weights = kernel.tensor("topk_weights", (batch_size, 8), "float32")
+    topk_indices = kernel.tensor("topk_indices", (batch_size, 8), "int32")
+    sorted_token_ids = kernel.tensor("sorted_token_ids", (max_tokens,), "int32")
+    expert_ids = kernel.tensor("expert_ids", (max_rows,), "int32")
+    num_valid_tokens = kernel.tensor("num_valid_tokens", (max_rows,), "int32")
+    num_tokens_post_pad = kernel.tensor("num_tokens_post_pad", (1,), "int32")
+    cumsum_buffer = kernel.tensor("cumsum_buffer", (129,), "int32")
+    reordered_hidden_state = kernel.tensor("reordered_hidden_state", (max_tokens, 2048), "float16")
+    silu_mul_output = kernel.tensor("silu_mul_output", (max_tokens, 768), "float16")
+    topk_reduce_output = kernel.tensor("topk_reduce_output", (batch_size, 2048), "float16")
 
     gating_done = kernel.event(
         "gating_done",
@@ -119,105 +117,115 @@ def build_moe_graph(config: Mapping[str, Any], batch_size: int) -> KernelSpec:
     (
         kernel.tile(
             "gating",
-            impl=GatingTileImpl(config),
+            impl=GatingTileImpl(config, kernel.tensors),
             tile_num=((batch_size + 127) // 128, 1, 4),
+            reads=[hidden_state, gate_weight],
+            writes=[gating_output],
             attrs={
                 "source_stage": "gating_output = hidden_state @ gate_weight.T",
                 "purpose": "compute split-K expert logits",
             },
-        )
-        .read(hidden_state, gate_weight)
-        .write(gating_output)
-        .notify(gating_done, lambda m, n, k: (0,))
+        ).notify(gating_done, lambda m, n, k: (0,))
     )
     (
         kernel.tile(
             "topk",
-            impl=TopkTileImpl(config, batch_size),
+            impl=TopkTileImpl(config, batch_size, kernel.tensors),
             tile_num=(148, 1, 1),
+            reads=[gating_output],
+            writes=[topk_weights, topk_indices],
             attrs={
                 "source_stage": "topk_weights, topk_indices = topk(gating_output)",
                 "purpose": "select experts and routing weights",
             },
         )
-        .read(gating_output)
-        .write(topk_weights, topk_indices)
         .wait(gating_done, lambda m, n, k: (0,))
         .notify(topk_done, lambda m, n, k: (0,))
     )
     (
         kernel.tile(
             "align",
-            impl=AlignTileImpl(config, batch_size),
+            impl=AlignTileImpl(config, batch_size, kernel.tensors),
             tile_num=(1, 1, 1),
+            reads=[topk_indices],
+            writes=[
+                sorted_token_ids,
+                expert_ids,
+                num_valid_tokens,
+                num_tokens_post_pad,
+                cumsum_buffer,
+            ],
             attrs={
                 "source_stage": "align tokens by expert",
                 "purpose": "produce padded routing metadata",
             },
         )
-        .read(topk_indices)
-        .write(sorted_token_ids, expert_ids, num_valid_tokens, num_tokens_post_pad, cumsum_buffer)
         .wait(topk_done, lambda m, n, k: (0,))
         .notify(align_done, lambda m, n, k: (0,))
     )
     (
         kernel.tile(
             "count_sort",
-            impl=CountSortTileImpl(config, batch_size),
+            impl=CountSortTileImpl(config, batch_size, kernel.tensors),
             tile_num=(148, 1, 1),
+            reads=[
+                topk_indices,
+                sorted_token_ids,
+                cumsum_buffer,
+                hidden_state,
+                num_tokens_post_pad,
+            ],
+            writes=[reordered_hidden_state],
             attrs={
                 "source_stage": "reorder hidden states by expert",
                 "purpose": "count and scatter routed tokens",
             },
         )
-        .read(topk_indices, sorted_token_ids, cumsum_buffer, hidden_state, num_tokens_post_pad)
-        .write(reordered_hidden_state)
         .wait(align_done, lambda m, n, k: (0,))
         .notify(count_sort_done, lambda m, n, k: (0,))
     )
     (
         kernel.tile(
             "gate_up_silu",
-            impl=GateUpSiluTileImpl(config, batch_size),
+            impl=GateUpSiluTileImpl(config, batch_size, kernel.tensors),
             tile_num=(routed_rows, 12, 1),
+            reads=[
+                reordered_hidden_state,
+                gate_up_weight,
+                topk_weights,
+                sorted_token_ids,
+                expert_ids,
+                num_valid_tokens,
+                num_tokens_post_pad,
+            ],
+            writes=[silu_mul_output],
             attrs={
                 "source_stage": "silu(gate) * up",
                 "purpose": "compute routed gate-up projections and SiLU",
             },
         )
-        .read(
-            reordered_hidden_state,
-            gate_up_weight,
-            topk_weights,
-            sorted_token_ids,
-            expert_ids,
-            num_valid_tokens,
-            num_tokens_post_pad,
-        )
-        .write(silu_mul_output)
         .wait(count_sort_done, lambda m, n, k: (0,))
         .notify(gate_up_done, lambda m, n, k: (m,))
     )
     (
         kernel.tile(
             "down",
-            impl=DownTileImpl(config, batch_size),
+            impl=DownTileImpl(config, batch_size, kernel.tensors),
             tile_num=(routed_rows, 16, 1),
+            reads=[
+                silu_mul_output,
+                down_weight,
+                expert_ids,
+                topk_weights,
+                sorted_token_ids,
+                num_valid_tokens,
+                num_tokens_post_pad,
+            ],
+            writes=[topk_reduce_output],
             attrs={
                 "source_stage": "topk_reduce_output = down(silu_mul_output)",
                 "purpose": "compute and accumulate routed down projections",
             },
-        )
-        .read(
-            silu_mul_output,
-            down_weight,
-            expert_ids,
-            topk_weights,
-            sorted_token_ids,
-            num_valid_tokens,
-            num_tokens_post_pad,
-        )
-        .write(topk_reduce_output)
-        .wait(gate_up_done, lambda m, n, k: (m,))
+        ).wait(gate_up_done, lambda m, n, k: (m,))
     )
     return kernel

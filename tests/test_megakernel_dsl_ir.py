@@ -14,22 +14,41 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""IR equivalence gates for the MoE DSL and manual fallback."""
+"""IR equivalence gates for the MoE DSL and private migration oracle."""
 
+import hashlib
+import json
 import re
+from pathlib import Path
 
 import pytest
+import tvm_ffi
 
 import tvm
 from tirx_kernels.megakernel.moe import MegaKernelMOE
 from tirx_kernels.megakernel.utils.config import MEGAKERNEL_MOE_BENCH_CONFIG
 from tirx_kernels.megakernel.utils.utils import get_source
 
+_GOLDEN = json.loads(Path(__file__).with_name("megakernel_oracles.json").read_text())["oracles"][
+    "moe"
+]["cases"]
+_CASES = [
+    (batch_size, scheduler, False)
+    for batch_size in [1, 4, 128, 512, 2048, 4096]
+    for scheduler in ["static", "unfused", "dynamic"]
+] + [(4, "dynamic", True)]
 
-def _build_module(batch_size: int, scheduler: str, lowering: str):
-    kernel = MegaKernelMOE(config=MEGAKERNEL_MOE_BENCH_CONFIG, world_size=1, profiler_on=False)
+
+def _build_module(
+    batch_size: int, scheduler: str, *, profiler_on: bool = False, oracle: bool = False
+):
+    kernel = MegaKernelMOE(
+        config=MEGAKERNEL_MOE_BENCH_CONFIG, world_size=1, profiler_on=profiler_on
+    )
     kernel._compile_batch_size = batch_size
-    return kernel.get_module(scheduler, lowering=lowering)
+    if oracle:
+        return kernel._get_manual_oracle_module(scheduler)
+    return kernel.get_module(scheduler)
 
 
 def _normalize_cuda_source(source: str) -> str:
@@ -39,20 +58,32 @@ def _normalize_cuda_source(source: str) -> str:
     return " ".join(source.split())
 
 
-@pytest.mark.parametrize("batch_size", [1, 4, 128, 512, 2048, 4096])
-@pytest.mark.parametrize("scheduler", ["static", "unfused", "dynamic"])
-def test_manual_and_dsl_are_structurally_equal(batch_size, scheduler):
-    manual = _build_module(batch_size, scheduler, "manual")
-    dsl = _build_module(batch_size, scheduler, "dsl")
+def _golden_key(batch_size: int, scheduler: str, profiler_on: bool) -> str:
+    return f"moe_b{batch_size}_{scheduler}_prof{int(profiler_on)}"
+
+
+@pytest.mark.parametrize("batch_size,scheduler,profiler_on", _CASES)
+def test_manual_and_dsl_are_structurally_equal(batch_size, scheduler, profiler_on):
+    manual = _build_module(batch_size, scheduler, profiler_on=profiler_on, oracle=True)
+    dsl = _build_module(batch_size, scheduler, profiler_on=profiler_on)
     tvm.ir.assert_structural_equal(manual, dsl, map_free_vars=True)
+    expected = _GOLDEN[_golden_key(batch_size, scheduler, profiler_on)]["structural_hash"]
+    assert tvm_ffi.structural_hash(manual, map_free_vars=True) == expected
+    assert tvm_ffi.structural_hash(dsl, map_free_vars=True) == expected
 
 
-@pytest.mark.parametrize("batch_size", [1, 4, 128, 512, 2048, 4096])
-@pytest.mark.parametrize("scheduler", ["static", "unfused", "dynamic"])
-def test_manual_and_dsl_generate_identical_cuda(batch_size, scheduler):
-    manual_source, manual_lib = get_source(_build_module(batch_size, scheduler, "manual"))
-    dsl_source, dsl_lib = get_source(_build_module(batch_size, scheduler, "dsl"))
+@pytest.mark.parametrize("batch_size,scheduler,profiler_on", _CASES)
+def test_manual_and_dsl_generate_identical_cuda(batch_size, scheduler, profiler_on):
+    manual_source, manual_lib = get_source(
+        _build_module(batch_size, scheduler, profiler_on=profiler_on, oracle=True)
+    )
+    dsl_source, dsl_lib = get_source(_build_module(batch_size, scheduler, profiler_on=profiler_on))
 
     # Keep both runtime modules alive until after comparison.
     assert manual_lib is not None and dsl_lib is not None
-    assert _normalize_cuda_source(manual_source) == _normalize_cuda_source(dsl_source)
+    manual_source = _normalize_cuda_source(manual_source)
+    dsl_source = _normalize_cuda_source(dsl_source)
+    assert manual_source == dsl_source
+    expected = _GOLDEN[_golden_key(batch_size, scheduler, profiler_on)]["cuda_sha256"]
+    assert hashlib.sha256(manual_source.encode()).hexdigest() == expected
+    assert hashlib.sha256(dsl_source.encode()).hexdigest() == expected

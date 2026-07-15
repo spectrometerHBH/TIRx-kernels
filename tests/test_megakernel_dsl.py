@@ -41,9 +41,22 @@ from tirx_kernels.megakernel.dsl import (
     make_moe_plan,
 )
 from tirx_kernels.megakernel.dsl._expr import ConstExpr, ScalarLoadExpr, walk_expr
+from tirx_kernels.megakernel.moe import MegaKernelMOE
 from tirx_kernels.megakernel.utils.config import MEGAKERNEL_MOE_BENCH_CONFIG, JobType, KernelConfig
 from tirx_kernels.megakernel.utils.support import generate_exec_queue_moe, push_moe_tasks
 from tirx_kernels.megakernel.utils.utils import MAX_M_IDX
+from tvm.error import DiagnosticError
+from tvm.megakernel.transform import (
+    BarrierAction,
+    NotifyAction,
+    ProfileAction,
+    QueuePushAction,
+    RunAction,
+    RuntimeEventInitAction,
+    SmemEnterAction,
+    SmemExitAction,
+    WaitAction,
+)
 
 _FORBIDDEN_SPEC_FIELDS = {
     "dispatch",
@@ -104,15 +117,7 @@ def _collect_attr_keys(value):
 
 
 def test_public_spec_types_are_tvm_owned_and_legacy_model_is_removed():
-    for name in (
-        "VarSpec",
-        "TensorSpec",
-        "EventSpec",
-        "DependencySpec",
-        "TileSpec",
-        "TileImpl",
-        "KernelSpec",
-    ):
+    for name in ("VarSpec", "TensorSpec", "EventSpec", "TileSpec", "TileImpl", "KernelSpec"):
         assert getattr(megakernel_dsl, name) is getattr(tvm_dsl, name)
 
     for removed in (
@@ -128,6 +133,8 @@ def test_public_spec_types_are_tvm_owned_and_legacy_model_is_removed():
     ):
         assert not hasattr(megakernel_dsl, removed)
     assert importlib.util.find_spec("tirx_kernels.megakernel.dsl.expr") is None
+    assert not hasattr(tvm_dsl, "DependencySpec")
+    assert not hasattr(megakernel_dsl, "DependencySpec")
 
 
 def test_complete_six_stage_graph_is_pure_logical_native_dsl():
@@ -151,8 +158,8 @@ def test_complete_six_stage_graph_is_pure_logical_native_dsl():
     ]
     assert len(spec.events) == 5
     assert "down_dispatch_done" not in spec.events
-    assert _tile(spec, "gate_up_silu").tile_num[0] == VarSpec("routed_rows")
-    assert _tile(spec, "down").tile_num[0] == VarSpec("routed_rows")
+    assert _tile(spec, "gate_up_silu").tile_num[0] is spec.vars["routed_rows"]
+    assert _tile(spec, "down").tile_num[0] is spec.vars["routed_rows"]
     assert not hasattr(spec.tensors["hidden_state"], "role")
 
     attr_keys = _collect_attr_keys(spec.attrs)
@@ -165,13 +172,11 @@ def test_complete_six_stage_graph_is_pure_logical_native_dsl():
 
 def test_graph_has_five_logical_edges_and_callable_coordinate_maps():
     spec = build_moe_graph(MEGAKERNEL_MOE_BENCH_CONFIG, 128)
-    producers = {
-        id(dependency.event): tile.name for tile in spec.tiles for dependency in tile.notifies
-    }
+    producers = {id(event): tile.name for tile in spec.tiles for event, _ in tile.notifies}
     edges = [
-        (producers[id(dependency.event)], tile.name, dependency.event.name)
+        (producers[id(event)], tile.name, event.name)
         for tile in spec.tiles
-        for dependency in tile.waits
+        for event, _ in tile.waits
     ]
     assert edges == [
         ("gating", "topk", "gating_done"),
@@ -181,14 +186,14 @@ def test_graph_has_five_logical_edges_and_callable_coordinate_maps():
         ("gate_up_silu", "down", "gate_up_done"),
     ]
     for tile in spec.tiles:
-        for dependency in (*tile.waits, *tile.notifies):
-            assert callable(dependency.coord_map)
-            coord = dependency.coord_map(2, 3, 4)
+        for event, coord_map in (*tile.waits, *tile.notifies):
+            assert callable(coord_map)
+            coord = coord_map(2, 3, 4)
             assert isinstance(coord, tuple)
-            assert len(coord) == len(dependency.event.shape)
+            assert len(coord) == len(event.shape)
 
 
-def test_six_concrete_tile_impls_hold_existing_tasks_and_only_compute_in_run():
+def test_six_concrete_tile_impls_directly_extend_tasks_and_hold_tensor_specs():
     spec = build_moe_graph(MEGAKERNEL_MOE_BENCH_CONFIG, 4)
     expected = (
         GatingTileImpl,
@@ -199,7 +204,9 @@ def test_six_concrete_tile_impls_hold_existing_tasks_and_only_compute_in_run():
         DownTileImpl,
     )
     assert tuple(type(tile.impl) for tile in spec.tiles) == expected
-    assert all(tile.impl.tile_task is not None for tile in spec.tiles)
+    assert all(not hasattr(tile.impl, "tile_task") for tile in spec.tiles)
+    assert all(tile.impl.tensor_bindings for tile in spec.tiles)
+    assert all(not hasattr(tile.impl, "bind_context") for tile in spec.tiles)
     assert len({tile.impl.job_type for tile in spec.tiles}) == 6
     for tile in spec.tiles:
         source = inspect.getsource(type(tile.impl).run)
@@ -213,11 +220,11 @@ def test_moe_lowering_env_resolves_runtime_rows_and_producer_order():
     assert env.rmax == _max_rows(512)
     assert env.tensor_producers["num_tokens_post_pad"] == "align"
     assert env.routed_rows.evaluate({"tensors": {"num_tokens_post_pad": [7 * 128]}}) == 7
-    assert env.upper_bound(VarSpec("routed_rows")) == _max_rows(512)
+    assert env.upper_bound(spec.vars["routed_rows"]) == _max_rows(512)
 
 
 @pytest.mark.parametrize("batch_size", [1, 4, 128, 512, 2048, 4096])
-def test_policy_event_layout_domains_and_execution_steps(batch_size):
+def test_policy_event_layout_domains_and_action_programs(batch_size):
     max_rows = _max_rows(batch_size)
     relaxed_rows = batch_size * 8 // 128 + 129
     expected_q = 1 if batch_size < 4 else 4
@@ -273,29 +280,113 @@ def test_policy_event_layout_domains_and_execution_steps(batch_size):
     assert dynamic.tile("down").scheduled_upper_bounds == (max_rows, 16 // expected_q, 1)
     assert dynamic.persistent_ctas == 148
     assert dynamic.pre_before_wait and dynamic.post_after_run and dynamic.fifo_drain
-    assert dynamic.tile("align").execution_steps == (
-        "pre_notify",
-        "wait",
-        "run",
-        "cta_sync",
-        "runtime_event_init",
-        "post_notify",
+    assert tuple(type(action) for action in dynamic.action_program("align").actions) == (
+        QueuePushAction,
+        WaitAction,
+        SmemEnterAction,
+        ProfileAction,
+        RunAction,
+        ProfileAction,
+        BarrierAction,
+        RuntimeEventInitAction,
+        NotifyAction,
+        SmemExitAction,
     )
-    assert dynamic.tile("down").execution_steps == ("pre_notify", "wait", "run")
-    assert static.tile("align").execution_steps == (
-        "wait",
-        "run",
-        "cta_sync",
-        "runtime_event_init",
-        "post_notify",
+    assert tuple(type(action) for action in dynamic.action_program("down").actions) == (
+        QueuePushAction,
+        WaitAction,
+        SmemEnterAction,
+        ProfileAction,
+        RunAction,
+        ProfileAction,
+        SmemExitAction,
+    )
+    assert tuple(type(action) for action in static.action_program("align").actions) == (
+        WaitAction,
+        SmemEnterAction,
+        ProfileAction,
+        RunAction,
+        ProfileAction,
+        BarrierAction,
+        RuntimeEventInitAction,
+        NotifyAction,
+        SmemExitAction,
     )
     assert dynamic.protocol is not None
     assert (dynamic.protocol.pre_decrement, dynamic.protocol.post_decrement) == (1, 2**16)
     assert dynamic.protocol.scheduler_warp == 7
     normalized = dynamic.normalized_data()
     assert normalized["events"][-1]["runtime_init"]["value"] == runtime_init.value.to_data()
-    assert normalized["tiles"][2]["execution_steps"] == dynamic.tile("align").execution_steps
+    assert normalized["tiles"][2]["actions"] == [
+        type(action).__name__ for action in dynamic.action_program("align").actions
+    ]
     assert normalized["dispatch"][0]["enqueue_upper_bound"] == 148
+    dynamic_down_run = next(
+        action for action in dynamic.action_program("down").actions if isinstance(action, RunAction)
+    )
+    static_down_run = next(
+        action for action in static.action_program("down").actions if isinstance(action, RunAction)
+    )
+    assert (dynamic_down_run.predicate, dynamic_down_run.repeat, dynamic_down_run.index_map) == (
+        "dynamic_or_routed_row",
+        expected_q,
+        "expand_down_n",
+    )
+    assert (static_down_run.predicate, static_down_run.repeat, static_down_run.index_map) == (
+        "dynamic_or_routed_row",
+        1,
+        "expand_down_n",
+    )
+
+
+def test_run_action_fields_are_authoritative_during_physical_lowering():
+    kernel = MegaKernelMOE(config=MEGAKERNEL_MOE_BENCH_CONFIG, world_size=1, profiler_on=False)
+    kernel._compile_batch_size = 4
+    lowerer = kernel._make_dsl_lowerer("dynamic")
+    execution = lowerer.execution
+    region = execution.device_regions[0]
+    programs = []
+    for program in region.tile_programs:
+        if program.tile.name == "down":
+            actions = tuple(
+                replace(action, predicate="invalid_mutated_predicate")
+                if isinstance(action, RunAction)
+                else action
+                for action in program.actions
+            )
+            program = replace(program, actions=actions)
+        programs.append(program)
+    lowerer.execution = replace(
+        execution, device_regions=(replace(region, tile_programs=tuple(programs)),)
+    )
+    kernel._make_dsl_lowerer = lambda scheduler: lowerer
+
+    with pytest.raises(DiagnosticError, match="invalid_mutated_predicate"):
+        kernel.get_module("dynamic")
+
+    kernel = MegaKernelMOE(config=MEGAKERNEL_MOE_BENCH_CONFIG, world_size=1, profiler_on=False)
+    kernel._compile_batch_size = 4
+    lowerer = kernel._make_dsl_lowerer("dynamic")
+    execution = lowerer.execution
+    region = execution.device_regions[0]
+    programs = tuple(
+        replace(
+            program,
+            actions=tuple(
+                action for action in program.actions if not isinstance(action, SmemExitAction)
+            ),
+        )
+        if program.tile.name == "down"
+        else program
+        for program in region.tile_programs
+    )
+    lowerer.execution = replace(
+        execution, device_regions=(replace(region, tile_programs=programs),)
+    )
+    kernel._make_dsl_lowerer = lambda scheduler: lowerer
+
+    with pytest.raises(DiagnosticError, match="open shared-memory scope"):
+        kernel.get_module("dynamic")
 
 
 def test_physical_wait_notify_scopes_and_dynamic_rules_are_policy_owned():
@@ -390,8 +481,8 @@ def test_dynamic_seed_queue_and_dispatch_mapping(batch_size):
 
 def test_unfused_collapses_gate_up_coordinates_only_in_physical_plan():
     spec = build_moe_graph(MEGAKERNEL_MOE_BENCH_CONFIG, 512)
-    assert _tile(spec, "gate_up_silu").notifies[0].coord_map(7, 0, 0) == (7,)
-    assert _tile(spec, "down").waits[0].coord_map(7, 0, 0) == (7,)
+    assert _tile(spec, "gate_up_silu").notifies[0][1](7, 0, 0) == (7,)
+    assert _tile(spec, "down").waits[0][1](7, 0, 0) == (7,)
     plan = MoeLowerer(megakernel_dsl.UnfusedPolicy()).lower(spec)
     assert plan.tile("gate_up_silu").notifies[0].coord == (ConstExpr(0),)
     assert plan.tile("down").waits[0].coord == (ConstExpr(0),)
@@ -404,7 +495,7 @@ def test_native_and_moe_validators_reject_invalid_graphs():
         spec.validate()
 
     spec = build_moe_graph(MEGAKERNEL_MOE_BENCH_CONFIG, 128)
-    _tile(spec, "topk").waits[0] = tvm_dsl.DependencySpec(spec.events["gating_done"], (0, 0))
+    _tile(spec, "topk").waits[0] = (spec.events["gating_done"], (0, 0))
     with pytest.raises(ValueError, match="rank"):
         spec.validate()
 
@@ -432,7 +523,7 @@ def test_validator_rejects_impure_callable_foreign_tensor_and_non_impl():
         state["value"] += 1
         return (state["value"],)
 
-    _tile(spec, "topk").waits[0] = tvm_dsl.DependencySpec(spec.events["gating_done"], impure)
+    _tile(spec, "topk").waits[0] = (spec.events["gating_done"], impure)
     with pytest.raises(ValueError, match="pure deterministic"):
         spec.validate()
 
@@ -462,7 +553,7 @@ def test_moe_env_rejects_invalid_runtime_binding_and_upper_bound():
 
     spec = build_moe_graph(MEGAKERNEL_MOE_BENCH_CONFIG, 128)
     _tile(spec, "gate_up_silu").tile_num = (VarSpec("unknown"), 12, 1)
-    with pytest.raises(ValueError, match="routed_rows"):
+    with pytest.raises(ValueError, match="outside this kernel"):
         MoeLoweringEnv(spec)
 
     spec = build_moe_graph(MEGAKERNEL_MOE_BENCH_CONFIG, 128)
@@ -483,38 +574,10 @@ def test_policy_rejects_coalescing_and_queue_capacity_regressions():
         MoeLowerer(StaticPolicy(queue_capacity=1)).lower(spec)
 
 
-def test_normalized_plan_rejects_execution_runtime_init_and_terminal_drain_regressions():
+def test_normalized_plan_rejects_runtime_init_and_terminal_drain_regressions():
     plan = make_moe_plan(MEGAKERNEL_MOE_BENCH_CONFIG, 512, "dynamic")
     align = plan.tile("align")
-    invalid = _replace_plan_tile(
-        plan,
-        "align",
-        execution_steps=(
-            "wait",
-            "pre_notify",
-            "run",
-            "cta_sync",
-            "runtime_event_init",
-            "post_notify",
-        ),
-    )
-    with pytest.raises(ValueError, match="pre-notification"):
-        invalid.validate()
-
-    invalid = _replace_plan_tile(
-        plan,
-        "align",
-        execution_steps=(
-            "pre_notify",
-            "run",
-            "wait",
-            "cta_sync",
-            "runtime_event_init",
-            "post_notify",
-        ),
-    )
-    with pytest.raises(ValueError, match="wait before"):
-        invalid.validate()
+    assert plan.pre_before_wait
 
     with pytest.raises(ValueError, match="derived from dispatch"):
         replace(plan, queue_upper_bound=plan.queue_upper_bound + 1).validate()

@@ -28,20 +28,6 @@ _EVENT_ATTRS = {
     "gate_up_done": "evt_group_gemm_gate_up",
     "down_dispatch_done": "evt_group_gemm_down",
 }
-_STEP_PRE_NOTIFY = "pre_notify"
-_STEP_WAIT = "wait"
-_STEP_RUN = "run"
-_STEP_CTA_SYNC = "cta_sync"
-_STEP_RUNTIME_EVENT_INIT = "runtime_event_init"
-_STEP_POST_NOTIFY = "post_notify"
-_EXECUTION_STEPS = {
-    _STEP_PRE_NOTIFY,
-    _STEP_WAIT,
-    _STEP_RUN,
-    _STEP_CTA_SYNC,
-    _STEP_RUNTIME_EVENT_INIT,
-    _STEP_POST_NOTIFY,
-}
 _PACKED_INDEX_LIMITS = (MAX_M_IDX, MAX_N_IDX, MAX_K_IDX)
 _SCOPE_WIDTHS = {
     "thread": 1,

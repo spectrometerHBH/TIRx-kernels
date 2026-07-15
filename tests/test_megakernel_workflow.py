@@ -113,13 +113,11 @@ def test_stage1_yaml_tensor_roles_and_flow_match_native_graph():
 def test_stage1_yaml_five_edges_and_coordinate_ranks_match_native_graph():
     plan = _load_plan()
     spec = build_moe_graph(MEGAKERNEL_MOE_BENCH_CONFIG, 128)
-    notifiers = {
-        id(dependency.event): tile.name for tile in spec.tiles for dependency in tile.notifies
-    }
+    notifiers = {id(event): tile.name for tile in spec.tiles for event, _ in tile.notifies}
     graph_edges = [
-        (notifiers[id(dependency.event)], tile.name, dependency.event.name)
+        (notifiers[id(event)], tile.name, event.name)
         for tile in spec.tiles
-        for dependency in tile.waits
+        for event, _ in tile.waits
     ]
     planned_edges = [
         (dependency["producer"], dependency["consumer"], dependency["event"])

@@ -14,7 +14,8 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""Concrete MoE adapters for logical megakernel tiles."""
+
+"""Concrete MoE TileImpls that directly extend the existing physical tasks."""
 
 from __future__ import annotations
 
@@ -30,229 +31,269 @@ from tirx_kernels.megakernel.tile_tasks import (
     TopkSoftmaxTile,
 )
 from tirx_kernels.megakernel.utils.config import JobType, ProfileEventType
-from tvm.megakernel.dsl import TileImpl
+from tvm.megakernel.dsl import TensorSpec, TileImpl
 
 
 class _MoeTileImpl(TileImpl):
-    """Bind one existing tile task to the native logical ``TileImpl`` API."""
+    """Shared logical metadata for one directly inherited physical tile."""
 
     implementation: str
     job_type: int
     profile_event_type: ProfileEventType
-    owner_attribute: str
 
-    def __init__(self, tile_task):
-        super().__init__()
-        self.tile_task = tile_task
-        self._owner = None
-        self._context = None
-
-    def register(self, owner):
-        """Register the held task with the existing megakernel lifecycle."""
-
-        self._owner = owner
-        registered = owner._add_tile(self.tile_task, self.profile_event_type)
-        setattr(owner, self.owner_attribute, registered)
-
-    def bind_context(self, context: Mapping[str, Any]):
-        self._context = context
-
-    def _bound(self):
-        if self._owner is None or self._context is None:
-            raise RuntimeError(f"{type(self).__name__} must be bound before run()")
-        return self._owner, self._context
+    def _init_logical(
+        self,
+        config: Mapping[str, Any],
+        tensor_bindings: Mapping[str, TensorSpec | tuple[TensorSpec, bool]],
+    ) -> None:
+        self.config = dict(config)
+        self.tensor_bindings = dict(tensor_bindings)
 
 
-class GatingTileImpl(_MoeTileImpl):
+class GatingTileImpl(GemmTile, _MoeTileImpl):
     implementation = "gating"
     job_type = JobType.MOE_GATING.value
     profile_event_type = ProfileEventType.MOE_GATING
-    owner_attribute = "gate"
 
-    def __init__(self, config: Mapping[str, Any]):
-        super().__init__(
-            GemmTile(
-                config["NUM_EXPERTS"],
-                config["HIDDEN_SIZE"],
-                "float16",
-                "float16",
-                config["GATING_SPLIT_K_FACTOR"],
-                128,
-                128,
-                use_tma_reduce=True,
-            )
+    def __init__(self, config: Mapping[str, Any], tensors: Mapping[str, TensorSpec]):
+        GemmTile.__init__(
+            self,
+            config["NUM_EXPERTS"],
+            config["HIDDEN_SIZE"],
+            "float16",
+            "float16",
+            config["GATING_SPLIT_K_FACTOR"],
+            128,
+            128,
+            use_tma_reduce=True,
+        )
+        self._init_logical(
+            config,
+            {
+                "hidden_state": tensors["hidden_state"],
+                "gate_weight": tensors["gate_weight"],
+                "gating_output": tensors["gating_output"],
+            },
         )
 
     def run(self, m_idx, n_idx, k_idx):
-        owner, context = self._bound()
-        owner.run_tile(
-            self.tile_task,
+        GemmTile.run(
+            self,
             m_idx,
             n_idx,
             k_idx,
-            context["hidden_state"],
-            context["gate_weight"],
-            context["gating_output"],
-            owner.profiler,
+            self.hidden_state,
+            self.gate_weight,
+            self.gating_output,
+            self.profiler,
         )
 
 
-class TopkTileImpl(_MoeTileImpl):
+class TopkTileImpl(TopkSoftmaxTile, _MoeTileImpl):
     implementation = "topk"
     job_type = JobType.MOE_TOPK_SOFTMAX.value
     profile_event_type = ProfileEventType.TOPK_SOFTMAX
-    owner_attribute = "topk_softmax"
 
-    def __init__(self, config: Mapping[str, Any], batch_size: int):
-        super().__init__(
-            TopkSoftmaxTile(
-                config["NUM_EXPERTS"], batch_size, config["NUM_EXPERTS_PER_TOK"], dtype="float32"
-            )
+    def __init__(
+        self, config: Mapping[str, Any], batch_size: int, tensors: Mapping[str, TensorSpec]
+    ):
+        TopkSoftmaxTile.__init__(
+            self, config["NUM_EXPERTS"], batch_size, config["NUM_EXPERTS_PER_TOK"], dtype="float32"
+        )
+        self._init_logical(
+            config,
+            {
+                "gating_output": tensors["gating_output"],
+                "topk_weights": tensors["topk_weights"],
+                "topk_indices": tensors["topk_indices"],
+            },
         )
 
     def run(self, m_idx, n_idx, k_idx):
-        owner, context = self._bound()
-        owner.run_tile(
-            self.tile_task,
+        TopkSoftmaxTile.run(
+            self,
             m_idx,
             n_idx,
             k_idx,
-            context["gating_output"],
-            context["topk_weights"],
-            context["topk_indices"],
+            self.gating_output,
+            self.topk_weights,
+            self.topk_indices,
             renormalize=False,
         )
 
 
-class AlignTileImpl(_MoeTileImpl):
+class AlignTileImpl(MOEAlignTile, _MoeTileImpl):
     implementation = "align"
     job_type = JobType.MOE_ALIGN.value
     profile_event_type = ProfileEventType.MOE_ALIGN
-    owner_attribute = "align"
 
-    def __init__(self, config: Mapping[str, Any], batch_size: int):
+    def __init__(
+        self, config: Mapping[str, Any], batch_size: int, tensors: Mapping[str, TensorSpec]
+    ):
         numel = config["NUM_EXPERTS_PER_TOK"] * batch_size
-        super().__init__(MOEAlignTile(config["NUM_EXPERTS"], numel, 128, pad_sorted_token_ids=True))
+        MOEAlignTile.__init__(self, config["NUM_EXPERTS"], numel, 128, pad_sorted_token_ids=True)
+        self._init_logical(
+            config,
+            {
+                "topk_indices": (tensors["topk_indices"], True),
+                "sorted_token_ids": tensors["sorted_token_ids"],
+                "expert_ids": tensors["expert_ids"],
+                "num_tokens_post_pad": tensors["num_tokens_post_pad"],
+                "cumsum_buffer": tensors["cumsum_buffer"],
+                "num_valid_tokens": tensors["num_valid_tokens"],
+            },
+        )
 
     def run(self, m_idx, n_idx, k_idx):
-        owner, context = self._bound()
-        owner.run_tile(
-            self.tile_task,
+        MOEAlignTile.run(
+            self,
             m_idx,
             n_idx,
             k_idx,
-            context["topk_indices_flat"],
-            context["sorted_token_ids"],
-            context["expert_ids"],
-            context["num_tokens_post_pad"],
-            context["cumsum_buffer"],
-            context["num_valid_tokens"],
+            self.topk_indices,
+            self.sorted_token_ids,
+            self.expert_ids,
+            self.num_tokens_post_pad,
+            self.cumsum_buffer,
+            self.num_valid_tokens,
         )
 
 
-class CountSortTileImpl(_MoeTileImpl):
+class CountSortTileImpl(CountAndSortExpertTokens, _MoeTileImpl):
     implementation = "count_sort"
     job_type = JobType.MOE_COUNT_AND_SORT.value
     profile_event_type = ProfileEventType.COUNT_AND_SORT
-    owner_attribute = "count_and_sort_expert_tokens"
 
-    def __init__(self, config: Mapping[str, Any], batch_size: int):
+    def __init__(
+        self, config: Mapping[str, Any], batch_size: int, tensors: Mapping[str, TensorSpec]
+    ):
         numel = config["NUM_EXPERTS_PER_TOK"] * batch_size
-        super().__init__(
-            CountAndSortExpertTokens(numel, config["HIDDEN_SIZE"], config["NUM_EXPERTS_PER_TOK"])
+        CountAndSortExpertTokens.__init__(
+            self, numel, config["HIDDEN_SIZE"], config["NUM_EXPERTS_PER_TOK"]
+        )
+        self._init_logical(
+            config,
+            {
+                "topk_indices": (tensors["topk_indices"], True),
+                "sorted_token_ids": tensors["sorted_token_ids"],
+                "cumsum_buffer": tensors["cumsum_buffer"],
+                "hidden_state": tensors["hidden_state"],
+                "reordered_hidden_state": tensors["reordered_hidden_state"],
+            },
         )
 
     def run(self, m_idx, n_idx, k_idx):
-        owner, context = self._bound()
-        owner.run_tile(
-            self.tile_task,
+        CountAndSortExpertTokens.run(
+            self,
             m_idx,
             n_idx,
             k_idx,
-            context["topk_indices_flat"],
-            context["sorted_token_ids"],
-            context["cumsum_buffer"],
-            context["hidden_state"],
-            context["reordered_hidden_state"],
+            self.topk_indices,
+            self.sorted_token_ids,
+            self.cumsum_buffer,
+            self.hidden_state,
+            self.reordered_hidden_state,
         )
 
 
-class GateUpSiluTileImpl(_MoeTileImpl):
+class GateUpSiluTileImpl(GroupGEMMSiluTile, _MoeTileImpl):
     implementation = "gate_up_silu"
     job_type = JobType.MOE_GROUP_GEMM_GATE_UP_SILU.value
     profile_event_type = ProfileEventType.GROUP_GEMM_GATE_UP_SILU
-    owner_attribute = "group_gemm_gate_up_silu"
 
-    def __init__(self, config: Mapping[str, Any], batch_size: int):
+    def __init__(
+        self, config: Mapping[str, Any], batch_size: int, tensors: Mapping[str, TensorSpec]
+    ):
         numel = config["NUM_EXPERTS_PER_TOK"] * batch_size
-        super().__init__(
-            GroupGEMMSiluTile(
-                config["INTERMEDIATE_SIZE"] * 2,
-                config["HIDDEN_SIZE"],
-                config["NUM_EXPERTS"],
-                config["NUM_EXPERTS_PER_TOK"],
-                numel,
-                "float16",
-                "float16",
-                low_batch=batch_size < 2048,
-            )
+        GroupGEMMSiluTile.__init__(
+            self,
+            config["INTERMEDIATE_SIZE"] * 2,
+            config["HIDDEN_SIZE"],
+            config["NUM_EXPERTS"],
+            config["NUM_EXPERTS_PER_TOK"],
+            numel,
+            "float16",
+            "float16",
+            low_batch=batch_size < 2048,
+        )
+        self._init_logical(
+            config,
+            {
+                "reordered_hidden_state": tensors["reordered_hidden_state"],
+                "gate_up_weight": tensors["gate_up_weight"],
+                "silu_mul_output": tensors["silu_mul_output"],
+                "expert_ids": tensors["expert_ids"],
+                "topk_weights": (tensors["topk_weights"], True),
+                "sorted_token_ids": tensors["sorted_token_ids"],
+                "num_valid_tokens": tensors["num_valid_tokens"],
+            },
         )
 
     def run(self, m_idx, n_idx, k_idx):
-        owner, context = self._bound()
-        owner.run_tile(
-            self.tile_task,
+        GroupGEMMSiluTile.run(
+            self,
             m_idx,
             n_idx,
             k_idx,
-            context["reordered_hidden_state"],
-            context["gate_up_weight"],
-            context["silu_mul_output"],
-            context["expert_ids"],
-            context["topk_weights_flat"],
-            context["sorted_token_ids"],
-            context["num_valid_tokens"],
-            owner.profiler,
+            self.reordered_hidden_state,
+            self.gate_up_weight,
+            self.silu_mul_output,
+            self.expert_ids,
+            self.topk_weights,
+            self.sorted_token_ids,
+            self.num_valid_tokens,
+            self.profiler,
         )
 
 
-class DownTileImpl(_MoeTileImpl):
+class DownTileImpl(GroupGEMMTileSM100, _MoeTileImpl):
     implementation = "down"
     job_type = JobType.MOE_GROUP_GEMM_DOWN.value
     profile_event_type = ProfileEventType.GROUP_GEMM_DOWN
-    owner_attribute = "group_gemm_down"
 
-    def __init__(self, config: Mapping[str, Any], batch_size: int):
+    def __init__(
+        self, config: Mapping[str, Any], batch_size: int, tensors: Mapping[str, TensorSpec]
+    ):
         numel = config["NUM_EXPERTS_PER_TOK"] * batch_size
-        super().__init__(
-            GroupGEMMTileSM100(
-                config["HIDDEN_SIZE"],
-                config["INTERMEDIATE_SIZE"],
-                config["NUM_EXPERTS"],
-                config["NUM_EXPERTS_PER_TOK"],
-                numel,
-                "float16",
-                "float16",
-                acc_output=True,
-                low_batch=batch_size < 2048,
-            )
+        GroupGEMMTileSM100.__init__(
+            self,
+            config["HIDDEN_SIZE"],
+            config["INTERMEDIATE_SIZE"],
+            config["NUM_EXPERTS"],
+            config["NUM_EXPERTS_PER_TOK"],
+            numel,
+            "float16",
+            "float16",
+            acc_output=True,
+            low_batch=batch_size < 2048,
+        )
+        self._init_logical(
+            config,
+            {
+                "silu_mul_output": tensors["silu_mul_output"],
+                "down_weight": tensors["down_weight"],
+                "topk_reduce_output": tensors["topk_reduce_output"],
+                "expert_ids": tensors["expert_ids"],
+                "topk_weights": (tensors["topk_weights"], True),
+                "sorted_token_ids": tensors["sorted_token_ids"],
+                "num_valid_tokens": tensors["num_valid_tokens"],
+            },
         )
 
     def run(self, m_idx, n_idx, k_idx):
-        owner, context = self._bound()
-        owner.run_tile(
-            self.tile_task,
+        GroupGEMMTileSM100.run(
+            self,
             m_idx,
             n_idx,
             k_idx,
-            context["silu_mul_output"],
-            context["down_weight"],
-            context["topk_reduce_output"],
-            context["expert_ids"],
-            context["topk_weights_flat"],
-            context["sorted_token_ids"],
-            context["num_valid_tokens"],
-            owner.profiler,
+            self.silu_mul_output,
+            self.down_weight,
+            self.topk_reduce_output,
+            self.expert_ids,
+            self.topk_weights,
+            self.sorted_token_ids,
+            self.num_valid_tokens,
+            self.profiler,
         )
 
 

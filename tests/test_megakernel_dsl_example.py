@@ -41,9 +41,9 @@ def _shape_signature(shape):
 
 def _dependency_signature(dependency):
     samples = ((0, 0, 0), (1, 2, 3), (7, 5, 3))
-    coord_map = dependency.coord_map
+    event, coord_map = dependency
     coordinates = tuple(tuple(coord_map(*sample)) for sample in samples)
-    return (dependency.event.name, coordinates, dependency.attrs)
+    return (event.name, coordinates)
 
 
 def _graph_signature(spec: KernelSpec):

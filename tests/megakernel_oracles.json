@@ -1,0 +1,105 @@
+{
+  "format_version": 1,
+  "cuda_normalization": "replace anonymous i_N/v_N loop symbols with generated_symbol, then collapse whitespace",
+  "oracles": {
+    "moe": {
+      "source_commit": "f25752a34e5f5e56cd89e4fd3af586f01880f1b5",
+      "cases": {
+        "moe_b1_static_prof0": {
+          "structural_hash": 17375017039220870605,
+          "cuda_sha256": "9bfcba0d69b5a45db11c96bfc1414862b84d4c1d653bc08a6cb1d77fd1003d0d"
+        },
+        "moe_b1_unfused_prof0": {
+          "structural_hash": 8913099662052713736,
+          "cuda_sha256": "c98b2b89a184ac3bf00889708f8f8b45c93529a4e72237c25e1de187ba1f5283"
+        },
+        "moe_b1_dynamic_prof0": {
+          "structural_hash": 1118309990331659822,
+          "cuda_sha256": "08ac857338abab40b088f3d544442158cdd7d19c955b95e8b3fa4eb88ff61553"
+        },
+        "moe_b4_static_prof0": {
+          "structural_hash": 17615200085075230291,
+          "cuda_sha256": "6831b04efeed6e77c5818381495607322b645168121c7960e559680323b258bf"
+        },
+        "moe_b4_unfused_prof0": {
+          "structural_hash": 833136041602003382,
+          "cuda_sha256": "0ef7ed2b909ca5df4418cf1d63ade01289f4e105f00675b97f3dd1e3ed868224"
+        },
+        "moe_b4_dynamic_prof0": {
+          "structural_hash": 8572671933842303246,
+          "cuda_sha256": "1e12d9a8f579073c1719c752a9bf5a760d6f8936c599ea05d6ffa31fe554c471"
+        },
+        "moe_b4_dynamic_prof1": {
+          "structural_hash": 6808293951726445965,
+          "cuda_sha256": "d1eb0e08814f09f681f7d76e4407ec76a13d8e895632c921f5cc81a34c2a0ee4"
+        },
+        "moe_b128_static_prof0": {
+          "structural_hash": 6444226058001169798,
+          "cuda_sha256": "8df72232b8afa418e037cda3626b6b3e71832734b77dbc6bc09ea84667798b2a"
+        },
+        "moe_b128_unfused_prof0": {
+          "structural_hash": 1487263949787469359,
+          "cuda_sha256": "de49d2cdac9d2dfc84c56d569979dcbaa54c0bd42a0e5df161e8a5f95ceb7595"
+        },
+        "moe_b128_dynamic_prof0": {
+          "structural_hash": 2384393727946613789,
+          "cuda_sha256": "6ff45a1d6b421a45d5f16516c20d8e41dce560636b08d067523a1bdf3b01cb51"
+        },
+        "moe_b512_static_prof0": {
+          "structural_hash": 9739951078479111214,
+          "cuda_sha256": "1108a1cbd91f19108fd25f0464ebe44c4c392ab9968b22d40abf4907b5871182"
+        },
+        "moe_b512_unfused_prof0": {
+          "structural_hash": 613606752441411044,
+          "cuda_sha256": "8974adeb46205a3b38521bf0870e8563bc8d1a0a3b278f67596d27e57b896e76"
+        },
+        "moe_b512_dynamic_prof0": {
+          "structural_hash": 9985596675323990710,
+          "cuda_sha256": "e4501033944876fb4363fe52ab89731feb9fd62b211494ca6f684e6a9520e392"
+        },
+        "moe_b2048_static_prof0": {
+          "structural_hash": 438538267467046613,
+          "cuda_sha256": "fa4b3d3bf9a2be63f5d05b37e5ca15f4dda974efad22bebf1e53348e16c1358c"
+        },
+        "moe_b2048_unfused_prof0": {
+          "structural_hash": 4010697905830394963,
+          "cuda_sha256": "6650bd58c2423d51e464281c33c02d486807f43f1d731e4d57348a9e5da480f7"
+        },
+        "moe_b2048_dynamic_prof0": {
+          "structural_hash": 1294152823767619338,
+          "cuda_sha256": "105541c7062631f5cbb8c8ac64be5ef9b41da5ad1e7470511f6577b88989f975"
+        },
+        "moe_b4096_static_prof0": {
+          "structural_hash": 7324852830110931753,
+          "cuda_sha256": "4b85454100da61ad3921bf4702ff69191dad12b41fcc98502ff8427c971d4ba8"
+        },
+        "moe_b4096_unfused_prof0": {
+          "structural_hash": 4500838118815992554,
+          "cuda_sha256": "5dd49fcfefe8c1ab4d14c50b4bdb405193340d46c8044840144b1d06c5ccde3e"
+        },
+        "moe_b4096_dynamic_prof0": {
+          "structural_hash": 18346705005752439803,
+          "cuda_sha256": "7e0297eddec8a5827cb2b19293d5bcb5481c76f5e7bc73dd81a934589e3201ac"
+        }
+      }
+    },
+    "gemm_comm": {
+      "source_commit": "1fba0e545c769ab306c0cc2ad543e35f492bc93b",
+      "notes": "The static AllGather scheduler was frozen from the pre-action-program manual builder; its tile implementation is the source-commit implementation.",
+      "cases": {
+        "allgather_gemm_static": {
+          "structural_hash": 10770203809441741755,
+          "cuda_sha256": "8dcd022cf7c78307296eb1241584db5c6bfe90368f3940c83c6418d80da01cc0"
+        },
+        "allgather_gemm_dynamic": {
+          "structural_hash": 12857973811533028797,
+          "cuda_sha256": "4697d39e61bee07911746dac8e783ad2dd56a47f9adfd98261828e3299e1d604"
+        },
+        "gemm_reduce_scatter_static": {
+          "structural_hash": 4415136087932461434,
+          "cuda_sha256": "b9848d8c551416fa31b12dca630fd4aa7e864dd40d0e2dcf6e8b7740c9e148e7"
+        }
+      }
+    }
+  }
+}
