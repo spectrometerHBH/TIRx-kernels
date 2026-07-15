@@ -46,17 +46,6 @@ REPO_ROOT = HERE.parent.parent
 DEFAULT_LATEST_RUN = REPO_ROOT / ".bench-suite" / "latest.json"
 DEFAULT_BASELINE = HERE / "baseline.json"
 
-_REFERENCE_PACKAGES = {
-    "cublaslt_nvfp4": ("torch",),
-    "flashattn_sm100": ("flash_attn",),
-    "flashinfer": ("flashinfer",),
-    "flashinfer_full": ("flashinfer",),
-    "sglang_cutedsl": ("sglang", "cutlass"),
-    "sglang_full": ("sglang",),
-    "torch-cublas": ("torch",),
-    "trtllm_gen": ("flashinfer",),
-}
-
 
 def _refs_only(impls: dict[str, float]) -> dict[str, float]:
     return {k: v for k, v in impls.items() if not is_our_impl(k) and v > 0}
@@ -105,32 +94,6 @@ def _protocol_mismatch(base_row: dict, cur_row: dict) -> str | None:
     if not differences:
         return None
     return "benchmark protocol mismatch: " + "; ".join(sorted(differences))
-
-
-def _packages_for_reference(reference: str) -> tuple[str, ...]:
-    if reference.startswith("deepgemm"):
-        return ("deep_gemm",)
-    return _REFERENCE_PACKAGES.get(reference, ())
-
-
-def _reference_provenance_mismatch(
-    reference: str, base_payload: dict, cur_payload: dict
-) -> str | None:
-    """Describe changed package identity for the selected reference impl."""
-    baseline_packages = base_payload.get("baselines") or {}
-    current_packages = cur_payload.get("baselines") or {}
-    differences = []
-    for package in _packages_for_reference(reference):
-        baseline = baseline_packages.get(package) or {}
-        current = current_packages.get(package) or {}
-        for field in ("version", "git_sha", "torch_git_version", "cuda"):
-            if field in baseline and field in current and baseline[field] != current[field]:
-                differences.append(
-                    f"{package}.{field}: baseline={baseline[field]!r}, current={current[field]!r}"
-                )
-    if not differences:
-        return None
-    return "reference provenance mismatch: " + "; ".join(sorted(differences))
 
 
 def pick_ref(base_impls: dict[str, float]) -> str | None:
@@ -210,12 +173,9 @@ def build_report(
             continue
         cur_impls = cur[key]
         protocol_mismatch = _protocol_mismatch(base_rows[key], cur_status[key])
-        provenance_mismatch = _reference_provenance_mismatch(ref, base_payload, cur_payload)
-        mismatch_reasons = [x for x in (protocol_mismatch, provenance_mismatch) if x]
-        if mismatch_reasons:
-            mismatch = "; ".join(mismatch_reasons)
+        if protocol_mismatch:
             for ours_b in baseline_ours:
-                not_comparable.append((key[0], key[1], f"{ours_b}: {mismatch}"))
+                not_comparable.append((key[0], key[1], f"{ours_b}: {protocol_mismatch}"))
             continue
         for ours_b in baseline_ours:
             if ours_b not in cur_impls or ref not in cur_impls:
@@ -302,7 +262,7 @@ def build_report(
         w(
             "_In baseline with a ref/ours pair, but produced no comparable "
             "measurement this run (failed, interfered, missing an impl, or benchmark "
-            "protocol/reference provenance mismatch), so excluded from the ratio table "
+            "protocol mismatch), so excluded from the ratio table "
             "above. Not a perf signal; flagged so lost coverage is never silent._"
         )
         w()

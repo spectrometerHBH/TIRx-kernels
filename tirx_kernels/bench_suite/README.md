@@ -152,8 +152,7 @@ remain in the run JSON for variance and outlier inspection.
   `baseline.json`'s ours + ref impls).
 - Baseline and current rows must use the same recorded benchmark protocol
   (including rounds, aggregation, timer, budgets, cooldown, and implementation
-  order when those fields are available) and matching package provenance for
-  the selected reference implementation. Mismatches are reported as **not
+  order when those fields are available). Mismatches are reported as **not
   comparable**, never as performance regressions or improvements.
 
 ## Outputs

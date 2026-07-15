@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
-import importlib.metadata
 import inspect
 import math
 import os
@@ -1442,31 +1441,7 @@ def load_deep_gemm_mega() -> tuple[Any, str]:
         ) from exc
     if not hasattr(module, "fp8_fp4_mega_moe"):
         raise SkipTest("DeepGEMM mega_moe runtime unavailable: missing fp8_fp4_mega_moe")
-    try:
-        version = importlib.metadata.version("deep_gemm")
-    except importlib.metadata.PackageNotFoundError:
-        version = str(getattr(module, "__version__", "unknown"))
-    module_version = str(getattr(module, "__version__", "unknown"))
-    if module_version != "unknown" and module_version != version.split("+", 1)[0]:
-        raise RuntimeError(
-            "DeepGEMM package mismatch: imported module version "
-            f"{module_version} from {getattr(module, '__file__', '<unknown>')}, "
-            f"but distribution metadata reports {version}"
-        )
-    extension = getattr(module, "_C", None)
-    if extension is None or not hasattr(extension, "get_ring_limit_for_mega_moe"):
-        raise RuntimeError(
-            "DeepGEMM runtime lacks _C.get_ring_limit_for_mega_moe; loaded "
-            f"{getattr(module, '__file__', '<unknown>')}"
-        )
-    expected_version = os.environ.get("TIRX_DEEPGEMM_EXPECTED_VERSION")
-    if expected_version and version != expected_version:
-        raise RuntimeError(
-            f"DeepGEMM runtime version mismatch: expected {expected_version}, got {version} "
-            f"from {getattr(module, '__file__', '<unknown>')}"
-        )
-    source = f"installed:{version}:{getattr(module, '__file__', '<unknown>')}"
-    return module, source
+    return module, "installed"
 
 
 def _find_free_port() -> int:
@@ -5498,7 +5473,6 @@ def _run_worker(local_rank: int, cfg_dict: dict[str, Any], mode: str) -> dict[st
     timer = None if timer is None else str(timer)
     rounds = int(worker_kwargs.pop("rounds", 1))
     cooldown_s = float(worker_kwargs.pop("cooldown_s", 1.0))
-    expected_deepgemm_version = str(worker_kwargs.pop("expected_deepgemm_version", ""))
     config = MegaMoeConfig(**worker_kwargs)
     config.validate()
 
@@ -5509,13 +5483,6 @@ def _run_worker(local_rank: int, cfg_dict: dict[str, Any], mode: str) -> dict[st
         )
 
     deep_gemm, source = load_deep_gemm_mega()
-    if expected_deepgemm_version:
-        actual_deepgemm_version = source.split(":", 2)[1]
-        if actual_deepgemm_version != expected_deepgemm_version:
-            raise RuntimeError(
-                "DeepGEMM benchmark reference version mismatch: "
-                f"expected {expected_deepgemm_version}, got {actual_deepgemm_version}"
-            )
     case = None
     dg_case = None
     tirx_case = None

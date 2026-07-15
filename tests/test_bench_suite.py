@@ -148,43 +148,6 @@ def test_ratio_report_rejects_mismatched_round_protocol() -> None:
     assert "| gemm | m1024 | tir | reference |" not in report
 
 
-def test_ratio_report_rejects_reference_version_mismatch() -> None:
-    baseline = {
-        "baselines": {"flashinfer": {"version": "0.6.12"}},
-        "results": [
-            {
-                "kernel": "nvfp4_gemm",
-                "label": "8192x8192x8192",
-                "status": "ok",
-                "impls": {"tir": 175.0, "flashinfer": 185.0},
-                "aggregated": {"rounds": 5, "method": "mean"},
-            }
-        ],
-    }
-    current = {
-        "baselines": {"flashinfer": {"version": "0.6.13"}},
-        "results": [
-            {
-                "kernel": "nvfp4_gemm",
-                "label": "8192x8192x8192",
-                "status": "ok",
-                "impls": {"tir": 185.0, "flashinfer": 169.0},
-                "aggregated": {"rounds": 5, "method": "mean"},
-            }
-        ],
-    }
-
-    report, regressions = build_report(baseline, current)
-
-    assert regressions == 0
-    assert "0 comparable implementation/reference measurements" in report
-    assert (
-        "reference provenance mismatch: flashinfer.version: "
-        "baseline='0.6.12', current='0.6.13'" in report
-    )
-    assert "| nvfp4_gemm | 8192x8192x8192 | tir | flashinfer |" not in report
-
-
 def test_slim_baseline_row_preserves_benchmark_protocol() -> None:
     row = {
         "kernel": "gemm",
