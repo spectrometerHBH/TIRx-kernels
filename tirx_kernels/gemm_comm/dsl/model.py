@@ -99,6 +99,14 @@ class RankSchedule:
 
 
 @dataclass(frozen=True)
+class RegionEntrypoint:
+    """Backend launch target owned by one execution region."""
+
+    region: str
+    target: str
+
+
+@dataclass(frozen=True)
 class GemmCommPlan:
     """Validated policy output consumed by the workload-specific lowerer."""
 
@@ -110,6 +118,7 @@ class GemmCommPlan:
     rank_schedules: tuple[RankSchedule, ...]
     physical_scheduler: str
     launch_steps: tuple[tuple[str, ...], ...]
+    region_entrypoints: tuple[RegionEntrypoint, ...]
     lowerable: bool = True
     unsupported_reason: str | None = None
 
@@ -131,6 +140,16 @@ class GemmCommPlan:
         if not all(isinstance(extent, int) for extent in tile_num):
             raise TypeError("distributed GEMM plans require compile-time tile extents")
         return tile_num[0] * tile_num[1] * tile_num[2]
+
+    def entrypoint_for(self, region: str) -> str:
+        """Return the unique backend target assigned to ``region`` by policy."""
+
+        targets = [
+            binding.target for binding in self.region_entrypoints if binding.region == region
+        ]
+        if len(targets) != 1:
+            raise ValueError(f"region {region!r} requires exactly one policy-owned entrypoint")
+        return targets[0]
 
     def execution_plan(self) -> ExecutionPlan:
         """Build the shared region, fetch, and tile-action contract."""
@@ -160,13 +179,14 @@ class GemmCommPlan:
                         tile_programs=(
                             TileActionProgram(tiles["gemm"], (RunAction(tiles["gemm"]),)),
                         ),
-                        attrs={"scheduler": self.physical_scheduler},
+                        attrs={
+                            "scheduler": self.physical_scheduler,
+                            "entrypoint": self.entrypoint_for(device_name),
+                        },
                     ),
                 ),
                 host_regions=(
-                    HostRegionPlan(
-                        host_name, (HostCallAction(tiles["allgather"].impl.entrypoint),)
-                    ),
+                    HostRegionPlan(host_name, (HostCallAction(self.entrypoint_for(host_name)),)),
                 ),
                 region_dependencies=(RegionDependencyPlan(host_name, device_name, "launch_order"),),
                 edge_bindings=(EdgeBindingPlan(edge, "fetch_guard", device_name),),
@@ -195,20 +215,24 @@ class GemmCommPlan:
                                 ),
                             ),
                         ),
-                        attrs={"scheduler": self.physical_scheduler},
+                        attrs={
+                            "scheduler": self.physical_scheduler,
+                            "entrypoint": self.entrypoint_for(partial_name),
+                        },
                     ),
                     DeviceRegionPlan(
                         reduce_name,
                         tile_programs=(
                             TileActionProgram(tiles["reduce"], (RunAction(tiles["reduce"]),)),
                         ),
+                        attrs={"entrypoint": self.entrypoint_for(reduce_name)},
                     ),
                 ),
                 host_regions=(
                     HostRegionPlan(
                         transfer_name,
                         (
-                            HostCallAction(tiles["transfer"].impl.entrypoint),
+                            HostCallAction(self.entrypoint_for(transfer_name)),
                             HostEdgeAction((staging_edge,), "completion"),
                         ),
                     ),
@@ -239,11 +263,20 @@ class GemmCommPlan:
             _validate_attrs(event.attrs, owner=f"event {event.name!r} attrs")
         for tile in self.spec.tiles:
             _validate_attrs(tile.attrs, owner=f"tile {tile.name!r} attrs")
-            for attribute in ("execution_space", "entrypoint", "tensor_specs", "run"):
+            for attribute in ("tensor_specs", "run"):
                 if not hasattr(tile.impl, attribute):
                     raise TypeError(
                         f"tile {tile.name!r} has an incompatible distributed GEMM TileImpl"
                     )
+
+        for binding in self.region_entrypoints:
+            if not isinstance(binding, RegionEntrypoint):
+                raise TypeError("region entrypoints must use RegionEntrypoint")
+            if not binding.region or not binding.target:
+                raise ValueError("region entrypoint names and targets must be non-empty")
+        bound_regions = [binding.region for binding in self.region_entrypoints]
+        if len(set(bound_regions)) != len(bound_regions):
+            raise ValueError("execution regions must have exactly one policy-owned entrypoint")
 
         if self.policy_name not in {"static", "dynamic"}:
             raise ValueError(f"unsupported policy {self.policy_name!r}")
@@ -280,7 +313,12 @@ class GemmCommPlan:
         stage_names = {tile.name for tile in self.spec.tiles}
         if set(name for group in self.launch_steps for name in group) != stage_names:
             raise ValueError("launch plan must cover every logical stage")
-        self.execution_plan()
+        execution = self.execution_plan()
+        execution_regions = {
+            region.name for region in (*execution.device_regions, *execution.host_regions)
+        }
+        if set(bound_regions) != execution_regions:
+            raise ValueError("policy-owned entrypoints must cover every execution region exactly")
         return self
 
     def normalized_data(self) -> dict[str, Any]:
@@ -292,6 +330,9 @@ class GemmCommPlan:
             "physical_scheduler": self.physical_scheduler,
             "task_count_per_rank": self.task_count_per_rank,
             "launch_steps": self.launch_steps,
+            "region_entrypoints": {
+                binding.region: binding.target for binding in self.region_entrypoints
+            },
             "lowerable": self.lowerable,
             "unsupported_reason": self.unsupported_reason,
             "rank_schedules": [
@@ -305,4 +346,4 @@ class GemmCommPlan:
         }
 
 
-__all__ = ["GemmCommPlan", "PhysicalTask", "RankSchedule"]
+__all__ = ["GemmCommPlan", "PhysicalTask", "RankSchedule", "RegionEntrypoint"]
