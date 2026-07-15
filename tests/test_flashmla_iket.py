@@ -60,7 +60,7 @@ def test_sparse_flashmla_declares_expected_warp_uniform_ranges(module, config) -
     func = module.get_kernel(**config)
     assert len(func.params) == 8
     script = func.script(show_meta=False)
-    declarations = set(re.findall(r'T\.tirx\.iket\.range_start\("([^"]+)"', script))
+    declarations = set(re.findall(r'T\.cuda\.iket\.range_start\("([^"]+)"', script))
     assert declarations == set(module.IKET_EVENT_NAMES)
     assert "profiler_buffer" not in script
     assert "clock64" not in script

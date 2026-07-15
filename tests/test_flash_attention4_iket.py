@@ -58,7 +58,7 @@ def test_flash_attention4_has_four_argument_abi_and_expected_annotations() -> No
     assert len(func.params) == 4
 
     script = func.script(show_meta=False)
-    declarations = set(re.findall(r'T\.tirx\.iket\.(?:mark|range_start)\("([^"]+)"', script))
+    declarations = set(re.findall(r'T\.cuda\.iket\.(?:mark|range_start)\("([^"]+)"', script))
     assert declarations == set(IKET_EVENT_NAMES)
     assert len(IKET_EVENT_NAMES) == 18
     assert "profiler_buffer" not in script
