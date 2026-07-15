@@ -22,13 +22,7 @@ from enum import Enum
 import tvm
 from tvm.ir.type import PointerType, PrimType
 from tvm.megakernel.dsl import TileImpl
-from tvm.megakernel.transform import (
-    EmissionContext,
-    ExecutionPlan,
-    FetchGuardAction,
-    MegakernelBackend,
-    TileEmitter,
-)
+from tvm.megakernel.transform import ExecutionPlan, FetchGuardStep
 from tvm.script import tirx as T
 from tvm.script.ir_builder import IRBuilder
 from tvm.script.tirx import tile as Tx
@@ -446,47 +440,36 @@ def consumer_fetch(
 # fmt: on
 
 
-class _AllGatherFetchBackend(MegakernelBackend):
-    """Realize the shard-ready edge at its scheduler fetch position."""
-
-    def __init__(self, sem, remote_rank, rank):
-        self.sem = sem
-        self.remote_rank = remote_rank
-        self.rank = rank
-
-    @T.inline
-    def _emit_guard(self):
-        if self.remote_rank != self.rank:
-            self.sem.semaphore_wait(self.remote_rank)
-
-    def emit_action(self, action, context):
-        del context
-        if not isinstance(action, FetchGuardAction):
-            raise ValueError(f"unsupported AllGather fetch action {type(action).__name__}")
-        if action.predicate != "remote_rank != rank":
-            raise ValueError(f"unsupported AllGather fetch predicate {action.predicate!r}")
-        self._emit_guard()
-
-
 @T.meta_class
 class AllGatherFetchProgram:
     """Bind a validated scheduler fetch program to its physical semaphore."""
 
     def __init__(self, execution_plan: ExecutionPlan | None, sem: Semaphore):
         if execution_plan is None:
-            self.context = None
-            self.actions = (FetchGuardAction((), predicate="remote_rank != rank"),)
+            self.steps = (FetchGuardStep(predicate="remote_rank != rank"),)
         else:
-            region = execution_plan.device_regions[0]
-            self.context = EmissionContext(execution_plan, region, "scheduler_fetch")
-            self.actions = region.fetch_program.actions
+            region = next(
+                region for region in execution_plan.device_regions if region.name == "gemm_device"
+            )
+            self.steps = region.fetch_steps
         self.sem = sem
 
     @T.inline
     def emit(self, remote_rank, rank):
-        backend = T.meta_var(_AllGatherFetchBackend(self.sem, remote_rank, rank))
-        emitter = T.meta_var(TileEmitter(backend))
-        emitter.emit_program(self.context, self.actions)
+        self._emit_steps(remote_rank, rank)
+
+    def _emit_steps(self, remote_rank, rank):
+        for step in self.steps:
+            if not isinstance(step, FetchGuardStep):
+                raise ValueError(f"unsupported AllGather fetch step {type(step).__name__}")
+            if step.predicate != "remote_rank != rank":
+                raise ValueError(f"unsupported AllGather fetch predicate {step.predicate!r}")
+            self._emit_guard(remote_rank, rank)
+
+    @T.inline
+    def _emit_guard(self, remote_rank, rank):
+        if remote_rank != rank:
+            self.sem.semaphore_wait(remote_rank)
 
 
 @T.meta_class
@@ -1150,29 +1133,26 @@ def build_kernel(
 
 
 # Runtime orchestration is kept separate from the complete device kernel above.
-# Import it only after every constant and TIRx definition is available so the
-# DSL modules can refer back to this first-class kernel module without a cycle.
-from ._allgather_gemm_runner import (  # noqa: E402
-    CONFIGS,
-    KERNEL_META,
-    _manual_queue_state,
-    _queue_state,
-    get_kernel,
-    prepare_data,
-    run_bench,
-    run_test,
-)
-
-__all__ = [
+# Resolve those exports lazily so spawn can import the runner first without
+# re-entering this module through a runner <-> kernel import cycle.
+_RUNTIME_EXPORTS = {
     "CONFIGS",
     "KERNEL_META",
-    "AllGatherGemmTileImpl",
-    "AllGatherTileImpl",
     "_manual_queue_state",
     "_queue_state",
-    "build_kernel",
     "get_kernel",
     "prepare_data",
     "run_bench",
     "run_test",
-]
+}
+
+
+def __getattr__(name):
+    if name in _RUNTIME_EXPORTS:
+        from . import _allgather_gemm_runner
+
+        return getattr(_allgather_gemm_runner, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+__all__ = ["AllGatherGemmTileImpl", "AllGatherTileImpl", "build_kernel", *sorted(_RUNTIME_EXPORTS)]

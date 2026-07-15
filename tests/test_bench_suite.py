@@ -53,6 +53,28 @@ def test_default_workloads_include_full_megakernel_moe_sweep() -> None:
     assert all("timer" not in w for w in megakernel_moe_workloads)
 
 
+def test_default_workloads_include_all_paired_gemm_comm_modes() -> None:
+    workloads = run.load_workloads(run.DEFAULT_WORKLOADS)
+    gemm_comm = [
+        (workload["kernel"], workload["config"])
+        for workload in workloads
+        if workload["kernel"] in {"allgather_gemm", "gemm_reduce_scatter"}
+    ]
+
+    assert gemm_comm == [
+        ("allgather_gemm", "tp4_m8192_n65536_k8192_fp16_static"),
+        ("allgather_gemm", "tp4_m8192_n65536_k8192_fp16_dynamic"),
+        ("gemm_reduce_scatter", "tp4_m16384_n12288_k49152_fp16_static"),
+    ]
+    selected = [
+        workload
+        for workload in workloads
+        if workload["kernel"] in {"allgather_gemm", "gemm_reduce_scatter"}
+    ]
+    assert all(workload["timer"] == "kineto" for workload in selected)
+    assert all(workload["num_gpus"] == 4 for workload in selected)
+
+
 def test_bench_suite_defaults_to_five_round_arithmetic_mean() -> None:
     row = {"round_samples": {"tirx": [1.0, 2.0, 3.0, 4.0, 100.0]}}
 

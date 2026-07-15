@@ -26,18 +26,13 @@ from typing import Any
 from tvm.megakernel.dsl import KernelSpec, TileSpec
 from tvm.megakernel.transform import (
     DeviceRegionPlan,
-    EdgeBindingPlan,
     ExecutionPlan,
-    FetchGuardAction,
-    HostCallAction,
-    HostEdgeAction,
+    FetchGuardStep,
+    HostCallStep,
     HostRegionPlan,
-    MidBodyPortAction,
-    RegionDependencyPlan,
-    RunAction,
-    SchedulerFetchProgram,
-    TileActionProgram,
-    logical_edges,
+    HostSyncStep,
+    MidBodyPortStep,
+    RunStep,
 )
 
 _FORBIDDEN_LOGICAL_FIELDS = {
@@ -99,28 +94,29 @@ class RankSchedule:
 
 
 @dataclass(frozen=True)
-class RegionEntrypoint:
-    """Backend launch target owned by one execution region."""
-
-    region: str
-    target: str
-
-
-@dataclass(frozen=True)
 class GemmCommPlan:
-    """Validated policy output consumed by the workload-specific lowerer."""
+    """Validated policy output with one authoritative physical execution."""
 
-    spec: KernelSpec
-    workload: str
-    policy_name: str
-    scheduled_tile: str
+    execution: ExecutionPlan
     persistent_clusters: int
     rank_schedules: tuple[RankSchedule, ...]
-    physical_scheduler: str
-    launch_steps: tuple[tuple[str, ...], ...]
-    region_entrypoints: tuple[RegionEntrypoint, ...]
     lowerable: bool = True
     unsupported_reason: str | None = None
+
+    @property
+    def spec(self) -> KernelSpec:
+        return self.execution.kernel
+
+    @property
+    def workload(self) -> str:
+        return self.spec.name
+
+    @property
+    def policy_name(self) -> str:
+        policy = self.execution.attrs.get("policy")
+        if not isinstance(policy, str) or not policy:
+            raise ValueError("distributed GEMM execution has no policy")
+        return policy
 
     @property
     def world_size(self) -> int:
@@ -129,6 +125,29 @@ class GemmCommPlan:
     @property
     def is_dynamic(self) -> bool:
         return self.policy_name == "dynamic"
+
+    @property
+    def scheduled_region(self) -> DeviceRegionPlan:
+        regions = [
+            region for region in self.execution.device_regions if "scheduler" in region.attrs
+        ]
+        if len(regions) != 1:
+            raise ValueError("distributed GEMM requires exactly one scheduled device region")
+        return regions[0]
+
+    @property
+    def physical_scheduler(self) -> str:
+        scheduler = self.scheduled_region.attrs["scheduler"]
+        if not isinstance(scheduler, str) or not scheduler:
+            raise ValueError("scheduled device region has no physical scheduler")
+        return scheduler
+
+    @property
+    def scheduled_tile(self) -> str:
+        programs = self.scheduled_region.tile_programs
+        if len(programs) != 1:
+            raise ValueError("scheduled device region requires exactly one tile program")
+        return programs[0].tile.name
 
     @property
     def tile(self) -> TileSpec:
@@ -141,123 +160,24 @@ class GemmCommPlan:
             raise TypeError("distributed GEMM plans require compile-time tile extents")
         return tile_num[0] * tile_num[1] * tile_num[2]
 
-    def entrypoint_for(self, region: str) -> str:
-        """Return the unique backend target assigned to ``region`` by policy."""
-
-        targets = [
-            binding.target for binding in self.region_entrypoints if binding.region == region
+    def region(self, name: str) -> DeviceRegionPlan | HostRegionPlan:
+        matching = [
+            region
+            for region in (*self.execution.device_regions, *self.execution.host_regions)
+            if region.name == name
         ]
-        if len(targets) != 1:
-            raise ValueError(f"region {region!r} requires exactly one policy-owned entrypoint")
-        return targets[0]
+        if len(matching) != 1:
+            raise ValueError(f"execution requires exactly one region named {name!r}")
+        return matching[0]
 
-    def execution_plan(self) -> ExecutionPlan:
-        """Build the shared region, fetch, and tile-action contract."""
-
-        edges = logical_edges(self.spec)
-        tiles = {tile.name: tile for tile in self.spec.tiles}
-        if self.workload == "allgather_gemm":
-            if len(edges) != 1:
-                raise ValueError("AllGather+GEMM requires exactly one logical edge")
-            edge = edges[0]
-            host_name = "allgather_host"
-            device_name = "gemm_device"
-            plan = ExecutionPlan(
-                kernel=self.spec,
-                device_regions=(
-                    DeviceRegionPlan(
-                        device_name,
-                        fetch_program=SchedulerFetchProgram(
-                            (
-                                FetchGuardAction(
-                                    (edge,),
-                                    predicate="remote_rank != rank",
-                                    payload={"event": edge.event},
-                                ),
-                            )
-                        ),
-                        tile_programs=(
-                            TileActionProgram(tiles["gemm"], (RunAction(tiles["gemm"]),)),
-                        ),
-                        attrs={
-                            "scheduler": self.physical_scheduler,
-                            "entrypoint": self.entrypoint_for(device_name),
-                        },
-                    ),
-                ),
-                host_regions=(
-                    HostRegionPlan(host_name, (HostCallAction(self.entrypoint_for(host_name)),)),
-                ),
-                region_dependencies=(RegionDependencyPlan(host_name, device_name, "launch_order"),),
-                edge_bindings=(EdgeBindingPlan(edge, "fetch_guard", device_name),),
-                attrs={"policy": self.policy_name},
-            )
-        elif self.workload == "gemm_reduce_scatter":
-            by_event = {edge.event.name: edge for edge in edges}
-            partial_edge = by_event["partial_shard_ready"]
-            staging_edge = by_event["staging_ready"]
-            partial_name = "partial_gemm_device"
-            transfer_name = "reduce_scatter_host"
-            reduce_name = "reduce_device"
-            plan = ExecutionPlan(
-                kernel=self.spec,
-                device_regions=(
-                    DeviceRegionPlan(
-                        partial_name,
-                        tile_programs=(
-                            TileActionProgram(
-                                tiles["partial_gemm"],
-                                (
-                                    RunAction(tiles["partial_gemm"]),
-                                    MidBodyPortAction(
-                                        (partial_edge,), "after_store_before_pipeline_advance"
-                                    ),
-                                ),
-                            ),
-                        ),
-                        attrs={
-                            "scheduler": self.physical_scheduler,
-                            "entrypoint": self.entrypoint_for(partial_name),
-                        },
-                    ),
-                    DeviceRegionPlan(
-                        reduce_name,
-                        tile_programs=(
-                            TileActionProgram(tiles["reduce"], (RunAction(tiles["reduce"]),)),
-                        ),
-                        attrs={"entrypoint": self.entrypoint_for(reduce_name)},
-                    ),
-                ),
-                host_regions=(
-                    HostRegionPlan(
-                        transfer_name,
-                        (
-                            HostCallAction(self.entrypoint_for(transfer_name)),
-                            HostEdgeAction((staging_edge,), "completion"),
-                        ),
-                    ),
-                ),
-                region_dependencies=(
-                    RegionDependencyPlan(partial_name, transfer_name, "launch_order"),
-                    RegionDependencyPlan(transfer_name, reduce_name, "completion"),
-                ),
-                edge_bindings=(
-                    EdgeBindingPlan(
-                        partial_edge,
-                        "mid_body_port",
-                        partial_name,
-                        port="after_store_before_pipeline_advance",
-                    ),
-                    EdgeBindingPlan(staging_edge, "host_runtime", transfer_name),
-                ),
-                attrs={"policy": self.policy_name},
-            )
-        else:
-            raise ValueError(f"unsupported distributed GEMM graph: {self.workload!r}")
-        return plan.validate()
+    def entrypoint_for(self, region_name: str) -> str:
+        entrypoint = self.region(region_name).attrs.get("entrypoint")
+        if not isinstance(entrypoint, str) or not entrypoint:
+            raise ValueError(f"region {region_name!r} has no backend entrypoint")
+        return entrypoint
 
     def validate(self) -> GemmCommPlan:
-        self.spec.validate()
+        self.execution.validate()
         _validate_attrs(self.spec.attrs, owner="kernel attrs")
         for event in self.spec.events.values():
             _validate_attrs(event.attrs, owner=f"event {event.name!r} attrs")
@@ -268,15 +188,6 @@ class GemmCommPlan:
                     raise TypeError(
                         f"tile {tile.name!r} has an incompatible distributed GEMM TileImpl"
                     )
-
-        for binding in self.region_entrypoints:
-            if not isinstance(binding, RegionEntrypoint):
-                raise TypeError("region entrypoints must use RegionEntrypoint")
-            if not binding.region or not binding.target:
-                raise ValueError("region entrypoint names and targets must be non-empty")
-        bound_regions = [binding.region for binding in self.region_entrypoints]
-        if len(set(bound_regions)) != len(bound_regions):
-            raise ValueError("execution regions must have exactly one policy-owned entrypoint")
 
         if self.policy_name not in {"static", "dynamic"}:
             raise ValueError(f"unsupported policy {self.policy_name!r}")
@@ -289,12 +200,31 @@ class GemmCommPlan:
         if self.lowerable != (self.unsupported_reason is None):
             raise ValueError("lowerable state and unsupported reason disagree")
 
-        tile_num = tuple(self.tile.tile_num)
-        expected = {
+        regions = (*self.execution.device_regions, *self.execution.host_regions)
+        for region in regions:
+            self.entrypoint_for(region.name)
+
+        physical_tiles = [
+            program.tile.name
+            for region in self.execution.device_regions
+            for program in region.tile_programs
+        ]
+        for region in self.execution.host_regions:
+            tile_name = region.attrs.get("tile")
+            if not isinstance(tile_name, str) or not tile_name:
+                raise ValueError(f"host region {region.name!r} has no logical tile")
+            physical_tiles.append(tile_name)
+        logical_tiles = [tile.name for tile in self.spec.tiles]
+        if len(set(physical_tiles)) != len(physical_tiles) or set(physical_tiles) != set(
+            logical_tiles
+        ):
+            raise ValueError("execution regions must cover every logical tile exactly once")
+
+        expected_tasks = {
             PhysicalTask(self.scheduled_tile, m, n, k)
-            for m in range(tile_num[0])
-            for n in range(tile_num[1])
-            for k in range(tile_num[2])
+            for m in range(self.tile.tile_num[0])
+            for n in range(self.tile.tile_num[1])
+            for k in range(self.tile.tile_num[2])
         }
         for schedule in self.rank_schedules:
             if self.is_dynamic:
@@ -303,22 +233,85 @@ class GemmCommPlan:
             elif schedule.shared_queue or len(schedule.worker_queues) != self.persistent_clusters:
                 raise ValueError("static policy must produce one queue per persistent cluster")
             tasks = schedule.tasks
-            if len(tasks) != len(expected) or set(tasks) != expected:
+            if len(tasks) != len(expected_tasks) or set(tasks) != expected_tasks:
                 raise ValueError(
                     f"rank {schedule.rank} schedule does not cover every logical tile exactly once"
                 )
 
-        if not self.launch_steps or any(not group for group in self.launch_steps):
-            raise ValueError("launch plan must contain non-empty execution groups")
-        stage_names = {tile.name for tile in self.spec.tiles}
-        if set(name for group in self.launch_steps for name in group) != stage_names:
-            raise ValueError("launch plan must cover every logical stage")
-        execution = self.execution_plan()
-        execution_regions = {
-            region.name for region in (*execution.device_regions, *execution.host_regions)
+        placements = {
+            placement.edge.event.name: placement for placement in self.execution.edge_placements()
         }
-        if set(bound_regions) != execution_regions:
-            raise ValueError("policy-owned entrypoints must cover every execution region exactly")
+        if self.workload == "allgather_gemm":
+            expected_regions = {"allgather_host", "gemm_device"}
+            placement = placements.get("shard_ready")
+            if placement is None or (placement.location, placement.region, placement.port) != (
+                "fetch",
+                "gemm_device",
+                None,
+            ):
+                raise ValueError("AllGather shard-ready edge must be placed at GEMM fetch")
+            device = self.region("gemm_device")
+            host = self.region("allgather_host")
+            if not isinstance(device, DeviceRegionPlan) or not isinstance(host, HostRegionPlan):
+                raise ValueError("AllGather execution region kinds are invalid")
+            if (
+                len(device.fetch_steps) != 1
+                or not isinstance(device.fetch_steps[0], FetchGuardStep)
+                or device.fetch_steps[0].predicate != "remote_rank != rank"
+            ):
+                raise ValueError("AllGather fetch program has an invalid guard step")
+            if tuple(type(step) for step in device.tile_programs[0].steps) != (RunStep,):
+                raise ValueError("AllGather GEMM program must contain exactly one run step")
+            if (
+                len(host.steps) != 1
+                or not isinstance(host.steps[0], HostCallStep)
+                or host.steps[0].name != "collective"
+            ):
+                raise ValueError("AllGather host region has an invalid collective step")
+        elif self.workload == "gemm_reduce_scatter":
+            expected_regions = {"partial_gemm_device", "reduce_scatter_host", "reduce_device"}
+            partial = placements.get("partial_shard_ready")
+            staging = placements.get("staging_ready")
+            if partial is None or (partial.location, partial.region, partial.port) != (
+                "tile",
+                "partial_gemm_device",
+                "after_store_before_pipeline_advance",
+            ):
+                raise ValueError("partial-ready edge must use the approved GEMM epilogue port")
+            if staging is None or (staging.location, staging.region, staging.port) != (
+                "host",
+                "reduce_scatter_host",
+                None,
+            ):
+                raise ValueError("staging-ready edge must be completed by the host collective")
+            partial_region = self.region("partial_gemm_device")
+            reduce_region = self.region("reduce_device")
+            host = self.region("reduce_scatter_host")
+            if (
+                not isinstance(partial_region, DeviceRegionPlan)
+                or not isinstance(reduce_region, DeviceRegionPlan)
+                or not isinstance(host, HostRegionPlan)
+            ):
+                raise ValueError("GEMM+ReduceScatter execution region kinds are invalid")
+            partial_steps = partial_region.tile_programs[0].steps
+            reduce_steps = reduce_region.tile_programs[0].steps
+            if tuple(type(step) for step in partial_steps) != (RunStep, MidBodyPortStep):
+                raise ValueError("partial GEMM program has an invalid physical step order")
+            if tuple(type(step) for step in reduce_steps) != (RunStep,):
+                raise ValueError("reduce program must contain exactly one run step")
+            if (
+                len(host.steps) != 2
+                or not isinstance(host.steps[0], HostCallStep)
+                or host.steps[0].name != "collective"
+                or not isinstance(host.steps[1], HostSyncStep)
+                or host.steps[1].kind != "communication_completion"
+            ):
+                kind = getattr(host.steps[-1], "kind", None) if host.steps else None
+                raise ValueError(f"reduce-scatter host region has invalid sync step {kind!r}")
+        else:
+            raise ValueError(f"unsupported distributed GEMM graph: {self.workload!r}")
+        if {region.name for region in regions} != expected_regions:
+            raise ValueError("execution regions do not match the distributed GEMM workload")
         return self
 
     def normalized_data(self) -> dict[str, Any]:
@@ -329,10 +322,29 @@ class GemmCommPlan:
             "persistent_clusters": self.persistent_clusters,
             "physical_scheduler": self.physical_scheduler,
             "task_count_per_rank": self.task_count_per_rank,
-            "launch_steps": self.launch_steps,
-            "region_entrypoints": {
-                binding.region: binding.target for binding in self.region_entrypoints
-            },
+            "regions": [
+                {
+                    "name": region.name,
+                    "kind": "device" if isinstance(region, DeviceRegionPlan) else "host",
+                    "entrypoint": region.attrs["entrypoint"],
+                    "scheduler": region.attrs.get("scheduler"),
+                    "tiles": (
+                        [program.tile.name for program in region.tile_programs]
+                        if isinstance(region, DeviceRegionPlan)
+                        else [region.attrs["tile"]]
+                    ),
+                    "steps": (
+                        [
+                            type(step).__name__
+                            for program in region.tile_programs
+                            for step in program.steps
+                        ]
+                        if isinstance(region, DeviceRegionPlan)
+                        else [type(step).__name__ for step in region.steps]
+                    ),
+                }
+                for region in self.execution.regions_in_dependency_order()
+            ],
             "lowerable": self.lowerable,
             "unsupported_reason": self.unsupported_reason,
             "rank_schedules": [
@@ -346,4 +358,4 @@ class GemmCommPlan:
         }
 
 
-__all__ = ["GemmCommPlan", "PhysicalTask", "RankSchedule", "RegionEntrypoint"]
+__all__ = ["GemmCommPlan", "PhysicalTask", "RankSchedule"]

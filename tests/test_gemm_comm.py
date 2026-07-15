@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import importlib
 import inspect
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -31,6 +32,8 @@ from tirx_kernels.registry import discover_kernels
 
 ag_impl = allgather_gemm
 rs_impl = gemm_reduce_scatter
+ag_runner = importlib.import_module("tirx_kernels.gemm_comm._allgather_gemm_runner")
+rs_runner = importlib.import_module("tirx_kernels.gemm_comm._gemm_reduce_scatter_runner")
 
 
 def test_gemm_comm_registry_entries() -> None:
@@ -79,6 +82,11 @@ def test_tuned_kernels_reject_other_configs(module, overrides) -> None:
         module.get_kernel(**overrides)
 
 
+def test_reduce_scatter_dynamic_runner_is_explicitly_unimplemented() -> None:
+    with pytest.raises(NotImplementedError, match="serialize the inter-tile pipeline"):
+        gemm_reduce_scatter.get_kernel(scheduler="dynamic")
+
+
 def test_allgather_dynamic_queue_has_exact_coverage() -> None:
     task_types, task_indices, heads, tails = allgather_gemm._queue_state()
     expected_tasks = allgather_gemm.GEMM_M_CLUSTERS * allgather_gemm.GEMM_N_CLUSTERS
@@ -104,34 +112,38 @@ def test_allgather_dynamic_queue_has_exact_coverage() -> None:
         np.testing.assert_array_equal(task_types[rank, expected_tasks:], -1)
 
 
-@pytest.mark.parametrize("module", [allgather_gemm, gemm_reduce_scatter])
-def test_run_bench_delegates_to_rank_local_worker(module, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "module, runner", [(allgather_gemm, ag_runner), (gemm_reduce_scatter, rs_runner)]
+)
+def test_run_bench_delegates_to_rank_local_worker(
+    module, runner, monkeypatch: pytest.MonkeyPatch
+) -> None:
     kernel = object()
     captured = {}
 
-    monkeypatch.setattr(module, "get_kernel", lambda *_args, **_kwargs: kernel)
+    monkeypatch.setattr(runner, "_get_benchmark_kernel", lambda *_args, **_kwargs: kernel)
 
     def fake_run_distributed(ir_module, **kwargs):
         captured.update(ir_module=ir_module, **kwargs)
         return {"status": "OK", "timer": "kineto"}
 
-    monkeypatch.setattr(module, "run_distributed", fake_run_distributed)
+    monkeypatch.setattr(runner, "run_distributed", fake_run_distributed)
 
     result = module.run_bench(timer="kineto", rounds=6, cooldown_s=0.25)
 
     assert result == {"status": "OK", "timer": "kineto"}
     assert captured["ir_module"] is kernel
     assert captured["world_size"] == 4
-    assert captured["worker"] is module._run_worker
+    assert captured["worker"] is runner._run_worker
     assert captured["mode"] == "bench"
     assert captured["worker_kwargs"]["timer"] == "kineto"
     assert captured["worker_kwargs"]["rounds"] == 6
     assert captured["worker_kwargs"]["cooldown_s"] == 0.25
 
 
-@pytest.mark.parametrize("module", [allgather_gemm, gemm_reduce_scatter])
-def test_worker_pairs_tirx_with_shared_kineto_baselines(module) -> None:
-    source = inspect.getsource(module._run_worker)
+@pytest.mark.parametrize("runner", [ag_runner, rs_runner])
+def test_worker_pairs_tirx_with_shared_kineto_baselines(runner) -> None:
+    source = inspect.getsource(runner._run_worker)
     assert "create_baseline_suite" in source
     assert "references=baselines.references()" in source
     assert 'prepare={"tirx": prepare}' in source
@@ -253,6 +265,75 @@ def test_library_provenance_records_loaded_versions_and_paths(
         "cublasmp": {"path": str(paths["cublasmp"]), "version": "0.10.0", "version_raw": 1000},
         "nvshmem": {"path": str(paths["nvshmem"]), "version": "3.4.5", "api_version": "1.3"},
     }
+
+
+@pytest.mark.parametrize("runner", [ag_runner, rs_runner])
+def test_dsl_and_manual_bench_share_inputs_but_not_state(
+    runner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shared_data = object()
+    context = object()
+    allocations = []
+    events = []
+
+    class FakeCase:
+        def __init__(self, prefix):
+            self.prefix = prefix
+
+        def reset(self):
+            events.append((self.prefix, "reset"))
+
+        def prepare(self):
+            events.append((self.prefix, "prepare"))
+
+        def launch(self):
+            events.append((self.prefix, "launch"))
+
+    runtime = SimpleNamespace(rank=0, bench_context=lambda: context)
+    monkeypatch.setattr(runner, "prepare_data", lambda **_kwargs: shared_data)
+
+    def fake_allocate(runtime_arg, module, data, scheduler, prefix):
+        case = FakeCase(prefix)
+        allocations.append((runtime_arg, module, data, scheduler, prefix, case))
+        return case
+
+    monkeypatch.setattr(runner, "_allocate_case", fake_allocate)
+
+    def fake_bench(funcs, **kwargs):
+        assert list(funcs) == ["dsl", "manual"]
+        assert list(kwargs["prepare"]) == ["dsl", "manual"]
+        assert kwargs["distributed"] is context
+        for name in funcs:
+            kwargs["prepare"][name]()
+            funcs[name]()
+        return {
+            "impls": {"dsl": 1.0, "manual": 1.0},
+            "round_samples": {"dsl": [1.0], "manual": [1.0]},
+            "errors": {},
+            "timer": "kineto",
+            "benchmark_protocol": {},
+        }
+
+    bench_module = importlib.import_module("tvm.tirx.bench")
+    monkeypatch.setattr(bench_module, "bench", fake_bench)
+
+    result = runner._run_worker(
+        runtime, object(), "bench", {"scheduler": "static", "timer": "kineto", "rounds": 6}
+    )
+
+    assert result["status"] == "OK"
+    assert result["timer"] == "kineto"
+    assert len(allocations) == 2
+    assert allocations[0][2] is shared_data and allocations[1][2] is shared_data
+    assert allocations[0][4:6] != allocations[1][4:6]
+    assert events == [
+        ("dsl", "reset"),
+        ("dsl", "prepare"),
+        ("dsl", "launch"),
+        ("manual", "reset"),
+        ("manual", "prepare"),
+        ("manual", "launch"),
+    ]
 
 
 def test_parent_compiles_once_before_spawning_ranks(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -49,10 +49,11 @@ from tirx_kernels.megakernel.examples.gemm_reduce_scatter import (
 from tirx_kernels.megakernel.examples.gemm_reduce_scatter import main as reduce_scatter_main
 from tvm.megakernel.dsl import TileImpl
 from tvm.megakernel.transform import (
-    FetchGuardAction,
-    HostCallAction,
-    HostEdgeAction,
-    MidBodyPortAction,
+    FetchGuardStep,
+    HostCallStep,
+    HostSyncStep,
+    MidBodyPortStep,
+    RunStep,
 )
 
 _allgather_gemm_runner = importlib.import_module("tirx_kernels.gemm_comm._allgather_gemm_runner")
@@ -206,7 +207,7 @@ def test_logical_graphs_use_concrete_kernel_tile_impls_without_scheduler_attrs(
     builder, tile_names, event_names
 ) -> None:
     spec = builder().validate()
-    execution = policy_for_scheduler("static").normalize(spec).execution_plan()
+    execution = policy_for_scheduler("static").normalize(spec).execution
     device_tile_names = {
         program.tile.name for region in execution.device_regions for program in region.tile_programs
     }
@@ -262,7 +263,7 @@ def test_lowerer_binds_and_executes_attached_device_tile_impls(builder, schedule
         (build_gemm_reduce_scatter_graph, "static"),
     ],
 )
-def test_region_entrypoints_are_owned_by_policy(builder, scheduler) -> None:
+def test_region_entrypoints_are_derived_from_execution_regions(builder, scheduler) -> None:
     spec = builder()
     lowered = GemmCommLowerer(policy_for_scheduler(scheduler)).lower(spec, plan_only=True)
 
@@ -270,18 +271,30 @@ def test_region_entrypoints_are_owned_by_policy(builder, scheduler) -> None:
         region.attrs["entrypoint"] for region in lowered.execution.device_regions
     )
     assert lowered.host_entrypoints == tuple(
-        action.name
-        for region in lowered.execution.host_regions
-        for action in region.actions
-        if isinstance(action, HostCallAction)
+        region.attrs["entrypoint"] for region in lowered.execution.host_regions
     )
+    assert lowered.execution is lowered.plan.execution
+    assert not hasattr(lowered.plan, "execution_plan")
+    assert not hasattr(lowered.plan, "launch_steps")
+    assert not hasattr(lowered.plan, "region_entrypoints")
+    normalized = lowered.plan.normalized_data()
+    assert "launch_steps" not in normalized and "region_entrypoints" not in normalized
+    assert [region["name"] for region in normalized["regions"]] == [
+        region.name for region in lowered.execution.regions_in_dependency_order()
+    ]
     assert all(
         not hasattr(tile.impl, "execution_space") and not hasattr(tile.impl, "entrypoint")
         for tile in spec.tiles
     )
 
+    region = lowered.execution.device_regions[0]
+    attrs = {key: value for key, value in region.attrs.items() if key != "entrypoint"}
+    execution = replace(
+        lowered.execution,
+        device_regions=(replace(region, attrs=attrs), *lowered.execution.device_regions[1:]),
+    )
     with pytest.raises(ValueError, match="entrypoint"):
-        replace(lowered.plan, region_entrypoints=lowered.plan.region_entrypoints[:-1]).validate()
+        replace(lowered.plan, execution=execution).validate()
 
 
 @pytest.mark.parametrize("scheduler", ["static", "dynamic"])
@@ -310,10 +323,14 @@ def test_dynamic_allgather_queue_is_generated_from_dsl_and_matches_manual_oracle
 @pytest.mark.parametrize("scheduler", ["static", "dynamic"])
 def test_allgather_shard_ready_is_bound_to_fetch_before_publish(scheduler: str) -> None:
     plan = policy_for_scheduler(scheduler).normalize(build_allgather_gemm_graph())
-    execution = plan.execution_plan()
-    fetch = execution.device_regions[0].fetch_program.actions
-    assert len(fetch) == 1 and isinstance(fetch[0], FetchGuardAction)
-    assert execution.edge_bindings[0].location == "fetch_guard"
+    execution = plan.execution
+    fetch = execution.device_regions[0].fetch_steps
+    assert len(fetch) == 1 and isinstance(fetch[0], FetchGuardStep)
+    assert tuple(type(step) for step in execution.device_regions[0].tile_programs[0].steps) == (
+        RunStep,
+    )
+    placement = execution.edge_placements()[0]
+    assert (placement.location, placement.region) == ("fetch", "gemm_device")
 
     if scheduler == "dynamic":
         source = _inline_source(allgather_gemm.GEMMMPMCQueue.dequeue)
@@ -325,15 +342,10 @@ def test_allgather_shard_ready_is_bound_to_fetch_before_publish(scheduler: str) 
 
 def test_allgather_fetch_predicate_is_authoritative() -> None:
     plan = policy_for_scheduler("dynamic").normalize(build_allgather_gemm_graph())
-    execution = plan.execution_plan()
+    execution = plan.execution
     region = execution.device_regions[0]
-    action = replace(region.fetch_program.actions[0], predicate="invalid_mutated_predicate")
-    execution = replace(
-        execution,
-        device_regions=(
-            replace(region, fetch_program=replace(region.fetch_program, actions=(action,))),
-        ),
-    )
+    step = replace(region.fetch_steps[0], predicate="invalid_mutated_predicate")
+    execution = replace(execution, device_regions=(replace(region, fetch_steps=(step,)),))
 
     with pytest.raises(tvm.error.DiagnosticError, match="invalid_mutated_predicate"):
         allgather_gemm.build_kernel("dynamic", execution_plan=execution)
@@ -341,13 +353,14 @@ def test_allgather_fetch_predicate_is_authoritative() -> None:
 
 def test_reduce_scatter_private_port_and_host_completion_order() -> None:
     plan = policy_for_scheduler("static").normalize(build_gemm_reduce_scatter_graph())
-    execution = plan.execution_plan()
+    execution = plan.execution
     partial_program = execution.device_regions[0].tile_programs[0]
-    assert any(isinstance(action, MidBodyPortAction) for action in partial_program.actions)
+    assert tuple(type(step) for step in partial_program.steps) == (RunStep, MidBodyPortStep)
     assert any(
-        isinstance(action, HostEdgeAction)
-        for region in execution.host_regions
-        for action in region.actions
+        isinstance(step, HostSyncStep) for region in execution.host_regions for step in region.steps
+    )
+    assert any(
+        isinstance(step, HostCallStep) for region in execution.host_regions for step in region.steps
     )
 
     source = _tile_run_source(
@@ -370,6 +383,42 @@ def test_reduce_scatter_private_port_and_host_completion_order() -> None:
         ("sync",),
         ("device", "reduce_sum"),
     ]
+
+
+def test_reduce_scatter_port_and_host_sync_steps_are_authoritative() -> None:
+    plan = policy_for_scheduler("static").normalize(build_gemm_reduce_scatter_graph())
+    execution = plan.execution
+    region = execution.device_regions[0]
+    program = region.tile_programs[0]
+    port = next(step for step in program.steps if isinstance(step, MidBodyPortStep))
+    steps = tuple(
+        replace(step, port="after_pipeline_advance") if step is port else step
+        for step in program.steps
+    )
+    mutated = replace(
+        execution,
+        device_regions=(
+            replace(region, tile_programs=(replace(program, steps=steps),)),
+            *execution.device_regions[1:],
+        ),
+    )
+    with pytest.raises(ValueError, match="approved GEMM epilogue port"):
+        replace(plan, execution=mutated).validate()
+
+    host = execution.host_regions[0]
+    host_steps = tuple(
+        replace(step, kind="invalid_sync") if isinstance(step, HostSyncStep) else step
+        for step in host.steps
+    )
+    mutated = replace(execution, host_regions=(replace(host, steps=host_steps),))
+    bindings = GemmCommRuntimeBindings(
+        launch_device=lambda name: None,
+        launch_host=lambda name: None,
+        communication_barrier=lambda: None,
+        communication_to_compute_sync=lambda: None,
+    )
+    with pytest.raises(ValueError, match="invalid_sync"):
+        GemmCommHostExecutor(bindings).execute(replace(plan, execution=mutated))
 
 
 def test_production_launches_use_region_executor_and_tileimpl_resource_hooks() -> None:

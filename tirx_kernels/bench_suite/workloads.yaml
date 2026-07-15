@@ -36,8 +36,9 @@ workloads:
   - {kernel: deepgemm_fp8_fp4_mega_moe, config: t8192_m8192_h7168_i3072_e384_k6_g6, timer: kineto, num_gpus: 6}
 
   # ── distributed GemmComm
-  - {kernel: allgather_gemm, config: tp4_m8192_n65536_k8192_fp16, timer: kineto, num_gpus: 4}
-  - {kernel: gemm_reduce_scatter, config: tp4_m16384_n12288_k49152_fp16, timer: kineto, num_gpus: 4}
+  - {kernel: allgather_gemm, config: tp4_m8192_n65536_k8192_fp16_static, timer: kineto, num_gpus: 4}
+  - {kernel: allgather_gemm, config: tp4_m8192_n65536_k8192_fp16_dynamic, timer: kineto, num_gpus: 4}
+  - {kernel: gemm_reduce_scatter, config: tp4_m16384_n12288_k49152_fp16_static, timer: kineto, num_gpus: 4}
 
   # ── deepgemm_sm100_fp4_mqa_logits
   - {kernel: deepgemm_sm100_fp4_mqa_logits, config: s2048_skv4096_h64_d128_f32_dense_cp}

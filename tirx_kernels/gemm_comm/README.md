@@ -31,9 +31,12 @@ The second source was historically called GEMM+AllReduce, but its actual
 protocol and output shape are ReduceScatter. The public name reflects the
 implemented operation.
 
-The runtime uses one Disco process per rank, NCCL for rank setup, and NVSHMEM
-for the overlapped communication protocol. Mutable queues, semaphores, and
-outputs are reset independently on every rank before each measured launch.
+The parent compiles and exports one module, then `torch.multiprocessing.spawn`
+starts one rank-local worker per GPU. NCCL bootstraps the process group and
+broadcasts the NVSHMEM UID; every worker explicitly initializes NVSHMEM, loads
+the local module, and owns its Device API streams. No Disco session or remote
+runtime object is created. Mutable queues, semaphores, workspaces, and outputs
+are reset independently on every rank before each measured launch.
 
 ## Megakernel DSL
 
@@ -49,9 +52,12 @@ concrete implementations live together:
 The TVM `TileImpl.run(m, n, k)` API is the only task boundary; tirx-kernels
 does not define another task model. The persistent kernels call those methods
 directly for every scheduled tile, including the independent TMA, MMA,
-epilogue, load, and reduction warp roles. The policy layer owns only rank-aware
-ordering and queue assignment. Standalone examples contain the complete
-logical DSL construction and are parity-tested against the production graphs.
+epilogue, load, and reduction warp roles. The policy layer produces one
+authoritative `ExecutionPlan` containing region entrypoints, ordered physical
+steps, rank-aware ordering, and queue assignment. Device adapters and the host
+executor interpret those steps directly. Standalone examples contain the
+complete logical DSL construction and are parity-tested against the production
+graphs.
 
 ```bash
 python -m tirx_kernels.megakernel.examples.allgather_gemm --scheduler dynamic
@@ -70,26 +76,14 @@ pipelined multi-role dynamic dequeue is available.
 The legacy builders are private test oracles used only for structural and
 code-generation parity checks. Production entry points always lower the DSL.
 
-## Baselines
+## Validation and benchmarking
 
-`run_bench()` measures the slowest rank with CUDA events and then launches an
-isolated process for two baselines using the same shapes and FP16 semantics:
-
-- cuBLASMp `cublasMpMatmul` with a symmetric NCCL workspace and the official
-  TP block-noncyclic distributions. `split_p2p` is the default algorithm hint.
-- an explicit cuBLAS + NCCL composition: AllGather then GEMM, or GEMM then
-  ReduceScatter. All tensors and GEMM outputs are preallocated outside the
-  timed region.
-
-The baseline worker requires cuBLASMp 0.10, nvmath-python bindings, NCCL4Py,
-and NCCL 2.29.2 or newer. Point it at the selected libraries when they are not
-installed in the default loader path:
-
-```bash
-export TIRX_NCCL_LIBRARY=/path/to/libnccl.so.2
-export TIRX_CUBLAS_LIBRARY=/path/to/libcublas.so
-export TIRX_CUBLASMP_LIBRARY=/path/to/libcublasmp.so.0
-```
+`run_bench()` measures the DSL and private manual oracle in the same worker and
+paired Kineto round. They share the exact rank-local input tensors but own
+independent mutable state. The shared distributed timer uses one preflight, 30
+warmups, 30 measured launches, cold L2, rank barriers, AB/BA ordering, and
+sample-wise slowest-rank aggregation. Reset and preparation remain outside the
+timed launch scope.
 
 For a four-GPU B200 host:
 
@@ -97,11 +91,10 @@ For a four-GPU B200 host:
 python -m tirx_kernels.test --kernel allgather_gemm
 python -m tirx_kernels.test --kernel gemm_reduce_scatter
 
-python -m tirx_kernels.bench --kernel allgather_gemm --rounds 3 --json
-python -m tirx_kernels.bench --kernel gemm_reduce_scatter --rounds 3 --json
+python -m tirx_kernels.bench --kernel allgather_gemm --timer kineto --rounds 6 --json
+python -m tirx_kernels.bench --kernel gemm_reduce_scatter --timer kineto --rounds 6 --json
 ```
 
-`--warmup` and `--repeat` are millisecond budgets, consistent with the common
-benchmark CLI. Each round calibrates iteration counts first, and the reported
-value is the mean of per-round medians. Baseline allocation, initialization,
-correctness comparison, barriers, and teardown are outside the timed region.
+The distributed Kineto protocol has fixed iteration counts, so `--warmup` and
+`--repeat` overrides are rejected. Six rounds give each AB and BA ordering three
+samples; the reported value is the mean of round means.

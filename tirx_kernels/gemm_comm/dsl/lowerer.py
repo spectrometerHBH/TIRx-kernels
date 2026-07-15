@@ -25,7 +25,7 @@ from typing import Any
 import numpy as np
 
 from tvm.megakernel.dsl import KernelSpec
-from tvm.megakernel.transform import ExecutionPlan, HostCallAction
+from tvm.megakernel.transform import ExecutionPlan
 
 from .. import allgather_gemm as ag_kernel
 from .model import GemmCommPlan
@@ -38,9 +38,22 @@ class LoweredGemmComm:
 
     plan: GemmCommPlan
     module: Any | None
-    device_entrypoints: tuple[str, ...]
-    host_entrypoints: tuple[str, ...]
-    execution: ExecutionPlan
+
+    @property
+    def execution(self) -> ExecutionPlan:
+        return self.plan.execution
+
+    @property
+    def device_entrypoints(self) -> tuple[str, ...]:
+        return tuple(
+            self.plan.entrypoint_for(region.name) for region in self.execution.device_regions
+        )
+
+    @property
+    def host_entrypoints(self) -> tuple[str, ...]:
+        return tuple(
+            self.plan.entrypoint_for(region.name) for region in self.execution.host_regions
+        )
 
 
 class GemmCommLowerer:
@@ -51,30 +64,20 @@ class GemmCommLowerer:
 
     def lower(self, spec: KernelSpec, *, plan_only: bool = False) -> LoweredGemmComm:
         plan = self.policy.normalize(spec)
-        execution = plan.execution_plan()
         if not plan.lowerable and not plan_only:
             raise NotImplementedError(plan.unsupported_reason)
 
-        device_entrypoints = tuple(
-            region.attrs["entrypoint"] for region in execution.device_regions
-        )
-        host_entrypoints = tuple(
-            action.name
-            for region in execution.host_regions
-            for action in region.actions
-            if isinstance(action, HostCallAction)
-        )
         module = None
         if not plan_only:
             builders = [
                 tile.impl.build_module
-                for tile in spec.tiles
+                for tile in plan.spec.tiles
                 if callable(getattr(tile.impl, "build_module", None))
             ]
             if len(builders) != 1:
                 raise ValueError("a distributed execution plan requires exactly one module backend")
-            module = builders[0](execution)
-        return LoweredGemmComm(plan, module, device_entrypoints, host_entrypoints, execution)
+            module = builders[0](plan.execution)
+        return LoweredGemmComm(plan, module)
 
 
 def make_allgather_dynamic_queue(

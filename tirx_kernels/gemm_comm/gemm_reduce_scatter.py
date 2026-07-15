@@ -23,13 +23,7 @@ import tvm
 from tvm.backend.cuda.lang import RankAwareGroupMajorTileScheduler
 from tvm.ir.type import PointerType, PrimType
 from tvm.megakernel.dsl import TileImpl
-from tvm.megakernel.transform import (
-    EmissionContext,
-    ExecutionPlan,
-    MegakernelBackend,
-    MidBodyPortAction,
-    TileEmitter,
-)
+from tvm.megakernel.transform import ExecutionPlan, MidBodyPortStep
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.bench import CudaProfiler
@@ -287,35 +281,13 @@ class ReduceScatterTileImpl(TileImpl):
         raise RuntimeError("host tiles are executed by GemmCommHostExecutor")
 
 
-class _PartialReadyPortBackend(MegakernelBackend):
-    """Emit the private partial-ready edge at the approved epilogue port."""
-
-    def __init__(self, sem, tid, signal_rank):
-        self.sem = sem
-        self.tid = tid
-        self.signal_rank = signal_rank
-
-    @T.inline
-    def _emit_notify(self):
-        self.sem.semaphore_notify(self.tid, self.signal_rank)
-
-    def emit_action(self, action, context):
-        del context
-        if not isinstance(action, MidBodyPortAction):
-            raise ValueError(f"unsupported partial-ready action {type(action).__name__}")
-        if action.port != "after_store_before_pipeline_advance":
-            raise ValueError(f"unsupported partial-ready port {action.port!r}")
-        self._emit_notify()
-
-
 @T.meta_class
 class PartialReadyPortProgram:
     """Bind one validated private edge port to the partial GEMM semaphore."""
 
     def __init__(self, execution_plan: ExecutionPlan | None, sem: Semaphore):
         if execution_plan is None:
-            self.context = None
-            self.actions = (MidBodyPortAction((), "after_store_before_pipeline_advance"),)
+            self.steps = (MidBodyPortStep("after_store_before_pipeline_advance"),)
         else:
             region = next(
                 region
@@ -325,17 +297,22 @@ class PartialReadyPortProgram:
             program = next(
                 program for program in region.tile_programs if program.tile.name == "partial_gemm"
             )
-            self.context = EmissionContext(execution_plan, region, "tile_action", program.tile)
-            self.actions = tuple(
-                action for action in program.actions if isinstance(action, MidBodyPortAction)
-            )
+            self.steps = tuple(step for step in program.steps if isinstance(step, MidBodyPortStep))
         self.sem = sem
 
     @T.inline
     def emit(self, tid, signal_rank):
-        backend = T.meta_var(_PartialReadyPortBackend(self.sem, tid, signal_rank))
-        emitter = T.meta_var(TileEmitter(backend))
-        emitter.emit_program(self.context, self.actions)
+        self._emit_steps(tid, signal_rank)
+
+    def _emit_steps(self, tid, signal_rank):
+        for step in self.steps:
+            if step.port != "after_store_before_pipeline_advance":
+                raise ValueError(f"unsupported partial-ready port {step.port!r}")
+            self._emit_notify(tid, signal_rank)
+
+    @T.inline
+    def _emit_notify(self, tid, signal_rank):
+        self.sem.semaphore_notify(tid, signal_rank)
 
 
 class PartialGemmTileImpl(TileImpl):
@@ -993,27 +970,24 @@ ReduceScatter = build_kernel()
 
 
 # Runtime orchestration is kept separate from the complete device kernels above.
-# Import it only after every constant and TIRx definition is available so the
-# DSL modules can refer back to this first-class kernel module without a cycle.
-from ._gemm_reduce_scatter_runner import (  # noqa: E402
-    CONFIGS,
-    KERNEL_META,
-    get_kernel,
-    prepare_data,
-    run_bench,
-    run_test,
-)
+# Resolve those exports lazily so spawn can import the runner first without
+# re-entering this module through a runner <-> kernel import cycle.
+_RUNTIME_EXPORTS = {"CONFIGS", "KERNEL_META", "get_kernel", "prepare_data", "run_bench", "run_test"}
+
+
+def __getattr__(name):
+    if name in _RUNTIME_EXPORTS:
+        from . import _gemm_reduce_scatter_runner
+
+        return getattr(_gemm_reduce_scatter_runner, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
-    "CONFIGS",
-    "KERNEL_META",
     "PartialGemmTileImpl",
     "ReduceScatter",
     "ReduceScatterTileImpl",
     "ReduceSumTileImpl",
     "build_kernel",
-    "get_kernel",
-    "prepare_data",
-    "run_bench",
-    "run_test",
+    *sorted(_RUNTIME_EXPORTS),
 ]
