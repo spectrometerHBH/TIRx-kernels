@@ -67,8 +67,8 @@ advance independently, so a CTA-wide dequeue would serialize the inter-tile
 pipeline. The implementation-preserving path remains the default until a
 pipelined multi-role dynamic dequeue is available.
 
-`get_kernel(..., use_dsl=False)` keeps an explicit manual oracle for structural
-and code-generation A/B checks.
+The legacy builders are private test oracles used only for structural and
+code-generation parity checks. Production entry points always lower the DSL.
 
 ## Baselines
 

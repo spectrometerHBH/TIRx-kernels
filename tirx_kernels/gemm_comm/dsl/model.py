@@ -24,6 +24,21 @@ from dataclasses import dataclass
 from typing import Any
 
 from tvm.megakernel.dsl import KernelSpec, TileSpec
+from tvm.megakernel.transform import (
+    DeviceRegionPlan,
+    EdgeBindingPlan,
+    ExecutionPlan,
+    FetchGuardAction,
+    HostCallAction,
+    HostEdgeAction,
+    HostRegionPlan,
+    MidBodyPortAction,
+    RegionDependencyPlan,
+    RunAction,
+    SchedulerFetchProgram,
+    TileActionProgram,
+    logical_edges,
+)
 
 _FORBIDDEN_LOGICAL_FIELDS = {
     "dispatch",
@@ -117,6 +132,106 @@ class GemmCommPlan:
             raise TypeError("distributed GEMM plans require compile-time tile extents")
         return tile_num[0] * tile_num[1] * tile_num[2]
 
+    def execution_plan(self) -> ExecutionPlan:
+        """Build the shared region, fetch, and tile-action contract."""
+
+        edges = logical_edges(self.spec)
+        tiles = {tile.name: tile for tile in self.spec.tiles}
+        if self.workload == "allgather_gemm":
+            if len(edges) != 1:
+                raise ValueError("AllGather+GEMM requires exactly one logical edge")
+            edge = edges[0]
+            host_name = "allgather_host"
+            device_name = "gemm_device"
+            plan = ExecutionPlan(
+                kernel=self.spec,
+                device_regions=(
+                    DeviceRegionPlan(
+                        device_name,
+                        fetch_program=SchedulerFetchProgram(
+                            (
+                                FetchGuardAction(
+                                    (edge,),
+                                    predicate="remote_rank != rank",
+                                    payload={"event": edge.event},
+                                ),
+                            )
+                        ),
+                        tile_programs=(
+                            TileActionProgram(tiles["gemm"], (RunAction(tiles["gemm"]),)),
+                        ),
+                        attrs={"scheduler": self.physical_scheduler},
+                    ),
+                ),
+                host_regions=(
+                    HostRegionPlan(
+                        host_name, (HostCallAction(tiles["allgather"].impl.entrypoint),)
+                    ),
+                ),
+                region_dependencies=(RegionDependencyPlan(host_name, device_name, "launch_order"),),
+                edge_bindings=(EdgeBindingPlan(edge, "fetch_guard", device_name),),
+                attrs={"policy": self.policy_name},
+            )
+        elif self.workload == "gemm_reduce_scatter":
+            by_event = {edge.event.name: edge for edge in edges}
+            partial_edge = by_event["partial_shard_ready"]
+            staging_edge = by_event["staging_ready"]
+            partial_name = "partial_gemm_device"
+            transfer_name = "reduce_scatter_host"
+            reduce_name = "reduce_device"
+            plan = ExecutionPlan(
+                kernel=self.spec,
+                device_regions=(
+                    DeviceRegionPlan(
+                        partial_name,
+                        tile_programs=(
+                            TileActionProgram(
+                                tiles["partial_gemm"],
+                                (
+                                    RunAction(tiles["partial_gemm"]),
+                                    MidBodyPortAction(
+                                        (partial_edge,), "after_store_before_pipeline_advance"
+                                    ),
+                                ),
+                            ),
+                        ),
+                        attrs={"scheduler": self.physical_scheduler},
+                    ),
+                    DeviceRegionPlan(
+                        reduce_name,
+                        tile_programs=(
+                            TileActionProgram(tiles["reduce"], (RunAction(tiles["reduce"]),)),
+                        ),
+                    ),
+                ),
+                host_regions=(
+                    HostRegionPlan(
+                        transfer_name,
+                        (
+                            HostCallAction(tiles["transfer"].impl.entrypoint),
+                            HostEdgeAction((staging_edge,), "completion"),
+                        ),
+                    ),
+                ),
+                region_dependencies=(
+                    RegionDependencyPlan(partial_name, transfer_name, "launch_order"),
+                    RegionDependencyPlan(transfer_name, reduce_name, "completion"),
+                ),
+                edge_bindings=(
+                    EdgeBindingPlan(
+                        partial_edge,
+                        "mid_body_port",
+                        partial_name,
+                        port="after_store_before_pipeline_advance",
+                    ),
+                    EdgeBindingPlan(staging_edge, "host_runtime", transfer_name),
+                ),
+                attrs={"policy": self.policy_name},
+            )
+        else:
+            raise ValueError(f"unsupported distributed GEMM graph: {self.workload!r}")
+        return plan.validate()
+
     def validate(self) -> GemmCommPlan:
         self.spec.validate()
         _validate_attrs(self.spec.attrs, owner="kernel attrs")
@@ -124,7 +239,7 @@ class GemmCommPlan:
             _validate_attrs(event.attrs, owner=f"event {event.name!r} attrs")
         for tile in self.spec.tiles:
             _validate_attrs(tile.attrs, owner=f"tile {tile.name!r} attrs")
-            for attribute in ("execution_space", "entrypoint", "bind_context", "run"):
+            for attribute in ("execution_space", "entrypoint", "tensor_specs", "run"):
                 if not hasattr(tile.impl, attribute):
                     raise TypeError(
                         f"tile {tile.name!r} has an incompatible distributed GEMM TileImpl"
@@ -165,6 +280,7 @@ class GemmCommPlan:
         stage_names = {tile.name for tile in self.spec.tiles}
         if set(name for group in self.launch_steps for name in group) != stage_names:
             raise ValueError("launch plan must cover every logical stage")
+        self.execution_plan()
         return self
 
     def normalized_data(self) -> dict[str, Any]:

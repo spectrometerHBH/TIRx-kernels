@@ -31,10 +31,10 @@ def build_allgather_gemm_graph() -> KernelSpec:
     kernel = KernelSpec(
         "allgather_gemm", attrs={"source": "SM100 TP4 AllGather and GEMM overlap pipeline"}
     )
-    local_a = kernel.input("local_a", (ag_kernel.LOCAL_M, ag_kernel.K), ag_kernel.a_type)
-    local_weight = kernel.input("local_weight", (ag_kernel.LOCAL_N, ag_kernel.K), ag_kernel.b_type)
-    gathered_a = kernel.intermediate("gathered_a", (ag_kernel.M, ag_kernel.K), ag_kernel.a_type)
-    output = kernel.output("output", (ag_kernel.M, ag_kernel.LOCAL_N), ag_kernel.d_type)
+    local_a = kernel.tensor("local_a", (ag_kernel.LOCAL_M, ag_kernel.K), ag_kernel.a_type)
+    local_weight = kernel.tensor("local_weight", (ag_kernel.LOCAL_N, ag_kernel.K), ag_kernel.b_type)
+    gathered_a = kernel.tensor("gathered_a", (ag_kernel.M, ag_kernel.K), ag_kernel.a_type)
+    output = kernel.tensor("output", (ag_kernel.M, ag_kernel.LOCAL_N), ag_kernel.d_type)
     shard_ready = kernel.event(
         "shard_ready",
         (ag_kernel.WORLD_SIZE,),
@@ -45,24 +45,29 @@ def build_allgather_gemm_graph() -> KernelSpec:
     (
         kernel.tile(
             "allgather",
-            impl=ag_kernel.AllGatherTileImpl(),
+            impl=ag_kernel.AllGatherTileImpl({"local_a": local_a, "gathered_a": gathered_a}),
             tile_num=(ag_kernel.WORLD_SIZE, 1, 1),
+            reads=[local_a],
+            writes=[gathered_a],
             attrs={"purpose": "publish every source activation shard to all ranks"},
-        )
-        .read(local_a)
-        .write(gathered_a)
-        .notify(shard_ready, lambda m, n, k: (m,))
+        ).notify(shard_ready, lambda m, n, k: (m,))
     )
     (
         kernel.tile(
             "gemm",
-            impl=ag_kernel.AllGatherGemmTileImpl(),
+            impl=ag_kernel.AllGatherGemmTileImpl(
+                {
+                    "local_a": local_a,
+                    "local_weight": local_weight,
+                    "gathered_a": gathered_a,
+                    "output": output,
+                }
+            ),
             tile_num=(ag_kernel.GEMM_M_CLUSTERS, ag_kernel.GEMM_N_CLUSTERS, 1),
+            reads=[local_a, gathered_a, local_weight],
+            writes=[output],
             attrs={"purpose": "multiply one gathered activation cluster by local weights"},
-        )
-        .read(local_a, gathered_a, local_weight)
-        .write(output)
-        .wait(shard_ready, lambda m, n, k: (m // ag_kernel.LOCAL_GEMM_M_CLUSTERS,))
+        ).wait(shard_ready, lambda m, n, k: (m // ag_kernel.LOCAL_GEMM_M_CLUSTERS,))
     )
     return kernel
 
@@ -76,13 +81,13 @@ def build_gemm_reduce_scatter_graph() -> KernelSpec:
     kernel = KernelSpec(
         "gemm_reduce_scatter", attrs={"source": "SM100 TP4 GEMM and ReduceScatter overlap pipeline"}
     )
-    local_a = kernel.input("local_a", (rs_kernel.M, rs_kernel.K), rs_kernel.a_type)
-    local_weight = kernel.input("local_weight", (rs_kernel.N, rs_kernel.K), rs_kernel.b_type)
-    partial = kernel.intermediate("partial", (rs_kernel.M, rs_kernel.N), rs_kernel.d_type)
-    staging = kernel.intermediate(
+    local_a = kernel.tensor("local_a", (rs_kernel.M, rs_kernel.K), rs_kernel.a_type)
+    local_weight = kernel.tensor("local_weight", (rs_kernel.N, rs_kernel.K), rs_kernel.b_type)
+    partial = kernel.tensor("partial", (rs_kernel.M, rs_kernel.N), rs_kernel.d_type)
+    staging = kernel.tensor(
         "staging", (rs_kernel.WORLD_SIZE, rs_kernel.LOCAL_M, rs_kernel.N), rs_kernel.d_type
     )
-    output = kernel.output("output", (rs_kernel.LOCAL_M, rs_kernel.N), rs_kernel.d_type)
+    output = kernel.tensor("output", (rs_kernel.LOCAL_M, rs_kernel.N), rs_kernel.d_type)
     partial_ready = kernel.event(
         "partial_shard_ready",
         (rs_kernel.WORLD_SIZE,),
@@ -99,40 +104,40 @@ def build_gemm_reduce_scatter_graph() -> KernelSpec:
     (
         kernel.tile(
             "partial_gemm",
-            impl=rs_kernel.PartialGemmTileImpl(),
+            impl=rs_kernel.PartialGemmTileImpl(
+                {"local_a": local_a, "local_weight": local_weight, "partial": partial}
+            ),
             tile_num=(m_clusters, n_clusters, 1),
+            reads=[local_a, local_weight],
+            writes=[partial],
             attrs={"purpose": "compute one cluster of the rank-local partial product"},
-        )
-        .read(local_a, local_weight)
-        .write(partial)
-        .notify(partial_ready, lambda m, n, k: (m // local_m_clusters,))
+        ).notify(partial_ready, lambda m, n, k: (m // local_m_clusters,))
     )
     (
         kernel.tile(
             "transfer",
-            impl=rs_kernel.ReduceScatterTileImpl(),
+            impl=rs_kernel.ReduceScatterTileImpl({"partial": partial, "staging": staging}),
             tile_num=(rs_kernel.WORLD_SIZE, rs_kernel.WORLD_SIZE, 1),
+            reads=[partial],
+            writes=[staging],
             attrs={"purpose": "move one source partial shard to one destination rank"},
         )
-        .read(partial)
-        .write(staging)
         .wait(partial_ready, lambda source, destination, k: (destination,))
         .notify(staging_ready, lambda source, destination, k: (destination,))
     )
     (
         kernel.tile(
             "reduce",
-            impl=rs_kernel.ReduceSumTileImpl(),
+            impl=rs_kernel.ReduceSumTileImpl({"staging": staging, "output": output}),
             tile_num=(
                 rs_kernel.WORLD_SIZE,
                 rs_kernel.LOCAL_M // rs_kernel.BLK_M_RS,
                 rs_kernel.N // rs_kernel.BLK_N_RS,
             ),
+            reads=[staging],
+            writes=[output],
             attrs={"purpose": "sum source-rank partials for one destination output tile"},
-        )
-        .read(staging)
-        .write(output)
-        .wait(staging_ready, lambda destination, m, n: (destination,))
+        ).wait(staging_ready, lambda destination, m, n: (destination,))
     )
     return kernel
 

@@ -75,18 +75,20 @@ def get_kernel(
     world_size: int = impl.WORLD_SIZE,
     dtype: str = "float16",
     scheduler: str = "dynamic",
-    use_dsl: bool = True,
     **_kwargs: Any,
 ):
     _check_config(M, N, K, world_size, dtype)
     _check_scheduler(scheduler)
-    if use_dsl:
-        from .dsl import GemmCommLowerer, build_allgather_gemm_graph, policy_for_scheduler
+    from .dsl import GemmCommLowerer, build_allgather_gemm_graph, policy_for_scheduler
 
-        lowered = GemmCommLowerer(policy_for_scheduler(scheduler)).lower(
-            build_allgather_gemm_graph()
-        )
-        return lowered.module
+    lowered = GemmCommLowerer(policy_for_scheduler(scheduler)).lower(build_allgather_gemm_graph())
+    return lowered.module
+
+
+def _get_manual_oracle_kernel(scheduler: str):
+    """Build the private pre-migration oracle for equivalence tests."""
+
+    _check_scheduler(scheduler)
     return impl.build_kernel(scheduler)
 
 
@@ -156,6 +158,7 @@ class _Case:
     task_idxs: Any
     head: Any
     tail: Any
+    plan: Any
 
     def reset(self) -> None:
         fill_ranked(self.semaphore, impl.WORLD_SIZE, (impl.WORLD_SIZE,), "uint64")
@@ -170,30 +173,55 @@ class _Case:
         sync_compute_to_communication(self.runtime)
 
     def launch(self) -> None:
-        self.runtime.session.get_global_func("runtime.disco.transfer_to_peers_all_gather")(
-            self.semaphore,
-            self.A,
-            self.ag_out,
-            self.runtime.communication_stream,
-            impl.M,
-            impl.K,
-            impl.WORLD_SIZE,
-        )
-        self.module["test_mma_ss_tma_2sm_persistent"](
-            self.A,
-            self.B,
-            self.ag_out,
-            self.semaphore,
-            self.out,
-            self.profiler,
-            self.task_types,
-            self.task_idxs,
-            self.head,
-            self.tail,
-        )
+        from .dsl import GemmCommHostExecutor, GemmCommRuntimeBindings
+
+        def launch_host(name):
+            if name != "runtime.disco.transfer_to_peers_all_gather":
+                raise ValueError(f"unsupported AllGather host region {name!r}")
+            self.runtime.session.get_global_func(name)(
+                self.semaphore,
+                self.A,
+                self.ag_out,
+                self.runtime.communication_stream,
+                impl.M,
+                impl.K,
+                impl.WORLD_SIZE,
+            )
+
+        def launch_device(name):
+            if name != "test_mma_ss_tma_2sm_persistent":
+                raise ValueError(f"unsupported AllGather device region {name!r}")
+            self.module[name](
+                self.A,
+                self.B,
+                self.ag_out,
+                self.semaphore,
+                self.out,
+                self.profiler,
+                self.task_types,
+                self.task_idxs,
+                self.head,
+                self.tail,
+            )
+
+        def unexpected_completion():
+            raise ValueError("AllGather execution plan has no completion edge")
+
+        GemmCommHostExecutor(
+            GemmCommRuntimeBindings(
+                launch_device=launch_device,
+                launch_host=launch_host,
+                communication_barrier=unexpected_completion,
+                communication_to_compute_sync=unexpected_completion,
+            )
+        ).execute(self.plan)
 
 
-def _allocate_case(runtime: DistributedRuntime, module: Any, data: dict[str, np.ndarray]) -> _Case:
+def _allocate_case(
+    runtime: DistributedRuntime, module: Any, data: dict[str, np.ndarray], scheduler: str
+) -> _Case:
+    from .dsl import build_allgather_gemm_graph, policy_for_scheduler
+
     session = runtime.session
     A = session.empty((impl.LOCAL_M, impl.K), impl.a_type)
     B = session.empty((impl.LOCAL_N, impl.K), impl.b_type)
@@ -213,6 +241,7 @@ def _allocate_case(runtime: DistributedRuntime, module: Any, data: dict[str, np.
         task_idxs=session.empty((impl.CAPACITY, impl.TASK_IDX_LEN), "int32"),
         head=session.empty((1,), "int32"),
         tail=session.empty((1,), "int32"),
+        plan=policy_for_scheduler(scheduler).normalize(build_allgather_gemm_graph()),
     )
     case.reset()
     session._sync_all()
@@ -247,7 +276,6 @@ def run_test(
     dtype: str = "float16",
     seed: int = 42,
     scheduler: str = "dynamic",
-    use_dsl: bool = True,
     **_kwargs: Any,
 ) -> None:
     """Compile, launch on four GPUs, and compare the full result with PyTorch."""
@@ -257,10 +285,9 @@ def run_test(
     data = prepare_data(M, N, K, world_size, dtype, seed=seed)
     with create_runtime(world_size) as runtime:
         with load_module(
-            runtime.session,
-            get_kernel(M, N, K, world_size, dtype, scheduler=scheduler, use_dsl=use_dsl),
+            runtime.session, get_kernel(M, N, K, world_size, dtype, scheduler=scheduler)
         ) as module:
-            case = _allocate_case(runtime, module, data)
+            case = _allocate_case(runtime, module, data, scheduler)
             case.prepare()
             case.launch()
             runtime.session._sync_all()
@@ -282,7 +309,6 @@ def run_bench(
     baseline_timeout: float = 900.0,
     cublasmp_algo: str = "split_p2p",
     scheduler: str = "dynamic",
-    use_dsl: bool = True,
     **_kwargs: Any,
 ) -> dict[str, Any]:
     """Benchmark the fused implementation using the slowest rank's CUDA event."""
@@ -292,10 +318,9 @@ def run_bench(
     data = prepare_data(M, N, K, world_size, dtype)
     with create_runtime(world_size) as runtime:
         with load_module(
-            runtime.session,
-            get_kernel(M, N, K, world_size, dtype, scheduler=scheduler, use_dsl=use_dsl),
+            runtime.session, get_kernel(M, N, K, world_size, dtype, scheduler=scheduler)
         ) as module:
-            case = _allocate_case(runtime, module, data)
+            case = _allocate_case(runtime, module, data, scheduler)
             tirx_result = benchmark_slowest_rank(
                 runtime.session,
                 reset=case.reset,

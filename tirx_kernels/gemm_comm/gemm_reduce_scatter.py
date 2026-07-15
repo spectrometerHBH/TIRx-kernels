@@ -23,6 +23,13 @@ import tvm
 from tvm.backend.cuda.lang import RankAwareGroupMajorTileScheduler
 from tvm.ir.type import PointerType, PrimType
 from tvm.megakernel.dsl import TileImpl
+from tvm.megakernel.transform import (
+    EmissionContext,
+    ExecutionPlan,
+    MegakernelBackend,
+    MidBodyPortAction,
+    TileEmitter,
+)
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.bench import CudaProfiler
@@ -271,19 +278,63 @@ class ReduceScatterTileImpl(TileImpl):
     execution_space = "host"
     entrypoint = "runtime.disco.transfer_to_peers_reduce_scatter"
 
-    def __init__(self):
+    def __init__(self, tensor_specs):
         super().__init__()
-        self._transfer = None
-        self._args = ()
-
-    def bind_context(self, transfer, *args) -> None:
-        self._transfer = transfer
-        self._args = args
+        self.tensor_specs = dict(tensor_specs)
 
     def run(self, m_idx, n_idx, k_idx):
-        if self._transfer is None:
-            raise RuntimeError("ReduceScatterTileImpl must be bound before run()")
-        return self._transfer(*self._args)
+        raise RuntimeError("host tiles are executed by GemmCommHostExecutor")
+
+
+class _PartialReadyPortBackend(MegakernelBackend):
+    """Emit the private partial-ready edge at the approved epilogue port."""
+
+    def __init__(self, sem, tid, signal_rank):
+        self.sem = sem
+        self.tid = tid
+        self.signal_rank = signal_rank
+
+    @T.inline
+    def _emit_notify(self):
+        self.sem.semaphore_notify(self.tid, self.signal_rank)
+
+    def emit_action(self, action, context):
+        del context
+        if not isinstance(action, MidBodyPortAction):
+            raise ValueError(f"unsupported partial-ready action {type(action).__name__}")
+        if action.port != "after_store_before_pipeline_advance":
+            raise ValueError(f"unsupported partial-ready port {action.port!r}")
+        self._emit_notify()
+
+
+@T.meta_class
+class PartialReadyPortProgram:
+    """Bind one validated private edge port to the partial GEMM semaphore."""
+
+    def __init__(self, execution_plan: ExecutionPlan | None, sem: Semaphore):
+        if execution_plan is None:
+            self.context = None
+            self.actions = (MidBodyPortAction((), "after_store_before_pipeline_advance"),)
+        else:
+            region = next(
+                region
+                for region in execution_plan.device_regions
+                if region.name == "partial_gemm_device"
+            )
+            program = next(
+                program for program in region.tile_programs if program.tile.name == "partial_gemm"
+            )
+            self.context = EmissionContext(execution_plan, region, "tile_action", program.tile)
+            self.actions = tuple(
+                action for action in program.actions if isinstance(action, MidBodyPortAction)
+            )
+        self.sem = sem
+
+    @T.inline
+    def emit(self, tid, signal_rank):
+        backend = T.meta_var(_PartialReadyPortBackend(self.sem, tid, signal_rank))
+        emitter = T.meta_var(TileEmitter(backend))
+        emitter.emit_program(self.context, self.actions)
 
 
 class PartialGemmTileImpl(TileImpl):
@@ -292,22 +343,217 @@ class PartialGemmTileImpl(TileImpl):
     execution_space = "device"
     entrypoint = "test_mma_ss_tma_2sm_persistent"
 
-    def __init__(self):
+    def __init__(self, tensor_specs=None):
         super().__init__()
-        self._bound = False
+        self.tensor_specs = {} if tensor_specs is None else dict(tensor_specs)
+        self._resources_initialized = False
 
-    def bind_context(self, **context) -> None:
+    def _attach_resources(self, **context) -> None:
         for name, value in context.items():
             setattr(self, name, value)
-        self._bound = True
 
-    def bind_role(self, role: str) -> None:
+    def _mark_resources_initialized(self) -> None:
+        self._resources_initialized = True
+
+    @T.inline
+    def host_init(self, A, B, gemm_out):
+        """Create and encode TileImpl-owned TMA tensor-map descriptors."""
+
+        A_tensor_map: T.let[T.handle("tensormap")] = T.tvm_stack_alloca("tensormap", 1)
+        B_tensor_map: T.let[T.handle("tensormap")] = T.tvm_stack_alloca("tensormap", 1)
+        C_tensor_map: T.let[T.handle("tensormap")] = T.tvm_stack_alloca("tensormap", 1)
+        T.call_packed(
+            "runtime.cuTensorMapEncodeTiled",
+            A_tensor_map,
+            "float16",
+            2,
+            A.data,
+            K,
+            M,
+            K * 2,
+            BLK_K,
+            BLK_M,
+            1,
+            1,
+            0,
+            3,
+            0,
+            0,
+        )
+        T.call_packed(
+            "runtime.cuTensorMapEncodeTiled",
+            B_tensor_map,
+            "float16",
+            2,
+            B.data,
+            K,
+            N,
+            K * 2,
+            BLK_K,
+            BLK_N // 2,
+            1,
+            1,
+            0,
+            3,
+            0,
+            0,
+        )
+        T.call_packed(
+            "runtime.cuTensorMapEncodeTiled",
+            C_tensor_map,
+            "float16",
+            2,
+            gemm_out.data,
+            N,
+            M,
+            N * 2,
+            EPI_TILE,
+            BLK_M,
+            1,
+            1,
+            0,
+            3,
+            0,
+            0,
+        )
+        self._attach_resources(
+            A_tensor_map=A_tensor_map, B_tensor_map=B_tensor_map, C_tensor_map=C_tensor_map
+        )
+
+    @T.inline
+    def init_storage(self, buf, sem, cbx, wg_id, warp_id, lane_id, tid):
+        """Create partial-GEMM smem, registers, descriptors, and pipelines."""
+
+        tmem_addr = T.decl_scalar("uint32", buf.data, scope="shared.dyn", elem_offset=0)
+        A_smem = T.decl_buffer(
+            (PIPE_DEPTH, NUM_CONSUMER, BLK_M, BLK_K),
+            a_type,
+            buf.data,
+            elem_offset=512,
+            layout=A_layout,
+        )
+        B_smem = T.decl_buffer(
+            (PIPE_DEPTH, BLK_N // 2, BLK_K),
+            b_type,
+            buf.data,
+            elem_offset=512 + BLK_K * BLK_M * NUM_CONSUMER * PIPE_DEPTH,
+            layout=B_layout,
+        )
+        C_smem = T.decl_buffer(
+            (NUM_CONSUMER, BLK_M, EPI_TILE),
+            d_type,
+            buf.data,
+            elem_offset=512
+            + BLK_K * BLK_M * NUM_CONSUMER * PIPE_DEPTH
+            + BLK_K * BLK_N // 2 * PIPE_DEPTH,
+            layout=D_layout,
+        )
+        reg = T.alloc_buffer((TMEM_LD_SIZE,), "float32", scope="local")
+        reg_wg = reg.view(
+            128, TMEM_LD_SIZE, layout=TileLayout(T.S[(128, TMEM_LD_SIZE) : (1 @ tid_in_wg, 1)])
+        )
+        reg_fp16 = T.alloc_buffer((BLK_N,), d_type, scope="local")
+        descA = T.local_scalar("uint64")
+        descB = T.local_scalar("uint64")
+        descI = T.local_scalar("uint32")
+        base_desc_A = T.local_scalar("uint64")
+        base_desc_B = T.local_scalar("uint64")
+        tma2mma_pipe = T.meta_var(
+            TMA2MMAPipeline(buf.data, 1, PIPE_DEPTH, 1, p_single_cta=False, c_single_cta=True)
+        )
+        mma2ld_pipe = T.meta_var(
+            MMA2LDpipeline(
+                buf.data, 1 + PIPE_DEPTH * 2, 1, NUM_CONSUMER, p_single_cta=True, c_single_cta=False
+            )
+        )
+        mma2ld_pipe.init(tid == 0, c2p_thread_count=128 * 2, p2c_thread_count=2)
+        tma2mma_pipe.init(tid == 0, c2p_thread_count=NUM_CONSUMER)
+        ptr: T.let[T.Var(name="ptr", dtype=PointerType(PrimType("uint64")))] = T.reinterpret(
+            "handle", T.ptx.map_shared_rank(tma2mma_pipe.mbar_p2c.ptr_to([0, 0]), 0)
+        )
+        tma_finished = T.decl_buffer([PIPE_DEPTH], "uint64", data=ptr, scope="shared")
+        self._attach_resources(
+            A_smem=A_smem,
+            B_smem=B_smem,
+            C_smem=C_smem,
+            reg=reg,
+            reg_wg=reg_wg,
+            reg_fp16=reg_fp16,
+            descA=descA,
+            descB=descB,
+            descI=descI,
+            base_desc_A=base_desc_A,
+            base_desc_B=base_desc_B,
+            tma2mma_pipe=tma2mma_pipe,
+            mma2ld_pipe=mma2ld_pipe,
+            tma_finished=tma_finished,
+            tmem_addr=tmem_addr,
+            sem=sem,
+            cbx=cbx,
+            wg_id=wg_id,
+            warp_id=warp_id,
+            lane_id=lane_id,
+            tid=tid,
+        )
+
+    @T.inline
+    def device_init(self):
+        """Allocate tensor memory and initialize the MMA instruction descriptor."""
+
+        if (self.wg_id == 0) & (self.warp_id == 0):
+            T.ptx.tcgen05.alloc(T.address_of(self.tmem_addr), n_cols=N_COLS, cta_group=cta_group)
+        T.ptx.tcgen05.encode_instr_descriptor(
+            T.address_of(self.descI),
+            d_dtype="float32",
+            a_dtype=a_type,
+            b_dtype=b_type,
+            M=MMA_M,
+            N=MMA_N,
+            K=MMA_K,
+            trans_a=False,
+            trans_b=False,
+            n_cta_groups=cta_group,
+        )
+        T.cuda.cta_sync()
+        T.cuda.trap_when_assert_failed(self.tmem_addr == 0)
+        tmem = T.decl_buffer(
+            (128, N_COLS),
+            "float32",
+            scope="tmem",
+            allocated_addr=0,
+            layout=TileLayout(T.S[(128, N_COLS) : (1 @ TLane, 1 @ TCol)]),
+        )
+        self._attach_resources(tmem=tmem)
+        self._mark_resources_initialized()
+
+    @T.inline
+    def release_tmem(self):
+        if (self.wg_id == 0) & (self.warp_id == 0):
+            T.ptx.tcgen05.relinquish_alloc_permit(cta_group=cta_group)
+            T.ptx.tcgen05.dealloc(self.tmem_addr, n_cols=N_COLS, cta_group=cta_group)
+
+    def bind_edge_port(self, execution_plan: ExecutionPlan | None, sem: Semaphore) -> None:
+        self.partial_ready_port = PartialReadyPortProgram(execution_plan, sem)
+
+    def build_module(self, execution_plan: ExecutionPlan):
+        """Build both device regions attached to this execution plan."""
+
+        reduce_impls = [
+            tile.impl
+            for tile in execution_plan.kernel.tiles
+            if tile.impl.entrypoint == "reduce_sum"
+        ]
+        if len(reduce_impls) != 1:
+            raise ValueError("GEMM+ReduceScatter requires exactly one reduce device region")
+        return build_kernel(self, reduce_impls[0], execution_plan=execution_plan)
+
+    def set_emission_role(self, role: str) -> None:
         self.role = role
 
     @T.inline
     def run(self, m_idx, n_idx, k_idx):
-        if not self._bound:
-            raise RuntimeError("PartialGemmTileImpl must be bound before run()")
+        if not self._resources_initialized:
+            raise RuntimeError("PartialGemmTileImpl resources are not initialized")
 
         if self.role == "load":
             for ko in range(K // BLK_K):
@@ -431,7 +677,7 @@ class PartialGemmTileImpl(TileImpl):
                 T.cuda.warpgroup_sync(self.wg_id + 1)
             comm_m_idx = T.meta_var(m_idx * 4 + self.wg_id * 2 + self.cbx)
             signal_rank = T.meta_var(comm_m_idx // (LOCAL_M // BLK_M))
-            self.sem.semaphore_notify(self.tid, signal_rank)
+            self.partial_ready_port.emit(self.tid, signal_rank)
             self.mma2ld_pipe.advance()
         else:
             raise ValueError(f"unsupported partial GEMM role: {self.role!r}")
@@ -457,22 +703,110 @@ class ReduceSumTileImpl(TileImpl):
     execution_space = "device"
     entrypoint = "reduce_sum"
 
-    def __init__(self):
+    def __init__(self, tensor_specs=None):
         super().__init__()
-        self._bound = False
+        self.tensor_specs = {} if tensor_specs is None else dict(tensor_specs)
+        self._resources_initialized = False
 
-    def bind_context(self, **context) -> None:
+    def _attach_resources(self, **context) -> None:
         for name, value in context.items():
             setattr(self, name, value)
-        self._bound = True
 
-    def bind_role(self, role: str) -> None:
+    def _mark_resources_initialized(self) -> None:
+        self._resources_initialized = True
+
+    @T.inline
+    def host_init(self, staging_buffer, out):
+        """Create and encode reduction tensor-map descriptors."""
+
+        src_tensor_map: T.let[T.handle("tensormap")] = T.tvm_stack_alloca("tensormap", 1)
+        dst_tensor_map: T.let[T.handle("tensormap")] = T.tvm_stack_alloca("tensormap", 1)
+        T.call_packed(
+            "runtime.cuTensorMapEncodeTiled",
+            src_tensor_map,
+            "float16",
+            3,
+            staging_buffer.data,
+            N,
+            LOCAL_M,
+            WORLD_SIZE,
+            N * 2,
+            LOCAL_M * N * 2,
+            BLK_N_RS,
+            BLK_M_RS,
+            1,
+            1,
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+        )
+        T.call_packed(
+            "runtime.cuTensorMapEncodeTiled",
+            dst_tensor_map,
+            "float16",
+            2,
+            out.data,
+            N,
+            LOCAL_M,
+            N * 2,
+            BLK_N_RS,
+            BLK_M_RS,
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+        )
+        self._attach_resources(src_tensor_map=src_tensor_map, dst_tensor_map=dst_tensor_map)
+
+    @T.inline
+    def init_storage(self, buf, wg_id, warp_id, lane_id, tid_in_wg):
+        """Create reduction smem, register storage, and its load pipeline."""
+
+        load_pipe = T.meta_var(
+            ReducePipe(buf.data, 0, RS_LOAD_PIPE_DEPTH, 1, p_single_cta=False, c_single_cta=False)
+        )
+        input_smem = T.decl_buffer(
+            (RS_LOAD_PIPE_DEPTH, BLK_M_RS, BLK_N_RS), d_type, buf.data, elem_offset=512
+        )
+        output_smem = T.decl_buffer(
+            (BLK_M_RS, BLK_N_RS),
+            d_type,
+            buf.data,
+            elem_offset=512 + RS_LOAD_PIPE_DEPTH * BLK_M_RS * BLK_N_RS,
+        )
+        reg_fp16 = T.alloc_buffer((8,), "float16", scope="local")
+        reg_fp32_tmp = T.alloc_buffer((8,), "float32", scope="local")
+        reg_fp32 = T.alloc_buffer((BLK_M_RS * BLK_N_RS // 8 // 128, 8), "float32", scope="local")
+        self._attach_resources(
+            load_pipe=load_pipe,
+            input_smem=input_smem,
+            output_smem=output_smem,
+            reg_fp16=reg_fp16,
+            reg_fp32_tmp=reg_fp32_tmp,
+            reg_fp32=reg_fp32,
+            wg_id=wg_id,
+            warp_id=warp_id,
+            lane_id=lane_id,
+            tid_in_wg=tid_in_wg,
+        )
+
+    @T.inline
+    def device_init(self, tid):
+        self.load_pipe.init(tid == 0, c2p_thread_count=128)
+        self._mark_resources_initialized()
+
+    def set_emission_role(self, role: str) -> None:
         self.role = role
 
     @T.inline
     def run(self, m_idx, n_idx, k_idx):
-        if not self._bound:
-            raise RuntimeError("ReduceSumTileImpl must be bound before run()")
+        if not self._resources_initialized:
+            raise RuntimeError("ReduceSumTileImpl resources are not initialized")
 
         if self.role == "load":
             if self.lane_id == 0:
@@ -537,17 +871,14 @@ class ReduceSumTileImpl(TileImpl):
 
 
 # fmt: off
-def _build_partial_gemm(partial_gemm_impl: PartialGemmTileImpl):
+def _build_partial_gemm(
+    partial_gemm_impl: PartialGemmTileImpl, execution_plan: ExecutionPlan | None
+):
     @T.prim_func
     def test_mma_ss_tma_2sm_persistent(A: T.Buffer((M, K), a_type), B: T.Buffer((N, K), b_type), gemm_out: T.Buffer((M, N), d_type),
                                     semaphore: T.Buffer((WORLD_SIZE, ), "uint64"),
                                     out: T.Buffer((LOCAL_M, N), d_type), profiler_buffer: T.Buffer((PROFILER_BUFFER_SIZE,), "uint64")):
-        A_tensor_map: T.let[T.handle("tensormap")] = T.tvm_stack_alloca("tensormap", 1)
-        B_tensor_map: T.let[T.handle("tensormap")] = T.tvm_stack_alloca("tensormap", 1)
-        C_tensor_map: T.let[T.handle("tensormap")] = T.tvm_stack_alloca("tensormap", 1)
-        T.call_packed("runtime.cuTensorMapEncodeTiled", A_tensor_map, "float16", 2, A.data, K, M, K * 2, BLK_K, BLK_M, 1, 1, 0, 3, 0, 0)
-        T.call_packed("runtime.cuTensorMapEncodeTiled", B_tensor_map, "float16", 2, B.data, K, N, K * 2, BLK_K, BLK_N // 2, 1, 1, 0, 3, 0, 0)
-        T.call_packed("runtime.cuTensorMapEncodeTiled", C_tensor_map, "float16", 2, gemm_out.data, N, M, N * 2, EPI_TILE, BLK_M, 1, 1, 0, 3, 0, 0)
+        partial_gemm_impl.host_init(A, B, gemm_out)
         T.device_entry()
         cbx, cby = T.cta_id_in_cluster([CLUSTER_M, CLUSTER_N])
         bx = T.cta_id([SM_COUNT])
@@ -568,79 +899,18 @@ def _build_partial_gemm(partial_gemm_impl: PartialGemmTileImpl):
         profiler.init(0)
         if bx < GEMM_SMS:
             profiler.start(ProfileEventType.GEMM, lane_id == 0)
-            tmem_addr = T.decl_scalar("uint32", buf.data, scope="shared.dyn", elem_offset=0)
-            A_smem = T.decl_buffer((PIPE_DEPTH, NUM_CONSUMER,BLK_M, BLK_K), a_type, buf.data, elem_offset=512, layout=A_layout)
-            B_smem = T.decl_buffer((PIPE_DEPTH, BLK_N // 2, BLK_K), b_type, buf.data, elem_offset=512 + BLK_K * BLK_M * NUM_CONSUMER * PIPE_DEPTH, layout=B_layout)
-            C_smem = T.decl_buffer((NUM_CONSUMER, BLK_M, EPI_TILE), d_type, buf.data, elem_offset=512 + BLK_K * BLK_M * NUM_CONSUMER * PIPE_DEPTH + BLK_K * BLK_N // 2 * PIPE_DEPTH, layout=D_layout)
-            reg = T.alloc_buffer((TMEM_LD_SIZE,), "float32", scope="local")
-            reg_wg = reg.view(128, TMEM_LD_SIZE, layout=TileLayout(T.S[(128, TMEM_LD_SIZE) : (1@tid_in_wg, 1)]))
-            reg_fp16 = T.alloc_buffer((BLK_N,), d_type, scope="local")
-            descA = T.local_scalar("uint64")
-            descB = T.local_scalar("uint64")
-            descI = T.local_scalar("uint32")
-            base_desc_A = T.local_scalar("uint64")
-            base_desc_B = T.local_scalar("uint64")
-            tma2mma_pipe = T.meta_var(TMA2MMAPipeline(buf.data, 1, PIPE_DEPTH, 1, p_single_cta=False, c_single_cta=True))
-            mma2ld_pipe = T.meta_var(MMA2LDpipeline(buf.data, 1 + PIPE_DEPTH * 2, 1, NUM_CONSUMER, p_single_cta=True, c_single_cta=False))
-            mma2ld_pipe.init(tid == 0, c2p_thread_count=128 * 2, p2c_thread_count=2)
-            tma2mma_pipe.init(tid == 0, c2p_thread_count=NUM_CONSUMER)
-            ptr: T.let[T.Var(name="ptr", dtype=PointerType(PrimType("uint64")))] = T.reinterpret("handle", T.ptx.map_shared_rank(tma2mma_pipe.mbar_p2c.ptr_to([0, 0]), 0))
-            tma_finished = T.decl_buffer([PIPE_DEPTH], "uint64", data=ptr, scope="shared")
+            partial_gemm_impl.init_storage(buf, sem, cbx, wg_id, warp_id, lane_id, tid)
             m_clusters = T.meta_var((M + BLK_M - 1) // BLK_M // CLUSTER_M // NUM_CONSUMER)
             n_clusters = T.meta_var((N + BLK_N - 1) // BLK_N // CLUSTER_N)
             gemm_tile_scheduler = T.meta_var(RankAwareGroupMajorTileScheduler("gemm_tile_scheduler", m_clusters, n_clusters, GROUP_SIZE, WORLD_SIZE))
             gemm_tile_scheduler.init(bx//2)
-            # alloc TMEM
-            if (wg_id == 0) & (warp_id == 0):
-                T.ptx.tcgen05.alloc(T.address_of(tmem_addr), n_cols=N_COLS, cta_group=cta_group)
-            T.ptx.tcgen05.encode_instr_descriptor(
-                T.address_of(descI),
-                d_dtype="float32",
-                a_dtype=a_type,
-                b_dtype=b_type,
-                M=MMA_M,
-                N=MMA_N,
-                K=MMA_K,
-                trans_a=False,
-                trans_b=False,
-                n_cta_groups=cta_group,
-            )
-            T.cuda.cta_sync()
-            T.cuda.trap_when_assert_failed(tmem_addr == 0)
-            tmem = T.decl_buffer((128, N_COLS), "float32", scope="tmem", allocated_addr=0,
-                                 layout=TileLayout(T.S[(128, N_COLS) : (1@TLane, 1@TCol)]))
-            partial_gemm_impl.bind_context(
-                A_tensor_map=A_tensor_map,
-                B_tensor_map=B_tensor_map,
-                C_tensor_map=C_tensor_map,
-                A_smem=A_smem,
-                B_smem=B_smem,
-                C_smem=C_smem,
-                reg=reg,
-                reg_wg=reg_wg,
-                reg_fp16=reg_fp16,
-                descA=descA,
-                descB=descB,
-                descI=descI,
-                base_desc_A=base_desc_A,
-                base_desc_B=base_desc_B,
-                tma2mma_pipe=tma2mma_pipe,
-                mma2ld_pipe=mma2ld_pipe,
-                tma_finished=tma_finished,
-                tmem_addr=tmem_addr,
-                tmem=tmem,
-                sem=sem,
-                cbx=cbx,
-                wg_id=wg_id,
-                warp_id=warp_id,
-                lane_id=lane_id,
-                tid=tid,
-            )
+            partial_gemm_impl.device_init()
+            partial_gemm_impl.bind_edge_port(execution_plan, sem)
             # reset RF
             if wg_id == NUM_CONSUMER:
                 T.ptx.setmaxnreg(False, 56)
                 if warp_id == 3:
-                    partial_gemm_impl.bind_role("load")
+                    partial_gemm_impl.set_emission_role("load")
                     while gemm_tile_scheduler.valid():
                         m_idx = T.meta_var(gemm_tile_scheduler.m_idx) # represent cluster task id
                         n_idx = T.meta_var(gemm_tile_scheduler.n_idx)
@@ -648,7 +918,7 @@ def _build_partial_gemm(partial_gemm_impl: PartialGemmTileImpl):
                         gemm_tile_scheduler.next_tile(stride=GEMM_SMS // 2)
                     partial_gemm_impl.finalize()
                 elif warp_id < NUM_CONSUMER:
-                    partial_gemm_impl.bind_role("mma")
+                    partial_gemm_impl.set_emission_role("mma")
                     while gemm_tile_scheduler.valid():
                         m_idx = T.meta_var(gemm_tile_scheduler.m_idx) # represent cluster task id
                         n_idx = T.meta_var(gemm_tile_scheduler.n_idx)
@@ -656,16 +926,14 @@ def _build_partial_gemm(partial_gemm_impl: PartialGemmTileImpl):
                         gemm_tile_scheduler.next_tile(stride=GEMM_SMS // 2)
             if wg_id < NUM_CONSUMER:
                 T.ptx.setmaxnreg(True, 224)
-                partial_gemm_impl.bind_role("epilogue")
+                partial_gemm_impl.set_emission_role("epilogue")
                 while gemm_tile_scheduler.valid():
                     m_idx = T.meta_var(gemm_tile_scheduler.m_idx) # represent cluster task id
                     n_idx = T.meta_var(gemm_tile_scheduler.n_idx)
                     partial_gemm_impl.run(m_idx, n_idx, 0)
                     gemm_tile_scheduler.next_tile(stride=GEMM_SMS // 2)
             # dealloc TMEM
-            if (wg_id == 0) & (warp_id == 0):
-                T.ptx.tcgen05.relinquish_alloc_permit(cta_group=cta_group)
-                T.ptx.tcgen05.dealloc(tmem_addr, n_cols=N_COLS, cta_group=cta_group)
+            partial_gemm_impl.release_tmem()
             profiler.end(ProfileEventType.GEMM, lane_id == 0)
 
     return test_mma_ss_tma_2sm_persistent
@@ -677,48 +945,7 @@ def _build_reduce_sum(reduce_sum_impl: ReduceSumTileImpl):
         staging_buffer: T.Buffer((WORLD_SIZE, LOCAL_M, N), "float16"),
         out: T.Buffer((LOCAL_M, N), d_type),
     ):
-        src_tensor_map: T.let[T.handle("tensormap")] = T.tvm_stack_alloca("tensormap", 1)
-        dst_tensor_map: T.let[T.handle("tensormap")] = T.tvm_stack_alloca("tensormap", 1)
-        T.call_packed(
-            "runtime.cuTensorMapEncodeTiled",
-            src_tensor_map,
-            "float16",
-            3,
-            staging_buffer.data,
-            N,
-            LOCAL_M,
-            WORLD_SIZE,
-            N * 2,
-            LOCAL_M * N * 2,
-            BLK_N_RS,
-            BLK_M_RS,
-            1,
-            1,
-            1,
-            1,
-            0,
-            0,
-            0,
-            0,
-        )
-        T.call_packed(
-            "runtime.cuTensorMapEncodeTiled",
-            dst_tensor_map,
-            "float16",
-            2,
-            out.data,
-            N,
-            LOCAL_M,
-            N * 2,
-            BLK_N_RS,
-            BLK_M_RS,
-            1,
-            1,
-            0,
-            0,
-            0,
-            0,
-        )
+        reduce_sum_impl.host_init(staging_buffer, out)
         T.device_entry()
         bx = T.cta_id([SM_COUNT])
         wg_id = T.warpgroup_id([2])
@@ -727,54 +954,21 @@ def _build_reduce_sum(reduce_sum_impl: ReduceSumTileImpl):
         tid_in_wg = T.thread_id_in_wg([128])
         tid = T.thread_id([256])
         buf = T.alloc_buffer([SMEM_SIZE], "uint8", scope="shared.dyn")
-        load_pipe = T.meta_var(
-            ReducePipe(
-                buf.data, 0, RS_LOAD_PIPE_DEPTH, 1, p_single_cta=False, c_single_cta=False
-            )
-        )
-        input_smem = T.decl_buffer(
-            (RS_LOAD_PIPE_DEPTH, BLK_M_RS, BLK_N_RS),
-            d_type,
-            buf.data,
-            elem_offset=512,
-        )
-        output_smem = T.decl_buffer(
-            (BLK_M_RS, BLK_N_RS),
-            d_type,
-            buf.data,
-            elem_offset=512 + RS_LOAD_PIPE_DEPTH * BLK_M_RS * BLK_N_RS,
-        )
-        reg_fp16 = T.alloc_buffer((8, ), "float16", scope="local")
-        reg_fp32_tmp = T.alloc_buffer((8), "float32", scope="local")
-        reg_fp32 = T.alloc_buffer((BLK_M_RS * BLK_N_RS // 8 // 128, 8), "float32", scope="local")
+        reduce_sum_impl.init_storage(buf, wg_id, warp_id, lane_id, tid_in_wg)
         iter = T.local_scalar("int32")
         iter = 0
-        load_pipe.init(tid == 0, c2p_thread_count=128)
+        reduce_sum_impl.device_init(tid)
         tile_id = T.meta_var(iter * SM_COUNT + bx)
         T.tvm_storage_sync("shared")
-        reduce_sum_impl.bind_context(
-            src_tensor_map=src_tensor_map,
-            dst_tensor_map=dst_tensor_map,
-            load_pipe=load_pipe,
-            input_smem=input_smem,
-            output_smem=output_smem,
-            reg_fp16=reg_fp16,
-            reg_fp32_tmp=reg_fp32_tmp,
-            reg_fp32=reg_fp32,
-            wg_id=wg_id,
-            warp_id=warp_id,
-            lane_id=lane_id,
-            tid_in_wg=tid_in_wg,
-        )
         if warp_id == 0 and wg_id == 0:
-            reduce_sum_impl.bind_role("load")
+            reduce_sum_impl.set_emission_role("load")
             while tile_id < LOCAL_M // BLK_M_RS * N // BLK_N_RS:
                 m_idx = T.meta_var(tile_id // (N // BLK_N_RS))
                 n_idx = T.meta_var(tile_id % (N // BLK_N_RS))
                 reduce_sum_impl.run(m_idx, n_idx, 0)
                 iter += 1
         elif wg_id == 1:
-            reduce_sum_impl.bind_role("reduce")
+            reduce_sum_impl.set_emission_role("reduce")
             while tile_id < LOCAL_M // BLK_M_RS * N // BLK_N_RS:
                 m_idx = T.meta_var(tile_id // (N // BLK_N_RS))
                 n_idx = T.meta_var(tile_id % (N // BLK_N_RS))
@@ -788,6 +982,7 @@ def _build_reduce_sum(reduce_sum_impl: ReduceSumTileImpl):
 def build_kernel(
     partial_gemm_impl: PartialGemmTileImpl | None = None,
     reduce_sum_impl: ReduceSumTileImpl | None = None,
+    execution_plan: ExecutionPlan | None = None,
 ):
     """Build the existing IRModule with the selected concrete tile implementations."""
 
@@ -795,7 +990,9 @@ def build_kernel(
     reduce_sum_impl = reduce_sum_impl or ReduceSumTileImpl()
     return tvm.IRModule(
         {
-            "test_mma_ss_tma_2sm_persistent": _build_partial_gemm(partial_gemm_impl),
+            "test_mma_ss_tma_2sm_persistent": _build_partial_gemm(
+                partial_gemm_impl, execution_plan
+            ),
             "reduce_sum": _build_reduce_sum(reduce_sum_impl),
         }
     )

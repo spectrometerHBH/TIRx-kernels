@@ -22,6 +22,13 @@ from enum import Enum
 import tvm
 from tvm.ir.type import PointerType, PrimType
 from tvm.megakernel.dsl import TileImpl
+from tvm.megakernel.transform import (
+    EmissionContext,
+    ExecutionPlan,
+    FetchGuardAction,
+    MegakernelBackend,
+    TileEmitter,
+)
 from tvm.script import tirx as T
 from tvm.script.ir_builder import IRBuilder
 from tvm.script.tirx import tile as Tx
@@ -376,6 +383,7 @@ class GEMMMPMCQueue(MPMCQueue):
         fetched_task_idx0: T.Buffer,
         fetched_task_idx1: T.Buffer,
         sem: Semaphore,
+        fetch_program,
         cbx,
         bx,
         rank,
@@ -388,8 +396,11 @@ class GEMMMPMCQueue(MPMCQueue):
             remote_rank = (
                 rank + (self.head_r[0] // (LOCAL_GEMM_M_CLUSTERS * GEMM_N_CLUSTERS))
             ) % WORLD_SIZE
-            if remote_rank != rank:
-                sem.semaphore_wait(remote_rank)
+            if fetch_program is None:
+                if remote_rank != rank:
+                    sem.semaphore_wait(remote_rank)
+            else:
+                fetch_program.emit(remote_rank, rank)
 
             self.masked_pos[0] = self.head_r[0] & self.mask
             fetched_task_type[0] = T.cuda.func_call(
@@ -432,10 +443,58 @@ def consumer_fetch(
 # fmt: on
 
 
+class _AllGatherFetchBackend(MegakernelBackend):
+    """Realize the shard-ready edge at its scheduler fetch position."""
+
+    def __init__(self, sem, remote_rank, rank):
+        self.sem = sem
+        self.remote_rank = remote_rank
+        self.rank = rank
+
+    @T.inline
+    def _emit_guard(self):
+        if self.remote_rank != self.rank:
+            self.sem.semaphore_wait(self.remote_rank)
+
+    def emit_action(self, action, context):
+        del context
+        if not isinstance(action, FetchGuardAction):
+            raise ValueError(f"unsupported AllGather fetch action {type(action).__name__}")
+        if action.predicate != "remote_rank != rank":
+            raise ValueError(f"unsupported AllGather fetch predicate {action.predicate!r}")
+        self._emit_guard()
+
+
+@T.meta_class
+class AllGatherFetchProgram:
+    """Bind a validated scheduler fetch program to its physical semaphore."""
+
+    def __init__(self, execution_plan: ExecutionPlan | None, sem: Semaphore):
+        if execution_plan is None:
+            self.context = None
+            self.actions = (FetchGuardAction((), predicate="remote_rank != rank"),)
+        else:
+            region = execution_plan.device_regions[0]
+            self.context = EmissionContext(execution_plan, region, "scheduler_fetch")
+            self.actions = region.fetch_program.actions
+        self.sem = sem
+
+    @T.inline
+    def emit(self, remote_rank, rank):
+        backend = T.meta_var(_AllGatherFetchBackend(self.sem, remote_rank, rank))
+        emitter = T.meta_var(TileEmitter(backend))
+        emitter.emit_program(self.context, self.actions)
+
+
 @T.meta_class
 class SingleDynamicTileScheduler:
     def __init__(
-        self, queue: MPMCQueue, packed_value: T.Buffer, sch_pipe: Pipeline, sem: Semaphore
+        self,
+        queue: MPMCQueue,
+        packed_value: T.Buffer,
+        sch_pipe: Pipeline,
+        sem: Semaphore,
+        fetch_program=None,
     ):
         self.queue = queue
         self.sch_pipe = sch_pipe
@@ -443,6 +502,7 @@ class SingleDynamicTileScheduler:
         self.fetched_task_idx0 = int_var("fetched_task_idx0")
         self.fetched_task_idx1 = int_var("fetched_task_idx1")
         self.sem = sem
+        self.fetch_program = fetch_program
         self.rs_rem = int_var("rs_rem")
         self.packed_value = packed_value
         IRBuilder.current().name("packed_value", self.packed_value)
@@ -461,7 +521,7 @@ class SingleDynamicTileScheduler:
         if warp_id_in_cta == 11 and lane_id == 0:
             if cbx == 0:
                 self.sch_pipe.producer_wait(0)
-                self.queue.dequeue(self.fetched_task_type, self.fetched_task_idx0, self.fetched_task_idx1, self.sem, cbx, bx, rank)
+                self.queue.dequeue(self.fetched_task_type, self.fetched_task_idx0, self.fetched_task_idx1, self.sem, self.fetch_program, cbx, bx, rank)
                 T.cuda.func_call(
                     "pack_values",
                     self.rs_rem[0],
@@ -508,11 +568,17 @@ class SingleStaticTileScheduler:
     """Deterministically assign the rank-aware task order to persistent clusters."""
 
     def __init__(
-        self, queue: MPMCQueue, packed_value: T.Buffer, sch_pipe: Pipeline, sem: Semaphore
+        self,
+        queue: MPMCQueue,
+        packed_value: T.Buffer,
+        sch_pipe: Pipeline,
+        sem: Semaphore,
+        fetch_program=None,
     ):
         self.sem = sem
         self.sch_pipe = sch_pipe
         self.packed_value = packed_value
+        self.fetch_program = fetch_program
         self.linear_idx = int_var("static_linear_idx")
         self.fetched_task_type = int_var("fetched_task_type")
         self.fetched_task_idx0 = int_var("fetched_task_idx0")
@@ -533,8 +599,11 @@ class SingleStaticTileScheduler:
             ) % GEMM_M_CLUSTERS
             self.fetched_task_idx1[0] = index_in_group // GROUP_SIZE
             remote_rank = T.meta_var((rank + self.linear_idx[0] // tasks_per_shard) % WORLD_SIZE)
-            if remote_rank != rank:
-                self.sem.semaphore_wait(remote_rank)
+            if self.fetch_program is None:
+                if remote_rank != rank:
+                    self.sem.semaphore_wait(remote_rank)
+            else:
+                self.fetch_program.emit(remote_rank, rank)
         else:
             self.fetched_task_type[0] = -1
 
@@ -595,19 +664,12 @@ class AllGatherTileImpl(TileImpl):
     execution_space = "host"
     entrypoint = "runtime.disco.transfer_to_peers_all_gather"
 
-    def __init__(self):
+    def __init__(self, tensor_specs):
         super().__init__()
-        self._transfer = None
-        self._args = ()
-
-    def bind_context(self, transfer, *args) -> None:
-        self._transfer = transfer
-        self._args = args
+        self.tensor_specs = dict(tensor_specs)
 
     def run(self, m_idx, n_idx, k_idx):
-        if self._transfer is None:
-            raise RuntimeError("AllGatherTileImpl must be bound before run()")
-        return self._transfer(*self._args)
+        raise RuntimeError("host tiles are executed by GemmCommHostExecutor")
 
 
 class AllGatherGemmTileImpl(TileImpl):
@@ -616,21 +678,169 @@ class AllGatherGemmTileImpl(TileImpl):
     execution_space = "device"
     entrypoint = "test_mma_ss_tma_2sm_persistent"
 
-    def __init__(self):
+    def __init__(self, tensor_specs=None):
         super().__init__()
-        self._bound = False
+        self.tensor_specs = {} if tensor_specs is None else dict(tensor_specs)
+        self._resources_initialized = False
 
-    def bind_context(self, **context) -> None:
-        """Bind buffers and pipeline state allocated by the enclosing kernel."""
-
+    def _attach_resources(self, **context) -> None:
         for name, value in context.items():
             setattr(self, name, value)
-        self._bound = True
+
+    def _mark_resources_initialized(self) -> None:
+        self._resources_initialized = True
+
+    @T.inline
+    def init_storage(
+        self,
+        A,
+        B,
+        ag_out,
+        out,
+        buf,
+        A_layout,
+        B_layout,
+        D_layout,
+        cbx,
+        wg_id,
+        warp_id,
+        lane_id,
+        rank,
+    ):
+        """Create tile-owned storage and descriptor state from the region smem base."""
+
+        tmem_addr = T.decl_scalar("uint32", buf.data, scope="shared.dyn", elem_offset=0)
+        A_smem = T.decl_buffer(
+            (PIPELINE_DEPTH, NUM_CONSUMER, BLK_M, BLK_K),
+            a_type,
+            buf.data,
+            layout=A_layout,
+            elem_offset=1024 // F16_BYTES,
+        )
+        B_smem = T.decl_buffer(
+            (PIPELINE_DEPTH, BLK_N, BLK_K),
+            b_type,
+            buf.data,
+            layout=B_layout,
+            elem_offset=1024 // F16_BYTES + PIPELINE_DEPTH * NUM_CONSUMER * BLK_M * BLK_K,
+        )
+        D_smem = T.decl_buffer(
+            (NUM_CONSUMER, BLK_M, EPI_TILE),
+            d_type,
+            buf.data,
+            layout=D_layout,
+            elem_offset=1024 // F16_BYTES + PIPELINE_DEPTH * (NUM_CONSUMER * BLK_M + BLK_N) * BLK_K,
+        )
+        descA = T.local_scalar("uint64")
+        descB = T.local_scalar("uint64")
+        descI = T.local_scalar("uint32")
+        phase = T.alloc_buffer((1,), "int32", scope="local")
+        phase_tmem = T.alloc_buffer((1,), "int32", scope="local")
+        stage = T.local_scalar("int32")
+        self._attach_resources(
+            A=A,
+            B=B,
+            ag_out=ag_out,
+            out=out,
+            buf=buf,
+            tmem_addr=tmem_addr,
+            A_smem=A_smem,
+            B_smem=B_smem,
+            D_smem=D_smem,
+            descA=descA,
+            descB=descB,
+            descI=descI,
+            phase=phase,
+            phase_tmem=phase_tmem,
+            stage=stage,
+            cbx=cbx,
+            wg_id=wg_id,
+            warp_id=warp_id,
+            lane_id=lane_id,
+            rank=rank,
+        )
+
+    @T.inline
+    def device_init(self, tid):
+        """Create and initialize the tile-owned TMA/MMA pipelines and descriptors."""
+
+        tma2mma = T.meta_var(BarTMA2MMA(self.buf.data, 4, PIPELINE_DEPTH, 1, is_p2c=True))
+        mma2tma = T.meta_var(
+            BarMMA2TMA(self.buf.data, 4 + PIPELINE_DEPTH, PIPELINE_DEPTH, 1, is_p2c=False)
+        )
+        mma2ld = T.meta_var(
+            BarMMA2LD(self.buf.data, 4 + 2 * PIPELINE_DEPTH, 1, NUM_CONSUMER, is_p2c=True)
+        )
+        ld2mma = T.meta_var(
+            BarLD2MMA(
+                self.buf.data, 4 + 2 * PIPELINE_DEPTH + NUM_CONSUMER, 1, NUM_CONSUMER, is_p2c=False
+            )
+        )
+        tma2mma.init(1, tid == 0)
+        mma2tma.init(NUM_CONSUMER, tid == 0)
+        mma2ld.init(1, tid == 0)
+        ld2mma.init(128 * NUM_CONSUMER, tid == 0)
+        ptr: T.let[T.Var(name="ptr", dtype=PointerType(PrimType("uint64")))] = T.reinterpret(
+            "handle", T.ptx.map_shared_rank(tma2mma.mbar.ptr_to([0, 0]), 0)
+        )
+        tma_finished = T.decl_buffer([PIPELINE_DEPTH], "uint64", data=ptr, scope="shared")
+        self.phase[0] = 0
+        self.phase_tmem[0] = 0
+        self._attach_resources(
+            tma_finished=tma_finished,
+            tma2mma=tma2mma,
+            mma2tma=mma2tma,
+            mma2ld=mma2ld,
+            ld2mma=ld2mma,
+        )
+
+    @T.inline
+    def init_descriptors_and_tmem(self):
+        """Initialize the MMA descriptor and allocate tile-owned tensor memory."""
+
+        T.ptx.tcgen05.encode_instr_descriptor(
+            T.address_of(self.descI),
+            d_dtype="float32",
+            a_dtype=a_type,
+            b_dtype=b_type,
+            M=MMA_M,
+            N=MMA_N,
+            K=MMA_K,
+            trans_a=False,
+            trans_b=False,
+            n_cta_groups=CTA_GROUP,
+        )
+        if (self.wg_id == 0) & (self.warp_id == 0):
+            T.ptx.tcgen05.alloc(T.address_of(self.tmem_addr), n_cols=N_COLS, cta_group=CTA_GROUP)
+
+    @T.inline
+    def init_tmem(self):
+        T.cuda.trap_when_assert_failed(self.tmem_addr == 0)
+        tmem = T.decl_buffer(
+            (128, N_COLS),
+            "float32",
+            scope="tmem",
+            allocated_addr=0,
+            layout=TileLayout(T.S[(128, N_COLS) : (1 @ TLane, 1 @ TCol)]),
+        )
+        self._attach_resources(tmem=tmem)
+        self._mark_resources_initialized()
+
+    @T.inline
+    def device_finalize(self):
+        if (self.wg_id == 0) & (self.warp_id == 0):
+            T.ptx.tcgen05.relinquish_alloc_permit(cta_group=CTA_GROUP)
+            T.ptx.tcgen05.dealloc(self.tmem_addr, n_cols=N_COLS, cta_group=CTA_GROUP)
+
+    def build_module(self, execution_plan: ExecutionPlan):
+        """Build this attached device implementation through its execution plan."""
+
+        return build_kernel(execution_plan.attrs["policy"], self, execution_plan=execution_plan)
 
     @T.inline
     def run(self, m_idx, n_idx, k_idx):
-        if not self._bound:
-            raise RuntimeError("AllGatherGemmTileImpl must be bound before run()")
+        if not self._resources_initialized:
+            raise RuntimeError("AllGatherGemmTileImpl resources are not initialized")
 
         if self.wg_id == NUM_CONSUMER:
             T.ptx.setmaxnreg(False, 56)
@@ -838,7 +1048,11 @@ class AllGatherGemmTileImpl(TileImpl):
             epilogue1()
 
 
-def build_kernel(scheduler: str = "dynamic", tile_impl: AllGatherGemmTileImpl | None = None):
+def build_kernel(
+    scheduler: str = "dynamic",
+    tile_impl: AllGatherGemmTileImpl | None = None,
+    execution_plan: ExecutionPlan | None = None,
+):
     if scheduler == "dynamic":
         scheduler_class = SingleDynamicTileScheduler
     elif scheduler == "static":
@@ -889,63 +1103,24 @@ def build_kernel(scheduler: str = "dynamic", tile_impl: AllGatherGemmTileImpl | 
         rank = T.nvshmem.my_pe()
         # alloc shared memory
         buf = T.alloc_buffer([SMEM_SIZE], "uint8", scope="shared.dyn")
-        tmem_addr = T.decl_scalar("uint32", buf.data, scope="shared.dyn", elem_offset=0)
-        A_smem = T.decl_buffer((PIPELINE_DEPTH, NUM_CONSUMER, BLK_M, BLK_K), a_type, buf.data, layout=A_layout,
-                                elem_offset=1024 // F16_BYTES)
-        B_smem = T.decl_buffer((PIPELINE_DEPTH, BLK_N, BLK_K), b_type, buf.data, layout=B_layout,
-                                elem_offset=1024 // F16_BYTES + PIPELINE_DEPTH * NUM_CONSUMER * BLK_M * BLK_K)
-        D_smem = T.decl_buffer((NUM_CONSUMER, BLK_M, EPI_TILE), d_type, buf.data, layout=D_layout,
-                                elem_offset=1024 // F16_BYTES + PIPELINE_DEPTH * (NUM_CONSUMER * BLK_M + BLK_N) * BLK_K)
-
-        # alloc local memory
-        descA = T.local_scalar("uint64")
-        descB = T.local_scalar("uint64")
-        descI = T.local_scalar("uint32")
-        phase = T.alloc_buffer((1,), "int32", scope="local")
-        phase_tmem = T.alloc_buffer((1,), "int32", scope="local")
-        stage = T.local_scalar("int32")
+        tile_impl.init_storage(A, B, ag_out, out, buf, A_layout, B_layout, D_layout, cbx, wg_id, warp_id, lane_id, rank)
 
         # ag + gemm
         sem = T.meta_var(Semaphore(cnt=1, buffer=semaphore))
+        fetch_program = T.meta_var(AllGatherFetchProgram(execution_plan, sem))
         gemm_queue = T.meta_var(GEMMMPMCQueue(CAPACITY, gemm_task_types, gemm_task_idxs, gemm_head, gemm_tail, GEMM_M_CLUSTERS * GEMM_N_CLUSTERS))
         packed_buf = T.decl_buffer((1,), "uint64", buf.data, elem_offset=64)
         packed_ptr: T.let[T.Var(name="packed_ptr", dtype=PointerType(PrimType("uint64")))] = T.reinterpret("handle", T.ptx.map_shared_rank(packed_buf.ptr_to([0]), 0)) # rank: 0
         packed_value = T.decl_buffer([1,], "uint64", data=packed_ptr, scope="shared")
         sch_pipe = T.meta_var(Pipeline(buf.data, 64 + 4, pipeline_depth=1, pipeline_num=1, p_single_cta=True, c_single_cta=False))
-        tile_scheduler = T.meta_var(scheduler_class(gemm_queue, packed_value, sch_pipe, sem))
+        tile_scheduler = T.meta_var(scheduler_class(gemm_queue, packed_value, sch_pipe, sem, fetch_program))
         profiler = T.meta_var(CudaProfiler(profiler_buffer, write_stride=PROFILER_WRITE_STRIDE, num_groups=NUM_GROUPS, profiler_enabled=PROFILER_ON))
 
         # initialize
         profiler.init(warp_id_in_cta)
-        tma2mma = T.meta_var(BarTMA2MMA(buf.data, 4, PIPELINE_DEPTH, 1, is_p2c=True))
-        mma2tma = T.meta_var(BarMMA2TMA(buf.data, 4 + PIPELINE_DEPTH, PIPELINE_DEPTH, 1, is_p2c=False))
-        mma2ld = T.meta_var(BarMMA2LD(buf.data, 4 + 2 * PIPELINE_DEPTH, 1, NUM_CONSUMER, is_p2c=True))
-        ld2mma = T.meta_var(BarLD2MMA(buf.data, 4 + 2 * PIPELINE_DEPTH + NUM_CONSUMER, 1, NUM_CONSUMER, is_p2c=False))
-        tma2mma.init(1, tid == 0)
-        mma2tma.init(NUM_CONSUMER, tid == 0)
-        mma2ld.init(1, tid == 0)
-        ld2mma.init(128 * NUM_CONSUMER, tid == 0)
-        ptr: T.let[T.Var(name="ptr", dtype=PointerType(PrimType("uint64")))] = T.reinterpret("handle", T.ptx.map_shared_rank(tma2mma.mbar.ptr_to([0, 0]), 0))
-        tma_finished = T.decl_buffer([PIPELINE_DEPTH], "uint64", data=ptr, scope="shared")
-        phase[0] = 0
-        phase_tmem[0] = 0
+        tile_impl.device_init(tid)
         sch_pipe.init(tid == 0, c2p_thread_count=C2P_THREAD_COUNT, p2c_thread_count=1)
-        T.ptx.tcgen05.encode_instr_descriptor(
-            T.address_of(descI),
-            d_dtype="float32",
-            a_dtype=a_type,
-            b_dtype=b_type,
-            M=MMA_M,
-            N=MMA_N,
-            K=MMA_K,
-            trans_a=False,
-            trans_b=False,
-            n_cta_groups=CTA_GROUP,
-        )
-
-        # alloc TMEM
-        if (wg_id == 0) & (warp_id == 0):
-            T.ptx.tcgen05.alloc(T.address_of(tmem_addr), n_cols=N_COLS, cta_group=CTA_GROUP)
+        tile_impl.init_descriptors_and_tmem()
 
         T.ptx.barrier.cluster.arrive()
         T.ptx.barrier.cluster.wait()
@@ -954,35 +1129,7 @@ def build_kernel(scheduler: str = "dynamic", tile_impl: AllGatherGemmTileImpl | 
         T.ptx.fence.mbarrier_init()
         tile_scheduler.init(cbx, bx, rank, warp_id_in_cta, lane_id)
 
-        T.cuda.trap_when_assert_failed(tmem_addr == 0)
-        tmem = T.decl_buffer((128, N_COLS), "float32", scope="tmem", allocated_addr=0, layout=TileLayout(T.S[(128, N_COLS) : (1@TLane, 1@TCol)]))
-
-        tile_impl.bind_context(
-            A=A,
-            B=B,
-            ag_out=ag_out,
-            out=out,
-            A_smem=A_smem,
-            B_smem=B_smem,
-            D_smem=D_smem,
-            tmem=tmem,
-            descA=descA,
-            descB=descB,
-            descI=descI,
-            phase=phase,
-            phase_tmem=phase_tmem,
-            stage=stage,
-            tma_finished=tma_finished,
-            tma2mma=tma2mma,
-            mma2tma=mma2tma,
-            mma2ld=mma2ld,
-            ld2mma=ld2mma,
-            cbx=cbx,
-            wg_id=wg_id,
-            warp_id=warp_id,
-            lane_id=lane_id,
-            rank=rank,
-        )
+        tile_impl.init_tmem()
 
         while tile_scheduler.valid():
             if tile_scheduler.fetched_task_type[0] == TaskType.GEMM.value:
@@ -995,9 +1142,7 @@ def build_kernel(scheduler: str = "dynamic", tile_impl: AllGatherGemmTileImpl | 
             tile_scheduler.next_tile(cbx, bx, rank, warp_id_in_cta, lane_id)
 
         # dealloc TMEM
-        if (wg_id == 0) & (warp_id == 0):
-            T.ptx.tcgen05.relinquish_alloc_permit(cta_group=CTA_GROUP)
-            T.ptx.tcgen05.dealloc(tmem_addr, n_cols=N_COLS, cta_group=CTA_GROUP)
+        tile_impl.device_finalize()
 
         T.ptx.barrier.cluster.arrive()
         T.ptx.barrier.cluster.wait()
