@@ -22,15 +22,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from tvm.megakernel.transform import (
-    FetchGuardAction,
-    HostCallAction,
-    HostEdgeAction,
-    MegakernelBackend,
-    MidBodyPortAction,
-    RunAction,
-    TileEmitter,
-)
+from tvm.megakernel.transform import DeviceRegionPlan, HostCallStep, HostSyncStep
 
 from .model import GemmCommPlan
 
@@ -45,37 +37,6 @@ class GemmCommRuntimeBindings:
     communication_to_compute_sync: Callable[[], None]
 
 
-class _GemmCommHostBackend(MegakernelBackend):
-    def __init__(self, bindings: GemmCommRuntimeBindings):
-        self.bindings = bindings
-
-    def begin_device_region(self, plan, region) -> None:
-        del plan
-        entrypoint = region.attrs.get("entrypoint")
-        if not isinstance(entrypoint, str) or not entrypoint:
-            raise ValueError(f"device region {region.name!r} has no backend entrypoint")
-        self.bindings.launch_device(entrypoint)
-
-    def emit_device_action(self, action, context) -> None:
-        if isinstance(action, RunAction | FetchGuardAction | MidBodyPortAction):
-            # These actions are realized inside their device kernel and do not
-            # add a host-side synchronization point.
-            return
-        else:
-            raise ValueError(f"unsupported GemmComm device action {type(action).__name__}")
-
-    def emit_host_action(self, action, context) -> None:
-        if isinstance(action, HostCallAction):
-            self.bindings.launch_host(action.name)
-        elif isinstance(action, HostEdgeAction):
-            if action.kind != "completion":
-                raise ValueError(f"unsupported host edge kind {action.kind!r}")
-            self.bindings.communication_barrier()
-            self.bindings.communication_to_compute_sync()
-        else:
-            raise ValueError(f"unsupported GemmComm host action {type(action).__name__}")
-
-
 class GemmCommHostExecutor:
     """Execute one region DAG without conflating launch order and completion."""
 
@@ -83,9 +44,26 @@ class GemmCommHostExecutor:
         self.bindings = bindings
 
     def execute(self, plan: GemmCommPlan) -> None:
+        plan.validate()
         if not plan.lowerable:
             raise NotImplementedError(plan.unsupported_reason)
-        TileEmitter(_GemmCommHostBackend(self.bindings)).emit(plan.execution_plan())
+        for region in plan.execution.regions_in_dependency_order():
+            entrypoint = plan.entrypoint_for(region.name)
+            if isinstance(region, DeviceRegionPlan):
+                self.bindings.launch_device(entrypoint)
+                continue
+            for step in region.steps:
+                if isinstance(step, HostCallStep):
+                    if step.name != "collective":
+                        raise ValueError(f"unsupported GemmComm host call {step.name!r}")
+                    self.bindings.launch_host(entrypoint)
+                elif isinstance(step, HostSyncStep):
+                    if step.kind != "communication_completion":
+                        raise ValueError(f"unsupported host sync kind {step.kind!r}")
+                    self.bindings.communication_barrier()
+                    self.bindings.communication_to_compute_sync()
+                else:
+                    raise ValueError(f"unsupported GemmComm host step {type(step).__name__}")
 
 
 __all__ = ["GemmCommHostExecutor", "GemmCommRuntimeBindings"]

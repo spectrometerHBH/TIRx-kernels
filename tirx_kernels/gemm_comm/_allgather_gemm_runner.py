@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Tensor-parallel AllGather + FP16 GEMM for SM100."""
+"""Rank-local runner for the DSL-lowered AllGather + FP16 GEMM."""
 
 from __future__ import annotations
 
@@ -24,23 +24,27 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+import torch
+import torch.distributed as dist
+
+import tvm
+from tvm.tirx import PrimFunc
 
 from . import allgather_gemm as impl
-from ._baselines import run_external_baselines
 from ._runtime import (
     DistributedRuntime,
     barrier_on_compute_stream,
-    benchmark_slowest_rank,
-    copy_ranked,
-    create_runtime,
-    fill_ranked,
-    load_module,
+    run_distributed,
     symmetric_empty,
+    sync_communication_to_compute,
     sync_compute_to_communication,
+    torch_view,
 )
 
 KERNEL_META = {"name": "allgather_gemm", "category": "gemm_comm", "compute_capability": 10}
 _SUPPORTED_SCHEDULERS = ("static", "dynamic")
+_DSL_PREFIX = "dsl"
+_MANUAL_PREFIX = "manual"
 
 CONFIGS = [
     {
@@ -92,6 +96,42 @@ def _get_manual_oracle_kernel(scheduler: str):
     return impl.build_kernel(scheduler)
 
 
+def _prefix_modules(modules: dict[str, Any]) -> tvm.IRModule:
+    functions = {}
+    for prefix, module in modules.items():
+        if isinstance(module, PrimFunc):
+            entries = [(str(module.attrs["global_symbol"]), module)]
+        elif isinstance(module, tvm.IRModule):
+            entries = [
+                (global_var.name_hint, function)
+                for global_var, function in module.functions.items()
+            ]
+        else:
+            raise TypeError(f"expected PrimFunc or IRModule, got {type(module).__name__}")
+        for original_name, function in entries:
+            name = f"{prefix}_{original_name}"
+            if isinstance(function, PrimFunc):
+                function = function.with_attr("global_symbol", name)
+            functions[name] = function
+    return tvm.IRModule(functions)
+
+
+def _get_benchmark_kernel(
+    M: int = impl.M,
+    N: int = impl.N,
+    K: int = impl.K,
+    world_size: int = impl.WORLD_SIZE,
+    dtype: str = "float16",
+    scheduler: str = "dynamic",
+) -> tvm.IRModule:
+    return _prefix_modules(
+        {
+            _DSL_PREFIX: get_kernel(M, N, K, world_size, dtype, scheduler=scheduler),
+            _MANUAL_PREFIX: _get_manual_oracle_kernel(scheduler),
+        }
+    )
+
+
 def prepare_data(
     M: int = impl.M,
     N: int = impl.N,
@@ -100,14 +140,22 @@ def prepare_data(
     dtype: str = "float16",
     seed: int = 42,
     scale: float = 0.05,
+    rank: int = 0,
     **_kwargs: Any,
-) -> dict[str, np.ndarray]:
-    """Create deterministic rank-local shards on the host."""
+) -> dict[str, torch.Tensor]:
+    """Create deterministic inputs directly on one rank's CUDA device."""
 
     _check_config(M, N, K, world_size, dtype)
-    rng = np.random.default_rng(seed)
-    A = (rng.standard_normal((world_size, impl.LOCAL_M, K)) * scale).astype(dtype)
-    B = (rng.standard_normal((world_size, impl.LOCAL_N, K)) * scale).astype(dtype)
+    if not 0 <= rank < world_size:
+        raise ValueError("rank must be in [0, world_size)")
+    device = torch.device("cuda", rank)
+    generator = torch.Generator(device=device).manual_seed(seed + rank)
+    A = torch.randn(
+        (impl.LOCAL_M, K), dtype=torch.float16, device=device, generator=generator
+    ).mul_(scale)
+    B = torch.randn(
+        (impl.LOCAL_N, K), dtype=torch.float16, device=device, generator=generator
+    ).mul_(scale)
     return {"A": A, "B": B}
 
 
@@ -148,6 +196,7 @@ def _queue_state() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
 class _Case:
     runtime: DistributedRuntime
     module: Any
+    entrypoint_prefix: str | None
     A: Any
     B: Any
     ag_out: Any
@@ -158,27 +207,36 @@ class _Case:
     task_idxs: Any
     head: Any
     tail: Any
+    initial_task_types: Any
+    initial_task_idxs: Any
+    initial_tail: Any
+    ag_out_torch: torch.Tensor
+    semaphore_torch: torch.Tensor
     plan: Any
 
     def reset(self) -> None:
-        fill_ranked(self.semaphore, impl.WORLD_SIZE, (impl.WORLD_SIZE,), "uint64")
-        task_types, task_idxs, heads, tails = _queue_state()
-        copy_ranked(self.task_types, task_types)
-        copy_ranked(self.task_idxs, task_idxs)
-        copy_ranked(self.head, heads)
-        copy_ranked(self.tail, tails)
+        self.semaphore_torch.zero_()
+        self.task_types.copy_(self.initial_task_types)
+        self.task_idxs.copy_(self.initial_task_idxs)
+        self.head.zero_()
+        self.tail.copy_(self.initial_tail)
 
     def prepare(self) -> None:
         barrier_on_compute_stream(self.runtime)
         sync_compute_to_communication(self.runtime)
 
+    def _entrypoint(self, name: str) -> str:
+        if self.entrypoint_prefix is None:
+            return name
+        return f"{self.entrypoint_prefix}_{name}"
+
     def launch(self) -> None:
         from .dsl import GemmCommHostExecutor, GemmCommRuntimeBindings
 
-        def launch_host(name):
-            if name != "runtime.disco.transfer_to_peers_all_gather":
+        def launch_host(name: str) -> None:
+            if name != impl.ALLGATHER_HOST_ENTRYPOINT:
                 raise ValueError(f"unsupported AllGather host region {name!r}")
-            self.runtime.session.get_global_func(name)(
+            tvm.get_global_func(name)(
                 self.semaphore,
                 self.A,
                 self.ag_out,
@@ -188,10 +246,10 @@ class _Case:
                 impl.WORLD_SIZE,
             )
 
-        def launch_device(name):
-            if name != "test_mma_ss_tma_2sm_persistent":
+        def launch_device(name: str) -> None:
+            if name != impl.GEMM_DEVICE_ENTRYPOINT:
                 raise ValueError(f"unsupported AllGather device region {name!r}")
-            self.module[name](
+            self.module[self._entrypoint(name)](
                 self.A,
                 self.B,
                 self.ag_out,
@@ -204,7 +262,7 @@ class _Case:
                 self.tail,
             )
 
-        def unexpected_completion():
+        def unexpected_completion() -> None:
             raise ValueError("AllGather execution plan has no completion edge")
 
         GemmCommHostExecutor(
@@ -215,57 +273,104 @@ class _Case:
                 communication_to_compute_sync=unexpected_completion,
             )
         ).execute(self.plan)
+        sync_communication_to_compute(self.runtime)
 
 
 def _allocate_case(
-    runtime: DistributedRuntime, module: Any, data: dict[str, np.ndarray], scheduler: str
+    runtime: DistributedRuntime,
+    module: Any,
+    data: dict[str, torch.Tensor],
+    scheduler: str,
+    entrypoint_prefix: str | None,
 ) -> _Case:
     from .dsl import build_allgather_gemm_graph, policy_for_scheduler
 
-    session = runtime.session
-    A = session.empty((impl.LOCAL_M, impl.K), impl.a_type)
-    B = session.empty((impl.LOCAL_N, impl.K), impl.b_type)
-    copy_ranked(A, data["A"])
-    copy_ranked(B, data["B"])
-
+    task_types, task_idxs, heads, tails = _queue_state()
+    device = torch.device("cuda", runtime.rank)
+    ag_out = symmetric_empty(runtime, (impl.M, impl.K), impl.a_type)
+    semaphore = symmetric_empty(runtime, (impl.WORLD_SIZE,), "uint64")
+    initial_task_types = torch.from_numpy(task_types[runtime.rank].copy()).to(device)
+    initial_task_idxs = torch.from_numpy(task_idxs[runtime.rank].copy()).to(device)
+    initial_tail = torch.from_numpy(tails[runtime.rank].copy()).to(device)
     case = _Case(
         runtime=runtime,
         module=module,
-        A=A,
-        B=B,
-        ag_out=symmetric_empty(session, (impl.M, impl.K), impl.a_type),
-        semaphore=symmetric_empty(session, (impl.WORLD_SIZE,), "uint64"),
-        out=session.empty((impl.M, impl.LOCAL_N), impl.d_type),
-        profiler=session.empty((impl.PROFILER_BUFFER_SIZE,), "uint64"),
-        task_types=session.empty((impl.CAPACITY,), "int32"),
-        task_idxs=session.empty((impl.CAPACITY, impl.TASK_IDX_LEN), "int32"),
-        head=session.empty((1,), "int32"),
-        tail=session.empty((1,), "int32"),
+        entrypoint_prefix=entrypoint_prefix,
+        A=data["A"],
+        B=data["B"],
+        ag_out=ag_out,
+        semaphore=semaphore,
+        out=torch.empty((impl.M, impl.LOCAL_N), dtype=torch.float16, device=device),
+        profiler=torch.empty(impl.PROFILER_BUFFER_SIZE, dtype=torch.uint64, device=device),
+        task_types=torch.empty_like(initial_task_types),
+        task_idxs=torch.empty_like(initial_task_idxs),
+        head=torch.from_numpy(heads[runtime.rank].copy()).to(device),
+        tail=torch.empty_like(initial_tail),
+        initial_task_types=initial_task_types,
+        initial_task_idxs=initial_task_idxs,
+        initial_tail=initial_tail,
+        ag_out_torch=torch_view(ag_out),
+        semaphore_torch=torch_view(semaphore),
         plan=policy_for_scheduler(scheduler).normalize(build_allgather_gemm_graph()),
     )
-    case.reset()
-    session._sync_all()
+    with torch.cuda.stream(runtime.timing_stream):
+        case.reset()
+    torch.cuda.synchronize(runtime.rank)
+    runtime.barrier()
     return case
 
 
-def _check_correctness(case: _Case, data: dict[str, np.ndarray]) -> None:
-    import torch
+def _check_correctness(case: _Case) -> None:
+    gathered_A = torch.empty((impl.M, impl.K), dtype=torch.float16, device=case.A.device)
+    with torch.cuda.stream(case.runtime.timing_stream):
+        dist.all_gather_into_tensor(gathered_A, case.A)
+    case.runtime.timing_stream.synchronize()
 
-    gathered_A = data["A"].reshape(impl.M, impl.K)
-    gathered_ref = torch.from_numpy(gathered_A)
-    A_cuda = gathered_ref.cuda(0)
-    for rank in range(impl.WORLD_SIZE):
-        ag_result = case.ag_out.debug_get_from_remote(rank).numpy()
-        # The local shard is consumed directly from A and intentionally is not
-        # copied into the symmetric AllGather workspace.
-        local = slice(rank * impl.LOCAL_M, (rank + 1) * impl.LOCAL_M)
-        ag_result[local] = gathered_A[local]
-        np.testing.assert_array_equal(ag_result, gathered_A)
+    local = slice(case.runtime.rank * impl.LOCAL_M, (case.runtime.rank + 1) * impl.LOCAL_M)
+    case.ag_out_torch[local].copy_(case.A)
+    torch.testing.assert_close(case.ag_out_torch, gathered_A, rtol=0, atol=0)
 
-        B_cuda = torch.from_numpy(data["B"][rank]).cuda(0)
-        reference = torch.matmul(A_cuda, B_cuda.T)
-        result = torch.from_numpy(case.out.debug_get_from_remote(rank).numpy()).cuda(0)
-        torch.testing.assert_close(result, reference, rtol=1e-3, atol=2e-2)
+    reference = torch.matmul(gathered_A, case.B.T)
+    torch.testing.assert_close(case.out, reference, rtol=1e-3, atol=2e-2)
+
+
+def _run_worker(
+    runtime: DistributedRuntime, module: Any, mode: str, kwargs: dict[str, Any]
+) -> dict[str, Any]:
+    scheduler = str(kwargs.get("scheduler", "dynamic"))
+    data = prepare_data(rank=runtime.rank, **kwargs)
+
+    if mode == "test":
+        case = _allocate_case(runtime, module, data, scheduler, None)
+        with torch.cuda.stream(runtime.timing_stream):
+            case.prepare()
+            case.launch()
+        runtime.device.sync(runtime.compute_stream)
+        _check_correctness(case)
+        return {"status": "OK"}
+    if mode != "bench":
+        raise ValueError(f"unsupported distributed worker mode {mode!r}")
+
+    from tvm.tirx.bench import bench
+
+    dsl_case = _allocate_case(runtime, module, data, scheduler, _DSL_PREFIX)
+    manual_case = _allocate_case(runtime, module, data, scheduler, _MANUAL_PREFIX)
+
+    def prepare(case: _Case) -> None:
+        case.reset()
+        case.prepare()
+
+    result = bench(
+        {"dsl": dsl_case.launch, "manual": manual_case.launch},
+        warmup=kwargs.get("warmup"),
+        repeat=kwargs.get("repeat"),
+        timer=kwargs.get("timer"),
+        rounds=kwargs.get("rounds", 1),
+        cooldown_s=kwargs.get("cooldown_s", 1.0),
+        distributed=runtime.bench_context(),
+        prepare={"dsl": lambda: prepare(dsl_case), "manual": lambda: prepare(manual_case)},
+    )
+    return {"status": "OK", **result}
 
 
 def run_test(
@@ -278,20 +383,25 @@ def run_test(
     scheduler: str = "dynamic",
     **_kwargs: Any,
 ) -> None:
-    """Compile, launch on four GPUs, and compare the full result with PyTorch."""
+    """Launch the DSL-lowered kernel on four GPUs and validate its result."""
 
     _check_config(M, N, K, world_size, dtype)
     _check_scheduler(scheduler)
-    data = prepare_data(M, N, K, world_size, dtype, seed=seed)
-    with create_runtime(world_size) as runtime:
-        with load_module(
-            runtime.session, get_kernel(M, N, K, world_size, dtype, scheduler=scheduler)
-        ) as module:
-            case = _allocate_case(runtime, module, data, scheduler)
-            case.prepare()
-            case.launch()
-            runtime.session._sync_all()
-            _check_correctness(case, data)
+    run_distributed(
+        get_kernel(M, N, K, world_size, dtype, scheduler=scheduler),
+        world_size=world_size,
+        worker=_run_worker,
+        mode="test",
+        worker_kwargs={
+            "M": M,
+            "N": N,
+            "K": K,
+            "world_size": world_size,
+            "dtype": dtype,
+            "seed": seed,
+            "scheduler": scheduler,
+        },
+    )
 
 
 def run_bench(
@@ -300,64 +410,38 @@ def run_bench(
     K: int = impl.K,
     world_size: int = impl.WORLD_SIZE,
     dtype: str = "float16",
+    *,
     warmup: int | None = None,
     repeat: int | None = None,
+    timer: str | None = None,
     rounds: int = 1,
     cooldown_s: float = 1.0,
-    baselines: bool = True,
-    baseline_strict: bool = False,
-    baseline_timeout: float = 900.0,
-    cublasmp_algo: str = "split_p2p",
     scheduler: str = "dynamic",
     **_kwargs: Any,
 ) -> dict[str, Any]:
-    """Benchmark the fused implementation using the slowest rank's CUDA event."""
+    """Pair the DSL and manual paths with the shared distributed Kineto timer."""
 
     _check_config(M, N, K, world_size, dtype)
     _check_scheduler(scheduler)
-    data = prepare_data(M, N, K, world_size, dtype)
-    with create_runtime(world_size) as runtime:
-        with load_module(
-            runtime.session, get_kernel(M, N, K, world_size, dtype, scheduler=scheduler)
-        ) as module:
-            case = _allocate_case(runtime, module, data, scheduler)
-            tirx_result = benchmark_slowest_rank(
-                runtime.session,
-                reset=case.reset,
-                prepare=case.prepare,
-                launch=case.launch,
-                warmup=warmup,
-                repeat=repeat,
-                rounds=rounds,
-                cooldown_s=cooldown_s,
-            )
-
-    result: dict[str, Any] = {
-        "status": "OK",
-        "impls": {"tirx": tirx_result["mean_us"]},
-        "samples_us": {"tirx": tirx_result["samples_us"]},
-        "round_samples": {"tirx": tirx_result["round_samples_us"]},
-        "timing": {"tirx": tirx_result},
-    }
-    if baselines:
-        baseline_result = run_external_baselines(
-            "allgather_gemm",
-            world_size=world_size,
-            warmup=warmup,
-            repeat=repeat,
-            rounds=rounds,
-            cooldown_s=cooldown_s,
-            cublasmp_algo=cublasmp_algo,
-            timeout=baseline_timeout,
-            strict=baseline_strict,
-        )
-        result["baselines"] = baseline_result
-        if baseline_result.get("status") == "OK":
-            for name, measurement in baseline_result["implementations"].items():
-                result["impls"][name] = measurement["mean_us"]
-                result["samples_us"][name] = measurement["samples_us"]
-                result["round_samples"][name] = measurement["round_samples_us"]
-    return result
+    return run_distributed(
+        _get_benchmark_kernel(M, N, K, world_size, dtype, scheduler),
+        world_size=world_size,
+        worker=_run_worker,
+        mode="bench",
+        worker_kwargs={
+            "M": M,
+            "N": N,
+            "K": K,
+            "world_size": world_size,
+            "dtype": dtype,
+            "scheduler": scheduler,
+            "warmup": warmup,
+            "repeat": repeat,
+            "timer": timer,
+            "rounds": rounds,
+            "cooldown_s": cooldown_s,
+        },
+    )
 
 
 __all__ = ["CONFIGS", "KERNEL_META", "get_kernel", "prepare_data", "run_bench", "run_test"]
