@@ -59,12 +59,12 @@ def main():
     parser.add_argument(
         "--timer",
         type=str,
-        choices=("event", "proton", "cudagraph", "cudagraph_proton", "megamoe"),
+        choices=("event", "proton", "cudagraph_proton", "megamoe"),
         default=None,
         help="Override the kernel module's benchmark timer: 'event' = do_bench, "
-        "'proton' = do_bench_proton, 'cudagraph' = do_bench_cudagraph, "
-        "'cudagraph_proton' = do_bench_cudagraph_proton [NVIDIA], 'megamoe' = "
-        "DeepGEMM bench_kineto protocol for MegaMoE",
+        "'proton' = do_bench_proton, 'cudagraph_proton' = "
+        "do_bench_cudagraph_proton [NVIDIA], 'megamoe' = DeepGEMM bench_kineto "
+        "protocol for MegaMoE",
     )
     parser.add_argument(
         "--rounds",

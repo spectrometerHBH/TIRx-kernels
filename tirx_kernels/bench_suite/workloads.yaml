@@ -6,8 +6,8 @@ defaults:
   # defaults. The global default timer is `proton` (resolved from timer=None in
   # tvm.tirx.bench.bench) -- pure per-kernel GPU time with the same cold-cache
   # preparation as Triton's do_bench_proton. Timer failures are explicit; the runner
-  # never labels an event measurement as Proton. `event`, `cudagraph`, and
-  # `cudagraph_proton` remain explicit alternatives with their native Triton semantics.
+  # never labels an event measurement as Proton. `event` and `cudagraph_proton`
+  # remain explicit alternatives with their native Triton semantics.
   # Override warmup/repeat/timer per-workload only for a specific exception.
 
 workloads:
