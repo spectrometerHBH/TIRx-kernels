@@ -34,8 +34,8 @@ from tirx_kernels.megakernel.utils.config import JobType, ProfileEventType
 from tvm.megakernel.dsl import TensorSpec, TileImpl
 
 
-class _MoeTileImpl(TileImpl):
-    """Shared logical metadata for one directly inherited physical tile."""
+class _MoeTileMetadataMixin(TileImpl):
+    """Attach shared MoE metadata to a directly inherited physical tile."""
 
     implementation: str
     job_type: int
@@ -50,7 +50,7 @@ class _MoeTileImpl(TileImpl):
         self.tensor_bindings = dict(tensor_bindings)
 
 
-class GatingTileImpl(GemmTile, _MoeTileImpl):
+class GatingTileImpl(GemmTile, _MoeTileMetadataMixin):
     implementation = "gating"
     job_type = JobType.MOE_GATING.value
     profile_event_type = ProfileEventType.MOE_GATING
@@ -89,7 +89,7 @@ class GatingTileImpl(GemmTile, _MoeTileImpl):
         )
 
 
-class TopkTileImpl(TopkSoftmaxTile, _MoeTileImpl):
+class TopkTileImpl(TopkSoftmaxTile, _MoeTileMetadataMixin):
     implementation = "topk"
     job_type = JobType.MOE_TOPK_SOFTMAX.value
     profile_event_type = ProfileEventType.TOPK_SOFTMAX
@@ -122,7 +122,7 @@ class TopkTileImpl(TopkSoftmaxTile, _MoeTileImpl):
         )
 
 
-class AlignTileImpl(MOEAlignTile, _MoeTileImpl):
+class AlignTileImpl(MOEAlignTile, _MoeTileMetadataMixin):
     implementation = "align"
     job_type = JobType.MOE_ALIGN.value
     profile_event_type = ProfileEventType.MOE_ALIGN
@@ -159,7 +159,7 @@ class AlignTileImpl(MOEAlignTile, _MoeTileImpl):
         )
 
 
-class CountSortTileImpl(CountAndSortExpertTokens, _MoeTileImpl):
+class CountSortTileImpl(CountAndSortExpertTokens, _MoeTileMetadataMixin):
     implementation = "count_sort"
     job_type = JobType.MOE_COUNT_AND_SORT.value
     profile_event_type = ProfileEventType.COUNT_AND_SORT
@@ -196,7 +196,7 @@ class CountSortTileImpl(CountAndSortExpertTokens, _MoeTileImpl):
         )
 
 
-class GateUpSiluTileImpl(GroupGEMMSiluTile, _MoeTileImpl):
+class GateUpSiluTileImpl(GroupGEMMSiluTile, _MoeTileMetadataMixin):
     implementation = "gate_up_silu"
     job_type = JobType.MOE_GROUP_GEMM_GATE_UP_SILU.value
     profile_event_type = ProfileEventType.GROUP_GEMM_GATE_UP_SILU
@@ -246,7 +246,7 @@ class GateUpSiluTileImpl(GroupGEMMSiluTile, _MoeTileImpl):
         )
 
 
-class DownTileImpl(GroupGEMMTileSM100, _MoeTileImpl):
+class DownTileImpl(GroupGEMMTileSM100, _MoeTileMetadataMixin):
     implementation = "down"
     job_type = JobType.MOE_GROUP_GEMM_DOWN.value
     profile_event_type = ProfileEventType.GROUP_GEMM_DOWN
