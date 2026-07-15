@@ -40,18 +40,7 @@ from .._expr import (
     walk_expr,
 )
 from ..spec import TileSpec
-from ._constants import (
-    _PACKED_INDEX_LIMITS,
-    _SCOPE_INSTANCES,
-    _SCOPE_ORDER,
-    _SCOPE_WIDTHS,
-    _STEP_CTA_SYNC,
-    _STEP_POST_NOTIFY,
-    _STEP_PRE_NOTIFY,
-    _STEP_RUN,
-    _STEP_RUNTIME_EVENT_INIT,
-    _STEP_WAIT,
-)
+from ._constants import _PACKED_INDEX_LIMITS, _SCOPE_INSTANCES, _SCOPE_ORDER, _SCOPE_WIDTHS
 from .model import (
     DynamicDispatchPlan,
     EventPlan,
@@ -97,7 +86,7 @@ def _logical_dependency_plans(
     waits = tuple(
         WaitPlan(
             logical_spec=dependency,
-            event=dependency.event.name,
+            event=dependency[0].name,
             coord=env.coord(tile, dependency),
             level=_WAIT_LEVEL_BY_TILE[tile.name],
         )
@@ -106,7 +95,7 @@ def _logical_dependency_plans(
     notifies = tuple(
         NotifyPlan(
             logical_spec=dependency,
-            event=dependency.event.name,
+            event=dependency[0].name,
             coord=env.coord(tile, dependency),
             scope=_NOTIFY_SCOPE_BY_TILE[tile.name][0],
             scope_id=_NOTIFY_SCOPE_BY_TILE[tile.name][1],
@@ -114,30 +103,6 @@ def _logical_dependency_plans(
         for dependency in tile.notifies
     )
     return waits, notifies
-
-
-def _execution_steps(
-    tile: TileSpec,
-    waits: tuple[WaitPlan, ...],
-    notifies: tuple[NotifyPlan, ...],
-    *,
-    is_dynamic: bool,
-    runtime_init: bool,
-) -> tuple[str, ...]:
-    steps = []
-    if is_dynamic:
-        steps.append(_STEP_PRE_NOTIFY)
-    if waits:
-        steps.append(_STEP_WAIT)
-    steps.append(_STEP_RUN)
-    if tile.impl.implementation == "align":
-        steps.append(_STEP_CTA_SYNC)
-        steps.append(_STEP_RUNTIME_EVENT_INIT)
-    elif runtime_init:
-        raise ValueError("only the align tile may initialize a runtime event in the MoE MVP")
-    if notifies:
-        steps.append(_STEP_POST_NOTIFY)
-    return tuple(steps)
 
 
 def _normalize_tiles(
@@ -179,13 +144,6 @@ def _normalize_tiles(
                 upper_bounds=upper,
                 scheduled_extents=scheduled_extents,
                 scheduled_upper_bounds=scheduled,
-                execution_steps=_execution_steps(
-                    tile,
-                    waits,
-                    notifies,
-                    is_dynamic=is_dynamic,
-                    runtime_init=tile.name in runtime_init_tiles,
-                ),
                 waits=waits,
                 notifies=notifies,
             )
@@ -763,10 +721,7 @@ def _validate_policy_edges(tiles: tuple[TilePlan, ...], rules: tuple[_DynamicDis
             )
         notify = matching_notifies[0]
         wait = matching_waits[0]
-        if (
-            notify.logical_spec.event is not wait.logical_spec.event
-            or notify.coord != rule.event_coord
-        ):
+        if notify.logical_spec[0] is not wait.logical_spec[0] or notify.coord != rule.event_coord:
             raise ValueError(
                 f"dynamic rule for {rule.source_tile!r} is inconsistent with its logical edge"
             )

@@ -63,8 +63,6 @@ KERNEL_META = {"name": "megakernel_moe", "category": "megakernel", "compute_capa
 
 _SUPPORTED_SCHEDULERS = ("static", "dynamic", "unfused")
 _STATIC_QUEUE_SCHEDULERS = ("static", "unfused")
-_SUPPORTED_LOWERINGS = ("dsl", "manual")
-_DEFAULT_LOWERING = "dsl"
 _TEST_BATCH_SIZES = (1, 4, 128, 512, 2048)
 _BENCH_BATCH_SIZES = (1, 8, 32, 128, 512, 1024, 2048, 4096)
 _BENCH_LAUNCH_SLOT_HEADROOM = 1.25
@@ -112,11 +110,10 @@ class MegaKernelMOE(MegaKernelWrapper):
         lowerer.lower(build_moe_graph(self.config, batch_size))
         return lowerer
 
-    def get_module(self, scheduler: str, lowering: str = _DEFAULT_LOWERING):
+    def _build_module(self, scheduler: str, *, manual_oracle: bool):
         _check_scheduler(scheduler)
-        _check_lowering(lowering)
         previous = getattr(self, "_active_lowering", None)
-        self._active_lowering = lowering
+        self._active_lowering = "manual" if manual_oracle else "dsl"
         try:
             return super().get_module(scheduler)
         finally:
@@ -124,6 +121,16 @@ class MegaKernelMOE(MegaKernelWrapper):
                 del self._active_lowering
             else:
                 self._active_lowering = previous
+
+    def get_module(self, scheduler: str):
+        """Build the public DSL lowering for one scheduler policy."""
+
+        return self._build_module(scheduler, manual_oracle=False)
+
+    def _get_manual_oracle_module(self, scheduler: str):
+        """Build the private pre-migration oracle used only by equivalence tests."""
+
+        return self._build_module(scheduler, manual_oracle=True)
 
     def _set_tiles(self, batch_size, low_batch):
         self.gate = self._add_tile(
@@ -270,7 +277,16 @@ class MegaKernelMOE(MegaKernelWrapper):
 
     def _add_tile(self, tile, profiler_event_type, predicate=True):
         self.tile_attr[tile] = (profiler_event_type, predicate)
-        subclass = GroupGEMMTileSM100 if isinstance(tile, GemmTile) else tile.__class__
+        if isinstance(tile, GemmTile):
+            subclass = GroupGEMMTileSM100
+        elif isinstance(tile, TopkSoftmaxTile):
+            subclass = TopkSoftmaxTile
+        elif isinstance(tile, MOEAlignTile):
+            subclass = MOEAlignTile
+        elif isinstance(tile, CountAndSortExpertTokens):
+            subclass = CountAndSortExpertTokens
+        else:
+            subclass = tile.__class__
         self.class_list.add(subclass)
         return tile
 
@@ -671,7 +687,8 @@ class MegaKernelMOE(MegaKernelWrapper):
                     self.task_impl_wait_etensor_init_complete(is_dynamic_sch)
                 else:
                     Tx.cuda.trap_when_assert_failed(False)
-            self.smem_manager.exit_tile_runtime()
+            if lowering != "dsl":
+                self.smem_manager.exit_tile_runtime()
             self.tile_scheduler.next_tile()
         if self.profiler_on:
             self.profiler.finalize(lane_id == 0)
@@ -683,7 +700,7 @@ class MegaKernelMOE(MegaKernelWrapper):
     #       but it requires change on engine side
     def get_func_static(self, unfused=False):
         compile_batch_size = getattr(self, "_compile_batch_size", 1)
-        lowering = getattr(self, "_active_lowering", _DEFAULT_LOWERING)
+        lowering = getattr(self, "_active_lowering", "dsl")
         scheduler_name = "unfused" if unfused else "static"
         dsl_lowerer = self._make_dsl_lowerer(scheduler_name) if lowering == "dsl" else None
 
@@ -785,7 +802,7 @@ class MegaKernelMOE(MegaKernelWrapper):
 
     def get_func_dynamic(self):
         compile_batch_size = getattr(self, "_compile_batch_size", 1)
-        lowering = getattr(self, "_active_lowering", _DEFAULT_LOWERING)
+        lowering = getattr(self, "_active_lowering", "dsl")
         dsl_lowerer = self._make_dsl_lowerer("dynamic") if lowering == "dsl" else None
 
         # fmt: off
@@ -1007,13 +1024,6 @@ def _check_scheduler(scheduler: str):
         )
 
 
-def _check_lowering(lowering: str):
-    if lowering not in _SUPPORTED_LOWERINGS:
-        raise ValueError(
-            f"Unsupported lowering {lowering!r}; expected one of {_SUPPORTED_LOWERINGS}"
-        )
-
-
 def _needs_unfused_reference(scheduler: str) -> bool:
     return scheduler in ("static", "dynamic")
 
@@ -1023,15 +1033,13 @@ def _compile_moe_schedulers(
     batch_size: int,
     world_size: int,
     profiler_on: bool,
-    lowering: str = _DEFAULT_LOWERING,
+    manual_oracle: bool = False,
 ) -> tuple[MegaKernelMOE, dict[str, tvm.runtime.Module]]:
     if world_size != 1:
         raise SkipTest("tirx-kernels MegaKernelMOE benchmark currently supports world_size=1")
     for scheduler in schedulers:
         _check_scheduler(scheduler)
-    _check_lowering(lowering)
-
-    key = (schedulers, batch_size, world_size, profiler_on, lowering)
+    key = (schedulers, batch_size, world_size, profiler_on, manual_oracle)
     cached = _COMPILE_CACHE.get(key)
     if cached is not None:
         return cached
@@ -1042,7 +1050,10 @@ def _compile_moe_schedulers(
     mk._compile_batch_size = batch_size
     libs = {}
     for scheduler in schedulers:
-        _, libs[scheduler] = get_source(mk.get_module(scheduler, lowering=lowering))
+        module = (
+            mk._get_manual_oracle_module(scheduler) if manual_oracle else mk.get_module(scheduler)
+        )
+        _, libs[scheduler] = get_source(module)
     _COMPILE_CACHE[key] = (mk, libs)
     return mk, libs
 
@@ -1067,9 +1078,8 @@ def _make_tir_case(
     scheduler: str,
     data: dict[str, torch.Tensor],
     launch_slots: int,
-    lowering: str = _DEFAULT_LOWERING,
+    manual_oracle: bool = False,
 ):
-    _check_lowering(lowering)
     dev = tvm.cuda(0)
     max_num_tokens_padded = get_max_num_tokens_padded(
         batch_size, mk.NUM_EXPERTS_PER_TOK, mk.NUM_EXPERTS, mk.MOE_M_PAD_SIZE
@@ -1077,7 +1087,7 @@ def _make_tir_case(
     case = {
         "kernel": lib["main"],
         "scheduler": scheduler,
-        "lowering": lowering,
+        "manual_oracle": manual_oracle,
         "cursor": 0,
         "launch_slots": launch_slots,
         "hidden_state": _as_tvm_tensor(data["hidden_state"], dev),
@@ -1140,7 +1150,7 @@ def _make_tir_case(
         case["graph_reset"]["topk_reduce_output"].append(torch.from_dlpack(topk_reduce_output))
 
     if scheduler in _STATIC_QUEUE_SCHEDULERS:
-        if lowering == "dsl":
+        if not manual_oracle:
             exec_queue = mk.get_normalized_plan(scheduler).make_static_queue()
         else:
             exec_queue = generate_exec_queue_moe(
@@ -1148,7 +1158,7 @@ def _make_tir_case(
             )
         case["exec_queue"] = tvm.runtime.tensor(exec_queue, dev)
     else:
-        if lowering == "dsl":
+        if not manual_oracle:
             exec_queue = mk.get_normalized_plan(scheduler).make_dynamic_queue()
         else:
             exec_queue = generate_exec_queue_moe(
@@ -1527,36 +1537,16 @@ def run_test(
     scheduler: str,
     world_size: int = 1,
     profiler_on: bool = False,
-    lowering: str = _DEFAULT_LOWERING,
-    compare_manual: bool = True,
     repeats: int = 1,
 ):
     _require_cuda_sm100()
     _check_scheduler(scheduler)
-    _check_lowering(lowering)
     if repeats <= 0:
         raise ValueError("repeats must be positive")
-    manual_reference = lowering == "dsl" and compare_manual
-    if manual_reference:
-        mk, libs = _compile_moe_schedulers(
-            (scheduler,), batch_size, world_size, profiler_on, lowering="dsl"
-        )
-        reference_mk, reference_libs = _compile_moe_schedulers(
-            (scheduler,), batch_size, world_size, profiler_on, lowering="manual"
-        )
-        reference_scheduler = scheduler
-        reference_lowering = "manual"
-    else:
-        compile_schedulers = [scheduler]
-        if _needs_unfused_reference(scheduler):
-            compile_schedulers.append("unfused")
-        mk, libs = _compile_moe_schedulers(
-            tuple(compile_schedulers), batch_size, world_size, profiler_on, lowering=lowering
-        )
-        reference_mk = mk
-        reference_libs = libs
-        reference_scheduler = "unfused"
-        reference_lowering = lowering
+    mk, libs = _compile_moe_schedulers((scheduler,), batch_size, world_size, profiler_on)
+    reference_mk, reference_libs = _compile_moe_schedulers(
+        (scheduler,), batch_size, world_size, profiler_on, manual_oracle=True
+    )
 
     _reset_prepare_data_cache()
     data = dict(prepare_data(batch_size, mk))
@@ -1570,19 +1560,17 @@ def run_test(
             scheduler=scheduler,
             data=data,
             launch_slots=repeats,
-            lowering=lowering,
         ),
     }
-    if manual_reference or _needs_unfused_reference(scheduler):
-        case["tir_reference"] = _make_tir_case(
-            batch_size=batch_size,
-            mk=reference_mk,
-            lib=reference_libs[reference_scheduler],
-            scheduler=reference_scheduler,
-            data=data,
-            launch_slots=repeats,
-            lowering=reference_lowering,
-        )
+    case["tir_reference"] = _make_tir_case(
+        batch_size=batch_size,
+        mk=reference_mk,
+        lib=reference_libs[scheduler],
+        scheduler=scheduler,
+        data=data,
+        launch_slots=repeats,
+        manual_oracle=True,
+    )
     for iteration in range(repeats):
         _reset_tir_case_for_cuda_graph(case["tir"])
         if "tir_reference" in case:
@@ -1636,7 +1624,6 @@ def run_bench(
     scheduler: str | None = None,
     world_size: int = 1,
     profiler_on: bool = False,
-    lowering: str = _DEFAULT_LOWERING,
     warmup: int | None = None,
     repeat: int | None = None,
     timer: str | None = None,
@@ -1650,10 +1637,7 @@ def run_bench(
     schedulers = (scheduler,) if scheduler is not None else _SUPPORTED_SCHEDULERS
     for scheduler_name in schedulers:
         _check_scheduler(scheduler_name)
-    _check_lowering(lowering)
-    mk, libs = _compile_moe_schedulers(
-        tuple(schedulers), batch_size, world_size, profiler_on, lowering=lowering
-    )
+    mk, libs = _compile_moe_schedulers(tuple(schedulers), batch_size, world_size, profiler_on)
 
     _reset_prepare_data_cache()
     data = dict(prepare_data(batch_size, mk))
@@ -1669,7 +1653,6 @@ def run_bench(
             scheduler=scheduler_name,
             data=data,
             launch_slots=8,
-            lowering=lowering,
         )
         tir_runtime_estimate_us[scheduler_name] = _estimate_tir_runtime_us(probe_case)
         launch_slots[scheduler_name] = _estimate_bench_launch_slots(
@@ -1688,7 +1671,6 @@ def run_bench(
             scheduler=scheduler_name,
             data=data,
             launch_slots=launch_slots[scheduler_name],
-            lowering=lowering,
         )
         for scheduler_name in schedulers
     }
@@ -1776,7 +1758,6 @@ def run_bench(
             "our_impls": list(tir_impls),
             "batch_size": batch_size,
             "world_size": world_size,
-            "lowering": lowering,
             "config": MEGAKERNEL_MOE_BENCH_CONFIG["CONFIG_NAME"],
             "benchmark_scope": "full_moe_router_plus_expert",
             "sglang_router": "torch_fp32_mm_softmax_topk",

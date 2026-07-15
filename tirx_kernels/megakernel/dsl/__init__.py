@@ -18,7 +18,7 @@
 
 from tvm.megakernel.dsl import (
     CoordMapType,
-    DependencySpec,
+    DependencyType,
     EventSpec,
     ExprLike,
     KernelSpec,
@@ -60,7 +60,7 @@ __all__ = [
     "AlignTileImpl",
     "CoordMapType",
     "CountSortTileImpl",
-    "DependencySpec",
+    "DependencyType",
     "DownTileImpl",
     "DynamicDispatchPlan",
     "DynamicPolicy",

@@ -18,7 +18,7 @@
 
 from tvm.megakernel.dsl import (
     CoordMapType,
-    DependencySpec,
+    DependencyType,
     EventSpec,
     ExprLike,
     KernelSpec,
@@ -32,7 +32,7 @@ from tvm.megakernel.dsl import (
 
 __all__ = [
     "CoordMapType",
-    "DependencySpec",
+    "DependencyType",
     "EventSpec",
     "ExprLike",
     "KernelSpec",

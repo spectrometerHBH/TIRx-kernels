@@ -32,19 +32,26 @@ from tirx_kernels.megakernel.utils.config import JobType, KernelConfig
 from tirx_kernels.megakernel.utils.dynamic_scheduler import DynamicTileScheduler, MPMCQueueHost
 from tirx_kernels.megakernel.utils.static_scheduler import StaticTileScheduler
 from tirx_kernels.megakernel.utils.utils import pack_into_32bit
+from tvm.megakernel.transform import (
+    BarrierAction,
+    DeviceRegionPlan,
+    EdgeBindingPlan,
+    ExecutionPlan,
+    NotifyAction,
+    ProfileAction,
+    QueuePushAction,
+    RunAction,
+    RuntimeEventInitAction,
+    SmemEnterAction,
+    SmemExitAction,
+    TileActionProgram,
+    WaitAction,
+    logical_edges,
+)
 
 from .._expr import ConstExpr, Expr, ScalarLoadExpr, TileIndexExpr, as_expr, walk_expr
 from ..moe_spec import _max_rows
-from ..spec import DependencySpec, EventSpec, KernelSpec, TileSpec, VarSpec
-from ._constants import (
-    _EXECUTION_STEPS,
-    _STEP_CTA_SYNC,
-    _STEP_POST_NOTIFY,
-    _STEP_PRE_NOTIFY,
-    _STEP_RUN,
-    _STEP_RUNTIME_EVENT_INIT,
-    _STEP_WAIT,
-)
+from ..spec import DependencyType, EventSpec, KernelSpec, TileSpec, VarSpec
 
 _FORBIDDEN_SPEC_FIELDS = {
     "dispatch",
@@ -125,7 +132,7 @@ class MoeLoweringEnv:
             _validate_logical_attrs(event.attrs, owner=f"event {event.name!r} attrs")
         for tile in spec.tiles:
             _validate_logical_attrs(tile.attrs, owner=f"tile {tile.name!r} attrs")
-            for name in ("implementation", "job_type", "profile_event_type", "register"):
+            for name in ("implementation", "job_type", "profile_event_type", "tensor_bindings"):
                 if not hasattr(tile.impl, name):
                     raise TypeError(f"tile {tile.name!r} has an incompatible MoE TileImpl")
 
@@ -146,7 +153,7 @@ class MoeLoweringEnv:
         for tile_name in ("gate_up_silu", "down"):
             tile = self.tile_map[tile_name]
             tile_num = tuple(tile.tile_num)
-            if tile_num[0] != VarSpec("routed_rows"):
+            if tile_num[0] is not spec.vars["routed_rows"]:
                 raise ValueError(f"tile {tile_name!r} must use VarSpec('routed_rows') on axis 0")
             if runtime_tensor not in tile.reads:
                 raise ValueError(f"tile {tile_name!r} must read num_tokens_post_pad")
@@ -156,11 +163,11 @@ class MoeLoweringEnv:
         edges = {tile.name: set() for tile in self.spec.tiles}
         notifiers: dict[int, list[str]] = {}
         for tile in self.spec.tiles:
-            for notify in tile.notifies:
-                notifiers.setdefault(id(notify.event), []).append(tile.name)
+            for event, _ in tile.notifies:
+                notifiers.setdefault(id(event), []).append(tile.name)
         for tile in self.spec.tiles:
-            for wait in tile.waits:
-                for producer in notifiers.get(id(wait.event), ()):
+            for event, _ in tile.waits:
+                for producer in notifiers.get(id(event), ()):
                     edges[producer].add(tile.name)
 
         def reachable(source: str, target: str) -> bool:
@@ -183,14 +190,14 @@ class MoeLoweringEnv:
     def extent(self, value: int | VarSpec) -> Expr:
         if isinstance(value, int) and not isinstance(value, bool):
             return ConstExpr(value)
-        if value == VarSpec("routed_rows"):
+        if value is self.spec.vars["routed_rows"]:
             return self.routed_rows
         raise ValueError(f"unsupported MoE runtime extent {value!r}")
 
     def upper_bound(self, value: int | VarSpec) -> int:
         if isinstance(value, int) and not isinstance(value, bool):
             return value
-        if value == VarSpec("routed_rows"):
+        if value is self.spec.vars["routed_rows"]:
             return self.rmax
         raise ValueError(f"runtime extent {value!r} has no static upper bound")
 
@@ -213,8 +220,8 @@ class MoeLoweringEnv:
             raise ValueError(f"event {event.name!r} must have a uniform physical init_count")
         return counts[0]
 
-    def coord(self, tile: TileSpec, dependency: DependencySpec) -> tuple[Expr, ...]:
-        coord_map = dependency.coord_map
+    def coord(self, tile: TileSpec, dependency: DependencyType) -> tuple[Expr, ...]:
+        event, coord_map = dependency
         indices = tuple(TileIndexExpr(tile.name, axis) for axis in range(3))
         if callable(coord_map):
             try:
@@ -231,7 +238,7 @@ class MoeLoweringEnv:
             values = coord_map
         if not isinstance(values, tuple | list):
             raise ValueError(f"tile {tile.name!r} coordinate map must return tuple or list")
-        if len(values) != len(_shape_tuple(dependency.event.shape)):
+        if len(values) != len(_shape_tuple(event.shape)):
             raise ValueError(f"tile {tile.name!r} coordinate rank does not match its event")
         result = tuple(as_expr(value) for value in values)
         for expr in result:
@@ -249,7 +256,7 @@ class RuntimeEventInitPlan:
     value: Expr
     scope: str = "thread"
     scope_id: int = 0
-    after_step: str = _STEP_CTA_SYNC
+    after_barrier: str = "cta"
 
 
 @dataclass(frozen=True)
@@ -276,7 +283,7 @@ class EventPlan:
 
 @dataclass(frozen=True)
 class WaitPlan:
-    logical_spec: DependencySpec
+    logical_spec: DependencyType
     event: str
     coord: tuple[Expr, ...]
     level: str
@@ -285,7 +292,7 @@ class WaitPlan:
 
 @dataclass(frozen=True)
 class NotifyPlan:
-    logical_spec: DependencySpec
+    logical_spec: DependencyType
     event: str
     coord: tuple[Expr, ...]
     scope: str
@@ -302,7 +309,6 @@ class TilePlan:
     upper_bounds: tuple[int, int, int]
     scheduled_extents: tuple[Expr, Expr, Expr]
     scheduled_upper_bounds: tuple[int, int, int]
-    execution_steps: tuple[str, ...]
     waits: tuple[WaitPlan, ...]
     notifies: tuple[NotifyPlan, ...]
 
@@ -386,6 +392,119 @@ class NormalizedPlan:
     persistent_ctas: int
     protocol: DynamicProtocolPlan | None
 
+    def execution_plan(self) -> ExecutionPlan:
+        """Materialize the policy's ordered physical action programs."""
+
+        edges = logical_edges(self.spec)
+        by_producer_event: dict[tuple[str, int], list] = {}
+        by_consumer_event: dict[tuple[str, int], list] = {}
+        for edge in edges:
+            by_producer_event.setdefault((edge.producer, id(edge.event)), []).append(edge)
+            by_consumer_event.setdefault((edge.consumer, id(edge.event)), []).append(edge)
+
+        programs = []
+        for tile in self.tiles:
+            actions = []
+            if self.is_dynamic:
+                outgoing = tuple(edge for edge in edges if edge.producer == tile.spec.name)
+                actions.append(
+                    QueuePushAction(edges=outgoing, payload=self.dispatch_plan(tile.spec.name))
+                )
+            for wait in tile.waits:
+                event, coord_map = wait.logical_spec
+                actions.append(
+                    WaitAction(
+                        tuple(by_consumer_event[(tile.spec.name, id(event))]),
+                        event,
+                        coord_map,
+                        level=wait.level,
+                        mask=wait.mask,
+                        payload=wait,
+                    )
+                )
+            actions.extend(
+                (
+                    SmemEnterAction(tile.spec),
+                    ProfileAction("begin", event=tile.spec.impl.profile_event_type, payload=tile),
+                )
+            )
+            predicate = None
+            if tile.implementation in ("gate_up_silu", "down"):
+                predicate = "dynamic_or_routed_row"
+            actions.append(
+                RunAction(
+                    tile.spec,
+                    predicate=predicate,
+                    repeat=self.down_coalescing if tile.implementation == "down" else 1,
+                    index_map="expand_down_n" if tile.implementation == "down" else None,
+                    payload=tile,
+                )
+            )
+            actions.append(
+                ProfileAction("end", event=tile.spec.impl.profile_event_type, payload=tile)
+            )
+            if tile.implementation == "align":
+                actions.append(BarrierAction("cta"))
+                runtime_events = tuple(
+                    event
+                    for event in self.events
+                    if event.runtime_init is not None and event.runtime_init.tile == tile.spec.name
+                )
+                if len(runtime_events) > 1:
+                    raise ValueError("a tile may initialize at most one runtime event")
+                if runtime_events:
+                    runtime_event = runtime_events[0]
+                    runtime_init = runtime_event.runtime_init
+                    actions.append(
+                        RuntimeEventInitAction(
+                            runtime_event,
+                            runtime_init.value,
+                            predicate=(runtime_init.scope, runtime_init.scope_id),
+                            payload=runtime_init,
+                        )
+                    )
+                else:
+                    actions.append(
+                        RuntimeEventInitAction(None, None, predicate=("thread", 0), payload=None)
+                    )
+            for notify in tile.notifies:
+                event, coord_map = notify.logical_spec
+                actions.append(
+                    NotifyAction(
+                        tuple(by_producer_event[(tile.spec.name, id(event))]),
+                        event,
+                        coord_map,
+                        scope=notify.scope,
+                        scope_id=notify.scope_id,
+                        count=notify.count,
+                        rank=notify.rank,
+                        release=notify.release,
+                        payload=notify,
+                    )
+                )
+            actions.append(SmemExitAction(tile.spec))
+            programs.append(TileActionProgram(tile.spec, tuple(actions)))
+
+        region_name = "moe_device"
+        return ExecutionPlan(
+            kernel=self.spec,
+            device_regions=(
+                DeviceRegionPlan(
+                    region_name, tile_programs=tuple(programs), attrs={"schedule": self.policy_name}
+                ),
+            ),
+            edge_bindings=tuple(
+                EdgeBindingPlan(edge, "tile_action", region_name) for edge in edges
+            ),
+            attrs={"normalized_plan": self},
+        ).validate()
+
+    def action_program(self, tile_name: str) -> TileActionProgram:
+        """Return one tile program from the validated execution plan."""
+
+        region = self.execution_plan().device_regions[0]
+        return next(program for program in region.tile_programs if program.tile.name == tile_name)
+
     @property
     def user_events(self) -> tuple[EventPlan, ...]:
         return tuple(event for event in self.events if event.name != "event_init_complete")
@@ -402,25 +521,36 @@ class NormalizedPlan:
     def pre_before_wait(self) -> bool:
         if not self.is_dynamic:
             return True
-        for tile in self.tiles:
-            steps = tile.execution_steps
-            if steps.count(_STEP_PRE_NOTIFY) != 1 or steps.count(_STEP_RUN) != 1:
+        for program in self.execution_plan().device_regions[0].tile_programs:
+            actions = program.actions
+            pre = [
+                index for index, action in enumerate(actions) if isinstance(action, QueuePushAction)
+            ]
+            runs = [index for index, action in enumerate(actions) if isinstance(action, RunAction)]
+            waits = [
+                index for index, action in enumerate(actions) if isinstance(action, WaitAction)
+            ]
+            if len(pre) != 1 or len(runs) != 1:
                 return False
-            pre_index = steps.index(_STEP_PRE_NOTIFY)
-            if pre_index > steps.index(_STEP_RUN):
+            if pre[0] > runs[0]:
                 return False
-            if _STEP_WAIT in steps and pre_index > steps.index(_STEP_WAIT):
+            if waits and pre[0] > min(waits):
                 return False
         return True
 
     @property
     def post_after_run(self) -> bool:
-        for tile in self.tiles:
-            steps = tile.execution_steps
-            has_post = _STEP_POST_NOTIFY in steps
-            if has_post != bool(tile.notifies):
+        for tile, program in zip(
+            self.tiles, self.execution_plan().device_regions[0].tile_programs, strict=True
+        ):
+            actions = program.actions
+            posts = [
+                index for index, action in enumerate(actions) if isinstance(action, NotifyAction)
+            ]
+            runs = [index for index, action in enumerate(actions) if isinstance(action, RunAction)]
+            if bool(posts) != bool(tile.notifies):
                 return False
-            if has_post and steps.index(_STEP_POST_NOTIFY) < steps.index(_STEP_RUN):
+            if posts and min(posts) < runs[0]:
                 return False
         return True
 
@@ -441,7 +571,6 @@ class NormalizedPlan:
             and dispatch.count_lower_bound == self.persistent_ctas
             and dispatch.count_upper_bound == self.persistent_ctas
             and not source.notifies
-            and _STEP_POST_NOTIFY not in source.execution_steps
         )
 
     def event(self, name: str) -> EventPlan:
@@ -484,46 +613,51 @@ class NormalizedPlan:
             raise ValueError("runtime event initialization references an unknown tile")
         if any(len(events) > 1 for events in runtime_inits.values()):
             raise ValueError("a task may initialize at most one runtime event in the MoE MVP")
-        for tile in self.tiles:
-            steps = tile.execution_steps
-            if any(step not in _EXECUTION_STEPS for step in steps) or len(steps) != len(set(steps)):
-                raise ValueError(f"tile {tile.spec.name!r} has an invalid execution plan")
-            if steps.count(_STEP_RUN) != 1:
+        execution_plan = self.execution_plan()
+        programs = execution_plan.device_regions[0].tile_programs
+        for tile, program in zip(self.tiles, programs, strict=True):
+            actions = program.actions
+            runs = [index for index, action in enumerate(actions) if isinstance(action, RunAction)]
+            waits = [
+                index for index, action in enumerate(actions) if isinstance(action, WaitAction)
+            ]
+            notifies = [
+                index for index, action in enumerate(actions) if isinstance(action, NotifyAction)
+            ]
+            barriers = [
+                index for index, action in enumerate(actions) if isinstance(action, BarrierAction)
+            ]
+            runtime_actions = [
+                index
+                for index, action in enumerate(actions)
+                if isinstance(action, RuntimeEventInitAction)
+            ]
+            if len(runs) != 1:
                 raise ValueError(f"tile {tile.spec.name!r} must execute exactly once")
-            if (_STEP_WAIT in steps) != bool(tile.waits):
+            if bool(waits) != bool(tile.waits) or len(waits) != len(tile.waits):
                 raise ValueError(f"tile {tile.spec.name!r} wait step does not match its waits")
-            if _STEP_WAIT in steps and steps.index(_STEP_WAIT) > steps.index(_STEP_RUN):
+            if waits and max(waits) > runs[0]:
                 raise ValueError(f"tile {tile.spec.name!r} must wait before execution")
-            if (_STEP_POST_NOTIFY in steps) != bool(tile.notifies):
+            if bool(notifies) != bool(tile.notifies) or len(notifies) != len(tile.notifies):
                 raise ValueError(f"tile {tile.spec.name!r} post step does not match its notifies")
-            if (_STEP_RUNTIME_EVENT_INIT in steps) != (tile.implementation == "align"):
-                raise ValueError(
-                    f"tile {tile.spec.name!r} has an invalid runtime initialization slot"
-                )
             if tile.implementation == "align":
-                if _STEP_CTA_SYNC not in steps or steps.index(_STEP_CTA_SYNC) < steps.index(
-                    _STEP_RUN
-                ):
+                if len(barriers) != 1 or barriers[0] < runs[0]:
                     raise ValueError("align must synchronize the CTA after tile execution")
-                if steps.index(_STEP_RUNTIME_EVENT_INIT) < steps.index(_STEP_CTA_SYNC):
-                    raise ValueError("align event initialization must follow CTA synchronization")
-                if _STEP_POST_NOTIFY in steps and steps.index(_STEP_POST_NOTIFY) < steps.index(
-                    _STEP_RUNTIME_EVENT_INIT
+                if runtime_inits and (
+                    len(runtime_actions) != 1 or runtime_actions[0] < barriers[0]
                 ):
+                    raise ValueError("align event initialization must follow CTA synchronization")
+                if runtime_actions and notifies and min(notifies) < runtime_actions[0]:
                     raise ValueError("align must initialize runtime events before completion")
-            elif _STEP_CTA_SYNC in steps:
+            elif barriers or runtime_actions:
                 raise ValueError(f"tile {tile.spec.name!r} has an unsupported CTA synchronization")
             for event in runtime_inits.get(tile.spec.name, ()):
                 runtime_init = event.runtime_init
-                if runtime_init is None or runtime_init.after_step not in steps:
+                if runtime_init is None or runtime_init.after_barrier != "cta":
                     raise ValueError(f"event {event.name!r} has an invalid runtime initialization")
-                if steps.index(_STEP_RUNTIME_EVENT_INIT) <= steps.index(runtime_init.after_step):
-                    raise ValueError(
-                        f"event {event.name!r} must be initialized after {runtime_init.after_step}"
-                    )
-                if _STEP_POST_NOTIFY in steps and steps.index(
-                    _STEP_RUNTIME_EVENT_INIT
-                ) > steps.index(_STEP_POST_NOTIFY):
+                if runtime_actions[0] <= barriers[0]:
+                    raise ValueError(f"event {event.name!r} must be initialized after cta barrier")
+                if notifies and runtime_actions[0] > min(notifies):
                     raise ValueError(
                         f"event {event.name!r} must be initialized before task completion"
                     )
@@ -608,7 +742,11 @@ class NormalizedPlan:
         else:
             if self.dispatch_plans or self.seed_tasks or self.protocol is not None:
                 raise ValueError("static plan contains dynamic scheduling state")
-            if any(_STEP_PRE_NOTIFY in tile.execution_steps for tile in self.tiles):
+            if any(
+                isinstance(action, QueuePushAction)
+                for program in programs
+                for action in program.actions
+            ):
                 raise ValueError("static task cannot contain a pre-notification step")
             if runtime_inits:
                 raise ValueError("static plan cannot contain runtime event initialization")
@@ -678,7 +816,7 @@ class NormalizedPlan:
                             "value": event.runtime_init.value.to_data(),
                             "scope": event.runtime_init.scope,
                             "scope_id": event.runtime_init.scope_id,
-                            "after_step": event.runtime_init.after_step,
+                            "after_barrier": event.runtime_init.after_barrier,
                         }
                     ),
                 }
@@ -693,7 +831,10 @@ class NormalizedPlan:
                     "runtime_extents": [extent.to_data() for extent in tile.runtime_extents],
                     "scheduled_extents": [extent.to_data() for extent in tile.scheduled_extents],
                     "scheduled_upper_bounds": tile.scheduled_upper_bounds,
-                    "execution_steps": tile.execution_steps,
+                    "actions": [
+                        type(action).__name__
+                        for action in self.action_program(tile.spec.name).actions
+                    ],
                     "reads": [tensor.name for tensor in tile.spec.reads],
                     "writes": [tensor.name for tensor in tile.spec.writes],
                     "waits": [
