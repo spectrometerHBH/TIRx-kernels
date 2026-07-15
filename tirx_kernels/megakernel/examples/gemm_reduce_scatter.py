@@ -23,21 +23,18 @@ Run from the tirx-kernels checkout with the paired TVM checkout on
     python -m tirx_kernels.megakernel.examples.gemm_reduce_scatter \
         --scheduler static
 
-The complete ``KernelSpec`` construction is visible in this file.  It does not
-call the production ``build_gemm_reduce_scatter_graph`` helper.
+The complete logical ``KernelSpec`` construction is visible in this file.  It
+does not call the production ``build_gemm_reduce_scatter_graph`` helper.
+The attached concrete ``TileImpl`` classes live beside the complete kernel in
+``tirx_kernels.gemm_comm.gemm_reduce_scatter``.
 """
 
 from __future__ import annotations
 
 import argparse
 
-from tirx_kernels.gemm_comm import _gemm_reduce_scatter_impl as impl
+from tirx_kernels.gemm_comm import gemm_reduce_scatter as impl
 from tirx_kernels.gemm_comm.dsl import GemmCommLowerer, policy_for_scheduler
-from tirx_kernels.gemm_comm.dsl.tile_impl import (
-    PartialGemmTileImpl,
-    ReduceScatterTileImpl,
-    ReduceSumTileImpl,
-)
 from tvm.megakernel.dsl import KernelSpec
 
 
@@ -71,7 +68,7 @@ def build_example() -> KernelSpec:
     (
         kernel.tile(
             "partial_gemm",
-            impl=PartialGemmTileImpl(),
+            impl=impl.PartialGemmTileImpl(),
             tile_num=(m_clusters, n_clusters, 1),
             attrs={"purpose": "compute one cluster of the rank-local partial product"},
         )
@@ -82,7 +79,7 @@ def build_example() -> KernelSpec:
     (
         kernel.tile(
             "transfer",
-            impl=ReduceScatterTileImpl(),
+            impl=impl.ReduceScatterTileImpl(),
             tile_num=(impl.WORLD_SIZE, impl.WORLD_SIZE, 1),
             attrs={"purpose": "move one source partial shard to one destination rank"},
         )
@@ -94,7 +91,7 @@ def build_example() -> KernelSpec:
     (
         kernel.tile(
             "reduce",
-            impl=ReduceSumTileImpl(),
+            impl=impl.ReduceSumTileImpl(),
             tile_num=(impl.WORLD_SIZE, impl.LOCAL_M // impl.BLK_M_RS, impl.N // impl.BLK_N_RS),
             attrs={"purpose": "sum source-rank partials for one destination output tile"},
         )

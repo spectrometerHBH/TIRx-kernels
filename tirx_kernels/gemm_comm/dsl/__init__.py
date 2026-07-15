@@ -17,18 +17,12 @@
 
 """Logical DSL and workload-specific lowering for distributed GEMM."""
 
+from ..allgather_gemm import AllGatherGemmTileImpl, AllGatherTileImpl
+from ..gemm_reduce_scatter import PartialGemmTileImpl, ReduceScatterTileImpl, ReduceSumTileImpl
 from .lowerer import GemmCommLowerer, LoweredGemmComm, make_allgather_dynamic_queue
 from .model import GemmCommPlan, PhysicalTask, RankSchedule
 from .policies import DynamicPolicy, StaticPolicy, make_plan, policy_for_scheduler
 from .specs import build_allgather_gemm_graph, build_gemm_reduce_scatter_graph
-from .tile_impl import (
-    AllGatherGemmTileImpl,
-    AllGatherTileImpl,
-    GemmCommTileTask,
-    PartialGemmTileImpl,
-    ReduceScatterTileImpl,
-    ReduceSumTileImpl,
-)
 
 __all__ = [
     "AllGatherGemmTileImpl",
@@ -36,7 +30,6 @@ __all__ = [
     "DynamicPolicy",
     "GemmCommLowerer",
     "GemmCommPlan",
-    "GemmCommTileTask",
     "LoweredGemmComm",
     "PartialGemmTileImpl",
     "PhysicalTask",

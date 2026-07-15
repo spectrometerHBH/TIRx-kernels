@@ -21,15 +21,8 @@ from __future__ import annotations
 
 from tvm.megakernel.dsl import KernelSpec
 
-from .. import _allgather_gemm_impl as ag_impl
-from .. import _gemm_reduce_scatter_impl as rs_impl
-from .tile_impl import (
-    AllGatherGemmTileImpl,
-    AllGatherTileImpl,
-    PartialGemmTileImpl,
-    ReduceScatterTileImpl,
-    ReduceSumTileImpl,
-)
+from .. import allgather_gemm as ag_kernel
+from .. import gemm_reduce_scatter as rs_kernel
 
 
 def build_allgather_gemm_graph() -> KernelSpec:
@@ -38,13 +31,13 @@ def build_allgather_gemm_graph() -> KernelSpec:
     kernel = KernelSpec(
         "allgather_gemm", attrs={"source": "SM100 TP4 AllGather and GEMM overlap pipeline"}
     )
-    local_a = kernel.input("local_a", (ag_impl.LOCAL_M, ag_impl.K), ag_impl.a_type)
-    local_weight = kernel.input("local_weight", (ag_impl.LOCAL_N, ag_impl.K), ag_impl.b_type)
-    gathered_a = kernel.intermediate("gathered_a", (ag_impl.M, ag_impl.K), ag_impl.a_type)
-    output = kernel.output("output", (ag_impl.M, ag_impl.LOCAL_N), ag_impl.d_type)
+    local_a = kernel.input("local_a", (ag_kernel.LOCAL_M, ag_kernel.K), ag_kernel.a_type)
+    local_weight = kernel.input("local_weight", (ag_kernel.LOCAL_N, ag_kernel.K), ag_kernel.b_type)
+    gathered_a = kernel.intermediate("gathered_a", (ag_kernel.M, ag_kernel.K), ag_kernel.a_type)
+    output = kernel.output("output", (ag_kernel.M, ag_kernel.LOCAL_N), ag_kernel.d_type)
     shard_ready = kernel.event(
         "shard_ready",
-        (ag_impl.WORLD_SIZE,),
+        (ag_kernel.WORLD_SIZE,),
         1,
         attrs={"meaning": "one source activation shard is visible on this rank"},
     )
@@ -52,8 +45,8 @@ def build_allgather_gemm_graph() -> KernelSpec:
     (
         kernel.tile(
             "allgather",
-            impl=AllGatherTileImpl(),
-            tile_num=(ag_impl.WORLD_SIZE, 1, 1),
+            impl=ag_kernel.AllGatherTileImpl(),
+            tile_num=(ag_kernel.WORLD_SIZE, 1, 1),
             attrs={"purpose": "publish every source activation shard to all ranks"},
         )
         .read(local_a)
@@ -63,13 +56,13 @@ def build_allgather_gemm_graph() -> KernelSpec:
     (
         kernel.tile(
             "gemm",
-            impl=AllGatherGemmTileImpl(),
-            tile_num=(ag_impl.GEMM_M_CLUSTERS, ag_impl.GEMM_N_CLUSTERS, 1),
+            impl=ag_kernel.AllGatherGemmTileImpl(),
+            tile_num=(ag_kernel.GEMM_M_CLUSTERS, ag_kernel.GEMM_N_CLUSTERS, 1),
             attrs={"purpose": "multiply one gathered activation cluster by local weights"},
         )
         .read(local_a, gathered_a, local_weight)
         .write(output)
-        .wait(shard_ready, lambda m, n, k: (m // ag_impl.LOCAL_GEMM_M_CLUSTERS,))
+        .wait(shard_ready, lambda m, n, k: (m // ag_kernel.LOCAL_GEMM_M_CLUSTERS,))
     )
     return kernel
 
@@ -77,36 +70,36 @@ def build_allgather_gemm_graph() -> KernelSpec:
 def build_gemm_reduce_scatter_graph() -> KernelSpec:
     """Describe rank-local partial GEMM, peer transfer, and local reduction."""
 
-    m_clusters = rs_impl.M // (rs_impl.BLK_M * rs_impl.CLUSTER_M * rs_impl.NUM_CONSUMER)
-    n_clusters = rs_impl.N // rs_impl.BLK_N
-    local_m_clusters = m_clusters // rs_impl.WORLD_SIZE
+    m_clusters = rs_kernel.M // (rs_kernel.BLK_M * rs_kernel.CLUSTER_M * rs_kernel.NUM_CONSUMER)
+    n_clusters = rs_kernel.N // rs_kernel.BLK_N
+    local_m_clusters = m_clusters // rs_kernel.WORLD_SIZE
     kernel = KernelSpec(
         "gemm_reduce_scatter", attrs={"source": "SM100 TP4 GEMM and ReduceScatter overlap pipeline"}
     )
-    local_a = kernel.input("local_a", (rs_impl.M, rs_impl.K), rs_impl.a_type)
-    local_weight = kernel.input("local_weight", (rs_impl.N, rs_impl.K), rs_impl.b_type)
-    partial = kernel.intermediate("partial", (rs_impl.M, rs_impl.N), rs_impl.d_type)
+    local_a = kernel.input("local_a", (rs_kernel.M, rs_kernel.K), rs_kernel.a_type)
+    local_weight = kernel.input("local_weight", (rs_kernel.N, rs_kernel.K), rs_kernel.b_type)
+    partial = kernel.intermediate("partial", (rs_kernel.M, rs_kernel.N), rs_kernel.d_type)
     staging = kernel.intermediate(
-        "staging", (rs_impl.WORLD_SIZE, rs_impl.LOCAL_M, rs_impl.N), rs_impl.d_type
+        "staging", (rs_kernel.WORLD_SIZE, rs_kernel.LOCAL_M, rs_kernel.N), rs_kernel.d_type
     )
-    output = kernel.output("output", (rs_impl.LOCAL_M, rs_impl.N), rs_impl.d_type)
+    output = kernel.output("output", (rs_kernel.LOCAL_M, rs_kernel.N), rs_kernel.d_type)
     partial_ready = kernel.event(
         "partial_shard_ready",
-        (rs_impl.WORLD_SIZE,),
+        (rs_kernel.WORLD_SIZE,),
         local_m_clusters * n_clusters,
         attrs={"meaning": "all logical GEMM clusters for one output row shard are complete"},
     )
     staging_ready = kernel.event(
         "staging_ready",
-        (rs_impl.WORLD_SIZE,),
-        rs_impl.WORLD_SIZE,
+        (rs_kernel.WORLD_SIZE,),
+        rs_kernel.WORLD_SIZE,
         attrs={"meaning": "all source-rank partial shards reached one destination"},
     )
 
     (
         kernel.tile(
             "partial_gemm",
-            impl=PartialGemmTileImpl(),
+            impl=rs_kernel.PartialGemmTileImpl(),
             tile_num=(m_clusters, n_clusters, 1),
             attrs={"purpose": "compute one cluster of the rank-local partial product"},
         )
@@ -117,8 +110,8 @@ def build_gemm_reduce_scatter_graph() -> KernelSpec:
     (
         kernel.tile(
             "transfer",
-            impl=ReduceScatterTileImpl(),
-            tile_num=(rs_impl.WORLD_SIZE, rs_impl.WORLD_SIZE, 1),
+            impl=rs_kernel.ReduceScatterTileImpl(),
+            tile_num=(rs_kernel.WORLD_SIZE, rs_kernel.WORLD_SIZE, 1),
             attrs={"purpose": "move one source partial shard to one destination rank"},
         )
         .read(partial)
@@ -129,11 +122,11 @@ def build_gemm_reduce_scatter_graph() -> KernelSpec:
     (
         kernel.tile(
             "reduce",
-            impl=ReduceSumTileImpl(),
+            impl=rs_kernel.ReduceSumTileImpl(),
             tile_num=(
-                rs_impl.WORLD_SIZE,
-                rs_impl.LOCAL_M // rs_impl.BLK_M_RS,
-                rs_impl.N // rs_impl.BLK_N_RS,
+                rs_kernel.WORLD_SIZE,
+                rs_kernel.LOCAL_M // rs_kernel.BLK_M_RS,
+                rs_kernel.N // rs_kernel.BLK_N_RS,
             ),
             attrs={"purpose": "sum source-rank partials for one destination output tile"},
         )

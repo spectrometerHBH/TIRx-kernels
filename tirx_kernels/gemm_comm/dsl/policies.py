@@ -21,31 +21,31 @@ from __future__ import annotations
 
 from tvm.megakernel.dsl import KernelSpec
 
-from .. import _allgather_gemm_impl as ag_impl
-from .. import _gemm_reduce_scatter_impl as rs_impl
+from .. import allgather_gemm as ag_kernel
+from .. import gemm_reduce_scatter as rs_kernel
 from .model import GemmCommPlan, PhysicalTask, RankSchedule
 from .specs import build_allgather_gemm_graph, build_gemm_reduce_scatter_graph
 
 
 def _allgather_tasks(rank: int) -> tuple[PhysicalTask, ...]:
     tasks: list[PhysicalTask] = []
-    for shard_offset in range(ag_impl.WORLD_SIZE):
-        shard = (rank + shard_offset) % ag_impl.WORLD_SIZE
-        begin = shard * ag_impl.LOCAL_GEMM_M_CLUSTERS
-        end = begin + ag_impl.LOCAL_GEMM_M_CLUSTERS
-        for n_idx in range(ag_impl.GEMM_N_CLUSTERS):
+    for shard_offset in range(ag_kernel.WORLD_SIZE):
+        shard = (rank + shard_offset) % ag_kernel.WORLD_SIZE
+        begin = shard * ag_kernel.LOCAL_GEMM_M_CLUSTERS
+        end = begin + ag_kernel.LOCAL_GEMM_M_CLUSTERS
+        for n_idx in range(ag_kernel.GEMM_N_CLUSTERS):
             for m_idx in range(begin, end):
                 tasks.append(PhysicalTask("gemm", m_idx, n_idx))
     return tuple(tasks)
 
 
 def _reduce_scatter_tasks(rank: int) -> tuple[PhysicalTask, ...]:
-    m_clusters = rs_impl.M // (rs_impl.BLK_M * rs_impl.CLUSTER_M * rs_impl.NUM_CONSUMER)
-    n_clusters = rs_impl.N // rs_impl.BLK_N
-    local_m_clusters = m_clusters // rs_impl.WORLD_SIZE
+    m_clusters = rs_kernel.M // (rs_kernel.BLK_M * rs_kernel.CLUSTER_M * rs_kernel.NUM_CONSUMER)
+    n_clusters = rs_kernel.N // rs_kernel.BLK_N
+    local_m_clusters = m_clusters // rs_kernel.WORLD_SIZE
     tasks: list[PhysicalTask] = []
-    for shard_offset in (*range(1, rs_impl.WORLD_SIZE), 0):
-        shard = (rank + shard_offset) % rs_impl.WORLD_SIZE
+    for shard_offset in (*range(1, rs_kernel.WORLD_SIZE), 0):
+        shard = (rank + shard_offset) % rs_kernel.WORLD_SIZE
         begin = shard * local_m_clusters
         end = begin + local_m_clusters
         for n_idx in range(n_clusters):
@@ -75,10 +75,10 @@ class StaticPolicy(GemmCommPolicy):
 
     def normalize(self, spec: KernelSpec) -> GemmCommPlan:
         if spec.name == "allgather_gemm":
-            clusters = ag_impl.SM_NUMBER // ag_impl.M_CLUSTER
+            clusters = ag_kernel.SM_NUMBER // ag_kernel.M_CLUSTER
             schedules = tuple(
                 _distribute_static(rank, _allgather_tasks(rank), clusters)
-                for rank in range(ag_impl.WORLD_SIZE)
+                for rank in range(ag_kernel.WORLD_SIZE)
             )
             plan = GemmCommPlan(
                 spec=spec,
@@ -91,10 +91,10 @@ class StaticPolicy(GemmCommPolicy):
                 launch_steps=(("allgather", "gemm"),),
             )
         elif spec.name == "gemm_reduce_scatter":
-            clusters = rs_impl.GEMM_SMS // rs_impl.CLUSTER_M
+            clusters = rs_kernel.GEMM_SMS // rs_kernel.CLUSTER_M
             schedules = tuple(
                 _distribute_static(rank, _reduce_scatter_tasks(rank), clusters)
-                for rank in range(rs_impl.WORLD_SIZE)
+                for rank in range(rs_kernel.WORLD_SIZE)
             )
             plan = GemmCommPlan(
                 spec=spec,
@@ -118,14 +118,14 @@ class DynamicPolicy(GemmCommPolicy):
         if spec.name == "allgather_gemm":
             schedules = tuple(
                 RankSchedule(rank=rank, shared_queue=_allgather_tasks(rank))
-                for rank in range(ag_impl.WORLD_SIZE)
+                for rank in range(ag_kernel.WORLD_SIZE)
             )
             plan = GemmCommPlan(
                 spec=spec,
                 workload=spec.name,
                 policy_name=self.name,
                 scheduled_tile="gemm",
-                persistent_clusters=ag_impl.SM_NUMBER // ag_impl.M_CLUSTER,
+                persistent_clusters=ag_kernel.SM_NUMBER // ag_kernel.M_CLUSTER,
                 rank_schedules=schedules,
                 physical_scheduler="mpmc_queue",
                 launch_steps=(("allgather", "gemm"),),
@@ -133,7 +133,7 @@ class DynamicPolicy(GemmCommPolicy):
         elif spec.name == "gemm_reduce_scatter":
             schedules = tuple(
                 RankSchedule(rank=rank, shared_queue=_reduce_scatter_tasks(rank))
-                for rank in range(rs_impl.WORLD_SIZE)
+                for rank in range(rs_kernel.WORLD_SIZE)
             )
             reason = (
                 "the current GEMM pipeline advances TMA, MMA, and epilogue roles independently; "
@@ -144,7 +144,7 @@ class DynamicPolicy(GemmCommPolicy):
                 workload=spec.name,
                 policy_name=self.name,
                 scheduled_tile="partial_gemm",
-                persistent_clusters=rs_impl.GEMM_SMS // rs_impl.CLUSTER_M,
+                persistent_clusters=rs_kernel.GEMM_SMS // rs_kernel.CLUSTER_M,
                 rank_schedules=schedules,
                 physical_scheduler="planned_mpmc_queue",
                 launch_steps=(("partial_gemm", "transfer"), ("reduce",)),

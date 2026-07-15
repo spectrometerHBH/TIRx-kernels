@@ -105,6 +105,13 @@ def _graph_signature(spec):
     }
 
 
+def _tile_run_source(tile_impl):
+    run = type(tile_impl).run
+    closure = inspect.getclosurevars(run).nonlocals
+    inline = closure.get("obj")
+    return inspect.getsource(inline.func if inline is not None else run)
+
+
 @pytest.mark.parametrize(
     "example_builder,production_builder,production_name",
     [
@@ -137,24 +144,46 @@ def test_standalone_examples_contain_complete_dsl_and_match_production_graphs(
         ),
     ],
 )
-def test_logical_graphs_use_tvm_tile_impls_without_scheduler_attrs(
+def test_logical_graphs_use_concrete_kernel_tile_impls_without_scheduler_attrs(
     builder, tile_names, event_names
 ) -> None:
     spec = builder().validate()
     assert [tile.name for tile in spec.tiles] == tile_names
     assert list(spec.events) == event_names
     assert all(isinstance(tile.impl, TileImpl) for tile in spec.tiles)
-    assert all(tile.impl.tile_task is not None for tile in spec.tiles)
-    assert all(
-        tile.impl.tile_task.module_factory is not None
-        for tile in spec.tiles
-        if tile.impl.execution_space == "device"
-    )
+    assert all(not hasattr(tile.impl, "tile_task") for tile in spec.tiles)
+    assert {type(tile.impl).__module__ for tile in spec.tiles} <= {
+        "tirx_kernels.gemm_comm.allgather_gemm",
+        "tirx_kernels.gemm_comm.gemm_reduce_scatter",
+    }
+    for tile in spec.tiles:
+        source = _tile_run_source(tile.impl)
+        if tile.impl.execution_space == "device":
+            assert "T." in source or "Tx." in source
+        else:
+            assert "_transfer" in source
 
     attrs = [spec.attrs]
     attrs.extend(event.attrs for event in spec.events.values())
     attrs.extend(tile.attrs for tile in spec.tiles)
     assert not (_FORBIDDEN & set(key for attr in attrs for key in _keys(attr)))
+
+
+@pytest.mark.parametrize(
+    "builder,scheduler",
+    [
+        (build_allgather_gemm_graph, "static"),
+        (build_allgather_gemm_graph, "dynamic"),
+        (build_gemm_reduce_scatter_graph, "static"),
+    ],
+)
+def test_lowerer_binds_and_executes_attached_device_tile_impls(builder, scheduler) -> None:
+    spec = builder()
+    device_impls = [tile.impl for tile in spec.tiles if tile.impl.execution_space == "device"]
+    lowered = GemmCommLowerer(policy_for_scheduler(scheduler)).lower(spec)
+
+    assert lowered.module is not None
+    assert all(tile_impl._bound for tile_impl in device_impls)
 
 
 @pytest.mark.parametrize("scheduler", ["static", "dynamic"])
