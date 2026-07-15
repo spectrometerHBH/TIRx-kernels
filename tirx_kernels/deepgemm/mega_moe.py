@@ -25,6 +25,7 @@ import os
 import random
 import socket
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from functools import cache
@@ -5419,6 +5420,7 @@ def _bench_megamoe_mode(
     between_impls: Any,
     *,
     rounds: int,
+    cooldown_s: float,
 ) -> dict[str, Any]:
     """Run the exact benchmark protocol used by latest DeepGEMM MegaMoE."""
     if funcs.keys() != kernel_names.keys():
@@ -5428,6 +5430,8 @@ def _bench_megamoe_mode(
     round_orders: list[list[str]] = []
     items = list(funcs.items())
     for round_idx in range(rounds):
+        if round_idx > 0:
+            time.sleep(cooldown_s)
         round_items = items if round_idx % 2 == 0 else list(reversed(items))
         round_orders.append([name for name, _ in round_items])
 
@@ -5463,6 +5467,7 @@ def _bench_megamoe_mode(
             "paired_profile_session": True,
             "cold_setup_per_implementation": True,
             "rounds": rounds,
+            "round_cooldown_s": cooldown_s,
             "round_orders": round_orders,
         },
     }
@@ -5673,6 +5678,7 @@ def _run_worker(local_rank: int, cfg_dict: dict[str, Any], mode: str) -> dict[st
                     torch.distributed.barrier,
                     reset_between_implementations,
                     rounds=rounds,
+                    cooldown_s=cooldown_s,
                 )
             else:
                 bench_result = bench(

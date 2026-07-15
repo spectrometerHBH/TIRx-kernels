@@ -302,8 +302,11 @@ def test_mega_moe_bench_inherits_shared_defaults() -> None:
     assert "bench_tk" not in inspect.getsource(_run_worker)
 
 
-def test_megamoe_timer_wraps_deepgemm_bench_kineto() -> None:
+def test_megamoe_timer_wraps_deepgemm_bench_kineto(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = []
+    sleeps = []
+
+    monkeypatch.setattr("tirx_kernels.deepgemm.mega_moe.time.sleep", sleeps.append)
 
     def fake_barrier() -> None:
         pass
@@ -327,12 +330,15 @@ def test_megamoe_timer_wraps_deepgemm_bench_kineto() -> None:
         fake_barrier,
         fake_between_impls,
         rounds=2,
+        cooldown_s=0.25,
     )
 
     assert calls == ["tirx", "deepgemm", "deepgemm", "tirx"]
+    assert sleeps == [0.25]
     assert result["timer"] == "megamoe"
     assert result["round_samples"] == {"tirx": [1000.0, 1000.0], "deepgemm": [1000.0, 1000.0]}
     assert result["benchmark_protocol"]["num_tests"] == 30
+    assert result["benchmark_protocol"]["round_cooldown_s"] == 0.25
     assert result["benchmark_protocol"]["round_orders"] == [
         ["tirx", "deepgemm"],
         ["deepgemm", "tirx"],
