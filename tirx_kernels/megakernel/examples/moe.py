@@ -274,7 +274,7 @@ def describe_plan(spec: KernelSpec, scheduler: str) -> str:
             f"scheduler: {plan.policy_name}",
             f"physical events ({len(plan.events)}): "
             + ", ".join(event.name for event in plan.events),
-            f"dispatch rules: {len(plan.dispatch_plans)}",
+            f"dispatch rules: {len(plan.dispatch_steps)}",
             f"queue upper bound: {plan.queue_upper_bound}",
             f"down coalescing: {plan.down_coalescing}",
         ]

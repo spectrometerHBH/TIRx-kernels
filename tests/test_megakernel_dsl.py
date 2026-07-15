@@ -29,11 +29,13 @@ from tirx_kernels.megakernel.dsl import (
     AlignTileImpl,
     CountSortTileImpl,
     DownTileImpl,
+    DynamicDispatchStep,
     DynamicPolicy,
     GateUpSiluTileImpl,
     GatingTileImpl,
     MoeLowerer,
     MoeLoweringEnv,
+    MoeTileProgram,
     StaticPolicy,
     TopkTileImpl,
     VarSpec,
@@ -47,15 +49,12 @@ from tirx_kernels.megakernel.utils.support import generate_exec_queue_moe, push_
 from tirx_kernels.megakernel.utils.utils import MAX_M_IDX
 from tvm.error import DiagnosticError
 from tvm.megakernel.transform import (
-    BarrierAction,
-    NotifyAction,
-    ProfileAction,
-    QueuePushAction,
-    RunAction,
-    RuntimeEventInitAction,
-    SmemEnterAction,
-    SmemExitAction,
-    WaitAction,
+    BarrierStep,
+    NotifyStep,
+    RunStep,
+    RuntimeEventInitStep,
+    TileProgram,
+    WaitStep,
 )
 
 _FORBIDDEN_SPEC_FIELDS = {
@@ -84,24 +83,23 @@ def _tile(spec, name):
 
 
 def _replace_plan_tile(plan, name, **changes):
-    tiles = tuple(
-        replace(tile, **changes) if tile.spec.name == name else tile for tile in plan.tiles
+    region = plan.execution.device_regions[0]
+    programs = tuple(
+        replace(program, **changes) if program.tile.name == name else program
+        for program in region.tile_programs
     )
-    return replace(plan, tiles=tiles)
+    execution = replace(plan.execution, device_regions=(replace(region, tile_programs=programs),))
+    return replace(plan, execution=execution)
 
 
-def _replace_plan_event(plan, name, **changes):
-    events = tuple(
-        replace(event, **changes) if event.name == name else event for event in plan.events
-    )
-    return replace(plan, events=events)
+def _replace_program_step(plan, tile_name, original, replacement):
+    program = plan.program(tile_name)
+    steps = tuple(replacement if step is original else step for step in program.steps)
+    return _replace_plan_tile(plan, tile_name, steps=steps)
 
 
 def _replace_dispatch(plan, source_tile, dispatch):
-    dispatches = tuple(
-        dispatch if item.rule.source_tile == source_tile else item for item in plan.dispatch_plans
-    )
-    return replace(plan, dispatch_plans=dispatches)
+    return _replace_program_step(plan, source_tile, plan.dispatch_step(source_tile), dispatch)
 
 
 def _collect_attr_keys(value):
@@ -130,11 +128,17 @@ def test_public_spec_types_are_tvm_owned_and_legacy_model_is_removed():
         "ConstExpr",
         "ScalarLoadExpr",
         "TileIndexExpr",
+        "DynamicDispatchPlan",
+        "NotifyPlan",
+        "RuntimeEventInitPlan",
+        "TilePlan",
+        "WaitPlan",
     ):
         assert not hasattr(megakernel_dsl, removed)
     assert importlib.util.find_spec("tirx_kernels.megakernel.dsl.expr") is None
     assert not hasattr(tvm_dsl, "DependencySpec")
     assert not hasattr(megakernel_dsl, "DependencySpec")
+    assert issubclass(MoeTileProgram, TileProgram)
 
 
 def test_complete_six_stage_graph_is_pure_logical_native_dsl():
@@ -228,7 +232,7 @@ def test_moe_lowering_env_resolves_runtime_rows_and_producer_order():
 
 
 @pytest.mark.parametrize("batch_size", [1, 4, 128, 512, 2048, 4096])
-def test_policy_event_layout_domains_and_action_programs(batch_size):
+def test_policy_event_layout_domains_and_physical_programs(batch_size):
     max_rows = _max_rows(batch_size)
     relaxed_rows = batch_size * 8 // 128 + 129
     expected_q = 1 if batch_size < 4 else 4
@@ -256,8 +260,8 @@ def test_policy_event_layout_domains_and_action_programs(batch_size):
     assert unfused.event("gate_up_done").init_count == max_rows * 12
     assert dynamic.event("gate_up_done").shape == (relaxed_rows,)
     assert dynamic.event("down_dispatch_done").init_count is None
-    assert dynamic.event("down_dispatch_done").runtime_init_tile == "align"
-    runtime_init = dynamic.event("down_dispatch_done").runtime_init
+    assert dynamic.runtime_init_tile("down_dispatch_done") == "align"
+    runtime_init = dynamic.runtime_init_step("down_dispatch_done")
     assert runtime_init is not None
     assert runtime_init.value.evaluate({"tensors": {"num_tokens_post_pad": [max_rows * 128]}}) == (
         2**16 + 1
@@ -284,52 +288,41 @@ def test_policy_event_layout_domains_and_action_programs(batch_size):
     assert dynamic.tile("down").scheduled_upper_bounds == (max_rows, 16 // expected_q, 1)
     assert dynamic.persistent_ctas == 148
     assert dynamic.pre_before_wait and dynamic.post_after_run and dynamic.fifo_drain
-    assert tuple(type(action) for action in dynamic.action_program("align").actions) == (
-        QueuePushAction,
-        WaitAction,
-        SmemEnterAction,
-        ProfileAction,
-        RunAction,
-        ProfileAction,
-        BarrierAction,
-        RuntimeEventInitAction,
-        NotifyAction,
-        SmemExitAction,
+    assert dynamic.program("align").smem_scope == "run_to_end"
+    assert tuple(type(step) for step in dynamic.program("align").steps) == (
+        DynamicDispatchStep,
+        WaitStep,
+        RunStep,
+        BarrierStep,
+        RuntimeEventInitStep,
+        NotifyStep,
     )
-    assert tuple(type(action) for action in dynamic.action_program("down").actions) == (
-        QueuePushAction,
-        WaitAction,
-        SmemEnterAction,
-        ProfileAction,
-        RunAction,
-        ProfileAction,
-        SmemExitAction,
+    assert tuple(type(step) for step in dynamic.program("down").steps) == (
+        DynamicDispatchStep,
+        WaitStep,
+        RunStep,
     )
-    assert tuple(type(action) for action in static.action_program("align").actions) == (
-        WaitAction,
-        SmemEnterAction,
-        ProfileAction,
-        RunAction,
-        ProfileAction,
-        BarrierAction,
-        RuntimeEventInitAction,
-        NotifyAction,
-        SmemExitAction,
+    assert tuple(type(step) for step in static.program("align").steps) == (
+        WaitStep,
+        RunStep,
+        BarrierStep,
+        RuntimeEventInitStep,
+        NotifyStep,
     )
     assert dynamic.protocol is not None
     assert (dynamic.protocol.pre_decrement, dynamic.protocol.post_decrement) == (1, 2**16)
     assert dynamic.protocol.scheduler_warp == 7
     normalized = dynamic.normalized_data()
     assert normalized["events"][-1]["runtime_init"]["value"] == runtime_init.value.to_data()
-    assert normalized["tiles"][2]["actions"] == [
-        type(action).__name__ for action in dynamic.action_program("align").actions
+    assert normalized["tiles"][2]["steps"] == [
+        type(step).__name__ for step in dynamic.program("align").steps
     ]
     assert normalized["dispatch"][0]["enqueue_upper_bound"] == 148
     dynamic_down_run = next(
-        action for action in dynamic.action_program("down").actions if isinstance(action, RunAction)
+        step for step in dynamic.program("down").steps if isinstance(step, RunStep)
     )
     static_down_run = next(
-        action for action in static.action_program("down").actions if isinstance(action, RunAction)
+        step for step in static.program("down").steps if isinstance(step, RunStep)
     )
     assert (dynamic_down_run.predicate, dynamic_down_run.repeat, dynamic_down_run.index_map) == (
         "dynamic_or_routed_row",
@@ -341,9 +334,10 @@ def test_policy_event_layout_domains_and_action_programs(batch_size):
         1,
         "expand_down_n",
     )
+    assert dynamic_down_run.profile_event == dynamic.program("down").tile.impl.profile_event_type
 
 
-def test_run_action_fields_are_authoritative_during_physical_lowering():
+def test_run_step_fields_are_authoritative_during_physical_lowering():
     kernel = MegaKernelMOE(config=MEGAKERNEL_MOE_BENCH_CONFIG, world_size=1, profiler_on=False)
     kernel._compile_batch_size = 4
     lowerer = kernel._make_dsl_lowerer("dynamic")
@@ -352,51 +346,33 @@ def test_run_action_fields_are_authoritative_during_physical_lowering():
     programs = []
     for program in region.tile_programs:
         if program.tile.name == "down":
-            actions = tuple(
-                replace(action, predicate="invalid_mutated_predicate")
-                if isinstance(action, RunAction)
-                else action
-                for action in program.actions
+            steps = tuple(
+                replace(step, predicate="invalid_mutated_predicate")
+                if isinstance(step, RunStep)
+                else step
+                for step in program.steps
             )
-            program = replace(program, actions=actions)
+            program = replace(program, steps=steps)
         programs.append(program)
-    lowerer.execution = replace(
-        execution, device_regions=(replace(region, tile_programs=tuple(programs)),)
-    )
+    execution = replace(execution, device_regions=(replace(region, tile_programs=tuple(programs)),))
+    lowerer.plan = replace(lowerer.plan, execution=execution)
     kernel._make_dsl_lowerer = lambda scheduler: lowerer
 
     with pytest.raises(DiagnosticError, match="invalid_mutated_predicate"):
         kernel.get_module("dynamic")
 
-    kernel = MegaKernelMOE(config=MEGAKERNEL_MOE_BENCH_CONFIG, world_size=1, profiler_on=False)
-    kernel._compile_batch_size = 4
-    lowerer = kernel._make_dsl_lowerer("dynamic")
-    execution = lowerer.execution
-    region = execution.device_regions[0]
-    programs = tuple(
-        replace(
-            program,
-            actions=tuple(
-                action for action in program.actions if not isinstance(action, SmemExitAction)
-            ),
-        )
-        if program.tile.name == "down"
-        else program
-        for program in region.tile_programs
-    )
-    lowerer.execution = replace(
-        execution, device_regions=(replace(region, tile_programs=programs),)
-    )
-    kernel._make_dsl_lowerer = lambda scheduler: lowerer
-
-    with pytest.raises(DiagnosticError, match="open shared-memory scope"):
-        kernel.get_module("dynamic")
+    plan = make_moe_plan(MEGAKERNEL_MOE_BENCH_CONFIG, 4, "dynamic")
+    with pytest.raises(ValueError, match="run_to_end"):
+        _replace_plan_tile(plan, "down", smem_scope="none").validate()
+    assert lowerer.execution is lowerer.plan.execution
 
 
 def test_physical_wait_notify_scopes_and_dynamic_rules_are_policy_owned():
     plan = make_moe_plan(MEGAKERNEL_MOE_BENCH_CONFIG, 128, "dynamic")
     assert [
-        (tile.spec.name, wait.event, wait.level) for tile in plan.tiles for wait in tile.waits
+        (program.tile.name, wait.event.name, wait.level)
+        for program in plan.programs
+        for wait in program.waits
     ] == [
         ("topk", "gating_done", "cta"),
         ("align", "topk_done", "cta"),
@@ -405,9 +381,9 @@ def test_physical_wait_notify_scopes_and_dynamic_rules_are_policy_owned():
         ("down", "gate_up_done", "warp"),
     ]
     assert [
-        (tile.spec.name, notify.event, notify.scope, notify.scope_id)
-        for tile in plan.tiles
-        for notify in tile.notifies
+        (program.tile.name, notify.event.name, notify.scope, notify.scope_id)
+        for program in plan.programs
+        for notify in program.notifies
     ] == [
         ("gating", "gating_done", "warpgroup", 0),
         ("topk", "topk_done", "cta", 0),
@@ -454,7 +430,7 @@ def test_dynamic_seed_queue_and_dispatch_mapping(batch_size):
     assert int(queue.tail[0]) == len(plan.seed_tasks)
     assert plan.queue_capacity == 32768
     assert plan.queue_upper_bound == len(plan.seed_tasks) + sum(
-        dispatch.enqueue_upper_bound for dispatch in plan.dispatch_plans
+        dispatch.enqueue_upper_bound for dispatch in plan.dispatch_steps
     )
     manual_queue = generate_exec_queue_moe(
         batch_size, MEGAKERNEL_MOE_BENCH_CONFIG, len(plan.events), "dynamic"
@@ -488,8 +464,8 @@ def test_unfused_collapses_gate_up_coordinates_only_in_physical_plan():
     assert _tile(spec, "gate_up_silu").notifies[0][1](7, 0, 0) == (7,)
     assert _tile(spec, "down").waits[0][1](7, 0, 0) == (7,)
     plan = MoeLowerer(megakernel_dsl.UnfusedPolicy()).lower(spec)
-    assert plan.tile("gate_up_silu").notifies[0].coord == (ConstExpr(0),)
-    assert plan.tile("down").waits[0].coord == (ConstExpr(0),)
+    assert plan.program("gate_up_silu").notifies[0].coord_map == (ConstExpr(0),)
+    assert plan.program("down").waits[0].coord_map == (ConstExpr(0),)
 
 
 def test_native_and_moe_validators_reject_invalid_graphs():
@@ -586,13 +562,13 @@ def test_normalized_plan_rejects_runtime_init_and_terminal_drain_regressions():
     with pytest.raises(ValueError, match="derived from dispatch"):
         replace(plan, queue_upper_bound=plan.queue_upper_bound + 1).validate()
 
-    down_event = plan.event("down_dispatch_done")
-    invalid_runtime = replace(down_event.runtime_init, value=ConstExpr(1))
-    invalid = _replace_plan_event(plan, "down_dispatch_done", runtime_init=invalid_runtime)
+    runtime_init = plan.runtime_init_step("down_dispatch_done")
+    invalid_runtime = replace(runtime_init, value=ConstExpr(1))
+    invalid = _replace_program_step(plan, "align", runtime_init, invalid_runtime)
     with pytest.raises(ValueError, match="invalid runtime initialization"):
         invalid.validate()
 
-    terminal = plan.dispatch_plan("down")
+    terminal = plan.dispatch_step("down")
     invalid_terminal = replace(
         terminal,
         rule=replace(terminal.rule, count=ConstExpr(147)),
@@ -604,35 +580,35 @@ def test_normalized_plan_rejects_runtime_init_and_terminal_drain_regressions():
     invalid = replace(invalid, queue_upper_bound=plan.queue_upper_bound - 1)
     with pytest.raises(ValueError, match="FIFO terminal drain"):
         invalid.validate()
-    assert align.spec is _tile(plan.spec, "align")
+    assert align.tile is _tile(plan.spec, "align")
 
 
 def test_plan_rejects_scope_mask_notification_and_dispatch_coverage_regressions():
     plan = make_moe_plan(MEGAKERNEL_MOE_BENCH_CONFIG, 128, "dynamic")
     align = plan.tile("align")
     oversized = replace(align.notifies[0], count=ConstExpr(2))
-    invalid = _replace_plan_tile(plan, "align", notifies=(oversized,))
+    invalid = _replace_program_step(plan, "align", align.notifies[0], oversized)
     with pytest.raises(ValueError, match="exceeds its thread scope"):
         invalid.validate()
 
     gating = plan.tile("gating")
     all_warpgroups = replace(gating.notifies[0], scope_id=-1)
-    invalid = _replace_plan_tile(plan, "gating", notifies=(all_warpgroups,))
+    invalid = _replace_program_step(plan, "gating", gating.notifies[0], all_warpgroups)
     with pytest.raises(ValueError, match="notifications per coordinate"):
         invalid.validate()
 
     cross_rank = replace(gating.notifies[0], rank=0)
-    invalid = _replace_plan_tile(plan, "gating", notifies=(cross_rank,))
+    invalid = _replace_program_step(plan, "gating", gating.notifies[0], cross_rank)
     with pytest.raises(ValueError, match="cross-rank"):
         invalid.validate()
 
     topk = plan.tile("topk")
     invalid_wait = replace(topk.waits[0], mask=-1)
-    invalid = _replace_plan_tile(plan, "topk", waits=(invalid_wait,))
+    invalid = _replace_program_step(plan, "topk", topk.waits[0], invalid_wait)
     with pytest.raises(ValueError, match="invalid wait mask"):
         invalid.validate()
 
-    gating_dispatch = plan.dispatch_plan("gating")
+    gating_dispatch = plan.dispatch_step("gating")
     duplicate_rule = replace(
         gating_dispatch.rule, tile_indices=(ConstExpr(0), ConstExpr(0), ConstExpr(0))
     )
@@ -646,13 +622,13 @@ def test_plan_rejects_scope_mask_notification_and_dispatch_coverage_regressions(
 
 def test_plan_rejects_invalid_event_coordinate_packed_index_and_protocol_link():
     plan = make_moe_plan(MEGAKERNEL_MOE_BENCH_CONFIG, 512, "dynamic")
-    gate = plan.dispatch_plan("gate_up_silu")
+    gate = plan.dispatch_step("gate_up_silu")
     invalid_coord = replace(gate.rule, event_coord=(ConstExpr(10_000),))
     invalid = _replace_dispatch(plan, "gate_up_silu", replace(gate, rule=invalid_coord))
     with pytest.raises(ValueError, match="event coordinate"):
         invalid.validate()
 
-    terminal = plan.dispatch_plan("down")
+    terminal = plan.dispatch_step("down")
     overflow_rule = replace(
         terminal.rule, tile_indices=(ConstExpr(MAX_M_IDX), ConstExpr(0), ConstExpr(0))
     )
@@ -683,5 +659,5 @@ def test_dynamic_plan_preserves_release_notifications():
     plan = make_moe_plan(MEGAKERNEL_MOE_BENCH_CONFIG, 128, "dynamic")
     gating = plan.tile("gating")
     released = replace(gating.notifies[0], release=True)
-    updated = _replace_plan_tile(plan, "gating", notifies=(released,))
+    updated = _replace_program_step(plan, "gating", gating.notifies[0], released)
     assert updated.validate().tile("gating").notifies[0].release

@@ -21,12 +21,13 @@ and scheduling:
   and wait/notify coordinate maps;
 - the six MoE `TileImpl` adapters: invoke existing tile-task compute only;
 - [`model.py`](dsl/lowering/model.py) and
-  [`normalize.py`](dsl/lowering/normalize.py): own private physical plans,
-  symbolic bounds, and strict validation;
+  [`normalize.py`](dsl/lowering/normalize.py): own the single physical
+  `ExecutionPlan`, ordered tile steps, symbolic bounds, and strict validation;
 - [`StaticPolicy`, `UnfusedPolicy`, and `DynamicPolicy`](dsl/lowering/policies.py):
-  create physical event, queue, runtime initialization, and dispatch plans;
-- [`MoeLowerer`](dsl/lowering/lowerer.py): emits those plans through the existing
-  TIRX ABI.
+  place event, queue, runtime initialization, and dispatch state directly in
+  those physical programs;
+- [`MoeLowerer`](dsl/lowering/lowerer.py): interprets each program's steps in
+  source order through the existing TIRX ABI.
 
 The Stage-1 planning artifact is
 [`workflow/qwen3_30b_a3b_moe_stage1.yaml`](workflow/qwen3_30b_a3b_moe_stage1.yaml).
