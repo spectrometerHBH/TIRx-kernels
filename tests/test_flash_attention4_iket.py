@@ -25,7 +25,7 @@ import pytest
 import torch
 
 import tvm
-from tirx_kernels.attention import profile_flash_attention4
+from tirx_kernels.attention import flash_attention4
 from tirx_kernels.attention.flash_attention4 import IKET_EVENT_NAMES, get_flash_attention4_kernel
 from tvm.tirx.cuda.iket import IketProfiler, IketProfileResult
 
@@ -73,7 +73,7 @@ def test_iket_profiler_is_not_exported_from_generic_bench_module() -> None:
     assert not hasattr(bench, "IketProfiler")
 
 
-def test_flash_attention4_profile_driver_uses_orchestrator_defaults(
+def test_flash_attention4_module_entry_uses_orchestrator_defaults(
     tmp_path, monkeypatch, capsys
 ) -> None:
     captured = {}
@@ -88,11 +88,11 @@ def test_flash_attention4_profile_driver_uses_orchestrator_defaults(
             html_reports=(tmp_path / "trace.html",),
         )
 
-    monkeypatch.setattr(profile_flash_attention4.iket, "run", fake_run)
-    monkeypatch.setattr(sys, "argv", ["profile_flash_attention4"])
-    profile_flash_attention4.main()
+    monkeypatch.setattr(flash_attention4.iket, "run", fake_run)
+    monkeypatch.setattr(sys, "argv", ["flash_attention4"])
+    flash_attention4.main()
 
-    assert captured["main"].func is profile_flash_attention4._profile_workload
+    assert captured["main"].func is flash_attention4._profile_iket_workload
     assert captured["kwargs"] == {
         "output_dir": "/tmp/fa4-iket",
         "postprocess": "all",

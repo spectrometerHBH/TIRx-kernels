@@ -25,7 +25,7 @@ import pytest
 import torch
 
 import tvm
-from tirx_kernels.flashmla import profile_sparse_prefill
+from tirx_kernels.flashmla import flash_mla_sparse_fwd
 from tirx_kernels.flashmla import sparse_prefill_head64_phase1 as head64
 from tirx_kernels.flashmla import sparse_prefill_head128_phase1 as head128
 from tirx_kernels.flashmla import sparse_prefill_head128_small_topk_phase1 as head128_small
@@ -68,7 +68,7 @@ def test_sparse_flashmla_declares_expected_warp_uniform_ranges(module, config) -
     assert "clock64" not in script
 
 
-def test_sparse_flashmla_profile_driver_uses_orchestrator_defaults(
+def test_sparse_flashmla_module_entry_uses_orchestrator_defaults(
     tmp_path, monkeypatch, capsys
 ) -> None:
     captured = {}
@@ -83,11 +83,11 @@ def test_sparse_flashmla_profile_driver_uses_orchestrator_defaults(
             html_reports=(tmp_path / "trace.html",),
         )
 
-    monkeypatch.setattr(profile_sparse_prefill.iket, "run", fake_run)
-    monkeypatch.setattr(sys, "argv", ["profile_sparse_prefill"])
-    profile_sparse_prefill.main()
+    monkeypatch.setattr(flash_mla_sparse_fwd.iket, "run", fake_run)
+    monkeypatch.setattr(sys, "argv", ["flash_mla_sparse_fwd"])
+    flash_mla_sparse_fwd.main()
 
-    assert captured["main"].func is profile_sparse_prefill._profile_workload
+    assert captured["main"].func is flash_mla_sparse_fwd._profile_iket_workload
     assert captured["kwargs"] == {
         "output_dir": "/tmp/flashmla-iket",
         "postprocess": "all",

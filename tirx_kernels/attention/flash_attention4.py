@@ -1,7 +1,16 @@
+"""FlashAttention-4 TIRx kernel and direct NVIDIA IKET profiling entry point.
+
+Run ``python -m tirx_kernels.attention.flash_attention4`` to profile the
+annotated kernel.  Correctness and ordinary benchmarks remain exposed through
+``run_test`` and ``run_bench``.
+"""
+
 from __future__ import annotations
 
+import argparse
 import math
 import os
+from functools import partial
 
 import numpy as np
 import torch
@@ -11,6 +20,7 @@ import tvm.testing
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.bench import bench
+from tvm.tirx.cuda import iket
 from tvm.tirx.cuda.iket import IketProfiler
 from tvm.tirx.lang.pipeline import MBarrier, Pipeline, PipelineState, TCGen05Bar
 from tvm.tirx.lang.tile_scheduler import FlashAttentionLinearScheduler, FlashAttentionLPTScheduler
@@ -1261,3 +1271,94 @@ def run_bench(
         references={"flashattn_sm100": _flashattn_sm100},
         **kwargs,
     )
+
+
+def _parse_iket_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Profile the annotated FA4 kernel with NVIDIA IKET"
+    )
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--seq-len", type=int, default=1024)
+    parser.add_argument("--num-qo-heads", type=int, default=32)
+    parser.add_argument("--num-kv-heads", type=int, default=32)
+    parser.add_argument("--head-dim", type=int, default=128)
+    parser.add_argument("--causal", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="Number of traced FA4 launches; setup and compilation remain outside the loop",
+    )
+    parser.add_argument("--output-dir", default="/tmp/fa4-iket")
+    parser.add_argument(
+        "--postprocess", choices=("perfetto", "json", "html", "none", "all"), default="all"
+    )
+    parser.add_argument("--clobber", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--timeout", type=float, default=600.0)
+    parser.add_argument("--keep", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--max-ts-cnt-per-warp", type=int, default=None)
+    return parser.parse_args()
+
+
+def _profile_iket_workload(args: argparse.Namespace) -> None:
+    if args.repeat <= 0:
+        raise ValueError("--repeat must be positive")
+
+    func = get_flash_attention4_kernel(
+        args.batch_size,
+        args.seq_len,
+        args.seq_len,
+        args.num_qo_heads,
+        args.num_kv_heads,
+        args.head_dim,
+        is_causal=args.causal,
+    )
+    executable = IketProfiler().compile(
+        tvm.IRModule({"main": func}),
+        target=tvm.target.Target({"kind": "cuda", "arch": "sm_100a"}),
+        tir_pipeline="tirx",
+    )
+
+    q, k, v, _ = prepare_data(
+        args.batch_size,
+        args.seq_len,
+        args.seq_len,
+        args.num_qo_heads,
+        args.num_kv_heads,
+        args.head_dim,
+    )
+    q, k, v = q.cuda(), k.cuda(), v.cuda()
+    out = torch.empty(
+        (args.batch_size, args.seq_len, args.num_qo_heads, args.head_dim),
+        dtype=torch.float16,
+        device="cuda",
+    )
+
+    for _ in range(args.repeat):
+        executable(q, k, v, out)
+    torch.cuda.synchronize()
+
+
+def _print_iket_result(result: iket.IketProfileResult) -> None:
+    print(f"IKET output directory: {result.output_dir}")
+    for path in (*result.json_traces, *result.perfetto_traces, *result.html_reports):
+        print(f"IKET artifact: {path}")
+
+
+def main() -> None:
+    """Profile FA4 when this kernel module is executed directly."""
+    args = _parse_iket_args()
+    result = iket.run(
+        partial(_profile_iket_workload, args),
+        output_dir=args.output_dir,
+        postprocess=args.postprocess,
+        clobber=args.clobber,
+        timeout=args.timeout,
+        keep=args.keep,
+        max_ts_cnt_per_warp=args.max_ts_cnt_per_warp,
+    )
+    _print_iket_result(result)
+
+
+if __name__ == "__main__":
+    main()
