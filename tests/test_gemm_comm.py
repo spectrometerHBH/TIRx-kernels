@@ -146,7 +146,7 @@ def test_worker_pairs_tirx_with_shared_kineto_baselines(runner) -> None:
     source = inspect.getsource(runner._run_worker)
     assert "create_baseline_suite" in source
     assert "references=baselines.references()" in source
-    assert 'prepare={"tirx": prepare}' in source
+    assert 'prepare={"dsl":' in source
     assert 'result["ratio_definition"] = "baseline_us / tirx_us"' in source
 
 
@@ -299,9 +299,28 @@ def test_dsl_and_manual_bench_share_inputs_but_not_state(
 
     monkeypatch.setattr(runner, "_allocate_case", fake_allocate)
 
+    class FakeBaselines:
+        def references(self):
+            return {"cublas_nccl": lambda: lambda: None, "cublasmp_split_p2p": lambda: lambda: None}
+
+        def metadata(self):
+            return {"cublasmp_algorithm": "split_p2p"}
+
+        def close(self):
+            events.append(("baselines", "close"))
+
+    def fake_create_baseline_suite(runtime_arg, data, **kwargs):
+        assert runtime_arg is runtime
+        assert data is shared_data
+        assert kwargs["world_size"] == 4
+        return FakeBaselines()
+
+    monkeypatch.setattr(runner, "create_baseline_suite", fake_create_baseline_suite)
+
     def fake_bench(funcs, **kwargs):
         assert list(funcs) == ["dsl", "manual"]
         assert list(kwargs["prepare"]) == ["dsl", "manual"]
+        assert list(kwargs["references"]) == ["cublas_nccl", "cublasmp_split_p2p"]
         assert kwargs["distributed"] is context
         for name in funcs:
             kwargs["prepare"][name]()
@@ -317,8 +336,12 @@ def test_dsl_and_manual_bench_share_inputs_but_not_state(
     bench_module = importlib.import_module("tvm.tirx.bench")
     monkeypatch.setattr(bench_module, "bench", fake_bench)
 
+    config = {key: value for key, value in runner.CONFIGS[0].items() if key != "label"}
     result = runner._run_worker(
-        runtime, object(), "bench", {"scheduler": "static", "timer": "kineto", "rounds": 6}
+        runtime,
+        object(),
+        "bench",
+        {**config, "scheduler": "static", "timer": "kineto", "rounds": 6},
     )
 
     assert result["status"] == "OK"
@@ -333,6 +356,7 @@ def test_dsl_and_manual_bench_share_inputs_but_not_state(
         ("manual", "reset"),
         ("manual", "prepare"),
         ("manual", "launch"),
+        ("baselines", "close"),
     ]
 
 

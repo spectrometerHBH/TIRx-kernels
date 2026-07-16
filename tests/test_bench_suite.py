@@ -9,6 +9,7 @@ import pytest
 
 from tirx_kernels.bench_suite import run
 from tirx_kernels.bench_suite.baseline_view import render_markdown
+from tirx_kernels.bench_suite.impls import is_our_impl, our_impls
 from tirx_kernels.bench_suite.ratio_diff import build_report
 from tirx_kernels.megakernel.moe import BENCH_CONFIGS as MEGAKERNEL_MOE_BENCH_CONFIGS
 from tirx_kernels.megakernel.moe import _estimate_bench_launch_slots
@@ -17,6 +18,12 @@ from tirx_kernels.megakernel.moe import _estimate_bench_launch_slots
 def test_bench_suite_standard_sampling_defaults() -> None:
     assert run.DEFAULT_ROUNDS == 5
     assert run.DEFAULT_COOLDOWN_S == 1.0
+
+
+def test_gemm_comm_dsl_and_manual_are_our_implementations() -> None:
+    impls = {"dsl": 100.0, "manual": 101.0, "cublas_nccl": 90.0, "cublasmp_split_p2p": 95.0}
+    assert our_impls(impls) == ["dsl", "manual"]
+    assert not is_our_impl("cublas_nccl")
 
 
 def test_finalize_bench_record_uses_all_rounds_arithmetic_mean() -> None:

@@ -29,6 +29,8 @@ import tvm
 from tvm.tirx import PrimFunc
 
 from . import gemm_reduce_scatter as impl
+from ._baselines import create_baseline_suite
+from ._baselines import ratios as baseline_ratios
 from ._runtime import (
     DistributedRuntime,
     barrier_on_communication_stream,
@@ -298,17 +300,33 @@ def _run_worker(
         case.reset()
         case.prepare()
 
-    result = bench(
-        {"dsl": dsl_case.launch, "manual": manual_case.launch},
-        warmup=kwargs.get("warmup"),
-        repeat=kwargs.get("repeat"),
-        timer=kwargs.get("timer"),
-        rounds=kwargs.get("rounds", 1),
-        cooldown_s=kwargs.get("cooldown_s", 1.0),
-        distributed=runtime.bench_context(),
-        prepare={"dsl": lambda: prepare(dsl_case), "manual": lambda: prepare(manual_case)},
+    baselines = create_baseline_suite(
+        runtime,
+        data,
+        workload="gemm_reduce_scatter",
+        M=kwargs["M"],
+        N=kwargs["N"],
+        K=kwargs["K"],
+        world_size=kwargs["world_size"],
     )
-    return {"status": "OK", **result}
+    try:
+        result = bench(
+            {"dsl": dsl_case.launch, "manual": manual_case.launch},
+            references=baselines.references(),
+            warmup=kwargs.get("warmup"),
+            repeat=kwargs.get("repeat"),
+            timer=kwargs.get("timer"),
+            rounds=kwargs.get("rounds", 1),
+            cooldown_s=kwargs.get("cooldown_s", 1.0),
+            distributed=runtime.bench_context(),
+            prepare={"dsl": lambda: prepare(dsl_case), "manual": lambda: prepare(manual_case)},
+        )
+        result["baseline_metadata"] = baselines.metadata()
+        result["ratio_definition"] = "baseline_us / tirx_us"
+        result["ratios"] = baseline_ratios(result, tirx="dsl")
+        return {"status": "OK", **result}
+    finally:
+        baselines.close()
 
 
 def run_test(
@@ -357,7 +375,7 @@ def run_bench(
     scheduler: str = "static",
     **_kwargs: Any,
 ) -> dict[str, Any]:
-    """Pair the DSL and manual paths with the shared distributed Kineto timer."""
+    """Pair DSL, manual, and external baselines under distributed Kineto."""
 
     _check_config(M, N, K, world_size, dtype)
     _check_scheduler(scheduler)

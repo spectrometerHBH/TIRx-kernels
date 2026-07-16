@@ -78,12 +78,44 @@ code-generation parity checks. Production entry points always lower the DSL.
 
 ## Validation and benchmarking
 
-`run_bench()` measures the DSL and private manual oracle in the same worker and
-paired Kineto round. They share the exact rank-local input tensors but own
-independent mutable state. The shared distributed timer uses one preflight, 30
-warmups, 30 measured launches, cold L2, rank barriers, AB/BA ordering, and
-sample-wise slowest-rank aggregation. Reset and preparation remain outside the
-timed launch scope.
+`run_bench()` measures four implementations in the same worker and paired
+Kineto round:
+
+- `dsl`: the production DSL-lowered TIRx module.
+- `manual`: the private implementation-preserving TIRx oracle.
+- `cublasmp_split_p2p`: cuBLASMp with the official TP block-noncyclic
+  distributions.
+- `cublas_nccl`: explicit AllGather then cuBLAS GEMM, or cuBLAS GEMM then
+  ReduceScatter.
+
+They share the exact rank-local input tensors but own independent mutable state
+and workspaces. The shared distributed timer uses one preflight, 30 warmups, 30
+measured launches, cold L2, rank barriers, forward/reverse round ordering, and
+sample-wise slowest-rank aggregation. Each implementation is captured in an
+isolated Kineto profiler session; the forward/reverse pairing controls the
+session execution order within a round. Allocation, baseline correctness
+preflight, reset, and preparation remain outside the timed launch scope.
+
+cuBLASMp 0.10 requires nvmath-python, NCCL4Py, and a compatible recent NCCL.
+Every benchmark requires absolute paths for all four runtime dependencies so a
+loader-path change cannot silently alter the comparison:
+
+```bash
+export TIRX_NCCL_LIBRARY=/path/to/libnccl.so.2
+export TIRX_CUBLAS_LIBRARY=/path/to/libcublas.so
+export TIRX_CUBLASMP_LIBRARY=/path/to/libcublasmp.so.0
+export TIRX_NVSHMEM_LIBRARY=/path/to/libnvshmem_host.so
+export PYTHONPATH=/path/to/nvmath-python:/path/to/cublasmp-package:$PYTHONPATH
+```
+
+The selected files are preloaded only in newly spawned rank workers. Each
+result records the actual shared object resolving the NCCL, cuBLAS, cuBLASMp,
+and NVSHMEM API symbol together with its runtime version, and fails if any
+loaded file differs from its configured lock. cuBLASMp builder failures remain
+visible in `errors`, which bench-suite treats as a failed workload.
+
+The result's `ratios` mapping is always `baseline_us / tirx_us`; values greater
+than one mean TIRx is faster.
 
 For a four-GPU B200 host:
 
