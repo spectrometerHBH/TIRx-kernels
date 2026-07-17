@@ -240,7 +240,7 @@ def _mma64_kernel(dtype, lane_align, accum, trans_a, trans_b):
     out = gmem_arg(b, dtype=nr.DType.F32, shape=(128, n))
     a_s = smem_tensor(b, dtype=dtype, shape=a_shape, byte_offset=0)
     b_s = smem_tensor(b, dtype=dtype, shape=b_shape, byte_offset=a_bytes)
-    dst = tmem_tensor(b, dtype=nr.DType.F32, shape=(m, n), col_start=0, lane_align=lane_align)
+    dst = tmem_tensor(b, dtype=nr.DType.F32, shape=(m, n), col_start=0)
     frag = reg_tensor(b, dtype=nr.DType.F32, shape=(n,))
     ma = b.mbar(kind=nr.MBarKind.TMA)
     mb = b.mbar(kind=nr.MBarKind.TMA)
@@ -257,10 +257,30 @@ def _mma64_kernel(dtype, lane_align, accum, trans_a, trans_b):
         b.mbarrier_init(mb, count=1)
         b.mbarrier_expect_tx(mb, bytes=b_bytes)
         b.tma_load(b_s, b_g, mbar=mb, bytes=b_bytes, coords=(0, 0), shape=b_shape)
-        b.tcgen05_mma(dst, a_s, b_s, m=m, n=n, k=k, accum=False, trans_a=trans_a, trans_b=trans_b)
+        b.tcgen05_mma(
+            dst,
+            a_s,
+            b_s,
+            m=m,
+            n=n,
+            k=k,
+            accum=False,
+            trans_a=trans_a,
+            trans_b=trans_b,
+            lane_align=lane_align,
+        )
         if accum:
             b.tcgen05_mma(
-                dst, a_s, b_s, m=m, n=n, k=k, accum=True, trans_a=trans_a, trans_b=trans_b
+                dst,
+                a_s,
+                b_s,
+                m=m,
+                n=n,
+                k=k,
+                accum=True,
+                trans_a=trans_a,
+                trans_b=trans_b,
+                lane_align=lane_align,
             )
         b.tcgen05_ld(frag, dst, shape="32x32b", num=n, row=0, col=0)
         b.reg_store(out[b.tid_in_wg(), 0:n], frag)
@@ -322,16 +342,22 @@ def _build_mma_failure(
     allocate=True,
 ):
     b = builder("mma_failure", smem_size_bytes=1 << 16)
-    dst = tmem_tensor(
-        b, dtype=nr.DType.F32, shape=dst_shape, col_start=col_start, lane_align=lane_align
-    )
+    dst = tmem_tensor(b, dtype=nr.DType.F32, shape=dst_shape, col_start=col_start)
     a = smem_tensor(b, dtype=nr.DType.F16, shape=a_shape, byte_offset=0)
     b_s = smem_tensor(b, dtype=nr.DType.F16, shape=(16, 16), byte_offset=4096)
     if allocate:
         with b.kernel_init(warp=0):
             b.tmem_alloc(dst, n_cols=32)
     with b.role(warp=0):
-        b.tcgen05_mma(dst if dst_slice is None else dst_slice(dst), a, b_s, m=128, n=16, k=16)
+        b.tcgen05_mma(
+            dst if dst_slice is None else dst_slice(dst),
+            a,
+            b_s,
+            m=128,
+            n=16,
+            k=16,
+            lane_align=lane_align,
+        )
     return b.build()
 
 
