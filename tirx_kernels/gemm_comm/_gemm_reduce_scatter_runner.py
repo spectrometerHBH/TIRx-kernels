@@ -182,6 +182,10 @@ class _Case:
     initial_queues: tuple[torch.Tensor, ...]
 
     def reset(self) -> None:
+        # A completed local launch does not imply that peer kernels have stopped
+        # writing this rank's symmetric queue state.  Join every rank before
+        # overwriting it; prepare() supplies the matching post-reset barrier.
+        barrier_on_compute_stream(self.runtime)
         (
             gemm_types,
             gemm_indices,
