@@ -32,9 +32,9 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from ._model_shapes import SUPPORTED_WORLD_SIZES
 from ._runtime import DistributedRuntime, _locked_library_paths
 
-_WORLD_SIZE = 4
 _ALGORITHMS = {
     "default": "DEFAULT",
     "split_p2p": "SPLIT_P2P",
@@ -177,8 +177,10 @@ class _Problem:
 def _problem(workload: str, *, M: int, N: int, K: int, world_size: int) -> _Problem:
     if workload not in {"allgather_gemm", "gemm_reduce_scatter"}:
         raise ValueError(f"unknown GemmComm baseline workload: {workload!r}")
-    if world_size != _WORLD_SIZE:
-        raise ValueError(f"GemmComm baselines require world_size={_WORLD_SIZE}, got {world_size}")
+    if world_size not in SUPPORTED_WORLD_SIZES:
+        raise ValueError(
+            f"GemmComm baselines require world_size in {SUPPORTED_WORLD_SIZES}, got {world_size}"
+        )
     if any(value <= 0 for value in (M, N, K)):
         raise ValueError("GemmComm baseline dimensions must be positive")
     if M % world_size or N % world_size or K % world_size:

@@ -22,7 +22,6 @@ from __future__ import annotations
 import ctypes
 import gc
 import os
-import socket
 import tempfile
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager
@@ -169,12 +168,6 @@ def sync_compute_to_communication(runtime: DistributedRuntime) -> None:
 
 def sync_communication_to_compute(runtime: DistributedRuntime) -> None:
     _sync_streams(runtime, runtime.communication_stream, runtime.compute_stream)
-
-
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 @contextmanager
@@ -343,7 +336,10 @@ def run_distributed(
 
         context = mp.get_context("spawn")
         result_queue = context.SimpleQueue()
-        init_method = f"tcp://127.0.0.1:{_find_free_port()}"
+        # Every GemmComm workload is single-host. A unique FileStore avoids the
+        # bind-after-probe race of selecting a free TCP port before concurrent
+        # rank groups start listening on it.
+        init_method = f"file://{Path(tmpdir) / 'torch-distributed-init'}"
         with _rank_library_preload(required=mode == "bench"):
             mp.spawn(
                 _rank_entry,

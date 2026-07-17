@@ -31,6 +31,7 @@ import tvm
 from . import rs_gemm_multimem_dynamic as impl
 from ._baselines import create_baseline_suite
 from ._baselines import ratios as baseline_ratios
+from ._model_shapes import GEMM_RS_MODEL_SHAPES, make_configs
 from ._runtime import (
     DistributedRuntime,
     barrier_on_compute_stream,
@@ -43,18 +44,7 @@ from ._runtime import (
 KERNEL_META = {"name": "gemm_reduce_scatter", "category": "gemm_comm", "compute_capability": 10}
 _RELAUNCH_COUNT = 20
 
-CONFIGS = [
-    {
-        "M": impl.M,
-        "N": impl.N,
-        "K": impl.TOTAL_K,
-        "world_size": world_size,
-        "dtype": impl.DTYPE,
-        "scheduler": "dynamic",
-        "label": f"tp{world_size}_m{impl.M}_n{impl.N}_k{impl.TOTAL_K}_fp16_dynamic",
-    }
-    for world_size in impl.SUPPORTED_WORLD_SIZES
-]
+CONFIGS = make_configs(GEMM_RS_MODEL_SHAPES)
 
 
 def _config(
@@ -299,7 +289,8 @@ def _allocate_case(
         rs_tail_torch=torch_view(rs_tail),
         initial_queues=initial_queues,
     )
-    require_nvls_multicast(runtime, case.gemm_out_torch)
+    if config.world_size > 1:
+        require_nvls_multicast(runtime, case.gemm_out_torch)
     with torch.cuda.stream(runtime.timing_stream):
         case.reset()
     runtime.timing_stream.synchronize()

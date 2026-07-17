@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -38,6 +39,12 @@ from tvm.tirx.layout import TCol, TileLayout, TLane, tid_in_wg
 
 from ._baselines import create_baseline_suite
 from ._baselines import ratios as baseline_ratios
+from ._model_shapes import (
+    ALLGATHER_GEMM_MODEL_SHAPES,
+    SUPPORTED_WORLD_SIZES,
+    make_configs,
+    shape_set,
+)
 from ._runtime import (
     DistributedRuntime,
     barrier_on_compute_stream,
@@ -47,6 +54,7 @@ from ._runtime import (
     sync_compute_to_communication,
     torch_view,
 )
+from ._specialize import load_specialized_module
 
 
 class TaskType(Enum):
@@ -64,8 +72,19 @@ event_type_names = ["gemm", "ag", "fetch"]
 ALLGATHER_HOST_ENTRYPOINT = "runtime.disco.transfer_to_peers_all_gather"
 GEMM_DEVICE_ENTRYPOINT = "test_mma_ss_tma_2sm_persistent"
 
-# M, N, K = 16384, 49152, 12288
-M, N, K = 8192, 8192 * 8, 8192
+_SPECIALIZATION_M_ENV = "TIRX_INTERNAL_ALLGATHER_GEMM_M"
+_SPECIALIZATION_N_ENV = "TIRX_INTERNAL_ALLGATHER_GEMM_N"
+_SPECIALIZATION_K_ENV = "TIRX_INTERNAL_ALLGATHER_GEMM_K"
+_SPECIALIZATION_WORLD_SIZE_ENV = "TIRX_INTERNAL_ALLGATHER_GEMM_WORLD_SIZE"
+
+# Qwen3-32B TP4 remains the convenient default. Public CONFIGS cover all eight
+# model shapes at TP1, TP2, and TP4.
+M = int(os.environ.get(_SPECIALIZATION_M_ENV, "8192"))
+N = int(os.environ.get(_SPECIALIZATION_N_ENV, "51200"))
+K = int(os.environ.get(_SPECIALIZATION_K_ENV, "5120"))
+WORLD_SIZE = int(os.environ.get(_SPECIALIZATION_WORLD_SIZE_ENV, "4"))
+DTYPE = "float16"
+_SUPPORTED_SHAPES = shape_set(ALLGATHER_GEMM_MODEL_SHAPES)
 
 M_CLUSTER = 2
 N_CLUSTER = 1
@@ -81,8 +100,7 @@ F16_BYTES = 2
 F32_BYTES = 4
 F128_BYTES = 16
 
-d_type, a_type, b_type = "float16", "float16", "float16"
-WORLD_SIZE = 4
+d_type, a_type, b_type = DTYPE, DTYPE, DTYPE
 LOCAL_M = M // WORLD_SIZE
 LOCAL_N = N // WORLD_SIZE
 BLK_M, BLK_N, BLK_K = 128, 128, 64
@@ -110,18 +128,20 @@ PIPE_CYCLE = (K // BLK_K) // PIPELINE_DEPTH
 PIPE_REMAIN_NUM = (K // BLK_K) % PIPELINE_DEPTH
 assert PIPELINE_DEPTH == 4
 
-GROUP_SIZE = min(8, LOCAL_M // (BLK_M * NUM_CONSUMER * CTA_GROUP))
 assert M % (NUM_CONSUMER * BLK_M * CTA_GROUP) == 0
 assert N % (BLK_N * CTA_GROUP) == 0
 GEMM_M_CLUSTERS = M // (NUM_CONSUMER * BLK_M * CTA_GROUP)  # gemm tile m: 512
 GEMM_N_CLUSTERS = LOCAL_N // (BLK_N * CTA_GROUP)  # gemm tile n: 256
 LOCAL_GEMM_M_CLUSTERS = GEMM_M_CLUSTERS // WORLD_SIZE
+GROUP_SIZE = LOCAL_GEMM_M_CLUSTERS
 assert GROUP_SIZE == LOCAL_GEMM_M_CLUSTERS, (
     "AllGather queue grouping must match the rank-local GEMM M-cluster count"
 )
 
 # dyn scheduling
-CAPACITY = 2048
+TASK_COUNT = GEMM_M_CLUSTERS * GEMM_N_CLUSTERS
+CAPACITY = max(2048, 1 << (TASK_COUNT - 1).bit_length())
+assert CAPACITY <= 8192, "AllGather+GEMM queue exceeds the supported capacity"
 TASK_IDX_LEN = 2
 ENABLE_WARP_BROADCAST = False
 C2P_THREAD_COUNT = 12 * 2 if ENABLE_WARP_BROADCAST else NUM_THREADS * 2
@@ -140,6 +160,76 @@ CUDA_EVENT_PROFILER = False
 if CUDA_EVENT_PROFILER:
     PROFILER_ON = False
 VALIDATE = True
+
+
+@dataclass(frozen=True)
+class AllGatherGemmConfig:
+    M: int
+    N: int
+    K: int
+    world_size: int
+    dtype: str
+    local_m: int
+    local_n: int
+    pipe_cycle: int
+    pipe_remainder: int
+    group_size: int
+    gemm_m_clusters: int
+    gemm_n_clusters: int
+    local_gemm_m_clusters: int
+    task_count: int
+    capacity: int
+
+
+def derive_config(
+    M: int = M, N: int = N, K: int = K, world_size: int = WORLD_SIZE, dtype: str = DTYPE
+) -> AllGatherGemmConfig:
+    """Validate and derive one model-shape/world-size specialization."""
+
+    if (M, N, K) not in _SUPPORTED_SHAPES:
+        raise ValueError(f"AllGather+GEMM does not support shape M={M}, N={N}, K={K}")
+    if world_size not in SUPPORTED_WORLD_SIZES:
+        raise ValueError(
+            f"AllGather+GEMM supports world_size in {SUPPORTED_WORLD_SIZES}; got {world_size}"
+        )
+    if dtype != DTYPE:
+        raise ValueError(f"AllGather+GEMM supports only dtype={DTYPE!r}; got {dtype!r}")
+    if M % world_size or N % world_size:
+        raise ValueError("AllGather+GEMM M and N must be divisible by world_size")
+    if K % BLK_K:
+        raise ValueError(f"AllGather+GEMM K must be divisible by {BLK_K}")
+    if M % (NUM_CONSUMER * BLK_M * CTA_GROUP) or N % (BLK_N * CTA_GROUP):
+        raise ValueError("AllGather+GEMM M and N do not satisfy the 2-CTA tile geometry")
+    local_m = M // world_size
+    local_n = N // world_size
+    if local_m % (NUM_CONSUMER * BLK_M * CTA_GROUP) or local_n % (BLK_N * CTA_GROUP):
+        raise ValueError("AllGather+GEMM rank-local dimensions do not satisfy tile geometry")
+    gemm_m_clusters = M // (NUM_CONSUMER * BLK_M * CTA_GROUP)
+    gemm_n_clusters = local_n // (BLK_N * CTA_GROUP)
+    local_gemm_m_clusters = gemm_m_clusters // world_size
+    task_count = gemm_m_clusters * gemm_n_clusters
+    capacity = max(2048, 1 << (task_count - 1).bit_length())
+    if capacity > 8192:
+        raise AssertionError(
+            f"AllGather+GEMM requires queue capacity {capacity}, above the supported 8192"
+        )
+    return AllGatherGemmConfig(
+        M=M,
+        N=N,
+        K=K,
+        world_size=world_size,
+        dtype=dtype,
+        local_m=local_m,
+        local_n=local_n,
+        pipe_cycle=(K // BLK_K) // PIPELINE_DEPTH,
+        pipe_remainder=(K // BLK_K) % PIPELINE_DEPTH,
+        group_size=local_gemm_m_clusters,
+        gemm_m_clusters=gemm_m_clusters,
+        gemm_n_clusters=gemm_n_clusters,
+        local_gemm_m_clusters=local_gemm_m_clusters,
+        task_count=task_count,
+        capacity=capacity,
+    )
 
 
 pack_values = """
@@ -809,24 +899,11 @@ def _build_kernel():
 
 KERNEL_META = {"name": "allgather_gemm", "category": "gemm_comm", "compute_capability": 10}
 
-CONFIGS = [
-    {
-        "M": M,
-        "N": N,
-        "K": K,
-        "world_size": WORLD_SIZE,
-        "dtype": "float16",
-        "scheduler": "dynamic",
-        "label": f"tp{WORLD_SIZE}_m{M}_n{N}_k{K}_fp16_dynamic",
-    }
-]
+CONFIGS = make_configs(ALLGATHER_GEMM_MODEL_SHAPES)
 
 
-def _check_config(M_: int, N_: int, K_: int, world_size: int, dtype: str) -> None:
-    expected = (M, N, K, WORLD_SIZE, "float16")
-    actual = (M_, N_, K_, world_size, dtype)
-    if actual != expected:
-        raise ValueError(f"this tuned kernel supports only {expected}, got {actual}")
+def _check_config(M_: int, N_: int, K_: int, world_size: int, dtype: str) -> AllGatherGemmConfig:
+    return derive_config(M_, N_, K_, world_size, dtype)
 
 
 def _check_scheduler(scheduler: str) -> None:
@@ -843,8 +920,24 @@ def get_kernel(
     scheduler: str = "dynamic",
     **_kwargs: Any,
 ):
-    _check_config(M, N, K, world_size, dtype)
+    config = _check_config(M, N, K, world_size, dtype)
     _check_scheduler(scheduler)
+    requested = (config.M, config.N, config.K, config.world_size)
+    active = (globals()["M"], globals()["N"], globals()["K"], WORLD_SIZE)
+    if requested != active:
+        specialized = load_specialized_module(
+            package=__package__,
+            stem="allgather_gemm",
+            source=__file__,
+            key=requested,
+            environment={
+                _SPECIALIZATION_M_ENV: config.M,
+                _SPECIALIZATION_N_ENV: config.N,
+                _SPECIALIZATION_K_ENV: config.K,
+                _SPECIALIZATION_WORLD_SIZE_ENV: config.world_size,
+            },
+        )
+        return specialized.get_kernel()
     return _build_kernel()
 
 
@@ -873,40 +966,43 @@ def prepare_data(
 ) -> dict[str, torch.Tensor]:
     """Create deterministic inputs directly on one rank's CUDA device."""
 
-    _check_config(M, N, K, world_size, dtype)
+    config = _check_config(M, N, K, world_size, dtype)
     _check_scheduler(scheduler)
     if not 0 <= rank < world_size:
         raise ValueError("rank must be in [0, world_size)")
     device = torch.device("cuda", rank)
     generator = torch.Generator(device=device).manual_seed(seed + rank)
-    A = torch.randn((LOCAL_M, K), dtype=torch.float16, device=device, generator=generator).mul_(
-        scale
-    )
-    B = torch.randn((LOCAL_N, K), dtype=torch.float16, device=device, generator=generator).mul_(
-        scale
-    )
+    A = torch.randn(
+        (config.local_m, config.K), dtype=torch.float16, device=device, generator=generator
+    ).mul_(scale)
+    B = torch.randn(
+        (config.local_n, config.K), dtype=torch.float16, device=device, generator=generator
+    ).mul_(scale)
     return {"A": A, "B": B}
 
 
-def _queue_state() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    task_types = np.full((WORLD_SIZE, CAPACITY), -1, dtype=np.int32)
-    task_idxs = np.zeros((WORLD_SIZE, CAPACITY, TASK_IDX_LEN), dtype=np.int32)
-    heads = np.zeros((WORLD_SIZE, 1), dtype=np.int32)
-    tails = np.zeros((WORLD_SIZE, 1), dtype=np.int32)
+def _queue_state(
+    config: AllGatherGemmConfig | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    config = config or derive_config()
+    task_types = np.full((config.world_size, config.capacity), -1, dtype=np.int32)
+    task_idxs = np.zeros((config.world_size, config.capacity, TASK_IDX_LEN), dtype=np.int32)
+    heads = np.zeros((config.world_size, 1), dtype=np.int32)
+    tails = np.zeros((config.world_size, 1), dtype=np.int32)
 
-    for rank in range(WORLD_SIZE):
+    for rank in range(config.world_size):
         tasks: list[tuple[int, int]] = []
-        offset = rank * LOCAL_GEMM_M_CLUSTERS
-        group_count = math.ceil(GEMM_M_CLUSTERS / GROUP_SIZE)
+        offset = rank * config.local_gemm_m_clusters
+        group_count = math.ceil(config.gemm_m_clusters / config.group_size)
         for group in range(group_count):
-            begin = group * GROUP_SIZE
-            end = min((group + 1) * GROUP_SIZE, GEMM_M_CLUSTERS)
-            for n_idx in range(GEMM_N_CLUSTERS):
+            begin = group * config.group_size
+            end = min((group + 1) * config.group_size, config.gemm_m_clusters)
+            for n_idx in range(config.gemm_n_clusters):
                 for m_idx in range(begin, end):
-                    tasks.append(((offset + m_idx) % GEMM_M_CLUSTERS, n_idx))
-        if len(tasks) != GEMM_M_CLUSTERS * GEMM_N_CLUSTERS:
+                    tasks.append(((offset + m_idx) % config.gemm_m_clusters, n_idx))
+        if len(tasks) != config.task_count:
             raise AssertionError("incomplete AllGather+GEMM queue")
-        if len(tasks) > CAPACITY:
+        if len(tasks) > config.capacity:
             raise AssertionError("AllGather+GEMM queue exceeds capacity")
         task_types[rank, : len(tasks)] = TaskType.GEMM.value
         task_idxs[rank, : len(tasks)] = tasks
@@ -918,6 +1014,7 @@ def _queue_state() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
 class _Case:
     runtime: DistributedRuntime
     module: Any
+    config: AllGatherGemmConfig
     A: Any
     B: Any
     ag_out: Any
@@ -947,7 +1044,13 @@ class _Case:
 
     def launch(self) -> None:
         tvm.get_global_func(ALLGATHER_HOST_ENTRYPOINT)(
-            self.semaphore, self.A, self.ag_out, self.runtime.communication_stream, M, K, WORLD_SIZE
+            self.semaphore,
+            self.A,
+            self.ag_out,
+            self.runtime.communication_stream,
+            self.config.M,
+            self.config.K,
+            self.config.world_size,
         )
         self.module[GEMM_DEVICE_ENTRYPOINT](
             self.A,
@@ -965,23 +1068,27 @@ class _Case:
 
 
 def _allocate_case(
-    runtime: DistributedRuntime, module: Any, data: dict[str, torch.Tensor]
+    runtime: DistributedRuntime,
+    module: Any,
+    data: dict[str, torch.Tensor],
+    config: AllGatherGemmConfig,
 ) -> _Case:
-    task_types, task_idxs, heads, tails = _queue_state()
+    task_types, task_idxs, heads, tails = _queue_state(config)
     device = torch.device("cuda", runtime.rank)
-    ag_out = symmetric_empty(runtime, (M, K), a_type)
-    semaphore = symmetric_empty(runtime, (WORLD_SIZE,), "uint64")
+    ag_out = symmetric_empty(runtime, (config.M, config.K), a_type)
+    semaphore = symmetric_empty(runtime, (config.world_size,), "uint64")
     initial_task_types = torch.from_numpy(task_types[runtime.rank].copy()).to(device)
     initial_task_idxs = torch.from_numpy(task_idxs[runtime.rank].copy()).to(device)
     initial_tail = torch.from_numpy(tails[runtime.rank].copy()).to(device)
     case = _Case(
         runtime=runtime,
         module=module,
+        config=config,
         A=data["A"],
         B=data["B"],
         ag_out=ag_out,
         semaphore=semaphore,
-        out=torch.empty((M, LOCAL_N), dtype=torch.float16, device=device),
+        out=torch.empty((config.M, config.local_n), dtype=torch.float16, device=device),
         profiler=torch.empty(PROFILER_BUFFER_SIZE, dtype=torch.uint64, device=device),
         task_types=torch.empty_like(initial_task_types),
         task_idxs=torch.empty_like(initial_task_idxs),
@@ -1001,12 +1108,13 @@ def _allocate_case(
 
 
 def _check_correctness(case: _Case) -> None:
-    gathered_A = torch.empty((M, K), dtype=torch.float16, device=case.A.device)
+    config = case.config
+    gathered_A = torch.empty((config.M, config.K), dtype=torch.float16, device=case.A.device)
     with torch.cuda.stream(case.runtime.timing_stream):
         dist.all_gather_into_tensor(gathered_A, case.A)
     case.runtime.timing_stream.synchronize()
 
-    local = slice(case.runtime.rank * LOCAL_M, (case.runtime.rank + 1) * LOCAL_M)
+    local = slice(case.runtime.rank * config.local_m, (case.runtime.rank + 1) * config.local_m)
     case.ag_out_torch[local].copy_(case.A)
     torch.testing.assert_close(case.ag_out_torch, gathered_A, rtol=0, atol=0)
 
@@ -1017,8 +1125,12 @@ def _check_correctness(case: _Case) -> None:
 def _run_worker(
     runtime: DistributedRuntime, module: Any, mode: str, kwargs: dict[str, Any]
 ) -> dict[str, Any]:
+    config = _check_config(
+        kwargs["M"], kwargs["N"], kwargs["K"], kwargs["world_size"], kwargs["dtype"]
+    )
+    _check_scheduler(kwargs.get("scheduler", "dynamic"))
     data = prepare_data(rank=runtime.rank, **kwargs)
-    case = _allocate_case(runtime, module, data)
+    case = _allocate_case(runtime, module, data, config)
 
     if mode == "test":
         with torch.cuda.stream(runtime.timing_stream):
@@ -1083,7 +1195,7 @@ def run_test(
     scheduler: str = "dynamic",
     **_kwargs: Any,
 ) -> None:
-    """Compile, launch on four GPUs, and compare the full result with PyTorch."""
+    """Compile, launch on the requested TP ranks, and compare with PyTorch."""
 
     _check_config(M, N, K, world_size, dtype)
     _check_scheduler(scheduler)
@@ -1149,7 +1261,9 @@ def run_bench(
 __all__ = [
     "CONFIGS",
     "KERNEL_META",
+    "AllGatherGemmConfig",
     "_get_benchmark_kernel",
+    "derive_config",
     "get_kernel",
     "prepare_data",
     "run_bench",

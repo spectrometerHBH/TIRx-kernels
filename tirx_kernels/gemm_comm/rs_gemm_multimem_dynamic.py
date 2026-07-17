@@ -15,8 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Direct TP4 port of the fused persistent dynamic-multimem GemmRS kernel."""
+"""Direct TP1/TP2/TP4 port of the fused persistent dynamic-multimem GemmRS kernel."""
 
+import os
 from dataclasses import dataclass
 from enum import Enum
 
@@ -26,15 +27,29 @@ from tvm.script import tirx as Tx
 from tvm.tirx.lang.pipeline import Pipeline as DataPipeline
 from tvm.tirx.layout import wg_local_layout
 
+from ._model_shapes import GEMM_RS_MODEL_SHAPES, SUPPORTED_WORLD_SIZES, shape_set
+from ._specialize import load_specialized_module
+
 
 class TaskType(Enum):
     GEMM = 0
     RS = 1
 
 
-M, N, K = (8192, 5120, 25600 // 4)
+_SPECIALIZATION_M_ENV = "TIRX_INTERNAL_GEMMRS_M"
+_SPECIALIZATION_N_ENV = "TIRX_INTERNAL_GEMMRS_N"
+_SPECIALIZATION_K_ENV = "TIRX_INTERNAL_GEMMRS_K"
+_SPECIALIZATION_WORLD_SIZE_ENV = "TIRX_INTERNAL_GEMMRS_WORLD_SIZE"
+
+M = int(os.environ.get(_SPECIALIZATION_M_ENV, "8192"))
+N = int(os.environ.get(_SPECIALIZATION_N_ENV, "5120"))
+TOTAL_K = int(os.environ.get(_SPECIALIZATION_K_ENV, "25600"))
+WORLD_SIZE = int(os.environ.get(_SPECIALIZATION_WORLD_SIZE_ENV, "4"))
+if TOTAL_K % WORLD_SIZE:
+    raise ValueError("GemmRS total K must be divisible by world_size")
+K = TOTAL_K // WORLD_SIZE
 DTYPE = "float16"
-SUPPORTED_WORLD_SIZES = (4,)
+_SUPPORTED_SHAPES = shape_set(GEMM_RS_MODEL_SHAPES)
 M_CLUSTER = 2
 N_CLUSTER = 1
 WG_NUMBER = 3
@@ -46,8 +61,6 @@ PIPELINE_DEPTH = 4
 F16_BYTES = 2
 F128_BYTES = 16
 d_type, a_type, b_type = ("float16", "float16", "float16")
-WORLD_SIZE = 4
-TOTAL_K = K * WORLD_SIZE
 LOCAL_M = M // WORLD_SIZE
 BLK_M, BLK_N, BLK_K = (128, 128, 64)
 assert LOCAL_M * WORLD_SIZE == M, "M must be divisible by WORLD_SIZE"
@@ -107,37 +120,51 @@ class GemmRSConfig:
 def derive_config(
     M: int = M, N: int = N, K: int = TOTAL_K, world_size: int = WORLD_SIZE, dtype: str = DTYPE
 ) -> GemmRSConfig:
-    """Validate and derive the one manually ported specialization."""
+    """Validate and derive one model-shape/world-size specialization."""
 
-    expected = (globals()["M"], globals()["N"], TOTAL_K, WORLD_SIZE, DTYPE)
-    actual = (M, N, K, world_size, dtype)
-    if actual != expected:
-        raise ValueError(
-            "manual dynamic GemmRS currently supports only "
-            f"M={expected[0]}, N={expected[1]}, K={expected[2]}, "
-            f"world_size={expected[3]}, dtype={expected[4]}; got "
-            f"M={M}, N={N}, K={K}, world_size={world_size}, dtype={dtype}"
-        )
+    if (M, N, K) not in _SUPPORTED_SHAPES:
+        raise ValueError(f"GemmRS does not support shape M={M}, N={N}, K={K}")
+    if world_size not in SUPPORTED_WORLD_SIZES:
+        raise ValueError(f"GemmRS supports world_size in {SUPPORTED_WORLD_SIZES}; got {world_size}")
+    if dtype != DTYPE:
+        raise ValueError(f"GemmRS supports only dtype={DTYPE!r}; got {dtype!r}")
+    if M % world_size or K % world_size:
+        raise ValueError("GemmRS M and K must be divisible by world_size")
+    k_local = K // world_size
+    local_m = M // world_size
+    if k_local % BLK_K:
+        raise ValueError(f"GemmRS rank-local K must be divisible by {BLK_K}")
+    if M % (NUM_CONSUMER * BLK_M * CTA_GROUP) or N % (BLK_N * CTA_GROUP):
+        raise ValueError("GemmRS M and N do not satisfy the 2-CTA tile geometry")
+    if local_m % TILE_M:
+        raise ValueError(f"GemmRS rank-local M must be divisible by {TILE_M}")
+    gemm_m_clusters = M // (NUM_CONSUMER * BLK_M * CTA_GROUP)
+    gemm_n_clusters = N // (BLK_N * CTA_GROUP)
+    rs_m_clusters = local_m // (BLK_M * CTA_GROUP)
+    rs_n_clusters = N // (BLK_N * CTA_GROUP)
     config = GemmRSConfig(
         M=M,
         N=N,
         total_k=K,
         world_size=world_size,
         dtype=dtype,
-        k_local=K // world_size,
-        local_m=M // world_size,
-        pipe_cycle=(K // world_size // BLK_K) // PIPELINE_DEPTH,
-        pipe_remainder=(K // world_size // BLK_K) % PIPELINE_DEPTH,
-        gemm_m_clusters=M // (NUM_CONSUMER * BLK_M * CTA_GROUP),
-        gemm_n_clusters=N // (BLK_N * CTA_GROUP),
-        rs_m_clusters=(M // world_size) // (BLK_M * CTA_GROUP),
-        rs_n_clusters=N // (BLK_N * CTA_GROUP),
-        gemm_task_count=GEMM_M_CLUSTERS * GEMM_N_CLUSTERS,
-        rs_task_count=RS_M_CLUSTERS * RS_N_CLUSTERS,
+        k_local=k_local,
+        local_m=local_m,
+        pipe_cycle=(k_local // BLK_K) // PIPELINE_DEPTH,
+        pipe_remainder=(k_local // BLK_K) % PIPELINE_DEPTH,
+        gemm_m_clusters=gemm_m_clusters,
+        gemm_n_clusters=gemm_n_clusters,
+        rs_m_clusters=rs_m_clusters,
+        rs_n_clusters=rs_n_clusters,
+        gemm_task_count=gemm_m_clusters * gemm_n_clusters,
+        rs_task_count=rs_m_clusters * rs_n_clusters,
         completion_count=2 * world_size,
     )
     if config.gemm_task_count > CAPACITY or config.rs_task_count > CAPACITY:
-        raise AssertionError("queue capacity is too small for the tuned workload")
+        raise AssertionError(
+            f"GemmRS queue capacity {CAPACITY} is too small for "
+            f"{config.gemm_task_count} GEMM and {config.rs_task_count} RS tasks"
+        )
     return config
 
 
@@ -693,19 +720,32 @@ def test_mma_ss_tma_2sm_persistent(
                 if offset < TILE_M // 2 * TILE_N // 8:
                     m_start = Tx.meta_var(offset // (TILE_N // 8))
                     n_start = Tx.meta_var(offset % (TILE_N // 8) * 8)
-                    Tx.cuda.func_call(
-                        "ld_reduce_8_fp16",
-                        gemm_out.ptr_to(
-                            [
-                                rank * LOCAL_M + TILE_M * m_idx + TILE_M // 2 * cbx + m_start,
-                                TILE_N * n_idx + n_start,
+                    if WORLD_SIZE == 1:
+                        for vec in Tx.vectorized(8):
+                            out[
+                                TILE_M * m_idx + TILE_M // 2 * cbx + m_start,
+                                TILE_N * n_idx + n_start + vec,
+                            ] = gemm_out[
+                                TILE_M * m_idx + TILE_M // 2 * cbx + m_start,
+                                TILE_N * n_idx + n_start + vec,
                             ]
-                        ),
-                        out.ptr_to(
-                            [TILE_M * m_idx + TILE_M // 2 * cbx + m_start, TILE_N * n_idx + n_start]
-                        ),
-                        source_code=ld_reduce_8xfp16,
-                    )
+                    else:
+                        Tx.cuda.func_call(
+                            "ld_reduce_8_fp16",
+                            gemm_out.ptr_to(
+                                [
+                                    rank * LOCAL_M + TILE_M * m_idx + TILE_M // 2 * cbx + m_start,
+                                    TILE_N * n_idx + n_start,
+                                ]
+                            ),
+                            out.ptr_to(
+                                [
+                                    TILE_M * m_idx + TILE_M // 2 * cbx + m_start,
+                                    TILE_N * n_idx + n_start,
+                                ]
+                            ),
+                            source_code=ld_reduce_8xfp16,
+                        )
                     offset += NUM_THREADS
                 else:
                     break
@@ -962,8 +1002,22 @@ def build_kernel(config: GemmRSConfig | None = None) -> tvm.IRModule:
     """Return the directly ported fused persistent GemmRS kernel."""
 
     config = config or derive_config()
-    if config != derive_config():
-        raise ValueError(f"unsupported GemmRS specialization: {config!r}")
+    requested = (config.M, config.N, config.total_k, config.world_size)
+    active = (M, N, TOTAL_K, WORLD_SIZE)
+    if requested != active:
+        specialized = load_specialized_module(
+            package=__package__,
+            stem="rs_gemm_multimem_dynamic",
+            source=__file__,
+            key=requested,
+            environment={
+                _SPECIALIZATION_M_ENV: config.M,
+                _SPECIALIZATION_N_ENV: config.N,
+                _SPECIALIZATION_K_ENV: config.total_k,
+                _SPECIALIZATION_WORLD_SIZE_ENV: config.world_size,
+            },
+        )
+        return specialized.build_kernel()
     return tvm.IRModule({FUSED_DEVICE_ENTRYPOINT: test_mma_ss_tma_2sm_persistent})
 
 

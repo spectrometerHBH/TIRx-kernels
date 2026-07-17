@@ -20,18 +20,21 @@ under the License.
 # Distributed GEMM kernels
 
 This category contains the SM100, tensor-parallel kernels recovered from the
-megakernel performance branch. Both currently registered workloads are TP4:
+megakernel performance branch. Both workloads register TP1, TP2, and TP4
+specializations for eight model shapes:
 
 | Registry name | Global operation | Rank-local result |
 | --- | --- | --- |
-| `allgather_gemm` | `A[M, K] @ W[N, K].T` after gathering row shards of `A` | `[M, N / 4]` |
-| `gemm_reduce_scatter` | sum of rank-local `A[M, K / 4] @ W[N, K / 4].T`, scattered over `M` | `[M / 4, N]` |
+| `allgather_gemm` | `A[M, K] @ W[N, K].T` after gathering row shards of `A` | `[M, N / TP]` |
+| `gemm_reduce_scatter` | sum of rank-local `A[M, K / TP] @ W[N, K / TP].T`, scattered over `M` | `[M / TP, N]` |
 
 The second source was historically called GEMM+AllReduce, but its actual
 protocol and output shape are ReduceScatter. The public name reflects the
-implemented operation. Its tuned workload is fixed to `M=8192`, `N=5120`,
-`K=25600`, and FP16. Only the directly ported TP4 dynamic specialization is
-registered; other world sizes and the legacy static scheduler are rejected.
+implemented operation. The registered matrix contains the Qwen3-8B,
+LLaMA-3.1-8B, Gemma-2-9B, Gemma-2-27B, Qwen3-32B, LLaMA-3.1-70B,
+GPT-3-175B, and LLaMA-3.1-405B shapes supplied by the benchmark suite. All use
+`M=8192` and FP16. TP values other than 1, 2, or 4 and the legacy static
+scheduler are rejected.
 
 The parent compiles and exports one module, then `torch.multiprocessing.spawn`
 starts one rank-local worker per GPU. NCCL bootstraps the process group and
@@ -46,9 +49,10 @@ the already validated dynamic queue implementation. GEMM+ReduceScatter uses
 the hand-transcribed fused persistent
 kernel in `rs_gemm_multimem_dynamic.py`: a two-CTA GEMM queue feeds an initially
 empty ReduceScatter queue, and the final contributor publishes each tile with
-system-scope release/acquire ordering. ReduceScatter uses NVLS
-`multimem.ld_reduce` directly from the multicast partial output; there is no
-host peer transfer, staging buffer, or separate reduction kernel.
+system-scope release/acquire ordering. TP2 and TP4 ReduceScatter use NVLS
+`multimem.ld_reduce` directly from the multicast partial output; TP1 uses the
+same fused queue and a local vectorized writeback. There is no host peer
+transfer, staging buffer, or separate reduction kernel.
 
 ## Validation and benchmarking
 
@@ -88,14 +92,18 @@ visible in `errors`, which bench-suite treats as a failed workload.
 The result's `ratios` mapping is always `baseline_us / tirx_us`; values greater
 than one mean TIRx is faster.
 
-For a four-GPU B200 host:
+For a B200 host, select any registered config explicitly when needed:
 
 ```bash
-python -m tirx_kernels.test --kernel allgather_gemm
-python -m tirx_kernels.test --kernel gemm_reduce_scatter
+python -m tirx_kernels.test --kernel allgather_gemm \
+  --config tp2_m8192_n51200_k5120_fp16_dynamic
+python -m tirx_kernels.test --kernel gemm_reduce_scatter \
+  --config tp4_m8192_n5120_k25600_fp16_dynamic
 
-python -m tirx_kernels.bench --kernel allgather_gemm --timer event --rounds 6 --json
-python -m tirx_kernels.bench --kernel gemm_reduce_scatter --timer event --rounds 6 --json
+python -m tirx_kernels.bench --kernel allgather_gemm \
+  --config tp2_m8192_n51200_k5120_fp16_dynamic --timer event --rounds 6 --json
+python -m tirx_kernels.bench --kernel gemm_reduce_scatter \
+  --config tp4_m8192_n5120_k25600_fp16_dynamic --timer event --rounds 6 --json
 ```
 
 The distributed event and Kineto protocols use fixed iteration counts, so

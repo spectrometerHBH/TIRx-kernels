@@ -10,6 +10,8 @@ import pytest
 from tirx_kernels.bench_suite import run
 from tirx_kernels.bench_suite.baseline_view import render_markdown
 from tirx_kernels.bench_suite.ratio_diff import build_report
+from tirx_kernels.gemm_comm.allgather_gemm import CONFIGS as ALLGATHER_GEMM_CONFIGS
+from tirx_kernels.gemm_comm.gemm_reduce_scatter import CONFIGS as GEMM_RS_CONFIGS
 from tirx_kernels.megakernel.moe import BENCH_CONFIGS as MEGAKERNEL_MOE_BENCH_CONFIGS
 from tirx_kernels.megakernel.moe import _estimate_bench_launch_slots
 
@@ -61,12 +63,22 @@ def test_default_workloads_include_manual_gemm_comm_event_profiles() -> None:
         if workload["kernel"] in {"allgather_gemm", "gemm_reduce_scatter"}
     ]
 
-    assert [(workload["kernel"], workload["config"]) for workload in selected] == [
-        ("allgather_gemm", "tp4_m8192_n65536_k8192_fp16_dynamic"),
-        ("gemm_reduce_scatter", "tp4_m8192_n5120_k25600_fp16_dynamic"),
+    expected = [
+        *(("allgather_gemm", config) for config in ALLGATHER_GEMM_CONFIGS),
+        *(("gemm_reduce_scatter", config) for config in GEMM_RS_CONFIGS),
     ]
+    assert [(workload["kernel"], workload["config"]) for workload in selected] == [
+        (kernel, config["label"]) for kernel, config in expected
+    ]
+    assert len(selected) == 48
     assert all(workload["timer"] == "event" for workload in selected)
-    assert all(workload["num_gpus"] == 4 for workload in selected)
+    expected_world_sizes = {
+        (kernel, config["label"]): config["world_size"] for kernel, config in expected
+    }
+    assert all(
+        workload["num_gpus"] == expected_world_sizes[(workload["kernel"], workload["config"])]
+        for workload in selected
+    )
 
 
 def test_bench_suite_defaults_to_five_round_arithmetic_mean() -> None:

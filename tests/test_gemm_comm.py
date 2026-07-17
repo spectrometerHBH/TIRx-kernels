@@ -29,6 +29,12 @@ from tirx_kernels.gemm_comm import _gemm_reduce_scatter_runner as rs_runner
 from tirx_kernels.gemm_comm import _runtime as runtime
 from tirx_kernels.gemm_comm import allgather_gemm, gemm_reduce_scatter
 from tirx_kernels.gemm_comm import rs_gemm_multimem_dynamic as rs_kernel
+from tirx_kernels.gemm_comm._model_shapes import (
+    ALLGATHER_GEMM_MODEL_SHAPES,
+    GEMM_RS_MODEL_SHAPES,
+    SUPPORTED_WORLD_SIZES,
+    make_configs,
+)
 from tirx_kernels.registry import discover_kernels
 
 ag_runner = allgather_gemm
@@ -40,29 +46,13 @@ def test_gemm_comm_registry_entries() -> None:
     assert all(module.KERNEL_META["compute_capability"] == 10 for module in kernels.values())
 
 
-def test_tuned_tp4_configs_are_explicit() -> None:
-    assert allgather_gemm.CONFIGS == [
-        {
-            "M": 8192,
-            "N": 65536,
-            "K": 8192,
-            "world_size": 4,
-            "dtype": "float16",
-            "scheduler": "dynamic",
-            "label": "tp4_m8192_n65536_k8192_fp16_dynamic",
-        }
-    ]
-    assert gemm_reduce_scatter.CONFIGS == [
-        {
-            "M": 8192,
-            "N": 5120,
-            "K": 25600,
-            "world_size": 4,
-            "dtype": "float16",
-            "scheduler": "dynamic",
-            "label": "tp4_m8192_n5120_k25600_fp16_dynamic",
-        }
-    ]
+def test_model_shape_configs_cover_tp1_tp2_tp4() -> None:
+    assert allgather_gemm.CONFIGS == make_configs(ALLGATHER_GEMM_MODEL_SHAPES)
+    assert gemm_reduce_scatter.CONFIGS == make_configs(GEMM_RS_MODEL_SHAPES)
+    for configs in (allgather_gemm.CONFIGS, gemm_reduce_scatter.CONFIGS):
+        assert len(configs) == 8 * len(SUPPORTED_WORLD_SIZES) == 24
+        assert {config["world_size"] for config in configs} == set(SUPPORTED_WORLD_SIZES)
+        assert len({config["label"] for config in configs}) == len(configs)
 
 
 @pytest.mark.parametrize(
@@ -75,8 +65,42 @@ def test_tuned_tp4_configs_are_explicit() -> None:
     ],
 )
 def test_tuned_kernels_reject_other_configs(module, overrides) -> None:
-    with pytest.raises(ValueError, match="supports only"):
+    with pytest.raises(ValueError, match="does not support|supports world_size|supports only"):
         module.get_kernel(**overrides)
+
+
+def test_allgather_config_derivation_covers_every_registered_shape() -> None:
+    for raw in allgather_gemm.CONFIGS:
+        config = allgather_gemm.derive_config(
+            raw["M"], raw["N"], raw["K"], raw["world_size"], raw["dtype"]
+        )
+        assert config.local_m == config.M // config.world_size
+        assert config.local_n == config.N // config.world_size
+        assert config.group_size == config.local_gemm_m_clusters == 16 // config.world_size
+        assert config.task_count == config.gemm_m_clusters * config.gemm_n_clusters
+        assert config.capacity >= max(2048, config.task_count)
+        assert config.capacity & (config.capacity - 1) == 0
+        assert config.capacity <= 8192
+
+
+def test_reduce_scatter_config_derivation_covers_every_registered_shape() -> None:
+    for raw in gemm_reduce_scatter.CONFIGS:
+        config = rs_kernel.derive_config(
+            raw["M"], raw["N"], raw["K"], raw["world_size"], raw["dtype"]
+        )
+        assert config.local_m == config.M // config.world_size
+        assert config.k_local == config.total_k // config.world_size
+        assert config.gemm_task_count == config.gemm_m_clusters * config.gemm_n_clusters
+        assert config.rs_task_count == config.rs_m_clusters * config.rs_n_clusters
+        assert config.completion_count == 2 * config.world_size
+        assert max(config.gemm_task_count, config.rs_task_count) <= rs_kernel.CAPACITY
+
+
+def test_all_registered_kernels_build_shape_specialized_ir() -> None:
+    for module in (allgather_gemm, gemm_reduce_scatter):
+        for raw in module.CONFIGS:
+            kwargs = {key: value for key, value in raw.items() if key != "label"}
+            assert module.get_kernel(**kwargs) is not None
 
 
 def test_reduce_scatter_manual_config_and_queue_geometry() -> None:
@@ -106,7 +130,7 @@ def test_reduce_scatter_manual_config_and_queue_geometry() -> None:
 
 @pytest.mark.parametrize("kwargs", [{"world_size": 8}, {"scheduler": "static"}, {"M": 1}])
 def test_reduce_scatter_manual_port_rejects_unsupported_configs(kwargs) -> None:
-    with pytest.raises(ValueError, match="supports only"):
+    with pytest.raises(ValueError):
         gemm_reduce_scatter.get_kernel(**kwargs)
 
 
@@ -220,6 +244,42 @@ def test_allgather_dynamic_queue_has_exact_coverage() -> None:
         )
         assert set(map(tuple, task_indices[rank, :expected_tasks])) == expected_indices
         np.testing.assert_array_equal(task_types[rank, expected_tasks:], -1)
+
+
+def test_all_registered_queue_states_fit_and_cover_tiles() -> None:
+    for raw in allgather_gemm.CONFIGS:
+        config = allgather_gemm.derive_config(
+            raw["M"], raw["N"], raw["K"], raw["world_size"], raw["dtype"]
+        )
+        task_types, task_indices, heads, tails = allgather_gemm._queue_state(config)
+        assert task_types.shape == (config.world_size, config.capacity)
+        assert task_indices.shape == (config.world_size, config.capacity, 2)
+        np.testing.assert_array_equal(heads, 0)
+        np.testing.assert_array_equal(tails, config.task_count)
+        for rank in range(config.world_size):
+            assert len(set(map(tuple, task_indices[rank, : config.task_count]))) == (
+                config.task_count
+            )
+
+    for raw in gemm_reduce_scatter.CONFIGS:
+        config = rs_kernel.derive_config(
+            raw["M"], raw["N"], raw["K"], raw["world_size"], raw["dtype"]
+        )
+        state = rs_runner._queue_state(config)
+        gemm_types, gemm_indices, gemm_heads, gemm_tails = state[:4]
+        rs_types, _rs_indices, rs_heads, rs_tails = state[4:]
+        np.testing.assert_array_equal(gemm_heads, 0)
+        np.testing.assert_array_equal(gemm_tails, config.gemm_task_count)
+        np.testing.assert_array_equal(rs_types, -1)
+        np.testing.assert_array_equal(rs_heads, 0)
+        np.testing.assert_array_equal(rs_tails, 0)
+        for rank in range(config.world_size):
+            assert len(set(map(tuple, gemm_indices[rank, : config.gemm_task_count]))) == (
+                config.gemm_task_count
+            )
+            np.testing.assert_array_equal(
+                gemm_types[rank, : config.gemm_task_count], rs_kernel.TaskType.GEMM.value
+            )
 
 
 @pytest.mark.parametrize(
@@ -471,7 +531,6 @@ def test_parent_compiles_once_before_spawning_ranks(monkeypatch: pytest.MonkeyPa
         return executable
 
     monkeypatch.setattr(runtime, "require_sm100", lambda _world_size: None)
-    monkeypatch.setattr(runtime, "_find_free_port", lambda: 12345)
     monkeypatch.setattr(runtime.tvm, "compile", fake_compile)
     monkeypatch.setattr(
         runtime.mp, "get_context", lambda _method: SimpleNamespace(SimpleQueue=lambda: queue)
@@ -496,6 +555,7 @@ def test_parent_compiles_once_before_spawning_ranks(monkeypatch: pytest.MonkeyPa
     assert len(spawn_calls) == 1
     assert spawn_calls[0][0] is runtime._rank_entry
     assert spawn_calls[0][2:] == (4, True)
+    assert spawn_calls[0][1][1].startswith("file://")
 
 
 def test_rank_process_group_has_explicit_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
