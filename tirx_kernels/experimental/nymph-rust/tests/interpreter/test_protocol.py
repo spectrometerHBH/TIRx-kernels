@@ -293,7 +293,7 @@ def test_protocol_tmem_mma_layout_f_emits_union_boxes():
     b = builder("protocol_tmem_layout_f_boxes", smem_size_bytes=a_bytes + b_bytes)
     a_s = smem_tensor(b, dtype=nr.DType.F16, shape=(m, k), byte_offset=0)
     b_s = smem_tensor(b, dtype=nr.DType.F16, shape=(n, k), byte_offset=a_bytes)
-    dst = tmem_tensor(b, dtype=nr.DType.F32, shape=(m, n), col_start=0, lane_align=0)
+    dst = tmem_tensor(b, dtype=nr.DType.F32, shape=(m, n), col_start=0)
 
     with b.kernel_init(warp=0):
         b.tmem_alloc(dst, n_cols=32)

@@ -54,16 +54,13 @@ def f32(values, shape=None):
     return arr.reshape(shape) if shape is not None else arr
 
 
-def tmem_layout(*, col_start=0, lane_align=0):
-    return nr.TmemLayout(nr.TmemLayoutKind.LANE_128, col_start, lane_align)
+def tmem_layout(*, col_start=0):
+    return nr.TmemLayout(nr.TmemLayoutKind.LANE_128, col_start)
 
 
-def tmem_tensor(b, *, dtype=nr.DType.F32, shape=(128, 128), col_start=0, lane_align=0):
+def tmem_tensor(b, *, dtype=nr.DType.F32, shape=(128, 128), col_start=0):
     return b.tensor(
-        space=nr.MemorySpace.TMEM,
-        dtype=dtype,
-        shape=shape,
-        layout=tmem_layout(col_start=col_start, lane_align=lane_align),
+        space=nr.MemorySpace.TMEM, dtype=dtype, shape=shape, layout=tmem_layout(col_start=col_start)
     )
 
 
