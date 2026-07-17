@@ -117,6 +117,60 @@ def test_reduce_scatter_remote_queue_uses_system_release_acquire() -> None:
     assert "ld.global.acquire.sys.b32" in rs_kernel.while_ld_global_acquire
 
 
+def test_reduce_scatter_reset_joins_peer_writers_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    events = []
+
+    class TensorProbe:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def copy_(self, _value) -> None:
+            events.append(f"copy:{self.name}")
+
+        def zero_(self) -> None:
+            events.append(f"zero:{self.name}")
+
+        def fill_(self, _value) -> None:
+            events.append(f"fill:{self.name}")
+
+    monkeypatch.setattr(rs_runner, "torch_view", lambda tensor: tensor)
+    monkeypatch.setattr(
+        rs_runner, "barrier_on_compute_stream", lambda runtime: events.append(f"barrier:{runtime}")
+    )
+    case = SimpleNamespace(
+        runtime="runtime",
+        initial_queues=(object(),) * 8,
+        gemm_task_types=TensorProbe("gemm_types"),
+        gemm_task_idxs=TensorProbe("gemm_indices"),
+        gemm_head_torch=TensorProbe("gemm_head"),
+        gemm_tail_torch=TensorProbe("gemm_tail"),
+        rs_task_types=TensorProbe("rs_types"),
+        rs_task_idxs=TensorProbe("rs_indices"),
+        rs_head_torch=TensorProbe("rs_head"),
+        rs_tail_torch=TensorProbe("rs_tail"),
+        semaphore_torch=TensorProbe("semaphore"),
+        gemm_out_torch=TensorProbe("gemm_out"),
+        out=TensorProbe("out"),
+    )
+
+    rs_runner._Case.reset(case)
+
+    assert events[0] == "barrier:runtime"
+    assert events[1:] == [
+        "copy:gemm_types",
+        "copy:gemm_indices",
+        "copy:gemm_head",
+        "copy:gemm_tail",
+        "copy:rs_types",
+        "copy:rs_indices",
+        "copy:rs_head",
+        "copy:rs_tail",
+        "zero:semaphore",
+        "fill:gemm_out",
+        "fill:out",
+    ]
+
+
 def test_reduce_scatter_manual_kernel_has_no_legacy_profiler_argument() -> None:
     kernel = rs_kernel.build_kernel()
     func = kernel[rs_kernel.FUSED_DEVICE_ENTRYPOINT]
