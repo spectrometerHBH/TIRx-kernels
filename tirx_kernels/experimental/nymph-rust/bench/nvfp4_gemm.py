@@ -12,15 +12,20 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sys
 import tempfile
 
-import nymph_rs as nr
-import torch
-from nymph_rs.kernels import NvFp4GemmConfig, build_nvfp4_gemm, gemm_config_for
+_NYMPH_PY = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "python"))
+if _NYMPH_PY not in sys.path:
+    sys.path.insert(0, _NYMPH_PY)
 
-import tvm
-from tirx_kernels.gemm.nvfp4_gemm import prepare_data, tir_ws_kernel
-from tvm.tirx.bench import bench
+import nymph_rs as nr  # noqa: E402
+import torch  # noqa: E402
+from nymph_rs.kernels import NvFp4GemmConfig, build_nvfp4_gemm, gemm_config_for  # noqa: E402
+
+import tvm  # noqa: E402
+from tirx_kernels.gemm.nvfp4_gemm import prepare_data, tir_ws_kernel  # noqa: E402
+from tvm.tirx.bench import bench  # noqa: E402
 
 KERNEL_META = {"name": "nymph_nvfp4_gemm", "category": "experimental", "compute_capability": 10}
 CONFIGS = [

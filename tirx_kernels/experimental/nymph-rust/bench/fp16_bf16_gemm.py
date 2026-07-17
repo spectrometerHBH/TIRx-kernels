@@ -11,17 +11,22 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sys
 import tempfile
 
-import nymph_rs as nr
-import torch
-from nymph_rs.kernels import build_fp16_bf16_gemm
-from nymph_rs.kernels.fp16_bf16_gemm import Fp16Bf16GemmConfig
+_NYMPH_PY = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "python"))
+if _NYMPH_PY not in sys.path:
+    sys.path.insert(0, _NYMPH_PY)
 
-import tvm
-from tirx_kernels.gemm.fp16_bf16_gemm import prepare_data, tir_kernel
-from tirx_kernels.runner import compile_kernel
-from tvm.tirx.bench import bench
+import nymph_rs as nr  # noqa: E402
+import torch  # noqa: E402
+from nymph_rs.kernels import build_fp16_bf16_gemm  # noqa: E402
+from nymph_rs.kernels.fp16_bf16_gemm import Fp16Bf16GemmConfig  # noqa: E402
+
+import tvm  # noqa: E402
+from tirx_kernels.gemm.fp16_bf16_gemm import prepare_data, tir_kernel  # noqa: E402
+from tirx_kernels.runner import compile_kernel  # noqa: E402
+from tvm.tirx.bench import bench  # noqa: E402
 
 KERNEL_META = {"name": "nymph_fp16_bf16_gemm", "category": "experimental", "compute_capability": 10}
 CONFIGS = [

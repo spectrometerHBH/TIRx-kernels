@@ -57,15 +57,15 @@ def main() -> None:
                 continue
             result = run_kernel_bench(kname, cfg, rounds=args.rounds, timer=args.timer)
             im = result["impls"]
-            ratio = im["canon"] / im["nymph"]
+            ratio = im["tir"] / im["tirx"]
             rs = result.get("round_samples", {})
             spread = ""
-            if rs.get("canon") and rs.get("nymph"):
-                pr = sorted(c / n for c, n in zip(rs["canon"], rs["nymph"]))
+            if rs.get("tir") and rs.get("tirx"):
+                pr = sorted(c / n for c, n in zip(rs["tir"], rs["tirx"]))
                 spread = f"  per-round[{pr[0]:.3f}-{pr[-1]:.3f}]"
             print(
-                f"{kname} {cfg['label']}: canon/nymph={ratio:.3f}{spread}  "
-                f"canon={im['canon']:.1f}us nymph={im['nymph']:.1f}us",
+                f"{kname} {cfg['label']}: tir/tirx={ratio:.3f}{spread}  "
+                f"tir={im['tir']:.1f}us tirx={im['tirx']:.1f}us",
                 flush=True,
             )
 
