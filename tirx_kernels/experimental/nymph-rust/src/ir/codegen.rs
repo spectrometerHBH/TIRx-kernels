@@ -624,10 +624,11 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
             .ok_or_else(|| format!("codegen: peer references unknown mbar {mbar_id}"))?;
         let stages = ctx.mbar_stages.get(mbar_id).copied().unwrap_or(1).max(1);
         let ptr_var = format!("{peer_name}_ptr");
-        // The `T.let[...]` annotation makes the ptr a typed Var (a bare
-        // `T.reinterpret(...)` returns a PrimExpr, which `decl_buffer(data=)` rejects).
+        // The `T.let` annotation binds the ptr as a Var typed by the exact
+        // PointerType from `T.reinterpret` (a bare expr is not a Var, which
+        // `decl_buffer(data=)` rejects).
         out.push_str(&format!(
-            "{p}{ptr_var}: T.let[T.Var(name=\"{ptr_var}\", dtype=PointerType(PrimType(\"uint64\")))] = T.reinterpret(\"handle\", T.ptx.map_shared_rank({base}.ptr_to([0]), 1))\n",
+            "{p}{ptr_var}: T.let = T.reinterpret(PointerType(PrimType(\"uint64\")), T.ptx.map_shared_rank({base}.ptr_to([0]), 1))\n",
             p = pad(ind),
             ptr_var = ptr_var,
             base = base,
@@ -660,7 +661,7 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
         let stages = ctx.mbar_stages.get(&id).copied().unwrap_or(1).max(1);
         let ptr_var = format!("{view}_ptr");
         out.push_str(&format!(
-            "{p}{ptr_var}: T.let[T.Var(name=\"{ptr_var}\", dtype=PointerType(PrimType(\"uint64\")))] = T.reinterpret(\"handle\", T.ptx.map_shared_rank({base}.ptr_to([0]), 0))\n",
+            "{p}{ptr_var}: T.let = T.reinterpret(PointerType(PrimType(\"uint64\")), T.ptx.map_shared_rank({base}.ptr_to([0]), 0))\n",
             p = pad(ind),
             ptr_var = ptr_var,
             base = base,
@@ -2381,11 +2382,11 @@ fn emit_stmt(
         MBarrierArrive { mbar, count, stage } => {
             // Two arrive forms (see `ptx_mbarrier_arrive`):
             //   * LOCAL (remote_coord=None): the implicit count-of-1 form
-            //     `T.ptx.mbarrier.arrive(bar)`. (The 2nd positional arg is `cta_id`,
+            //     `T.ptx.mbarrier.arrive(bar)`. (The 2nd positional arg is `remote`,
             //     NOT a count — so a count must never be passed positionally here.)
             //   * CROSS-CTA (remote_coord=Some(c)): the cluster form on the LOCAL
-            //     barrier of CTA `c`: `T.ptx.mbarrier.arrive(bar, cta_id=c, pred=True)`
-            //     — the canonical `tmem_pipe.empty.arrive(slot, cta_id=0, pred=True)`.
+            //     barrier of CTA `c`: `T.ptx.mbarrier.arrive(bar, remote=c, pred=True)`
+            //     — the canonical `tmem_pipe.empty.arrive(slot, remote=0, pred=True)`.
             //     This is NOT the map_shared_rank peer view; the cluster arrive remaps
             //     to CTA c internally, so we use the local mbar name + cta_id.
             //
@@ -2408,7 +2409,7 @@ fn emit_stmt(
                     .map(|s| emit_scalar(s, ctx))
                     .unwrap_or_else(|| "0".to_string());
                 format!(
-                    "T.ptx.mbarrier.arrive({local_name}.ptr_to([{slot}]), cta_id={cta}, pred=True)",
+                    "T.ptx.mbarrier.arrive({local_name}.ptr_to([{slot}]), remote={cta}, pred=True)",
                     cta = emit_scalar(remote, ctx),
                 )
             } else {
@@ -2420,7 +2421,7 @@ fn emit_stmt(
                     // A local arrive with an explicit count>1 has no implicit form;
                     // none occur in this kernel. Emit the count via the cluster form on
                     // the local CTA (cta_id read from the runtime scope).
-                    format!("T.ptx.mbarrier.arrive({slot_ptr}, cta_id=cbx, pred=True, count={cnt})")
+                    format!("T.ptx.mbarrier.arrive({slot_ptr}, remote=cbx, pred=True, count={cnt})")
                 }
             };
             emit_guarded(out, &body);
