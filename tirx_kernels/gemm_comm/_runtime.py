@@ -27,6 +27,7 @@ import tempfile
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from unittest import SkipTest
@@ -45,6 +46,7 @@ _LOCKED_LIBRARY_ENVS = {
     "cublasmp": "TIRX_CUBLASMP_LIBRARY",
     "nvshmem": "TIRX_NVSHMEM_LIBRARY",
 }
+_PROCESS_GROUP_TIMEOUT = timedelta(seconds=60)
 
 
 @dataclass
@@ -295,6 +297,7 @@ def _rank_entry(
             world_size=world_size,
             rank=rank,
             device_id=torch.device("cuda", rank),
+            timeout=_PROCESS_GROUP_TIMEOUT,
         )
         uid = _broadcast_nvshmem_uid(rank)
         tvm.get_global_func("runtime.disco.nvshmem.init_nvshmem")(uid, world_size, rank)

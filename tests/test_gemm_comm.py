@@ -117,6 +117,25 @@ def test_reduce_scatter_remote_queue_uses_system_release_acquire() -> None:
     assert "ld.global.acquire.sys.b32" in rs_kernel.while_ld_global_acquire
 
 
+def test_reduce_scatter_publishes_gemm_output_before_completion_atomic() -> None:
+    module_source = inspect.getsource(rs_kernel)
+    notify_start = module_source.index("    def semaphore_notify(")
+    notify_source = module_source[
+        notify_start : module_source.index("\n\n@Tx.prim_func", notify_start)
+    ]
+    assert "__threadfence_system();" in rs_kernel.thread_fence_system
+    assert notify_source.index('"thread_fence_system"') < notify_source.index(
+        '"semaphore_notify_remote"'
+    )
+    assert "Tx.cuda.thread_fence()" not in notify_source
+
+
+def test_gemm_comm_static_geometry_guards() -> None:
+    assert allgather_gemm.GROUP_SIZE == allgather_gemm.LOCAL_GEMM_M_CLUSTERS
+    assert rs_kernel.SMEM_SIZE == 230400
+    assert rs_kernel.SMEM_SIZE <= rs_kernel.SM100_SMEM_CAPACITY == 232448
+
+
 def test_reduce_scatter_reset_joins_peer_writers_first(monkeypatch: pytest.MonkeyPatch) -> None:
     events = []
 
@@ -477,6 +496,26 @@ def test_parent_compiles_once_before_spawning_ranks(monkeypatch: pytest.MonkeyPa
     assert len(spawn_calls) == 1
     assert spawn_calls[0][0] is runtime._rank_entry
     assert spawn_calls[0][2:] == (4, True)
+
+
+def test_rank_process_group_has_explicit_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = {}
+
+    class InitStopped(RuntimeError):
+        pass
+
+    def stop_after_init_call(**kwargs):
+        captured.update(kwargs)
+        raise InitStopped
+
+    monkeypatch.setattr(runtime.torch.cuda, "set_device", lambda _rank: None)
+    monkeypatch.setattr(runtime.dist, "init_process_group", stop_after_init_call)
+    monkeypatch.setattr(runtime.dist, "is_initialized", lambda: False)
+
+    with pytest.raises(InitStopped):
+        runtime._rank_entry(0, 4, "tcp://127.0.0.1:12345", "kernel.so", None, "test", {}, None)
+
+    assert captured["timeout"].total_seconds() == 60
 
 
 def test_gemm_comm_runtime_has_no_disco_objects_or_private_timer() -> None:

@@ -55,6 +55,15 @@ assert LOCAL_M % BLK_M == 0, "LOCAL_M must be divisible by BLK_M"
 MMA_M, MMA_N, MMA_K = (256, 256, 16)
 EPI_TILE = 64
 SWIZZLE = 3
+SMEM_RESERVED_BYTES = 1024
+SMEM_SIZE = (
+    PIPELINE_DEPTH * NUM_CONSUMER * BLK_M * BLK_K * F16_BYTES
+    + PIPELINE_DEPTH * BLK_N * BLK_K * F16_BYTES
+    + NUM_CONSUMER * BLK_M * EPI_TILE * F16_BYTES
+    + SMEM_RESERVED_BYTES
+)
+SM100_SMEM_CAPACITY = 232448
+assert SMEM_SIZE <= SM100_SMEM_CAPACITY, "GemmRS shared-memory usage exceeds the SM100 limit"
 TMEM_LD_SIZE = 64
 N_COLS = 512
 CTA_GROUP = 2
@@ -136,6 +145,11 @@ ld_reduce_8xfp16 = '\n__forceinline__ __device__ void ld_reduce_8_fp16(void* src
 pack_values = '\n__forceinline__ __device__ void pack_values(int32_t rem, int32_t task_type, int32_t task_idx0, int32_t task_idx1, uint64_t* dst_addr) {\n    asm volatile("st.shared::cluster.v4.b32 [%0], {%1, %2, %3, %4};"\n                 :\n                 : "l"(dst_addr), "r"(rem), "r"(task_type), "r"(task_idx0), "r"(task_idx1)\n                 : "memory");\n}\n'
 unpack_values = '\n__forceinline__ __device__ void unpack_values(uint64_t* src_addr, int32_t* rem, int32_t* task_type, int32_t* task_idx0, int32_t* task_idx1) {\n    asm volatile("ld.shared::cluster.v4.b32 {%0, %1, %2, %3}, [%4];"\n                 : "=r"(*rem), "=r"(*task_type), "=r"(*task_idx0), "=r"(*task_idx1)\n                 : "l"(src_addr)\n                 : "memory");\n\n}\n'
 semaphore_notify_remote = "\n__forceinline__ __device__ uint64_t semaphore_notify_remote(int32_t signal_rank, uint64_t* addr, uint64_t signal_value) {\n    auto dst_addr = reinterpret_cast<unsigned long long*>(nvshmem_ptr(addr, signal_rank));\n    return atomicAdd_system(dst_addr, signal_value);\n}\n"
+thread_fence_system = """
+__forceinline__ __device__ void thread_fence_system() {
+    __threadfence_system();
+}
+"""
 enqueue_remote = """
 __forceinline__ __device__ void enqueue_remote(
         int32_t* task_types, int32_t* task_idxs, int32_t* tail, int32_t mask,
@@ -476,6 +490,7 @@ class Semaphore:
     @Tx.inline
     def semaphore_notify(self, signal_rank, tid, m_idx, n_idx, rs_queue):
         if tid % 128 == 0:
+            Tx.cuda.func_call("thread_fence_system", source_code=thread_fence_system)
             self.state[0] = (
                 Tx.cuda.func_call(
                     "semaphore_notify_remote",
@@ -489,7 +504,6 @@ class Semaphore:
             )
             if self.state[0] == self.cnt:
                 rs_queue.enqueue(signal_rank, TaskType.RS.value, m_idx, n_idx)
-        Tx.cuda.thread_fence()
 
 
 @Tx.prim_func
@@ -596,7 +610,7 @@ def test_mma_ss_tma_2sm_persistent(
     packed_buf = pool.alloc((1,), "uint64", align=16)
     sch_pipe_base = pool.offset // 8
     pool.move_base_to(pool.offset + 2 * 1 * 1 * 8)
-    pool.move_base_to(1024)
+    pool.move_base_to(SMEM_RESERVED_BYTES)
     A_smem = pool.alloc_tcgen05_mma_AB((PIPELINE_DEPTH, NUM_CONSUMER, BLK_M, BLK_K), a_type)
     B_smem = pool.alloc_tcgen05_mma_AB((PIPELINE_DEPTH, BLK_N, BLK_K), b_type)
     D_smem = pool.alloc_tcgen05_mma_AB((NUM_CONSUMER, BLK_M, EPI_TILE), d_type)

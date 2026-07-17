@@ -116,6 +116,9 @@ assert N % (BLK_N * CTA_GROUP) == 0
 GEMM_M_CLUSTERS = M // (NUM_CONSUMER * BLK_M * CTA_GROUP)  # gemm tile m: 512
 GEMM_N_CLUSTERS = LOCAL_N // (BLK_N * CTA_GROUP)  # gemm tile n: 256
 LOCAL_GEMM_M_CLUSTERS = GEMM_M_CLUSTERS // WORLD_SIZE
+assert GROUP_SIZE == LOCAL_GEMM_M_CLUSTERS, (
+    "AllGather queue grouping must match the rank-local GEMM M-cluster count"
+)
 
 # dyn scheduling
 CAPACITY = 2048
