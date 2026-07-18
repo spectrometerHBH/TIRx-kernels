@@ -1305,8 +1305,8 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
     }
     walk_reg_widths(&k.body, &mut reg_widths);
 
-    // Scalar var names. Every `ScalarDef` introduces a scalar cell (an
-    // `alloc_local(1, ...)` referenced as `NAME[0]`). Var ids are globally unique, so
+    // Scalar var names. Every `ScalarDef` introduces an SSA register var
+    // (`NAME: T.int32 = init`, read as `NAME`). Var ids are globally unique, so
     // a per-id name (`s{id}`) is stable and collision-free.
     let mut scalar_names: HashMap<u32, String> = HashMap::new();
     fn walk_scalar_defs(stmts: &[Stmt], scalar_names: &mut HashMap<u32, String>) {
@@ -1427,7 +1427,7 @@ fn scope_name(kind: ScopeValueKind) -> &'static str {
 }
 
 /// Name of a loop var (`for v in range(...)`). Scalar vars are NOT named here —
-/// they are `alloc_local` cells, see `scalar_ref`.
+/// they are SSA register vars named via `Ctx::scalar_names`.
 fn var_name(ctx: &Ctx, v: &Var) -> String {
     ctx.var_names
         .get(&v.id.0)
@@ -2221,7 +2221,7 @@ fn emit_stmt(
             Ok(())
         }
 
-        // ---- scalar cells (an `alloc_local(1, ...)` register, read as NAME[0]) ----
+        // ---- scalar SSA register vars (`NAME: T.int32 = ...`, read as NAME) ----
         ScalarDef { var, initial } => {
             let name = ctx
                 .scalar_names

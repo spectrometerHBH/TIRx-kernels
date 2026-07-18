@@ -14,4 +14,6 @@ PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 maturin build --release
 rm -rf _pybuild && mkdir -p _pybuild
 python -m zipfile -e target/wheels/nymph_rs-*.whl _pybuild/
 
-PYTHONPATH="$PWD/_pybuild" python -m pytest tests/ "$@"
+# NOTE: prepend (not replace) so the shell's existing PYTHONPATH entries
+# (tvm_ffi shim, tvm/python, tirx-kernels) stay visible to the tests.
+PYTHONPATH="$PWD/_pybuild${PYTHONPATH:+:$PYTHONPATH}" python -m pytest tests/ "$@"
