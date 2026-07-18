@@ -109,6 +109,16 @@ TASK_FIELD_ID, TASK_FIELD_ITER = range(TASK_BROADCAST_FIELDS)
 # Per-shape tuning knobs (selected by N), mirroring TIRx GEMM_CONFIGS. CTA_M=256
 # always; everything else is derived from these.
 GEMM_CONFIGS = {
+    # 1024: mma_n=64 (16 N tiles × 4 M tiles = 64 cluster tasks on 74 clusters —
+    # the mma_n=32/128 alternatives under/over-occupy: 0.776 / worse), overlap
+    # epilogue + blk_k=128 (blk_k=64 is 0.878; no-overlap epilogue does not
+    # compile at this square — the 2-consumer SMEM footprint exceeds 227 KB).
+    # Re-swept 2026-07 (post-let batch, 10-round A/B): l2_group_size 2/4/8 =
+    # 0.973/0.980/0.980, wb_pipe_depth=4 = 0.965, pipe_depth=4 = 0.960 — the
+    # current config is the plateau at ~0.980. The residual is NOT a config
+    # knob: ncu has nymph at +17% total instructions vs canon (SYNCS/BRA/IMAD/
+    # ISETP/R2UR cluster), a whole-function ptxas placement issue the T.let
+    # conversion did not move (docs/perf-methodology.md §3).
     1024: {
         "mma_n": 64,
         "blk_k": 128,
