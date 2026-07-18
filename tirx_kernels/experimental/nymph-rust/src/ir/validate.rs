@@ -540,6 +540,11 @@ fn validate_stmt(s: &Stmt) -> R {
             }
             validate_scalar(src)?;
             validate_scalar(src_lane)?;
+            if let Some(l) = static_int(src_lane) {
+                if !(0..32).contains(&l) {
+                    return bail("shuffle_sync src_lane must be in [0, 32)");
+                }
+            }
         }
         Stmt::StoreScalar { dst, value } => {
             validate_slice(dst, "store_scalar dst")?;
@@ -627,6 +632,7 @@ fn validate_stmt(s: &Stmt) -> R {
         Stmt::ClcTryCancel {
             scheduler,
             handle,
+            mbar,
             cta_group,
             ..
         } => {
@@ -636,6 +642,16 @@ fn validate_stmt(s: &Stmt) -> R {
             }
             if handle.space != MemorySpace::Smem {
                 return bail("clc_try_cancel handle must be SMEM");
+            }
+            // try_cancel completes-tx the signalled mbarrier like a TMA landing.
+            if mbar.mbar.kind != MBarKind::Tma {
+                return bail("clc_try_cancel mbar kind must be tma");
+            }
+            // The CLC response written into the handle is a 16B (uint4) cell.
+            let handle_bytes = tensor_numel(&handle.shape)
+                .and_then(|n| n.checked_mul(dtype_size_bytes(handle.dtype)));
+            if handle_bytes.map_or(true, |b| b < 16) {
+                return bail("clc_try_cancel handle must be at least 16 bytes");
             }
             check_cta_group(*cta_group, "clc_try_cancel cta_group")?;
         }
@@ -673,6 +689,10 @@ fn validate_stmt(s: &Stmt) -> R {
 
         Stmt::MBarrierInit { count, stage, .. } => {
             check_positive(*count, "mbarrier_init count")?;
+            // PTX mbarrier v0 layout: the arrival-count field is 20 bits.
+            if *count > (1 << 20) - 1 {
+                return bail("mbarrier_init count must be <= 2^20 - 1");
+            }
             if let Some(v) = stage {
                 validate_scalar(v)?;
             }
@@ -687,9 +707,13 @@ fn validate_stmt(s: &Stmt) -> R {
             if let Some(v) = stage {
                 validate_scalar(v)?;
             }
-            if let Some(v) = phase {
-                validate_scalar(v)?;
-            }
+            // phase is REQUIRED: the phase-less form waits on the CURRENT
+            // parity in the sim while codegen emits a constant 0 — a latent
+            // sim/codegen divergence. Every kernel passes it explicitly.
+            let Some(v) = phase else {
+                return bail("mbarrier_wait phase is required");
+            };
+            validate_scalar(v)?;
         }
         Stmt::MBarrierExpectTx { bytes, stage, .. }
         | Stmt::MBarrierArriveExpectTx { bytes, stage, .. } => {
@@ -709,7 +733,7 @@ fn validate_stmt(s: &Stmt) -> R {
             gmem_shape,
             mbar_stage,
             multicast_cta_mask,
-            cache_hint: _,
+            cache_hint,
             prefetch_tensormap: _,
             cta_group,
         } => {
@@ -744,8 +768,26 @@ fn validate_stmt(s: &Stmt) -> R {
             validate_tma_gmem_shape(gmem_shape, &src.shape, shape, "tma_load")?;
             check_slice_covers(dst, shape, "tma_load dst slice")?;
             check_cta_group(*cta_group, "tma_load cta_group")?;
+            // cta_group=2 + multicast + a shared (peer-referenced) mbar: the
+            // sim's tx accounting completes once per UNIQUE barrier cell, but
+            // hardware completes once per multicast DESTINATION — no single
+            // expect_tx count satisfies both on a shared barrier (the nvfp4
+            // SFB note), so the combination is unmodelable.
+            if *cta_group == 2 && multicast_cta_mask.is_some() && mbar.remote_coord.is_some() {
+                return bail(
+                    "tma_load cta_group=2 multicast with a peer-referenced (shared) \
+                     mbar is not modeled",
+                );
+            }
+            // The L2 eviction hint is passed through to TIRx verbatim; only the
+            // policies the kernels use (and the emitted forms accept) are IR-legal.
+            if let Some(hint) = cache_hint {
+                if hint != "evict_normal" && hint != "evict_first" {
+                    return bail("tma_load cache_hint must be \"evict_normal\" or \"evict_first\"");
+                }
+            }
         }
-        Stmt::CpAsyncBulkS2Cluster { dst, src, .. } => {
+        Stmt::CpAsyncBulkS2Cluster { dst, src, mbar, .. } => {
             validate_slice(src, "cp_async_bulk_s2cluster src")?;
             validate_slice(dst, "cp_async_bulk_s2cluster dst")?;
             if src.tensor.space != MemorySpace::Smem || dst.tensor.space != MemorySpace::Smem {
@@ -753,6 +795,12 @@ fn validate_stmt(s: &Stmt) -> R {
             }
             if dst.tensor.dtype != src.tensor.dtype {
                 return bail("cp_async_bulk_s2cluster src and dst dtype must match");
+            }
+            // The copy targets a PEER CTA's SMEM and signals that peer's mbar —
+            // without a remote_coord the mbar resolves to the issuing CTA
+            // itself, which is not the cross-CTA exchange this op models.
+            if mbar.remote_coord.is_none() {
+                return bail("cp_async_bulk_s2cluster mbar must target a peer CTA (remote_coord)");
             }
         }
         Stmt::GmemAtomicAdd { sem, coords, .. } => {
@@ -1735,14 +1783,21 @@ fn check_role_geometry(
 }
 
 /// Walks 1 (var-defs) + 2 (scope rules), threading the defined-set, current scope,
-/// and per-role wg_sync barrier ownership. `role_token` identifies the enclosing
-/// role-like body (a counter); `next_token` hands out fresh ones.
+/// per-role wg_sync barrier ownership, and the per-role named-barrier id sets.
+/// `role_token` identifies the enclosing role-like body (a counter); `next_token`
+/// hands out fresh ones. The hardware's 16 barriers are ONE resource shared by
+/// wg_sync and named_barrier, so ONE role may not use the same barrier_id for
+/// both classes (its own arrivals would count toward two different rendezvous).
+/// Cross-ROLE id reuse (canon's flash_bwd: a 2-warpgroup named_barrier(1) next
+/// to another warpgroup's private wg_sync(1)) is a deliberate hardware pattern
+/// and stays legal.
 #[allow(clippy::too_many_arguments)]
 fn check_context(
     body: &[Stmt],
     scope: Scope,
     role_token: Option<u32>,
     barriers: &mut HashMap<u32, u32>,
+    named_barriers: &mut HashMap<u32, HashSet<u32>>,
     defined: &mut HashSet<Var>,
     num_warps: u32,
     next_token: &mut u32,
@@ -1768,26 +1823,51 @@ fn check_context(
             Stmt::ClusterBarrierArrive if scope != Scope::Cta => {
                 return bail("cluster_barrier_arrive must be in CTA scope")
             }
+            Stmt::ShuffleSync { .. } if scope == Scope::Single => {
+                // shfl.sync with the full-warp mask inside a single-lane
+                // (elected) region is hardware UB — the mask names lanes that
+                // are not converged there.
+                return bail("shuffle_sync cannot be in single-thread (elected) scope");
+            }
+            Stmt::SetMaxNReg { warpgroup, .. } => {
+                if *warpgroup >= num_warps / 4 {
+                    return bail("setmaxnreg warpgroup must be in [0, kernel num_warps / 4)");
+                }
+            }
             Stmt::WgSync { barrier_id } => {
                 if scope != Scope::Warpgroup {
                     return bail("wg_sync must be in warpgroup scope");
                 }
                 let token = role_token.ok_or_else(|| err("wg_sync must be in a role"))?;
+                if named_barriers
+                    .get(barrier_id)
+                    .is_some_and(|tokens| tokens.contains(&token))
+                {
+                    return bail(
+                        "wg_sync barrier_id cannot alias a named_barrier in the same role",
+                    );
+                }
                 let owner = *barriers.entry(*barrier_id).or_insert(token);
                 if owner != token {
                     return bail("wg_sync barrier_id cannot be shared across roles");
                 }
             }
-            Stmt::NamedBarrier { .. } => {
+            Stmt::NamedBarrier { barrier_id, .. } => {
                 // Cross-warpgroup named barrier: warpgroup scope + a role, but
                 // intentionally SHARED across roles (the rendezvous spans them), so
-                // no single-owner check (unlike wg_sync).
+                // no single-owner check (unlike wg_sync). It still may not alias a
+                // wg_sync id IN THE SAME role — the 16 hardware barriers are one
+                // resource.
                 if scope != Scope::Warpgroup {
                     return bail("named_barrier must be in warpgroup scope");
                 }
-                if role_token.is_none() {
-                    return bail("named_barrier must be in a role");
+                let token = role_token.ok_or_else(|| err("named_barrier must be in a role"))?;
+                if barriers.get(barrier_id) == Some(&token) {
+                    return bail(
+                        "named_barrier barrier_id cannot alias a wg_sync in the same role",
+                    );
                 }
+                named_barriers.entry(*barrier_id).or_default().insert(token);
             }
             Stmt::WarpSync if scope == Scope::Single => {
                 return bail("warp_sync cannot be in single-thread scope");
@@ -1866,6 +1946,7 @@ fn check_context(
                     scope,
                     role_token,
                     barriers,
+                    named_barriers,
                     defined,
                     num_warps,
                     next_token,
@@ -1881,6 +1962,7 @@ fn check_context(
                     scope,
                     role_token,
                     barriers,
+                    named_barriers,
                     defined,
                     num_warps,
                     next_token,
@@ -1895,6 +1977,7 @@ fn check_context(
                     scope,
                     role_token,
                     barriers,
+                    named_barriers,
                     defined,
                     num_warps,
                     next_token,
@@ -1931,6 +2014,7 @@ fn check_context(
                     scope,
                     role_token,
                     barriers,
+                    named_barriers,
                     defined,
                     num_warps,
                     next_token,
@@ -1961,6 +2045,7 @@ fn check_context(
                     nested_scope_init(*warp, *lane, *elected),
                     Some(token),
                     barriers,
+                    named_barriers,
                     defined,
                     num_warps,
                     next_token,
@@ -1983,6 +2068,7 @@ fn check_context(
                     nested_scope_init(*warp, *lane, *elected),
                     Some(token),
                     barriers,
+                    named_barriers,
                     defined,
                     num_warps,
                     next_token,
@@ -2006,6 +2092,7 @@ fn check_context(
                     nested_scope_role(*warp, *warpgroup, *elected),
                     Some(token),
                     barriers,
+                    named_barriers,
                     defined,
                     num_warps,
                     next_token,
@@ -2023,6 +2110,7 @@ fn check_context(
                     scope,
                     role_token,
                     barriers,
+                    named_barriers,
                     defined,
                     num_warps,
                     next_token,
@@ -2255,12 +2343,14 @@ impl Kernel {
         check_smem_pool_bounds(self)?;
         let mut defined = HashSet::new();
         let mut barriers = HashMap::new();
+        let mut named_barriers: HashMap<u32, HashSet<u32>> = HashMap::new();
         let mut next_token = 0u32;
         check_context(
             &self.body,
             Scope::Cta,
             None,
             &mut barriers,
+            &mut named_barriers,
             &mut defined,
             self.num_warps,
             &mut next_token,

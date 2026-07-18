@@ -192,7 +192,7 @@ def test_protocol_deadlock_returns_failed_report():
     with b.role(warp=0, elected=True):
         b.mbarrier_expect_tx(mbar, bytes=8)
         b.mbarrier_arrive(mbar)
-        b.mbarrier_wait(mbar)
+        b.mbarrier_wait(mbar, phase=0)
 
     report = nr.check_protocol(b.build(), include_events=True)
     assert report["status"] == "Failed"

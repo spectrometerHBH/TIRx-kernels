@@ -106,7 +106,10 @@ def test_tma_multicast_writes_each_cta_smem():
     smem = smem_tensor(b, shape=(4,), byte_offset=0)
     reg = reg_tensor(b)
     mbar = b.mbar(kind=nr.MBarKind.TMA)
-    even_mbar = b.mbar_ref(mbar, remote_coord=0)
+    # The issuer is CTA0 (the cta_eq guard below), so its own-cell reference
+    # resolves to the same cell a peer-reference to CTA0 would — and keeps the
+    # kernel inside the cta_group=2 multicast rules (no shared peer mbar).
+    even_mbar = b.mbar_ref(mbar)
 
     with b.kernel_init(warp=0):
         b.mbarrier_init(mbar, count=1)

@@ -43,9 +43,18 @@ fn execute_shuffle_sync<'a, 'k>(
     }
     let mut out = Vec::with_capacity(ctx.cohort.len());
     for (i, t) in ctx.cohort.iter().enumerate() {
-        let sl = lanes[i].max(0) as usize;
+        // The shfl source lane must address the issuing warp's own 32 lanes —
+        // an out-of-range lane is hardware UB (the old code silently clamped a
+        // negative lane to 0 and computed the wrong broadcast).
+        let sl = lanes[i];
+        if !(0..32).contains(&sl) {
+            return Err(InterpreterError::new(
+                "shuffle_sync_lane_range",
+                "shuffle_sync source lane is outside [0, 32)",
+            ));
+        }
         let v = by_lane
-            .get(&(t.cta_id, t.warp_id, sl))
+            .get(&(t.cta_id, t.warp_id, sl as usize))
             .copied()
             .ok_or_else(|| {
                 InterpreterError::new(

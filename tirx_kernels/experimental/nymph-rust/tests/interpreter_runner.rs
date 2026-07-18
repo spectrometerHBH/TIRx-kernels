@@ -372,10 +372,10 @@ fn tma_multicast_group2_mbar_targets_are_deduplicated() {
         stages: 1,
         arrive_count: None,
     });
-    let even_mbar = MBarRef {
-        mbar: mbar.clone(),
-        remote_coord: Some(ScalarValue::Int(0)),
-    };
+    // The issuer is CTA0 (the cta_eq(0) guard below), so its own-cell reference
+    // resolves to the same cell a peer-reference to CTA0 would — and keeps the
+    // kernel inside the cta_group=2 multicast rules (no shared peer mbar).
+    let even_mbar = mbar_ref(&mbar);
     let kernel = Kernel {
         name: "tma_multicast_cta_group2".into(),
         args: vec![source.clone()],
@@ -536,7 +536,9 @@ fn mbarrier_wait_success_and_blocked_frontier_are_rust_internal() {
                     Stmt::MBarrierWait {
                         mbar: mbar_ref(&expect_tx),
                         stage: None,
-                        phase: None,
+                        // The wait never completes (the tx is never completed):
+                        // phase 0 blocks on the post-init parity forever.
+                        phase: Some(ScalarValue::Int(0)),
                     },
                 ],
                 warp: Some(0),
@@ -956,4 +958,276 @@ fn tcgen05_commit_success_paths_update_rust_internal_mbar_cells() {
     assert_eq!(trace_status(&multicast_result), ProtocolStatus::Passed);
     assert!(!has_mbar_arrive_for_cta(&multicast_result, 0));
     assert!(has_mbar_arrive_for_cta(&multicast_result, 1));
+}
+
+// ---- fail-closed: shuffle lane range, s2cluster, in-place MMA accum ---------
+
+/// A warp-scope shuffle broadcast from a runtime-computed lane: a negative lane
+/// used to be silently clamped to 0 (wrong broadcast); it must now fail closed.
+#[test]
+fn shuffle_sync_lane_range_fail_closed() {
+    let mk = |src_lane: ScalarValue| Kernel {
+        name: "shuffle_lane".into(),
+        args: vec![],
+        body: vec![Stmt::Role {
+            body: vec![
+                Stmt::ScalarDef {
+                    var: var(700, VarBinding::Scalar),
+                    initial: ScalarInitial::Value(ScalarValue::Int(7)),
+                },
+                Stmt::ShuffleSync {
+                    var: var(701, VarBinding::Scalar),
+                    src: ScalarValue::Var(var(700, VarBinding::Scalar)),
+                    src_lane,
+                },
+            ],
+            warp: Some(0),
+            warpgroup: None,
+            elected: false,
+            maxnreg: None,
+        }],
+        num_warps: 4,
+        smem_size_bytes: 0,
+        launch_shape: vec![1],
+        cluster_shape: vec![1],
+        smem_pool: false,
+    };
+    let negative = run_value_kernel(
+        &mk(ScalarValue::expr(
+            ScalarOp::Sub,
+            vec![ScalarValue::Int(0), ScalarValue::Int(1)],
+        )),
+        HashMap::new(),
+    );
+    assert!(!negative.completed);
+    assert_eq!(
+        negative.failure_reason.as_deref(),
+        Some("shuffle_sync_lane_range")
+    );
+    let over = run_value_kernel(
+        &mk(ScalarValue::expr(
+            ScalarOp::Add,
+            vec![ScalarValue::Int(31), ScalarValue::Int(1)],
+        )),
+        HashMap::new(),
+    );
+    assert!(!over.completed);
+    assert_eq!(
+        over.failure_reason.as_deref(),
+        Some("shuffle_sync_lane_range")
+    );
+    // A uniform broadcast from lane 0 is value-preserving and still runs.
+    let good = run_value_kernel(&mk(ScalarValue::Int(0)), HashMap::new());
+    assert!(good.completed, "failed: {:?}", good.failure_reason);
+}
+
+/// cp.async.bulk.shared::cluster: 16B-sector byte count, byte count == src tile,
+/// and a peer (not self) destination — all fail closed at execution.
+#[test]
+fn s2cluster_bytes_and_self_target_fail_closed() {
+    let src = smem_tensor(710, DType::F32, vec![4], 0);
+    let dst = smem_tensor(711, DType::F32, vec![4], 64);
+    let mbar = Arc::new(MBar {
+        id: 710,
+        kind: MBarKind::Tma,
+        stages: 1,
+        arrive_count: None,
+    });
+    let peer = ScalarValue::expr(
+        ScalarOp::Sub,
+        vec![
+            ScalarValue::Int(1),
+            ScalarValue::Scope(ScopeValueKind::CtaidInCluster),
+        ],
+    );
+    let mk = |bytes: i64, src_shape: Vec<ScalarValue>, remote: ScalarValue| {
+        let mut src_sl = full_slice(src.clone());
+        src_sl.shape = src_shape;
+        Kernel {
+            name: "s2cluster_bad".into(),
+            args: vec![],
+            body: vec![
+                Stmt::MBarDef { mbar: mbar.clone() },
+                kernel_init(vec![Stmt::MBarrierInit {
+                    mbar: mbar_ref(&mbar),
+                    count: 1,
+                    stage: None,
+                }]),
+                Stmt::Role {
+                    body: vec![Stmt::CpAsyncBulkS2Cluster {
+                        dst: full_slice(dst.clone()),
+                        src: src_sl,
+                        mbar: MBarRef {
+                            mbar: mbar.clone(),
+                            remote_coord: Some(remote),
+                        },
+                        bytes: ScalarValue::Int(bytes),
+                    }],
+                    warp: Some(0),
+                    warpgroup: None,
+                    elected: false,
+                    maxnreg: None,
+                },
+            ],
+            num_warps: 4,
+            smem_size_bytes: 256,
+            launch_shape: vec![2],
+            cluster_shape: vec![2],
+            smem_pool: false,
+        }
+    };
+    let one = |v: i64| vec![ScalarValue::Int(v)];
+    // 8 bytes: not a whole number of 16B sectors.
+    let r = run_value_kernel(&mk(8, one(2), peer.clone()), HashMap::new());
+    assert!(!r.completed);
+    assert_eq!(r.failure_reason.as_deref(), Some("s2cluster_bytes"));
+    // 16 bytes against an 8-byte (2 x f32) src tile: extent mismatch.
+    let r = run_value_kernel(&mk(16, one(2), peer.clone()), HashMap::new());
+    assert!(!r.completed);
+    assert_eq!(r.failure_reason.as_deref(), Some("s2cluster_bytes"));
+    // A self-targeted "exchange": the dst CTA is the issuing CTA itself.
+    let r = run_value_kernel(
+        &mk(
+            16,
+            one(4),
+            ScalarValue::Scope(ScopeValueKind::CtaidInCluster),
+        ),
+        HashMap::new(),
+    );
+    assert!(!r.completed);
+    assert_eq!(r.failure_reason.as_deref(), Some("s2cluster_self_target"));
+}
+
+/// The in-place MMA path reads the accumulator's current cells when accum=true;
+/// like the fallback path (missing_tmem_value), it must refuse unwritten cells
+/// instead of silently accumulating from zeros.
+#[test]
+fn tcgen05_mma_inplace_accum_requires_written_accumulator() {
+    let a_g = gmem_tensor(720, DType::F16, vec![128, 16]);
+    let b_g = gmem_tensor(721, DType::F16, vec![16, 16]);
+    let a_s = smem_tensor(722, DType::F16, vec![128, 16], 0);
+    let b_s = smem_tensor(723, DType::F16, vec![16, 16], 4096);
+    let acc = tmem_tensor(724, 0);
+    let mbar = Arc::new(MBar {
+        id: 720,
+        kind: MBarKind::Tma,
+        stages: 1,
+        arrive_count: None,
+    });
+    let mma = |accum: bool| Stmt::Tcgen05Mma {
+        dst: full_slice(acc.clone()),
+        a: full_slice(a_s.clone()),
+        b: full_slice(b_s.clone()),
+        m: 128,
+        n: 16,
+        k: 16,
+        accum,
+        trans_a: false,
+        trans_b: false,
+        cta_group: 1,
+        sfa: None,
+        sfb: None,
+        sf_byte: 0,
+        sf_e4m3: false,
+        sf_block: 0,
+        a_fp4: false,
+        b_fp4: false,
+        lane_align: 0,
+    };
+    let mk = |first_overwrite: bool| {
+        let mut role_body = vec![
+            Stmt::MBarrierArriveExpectTx {
+                mbar: mbar_ref(&mbar),
+                bytes: 4608,
+                stage: None,
+            },
+            Stmt::TmaLoad {
+                dst: full_slice(a_s.clone()),
+                src: a_g.clone(),
+                mbar: mbar_ref(&mbar),
+                bytes: ScalarValue::Int(4096),
+                coords: vec![ScalarValue::Int(0), ScalarValue::Int(0)],
+                shape: vec![128, 16],
+                gmem_shape: None,
+                mbar_stage: None,
+                multicast_cta_mask: None,
+                cache_hint: None,
+                prefetch_tensormap: true,
+                cta_group: 1,
+            },
+            Stmt::TmaLoad {
+                dst: full_slice(b_s.clone()),
+                src: b_g.clone(),
+                mbar: mbar_ref(&mbar),
+                bytes: ScalarValue::Int(512),
+                coords: vec![ScalarValue::Int(0), ScalarValue::Int(0)],
+                shape: vec![16, 16],
+                gmem_shape: None,
+                mbar_stage: None,
+                multicast_cta_mask: None,
+                cache_hint: None,
+                prefetch_tensormap: true,
+                cta_group: 1,
+            },
+            Stmt::MBarrierWait {
+                mbar: mbar_ref(&mbar),
+                stage: None,
+                phase: Some(ScalarValue::Int(0)),
+            },
+        ];
+        if first_overwrite {
+            role_body.push(mma(false));
+        }
+        role_body.push(mma(true));
+        Kernel {
+            name: "mma_inplace_accum".into(),
+            args: vec![a_g.clone(), b_g.clone()],
+            body: vec![
+                Stmt::MBarDef { mbar: mbar.clone() },
+                kernel_init(vec![
+                    Stmt::TmemAlloc {
+                        tensor: acc.clone(),
+                        n_cols: 32,
+                        cta_group: 1,
+                    },
+                    Stmt::MBarrierInit {
+                        mbar: mbar_ref(&mbar),
+                        count: 1,
+                        stage: None,
+                    },
+                ]),
+                Stmt::Role {
+                    body: role_body,
+                    warp: Some(0),
+                    warpgroup: None,
+                    elected: false,
+                    maxnreg: None,
+                },
+                kernel_finalize(vec![Stmt::TmemDealloc {
+                    tensor: acc.clone(),
+                    n_cols: 32,
+                    cta_group: 1,
+                }]),
+            ],
+            num_warps: 4,
+            smem_size_bytes: 4608,
+            launch_shape: vec![1],
+            cluster_shape: vec![1],
+            smem_pool: false,
+        }
+    };
+    let inputs = HashMap::from([
+        (a_g.id, ValueArray1::zeros(DType::F16, 128 * 16)),
+        (b_g.id, ValueArray1::zeros(DType::F16, 16 * 16)),
+    ]);
+    // accum=true on a never-written accumulator: fail closed.
+    let missing = run_value_kernel(&mk(false), inputs.clone());
+    assert!(!missing.completed);
+    assert_eq!(
+        missing.failure_reason.as_deref(),
+        Some("missing_tmem_value")
+    );
+    // accum=false first (the prologue MMA) writes the cells; accum then runs.
+    let ok = run_value_kernel(&mk(true), inputs);
+    assert!(ok.completed, "failed: {:?}", ok.failure_reason);
 }

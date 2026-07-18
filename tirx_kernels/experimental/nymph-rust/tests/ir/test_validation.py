@@ -295,6 +295,162 @@ def test_rejects_tcgen05_cp_e4m3_dst_not_block_multiple():
         make([n.Tcgen05Cp(dst=dst, src=src)])
 
 
+# ---- shuffle_sync ------------------------------------------------------------
+
+
+def test_rejects_shuffle_sync_static_lane_out_of_range():
+    for bad_lane in (-1, 32):
+        v = n.Var(binding=n.VarBinding.SCALAR, dtype=n.ScalarDType.I32)
+        with pytest.raises(ValueError, match=r"src_lane must be in \[0, 32\)"):
+            make([n.ShuffleSync(var=v, src=5, src_lane=bad_lane)])
+
+
+def test_rejects_shuffle_sync_in_elected_scope():
+    v = n.Var(binding=n.VarBinding.SCALAR, dtype=n.ScalarDType.I32)
+    body = [n.Role(body=(n.ShuffleSync(var=v, src=5, src_lane=0),), warp=0, elected=True)]
+    with pytest.raises(ValueError, match="shuffle_sync cannot be in single-thread"):
+        make(body)
+
+
+def test_accepts_shuffle_sync_in_warp_scope():
+    v = n.Var(binding=n.VarBinding.SCALAR, dtype=n.ScalarDType.I32)
+    make([n.Role(body=(n.ShuffleSync(var=v, src=5, src_lane=0),), warp=0)])
+
+
+# ---- mbarrier ----------------------------------------------------------------
+
+
+def test_rejects_mbarrier_wait_without_phase():
+    mbar = n.MBar(kind=n.MBarKind.TMA)
+    with pytest.raises(ValueError, match="mbarrier_wait phase is required"):
+        make([n.MBarrierWait(mbar)])
+
+
+def test_rejects_mbarrier_init_count_over_ptx_layout():
+    mbar = n.MBar(kind=n.MBarKind.TMA)
+    with pytest.raises(ValueError, match=r"count must be <= 2\^20 - 1"):
+        make([n.MBarrierInit(mbar, count=1 << 20)])
+    make([n.MBarrierInit(mbar, count=(1 << 20) - 1)])
+
+
+# ---- clc_try_cancel ----------------------------------------------------------
+
+
+def _clc_scheduler():
+    return n.Scheduler(space=n.TaskSpace(grid=(4,), fields=("task",)), policy="custom")
+
+
+def test_rejects_clc_try_cancel_mbar_kind_and_handle_size():
+    sched = _clc_scheduler()
+    bad_mbar = n.MBar(kind=n.MBarKind.THREAD)
+    with pytest.raises(ValueError, match="clc_try_cancel mbar kind must be tma"):
+        make([n.ClcTryCancel(sched, smem([4], dtype=n.DType.U32), bad_mbar)])
+    ok_mbar = n.MBar(kind=n.MBarKind.TMA)
+    with pytest.raises(ValueError, match="handle must be at least 16 bytes"):
+        make([n.ClcTryCancel(sched, smem([2], dtype=n.DType.U32), ok_mbar)])
+    # A well-formed one (inside the scheduler_impl the op belongs to) validates.
+    make(
+        [
+            n.SchedulerImpl(
+                scheduler=sched,
+                body=(n.ClcTryCancel(sched, smem([4], dtype=n.DType.U32), ok_mbar),),
+            )
+        ]
+    )
+
+
+# ---- setmaxnreg --------------------------------------------------------------
+
+
+def test_rejects_setmaxnreg_warpgroup_out_of_range():
+    with pytest.raises(
+        ValueError, match=r"setmaxnreg warpgroup must be in \[0, kernel num_warps / 4\)"
+    ):
+        make([n.SetMaxNReg(1, 56)], num_warps=4)
+    make([n.SetMaxNReg(0, 56)], num_warps=4)
+
+
+# ---- tma_load ----------------------------------------------------------------
+
+
+def _tma_load(hint, **overrides):
+    kw = dict(
+        dst=smem([128, 64])[:, :],
+        src=gmem([1024, 1024]),
+        mbar=n.MBar(kind=n.MBarKind.TMA),
+        bytes=16384,
+        coords=(0, 0),
+        shape=[128, 64],
+        cache_hint=hint,
+    )
+    kw.update(overrides)
+    return n.TmaLoad(**kw)
+
+
+def test_rejects_tma_load_bad_cache_hint():
+    with pytest.raises(ValueError, match="cache_hint"):
+        make([_tma_load("evict_last")])
+    make([_tma_load("evict_normal")])
+    make([_tma_load("evict_first")])
+
+
+def test_rejects_tma_load_group2_multicast_shared_mbar():
+    shared = n.MBarRef(n.MBar(kind=n.MBarKind.TMA), remote_coord=0)
+    with pytest.raises(ValueError, match="not modeled"):
+        make(
+            [_tma_load(None, mbar=shared, multicast_cta_mask=0b11, cta_group=2)],
+            launch=(2,),
+            cluster=(2,),
+        )
+
+
+# ---- cp_async_bulk_s2cluster -------------------------------------------------
+
+
+def test_rejects_s2cluster_without_remote_coord():
+    with pytest.raises(ValueError, match="must target a peer CTA"):
+        make(
+            [
+                n.CpAsyncBulkS2Cluster(
+                    dst=smem([4], dtype=n.DType.F32)[:],
+                    src=smem([4], dtype=n.DType.F32)[:],
+                    mbar=n.MBar(kind=n.MBarKind.TMA),
+                    bytes=16,
+                )
+            ]
+        )
+
+
+# ---- named_barrier vs wg_sync barrier ids ------------------------------------
+
+
+def test_rejects_named_barrier_aliasing_wg_sync():
+    for first, second in [
+        (n.WgSync(barrier_id=3), n.NamedBarrier(barrier_id=3, num_warps=8)),
+        (n.NamedBarrier(barrier_id=3, num_warps=8), n.WgSync(barrier_id=3)),
+    ]:
+        with pytest.raises(ValueError, match="cannot alias"):
+            make([n.Role(body=(first, second), warpgroup=0)], num_warps=8)
+
+
+def test_accepts_distinct_named_and_wg_barrier_ids():
+    body = (n.NamedBarrier(barrier_id=1, num_warps=8), n.WgSync(barrier_id=2))
+    make([n.Role(body=body, warpgroup=0)], num_warps=8)
+
+
+def test_accepts_cross_role_named_and_wg_barrier_id_reuse():
+    # Canon's flash_bwd pattern: wg0+wg1 rendezvous on named_barrier(1) while
+    # wg2 keeps its private wg_sync(1) — cross-role id reuse is deliberate.
+    make(
+        [
+            n.Role(body=(n.NamedBarrier(barrier_id=1, num_warps=8),), warpgroup=0),
+            n.Role(body=(n.NamedBarrier(barrier_id=1, num_warps=8),), warpgroup=1),
+            n.Role(body=(n.WgSync(barrier_id=1),), warpgroup=2),
+        ],
+        num_warps=12,
+    )
+
+
 # ---- tma ------------------------------------------------------------------
 
 

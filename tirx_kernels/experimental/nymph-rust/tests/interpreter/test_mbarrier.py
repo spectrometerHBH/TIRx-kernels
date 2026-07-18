@@ -10,7 +10,7 @@ def test_mbarrier_wait_runtime_failures_are_closed():
     with b.role(warp=0, elected=True):
         b.mbarrier_expect_tx(expect_tx, bytes=8)
         b.mbarrier_arrive(expect_tx)
-        b.mbarrier_wait(expect_tx)
+        b.mbarrier_wait(expect_tx, phase=0)
 
     with expect_runtime_error("deadlock"):
         run(b.build())

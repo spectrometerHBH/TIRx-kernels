@@ -155,6 +155,13 @@ fn execute_cp_async_bulk_s2cluster<'a, 'k>(
             "cp_async_bulk_s2cluster bytes must be positive",
         ));
     }
+    // cp.async.bulk moves whole 16B sectors.
+    if byte_count % 16 != 0 {
+        return Err(InterpreterError::new(
+            "s2cluster_bytes",
+            "cp_async_bulk_s2cluster bytes must be a multiple of 16",
+        ));
+    }
     if src.tensor.space != MemorySpace::Smem || dst.tensor.space != MemorySpace::Smem {
         return Err(InterpreterError::new(
             "s2cluster_space",
@@ -162,14 +169,29 @@ fn execute_cp_async_bulk_s2cluster<'a, 'k>(
         ));
     }
     // The peer (destination) CTA is the mbar's target — keeps the SMEM write and the
-    // completion signal on the same CTA.
+    // completion signal on the same CTA. It must be a DIFFERENT CTA: this op is the
+    // cross-CTA exchange, not a local copy.
     let target = uniform_mbar_target(ctx, mbar, None)?;
     let peer_in_cluster = target.identity.ctaid_in_cluster;
+    if peer_in_cluster == ctx.stream.ctaid_in_cluster {
+        return Err(InterpreterError::new(
+            "s2cluster_self_target",
+            "cp_async_bulk_s2cluster dst must be a different (peer) CTA",
+        ));
+    }
     let peer_global = ctx.global_cta_id(peer_in_cluster);
     let src_offsets = uniform_tuple(ctx, &src.offsets, "s2cluster src offsets")?;
     let dst_offsets = uniform_tuple(ctx, &dst.offsets, "s2cluster dst offsets")?;
     let src_shape = uniform_tuple(ctx, &src.shape, "s2cluster src shape")?;
     let dst_shape = uniform_tuple(ctx, &dst.shape, "s2cluster dst shape")?;
+    // The byte count must match the src tile exactly — a mismatch silently copies
+    // the wrong extent while the mbar's expect_tx counts something else.
+    if byte_count != numel(&src_shape) as i64 * dtype_bytes(src.tensor.dtype) {
+        return Err(InterpreterError::new(
+            "s2cluster_bytes",
+            "cp_async_bulk_s2cluster bytes must match the src tile",
+        ));
+    }
 
     if ctx.trace_mode() {
         let scope = ctx.access_scope();
