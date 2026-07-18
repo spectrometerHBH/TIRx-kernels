@@ -31,7 +31,7 @@ def build_bootstrap_gemm(M=256, N=128, K=64, dtype=DType.F16):
     accum = TmemBand(col0=0, dtype=DType.F32)
     accum_frag = k.tensor(space=MemorySpace.REG, dtype=DType.F32, shape=(8,))
     out_frag = k.tensor(space=MemorySpace.REG, dtype=dtype, shape=(8,))
-    smem_full = k.mbar(kind=MBarKind.TMA, stages=1)
+    smem_full = k.mbar(kind=MBarKind.TMA, stages=1, leader_routed=True)
     mma_done = k.mbar(kind=MBarKind.TCGEN05, stages=1)
     peer_full = k.mbar_ref(smem_full, remote_coord=1)
     cr = k.ctaid_in_cluster()

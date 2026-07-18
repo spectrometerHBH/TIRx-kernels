@@ -332,7 +332,9 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
     _frag_f32_width = r.epi_n if r.overlap else NOL
     _frag_out_width = r.epi_n if r.overlap else r.mma_n
 
-    smem_full = k.mbar(kind=MBarKind.TMA, stages=r.pipe_depth)
+    # leader_routed: both CTAs' A/B TMA completions signal the LEADER CTA's copy
+    # (the canonical cta_group=2 pattern replacing the illegal peer try_wait).
+    smem_full = k.mbar(kind=MBarKind.TMA, stages=r.pipe_depth, leader_routed=True)
     smem_empty = k.mbar(kind=MBarKind.TCGEN05, stages=r.pipe_depth)
     tmem_full = k.mbar(kind=MBarKind.TCGEN05, stages=r.tmem_slots)
     tmem_empty = k.mbar(kind=MBarKind.THREAD, stages=r.tmem_slots)

@@ -240,17 +240,17 @@ struct Ctx {
     /// in the nymph IR (instruction granularity); the wide read/cast/store band
     /// needs it sized to the full column band. id -> width.
     reg_widths: HashMap<u32, usize>,
-    /// mbar ids of the TMA-load completion barriers (`smem_full`, `sf_full`, ...) in a
-    /// cta_group=2 cluster kernel — every TMA barrier carrying a peer reference. In
-    /// cluster mode the canonical pattern routes BOTH CTAs' TMA completions to the
-    /// LEADER CTA's barrier (a `map_shared_rank(.., 0)` view used uniformly by both
-    /// CTAs): each CTA's `Tx.copy_async` signals it, the leader (cbx==0) issues one
-    /// `arrive.expect_tx` for the full cluster byte count, and the leader's MMA waits
-    /// its own LOCAL barrier (which both CTAs fill). This replaces the illegal peer
-    /// `try_wait` AND is the prerequisite for multicast TMA loads (the per-destination
-    /// transaction count of a `multicast::cluster` copy must land on the single leader
-    /// barrier, accounted via the `* cta_group` factor in the leader expect_tx). Empty
-    /// when not cluster mode / no cluster TMA barrier.
+    /// mbar ids of the TMA-load completion barriers (`smem_full`, `sf_full`, ...)
+    /// flagged `leader_routed` by the IR. In cluster mode the canonical pattern
+    /// routes BOTH CTAs' TMA completions to the LEADER CTA's barrier (a
+    /// `map_shared_rank(.., 0)` view used uniformly by both CTAs): each CTA's
+    /// `Tx.copy_async` signals it, the leader (cbx==0) issues one
+    /// `arrive.expect_tx` for the full cluster byte count, and the leader's MMA
+    /// waits its own LOCAL barrier (which both CTAs fill). This replaces the
+    /// illegal peer `try_wait` AND is the prerequisite for multicast TMA loads
+    /// (the per-destination transaction count of a `multicast::cluster` copy
+    /// must land on the single leader barrier, accounted via the `* cta_group`
+    /// factor in the leader expect_tx). Empty when no mbar is flagged.
     tma_leader_mbars: std::collections::HashSet<u32>,
     /// Number of launched clusters (`launch_cta_count / cta_group`) — the grid stride
     /// for a `ForEachTask` grid-stride scheduler loop.
@@ -262,6 +262,13 @@ struct Ctx {
     /// Usage-derived scale-factor tensor ids (see `collect_sf_ids`) — the ONLY
     /// authority on "is this tensor a scale factor"; dtype is never consulted.
     sf: SfIds,
+    /// Var ids provably non-negative (see `collect_nonneg_vars`) — the ONLY
+    /// authority `is_nonneg` consults for `ScalarValue::Var`: ForLoop induction
+    /// vars with a non-negative-literal start and positive-literal step, plus
+    /// scalar vars whose every definition is provably non-negative (fixpoint).
+    /// A bare `Var(_) => true` would silently strength-reduce a `%`/`//` on a
+    /// sentinel-negative scalar (e.g. a drained-scheduler `task_id == -1`).
+    nonneg_vars: std::collections::HashSet<u32>,
 }
 
 /// One NVFP4 e4m3 scale-factor TMEM view (`SFA_tmem`/`SFB_tmem`). The IR's SF
@@ -1124,37 +1131,28 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
     // cta_group from the cluster size (the bootstrap is cta_group=2).
     let cta_group = k.cluster_shape.iter().product::<usize>().max(1) as u8;
 
-    // The TMA-load completion barriers to leader-route in cluster (cta_group=2) mode:
-    // EVERY mbar that a `TmaLoad` signals AND that carries a peer reference (the IR's
-    // `smem_full` for A/B, `sf_full` for the scales, ...). Routing both CTAs' TMA to the
-    // leader's copy of each barrier (and waiting only the local copy) is the legal
-    // substitute for the peer wait, AND the prerequisite for multicast loads — a
-    // `multicast::cluster` copy's per-destination transaction count must accumulate on
-    // the single leader barrier (the `* cta_group` leader expect_tx accounts for it).
-    // Only the barriers with a peer reference are routed; single-CTA TMA barriers stay
-    // local. Only populated when cta_group > 1.
+    // The TMA-load completion barriers to leader-route, from the IR's explicit
+    // `MBar::leader_routed` flag (validate has already checked each carries a
+    // peer reference and is only used by TmaLoad/expect_tx). Routing both CTAs'
+    // TMA to the leader's copy of each barrier (and waiting only the local
+    // copy) is the legal substitute for the peer wait, AND the prerequisite for
+    // multicast loads — a `multicast::cluster` copy's per-destination
+    // transaction count must accumulate on the single leader barrier (the
+    // `* cta_group` leader expect_tx accounts for it).
     let mut tma_leader_mbars: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    if cta_group > 1 {
-        fn find_tma_mbars(stmts: &[Stmt], out: &mut std::collections::HashSet<u32>) {
-            for s in stmts {
-                if let Stmt::TmaLoad { mbar, .. } = s {
-                    out.insert(mbar.mbar.id);
-                }
-                for body in s.child_bodies() {
-                    find_tma_mbars(body, out);
+    fn find_leader_mbars(stmts: &[Stmt], out: &mut std::collections::HashSet<u32>) {
+        for s in stmts {
+            if let Stmt::MBarDef { mbar } = s {
+                if mbar.leader_routed {
+                    out.insert(mbar.id);
                 }
             }
-        }
-        let mut tma_mbars = std::collections::HashSet::new();
-        find_tma_mbars(&k.body, &mut tma_mbars);
-        // Only leader-route a barrier that actually has a peer reference (a true cluster
-        // TMA barrier); a single-CTA TMA barrier stays local.
-        for id in tma_mbars {
-            if peer_names.contains_key(&id) {
-                tma_leader_mbars.insert(id);
+            for body in s.child_bodies() {
+                find_leader_mbars(body, out);
             }
         }
     }
+    find_leader_mbars(&k.body, &mut tma_leader_mbars);
 
     // The single TMEM view buffer spans every allocated column band:
     // `max(base_col + n_cols)` over the kernel's TmemAllocs.
@@ -1255,6 +1253,7 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
         num_clusters: (k.launch_cta_count() / (cta_group as usize).max(1)).max(1),
         sf_views,
         sf,
+        nonneg_vars: collect_nonneg_vars(k),
     })
 }
 
@@ -1478,28 +1477,140 @@ fn binop_symbol(op: ScalarOp) -> Option<&'static str> {
     })
 }
 
-/// Conservatively decide whether a scalar is provably `>= 0`. Used to rewrite
-/// `x % 2` into `x & 1` only when the two are equal (true exactly for non-negative
-/// `x`). The pipeline-phase parities (`occ % 2`, `(occ + 1) % 2`, ring/slot indices)
-/// are all built from non-negative loop counters, `FloorDiv`s, and `Mod`s, so they
-/// qualify; the only negative scalar in the kernel (`task_id`/`bcast_id == -1`
-/// sentinel) is never an operand of a `% 2`.
-fn is_nonneg(sv: &ScalarValue) -> bool {
+/// Conservatively decide whether a scalar is provably `>= 0`, given the
+/// provably-nonnegative var ids. Used to rewrite `x % d` / `x // d` into
+/// `T.truncmod`/`T.truncdiv` for a non-pow2 positive-literal `d` — only valid
+/// when trunc (toward 0) and floor (toward -inf) agree, i.e. for non-negative
+/// `x`. (The pow2 bit-op rewrite needs no sign assumption: floormod/floordiv
+/// by `2^k` IS `& (2^k-1)` / `>> k` in two's complement, negative dividends
+/// included — see `emit_expr`.)
+///
+/// The pipeline-phase parities (`occ % 2`, `(occ + 1) % 2`, ring/slot indices)
+/// are all built from non-negative loop counters, scope ids, `FloorDiv`s, and
+/// `Mod`s, so they qualify; a sentinel-negative scalar (the scheduler's
+/// `task_id`/`bcast_id == -1`) is never proven non-negative: scope ids are
+/// hardware-non-negative, but a `Var` qualifies ONLY via `nonneg_vars` — a
+/// ForLoop induction variable with a non-negative-literal start and
+/// positive-literal step, or a scalar whose every definition is provably
+/// non-negative (a mailbox/`ClcQueryCancel` load is never assumed so).
+fn is_nonneg(sv: &ScalarValue, nonneg_vars: &HashSet<u32>) -> bool {
     match sv {
         ScalarValue::Int(i) => *i >= 0,
-        // Loop counters and scope ids (lane/warp/wg/cta/tid) are all >= 0.
-        ScalarValue::Var(_) | ScalarValue::Scope(_) => true,
+        // Scope ids (lane/warp/wg/cta/tid) are hardware non-negative. A var is
+        // non-negative only when the analysis proved it (loop induction vars
+        // with non-negative literal bounds; scalars with non-negative defs).
+        ScalarValue::Var(v) => nonneg_vars.contains(&v.id.0),
+        ScalarValue::Scope(_) => true,
         ScalarValue::Expr(e) => match e.op {
             // FloorDiv / Mod by a positive divisor of a non-negative dividend is
             // non-negative; Mul/Add of non-negatives stay non-negative.
-            ScalarOp::FloorDiv | ScalarOp::Mod => is_nonneg(&e.args[0]) && is_nonneg(&e.args[1]),
+            ScalarOp::FloorDiv | ScalarOp::Mod => {
+                is_nonneg(&e.args[0], nonneg_vars) && is_nonneg(&e.args[1], nonneg_vars)
+            }
             ScalarOp::Mul | ScalarOp::Add | ScalarOp::Min | ScalarOp::Max => {
-                e.args.iter().all(is_nonneg)
+                e.args.iter().all(|a| is_nonneg(a, nonneg_vars))
             }
             // Anything else (Sub, Neg, Select, comparisons, ...) is not assumed >= 0.
             _ => false,
         },
     }
+}
+
+/// Collect the provably-nonnegative var ids `is_nonneg` consults (see it).
+///   * ForLoop induction vars with a non-negative-literal start and a
+///     positive-literal step (a rolled `T.serial` counter runs start, start+step,
+///     ... and stays non-negative);
+///   * scalar vars whose EVERY definition is provably non-negative: the
+///     `ScalarDef` initial (a `ScalarInitial::Tensor` mailbox load is never
+///     assumed non-negative — it can carry the -1 sentinel), every
+///     `ScalarStore` source, and every `ShuffleSync` source. Seeded
+///     optimistically, then dropped to a fixpoint (a ring counter defined
+///     through its own non-negative update chain converges). A
+///     `ClcQueryCancel` result is never non-negative (0xFFFFFFFF -> -1 on drain).
+fn collect_nonneg_vars(k: &Kernel) -> HashSet<u32> {
+    let mut nonneg: HashSet<u32> = HashSet::new();
+    fn seed_loop_vars(stmts: &[Stmt], nonneg: &mut HashSet<u32>) {
+        for s in stmts {
+            if let Stmt::ForLoop {
+                var, start, step, ..
+            } = s
+            {
+                if as_int(start).is_some_and(|v| v >= 0) && as_int(step).is_some_and(|v| v >= 1) {
+                    nonneg.insert(var.id.0);
+                }
+            }
+            for body in s.child_bodies() {
+                seed_loop_vars(body, nonneg);
+            }
+        }
+    }
+    seed_loop_vars(&k.body, &mut nonneg);
+
+    // Gather every scalar-var definition.
+    #[derive(Default)]
+    struct ScalarDefs {
+        /// Def exprs that must ALL be non-negative for the var to qualify.
+        exprs: Vec<ScalarValue>,
+        /// A definition that can never be proven non-negative (mailbox load /
+        /// CLC query) — the var is excluded outright.
+        poisoned: bool,
+    }
+    fn collect_scalar_defs(stmts: &[Stmt], defs: &mut HashMap<u32, ScalarDefs>) {
+        for s in stmts {
+            match s {
+                Stmt::ScalarDef { var, initial } => {
+                    let e = defs.entry(var.id.0).or_default();
+                    match initial {
+                        ScalarInitial::Value(v) => e.exprs.push(v.clone()),
+                        ScalarInitial::Tensor(_) => e.poisoned = true,
+                    }
+                }
+                Stmt::ScalarStore { var, value } => {
+                    defs.entry(var.id.0).or_default().exprs.push(value.clone());
+                }
+                Stmt::ShuffleSync { var, src, .. } => {
+                    defs.entry(var.id.0).or_default().exprs.push(src.clone());
+                }
+                Stmt::ClcQueryCancel { var, .. } => {
+                    defs.entry(var.id.0).or_default().poisoned = true;
+                }
+                _ => {}
+            }
+            for body in s.child_bodies() {
+                collect_scalar_defs(body, defs);
+            }
+        }
+    }
+    let mut defs: HashMap<u32, ScalarDefs> = HashMap::new();
+    collect_scalar_defs(&k.body, &mut defs);
+
+    // Fixpoint: optimistically assume every unpoisoned scalar var non-negative,
+    // then drop any var with a definition not provably non-negative under the
+    // current hypothesis until stable.
+    let mut hyps: HashSet<u32> = defs
+        .iter()
+        .filter(|(_, d)| !d.poisoned)
+        .map(|(id, _)| *id)
+        .collect();
+    loop {
+        let mut dropped = Vec::new();
+        for id in &hyps {
+            let d = &defs[id];
+            let mut trial: HashSet<u32> = hyps.clone();
+            trial.extend(nonneg.iter().copied());
+            if d.exprs.iter().any(|e| !is_nonneg(e, &trial)) {
+                dropped.push(*id);
+            }
+        }
+        if dropped.is_empty() {
+            break;
+        }
+        for id in dropped {
+            hyps.remove(&id);
+        }
+    }
+    nonneg.extend(hyps);
+    nonneg
 }
 
 /// If `sv` is a positive power-of-two literal `2^k` (k >= 1), return `k`. Drives the
@@ -1524,27 +1635,32 @@ fn positive_int_divisor(sv: &ScalarValue) -> Option<i64> {
 
 fn emit_expr(e: &ScalarExpr, ctx: &Ctx, parent_prec: u8) -> Result<String, String> {
     let prec = op_prec(e.op);
-    // ---- Non-negative div/mod strength reduction (generic, driven by `is_nonneg`) ----
-    // The nymph IR's ring/slot/phase indices and the L2-swizzle coords are all built
-    // from non-negative loop counters and scope ids, so `is_nonneg(dividend)` holds.
-    // TVM lowers a SIGNED `floordiv`/`floormod` (what Python `//`/`%` parse to) with a
-    // sign-correction tail: `floormod(x,d)` -> `(x % d) + (d & ((x % d) >> 31))` and
-    // `floordiv(x,d)` -> `(x / d) + ((x % d) >> 31)`. For a provably non-negative `x`
-    // every correction term is 0, so it is pure wasted integer ALU recomputed at each
-    // index (the L2 `% 5`//5` is recomputed per task per role). Two rewrites, both gated
-    // ONLY on the generic `is_nonneg` + a positive-literal divisor (no kernel/shape key):
+    // ---- Div/mod strength reduction (generic; see `is_nonneg`) ----
+    // The nymph IR's ring/slot/phase indices and the L2-swizzle coords are all
+    // built from provably non-negative counters and scope ids. TVM lowers a
+    // SIGNED `floordiv`/`floormod` (what Python `//`/`%` parse to) with a
+    // sign-correction tail: `floormod(x,d)` -> `(x % d) + (d & ((x % d) >> 31))`
+    // and `floordiv(x,d)` -> `(x / d) + ((x % d) >> 31)` — pure wasted integer
+    // ALU when the dividend is non-negative (every correction term is 0), and
+    // recomputed per index. Two rewrites:
     //
-    //   * divisor == 2^k  -> bit ops: `% 2^k` => `(x) & (2^k - 1)`, `// 2^k` => `(x) >> k`.
-    //     No div/mod instruction at all. (Generalizes the prior `% 2 -> & 1`, which also
-    //     dodged a TIRx->CUDA simplifier bug that mis-folds `floormod(floordiv(..),2)` to
-    //     0; bit ops are left intact by the simplifier, so that rationale still holds.)
-    //   * other positive literal (e.g. 5) -> `T.truncdiv` / `T.truncmod`: numerically
-    //     identical to floordiv/floormod for non-negative `x`, but lowers to a plain
-    //     `/` / `%` with NO sign-correction tail.
+    //   * divisor == 2^k  -> bit ops: `% 2^k` => `(x) & (2^k - 1)`, `// 2^k` =>
+    //     `(x) >> k`. NO sign gate: in two's complement, Python's floormod /
+    //     floordiv by 2^k are EXACTLY `& (2^k-1)` / arithmetic `>> k` for
+    //     negative dividends too (`-1 % 4 == 3 == -1 & 3`, `-1 // 4 == -1 ==
+    //     -1 >> 2`), so the rewrite is an unconditional identity. (It also
+    //     dodges a TIRx->CUDA simplifier bug that mis-folds
+    //     `floormod(floordiv(..),2)` to 0; bit ops are left intact.)
+    //   * other positive literal (e.g. 5) -> `T.truncdiv` / `T.truncmod`:
+    //     numerically identical to floordiv/floormod ONLY for a non-negative
+    //     `x` (trunc rounds toward 0, floor toward -inf), so this path is
+    //     gated on the provable-`is_nonneg` set (`ctx.nonneg_vars`), never a
+    //     blanket var assumption — a sentinel-negative scalar keeps its
+    //     correct floordiv/floormod form.
     //
     // `&`, `>>` bind looser than `% // * + -` in Python: parenthesize the dividend and
     // wrap the whole result for any parent binding tighter than bitand/shift.
-    if (e.op == ScalarOp::Mod || e.op == ScalarOp::FloorDiv) && is_nonneg(&e.args[0]) {
+    if e.op == ScalarOp::Mod || e.op == ScalarOp::FloorDiv {
         if let Some(k) = as_pow2_shift(&e.args[1]) {
             let lhs = emit_scalar_prec(&e.args[0], ctx, 0)?;
             let s = if e.op == ScalarOp::Mod {
@@ -1554,17 +1670,21 @@ fn emit_expr(e: &ScalarExpr, ctx: &Ctx, parent_prec: u8) -> Result<String, Strin
             };
             return Ok(if parent_prec > 0 { format!("({s})") } else { s });
         }
-        if let Some(d) = positive_int_divisor(&e.args[1]) {
-            let fname = if e.op == ScalarOp::Mod {
-                "T.truncmod"
-            } else {
-                "T.truncdiv"
-            };
-            // A function call is atomic — no surrounding parens needed for any parent.
-            return Ok(format!(
-                "{fname}({}, {d})",
-                emit_scalar_prec(&e.args[0], ctx, 0)?
-            ));
+        // Divisor 1 needs no sign gate either: `x % 1 == 0` and `x // 1 == x`
+        // under BOTH floor and trunc semantics, for every x.
+        if as_int(&e.args[1]) == Some(1) || is_nonneg(&e.args[0], &ctx.nonneg_vars) {
+            if let Some(d) = positive_int_divisor(&e.args[1]) {
+                let fname = if e.op == ScalarOp::Mod {
+                    "T.truncmod"
+                } else {
+                    "T.truncdiv"
+                };
+                // A function call is atomic — no surrounding parens needed for any parent.
+                return Ok(format!(
+                    "{fname}({}, {d})",
+                    emit_scalar_prec(&e.args[0], ctx, 0)?
+                ));
+            }
         }
     }
     let s = match e.op {
@@ -3264,5 +3384,152 @@ mod tests {
         k.cluster_shape = vec![2, 2, 2];
         let err = kernel_to_tirx_source(&k).unwrap_err();
         assert!(err.contains("no cta_id_in_cluster emission"), "{err}");
+    }
+
+    fn scalar_var(id: u32) -> Var {
+        Var {
+            id: VarId(id),
+            binding: VarBinding::Scalar,
+            dtype: ScalarDType::I32,
+        }
+    }
+
+    /// A scalar whose every definition is provably non-negative (0-init,
+    /// `s = s + 1` updates) IS strength-reduced on a non-pow2 divisor; a
+    /// mailbox-loaded scalar (possible -1 sentinel) is NOT — it keeps the
+    /// floormod form. The pow2 bit-op rewrite is a two's-complement identity
+    /// and applies to both.
+    #[test]
+    fn nonneg_analysis_gates_only_the_trunc_rewrite() {
+        let good = scalar_var(0);
+        let bad = scalar_var(1);
+        let mailbox = Arc::new(Tensor {
+            id: 9,
+            space: MemorySpace::Smem,
+            dtype: DType::I32,
+            shape: vec![1],
+            layout: None,
+            byte_offset: Some(0),
+            reg_frag: None,
+        });
+        let load = TensorSlice {
+            tensor: mailbox.clone(),
+            offsets: vec![ScalarValue::Int(0)],
+            shape: vec![ScalarValue::Int(1)],
+        };
+        let body = vec![
+            Stmt::TensorDef {
+                tensor: mailbox.clone(),
+            },
+            Stmt::ScalarDef {
+                var: good,
+                initial: ScalarInitial::Value(ScalarValue::Int(0)),
+            },
+            Stmt::ScalarStore {
+                var: good,
+                value: ScalarValue::expr(
+                    ScalarOp::Add,
+                    vec![ScalarValue::Var(good), ScalarValue::Int(1)],
+                ),
+            },
+            Stmt::ScalarDef {
+                var: bad,
+                initial: ScalarInitial::Tensor(load),
+            },
+            // `good % 5` -> truncmod (proven non-negative); `bad % 5` -> floormod;
+            // `bad % 4` -> `& 3` (pow2 identity, no sign gate).
+            Stmt::ScalarStore {
+                var: good,
+                value: ScalarValue::expr(
+                    ScalarOp::Mod,
+                    vec![ScalarValue::Var(good), ScalarValue::Int(5)],
+                ),
+            },
+            Stmt::ScalarStore {
+                var: bad,
+                value: ScalarValue::expr(
+                    ScalarOp::Mod,
+                    vec![ScalarValue::Var(bad), ScalarValue::Int(5)],
+                ),
+            },
+            Stmt::ScalarStore {
+                var: bad,
+                value: ScalarValue::expr(
+                    ScalarOp::Mod,
+                    vec![ScalarValue::Var(bad), ScalarValue::Int(4)],
+                ),
+            },
+        ];
+        let src = kernel_to_tirx_source(&kernel(body)).unwrap();
+        assert!(src.contains("s0 = T.truncmod(s0, 5)"), "{src}");
+        assert!(src.contains("s1 = s1 % 5"), "{src}");
+        assert!(src.contains("s1 = (s1) & 3"), "{src}");
+    }
+
+    /// A `leader_routed` mbar must carry a peer reference and be used only by
+    /// TmaLoad/expect_tx — validate fails closed otherwise.
+    #[test]
+    fn leader_routed_mbar_needs_a_peer_ref() {
+        use super::super::dtype::MBarKind;
+        use super::super::mbar::{MBar, MBarRef};
+        fn leader_mbar(kind: MBarKind) -> Arc<MBar> {
+            Arc::new(MBar {
+                id: 3,
+                kind,
+                stages: 1,
+                arrive_count: None,
+                leader_routed: true,
+            })
+        }
+        let peer_wait = |mbar: Arc<MBar>| Stmt::MBarrierWait {
+            mbar: MBarRef {
+                mbar,
+                remote_coord: Some(ScalarValue::Int(1)),
+            },
+            stage: None,
+            phase: Some(ScalarValue::Int(0)),
+        };
+
+        // No peer reference anywhere -> reject.
+        let k = kernel(vec![Stmt::MBarDef {
+            mbar: leader_mbar(MBarKind::Tma),
+        }]);
+        let err = k.validate().unwrap_err();
+        assert!(err.message.contains("must carry a peer reference"), "{err}");
+
+        // A peer reference + a wait is fine.
+        let k = kernel(vec![
+            Stmt::MBarDef {
+                mbar: leader_mbar(MBarKind::Tma),
+            },
+            peer_wait(leader_mbar(MBarKind::Tma)),
+        ]);
+        assert!(k.validate().is_ok(), "{:?}", k.validate().unwrap_err());
+
+        // ...but a commit on the leader-routed barrier is not (the mbar kind is
+        // TCGEN05 so the commit's own kind rule passes and the routing rule is
+        // what fires).
+        let commit = Stmt::Tcgen05Commit {
+            mbar: MBarRef {
+                mbar: leader_mbar(MBarKind::Tcgen05),
+                remote_coord: None,
+            },
+            stage: None,
+            cta_group: 2,
+            multicast_cta_mask: None,
+        };
+        let k = kernel(vec![
+            Stmt::MBarDef {
+                mbar: leader_mbar(MBarKind::Tcgen05),
+            },
+            peer_wait(leader_mbar(MBarKind::Tcgen05)),
+            commit,
+        ]);
+        let err = k.validate().unwrap_err();
+        assert!(
+            err.message
+                .contains("must only be used by TmaLoad/expect_tx"),
+            "{err}"
+        );
     }
 }

@@ -2398,6 +2398,76 @@ fn check_tmem_alloc_bands(kernel: &Kernel) -> R {
     let mut live = Vec::new();
     walk(&kernel.body, &mut live)
 }
+/// Walk 5: the `leader_routed` IR flag is the ONLY authority on cluster
+/// TMA-completion routing — codegen honors it and never guesses it from the
+/// usage structure. Consistency rules for a leader-routed mbar:
+///   1. it must carry a peer reference (an `MBarRef` with `remote_coord` — the
+///      cross-CTA wait the leader routing replaces), and
+///   2. it must be named ONLY by TMA-transaction ops (`TmaLoad`,
+///      `MBarrierExpectTx`, `MBarrierArriveExpectTx`) plus the bookkeeping ops
+///      that keep their local form (`MBarrierInit`, `MBarrierWait`). Routing a
+///      thread arrive, a tcgen05 commit, or a CLC/S2Cluster completion to the
+///      leader would corrupt the barrier's accounting.
+fn check_leader_routed_mbars(kernel: &Kernel) -> R {
+    let mut leader_ids: HashSet<u32> = HashSet::new();
+    let mut has_peer_ref: HashSet<u32> = HashSet::new();
+    fn walk(stmts: &[Stmt], leader_ids: &HashSet<u32>, has_peer: &mut HashSet<u32>) -> R {
+        for s in stmts {
+            let (refs, is_tx_use): (Vec<&MBarRef>, bool) = match s {
+                Stmt::MBarrierInit { mbar, .. }
+                | Stmt::MBarrierWait { mbar, .. }
+                | Stmt::MBarrierExpectTx { mbar, .. }
+                | Stmt::MBarrierArriveExpectTx { mbar, .. }
+                | Stmt::TmaLoad { mbar, .. } => (vec![mbar], true),
+                Stmt::MBarrierArrive { mbar, .. }
+                | Stmt::Tcgen05Commit { mbar, .. }
+                | Stmt::ClcTryCancel { mbar, .. }
+                | Stmt::CpAsyncBulkS2Cluster { mbar, .. } => (vec![mbar], false),
+                _ => (vec![], true),
+            };
+            for mref in refs {
+                if mref.remote_coord.is_some() {
+                    has_peer.insert(mref.mbar.id);
+                }
+                if leader_ids.contains(&mref.mbar.id) && !is_tx_use {
+                    return bail(format!(
+                        "leader_routed mbar {} must only be used by TmaLoad/expect_tx \
+                         (plus init/wait) — an arrive/commit/CLC completion cannot be \
+                         leader-routed",
+                        mref.mbar.id
+                    ));
+                }
+            }
+            for child in s.child_bodies() {
+                walk(child, leader_ids, has_peer)?;
+            }
+        }
+        Ok(())
+    }
+    fn collect_defs(stmts: &[Stmt], leader_ids: &mut HashSet<u32>) {
+        for s in stmts {
+            if let Stmt::MBarDef { mbar } = s {
+                if mbar.leader_routed {
+                    leader_ids.insert(mbar.id);
+                }
+            }
+            for child in s.child_bodies() {
+                collect_defs(child, leader_ids);
+            }
+        }
+    }
+    collect_defs(&kernel.body, &mut leader_ids);
+    walk(&kernel.body, &leader_ids, &mut has_peer_ref)?;
+    for id in leader_ids {
+        if !has_peer_ref.contains(&id) {
+            return bail(format!(
+                "leader_routed mbar {id} must carry a peer reference (an MBarRef with \
+                 remote_coord — the cross-CTA wait the leader routing replaces)"
+            ));
+        }
+    }
+    Ok(())
+}
 
 fn check_smem_pool_bounds(kernel: &Kernel) -> R {
     fn check_tensor(tensor: &Tensor, smem_size_bytes: usize) -> R {
@@ -2580,6 +2650,7 @@ impl Kernel {
         )?;
         check_cta_group_consistency(&self.body)?;
         check_tmem_alloc_bands(self)?;
+        check_leader_routed_mbars(self)?;
         Ok(())
     }
 }

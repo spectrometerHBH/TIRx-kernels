@@ -549,12 +549,14 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
         reg_frag=("16x256b", accum_frag.id) if stmatrix_epi else None,
     )
 
-    smem_full = k.mbar(kind=MBarKind.TMA, stages=smem_depth)
+    # leader_routed: both CTAs' TMA completions (A/B on smem_full, SFA/SFB on
+    # sf_full) signal the LEADER CTA's copy (the canonical cta_group=2 pattern).
+    smem_full = k.mbar(kind=MBarKind.TMA, stages=smem_depth, leader_routed=True)
     # Separate SF-load completion barrier (canon's `scale_full_bar`/buffer_6, distinct from
     # the A/B `tile_full_bar`/buffer_5). Canon waits BOTH in the MMA before the cp/gemm; the
     # scale and tile loads land on different barriers (and on different TMA warps). Mirror
     # canon exactly — one barrier for A/B, one for SFA/SFB — so the MMA orders against each.
-    sf_full = k.mbar(kind=MBarKind.TMA, stages=smem_depth)
+    sf_full = k.mbar(kind=MBarKind.TMA, stages=smem_depth, leader_routed=True)
     smem_empty = k.mbar(kind=MBarKind.TCGEN05, stages=smem_depth)
     tmem_full = k.mbar(kind=MBarKind.TCGEN05, stages=ACC_DEPTH)
     tmem_empty = k.mbar(kind=MBarKind.THREAD, stages=ACC_DEPTH)

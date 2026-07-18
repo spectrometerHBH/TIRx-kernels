@@ -361,8 +361,21 @@ class IRBuilder:
     def nvshmem_my_pe(self) -> ScopeValue:
         return ScopeValue(kind="nvshmem_my_pe")
 
-    def mbar(self, *, kind: MBarKind, stages: int = 1, arrive_count: int | None = None) -> MBar:
-        mbar = MBar(kind=kind, stages=stages, arrive_count=arrive_count)
+    def mbar(
+        self,
+        *,
+        kind: MBarKind,
+        stages: int = 1,
+        arrive_count: int | None = None,
+        leader_routed: bool = False,
+    ) -> MBar:
+        """``leader_routed=True`` marks a cluster TMA-completion barrier: BOTH
+        CTAs' TMA loads signal the LEADER CTA's copy of it (the canonical
+        cta_group=2 pattern — the legal substitute for a peer ``try_wait``, and
+        the prerequisite for multicast loads). Explicit IR routing metadata —
+        codegen honors it, it never guesses it from the usage structure.
+        Validate requires a peer reference and TMA-load/expect_tx-only use."""
+        mbar = MBar(kind=kind, stages=stages, arrive_count=arrive_count, leader_routed=leader_routed)
         self._append(MBarDef(mbar))
         return mbar
 

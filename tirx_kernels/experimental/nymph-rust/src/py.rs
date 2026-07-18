@@ -1528,8 +1528,13 @@ pub struct PyMBar(pub Arc<ir::MBar>);
 #[pymethods]
 impl PyMBar {
     #[new]
-    #[pyo3(signature = (kind, stages = 1, arrive_count = None))]
-    fn new(kind: PyMBarKind, stages: u32, arrive_count: Option<u32>) -> PyResult<Self> {
+    #[pyo3(signature = (kind, stages = 1, arrive_count = None, leader_routed = false))]
+    fn new(
+        kind: PyMBarKind,
+        stages: u32,
+        arrive_count: Option<u32>,
+        leader_routed: bool,
+    ) -> PyResult<Self> {
         // Validate eagerly, like Python's MBar.__post_init__.
         if stages < 1 {
             return Err(PyValueError::new_err(
@@ -1548,6 +1553,7 @@ impl PyMBar {
             kind: kind.into(),
             stages,
             arrive_count,
+            leader_routed,
         })))
     }
     #[getter]
@@ -1561,6 +1567,10 @@ impl PyMBar {
     #[getter]
     fn arrive_count(&self) -> Option<u32> {
         self.0.arrive_count
+    }
+    #[getter]
+    fn leader_routed(&self) -> bool {
+        self.0.leader_routed
     }
     #[getter]
     fn id(&self) -> u32 {
