@@ -54,7 +54,6 @@ from ..nymph_rs import (
     LaunchShape,
     MBarKind,
     MemorySpace,
-    ScalarDType,
     TensorSlice,
 )
 
@@ -656,7 +655,13 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     # ---- TMA producer (wg0/warp2 — canon's WarpRole.TMA) ----
     with k.role(warp=2):
         with k.for_each_task(task_scheduler) as task:
-            local_iter = k.shuffle_sync((task.task_id - task_start) // task_step)
+            # `let` SSA binding (canon's while-loop `T.let` decode chain), replacing
+            # the shuffle_sync broadcast: the immutable binding keeps the whole
+            # local_iter -> stage/occ chain on ptxas's uniform datapath WITHOUT the
+            # SHFL instruction (ncu: the shuffle form still paid vector math + R2UR
+            # on the g2cluster lines). Value-model-identical: task_id is CTA-uniform,
+            # so the per-lane eval agrees with the old broadcast.
+            local_iter = k.let((task.task_id - task_start) // task_step)
             m_idx, n_idx = work_coords(task.task_id, cta_rank)
             a_m = m_idx * CTA_M  # this CTA's own M tile
             b_n = n_idx * mma_n + cta_rank * cta_n  # this CTA's half of the N band
@@ -778,13 +783,11 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
         with k.for_each_task(task_scheduler) as task:
             # NO shuffle_sync here: __shfl_sync(0xffffffff) inside this single-lane
             # elected region is UB on GPU (the mask demands all 32 lanes converge;
-            # reproduced as a flaky launch hang on the fp16 producer). local_iter
-            # stays a plain scalar — the derived stage/phase math pays R2UR until a
-            # UB-free uniform mechanism lands. The NON-elected task loops (TMA
-            # producer, consumer wg) do wrap with shuffle_sync.
-            local_iter = k.scalar(
-                initial=(task.task_id - task_start) // task_step, dtype=ScalarDType.I32
-            )
+            # reproduced as a flaky launch hang on the fp16 producer). local_iter is
+            # a `let` SSA binding instead — the UB-free uniform mechanism: immutable
+            # and single-assignment, so ptxas keeps the derived stage/phase chain on
+            # the uniform datapath without any SHFL.
+            local_iter = k.let((task.task_id - task_start) // task_step)
             with k.if_(cta_rank.eq(0)):
                 tmem_idx = local_iter % ACC_DEPTH
                 k.mbarrier_wait(tmem_empty, stage=tmem_idx, phase=(local_iter // ACC_DEPTH + 1) % 2)
@@ -920,7 +923,9 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
 
     with k.role(warpgroup=1, maxnreg=config.maxnreg_epilogue):
         with k.for_each_task(task_scheduler) as task:
-            local_iter = k.shuffle_sync((task.task_id - task_start) // task_step)
+            # Same `let` SSA form as the TMA producer (was shuffle_sync): no SHFL,
+            # the tmem_idx/phase decode chain stays on the uniform datapath.
+            local_iter = k.let((task.task_id - task_start) // task_step)
             m_idx, n_idx = work_coords(task.task_id, cta_rank)
             d_m = m_idx * CTA_M
             d_n = n_idx * mma_n

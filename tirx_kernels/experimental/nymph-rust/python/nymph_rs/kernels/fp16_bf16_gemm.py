@@ -487,17 +487,16 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
             # Hoist the per-task tile coords into registers ONCE per task (canon's
             # `buffer_5`/`buffer_6`), instead of re-deriving the L2-raster expression
             # `(task>>6)*4 + (task&63)&3` inline in every TMA address (3x/k-tile here).
-            # They are deliberately NOT wrapped in shuffle_sync: the task id comes from
-            # a scheduler-mailbox LDS (a vector load ptxas can't prove warp-uniform) and
-            # a shuffle would force the uniform datapath, but __shfl_sync in this
-            # single-lane elected region is UB (flaky GPU hang). nvfp4 wraps only its
-            # NON-elected task loops for the same reason; its elected MMA warp is
-            # likewise unwrapped. Unwrapped, every TMA issue pays vector math + R2UR
-            # moves (ncu fp16 1024: R2UR 13.5K vs canon 1.8K, clustered on the two
-            # g2cluster lines) — closing that needs a UB-free uniform mechanism.
+            # They are `let` bindings (canon's `tile_row`/`tile_col: T.let` decode
+            # chain): immutable SSA, NOT mutable local-scalar cells — a mutable cell
+            # defeats ptxas's uniform-register analysis and every TMA issue then pays
+            # vector math + R2UR moves (ncu fp16 1024: R2UR 13.5K vs canon 1.8K,
+            # clustered on the two g2cluster lines). __shfl_sync would also force the
+            # uniform datapath but is UB in this single-lane elected region (flaky GPU
+            # hang) — the let form needs no shuffle.
             m_idx_e, n_idx_e = work_coords(task_id)
-            m_idx = k.scalar(initial=m_idx_e, dtype=ScalarDType.I32)
-            n_idx = k.scalar(initial=n_idx_e, dtype=ScalarDType.I32)
+            m_idx = k.let(m_idx_e)
+            n_idx = k.let(n_idx_e)
             b_n = (n_idx * CTA_GROUP + cta_rank) * r.blk_n
             with k.for_loop(stop=r.k_tiles) as kt:
                 k.mbarrier_wait(smem_empty, stage=ld_stage, phase=(ld_phase + 1) % 2)
@@ -619,18 +618,17 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
                 # warpgroup-syncs spills to local memory (measured: 489K LDL -> 0).
                 # Hoist tile coords once/task (canon's `cur_m`/`cur_n`) — the epilogue
                 # store address re-derives the same L2-raster expression ×8 otherwise.
-                # shuffle_sync makes them compiler-provably warp-UNIFORM so the derived
-                # epilogue address/phase math lowers to the uniform datapath (UIADD3/
-                # UISETP/USEL like canon) instead of vector IMAD/ISETP/SEL + per-use
-                # R2UR conversions — the nvfp4 local_iter treatment (ncu fp16 1024:
-                # nymph R2UR 13.5K vs canon 1.8K, IMAD +9.4K, ISETP +8.3K; isolated
-                # duration 16% over canon). Wrap only the CONSUMER's derived values
-                # (wrapping raw task_id in the producer paths was the June bf16-8192
-                # pathological-compile case).
-                local_iter = k.shuffle_sync(local_iter)
+                # `let` bindings (canon's wb__nxt `T.let` decode chain): immutable SSA,
+                # so the derived epilogue address/phase math lowers to the uniform
+                # datapath (UIADD3/UISETP/USEL like canon) WITHOUT the SHFL the old
+                # shuffle_sync form paid (ncu fp16 1024: nymph R2UR 13.5K vs canon
+                # 1.8K, IMAD +9.4K, ISETP +8.3K; isolated duration 16% over canon).
+                # Convert only the CONSUMER's derived values (wrapping raw task_id in
+                # the producer paths was the June bf16-8192 pathological-compile case).
+                local_iter = k.let(local_iter)
                 m_idx_e, n_idx_e = work_coords(task_id)
-                m_idx = k.shuffle_sync(m_idx_e)
-                n_idx = k.shuffle_sync(n_idx_e)
+                m_idx = k.let(m_idx_e)
+                n_idx = k.let(n_idx_e)
                 if r.overlap:
                     slot = local_iter % r.tmem_slots
                     tmem_full_phase = (local_iter // r.tmem_slots) % 2

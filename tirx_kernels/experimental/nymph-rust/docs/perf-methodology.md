@@ -35,7 +35,8 @@ diff against canon (method established in commit 9ef5a61a / 034ae826):
      living in vector registers feeding uniform-pipe instructions (UTMALDG
      TMA coords). Fix class: uniform-datapath placement (SSA `T.let` form,
      `shuffle_sync` outside elected regions) — see the producer comment in
-     fp16_bf16_gemm.py.
+     fp16_bf16_gemm.py. NOTE (2026-07): the `T.let` form landed and did NOT
+     move the count — the placement failure is whole-function; see §3.
    - **BSSY/BSYNC pairs**: per-op guard `if` blocks reconverging; fixed by
      elect_sync guards + adjacent same-guard folding in codegen.
    - **UTMACMDFLUSH 4x**: epilogue commit_group not single-thread-guarded;
@@ -59,6 +60,30 @@ diff against canon (method established in commit 9ef5a61a / 034ae826):
   diffs; go straight to opcode/SASS level.
 - **stmatrix epilogue** for the nvfp4 shapes: verified working via ncu but
   regresses on 1024/2048/4096 (0.968/0.980/0.940). Capability exists, off.
+- **R2UR via the scalar-binding emission form** (fp16 1024, 2026-07): the
+  per-task decode chain was converted from mutable `T.int32` local cells to
+  single-assignment `T.let` SSA bindings (IR `ScalarLet`, canon's exact
+  source form — verified in the lowered CUDA as `int s10 = (s8_ptr[0] & 3);`)
+  and the three nvfp4/fp16 `shuffle_sync` spots were replaced by lets.
+  Measured A/B (ncu InstructionStats, single launch): fp16 1024 R2UR
+  13504 -> 13504 (SHFL 2560 -> 1024, total inst 322280 -> 322135);
+  nvfp4 1024 R2UR 2016 -> 2016 (canon fp16: 1792, canon nvfp4: 4544 —
+  nvfp4-nymph was already better than canon). So the decode-chain binding
+  form is NOT what keeps the chain off the uniform datapath. The R2UR is a
+  WHOLE-FUNCTION ptxas uniform-placement decision, evidenced by
+  nvrtc+nvdisasm bisection on the dumped device source (R2UR SASS lines):
+  strip the CLC scheduler region -> 3 (from 90), strip MMA -> 12, strip
+  epilogue -> 74, producer-only -> 2; splicing CANON's scheduler verbatim
+  into the nymph kernel stays 90 (content-irrelevant); injecting nymph's
+  control-flow shapes into canon stays 4 (shape-irrelevant). Morphs that did
+  NOT flip it: vacuous-break removal, canon ring-advance form, expect_tx
+  order, init-elect batching (90->85), MMA peel+roll -> single loop w/ accum
+  cell (112, worse), meta_var-equivalent inlining of the let exprs at use
+  sites (90), scheduler done-flag form, ptxas --register-usage-level 6/8/10,
+  --allow-expensive-optimizations. `-O1` drops it (90->62) but is not
+  viable. The actionable direction (not yet done): shrink the whole-kernel
+  static complexity until ptxas's placement flips — canon is ~29% smaller
+  in SASS than nymph on this shape.
 
 ## 4. Rules of engagement
 
