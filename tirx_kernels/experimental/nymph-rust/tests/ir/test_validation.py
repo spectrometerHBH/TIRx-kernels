@@ -262,6 +262,39 @@ def test_rejects_mma_nvfp4_sf_byte():
         make([n.Tcgen05Mma(dst=dst, a=a, b=b, sfa=sfa, sfb=sfb, **fp4_kwargs(sf_byte=2))])
 
 
+# ---- tcgen05_cp --------------------------------------------------------------
+
+
+def test_accepts_tcgen05_cp_u32_and_e4m3():
+    dst = tmem([128, 4], dtype=n.DType.U32)[:, :]
+    src = smem([512], dtype=n.DType.U32)[:]
+    make([n.Tcgen05Cp(dst=dst, src=src)])
+    dst = tmem([128, 32], dtype=n.DType.F8E4M3)[:, :]
+    src = smem([1, 256, 16], dtype=n.DType.F8E4M3)[:, :, :]
+    make([n.Tcgen05Cp(dst=dst, src=src)])
+
+
+def test_rejects_tcgen05_cp_dtype_mismatch():
+    dst = tmem([128, 4], dtype=n.DType.U32)[:, :]
+    src = smem([512], dtype=n.DType.F8E4M3)[:]
+    with pytest.raises(ValueError, match="tcgen05_cp dst and src dtype must match"):
+        make([n.Tcgen05Cp(dst=dst, src=src)])
+
+
+def test_rejects_tcgen05_cp_u32_src_not_1d():
+    dst = tmem([128, 4], dtype=n.DType.U32)[:, :]
+    src = smem([128, 4], dtype=n.DType.U32)[:, :]
+    with pytest.raises(ValueError, match="u32 src must be effectively 1-D"):
+        make([n.Tcgen05Cp(dst=dst, src=src)])
+
+
+def test_rejects_tcgen05_cp_e4m3_dst_not_block_multiple():
+    dst = tmem([128, 3], dtype=n.DType.F8E4M3)[:, :]
+    src = smem([1, 64, 6], dtype=n.DType.F8E4M3)[:, :, :]
+    with pytest.raises(ValueError, match="must be a multiple of the src's innermost"):
+        make([n.Tcgen05Cp(dst=dst, src=src)])
+
+
 # ---- tma ------------------------------------------------------------------
 
 

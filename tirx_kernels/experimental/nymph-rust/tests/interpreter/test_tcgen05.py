@@ -121,7 +121,7 @@ def u32_sentinels(rows, cols):
     return u32(values, shape=(rows, cols))
 
 
-def _tcgen05_role_failure_kernel(op, *, row=0, col=0, elected=False):
+def _tcgen05_role_failure_kernel(op, *, row=0, col=0, elected=False, shape="32x32b"):
     b = builder("tcgen05_datapath_failure")
     src = tmem_tensor(b, dtype=nr.DType.F32, shape=(128, 128), col_start=0)
     dst = reg_tensor(b, dtype=nr.DType.F32, shape=(1,))
@@ -129,9 +129,9 @@ def _tcgen05_role_failure_kernel(op, *, row=0, col=0, elected=False):
         b.tmem_alloc(src, n_cols=64)
     with b.role(warp=0, elected=elected):
         if op == "ld":
-            b.tcgen05_ld(dst, src, row=row, col=col)
+            b.tcgen05_ld(dst, src, shape=shape, row=row, col=col)
         else:
-            b.tcgen05_st(src, dst, row=row, col=col)
+            b.tcgen05_st(src, dst, shape=shape, row=row, col=col)
     return b.build()
 
 
@@ -146,11 +146,62 @@ def test_tcgen05_ld_st_reject_partial_warp_and_tmem_bounds_fail_closed():
         run(_tcgen05_role_failure_kernel("st", col=512))
 
 
+def test_tcgen05_ld_st_reject_row_escaping_subpartition():
+    # 32x32b spans all 32 lanes of the warp's subpartition: row=32 silently
+    # addresses the NEXT subpartition on hardware (UB) — fail closed instead.
+    with expect_runtime_error("tcgen05_ld_out_of_range"):
+        run(_tcgen05_role_failure_kernel("ld", row=32))
+    with expect_runtime_error("tcgen05_st_out_of_range"):
+        run(_tcgen05_role_failure_kernel("st", row=32))
+    # 16-lane atoms may start at row 0 or 16 only; 48 escapes the subpartition.
+    with expect_runtime_error("tcgen05_ld_out_of_range"):
+        run(_tcgen05_role_failure_kernel("ld", row=48, shape="16x64b"))
+
+
+def test_tcgen05_cp_commit_wait_reject_partial_warp_cohort():
+    # cp/commit are single-thread-ISSUE like the MMA: a full warp or a single
+    # elected lane. A ragged partial cohort is a real divergence bug.
+    b = builder("tcgen05_cp_partial", smem_size_bytes=512)
+    dst = tmem_tensor(b, dtype=nr.DType.U32, shape=(128, 1), col_start=0)
+    src = smem_tensor(b, dtype=nr.DType.U32, shape=(128,), byte_offset=0)
+    with b.kernel_init(warp=0):
+        b.tmem_alloc(dst, n_cols=32)
+    with b.role(warp=0):
+        with b.if_(b.lane_id() < 16):
+            b.tcgen05_cp(dst, src)
+    with b.kernel_finalize(warp=0):
+        b.tmem_dealloc(dst, n_cols=32)
+    with expect_runtime_error("tcgen05_cp_mask"):
+        run(b.build())
+
+    b = builder("tcgen05_commit_partial")
+    done = b.mbar(kind=nr.MBarKind.TCGEN05)
+    with b.kernel_init(warp=0):
+        b.mbarrier_init(done, count=1)
+    with b.role(warp=0):
+        with b.if_(b.lane_id() < 16):
+            b.tcgen05_commit(done)
+    with expect_runtime_error("tcgen05_commit_mask"):
+        run(b.build())
+
+    # tcgen05.wait::ld/st are warp-collective like the ld/st they drain.
+    for wait_op, code in [("ld", "tcgen05_wait_ld_mask"), ("st", "tcgen05_wait_st_mask")]:
+        b = builder(f"tcgen05_wait_{wait_op}_partial")
+        with b.role(warp=0):
+            with b.if_(b.lane_id() < 16):
+                if wait_op == "ld":
+                    b.tcgen05_wait_ld()
+                else:
+                    b.tcgen05_wait_st()
+        with expect_runtime_error(code):
+            run(b.build())
+
+
 def _reg_row_cols(b, tensor, col, cols):
     return tensor[b.tid_in_wg(), col : col + cols]
 
 
-def _tcgen05_datapath_kernel(shape, num, mode):
+def _tcgen05_datapath_kernel(shape, num, mode, row=0):
     reg_size = register_count(shape, num)
     b = builder(f"tcgen05_{mode}_datapath")
     tmem = tmem_tensor(b, dtype=nr.DType.U32, shape=(128, 256), col_start=0)
@@ -172,18 +223,42 @@ def _tcgen05_datapath_kernel(shape, num, mode):
 
         if mode == "st":
             b.reg_load(source_reg, _reg_row_cols(b, source_g, 0, reg_size))
-            b.tcgen05_st(tmem, source_reg, shape=shape, num=num, row=0, col=0)
+            b.tcgen05_st(tmem, source_reg, shape=shape, num=num, row=row, col=0)
             for col in [0, 128]:
                 b.tcgen05_ld(chunk_reg, tmem, shape="32x32b", num=128, row=0, col=col)
                 b.reg_store(_reg_row_cols(b, out, col, 128), chunk_reg)
         else:
-            b.tcgen05_ld(out_reg, tmem, shape=shape, num=num, row=0, col=0)
+            b.tcgen05_ld(out_reg, tmem, shape=shape, num=num, row=row, col=0)
             b.reg_store(_reg_row_cols(b, out, 0, reg_size), out_reg)
 
     with b.kernel_finalize(warp=0):
         b.tmem_dealloc(tmem, n_cols=256)
 
     return b.build(), seed_g, source_g, out
+
+
+def test_tcgen05_st_row16_16x_covers_upper_half_subpartition():
+    # The 16-lane atoms at row=16 cover lanes 16..31 of each warp's OWN
+    # subpartition (the TIRx M=128 two-slab fragment) — legal, must not be
+    # caught by the subpartition containment check.
+    shape, num, row = "16x64b", 2, 16
+    kernel, seed_g, source_g, out = _tcgen05_datapath_kernel(shape, num, "st", row=row)
+    reg_size = register_count(shape, num)
+    outputs = run(
+        kernel,
+        {seed_g: np.zeros((128, 256), dtype=np.uint32), source_g: u32_sentinels(128, reg_size)},
+    )
+    dump = output(outputs, out)
+    lane_idx, col_idx = datapath_index_arrays(shape, num)
+    expected = np.zeros((128, 256), dtype=np.uint32)
+    for tid in range(128):
+        warp = tid // 32
+        lane = tid % 32
+        for reg in range(reg_size):
+            phys_lane = 32 * (warp % 4) + row + lane_idx[lane, reg]
+            phys_col = col_idx[lane, reg]
+            expected[phys_lane, phys_col] = (tid << 16) | reg
+    np.testing.assert_array_equal(dump, expected, err_msg=f"{shape}.x{num} row={row}")
 
 
 def test_tcgen05_st_non32_shapes_scatter_to_modeled_physical_cells():

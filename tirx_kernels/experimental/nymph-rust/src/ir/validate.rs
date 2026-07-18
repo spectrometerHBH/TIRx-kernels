@@ -1086,9 +1086,15 @@ fn validate_stmt(s: &Stmt) -> R {
             if src.tensor.space != MemorySpace::Smem {
                 return bail("tcgen05_cp src must be SMEM");
             }
+            // dst/src dtype must MATCH: the u32 path writes whole cells and the
+            // e4m3 path writes raw scale bytes — a mixed pair (e.g. an e4m3 src
+            // into a u32 dst) would write bytes into word cells (write_sf_byte
+            // carries no dtype check).
+            if dst.tensor.dtype != src.tensor.dtype {
+                return bail("tcgen05_cp dst and src dtype must match");
+            }
             // UE8M0 path packs scale bytes as u32 cells; NVFP4 moves e4m3 scale bytes.
-            let ok_sf = |d: DType| matches!(d, DType::U32 | DType::F8E4M3);
-            if !ok_sf(dst.tensor.dtype) || !ok_sf(src.tensor.dtype) {
+            if !matches!(dst.tensor.dtype, DType::U32 | DType::F8E4M3) {
                 return bail("tcgen05_cp moves u32 (UE8M0) or e4m3 (nvfp4) scale cells");
             }
             let (Some(dst_shape), Some(src_shape)) =
@@ -1103,6 +1109,26 @@ fn validate_stmt(s: &Stmt) -> R {
             let src_numel: usize = src_shape.iter().product();
             if dst_numel != src_numel {
                 return bail("tcgen05_cp src/dst element counts must match");
+            }
+            if src.tensor.dtype == DType::F8E4M3 {
+                // NVFP4: the src's innermost dim is the per-row SF-block count;
+                // the (128, cols) dst folds whole 128-row super-blocks of it, so
+                // the dst column count must be a multiple of that block count
+                // (execute_cp's super-block folding divides by it).
+                let nblocks = *src_shape.last().unwrap_or(&0);
+                if nblocks == 0 || dst_shape[1] % nblocks != 0 {
+                    return bail(
+                        "tcgen05_cp e4m3 dst cols must be a multiple of the src's \
+                         innermost SF-block dim",
+                    );
+                }
+            } else {
+                // UE8M0 u32: the value model enumerates the src flat into
+                // (lane, col) cells, so it must be a single effective vector —
+                // a 2-D tile's (row, col) reading is not what the copy models.
+                if src_shape.iter().filter(|&&d| d != 1).count() > 1 {
+                    return bail("tcgen05_cp u32 src must be effectively 1-D");
+                }
             }
         }
         Stmt::Tcgen05Commit {

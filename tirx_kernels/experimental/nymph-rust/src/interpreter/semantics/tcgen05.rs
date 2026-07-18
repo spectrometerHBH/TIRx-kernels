@@ -46,12 +46,18 @@ pub fn register(reg: &mut StmtExecutorRegistry) {
 }
 
 fn execute_wait<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
+    let (async_kind, label) = match stmt {
+        Stmt::Tcgen05WaitLd => (TmemAsyncKind::Ld, "wait_ld"),
+        Stmt::Tcgen05WaitSt => (TmemAsyncKind::St, "wait_st"),
+        _ => unreachable!(),
+    };
+    // tcgen05.wait::ld/st are warp-collective, exactly like the ld/st they
+    // drain (resolve_datapath's full-warp rule).
+    ctx.check_full_warp_cohort(
+        format!("tcgen05_{label}_mask"),
+        format!("tcgen05_{label} must be issued by one or more full warps"),
+    )?;
     if ctx.trace_mode() {
-        let async_kind = match stmt {
-            Stmt::Tcgen05WaitLd => TmemAsyncKind::Ld,
-            Stmt::Tcgen05WaitSt => TmemAsyncKind::St,
-            _ => unreachable!(),
-        };
         ctx.emit(TraceEventKind::TmemWait {
             async_kind,
             scope: ctx.access_scope(),
@@ -61,6 +67,12 @@ fn execute_wait<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IRes
 }
 
 fn execute_commit<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
+    // Same issue-granularity rule as the MMA/cp: a full warp or a single
+    // elected lane — a ragged partial cohort is a real divergence bug.
+    ctx.check_tcgen05_issuer(
+        "tcgen05_commit_mask",
+        "tcgen05_commit must be issued by a full warp or a single elected lane",
+    )?;
     let (mbar, stage, cta_group, multicast) = match stmt {
         Stmt::Tcgen05Commit {
             mbar,
@@ -153,6 +165,22 @@ fn check_row_alignment(row: i64, shape: &str, label: &str) -> IResult<()> {
     Ok(())
 }
 
+/// The atom's lane span must fit INSIDE the issuing warp's own 32-lane
+/// subpartition: `.32x32b` spans all 32 lanes (row must be 0); the 16-lane
+/// `.16x*b` atoms may start at row 0 or 16. A larger row lands in the NEXT
+/// subpartition's lanes — hardware UB that the sim would otherwise compute
+/// silently (the atom lane indices are subpartition-relative).
+fn check_subpartition_span(row: i64, shape: &str, label: &str) -> IResult<()> {
+    let span: i64 = if shape.starts_with("16x") { 16 } else { 32 };
+    if row < 0 || row + span > 32 {
+        return Err(InterpreterError::new(
+            format!("tcgen05_{label}_out_of_range"),
+            format!("tcgen05_{label} row escapes the warp's 32-lane TMEM subpartition"),
+        ));
+    }
+    Ok(())
+}
+
 fn resolve_datapath(
     ctx: &CohortContext,
     stmt_row: &crate::ir::ScalarValue,
@@ -169,6 +197,7 @@ fn resolve_datapath(
     let row = ctx.eval_scalar_uniform(stmt_row, "tcgen05 row", "divergent_operands")?;
     let col = ctx.eval_scalar_uniform(stmt_col, "tcgen05 col", "divergent_operands")?;
     check_row_alignment(row, shape, label)?;
+    check_subpartition_span(row, shape, label)?;
     let (lane_idx, col_idx) = datapath_index_arrays_cached(shape, num as usize)?;
     let reg_size = lane_idx.ncols();
     let col_start = tmem_layout_for(tmem_tensor)?.col_start;
@@ -209,6 +238,7 @@ fn resolve_datapath_bounds(
     let row = ctx.eval_scalar_uniform(stmt_row, "tcgen05 row", "divergent_operands")?;
     let col = ctx.eval_scalar_uniform(stmt_col, "tcgen05 col", "divergent_operands")?;
     check_row_alignment(row, shape, label)?;
+    check_subpartition_span(row, shape, label)?;
     let summary = datapath_index_summary_cached(shape, num as usize)?;
     let layout_col_start = tmem_layout_for(tmem_tensor)?.col_start;
     let abs_col_start = layout_col_start as i64 + col + summary.col_min as i64;
@@ -264,6 +294,7 @@ fn trace_ldst_tmem_region(
     let row = ctx.eval_scalar_uniform(stmt_row, "tcgen05 row", "divergent_operands")?;
     let col = ctx.eval_scalar_uniform(stmt_col, "tcgen05 col", "divergent_operands")?;
     check_row_alignment(row, shape, label)?;
+    check_subpartition_span(row, shape, label)?;
     let summary = datapath_index_summary_cached(shape, num as usize)?;
     let layout_col_start = tmem_layout_for(tmem_tensor)?.col_start;
     let col_start = layout_col_start as i64 + col + summary.col_min as i64;
@@ -1149,6 +1180,12 @@ fn read_scale_blocks(
 /// toward other streams is observed through `tcgen05_commit` (the trace records
 /// an async `Tmem(Cp)` write window drained by the commit).
 fn execute_cp<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
+    // Same issue-granularity rule as the MMA: a full warp or a single elected
+    // lane — a ragged partial cohort is a real divergence bug.
+    ctx.check_tcgen05_issuer(
+        "tcgen05_cp_mask",
+        "tcgen05_cp must be issued by a full warp or a single elected lane",
+    )?;
     let (dst, src, cta_group) = match stmt {
         Stmt::Tcgen05Cp {
             dst,
@@ -1598,6 +1635,25 @@ fn accumulate_inplace(
                 "missing_tmem_scratchpad",
                 "tcgen05_mma writes a missing TMEM scratchpad",
             ));
+        }
+    }
+    // accum=true reads the accumulator's CURRENT cells: they must have been
+    // written (an earlier MMA/st). The fallback path fails closed with
+    // missing_tmem_value on unwritten cells; the in-place path must agree —
+    // silently accumulating from zeroed cells is how a missing prologue MMA
+    // went undetected.
+    if accum {
+        for &cta_id in cta_ids {
+            let sp = ctx.state.values.tmem.scratchpad_for(cta_id)?;
+            let region = sp
+                .valid
+                .slice(ndarray::s![0..rows_per_cta, c0..c0 + n_total]);
+            if !region.iter().all(|&v| v) {
+                return Err(InterpreterError::new(
+                    "missing_tmem_value",
+                    "tcgen05_mma accum reads an unwritten TMEM accumulator cell",
+                ));
+            }
         }
     }
     MMA_SCRATCH.with(|sc| -> IResult<()> {
