@@ -25,6 +25,7 @@ scheduler.
   before trusting a green sim/check run.
 - [Hardware Verification](docs/hardware-verification.md) - B200 validation for
   the tcgen05 ld/st datapath and MMA accumulator layouts.
+- [Perf Methodology](docs/perf-methodology.md) - measuring and diagnosing the nymph ↔ canon gap (ncu opcode diff).
 - [Port Status](STATUS.md) - current implementation, correctness, performance,
   and remaining optimization work.
 
