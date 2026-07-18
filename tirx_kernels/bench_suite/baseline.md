@@ -2,8 +2,8 @@
 
 - Timestamp: `6`
 - Label:     `6d46ac95-dirty`
-- Git:       `{'tir': '9d215dda', 'tirx-kernels': '6d46ac95-dirty', 'tirx-bench-ci': None}`
-- Workloads: 283 ok, 0 failed
+- Git:       `{'tir': '2b8ac594', 'tirx-kernels': 'ca29abf7-dirty', 'tirx-bench-ci': None}`
+- Workloads: 332 ok, 0 failed
 
 Grouped workloads show one row per config and one timing column per implementation. Single-TIR workloads show ref/ours against the fastest reference implementation.
 
@@ -228,10 +228,59 @@ Grouped workloads show one row per config and one timing column per implementati
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
 |---|---|---:|---|---:|---:|---|
-| `m137_n24_k7680_s16` | tirx | 5.4381 | deepgemm | 5.1751 | 0.952 | — |
-| `m13_n24_k7168_s1` | tirx | 23.5442 | deepgemm | 20.6087 | 0.875 | — |
-| `m4096_n24_k28672_s16` | tirx | 65.5240 | deepgemm | 63.2597 | 0.965 | — |
-| `m4096_n24_k7168_s1` | tirx | 25.8518 | deepgemm | 23.8094 | 0.921 | — |
+| `m1024_n24_k16384_s9` | tirx | 11.1824 | deepgemm | 11.7271 | 1.049 | — |
+| `m1024_n24_k28672_s9` | tirx | 15.5596 | deepgemm | 17.2941 | 1.111 | — |
+| `m1152_n24_k16384_s8` | tirx | 11.8252 | deepgemm | 12.5618 | 1.062 | — |
+| `m1152_n24_k28672_s8` | tirx | 16.6749 | deepgemm | 18.7612 | 1.125 | — |
+| `m128_n24_k16384_s64` | tirx | 5.1958 | deepgemm | 5.2155 | 1.004 | — |
+| `m128_n24_k28672_s74` | tirx | 6.0959 | deepgemm | 6.1093 | 1.002 | — |
+| `m1344_n24_k16384_s7` | tirx | 12.9229 | deepgemm | 14.0269 | 1.085 | — |
+| `m1344_n24_k28672_s7` | tirx | 18.7020 | deepgemm | 21.1193 | 1.129 | — |
+| `m137_n24_k7680_s16` | tirx | 5.4822 | deepgemm | 5.5098 | 1.005 | — |
+| `m13_n24_k7168_s1` | tirx | 20.9186 | deepgemm | 21.3025 | 1.018 | — |
+| `m1536_n24_k16384_s6` | tirx | 14.2346 | deepgemm | 15.5870 | 1.095 | — |
+| `m1536_n24_k28672_s6` | tirx | 20.2178 | deepgemm | 23.3828 | 1.157 | — |
+| `m1856_n24_k16384_s5` | tirx | 15.8590 | deepgemm | 17.6680 | 1.114 | — |
+| `m1856_n24_k28672_s5` | tirx | 23.7855 | deepgemm | 27.6095 | 1.161 | — |
+| `m192_n24_k16384_s49` | tirx | 5.9152 | deepgemm | 5.9005 | 0.998 | — |
+| `m192_n24_k28672_s49` | tirx | 7.0874 | deepgemm | 7.0325 | 0.992 | — |
+| `m2048_n24_k16384_s4` | tirx | 16.8912 | deepgemm | 19.0994 | 1.131 | — |
+| `m2048_n24_k28672_s4` | tirx | 25.4020 | deepgemm | 30.1459 | 1.187 | — |
+| `m2368_n24_k16384_s4` | tirx | 18.7325 | deepgemm | 21.1567 | 1.129 | — |
+| `m2368_n24_k28672_s4` | tirx | 27.9665 | deepgemm | 32.9271 | 1.177 | — |
+| `m256_n24_k16384_s37` | tirx | 6.3246 | deepgemm | 6.2908 | 0.995 | — |
+| `m256_n24_k28672_s37` | tirx | 8.0263 | deepgemm | 7.9685 | 0.993 | — |
+| `m3136_n24_k16384_s3` | tirx | 22.2348 | deepgemm | 25.9524 | 1.167 | — |
+| `m3136_n24_k28672_s3` | tirx | 34.9758 | deepgemm | 41.8980 | 1.198 | — |
+| `m320_n24_k16384_s29` | tirx | 6.9229 | deepgemm | 6.8445 | 0.989 | — |
+| `m320_n24_k28672_s29` | tirx | 9.0380 | deepgemm | 9.0635 | 1.003 | — |
+| `m384_n24_k16384_s24` | tirx | 7.5321 | deepgemm | 7.4660 | 0.991 | — |
+| `m384_n24_k28672_s24` | tirx | 9.3400 | deepgemm | 9.4518 | 1.012 | — |
+| `m4096_n24_k16384_s2` | tirx | 29.4494 | deepgemm | 34.8818 | 1.184 | — |
+| `m4096_n24_k28672_s16` | tirx | 57.2953 | deepgemm | 62.6528 | 1.094 | — |
+| `m4096_n24_k28672_s2` | tirx | 45.6069 | deepgemm | 54.8153 | 1.202 | — |
+| `m4096_n24_k7168_s1` | tirx | 22.6812 | deepgemm | 23.7696 | 1.048 | — |
+| `m448_n24_k16384_s21` | tirx | 7.8346 | deepgemm | 7.7821 | 0.993 | — |
+| `m448_n24_k28672_s21` | tirx | 10.4344 | deepgemm | 10.5303 | 1.009 | — |
+| `m4736_n24_k16384_s2` | tirx | 32.3831 | deepgemm | 38.0174 | 1.174 | — |
+| `m4736_n24_k28672_s2` | tirx | 50.0892 | deepgemm | 59.9729 | 1.197 | — |
+| `m512_n24_k16384_s18` | tirx | 8.4915 | deepgemm | 8.4071 | 0.990 | — |
+| `m512_n24_k28672_s18` | tirx | 10.5443 | deepgemm | 10.8423 | 1.028 | — |
+| `m576_n24_k16384_s16` | tirx | 8.8630 | deepgemm | 8.8612 | 1.000 | — |
+| `m576_n24_k28672_s16` | tirx | 11.3077 | deepgemm | 11.7092 | 1.036 | — |
+| `m640_n24_k16384_s14` | tirx | 9.0611 | deepgemm | 9.1213 | 1.007 | — |
+| `m640_n24_k28672_s14` | tirx | 11.7550 | deepgemm | 12.5124 | 1.064 | — |
+| `m64_n24_k28672_s112` | tirx | 5.0789 | deepgemm | 5.1138 | 1.007 | — |
+| `m704_n24_k16384_s13` | tirx | 9.8072 | deepgemm | 9.9680 | 1.016 | — |
+| `m704_n24_k28672_s13` | tirx | 12.5693 | deepgemm | 13.4251 | 1.068 | — |
+| `m768_n24_k16384_s12` | tirx | 10.2125 | deepgemm | 10.3831 | 1.017 | — |
+| `m768_n24_k28672_s12` | tirx | 13.0898 | deepgemm | 14.1768 | 1.083 | — |
+| `m8192_n24_k16384_s1` | tirx | 51.5105 | deepgemm | 60.8589 | 1.181 | — |
+| `m8192_n24_k28672_s1` | tirx | 84.2244 | deepgemm | 92.6197 | 1.100 | — |
+| `m832_n24_k16384_s11` | tirx | 10.2201 | deepgemm | 10.3826 | 1.016 | — |
+| `m832_n24_k28672_s11` | tirx | 13.7982 | deepgemm | 15.1474 | 1.098 | — |
+| `m896_n24_k16384_s10` | tirx | 10.5779 | deepgemm | 10.9066 | 1.031 | — |
+| `m896_n24_k28672_s10` | tirx | 14.4737 | deepgemm | 16.0377 | 1.108 | — |
 
 ## flash_attention4
 
