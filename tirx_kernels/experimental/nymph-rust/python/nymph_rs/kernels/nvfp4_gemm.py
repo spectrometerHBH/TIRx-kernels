@@ -349,11 +349,22 @@ GEMM_CONFIGS = {
     #     stalling on the epilogue (0.954 -> 0.978).
     #   * epi_tile=32 — canon's EPI_TILE at 4096. The 32-wide store tile uses the 64B-atom D
     #     swizzle and a better-shaped TMA store; the dominant remaining lever (0.978 -> 0.999).
+    # Re-tuned 2026-07 (post-let batch, 10-round A/B, canon time flat at 29.6us):
+    #   * l2_group_size=4 — the big lever: 0.985 -> 1.005 (per-round 1.005-1.006). The old
+    #     2-row pick came from a shared-GPU sweep under the data-asymmetric bench (which had
+    #     4 at 0.957); under the fair bench + lets the 4-row band wins decisively. l2=8 is
+    #     back at 0.985.
+    #   * maxnreg_epilogue=240 — canon's register-pair direction (ncu had nymph 95 vs canon
+    #     172 regs/thread): raising the epilogue warpgroup cap alone was 0.985 -> 0.990,
+    #     stacked on l2=4: 1.005 -> 1.009/1.010 (224 and 240 tie within noise; 240 kept as
+    #     the wider plateau). maxnreg_producer=56 REGRESSES (0.988), d_depth=3 regresses
+    #     (0.980) — both stay at defaults.
     (4096, 4096, 4096): {
-        "l2_group_size": 2,
+        "l2_group_size": 4,
         "load_cache_hint": None,
         "epilogue": "no_overlap",
         "epi_tile": 32,
+        "maxnreg_epilogue": 240,
     },
     # 8192: the same no-overlap epilogue config as 4096 (see that comment). Under the FAIR
     # bench (both kernels fed identical real data) the default OVERLAP path benches 0.965 vs
