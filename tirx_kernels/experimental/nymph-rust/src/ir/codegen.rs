@@ -403,7 +403,7 @@ fn arg_name(i: usize) -> String {
 
 pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
     let ctx = build_ctx(k)?;
-    let mut out = String::new();
+    let mut out = Emitter::new();
 
     out.push_str(HEADER_IMPORTS);
     out.push_str(MMA_SHARED_LAYOUT_HELPER);
@@ -807,46 +807,119 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
     // ---- walk the body ----
     emit_body(&mut out, &k.body, ind, &ctx, Scope::Function)?;
 
-    Ok(merge_adjacent_guards(&out))
+    Ok(render_lines(merge_guards(out.finish())))
 }
 
-/// Merge ADJACENT identical single-thread guard blocks (`if tid_in_wg == 0:` /
-/// `if T.ptx.elect_sync():`) into one block. Canon writes the epilogue trio as
-/// `if tid%128==0: fence; store; commit` under ONE guard; emitting each op with
-/// its own guard costs a BSSY/BSYNC reconvergence pair per block in SASS (ncu
-/// nvfp4 4096: BSSY +14K / BSYNC +22K vs canon). Both guard predicates are
-/// invariant across adjacent blocks (tid constant; elect.sync re-elects the same
-/// leader with no divergence in between), so folding is semantics-preserving.
-/// Conservative: only exactly-adjacent lines (no blank/other line between).
-fn merge_adjacent_guards(src: &str) -> String {
-    const GUARDS: [&str; 2] = ["if tid_in_wg == 0:", "if T.ptx.elect_sync():"];
-    let lines: Vec<&str> = src.lines().collect();
-    let mut out: Vec<&str> = Vec::new();
+/// One emitted source line: its indent in 4-space units, its text WITHOUT the
+/// leading pad, and an optional single-issue-guard annotation. The annotation
+/// is set at the emission site when the line opens a `if tid_in_wg == 0:` /
+/// `if T.ptx.elect_sync():` single-issue guard block — it is what the guard
+/// merge keys on, so a textually identical line from an IR `If` (or any other
+/// construct) is never mistaken for a single-issue guard.
+#[derive(Clone, PartialEq, Eq)]
+struct Line {
+    indent: usize,
+    text: String,
+    guard: Option<&'static str>,
+}
+
+/// The emission sink: accumulates the source as STRUCTURED lines (not one flat
+/// string) so the guard merge works on the (indent, guard-annotation) line
+/// structure instead of re-parsing text (fragile to blank lines and to
+/// guard-looking non-guard lines). `push_str` keeps the call sites
+/// string-shaped; the sink splits into lines and records each line's indent
+/// (all padding goes through `pad()` = 4-space units).
+struct Emitter {
+    lines: Vec<Line>,
+    /// A line started but not yet `\n`-terminated (a push_str may split mid-line).
+    partial: String,
+}
+
+impl Emitter {
+    fn new() -> Self {
+        Emitter {
+            lines: Vec::new(),
+            partial: String::new(),
+        }
+    }
+
+    fn push_str(&mut self, s: &str) {
+        for chunk in s.split_inclusive('\n') {
+            if let Some(text) = chunk.strip_suffix('\n') {
+                self.partial.push_str(text);
+                self.finish_line();
+            } else {
+                self.partial.push_str(chunk);
+            }
+        }
+    }
+
+    fn push(&mut self, c: char) {
+        if c == '\n' {
+            self.finish_line();
+        } else {
+            self.partial.push(c);
+        }
+    }
+
+    fn finish_line(&mut self) {
+        let text = std::mem::take(&mut self.partial);
+        let indent = (text.len() - text.trim_start().len()) / 4;
+        self.lines.push(Line {
+            indent,
+            text: text.trim_start().to_string(),
+            guard: None,
+        });
+    }
+
+    /// Annotate the line just completed as a single-issue guard head.
+    fn mark_guard(&mut self, guard: &'static str) {
+        if let Some(last) = self.lines.last_mut() {
+            last.guard = Some(guard);
+        }
+    }
+
+    fn finish(mut self) -> Vec<Line> {
+        if !self.partial.is_empty() {
+            self.finish_line();
+        }
+        self.lines
+    }
+}
+
+/// Merge ADJACENT identical single-issue guard blocks (the annotated
+/// `if tid_in_wg == 0:` / `if T.ptx.elect_sync():` lines) into one block.
+/// Canon writes the epilogue trio as `if tid%128==0: fence; store; commit`
+/// under ONE guard; emitting each op with its own guard costs a BSSY/BSYNC
+/// reconvergence pair per block in SASS (ncu nvfp4 4096: BSSY +14K / BSYNC
+/// +22K vs canon). Both guard predicates are invariant across adjacent blocks
+/// (tid constant; elect.sync re-elects the same leader with no divergence in
+/// between), so folding is semantics-preserving. Conservative: only
+/// exactly-adjacent lines (no blank/other line between). Structured: the merge
+/// keys on the emission-site guard annotation and the numeric indent, never on
+/// the line text, so a non-guard line that merely reads the same is untouched.
+fn merge_guards(lines: Vec<Line>) -> Vec<Line> {
+    let mut out: Vec<Line> = Vec::new();
     let mut i = 0usize;
     while i < lines.len() {
-        let line = lines[i];
-        let trimmed = line.trim_start();
-        let indent_len = line.len() - trimmed.len();
-        if GUARDS.contains(&trimmed) {
-            out.push(line);
+        let line = &lines[i];
+        if let Some(guard) = line.guard {
+            let indent = line.indent;
+            out.push(line.clone());
             i += 1;
             loop {
                 // copy the guard's body: lines strictly deeper than the guard
                 while i < lines.len() {
-                    let l = lines[i];
-                    let lt = l.trim_start();
-                    if lt.is_empty() || l.len() - lt.len() <= indent_len {
+                    let l = &lines[i];
+                    if l.text.is_empty() || l.indent <= indent {
                         break;
                     }
-                    out.push(l);
+                    out.push(l.clone());
                     i += 1;
                 }
                 // absorb an immediately-following identical guard at the same depth
-                let dup = i < lines.len() && {
-                    let l = lines[i];
-                    let lt = l.trim_start();
-                    lt == trimmed && l.len() - lt.len() == indent_len
-                };
+                let dup =
+                    i < lines.len() && lines[i].guard == Some(guard) && lines[i].indent == indent;
                 if dup {
                     i += 1; // drop the duplicate guard line; keep copying its body
                 } else {
@@ -854,13 +927,25 @@ fn merge_adjacent_guards(src: &str) -> String {
                 }
             }
         } else {
-            out.push(line);
+            out.push(line.clone());
             i += 1;
         }
     }
-    let mut s = out.join("\n");
-    if src.ends_with('\n') {
-        s.push('\n');
+    out
+}
+
+/// Render the structured lines back to source text: re-pad each line from its
+/// numeric indent, join with newlines, terminate the final line.
+fn render_lines(lines: Vec<Line>) -> String {
+    let mut s = String::new();
+    for l in lines {
+        if l.text.is_empty() {
+            s.push('\n');
+        } else {
+            s.push_str(&pad(l.indent));
+            s.push_str(&l.text);
+            s.push('\n');
+        }
     }
     s
 }
@@ -1360,7 +1445,7 @@ fn reg_view_width(t: &Arc<Tensor>, ctx: &Ctx) -> usize {
 /// `name[:, :]` when it spans the whole tile). The fragment is a `T.wg_reg_tile`,
 /// i.e. already a 2D `(128, full)` warpgroup tile — no `.view()` indirection.
 fn emit_reg_view_slice(
-    _out: &mut String,
+    _out: &mut Emitter,
     _p: &str,
     t: &Arc<Tensor>,
     off: &ScalarValue,
@@ -1847,7 +1932,7 @@ fn emit_tmem_dst(op: &TmemOperand, n: u32, ctx: &Ctx) -> Result<String, String> 
 /// `tcgen05.fence.after_thread_sync()` + ONE `T.cuda.cta_sync()` — not a
 /// fence per wait and no cta_sync (the nymph IR leaves those implicit). (suspect 3)
 fn emit_body(
-    out: &mut String,
+    out: &mut Emitter,
     stmts: &[Stmt],
     indent: usize,
     ctx: &Ctx,
@@ -1928,6 +2013,7 @@ fn emit_body(
             }
             if j - i >= 2 {
                 out.push_str(&format!("{p}if {guard}:\n"));
+                out.mark_guard(guard);
                 for s in &stmts[i..j] {
                     emit_stmt(out, s, indent + 1, ctx, scope, true)?;
                 }
@@ -1973,7 +2059,7 @@ fn single_issue_guard(stmt: &Stmt, scope: Scope, ctx: &Ctx) -> Option<&'static s
 }
 
 fn emit_stmt(
-    out: &mut String,
+    out: &mut Emitter,
     stmt: &Stmt,
     indent: usize,
     ctx: &Ctx,
@@ -1990,13 +2076,15 @@ fn emit_stmt(
     // `if {guard}:` here and indent the body once. Coalesced (`bare == true`): the caller
     // already opened the shared guard at `indent - 1`, so emit the body at `indent` with no
     // guard. `body` is the inner line(s) WITHOUT leading indent or trailing newline.
-    let emit_guarded = |out: &mut String, body: &str| {
+    let emit_guarded = |out: &mut Emitter, body: &str| {
         if bare || scope == Scope::Elected {
             // Coalesced under a shared guard, or the whole role is already elected — emit
             // the single-issue body directly with no per-op `if guard:`.
             out.push_str(&format!("{p}{body}\n"));
         } else {
-            out.push_str(&format!("{p}if {}:\n", scope.issue_guard()));
+            let guard = scope.issue_guard();
+            out.push_str(&format!("{p}if {guard}:\n"));
+            out.mark_guard(guard);
             out.push_str(&format!("{p}    {body}\n"));
         }
     };
@@ -2193,7 +2281,9 @@ fn emit_stmt(
                         "{p}    T.ptx.barrier.cluster.wait(acquire=True, aligned=False)\n"
                     ));
                 }
-                out.push_str(&format!("{p}    if {}:\n", body_scope.issue_guard()));
+                let elect = body_scope.issue_guard();
+                out.push_str(&format!("{p}    if {elect}:\n"));
+                out.mark_guard(elect);
                 emit_body(out, &body[n_lead..], indent + 2, ctx, Scope::Elected)?;
             } else {
                 emit_body(out, body, indent + 1, ctx, body_scope)?;
@@ -2439,7 +2529,9 @@ fn emit_stmt(
                 // requires both operands be bool. `cbx == 0` is warp-uniform, so nesting
                 // is equivalent (all lanes take the same branch, then elect one).
                 out.push_str(&format!("{p}if cbx == 0:\n"));
-                out.push_str(&format!("{p}    if {}:\n", scope.issue_guard()));
+                let guard = scope.issue_guard();
+                out.push_str(&format!("{p}    if {guard}:\n"));
+                out.mark_guard(guard);
                 out.push_str(&format!(
                     "{p}        T.ptx.mbarrier.arrive.expect_tx({view}.ptr_to([{slot}]), {total_bytes})\n"
                 ));
@@ -3045,6 +3137,7 @@ fn emit_stmt(
                         out.push_str(&format!("{p}T.ptx.fence.proxy_async(\"shared::cta\")\n"));
                     } else {
                         out.push_str(&format!("{p}if tid_in_wg == 0:\n"));
+                        out.mark_guard("tid_in_wg == 0");
                         out.push_str(&format!(
                             "{p}    T.ptx.fence.proxy_async(\"shared::cta\")\n"
                         ));
@@ -3139,7 +3232,7 @@ fn emit_stmt(
         // rhs the alpha literal (or vice versa).
         RegMul { dst, lhs, rhs } => {
             let zero = ScalarValue::Int(0);
-            let reg_op = |op: &RegOperand, out: &mut String| -> Result<String, String> {
+            let reg_op = |op: &RegOperand, out: &mut Emitter| -> Result<String, String> {
                 match op {
                     RegOperand::Slice(s) => {
                         let off = s.offsets.first().unwrap_or(&zero);
@@ -3531,5 +3624,73 @@ mod tests {
                 .contains("must only be used by TmaLoad/expect_tx"),
             "{err}"
         );
+    }
+
+    /// The structured guard merge keys on the emission-site annotation, not the
+    /// line text: adjacent single-issue guards coalesce, but an IR `If` whose
+    /// condition happens to read like a guard (`tid_in_wg == 0`) is NOT merged
+    /// into them — the old text peephole could not tell the two apart.
+    #[test]
+    fn guard_merge_uses_the_annotation_not_the_text() {
+        use super::super::dtype::MBarKind;
+        use super::super::mbar::{MBar, MBarRef};
+        let mbar = Arc::new(MBar {
+            id: 5,
+            kind: MBarKind::Thread,
+            stages: 1,
+            arrive_count: None,
+            leader_routed: false,
+        });
+        let init = || Stmt::MBarrierInit {
+            mbar: MBarRef {
+                mbar: mbar.clone(),
+                remote_coord: None,
+            },
+            count: 1,
+            stage: None,
+        };
+        // wg role body: single-issue init, then an IR If with a guard-looking
+        // condition, then another single-issue init.
+        let body = vec![
+            init(),
+            Stmt::If {
+                cond: ScalarValue::expr(
+                    ScalarOp::Eq,
+                    vec![
+                        ScalarValue::Scope(ScopeValueKind::TidInWg),
+                        ScalarValue::Int(0),
+                    ],
+                ),
+                then_body: vec![Stmt::WgSync { barrier_id: 0 }],
+            },
+            init(),
+        ];
+        let role = Stmt::Role {
+            body,
+            warp: None,
+            warpgroup: Some(0),
+            elected: false,
+            maxnreg: None,
+        };
+        let src = kernel_to_tirx_source(&kernel(vec![Stmt::MBarDef { mbar: mbar.clone() }, role]))
+            .unwrap();
+        // Two annotated single-issue guard blocks (the If splits the run) —
+        // the merge must NOT fold the If into them, so `if tid_in_wg == 0:`
+        // appears exactly 3 times: two guards + the IR If.
+        let count = src.matches("if tid_in_wg == 0:").count();
+        assert_eq!(count, 3, "{src}");
+        // And the two adjacent inits inside ONE guard when the If is absent.
+        let role2 = Stmt::Role {
+            body: vec![init(), init()],
+            warp: None,
+            warpgroup: Some(0),
+            elected: false,
+            maxnreg: None,
+        };
+        let src2 =
+            kernel_to_tirx_source(&kernel(vec![Stmt::MBarDef { mbar: mbar.clone() }, role2]))
+                .unwrap();
+        assert_eq!(src2.matches("if tid_in_wg == 0:").count(), 1, "{src2}");
+        assert_eq!(src2.matches("mbarrier.init").count(), 2, "{src2}");
     }
 }
