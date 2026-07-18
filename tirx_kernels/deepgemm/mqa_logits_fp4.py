@@ -282,15 +282,8 @@ def prepare_data(**kwargs: Any) -> dict[str, Any]:
 
 
 def _mqa_fp4_wrelu_reduce_src(num_heads: int) -> str:
-    """Inline CUDA for the weighted-ReLU reduce over heads: sum_h relu(accum[h]) * weights[h].
-
-    Verbatim DeepGEMM SM100 MQA-logits f32 epilogue (sm100_mqa_logits.cuh): relu via
-    the packed abs-trick `x + |x|` (= 2*relu(x), FADD2 with free fabs modifiers) fused
-    into `__ffma2_rn` with two float2 accumulators, tail `(sum.x + sum.y) / 2` to
-    cancel the factor 2. This is 1 FADD2 + 1 FFMA2 per 2 heads instead of per-head
-    FMNMX + separate mul — matching DeepGEMM's SASS instruction mix. Emitted as a
-    kernel-local helper via `T.cuda_func_call` (deduped by name).
-    """
+    """DeepGEMM f32 wrelu epilogue (sm100_mqa_logits.cuh): relu as x+|x| packed into
+    FADD2+FFMA2, tail /2; emitted as a kernel-local helper via T.cuda_func_call."""
     return (
         f"__forceinline__ __device__ float tvm_builtin_mqa_fp4_wrelu_reduce_{num_heads}("
         "const float* __restrict__ accum, const float* __restrict__ weights) {\n"
@@ -368,11 +361,8 @@ def get_kernel(**kwargs: Any):
     # cp deposit dst: sf_per_mma is the cp atom (<= epc=4 so t_col stays a single
     # iter); SF_K//4 K-outer groups absorb the num_sfkv/128 row chunks.
     sf_tmem_kv_layout = sf_tmem_layout(128, SF_K=num_sfkv // 32, sf_per_mma=head_dim // 32)
-    # cp (SMEM->TMEM UTCCP) SMEM-side layouts read by the T.copy_async SF
-    # dispatch: the post-transpose bytes ARE the canonical sf_smem_layout, with
-    # rows = one warpx4 super-block (128); SF_K = num_sf/32 columns (the
-    # num_sf/128 row chunks ride the K-outer dim at stride 512, matching the TMEM
-    # dst's K-outer); sf_per_mma = cp atom = head_dim/sf_vec.
+    # cp (SMEM->TMEM UTCCP) SMEM-side layouts: post-transpose bytes ARE the canonical
+    # sf_smem_layout, with sf_per_mma = cp atom = head_dim/sf_vec.
     sf_cp_K = head_dim // 32
     sf_smem_q_cp_layout = sf_smem_layout(
         128, SF_K=num_sfq // 32, sf_per_mma=sf_cp_K, pipe_depth=num_q_stages
@@ -387,15 +377,8 @@ def get_kernel(**kwargs: Any):
         T.evaluate(T.ptx.griddepcontrol.wait())
 
     def emit_sf_transpose(buf, lane, stage_idx, elem_base):
-        # Warp-collective 128-uint32 SF chunk transpose, DeepGEMM's
-        # utccp_required_smem_warp_transpose shape: each lane reads 4x
-        # stride-32 uint32, warp_sync, then ONE st.shared.v4 to the
-        # lane-contiguous post-transpose address (the post layout places
-        # elements (a=0..3, b=lane) consecutively at lane*4). Replaces
-        # the scalar LDS/STS permute_layout (~106K scalar STS per
-        # launch) with vectorized stores. Plain Python helper (NOT
-        # @T.inline): the parser executes it eagerly at the call site,
-        # so plain Python locals double as the 4 staging registers.
+        # DeepGEMM's st.shared.v4 SF transpose (4x ld + 1 v4 store), not scalar LDS/STS.
+        # Plain Python helper: the parser executes it eagerly at the call site.
         v0 = T.ptx.ld(
             buf.ptr_to([stage_idx, elem_base + 0 * 32 + lane]), "uint32", "u32", space="shared"
         )
@@ -437,12 +420,8 @@ def get_kernel(**kwargs: Any):
         sf_kv_gmem_h: T.handle,
         weights_gmem_h: T.handle,
     ):
-        # Option B: seq_len / seq_len_kv are RUNTIME (symbolic), like DeepGEMM — one
-        # compiled kernel serves any length, no recompile. Everything structural
-        # (head_dim, num_heads, block_*, stages, dtype) stays compile-time JIT. The
-        # gmem/logits buffers are match_buffer'd against the runtime lengths; the
-        # cuTensorMap descriptors are host-built per launch from these dims.
-        # match_buffer must precede device_entry / any let-binding -> cast inline.
+        # seq_len / seq_len_kv are RUNTIME like DeepGEMM: one compiled kernel serves any
+        # length; structure stays compile-time. match_buffer must precede device_entry.
         cu_seq_len_k_start = T.match_buffer(cu_seq_len_k_start_h, (seq_len,), "int32")
         cu_seq_len_k_end = T.match_buffer(cu_seq_len_k_end_h, (seq_len,), "int32")
         logits = T.match_buffer(
@@ -476,12 +455,8 @@ def get_kernel(**kwargs: Any):
         warp_idx = T.warp_id([num_warps])
         warpgroup_idx = T.warpgroup_id([num_warps // 4])
         lane_idx = T.lane_id([32])
-        # SMEM via SMEMPool (auto-buffer + commit): the bump allocator owns the
-        # offsets (no manual smem_*_offset math). q/kv carry an explicit 64B-atom
-        # swizzle layout (head_dim//2 = 64 B/row); their fp4 MMA views are
-        # .view("float4_e2m1fn") of the same bytes. NOTE: anything that needs a
-        # buffer's start pointer must use .ptr_to([0,...]) / .view (which carry
-        # elem_offset), NOT .data — under the pool .data is the arena base.
+        # SMEMPool owns the smem offsets; q/kv carry a 64B-atom swizzle (head_dim//2
+        # B/row). Under the pool .data is the arena base — use .ptr_to([0,...])/.view.
         pool = T.SMEMPool()
         smem_q = pool.alloc(
             (num_q_stages, block_q * num_heads, head_dim // 2),
@@ -504,9 +479,8 @@ def get_kernel(**kwargs: Any):
             ),
         )
         smem_sf_q = pool.alloc((num_q_stages, num_sfq), "uint32", align=16)
-        # 2D (block_q, num_heads) view for the copy_async(tma) dst. A fresh decl_buffer
-        # (default 3D row-major layout), NOT smem_sf_q.view(shape) — the shape-view
-        # keeps the source's rank-2 layout, which mis-maps the 3D TMA write.
+        # 2D view for the copy_async(tma) dst: a fresh decl_buffer, NOT .view(shape)
+        # (the shape-view keeps the rank-2 layout and mis-maps the 3D TMA write).
         smem_sf_q_2d = T.decl_buffer(
             (num_q_stages, block_q, num_heads),
             "uint32",
@@ -517,18 +491,8 @@ def get_kernel(**kwargs: Any):
         )
         smem_sf_kv = pool.alloc((num_kv_stages, num_sfkv), "uint32", align=16)
         smem_weights = pool.alloc((num_q_stages, block_q, num_heads), "float32", align=16)
-        # Per-pipeline producer/consumer barrier pairs as Pipeline objects (replacing
-        # the flat smem_barriers buffer + manual init/wait/arrive helpers). full =
-        # data ready, empty = slot free. The Pipeline constructor allocs both barriers
-        # from the pool (same order/offsets as the old flat layout: full_q, empty_q,
-        # full_kv, empty_kv, full_tmem, empty_tmem) and runs mbarrier.init (thread 0)
-        # with the counts below — so there is no separate init loop; only the
-        # fence.mbarrier_init + cta_sync before first use remain.
-        #   q_pipe:    TMA load   -> MMA + math consumers; empty freed by every
-        #              reader, so empty count = num_math_threads + the MMA warp (32).
-        #   kv_pipe:   TMA load   -> MMA consumer; empty freed by tcgen05.commit.
-        #   tmem_pipe: MMA commit -> math consumers; empty freed by mbarrier.arrive
-        #              (one math warpgroup = 128 threads per tmem stage).
+        # Producer/consumer barrier pairs as Pipeline objects (full = data ready, empty
+        # = slot free); each Pipeline runs mbarrier.init itself, no separate init loop.
         q_pipe = Pipeline(
             pool,
             num_q_stages,
@@ -545,13 +509,8 @@ def get_kernel(**kwargs: Any):
         )
         tmem_ptr_in_smem = pool.alloc((1,), "uint32", align=4)
         pool.commit()
-        # TMEM via TMEMPool: the bump allocator owns the column offsets (replacing
-        # the hand-computed allocated_addr / tmem_start_col math). TMEMPool.alloc
-        # gives a CONSTANT col_start (0-based), so the accumulator stays at a constant
-        # 0 base -> the epilogue tcgen05.ld folds the base into the col offset instead
-        # of reloading tmem_ptr_in_smem[0] from smem each hot-loop iter (asserted == 0
-        # below). The manual tcgen05.alloc/dealloc keep the lifecycle. move_base_to
-        # overlaps the SF columns inside the over-declared accumulator span.
+        # TMEMPool gives a CONSTANT 0-based col_start so tcgen05.ld folds the base into
+        # the col offset; move_base_to overlaps the SF cols in the accumulator span.
         tmem_pool = T.TMEMPool(
             pool, total_cols=num_tmem_cols, cta_group=1, tmem_addr=tmem_ptr_in_smem
         )
@@ -600,9 +559,7 @@ def get_kernel(**kwargs: Any):
             schedule_result[0] = schedule_start
             schedule_result[1] = num_kv_blocks
 
-        # The Pipeline constructors above already ran mbarrier.init (thread 0); this
-        # fence makes those inits visible, and the cta_sync below publishes them
-        # CTA-wide before the first wait/arrive.
+        # Pipeline constructors already ran mbarrier.init; fence + cta_sync publish them.
         T.ptx.fence.mbarrier_init()
 
         if warp_idx == spec_warp_start + 2:
@@ -617,9 +574,8 @@ def get_kernel(**kwargs: Any):
         if warp_idx == spec_warp_start:
             T.ptx.setmaxnreg(False, 56)
             if T.ptx.elect_sync():
-                # Ring cursors with subtract-wrap (DeepGEMM RingPipeline): avoids
-                # `% kNumStages` / `// kNumStages`, which ptxas lowers into
-                # magic-number division on these hot paths.
+                # Ring cursors with subtract-wrap (DeepGEMM RingPipeline): avoids ptxas
+                # magic-number division for `% kNumStages` on these hot paths.
                 q_stage_idx: T.uint32 = T.uint32(0)
                 q_phase: T.uint32 = T.uint32(0)
                 q_idx: T.uint32 = sm_idx
@@ -689,7 +645,7 @@ def get_kernel(**kwargs: Any):
                             mbar=kv_pipe.full.ptr_to([kv_stage_idx]),
                             cta_group=1,
                             cache_hint="evict_normal",
-                        prefetch_tensormap=True,
+                            prefetch_tensormap=True,
                         )
                         Tx.copy_async(
                             smem_sf_kv[kv_stage_idx, 0:block_kv],
@@ -698,7 +654,7 @@ def get_kernel(**kwargs: Any):
                             mbar=kv_pipe.full.ptr_to([kv_stage_idx]),
                             cta_group=1,
                             cache_hint="evict_normal",
-                        prefetch_tensormap=True,
+                            prefetch_tensormap=True,
                         )
                         kv_pipe.full.arrive(
                             kv_stage_idx,
@@ -714,14 +670,8 @@ def get_kernel(**kwargs: Any):
             T.ptx.setmaxnreg(False, 56)
             T.cuda.trap_when_assert_failed(tmem_ptr_in_smem[0] == T.uint32(0))
             desc_i: T.uint32
-            # GAP 1: encode the block-scaled instruction descriptor ONCE here
-            # (above the q/kv/math_wg loops). The T.gemm_async D-MMA below is
-            # passed ``descI=desc_i``; with the gemm_async decouple fix that path
-            # copies desc_i to a per-call local and still does the per-ki sf_id
-            # ``runtime_instr_desc`` rotation — so the encode_instr_descriptor
-            # intrinsic is emitted exactly once for the whole kernel (matching the
-            # hand-rolled original) instead of once per gemm_async call (2x: once
-            # per math warpgroup).
+            # GAP 1: encode the block-scaled instruction descriptor ONCE here; the
+            # gemm_async path rotates the per-ki SF id from this single desc_i.
             T.ptx.tcgen05.encode_instr_descriptor_block_scaled(
                 T.address_of(desc_i),
                 d_dtype="float32",
@@ -738,28 +688,20 @@ def get_kernel(**kwargs: Any):
                 trans_b=False,
                 n_cta_groups=1,
             )
-            # REGION D operand views: fp4 over the same packed-uint8 smem bytes.
-            # .view down-casts uint8->fp4 (halves the byte count -> head_dim//2 ->
-            # head_dim cols, unpacks the 64B swizzle) AND carries elem_offset, so it
-            # gives the true buffer start under the pool (unlike reinterpret(.data)).
+            # REGION D operand views: fp4 over the packed-uint8 smem bytes; .view also
+            # carries elem_offset, giving the true buffer start under the pool.
             smem_kv_fp4 = smem_kv.view("float4_e2m1fn")
             smem_q_fp4 = smem_q.view("float4_e2m1fn")
-            # e8m0 views of the same SF SMEM under the cp (sf_smem) layout, the
-            # SMEM source for T.copy_async into the SF TMEM. Declared at the
-            # natural (rows=128, SF_K) SF footprint so the copy region matches
-            # the (128, SF_K) SF TMEM tile; the lane/super-block packing lives
-            # in sf_smem_*_cp_layout, not in the buffer shape.
+            # e8m0 views of the SF SMEM under the cp (sf_smem) layout, declared at the
+            # (rows=128, SF_K) footprint matching the SF TMEM tile.
             smem_sf_q_cp = smem_sf_q.view("float8_e8m0fnu").view(
                 num_q_stages, 128, num_sfq // 32, layout=sf_smem_q_cp_layout
             )
             smem_sf_kv_cp = smem_sf_kv.view("float8_e8m0fnu").view(
                 num_kv_stages, 128, num_sfkv // 32, layout=sf_smem_kv_cp_layout
             )
-            # SFA/SFB TMEM views in the dispatcher-canonical sf_tmem_layout (the
-            # gemm validator expects sf_per_mma == sf_mma_k = 2 for fp4+e8m0, not
-            # the 8 the cp-side buffers carry). Same TMEM columns (allocated_addr)
-            # as the SF cp deposits: SFB(=Q) at tmem_start_col_of_sfq; SFA(=KV) at
-            # tmem_start_col_of_sfkv (+math_wg_i*4 chosen per warpgroup below).
+            # SFA/SFB TMEM views in the dispatcher-canonical sf_tmem_layout (sf_per_mma
+            # == 2 for fp4+e8m0); same TMEM columns as the SF cp deposits.
             sf_mma_k_dispatch = T.meta_var(umma_k // 32)  # fp4 SF_VEC=32 -> 2 SFs/MMA-K
             sf_K_dispatch = T.meta_var((umma_k // 32) * (head_dim // umma_k))
             sf_tmem_q_mma_layout = T.meta_var(
@@ -796,42 +738,26 @@ def get_kernel(**kwargs: Any):
                 kv_idx: T.uint32 = T.uint32(0)
                 while kv_idx < num_kv_blocks:
                     kv_pipe.full.wait(kv_stage_idx, kv_phase)
-                    # Transpose per 128-uint32 chunk (P=4, [4,32]) with a fence PER
-                    # chunk (transpose0→fence, transpose1→fence), matching the
-                    # hand-rolled deposit's interleaving — NOT both transposes then
-                    # a single trailing fence. The interleaved form preserves the
-                    # SF-deposit→cp→MMA instruction schedule the latency-bound
-                    # bf16-dense epilogue depends on.
+                    # Transpose per 128-uint32 chunk with a fence PER chunk (interleaved
+                    # transpose/fence), matching the hand-rolled deposit's schedule.
                     emit_sf_transpose(smem_sf_kv, lane_idx, kv_stage_idx, 0)
                     T.ptx.fence.proxy_async("shared::cta")
                     emit_sf_transpose(smem_sf_kv, lane_idx, kv_stage_idx, num_utccp_aligned_elems)
                     T.ptx.fence.proxy_async("shared::cta")
-                    # cp + MMA share ONE elect scope (matching the hand-rolled
-                    # deposit): copy_async needs the thread scope, and folding the
-                    # MMA issue into it drops a redundant elect.sync per kv-iter and
-                    # lets the cp overlap the MMA setup.
+                    # cp + MMA share ONE elect scope: drops a redundant elect.sync per
+                    # kv-iter and lets the cp overlap the MMA setup.
                     if T.ptx.elect_sync():
                         Tx.copy_async(
                             sfkv_tmem, smem_sf_kv_cp[T.cast(kv_stage_idx, "int32")], cta_group=1
                         )
                         for math_wg_i in T.unroll(0, num_math_warpgroups):
                             tmem_addr: T.uint32 = tmem_stage_idx * T.uint32(umma_n)
-                            # int32 column base for the C-accumulator slice (the
-                            # gemm dispatch's C layout check compares the slice
-                            # extent dtype; a uint32 base would promote the N=umma_n
-                            # extent to uint32 and fail StructuralEqual vs int32).
+                            # int32 column base: a uint32 base would promote the slice
+                            # extent and fail the gemm dispatch's StructuralEqual check.
                             tmem_col_start: T.int32 = T.cast(tmem_addr, "int32")
                             tmem_pipe.empty.wait(tmem_stage_idx, tmem_phase ^ T.uint32(1))
-                            # REGION D: block-scaled fp4 UMMA (KV @ Qᵀ -> TMEM logits
-                            # accumulator) as the T.gemm_async tile primitive. It runs
-                            # the head_dim//umma_k=2 K-loop internally, builds the A/B
-                            # matrix descriptors (swizzle=2), and — with descI hoisted
-                            # + passed below — copies desc_i to a per-call local and
-                            # rotates the per-ki SF id (k*2) via runtime_instr_desc,
-                            # emitting tcgen05.mma.block_scale + enable_input_d=(k!=0).
-                            # Operand order (D, A=KV, B=Q) with SFA=KV-scales /
-                            # SFB=Q-scales in TMEM (sfa@388+wg*4, sfb@384) matches the
-                            # original hand-rolled block-scaled UMMA exactly.
+                            # REGION D: block-scaled fp4 UMMA (KV @ Qᵀ) via gemm_async;
+                            # operand order (D, A=KV, B=Q) with SFA=KV / SFB=Q scales in TMEM.
                             sfkv_tmem_mma = T.decl_buffer(
                                 (128, sf_K_dispatch),
                                 "float8_e8m0fnu",
@@ -854,11 +780,7 @@ def get_kernel(**kwargs: Any):
                                 dispatch="tcgen05",
                                 cta_group=1,
                                 # Recompute the SMEM descriptor per MMA (cvta on the
-                                # uniform datapath). The kv-stage index lands in a regular
-                                # register here, so the default "hoist" path costs an R2UR
-                                # per MMA (~+3% on this latency-bound kernel). See the
-                                # gemm_async tcgen05 dispatch for the hoist-vs-recompute
-                                # rationale.
+                                # uniform datapath); "hoist" costs an R2UR per MMA here.
                                 smem_desc="recompute",
                             )
                             tmem_pipe.full.arrive(tmem_stage_idx)
@@ -907,13 +829,8 @@ def get_kernel(**kwargs: Any):
                             tmem_addr: T.uint32 = tmem_stage_idx * T.uint32(umma_n) + T.uint32(
                                 q_inner_i * num_heads
                             )
-                            # REGION E: TMEM->register read of the logits accumulator via
-                            # tile primitive (one tcgen05.ld.32x32b.x64 — the 2x x32
-                            # split was A/B-tested twice for THIS kernel and is slower
-                            # both times, unlike fp8 where the split wins).
-                            # accum stays a flat per-thread (num_heads,) buffer for the
-                            # wrelu reduce below; the 2-D (128, num_heads) view of the
-                            # SAME per-thread bytes re-emits the .32x32b tcgen05.ld.
+                            # REGION E: TMEM->register read as one tcgen05.ld.32x32b.x64
+                            # (unlike fp8's 2x x32 split); accum stays flat for the wrelu reduce.
                             accum_2d = accum.view(128, num_heads, layout=wg_local_layout(num_heads))
                             Tx.warpgroup.copy_async(
                                 accum_2d, tmem[:, tmem_addr : tmem_addr + num_heads]
@@ -921,9 +838,7 @@ def get_kernel(**kwargs: Any):
                             T.ptx.tcgen05.wait.ld()
                             if q_inner_i == block_q - 1:
                                 tmem_pipe.empty.arrive(tmem_stage_idx)
-                            # Weighted-ReLU reduce via kernel-local inline CUDA —
-                            # verbatim DeepGEMM f32 epilogue (packed abs-trick FADD2
-                            # + FFMA2, see _mqa_fp4_wrelu_reduce_src).
+                            # Weighted-ReLU reduce via inline CUDA (see _mqa_fp4_wrelu_reduce_src).
                             result_f32: T.float32 = cuda_func_call(
                                 f"tvm_builtin_mqa_fp4_wrelu_reduce_{num_heads}",
                                 T.address_of(accum[0]),
@@ -932,22 +847,16 @@ def get_kernel(**kwargs: Any):
                                 return_type="float32",
                             )
                             result = T.cast(result_f32, logits_tir_dtype)
-                            # Per-token logits base offset (DeepGEMM's form): an
-                            # IMAD.WIDE per store. Keeping a per-q-block array of these
-                            # u64 offsets live across the loop makes ptxas spill the
-                            # store address to local memory at 224 regs.
+                            # Per-token logits base offset (an IMAD.WIDE per store): a
+                            # per-q-block u64 offset array would spill at 224 regs.
                             q_offset: T.uint64 = T.cast(
                                 q_idx * T.uint32(block_q) + T.uint32(q_inner_i), "uint64"
                             ) * T.cast(logits_stride, "uint64")
                             if config.compressed_logits:
                                 row_k_start: T.uint32 = seq_k_start[q_inner_i]
                                 row_k_end: T.uint32 = seq_k_end[q_inner_i]
-                                # Range-guarded store with per-operand u64 casts
-                                # `q_offset + (u64)kv - (u64)rks`: if-converts to a
-                                # predicated `@P STG` here (the clamp-to-padding
-                                # unconditional-store variant was A/B-tested and is
-                                # slower for THIS kernel — its fp4 guard already
-                                # predicates cleanly, unlike fp8's).
+                                # Range-guarded store: if-converts to a predicated @P STG
+                                # for this kernel (unlike fp8's clamp-to-padding variant).
                                 if row_k_start <= kv_offset and kv_offset < row_k_end:
                                     store_logits(
                                         q_offset
@@ -1011,11 +920,7 @@ def _compile_tirx_mqa_for_config(
     )
     with target:
         mod = tvm.IRModule({"main": kernel})
-        # TVM's NVRTC path appends --use_fast_math (=> -ftz=true); the FTZ abs in
-        # the wrelu epilogue then cannot fold into the packed FADD2 operand
-        # modifier, doubling that instruction count vs DeepGEMM (which compiles
-        # non-FTZ). Undo just the FTZ bit for this kernel (appended last by the
-        # tvm.support.nvcc NVRTC path, so it overrides the default).
+        # --ftz=false lets abs fold into FADD2 operand modifiers (ftz blocks it).
         os.environ["TVM_CUDA_NVRTC_EXTRA_OPTS"] = "--ftz=false"
         return tvm.compile(mod, target=target, tir_pipeline="tirx")
 
@@ -1024,12 +929,8 @@ _compile_tirx_mqa_for_config = cache(_compile_tirx_mqa_for_config)
 
 
 def _compile_tirx_mqa(config: MQALogitsConfig, max_seqlen_k: int) -> Any:
-    # Option B: the generated kernel does NOT depend on seq_len / seq_len_kv /
-    # disable_cp / logits_stride (all RUNTIME now — see the match_buffer'd gmem
-    # buffers + runtime logits_stride). Pass canonical values for those so the
-    # compile cache dedups to ONE kernel per *structural* config
-    # (num_heads, head_dim, logits_dtype, compressed_logits, num_sms) — exactly like
-    # DeepGEMM, which templates on structure and takes the lengths at runtime.
+    # The kernel is independent of seq_len/seq_len_kv/disable_cp/logits_stride (all
+    # runtime): canonical values let the cache dedup to one kernel per structural config.
     return _compile_tirx_mqa_for_config(
         seq_len=config.block_q,
         seq_len_kv=config.block_kv,
@@ -1082,10 +983,8 @@ def _run_tirx_invocation(data: dict[str, Any], invocation: dict[str, Any]) -> to
     config: MQALogitsConfig = data["config"]
     executable = invocation["executable"]
     logits = invocation["logits"]
-    # All five GMEM->SMEM bulk loads are TIRx copy_async(dispatch="tma") tile
-    # primitives; pass the raw tensors as gmem buffers (the cuTensorMap
-    # descriptors are built in-kernel by the copy dispatch). The packed-fp4
-    # Q/KV are reinterpreted as uint8 (sub-byte dtypes aren't TMA-addressable).
+    # The GMEM->SMEM loads are in-kernel copy_async(tma); packed-fp4 Q/KV are passed as
+    # uint8 (sub-byte dtypes aren't TMA-addressable).
     q_fp4, sf_q = data["q_in"]
     kv_fp4, sf_kv = data["kv_in"]
     weights = data["weights"]
