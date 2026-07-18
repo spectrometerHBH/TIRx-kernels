@@ -44,10 +44,50 @@ import tvm
 from tvm.ir.type import PointerType, PrimType
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
-from tvm.tirx.cuda.operator.tile_primitive.tma_utils import mma_shared_layout
-from tvm.tirx.layout import R, S, TCol, TileLayout, TLane
+from tvm.tirx.layout import ComposeLayout, R, S, TCol, TileLayout, TLane
 from tvm.tirx.layout import tid_in_wg as axis_tid_in_wg
 ";
+
+/// Vendored `mma_shared_layout(dtype, swizzle_mode, shape)` — a faithful port of
+/// TVM's `tile_primitive.tma_utils.mma_shared_layout`, emitted into the source so
+/// the generated file depends only on the PUBLIC `tvm.tirx.layout` algebra
+/// (`ComposeLayout`/`TileLayout`/`S`), not the TVM-private
+/// `tvm.tirx.cuda.operator.tile_primitive.tma_utils` import path. Same
+/// swizzle-atom math: the no-swizzle mode is the packed-16B atom; modes 1/2/3
+/// tile the (8, 256/512/1024-bit) MMA atom over the tile via `tile_to`.
+const MMA_SHARED_LAYOUT_HELPER: &str = r#"
+def mma_shared_layout(dtype, swizzle_mode, shape):
+    """MMA-compatible shared-memory layout for shape and dtype (vendored from
+    tvm.tirx.cuda.operator.tile_primitive.tma_utils so the emitted source has
+    no TVM-private import). Same default tiling of the TMA atom layout."""
+    bits = tvm.DataType(dtype).bits
+    if swizzle_mode == 0:
+        # No-swizzle MMA smem is the packed-16B atom: offset e16*m +
+        # M*e16*(k//e16) + k%e16 (e16=128/bits); plain tile if K % e16 != 0.
+        e16 = 128 // bits
+        m, k = int(shape[-2]), int(shape[-1])
+        if k % e16 == 0:
+            lead = [int(s) for s in shape[:-2]]
+            extents = [*lead, m, k // e16, e16]
+            strides = []
+            stride = m * k
+            for e in reversed(lead):
+                strides.insert(0, stride)
+                stride *= e
+            strides += [e16, m * e16, 1]
+            return TileLayout(S[tuple(extents) : tuple(strides)]).canonicalize()
+        return TileLayout(S[tuple(shape)]).canonicalize()
+    # The (8, 256/512/1024-bit) swizzle atom for modes 1/2/3, in element units.
+    atom_shape = {1: [8, 256], 2: [8, 512], 3: [8, 1024]}[swizzle_mode]
+    atom_shape[-1] //= bits
+    atom_shape = [1] * (len(shape) - len(atom_shape)) + atom_shape
+    per_element = (128 // bits).bit_length() - 1
+    period = 1 << (per_element + swizzle_mode + 3)
+    layout = ComposeLayout(per_element, swizzle_mode, 3, TileLayout(S[(period,)]))
+    tile_to_shape = list(atom_shape)
+    tile_to_shape[-2] = shape[-2]
+    return layout.tile_to(tile_to_shape, atom_shape).tile_to(shape, tile_to_shape).canonicalize()
+"#;
 
 /// SF SMEM/GMEM physical layout, computed HERE from the fixed nvfp4 SF formula
 /// (128-row super-blocks, epc=4) instead of importing TVM's `sf_smem_layout`.
@@ -324,6 +364,16 @@ fn swizzle_for_row_bytes(row_bytes: usize) -> u8 {
     }
 }
 
+/// Hardware thread-width constants: lanes per warp (the PTX warp width) and
+/// threads per warpgroup. A warpgroup is 4 warps = 128 threads on sm_90/100,
+/// and the tcgen05 TMEM datapath is 128 lanes tall — silicon invariants, NOT
+/// kernel parameters. The launch config only decides the warpgroup COUNT
+/// (`num_warps / WG_WARPS`, validated a multiple of 4 by `validate`), never
+/// these widths, so they stay named constants rather than per-kernel inputs.
+const WARP_LANES: usize = 32;
+const WG_WARPS: usize = 4;
+const WG_THREADS: usize = WG_WARPS * WARP_LANES; // 128; == TMEM lane rows
+
 /// Indent helper.
 fn pad(indent: usize) -> String {
     "    ".repeat(indent)
@@ -345,6 +395,7 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
     let mut out = String::new();
 
     out.push_str(HEADER_IMPORTS);
+    out.push_str(MMA_SHARED_LAYOUT_HELPER);
     out.push('\n');
 
     // Argument tensors, named by position (A, B, C, D, …). The fp16/bootstrap GEMM
@@ -458,7 +509,7 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
     out.push('\n');
 
     let num_warps = k.num_warps;
-    let num_wg = num_warps / 4;
+    let num_wg = num_warps as usize / WG_WARPS;
     out.push_str(&format!("{p}T.device_entry()\n", p = pad(ind)));
     // INVARIANT I1a: persistent grid, 1 CTA/SM. Without this the compiler may
     // place 2 CTAs/SM, the software-pipelined steady state drifts under the warp
@@ -472,8 +523,27 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
         p = pad(ind),
         n = num_warps
     ));
+    // The cluster-scope ids come from the kernel's cluster_shape (a 1-D shape
+    // (n,) is the x extent, y=1). The emitted form names exactly two ids
+    // (cbx/cby, the leader/peer selectors used below), so a cluster of rank >2
+    // has no emission form — fail closed rather than drop a dimension.
+    let (cx, cy) = match k.cluster_shape.as_slice() {
+        [x] => (*x, 1usize),
+        [x, y] => (*x, *y),
+        other => {
+            return Err(format!(
+                "codegen: cluster_shape {other:?} has no cta_id_in_cluster emission \
+                 (only rank-1 (x,) or rank-2 (x, y) clusters are supported)"
+            ));
+        }
+    };
+    if cx == 0 || cy == 0 {
+        return Err(format!(
+            "codegen: cluster_shape dims must be positive (got [{cx}, {cy}])"
+        ));
+    }
     out.push_str(&format!(
-        "{p}cbx, cby = T.cta_id_in_cluster([2, 1], preferred=[2, 1])\n",
+        "{p}cbx, cby = T.cta_id_in_cluster([{cx}, {cy}], preferred=[{cx}, {cy}])\n",
         p = pad(ind)
     ));
     // The kernel→cta axis extent is the TOTAL launched CTA count, NOT the cluster
@@ -495,8 +565,9 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
         n = num_wg
     ));
     out.push_str(&format!(
-        "{p}tid_in_wg = T.thread_id_in_wg([128])\n",
-        p = pad(ind)
+        "{p}tid_in_wg = T.thread_id_in_wg([{wg_threads}])\n",
+        p = pad(ind),
+        wg_threads = WG_THREADS
     ));
     // Lane within the warp. Single-issue async ops (mbarrier / TMA / MMA / commit)
     // run inside a single-warp role, so the per-thread guard must be lane 0 of that
@@ -504,7 +575,11 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
     // *warpgroup* and is never true for a warp whose lanes map to tid_in_wg 32..63
     // (e.g. warp 5 in warpgroup 1), so the issue would never fire and the MMA would
     // deadlock. Mirrors the canonical kernels' `lane_id == 0` / `elect_sync` guard.
-    out.push_str(&format!("{p}lane_id = T.lane_id([32])\n", p = pad(ind)));
+    out.push_str(&format!(
+        "{p}lane_id = T.lane_id([{warp_lanes}])\n",
+        p = pad(ind),
+        warp_lanes = WARP_LANES
+    ));
     out.push('\n');
 
     // ---- SMEM buffers (N-D; the swizzled rings + the plain I32 mailbox) ----
@@ -1370,7 +1445,8 @@ fn note_sf_view(
         return Err("codegen: SF TMEM operand base column is negative".to_string());
     }
     let col = col as usize;
-    let logical_rows = rows.div_ceil(128) * 128;
+    // The logical rows round up to whole TMEM-lane (128-row) super-blocks.
+    let logical_rows = rows.div_ceil(WG_THREADS) * WG_THREADS;
     let logical_cols = nblocks;
     if let Some(v) = views.iter().find(|v| v.col == col) {
         if v.logical_rows != logical_rows || v.logical_cols != logical_cols {
@@ -2003,8 +2079,9 @@ fn emit_stmt(
                 }) => match cast_of {
                     None => {
                         out.push_str(&format!(
-                                "{p}{name} = T.alloc_tcgen05_ldst_frag(\"{instr_shape}\", (128, {width}), \"{dt}\")\n",
+                                "{p}{name} = T.alloc_tcgen05_ldst_frag(\"{instr_shape}\", ({wg_threads}, {width}), \"{dt}\")\n",
                                 p = pad(indent),
+                                wg_threads = WG_THREADS,
                                 dt = dtype_str(tensor.dtype),
                             ));
                     }
@@ -2076,7 +2153,8 @@ fn emit_stmt(
             // the epilogue address math (VIADD/LOP3/LDS) roughly in half.
             if let Some(cols) = ctx.tmem_view_cols {
                 out.push_str(&format!(
-                    "{p}tmem = T.decl_buffer((128, {cols}), \"float32\", scope=\"tmem\", allocated_addr=0, layout=TileLayout(S[(128, {cols}) : (1 @ TLane, 1 @ TCol)]))\n",
+                    "{p}tmem = T.decl_buffer(({wg_threads}, {cols}), \"float32\", scope=\"tmem\", allocated_addr=0, layout=TileLayout(S[({wg_threads}, {cols}) : (1 @ TLane, 1 @ TCol)]))\n",
+                    wg_threads = WG_THREADS,
                 ));
             }
             // NVFP4 e4m3 scale-factor TMEM views (canon's tmem_pool.alloc_sf(...,
@@ -3219,7 +3297,8 @@ fn strip_tid_in_wg(sv: &ScalarValue) -> Option<ScalarValue> {
 /// reg_store dst (GMEM) -> the warpgroup-collective row band `C[base:base+128,
 /// col:col+w]`. The value model's row offset is `base + tid_in_wg` (one row per
 /// thread); the wg-collective `Tx.copy` takes the whole 128-row tile, so the lane
-/// term is stripped and the row becomes a 128-wide range.
+/// term is stripped and the row becomes a 128-wide range (WG_THREADS rows = one
+/// row per warpgroup thread, a hardware constant).
 fn emit_gmem_row_store(dst: &TensorSlice, ctx: &Ctx) -> Result<String, String> {
     let name = ctx.tensor_name(dst.tensor.id)?;
     if dst.offsets.len() != 2 {
@@ -3227,14 +3306,15 @@ fn emit_gmem_row_store(dst: &TensorSlice, ctx: &Ctx) -> Result<String, String> {
     }
     let clo = emit_scalar(&dst.offsets[1], ctx)?;
     let chi = add_bound(&dst.offsets[1], &dst.shape[1], ctx)?;
+    let wg_rows = ScalarValue::Int(WG_THREADS as i64);
     if let Some(base) = strip_tid_in_wg(&dst.offsets[0]) {
         let lo = emit_scalar(&base, ctx)?;
-        let hi = add_bound(&base, &ScalarValue::Int(128), ctx)?;
+        let hi = add_bound(&base, &wg_rows, ctx)?;
         Ok(format!("{name}[{lo}:{hi}, {clo}:{chi}]"))
     } else {
         // No lane term (already a tile base): emit a 128-row band from the offset.
         let lo = emit_scalar(&dst.offsets[0], ctx)?;
-        let hi = add_bound(&dst.offsets[0], &ScalarValue::Int(128), ctx)?;
+        let hi = add_bound(&dst.offsets[0], &wg_rows, ctx)?;
         Ok(format!("{name}[{lo}:{hi}, {clo}:{chi}]"))
     }
 }
@@ -3331,5 +3411,30 @@ mod tests {
         assert_eq!(arg_name(25), "Z");
         assert_eq!(arg_name(26), "arg26");
         assert_eq!(arg_name(40), "arg40");
+    }
+
+    /// The cluster-scope ids derive from the kernel's `cluster_shape` (a 1-D
+    /// (n,) is the x extent with y=1); a rank>2 cluster has no emission form
+    /// and fails closed.
+    #[test]
+    fn cluster_ids_derive_from_cluster_shape() {
+        let mut k = kernel(vec![]);
+        k.cluster_shape = vec![1];
+        let src = kernel_to_tirx_source(&k).unwrap();
+        assert!(
+            src.contains("cbx, cby = T.cta_id_in_cluster([1, 1], preferred=[1, 1])"),
+            "{src}"
+        );
+
+        k.cluster_shape = vec![2, 2];
+        let src = kernel_to_tirx_source(&k).unwrap();
+        assert!(
+            src.contains("cbx, cby = T.cta_id_in_cluster([2, 2], preferred=[2, 2])"),
+            "{src}"
+        );
+
+        k.cluster_shape = vec![2, 2, 2];
+        let err = kernel_to_tirx_source(&k).unwrap_err();
+        assert!(err.contains("no cta_id_in_cluster emission"), "{err}");
     }
 }
