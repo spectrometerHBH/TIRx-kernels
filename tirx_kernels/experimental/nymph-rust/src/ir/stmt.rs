@@ -521,6 +521,16 @@ pub enum Stmt {
         /// accumulates `dst += src` instead of overwriting. Trace/protocol treat it
         /// like a store (a GMEM-output bulk async write).
         reduce_add: bool,
+        /// Explicit opt-in for a NON-INTEGER (today: f32) `reduce_add`. A float
+        /// reduction is not associative, so cross-CTA reduce-adds to one location are
+        /// race-free (hardware-atomic, commutative) but ORDER-DEPENDENT — the result is
+        /// not bit-reproducible. The protocol checker can only WARN
+        /// (`nondeterministic_reduction`), and warnings are easy to miss, so validate
+        /// REJECTS a float reduce-add unless the kernel author sets this flag. With the
+        /// flag set, the checker keeps its warning. An integer reduce-add (exact,
+        /// associative) would not need it; validate currently restricts reduce_add to
+        /// f32 dst anyway.
+        allow_nondet_reduce: bool,
         /// L2 eviction policy for the store (canon's epilogue store carries
         /// `"evict_first"`: the output band is write-once, never re-read — dead lines
         /// must not pack L2 and evict live operand tiles / tensormaps). `None` = no hint.

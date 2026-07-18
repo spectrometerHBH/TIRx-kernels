@@ -45,6 +45,15 @@ pub struct RunOptions {
     pub max_executed_stmts: Option<usize>,
     pub mode: ExecutionMode,
     pub check_protocol: bool,
+    /// Rotation offset for the CLC round-robin oracle (the trusted seam): 0 is the
+    /// canonical order — cluster `c` steals `c + 1*cc, c + 2*cc, …`. A non-zero offset
+    /// rotates each cluster's steal sequence within its own residue class (task
+    /// `c + k*cc` served at steal `j` has `k = 1 + (offset + j) % class_len`), so
+    /// every task is still handed out exactly once and the run still terminates, but
+    /// the protocol checker sees a DIFFERENT task order. Value results are
+    /// task-assignment-independent; this exists to check protocol properties under
+    /// more than one canonical schedule.
+    pub clc_oracle_offset: usize,
 }
 
 impl Default for RunOptions {
@@ -54,6 +63,7 @@ impl Default for RunOptions {
             max_executed_stmts: None,
             mode: ExecutionMode::Trace,
             check_protocol: true,
+            clc_oracle_offset: 0,
         }
     }
 }

@@ -3044,6 +3044,7 @@ fn emit_stmt(
             shape,
             gmem_shape,
             reduce_add,
+            allow_nondet_reduce: _,
             cache_hint,
             prefetch_tensormap,
         } => {

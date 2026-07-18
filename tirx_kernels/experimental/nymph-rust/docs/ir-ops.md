@@ -28,9 +28,12 @@ commit 76600421 (codegen-side rejections + sf_block validation).
    GPU that sim cannot reproduce (codegen.rs comment documents it).
 3. **CLC round-robin oracle** (trusted seam): `ClcQueryCancel` returns
    canonical round-robin tasks. Holds for ANY order: each task exactly once,
-   termination. Only checked under round-robin: value regressions, mailbox
-   stage/phase reuse rhythm. Full assignment-confluence is a documented
-   non-goal (RFC §5).
+   termination. The oracle is parameterized (`check_protocol(...,
+   clc_oracle_offset=k)` rotates each cluster's steal order within its own
+   residue class — k=0 is the canonical order), and the protocol suite runs
+   the fp16/bf16 GEMM under multiple offsets (test_protocol.py). Still
+   canonical-order-only: value regressions and the mailbox stage/phase reuse
+   rhythm. Full assignment-confluence is a documented non-goal (RFC §5).
 4. **Value at issue for MMA/cp**; completion observed via commit/mbar. Same-
    stream order makes this sound; the checker drains windows at the commit.
 5. **Accumulation order**: MMA via OpenBLAS sgemm (BLAS blocking order), not
@@ -135,7 +138,10 @@ SILENT / deferred (load-bearing, needs kernel rework):
 Modeled: routing rules (cg2 unicast mbar ∈ {dst,peer}; cg2 multicast parity
 routing — matches PTX), OOB clamp/zero-fill/squash, reduce_add (f32) with
 checker TmaReduce events, commit/wait groups as counters (never block;
-.read-vs-not distinction unmodeled).
+.read-vs-not distinction unmodeled). A float reduce_add is order-dependent, so
+it is IR-level OPT-IN: validate rejects `TmaStore.reduce_add` on a non-integer
+dst unless `allow_nondet_reduce` is set (the checker's
+`nondeterministic_reduction` warning still fires with the flag).
 
 SILENT / known divergences:
 - **cg2 multicast to a SHARED (leader) mbar**: sim dedups tx per unique cell
@@ -168,6 +174,11 @@ CLC handle's 16B async-proxy write not modeled (race checker can't see it).
 
 Modeled: try_cancel → per-cluster slot + 16B complete-tx to cta_group CTAs
 (matches .multicast::cluster::all); query-before-try rejected; drained → -1.
+The oracle's steal order is rotatable per cluster via
+`check_protocol`'s `clc_oracle_offset` (see global abstraction 3) — a cheap
+way to re-run protocol checks under ≥2 task orders without touching the
+runner; the offset stays within each cluster's residue class, so "each task
+exactly once" and termination are preserved by construction.
 Envelope gaps → **fixed in audit batch**: mbar kind must be TMA; handle ≥16B.
 Deferred: re-try after drained is idempotent in sim, UB on HW (reject later).
 

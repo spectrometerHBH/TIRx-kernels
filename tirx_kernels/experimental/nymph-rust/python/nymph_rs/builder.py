@@ -516,12 +516,20 @@ class IRBuilder:
         gmem_shape: Shape | None = None,
         cache_hint: str | None = "evict_first",
         prefetch_tensormap: bool = True,
+        allow_nondet_reduce: bool = False,
     ) -> None:
         """TMA reduce-add (``cp.reduce.async.bulk...add.f32``): atomically accumulate
         ``dst += src`` (SMEM→GMEM, f32). Same bulk-async path as ``tma_store`` (commit
         with ``cp_async_bulk_commit_group`` / wait with ``cp_async_bulk_wait_group_read``);
         value-mode accumulates instead of overwriting. dst must be an f32 GMEM tensor.
-        ``cache_hint``/``prefetch_tensormap`` as in ``tma_store``."""
+        ``cache_hint``/``prefetch_tensormap`` as in ``tma_store``.
+
+        A float reduction is not associative: cross-CTA reduce-adds into one location
+        are race-free (hardware-atomic, commutative) but ORDER-DEPENDENT — the result is
+        not bit-reproducible. The protocol checker can only warn
+        (``nondeterministic_reduction``) about that, so the IR makes the non-determinism
+        opt-in: validate REJECTS a float reduce-add unless ``allow_nondet_reduce=True``
+        is passed (the checker's warning still fires with the flag set)."""
         if isinstance(src, Tensor):
             src = src[...]
         stmt = TmaStore(
@@ -531,6 +539,7 @@ class IRBuilder:
             shape=shape,
             gmem_shape=gmem_shape,
             reduce_add=True,
+            allow_nondet_reduce=allow_nondet_reduce,
             cache_hint=cache_hint,
             prefetch_tensormap=prefetch_tensormap,
         )

@@ -135,12 +135,13 @@ fn run_failure_message(prefix: &str, result: &interpreter::RunResult) -> String 
 }
 
 #[pyfunction]
-#[pyo3(signature = (kernel, inputs = None, include_events = false))]
+#[pyo3(signature = (kernel, inputs = None, include_events = false, clc_oracle_offset = 0))]
 fn check_protocol(
     py: Python<'_>,
     kernel: &PyKernel,
     inputs: Option<&Bound<'_, PyDict>>,
     include_events: bool,
+    clc_oracle_offset: usize,
 ) -> PyResult<Py<PyDict>> {
     let rust_inputs = match inputs {
         Some(inputs) => coerce_py_inputs(py, inputs)?.0,
@@ -151,6 +152,7 @@ fn check_protocol(
         rust_inputs,
         RunOptions {
             mode: ExecutionMode::Trace,
+            clc_oracle_offset,
             ..Default::default()
         },
     );
@@ -2203,7 +2205,7 @@ fn gmem_wait_eq(
     }))
 }
 #[pyfunction]
-#[pyo3(name = "TmaStore", signature = (dst, src, coords, shape, gmem_shape = None, reduce_add = false, cache_hint = None, prefetch_tensormap = true))]
+#[pyo3(name = "TmaStore", signature = (dst, src, coords, shape, gmem_shape = None, reduce_add = false, allow_nondet_reduce = false, cache_hint = None, prefetch_tensormap = true))]
 #[allow(clippy::too_many_arguments)]
 fn tma_store(
     dst: PyTensor,
@@ -2212,6 +2214,7 @@ fn tma_store(
     shape: Vec<usize>,
     gmem_shape: Option<Vec<usize>>,
     reduce_add: bool,
+    allow_nondet_reduce: bool,
     cache_hint: Option<String>,
     prefetch_tensormap: bool,
 ) -> PyResult<PyStmt> {
@@ -2222,6 +2225,7 @@ fn tma_store(
         shape,
         gmem_shape,
         reduce_add,
+        allow_nondet_reduce,
         cache_hint,
         prefetch_tensormap,
     }))

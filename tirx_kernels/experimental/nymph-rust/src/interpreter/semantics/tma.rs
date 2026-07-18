@@ -67,18 +67,35 @@ fn execute_clc_try_cancel<'a, 'k>(
     // which the worker processes via init, NOT via a steal. `try_cancel` (this op)
     // returns the *stolen* tiles cluster_id + 1*cc, + 2*cc, ... — exactly the hardware
     // semantics (query_cancel never returns the launcher's own tile).
+    //
+    // `options.clc_oracle_offset` rotates the steal order WITHIN the cluster's residue
+    // class (tasks cluster_id + k*cc, k = 1..=class_len): the j-th steal serves
+    // k = 1 + (offset + j) % class_len. Offset 0 is the canonical round-robin; any
+    // offset still hands every task out exactly once and terminates, but yields a
+    // different task ORDER for the protocol checker.
+    let stealable = if total_tasks > cluster_id {
+        (total_tasks - 1 - cluster_id) / cluster_count
+    } else {
+        0
+    };
     let cur = *ctx
         .state
         .scheduler_next_cursors
         .entry((scheduler.id, cluster_id))
         .or_insert(1);
-    let offset = cur
-        .checked_mul(cluster_count)
-        .ok_or_else(|| InterpreterError::new("invalid_scheduler", "task index overflows usize"))?;
-    let task = cluster_id
-        .checked_add(offset)
-        .ok_or_else(|| InterpreterError::new("invalid_scheduler", "task index overflows usize"))?;
-    let drained = task >= total_tasks;
+    let j = cur - 1; // 0-based steal index within the residue class
+    let drained = j >= stealable;
+    let task = if drained {
+        0 // unused (drained) — kept in range so the raw_value path stays simple
+    } else {
+        let k = 1 + (ctx.options.clc_oracle_offset + j) % stealable;
+        let offset = k.checked_mul(cluster_count).ok_or_else(|| {
+            InterpreterError::new("invalid_scheduler", "task index overflows usize")
+        })?;
+        cluster_id.checked_add(offset).ok_or_else(|| {
+            InterpreterError::new("invalid_scheduler", "task index overflows usize")
+        })?
+    };
     if !drained {
         *ctx.state
             .scheduler_next_cursors
@@ -596,6 +613,8 @@ fn execute_tma_store<'a, 'k>(
             shape,
             gmem_shape,
             reduce_add,
+            // Validate-gated opt-in marker — no value/trace semantics of its own.
+            allow_nondet_reduce: _,
             // Pure HW hints — no value/trace semantics.
             cache_hint: _,
             prefetch_tensormap: _,

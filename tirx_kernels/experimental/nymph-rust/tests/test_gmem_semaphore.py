@@ -20,18 +20,22 @@ Standalone proofs (isolated from the full flash-bwd kernel):
 """
 
 import numpy as np
-import pytest
-
 import nymph_rs as nr
-from nymph_rs import IRBuilder, MemorySpace, DType, TensorSlice, FenceKind, FenceScope, MBarKind
+import pytest
+from nymph_rs import DType, FenceKind, FenceScope, IRBuilder, MemorySpace, TensorSlice
 
 
 def _sl(t, o, s):
     return TensorSlice(tensor=t, offsets=o, shape=s)
 
 
-def _build(*, with_sem: bool, wrong_turn: bool = False, same_turn: bool = False,
-           signal_before_drain: bool = False):
+def _build(
+    *,
+    with_sem: bool,
+    wrong_turn: bool = False,
+    same_turn: bool = False,
+    signal_before_drain: bool = False,
+):
     """Two CTAs each reduce-add their src row into the SHARED dQ tile (1 row, 4 cols).
     out tile = src[0] + src[1]. The order is fixed by the per-tile semaphore: CTA c
     waits counter==c then adds then signals +1.
@@ -43,16 +47,16 @@ def _build(*, with_sem: bool, wrong_turn: bool = False, same_turn: bool = False,
                           longer covers the completed write."""
     k = IRBuilder("sem_toy", num_warps=4, smem_size_bytes=64, launch_shape=(2,))
     src = k.arg(space=MemorySpace.GMEM, dtype=DType.F32, shape=(2, 4))
-    dq = k.arg(space=MemorySpace.GMEM, dtype=DType.F32, shape=(1, 4))     # shared dQ tile
-    sem = k.arg(space=MemorySpace.GMEM, dtype=DType.I32, shape=(1,))      # one cell per dQ tile
+    dq = k.arg(space=MemorySpace.GMEM, dtype=DType.F32, shape=(1, 4))  # shared dQ tile
+    sem = k.arg(space=MemorySpace.GMEM, dtype=DType.I32, shape=(1,))  # one cell per dQ tile
     s = k.tensor(space=MemorySpace.SMEM, dtype=DType.F32, shape=(1, 4), byte_offset=0)
     r = k.tensor(space=MemorySpace.REG, dtype=DType.F32, shape=(4,))
     with k.role(warpgroup=0):
         cta = k.cta_id()
         if wrong_turn:
-            turn = cta + 5          # never produced → deadlock
+            turn = cta + 5  # never produced → deadlock
         elif same_turn:
-            turn = 0                # both pass immediately → no serialization
+            turn = 0  # both pass immediately → no serialization
         else:
             turn = cta
         # stage this CTA's src row into SMEM (the reduce-add source).
@@ -63,11 +67,17 @@ def _build(*, with_sem: bool, wrong_turn: bool = False, same_turn: bool = False,
         k.fence(kind=FenceKind.ASYNC_PROXY, scope=FenceScope.CTA)
         if with_sem:
             with k.if_(k.tid_in_wg().eq(0)):
-                k.gmem_wait_eq(sem, coords=(0,), value=turn)   # wait my turn
+                k.gmem_wait_eq(sem, coords=(0,), value=turn)  # wait my turn
             k.wg_sync(barrier_id=1)
         with k.if_(k.tid_in_wg().eq(0)):
-            k.tma_reduce_add(dq, _sl(s, (0, 0), (1, 4)),
-                             coords=(0, 0), shape=(1, 4), gmem_shape=(1, 4))
+            k.tma_reduce_add(
+                dq,
+                _sl(s, (0, 0), (1, 4)),
+                coords=(0, 0),
+                shape=(1, 4),
+                gmem_shape=(1, 4),
+                allow_nondet_reduce=True,
+            )
             k.cp_async_bulk_commit_group()
             if signal_before_drain and with_sem:
                 # WRONG: signal the next CTA BEFORE draining this CTA's reduce-add. The
@@ -76,7 +86,7 @@ def _build(*, with_sem: bool, wrong_turn: bool = False, same_turn: bool = False,
                 k.gmem_atomic_add(sem, coords=(0,), value=1, order="release")
                 k.cp_async_bulk_wait_group_read(0)
             else:
-                k.cp_async_bulk_wait_group_read(0)   # FULL drain BEFORE the signal
+                k.cp_async_bulk_wait_group_read(0)  # FULL drain BEFORE the signal
         if with_sem and not signal_before_drain:
             k.wg_sync(barrier_id=1)
             with k.if_(k.tid_in_wg().eq(0)):
@@ -109,7 +119,7 @@ def test_positive_passed_and_no_nondeterminism_and_bit_identical():
     r2 = nr.interpret(kernel, {src: _src()})
     a1 = np.asarray(r1[dq.id], np.float32).reshape(1, 4)
     a2 = np.asarray(r2[dq.id], np.float32).reshape(1, 4)
-    np.testing.assert_array_equal(a1, a2)                     # bit-identical
+    np.testing.assert_array_equal(a1, a2)  # bit-identical
     np.testing.assert_allclose(a1, _src().sum(0, keepdims=True), rtol=0, atol=0)
 
 

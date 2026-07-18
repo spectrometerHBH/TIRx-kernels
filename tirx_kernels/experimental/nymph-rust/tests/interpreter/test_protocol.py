@@ -441,3 +441,34 @@ def test_oob_tensor_slice_caught_in_value_and_trace():
     report = nr.check_protocol(kernel)
     assert report["status"] == "Failed"
     assert "tensor_value" in {d["code"] for d in report["diagnostics"]}
+
+
+def test_clc_oracle_offset_rotates_task_order_and_still_passes():
+    # The CLC oracle (the trusted seam) is parameterizable: `clc_oracle_offset`
+    # rotates each cluster's steal sequence within its own residue class, so the
+    # protocol checker runs under MORE THAN ONE task order — every task is still
+    # handed out exactly once and the run still terminates (the two order-independent
+    # properties), while the per-order check (no duplicate handoff) holds in each.
+    #
+    # 4 pair-tasks on ONE cluster pair -> 3 steals, a 3-element residue class:
+    # offsets 0/1/2 give the three rotations of [1, 2, 3].
+    cfg = Fp16Bf16GemmConfig(m=1024, n=512, k=16, blk_k=16, launch_shape=(2,))
+    kernel = build_fp16_bf16_gemm(cfg)
+
+    def stolen_task_order(offset):
+        report = nr.check_protocol(kernel, include_events=True, clc_oracle_offset=offset)
+        assert report["status"] == "Passed", report["diagnostics"][:2]
+        assert _pass_status(report, "deadlock_freedom") == "Passed"
+        return [
+            event["task_id"] for event in _events(report, "scheduler_next") if event["task_id"] >= 0
+        ]
+
+    canonical = stolen_task_order(0)
+    rotated = [stolen_task_order(offset) for offset in (1, 2)]
+    # The canonical order is round-robin; each rotation is a DIFFERENT order...
+    assert canonical == sorted(canonical)
+    assert any(order != canonical for order in rotated)
+    # ...covering the SAME task set, each task exactly once.
+    for order in (canonical, *rotated):
+        assert len(order) == len(set(order))
+        assert set(order) == set(canonical)

@@ -880,6 +880,7 @@ fn validate_stmt(s: &Stmt) -> R {
             shape,
             gmem_shape,
             reduce_add,
+            allow_nondet_reduce,
             cache_hint: _,
             prefetch_tensormap: _,
         } => {
@@ -890,6 +891,15 @@ fn validate_stmt(s: &Stmt) -> R {
             }
             if *reduce_add && dst.dtype != DType::F32 {
                 return bail("tma_reduce_add dst must be f32");
+            }
+            // Float reduce-add is order-dependent (float add is not associative): the
+            // checker can only WARN `nondeterministic_reduction`, so the IR makes the
+            // non-determinism opt-in instead — reject unless the author declared it.
+            if *reduce_add && !dst.dtype.is_integer() && !allow_nondet_reduce {
+                return bail(
+                    "tma_reduce_add on a non-integer dst is order-dependent; \
+                     pass allow_nondet_reduce=true to opt in",
+                );
             }
             if src.tensor.space != MemorySpace::Smem {
                 return bail("tma_store src must be SMEM");
