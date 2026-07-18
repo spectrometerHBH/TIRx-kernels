@@ -20,7 +20,7 @@ under the License.
 # Distributed GEMM kernels
 
 This category contains the SM100, tensor-parallel kernels recovered from the
-megakernel performance branch. Both workloads register TP1, TP2, and TP4
+megakernel performance branch. Both workloads register TP1 and TP4
 specializations for eight model shapes:
 
 | Registry name | Global operation | Rank-local result |
@@ -32,9 +32,8 @@ The second source was historically called GEMM+AllReduce, but its actual
 protocol and output shape are ReduceScatter. The public name reflects the
 implemented operation. The registered matrix contains the Qwen3-8B,
 LLaMA-3.1-8B, Gemma-2-9B, Gemma-2-27B, Qwen3-32B, LLaMA-3.1-70B,
-GPT-3-175B, and LLaMA-3.1-405B shapes supplied by the benchmark suite. All use
-`M=8192` and FP16. TP values other than 1, 2, or 4 and the legacy static
-scheduler are rejected.
+GPT-3-175B, and LLaMA-3.1-405B shapes. All use `M=8192` and FP16. TP values
+other than 1 or 4 and the legacy static scheduler are rejected.
 
 The parent compiles and exports one module, then `torch.multiprocessing.spawn`
 starts one rank-local worker per GPU. NCCL bootstraps the process group and
@@ -46,10 +45,10 @@ are reset independently on every rank before each measured launch.
 Both registry entries are direct kernel ports. This PR contains no megakernel
 DSL, scheduling policy, execution region, or MoE change. AllGather+GEMM keeps
 the already validated dynamic queue implementation. GEMM+ReduceScatter uses
-the hand-transcribed fused persistent
-kernel in `rs_gemm_multimem_dynamic.py`: a two-CTA GEMM queue feeds an initially
+the hand-transcribed fused persistent kernel in `gemm_reduce_scatter.py`: a
+two-CTA GEMM queue feeds an initially
 empty ReduceScatter queue, and the final contributor publishes each tile with
-system-scope release/acquire ordering. TP2 and TP4 ReduceScatter use NVLS
+system-scope release/acquire ordering. TP4 ReduceScatter uses NVLS
 `multimem.ld_reduce` directly from the multicast partial output; TP1 uses the
 same fused queue and a local vectorized writeback. There is no host peer
 transfer, staging buffer, or separate reduction kernel.
@@ -68,8 +67,7 @@ use their arithmetic mean. The cuBLAS+NCCL reference initializes both libraries
 and captures the complete GEMM-plus-collective sequence before timing; its event
 closure is one CUDA Graph replay. TIRx and cuBLASMp retain their direct launch
 closures. All headline values use the same event protocol, so ratios never mix
-timers. A separate `kernel_only` result uses DeepGEMM's named-kernel Kineto
-protocol for the fused TIRx kernel only.
+timers. Kernel-only Kineto profiling is not part of the standard sweep.
 
 cuBLASMp 0.10 requires nvmath-python, NCCL4Py, and a compatible recent NCCL.
 Every benchmark requires absolute paths for all four runtime dependencies so a
@@ -96,16 +94,16 @@ For a B200 host, select any registered config explicitly when needed:
 
 ```bash
 python -m tirx_kernels.test --kernel allgather_gemm \
-  --config tp2_m8192_n51200_k5120_fp16_dynamic
+  --config tp4_m8192_n51200_k5120_fp16_dynamic
 python -m tirx_kernels.test --kernel gemm_reduce_scatter \
   --config tp4_m8192_n5120_k25600_fp16_dynamic
 
 python -m tirx_kernels.bench --kernel allgather_gemm \
-  --config tp2_m8192_n51200_k5120_fp16_dynamic --timer event --rounds 6 --json
+  --config tp4_m8192_n51200_k5120_fp16_dynamic --timer event --rounds 6 --json
 python -m tirx_kernels.bench --kernel gemm_reduce_scatter \
   --config tp4_m8192_n5120_k25600_fp16_dynamic --timer event --rounds 6 --json
 ```
 
-The distributed event and Kineto protocols use fixed iteration counts, so
-`--warmup` and `--repeat` overrides are rejected. The reported value is the
-arithmetic mean of the six round results.
+The distributed event protocol uses fixed iteration counts, so `--warmup` and
+`--repeat` overrides are rejected. The reported value is the arithmetic mean of
+the six round results.

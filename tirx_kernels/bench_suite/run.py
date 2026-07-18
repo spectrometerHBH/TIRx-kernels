@@ -396,6 +396,16 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _visible_gpu_rows(rows: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Apply the process CUDA visibility filter to physical NVML rows."""
+
+    configured = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if configured is None:
+        return rows
+    visible = {item.strip() for item in configured.split(",") if item.strip()}
+    return [(index, uuid) for index, uuid in rows if index in visible or uuid in visible]
+
+
 def _gpu_uuid_of(idx: str) -> str | None:
     """Look up the UUID for a GPU index via nvidia-smi."""
     try:
@@ -1569,7 +1579,7 @@ def main() -> None:
     #    are banned for the rest of the run.
     # 2. Per-workload acquire: re-scan utilization/memory every time we need a card.
     listing_pool = GpuPool(util_threshold=args.util_threshold, mem_threshold=args.mem_threshold)
-    in_filter = [idx for idx, _ in listing_pool._all_gpus()]
+    in_filter = [idx for idx, _ in _visible_gpu_rows(listing_pool._all_gpus())]
     if not in_filter:
         print("[bench-suite] no visible GPUs.", file=sys.stderr)
         sys.exit(1)

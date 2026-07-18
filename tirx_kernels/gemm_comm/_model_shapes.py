@@ -19,7 +19,7 @@
 
 from __future__ import annotations
 
-SUPPORTED_WORLD_SIZES = (1, 2, 4)
+SUPPORTED_WORLD_SIZES = (1, 4)
 
 GEMM_RS_MODEL_SHAPES = (
     ("qwen3_8b", 8192, 4096, 12288),

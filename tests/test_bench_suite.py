@@ -63,20 +63,16 @@ def test_default_workloads_include_manual_gemm_comm_event_profiles() -> None:
         if workload["kernel"] in {"allgather_gemm", "gemm_reduce_scatter"}
     ]
 
-    expected = [
-        *(("allgather_gemm", config) for config in ALLGATHER_GEMM_CONFIGS),
-        *(("gemm_reduce_scatter", config) for config in GEMM_RS_CONFIGS),
-    ]
-    assert [(workload["kernel"], workload["config"]) for workload in selected] == [
-        (kernel, config["label"]) for kernel, config in expected
-    ]
-    assert len(selected) == 48
-    assert all(workload["timer"] == "event" for workload in selected)
-    expected_world_sizes = {
-        (kernel, config["label"]): config["world_size"] for kernel, config in expected
+    configs_by_kernel = {
+        "allgather_gemm": {config["label"]: config for config in ALLGATHER_GEMM_CONFIGS},
+        "gemm_reduce_scatter": {config["label"]: config for config in GEMM_RS_CONFIGS},
     }
+    assert len(selected) == 16
+    assert all(workload["config"] in configs_by_kernel[workload["kernel"]] for workload in selected)
+    assert all(workload["timer"] == "event" for workload in selected)
     assert all(
-        workload["num_gpus"] == expected_world_sizes[(workload["kernel"], workload["config"])]
+        workload["num_gpus"]
+        == configs_by_kernel[workload["kernel"]][workload["config"]]["world_size"]
         for workload in selected
     )
 

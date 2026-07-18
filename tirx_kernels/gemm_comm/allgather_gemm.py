@@ -78,7 +78,7 @@ _SPECIALIZATION_K_ENV = "TIRX_INTERNAL_ALLGATHER_GEMM_K"
 _SPECIALIZATION_WORLD_SIZE_ENV = "TIRX_INTERNAL_ALLGATHER_GEMM_WORLD_SIZE"
 
 # Qwen3-32B TP4 remains the convenient default. Public CONFIGS cover all eight
-# model shapes at TP1, TP2, and TP4.
+# model shapes at TP1 and TP4.
 M = int(os.environ.get(_SPECIALIZATION_M_ENV, "8192"))
 N = int(os.environ.get(_SPECIALIZATION_N_ENV, "51200"))
 K = int(os.environ.get(_SPECIALIZATION_K_ENV, "5120"))
@@ -1167,19 +1167,9 @@ def _run_worker(
             distributed=runtime.bench_context(),
             prepare={"tirx": prepare},
         )
-        kernel_only = bench(
-            {"tirx": case.launch},
-            timer="kineto",
-            rounds=kwargs.get("rounds", 1),
-            cooldown_s=kwargs.get("cooldown_s", 1.0),
-            distributed=runtime.bench_context(),
-            prepare={"tirx": prepare},
-            kineto_kernel_names={"tirx": GEMM_DEVICE_ENTRYPOINT},
-        )
         result["baseline_metadata"] = baselines.metadata()
         result["ratio_definition"] = "baseline_us / tirx_us"
         result["ratios"] = baseline_ratios(result)
-        result["kernel_only"] = kernel_only
         return {"status": "OK", **result}
     finally:
         baselines.close()
@@ -1231,7 +1221,7 @@ def run_bench(
     scheduler: str = "dynamic",
     **_kwargs: Any,
 ) -> dict[str, Any]:
-    """Return full-operation event timings plus a fused-kernel Kineto diagnostic."""
+    """Return full-operation event timings for TIRx and both baselines."""
 
     _check_config(M, N, K, world_size, dtype)
     _check_scheduler(scheduler)
