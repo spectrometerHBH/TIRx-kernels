@@ -19,6 +19,8 @@ scheduler.
   blocking, value state, and the direct-mutation execution model.
 - [Interpreter Semantics](docs/interpreter-semantics.md) - reviewed semantics
   by statement family and the current proof boundary.
+- [IR Op Semantics Ledger](docs/ir-ops.md) - per-op PTX conformance:
+  modeled / abstracted / rejected / silently-accepted configurations.
 - [Hardware Verification](docs/hardware-verification.md) - B200 validation for
   the tcgen05 ld/st datapath and MMA accumulator layouts.
 - [Port Status](STATUS.md) - current implementation, correctness, performance,
