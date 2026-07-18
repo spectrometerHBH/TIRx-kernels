@@ -33,9 +33,9 @@ CONFIGS = [
 ]
 
 
-def _compile_nymph(M, N, K):
+def _compile_nymph(M, N, K, alpha):
     src = nr.kernel_to_tirx_source(
-        build_nvfp4_gemm(NvFp4GemmConfig(m=M, n=N, k=K, **gemm_config_for(M, N, K)))
+        build_nvfp4_gemm(NvFp4GemmConfig(m=M, n=N, k=K, alpha=alpha, **gemm_config_for(M, N, K)))
     )
     p = os.path.join(tempfile.mkdtemp(prefix="nymph_nvfp4_"), "g.py")
     with open(p, "w") as f:
@@ -54,13 +54,25 @@ def run_bench(M, N, K, *, warmup=None, repeat=None, timer=None, **kwargs):
         canon = tvm.compile(
             tvm.IRModule({"main": tir_ws_kernel(M, N, K)}), target, tir_pipeline="tirx"
         )
-    nymph = _compile_nymph(M, N, K)
     A, B, Asf, Bsf, alpha, Cref = prepare_data(M, N, K)
+    # Same math on both sides: canon applies the runtime-alpha rescale, nymph bakes
+    # the SAME alpha as a build-time immediate (the remaining asymmetry is the alpha
+    # LOAD, a known capability difference — not a different computation).
+    nymph = _compile_nymph(M, N, K, float(alpha))
     at = torch.tensor([float(alpha)], device="cuda", dtype=torch.float)
     Ae, Be = Asf.view(torch.float8_e4m3fn), Bsf.view(torch.float8_e4m3fn)
     oc = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
     on = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
     funcs = {"tir": lambda: canon(A, B, Asf, Bsf, at, oc), "tirx": lambda: nymph(A, B, Ae, Be, on)}
+    # One-shot correctness gate BEFORE timing: a ratio of two kernels computing
+    # different results is meaningless, so fail loudly if either diverges.
+    for fn in funcs.values():
+        fn()
+    torch.cuda.synchronize()
+    for name, out in (("tir", oc), ("tirx", on)):
+        cos = torch.nn.functional.cosine_similarity(out.float().flatten(), Cref.flatten(), dim=0)
+        if cos < 0.98:
+            raise AssertionError(f"{name} output diverges from reference (cosine={cos:.4f})")
     return bench(funcs, warmup=warmup, repeat=repeat, timer=timer, **kwargs)
 
 

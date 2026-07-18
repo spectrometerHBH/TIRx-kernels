@@ -43,7 +43,10 @@ CONFIGS = [{"M": s, "N": s, "K": s, "label": f"{s}x{s}x{s}"} for s in [1024, 204
 #    NOT add your own cooldowns / warm-L2 / CUDA-event timing (see "Don't" below).
 def run_bench(M, N, K, *, warmup=None, repeat=None, timer=None, **kwargs):
     ...  # compile canon + nymph; allocate inputs once (Triton pure-launch)
-    funcs = {"canon": lambda: canon(...), "nymph": lambda: nymph(...)}
+    # Impl names MUST be "tir" (canon) / "tirx" (nymph): the bench-suite's
+    # OURS_IMPLS contract (`bench_suite/impls.py::is_our_impl`) recognizes only
+    # tir/tirx(-prefixed) names — anything else is filtered out of reports.
+    funcs = {"tir": lambda: canon(...), "tirx": lambda: nymph(...)}
     return bench(funcs, warmup=warmup, repeat=repeat, timer=timer, **kwargs)
 
 # 4. Self-register into the bench-suite kernel cache so `load_kernel(name)` finds
@@ -75,8 +78,8 @@ m = importlib.util.module_from_spec(spec); sys.modules["nvfp4_iface"] = m; spec.
 mod = load_kernel("nymph_nvfp4_gemm")        # STANDARD lookup (via the registry cache)
 for cfg in mod.CONFIGS:                      # each module iterates its OWN CONFIGS
     r = run_kernel_bench("nymph_nvfp4_gemm", cfg, rounds=10, timer="proton")  # no registry=
-    im = r["impls"]                          # {"canon": us, "nymph": us} — round-aggregate
-    print(f"{cfg['label']}: canon/nymph = {im['canon'] / im['nymph']:.3f}")
+    im = r["impls"]                          # {"tir": us, "tirx": us} — round-aggregate
+    print(f"{cfg['label']}: tir/tirx = {im['tir'] / im['tirx']:.3f}")
 ```
 
 `bench/run_suite.py` in this dir does exactly this for all nymph GEMM kernels:

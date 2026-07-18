@@ -60,6 +60,18 @@ def run_bench(dtype, M, N, K, warmup=None, repeat=None, timer=None, **kwargs):
     a, b, c = prepare_data(dtype, M, N, K)
     oc, on = torch.zeros_like(c, device="cuda"), torch.zeros_like(c, device="cuda")
     funcs = {"tir": lambda: canon(a, b, oc), "tirx": lambda: nymph(a, b, on)}
+    # One-shot correctness gate BEFORE timing (a ratio of two kernels computing
+    # different results is meaningless): both outputs vs the torch reference.
+    for fn in funcs.values():
+        fn()
+    torch.cuda.synchronize()
+    ref = torch.mm(a, b.T)
+    for name, out in (("tir", oc), ("tirx", on)):
+        cos = torch.nn.functional.cosine_similarity(
+            out.float().flatten(), ref.float().flatten(), dim=0
+        )
+        if cos < 0.99:
+            raise AssertionError(f"{name} output diverges from reference (cosine={cos:.4f})")
     return bench(funcs, warmup=warmup, repeat=repeat, timer=timer, **kwargs)
 
 

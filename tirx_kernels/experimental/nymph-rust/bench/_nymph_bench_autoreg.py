@@ -12,8 +12,7 @@ import importlib.util
 import os
 import sys
 
-_HERE_GATE = True
-if _HERE_GATE:
+if os.environ.get("NYMPH_BENCH_SUITE") == "1":
     _HERE = os.path.dirname(os.path.abspath(__file__))
 
     def _register(mod_name, filename):
