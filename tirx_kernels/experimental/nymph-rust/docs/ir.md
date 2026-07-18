@@ -7,11 +7,14 @@ modules import from `ir`, not the other way around.
 ## Structure
 
 - `dtype.rs` - simple enums: `MemorySpace`, `DType`, `Swizzle`,
-  `TmemLayoutKind`, `MBarKind`, `FenceKind`, `FenceScope`, `VarBinding`,
+  `MBarKind`, `FenceKind`, `FenceScope`, `VarBinding`,
   `ScalarDType`, and `ScalarOp`.
 - `scalar.rs` - `Var`, `ScalarExpr`, `ScalarValue`, and `ScalarInitial`.
-- `tensor.rs` - `Tensor`, `TensorSlice`, `Layout`, `SmemSwizzleLayout`, and
-  `TmemLayout`.
+- `tensor.rs` - `Tensor`, `TensorSlice`, `Layout`, `SmemSwizzleLayout`,
+  `TmemOperand`, and `MmaOperand`. TMEM is not a tensor: a TMEM reference is a
+  `TmemOperand` — an absolute physical (lane, col) plus the dtype the addressed
+  cells are (un)packed as; allocations are explicit column bands
+  (`TmemAlloc`/`TmemDealloc`/`TmemRelinquish`).
 - `mbar.rs` - `MBar` and `MBarRef`.
 - `stmt.rs` - the `Stmt` enum, including control, metadata, register, TMA,
   TMEM, tcgen05, mbarrier, fence, sync, and cp.async statements.
@@ -29,9 +32,11 @@ and interpretation.
   op-family base class.
 - Body-bearing variants implement `Stmt::child_bodies()`. Structural walks use
   this hook, so new control nodes must expose their nested bodies there.
-- Tensor layouts are metadata for lowering and for modeled TMEM physical
-  mapping. The value interpreter honors `TmemLayout`; SMEM swizzle metadata is
-  recorded but not simulated.
+- Tensor layouts are metadata for lowering. SMEM swizzle metadata is recorded
+  but not simulated; TMEM has no layout at all — every TMEM operand is an
+  absolute physical (lane, col) the value interpreter reads/writes directly,
+  and `validate.rs`'s band walk proves each operand's column span lands inside
+  a live allocation.
 - `Kernel::validate()` owns the validation pass. Rust cannot run Python-style
   dataclass `__post_init__` hooks, so construction is cheap and validation is an
   explicit kernel-level check.

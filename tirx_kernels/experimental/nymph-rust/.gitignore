@@ -4,3 +4,6 @@
 /_pybuild
 # Locally-built extension symlink (target/release/libnymph_rs.so) for direct PYTHONPATH import.
 /python/nymph_rs/nymph_rs*.so
+# Bundled shared libs the wheel's abi3.so RPATHs to (copied next to python/nymph_rs/ so the
+# source-tree import — used by bench/ — resolves the same auditwheel-mangled names).
+/python/nymph_rs.libs/
