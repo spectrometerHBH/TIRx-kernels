@@ -34,7 +34,7 @@ use super::dtype::{DType, MemorySpace, ScalarOp, ScopeValueKind, Swizzle, VarBin
 use super::kernel::Kernel;
 use super::scalar::{ScalarExpr, ScalarInitial, ScalarValue, Var};
 use super::stmt::{RegOperand, Stmt};
-use super::tensor::{Layout, Tensor, TensorSlice};
+use super::tensor::{Layout, MmaOperand, Tensor, TensorSlice, TmemOperand};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -186,11 +186,11 @@ struct Ctx {
     scalar_names: HashMap<u32, String>,
     /// cta_group for engine dispatch (TMA/MMA/commit), from the kernel cluster size.
     cta_group: u8,
-    /// Base TMEM tensor (the largest-col allocation); the accum view maps onto it.
-    tmem_base: Option<Arc<Tensor>>,
-    /// `n_cols` passed to `tcgen05.alloc` — the column count the `tmem` view must
-    /// match (the view must not exceed the allocation, else illegal tcgen05 access).
-    tmem_alloc_cols: Option<u32>,
+    /// Column span of the single TMEM view buffer: the largest
+    /// `base_col + n_cols` over the kernel's `TmemAlloc`s. The view is one
+    /// `decl_buffer((128, cols), allocated_addr=0)` — TMEM is not a tensor, so
+    /// every TMEM instruction references it by absolute column slice.
+    tmem_view_cols: Option<usize>,
     /// Per-REG-tensor declared width AFTER the epilogue collapse widens the band.
     /// The fragment is declared `T.alloc_local(8)` in the nymph IR (instruction
     /// granularity); the collapsed wide read/cast/store needs it sized to the full
@@ -211,12 +211,29 @@ struct Ctx {
     /// Number of launched clusters (`launch_cta_count / cta_group`) — the grid stride
     /// for a `ForEachTask` grid-stride scheduler loop.
     num_clusters: usize,
-    /// NVFP4 e4m3 scale-factor TMEM tensors (SFA_tmem, SFB_tmem), in declaration order;
-    /// declared via `alloc_sf` right after the `tmem` view in KernelInit.
-    sf_tmems: Vec<Arc<Tensor>>,
+    /// NVFP4 e4m3 scale-factor TMEM views (SFA_tmem, SFB_tmem), keyed by the
+    /// operand's absolute physical base column; declared via `decl_buffer`
+    /// right after the `tmem` view in KernelInit.
+    sf_views: Vec<SfView>,
     /// Usage-derived scale-factor tensor ids (see `collect_sf_ids`) — the ONLY
     /// authority on "is this tensor a scale factor"; dtype is never consulted.
     sf: SfIds,
+}
+
+/// One NVFP4 e4m3 scale-factor TMEM view (`SFA_tmem`/`SFB_tmem`). The IR's SF
+/// operands are absolute physical TMEM addresses; the view re-materializes
+/// canon's logical `(rows, SF_K)` `decl_buffer` at that column so the
+/// block-scaled `Tx.gemm_async`/`Tx.copy_async` emission is unchanged.
+#[derive(Clone)]
+struct SfView {
+    name: String,
+    /// Absolute physical base column of the SF band.
+    col: usize,
+    /// Logical rows: the scaled-row count rounded up to whole 128-lane
+    /// super-blocks (a 256-row SFB band folds into 2 column super-blocks).
+    logical_rows: usize,
+    /// Logical cols: the per-row scale-block count (nvfp4 `k/16`).
+    logical_cols: usize,
 }
 
 impl Ctx {
@@ -764,14 +781,14 @@ fn merge_adjacent_guards(src: &str) -> String {
 /// Collect every tensor referenced anywhere (args + defs + slices), deduped by id,
 /// in a deterministic (id-sorted) order.
 /// Scale-factor tensor ids derived from USAGE, not dtype. A tensor is a scale
-/// factor iff it feeds the block-scaled MMA datapath: the `sfa`/`sfb` operand of a
-/// `Tcgen05Mma`, an endpoint of a `tcgen05.cp` (the SMEM→TMEM SF staging copy), or
-/// the GMEM source of a `TmaLoad` that fills an SF SMEM ring. dtype alone proves
-/// nothing — a plain fp8 DATA tensor is also e4m3, and laying it out as SF bytes
-/// would silently corrupt it.
+/// factor iff it feeds the block-scaled MMA datapath on its way INTO TMEM: an
+/// endpoint of a `tcgen05.cp` (the SMEM→TMEM SF staging copy), or the GMEM
+/// source of a `TmaLoad` that fills an SF SMEM ring. dtype alone proves
+/// nothing — a plain fp8 DATA tensor is also e4m3, and laying it out as SF
+/// bytes would silently corrupt it. (The TMEM side of the SF path is a
+/// `TmemOperand` now — physical addresses, no tensor ids; see `sf_views`.)
 #[derive(Default)]
 struct SfIds {
-    tmem: HashSet<u32>,
     smem: HashSet<u32>,
     gmem: HashSet<u32>,
 }
@@ -786,21 +803,11 @@ fn collect_sf_ids(k: &Kernel) -> SfIds {
         }
     }
     let mut ids = SfIds::default();
-    // Pass 1: MMA sf operands (TMEM) + tcgen05.cp endpoints (TMEM dst, SMEM src).
-    walk(&k.body, &mut |s| match s {
-        Stmt::Tcgen05Mma {
-            sfa: Some(sfa),
-            sfb: Some(sfb),
-            ..
-        } => {
-            ids.tmem.insert(sfa.tensor.id);
-            ids.tmem.insert(sfb.tensor.id);
-        }
-        Stmt::Tcgen05Cp { dst, src, .. } => {
-            ids.tmem.insert(dst.tensor.id);
+    // Pass 1: tcgen05.cp sources (SMEM).
+    walk(&k.body, &mut |s| {
+        if let Stmt::Tcgen05Cp { src, .. } = s {
             ids.smem.insert(src.tensor.id);
         }
-        _ => {}
     });
     // Pass 2: GMEM sources of the TMA loads that fill an SF SMEM ring (one level —
     // SF bytes flow gmem -> smem -> tmem, there are no longer chains).
@@ -843,9 +850,7 @@ fn note_slice(s: &TensorSlice, map: &mut HashMap<u32, Arc<Tensor>>) {
 fn collect_from_stmt(s: &Stmt, map: &mut HashMap<u32, Arc<Tensor>>) {
     use Stmt::*;
     match s {
-        TensorDef { tensor } | TmemAlloc { tensor, .. } | TmemDealloc { tensor, .. } => {
-            note_tensor(tensor, map)
-        }
+        TensorDef { tensor } => note_tensor(tensor, map),
         TmaLoad { dst, src, .. } => {
             note_slice(dst, map);
             note_tensor(src, map);
@@ -854,17 +859,21 @@ fn collect_from_stmt(s: &Stmt, map: &mut HashMap<u32, Arc<Tensor>>) {
             note_tensor(dst, map);
             note_slice(src, map);
         }
-        Tcgen05Mma { dst, a, b, .. } => {
-            note_slice(dst, map);
-            note_slice(a, map);
-            note_slice(b, map);
+        Tcgen05Mma { a, b, .. } => {
+            // TMEM operands (dst/sfa/sfb, TmemOperand-form a/b) carry no tensor.
+            for op in [a, b] {
+                if let MmaOperand::Slice(s) = op {
+                    note_slice(s, map);
+                }
+            }
         }
-        Tcgen05Ld { dst, src, .. } => {
-            note_slice(dst, map);
-            note_tensor(src, map);
+        Tcgen05Cp { src, .. } => {
+            note_slice(src, map);
         }
-        Tcgen05St { dst, src, .. } => {
-            note_tensor(dst, map);
+        Tcgen05Ld { dst, .. } => {
+            note_slice(dst, map);
+        }
+        Tcgen05St { src, .. } => {
             note_slice(src, map);
         }
         RegCvt { dst, src, .. } | RegLoad { dst, src } | RegStore { dst, src } => {
@@ -946,13 +955,18 @@ fn try_collapse_mma_run(stmts: &[Stmt]) -> Option<(Stmt, usize)> {
     if sfa.is_some() || sfb.is_some() {
         return None;
     }
-    // K is the last operand dim. Record the first op's K offset/extent.
-    let a_kdim = a.offsets.len().checked_sub(1)?;
-    let b_kdim = b.offsets.len().checked_sub(1)?;
-    let a_k0 = as_int(&a.offsets[a_kdim])?;
-    let b_k0 = as_int(&b.offsets[b_kdim])?;
-    let a_kext = as_int(&a.shape[a_kdim])?;
-    let b_kext = as_int(&b.shape[b_kdim])?;
+    // K is the last operand dim of an SMEM slice (a TMEM operand names no
+    // K-offset to advance, so it never collapses).
+    let (MmaOperand::Slice(a_sl), MmaOperand::Slice(b_sl)) = (a, b) else {
+        return None;
+    };
+    // Record the first op's K offset/extent.
+    let a_kdim = a_sl.offsets.len().checked_sub(1)?;
+    let b_kdim = b_sl.offsets.len().checked_sub(1)?;
+    let a_k0 = as_int(&a_sl.offsets[a_kdim])?;
+    let b_k0 = as_int(&b_sl.offsets[b_kdim])?;
+    let a_kext = as_int(&a_sl.shape[a_kdim])?;
+    let b_kext = as_int(&b_sl.shape[b_kdim])?;
 
     let mut count = 1usize;
     let mut a_khi = a_k0 + a_kext;
@@ -975,8 +989,14 @@ fn try_collapse_mma_run(stmts: &[Stmt]) -> Option<(Stmt, usize)> {
         if sfa2.is_some() || sfb2.is_some() {
             break;
         }
+        let (MmaOperand::Slice(a2), MmaOperand::Slice(b2)) = (a2, b2) else {
+            break;
+        };
         // Same dst (accumulator), same A/B tensors, accum True (continuation).
-        if d2 != dst || !Arc::ptr_eq(&a2.tensor, &a.tensor) || !Arc::ptr_eq(&b2.tensor, &b.tensor) {
+        if d2 != dst
+            || !Arc::ptr_eq(&a2.tensor, &a_sl.tensor)
+            || !Arc::ptr_eq(&b2.tensor, &b_sl.tensor)
+        {
             break;
         }
         if !*accum2 {
@@ -995,10 +1015,10 @@ fn try_collapse_mma_run(stmts: &[Stmt]) -> Option<(Stmt, usize)> {
             break;
         }
         // All non-K dims of A/B must match the first op (same tile).
-        if a2.offsets[..a_kdim] != a.offsets[..a_kdim]
-            || a2.shape[..a_kdim] != a.shape[..a_kdim]
-            || b2.offsets[..b_kdim] != b.offsets[..b_kdim]
-            || b2.shape[..b_kdim] != b.shape[..b_kdim]
+        if a2.offsets[..a_kdim] != a_sl.offsets[..a_kdim]
+            || a2.shape[..a_kdim] != a_sl.shape[..a_kdim]
+            || b2.offsets[..b_kdim] != b_sl.offsets[..b_kdim]
+            || b2.shape[..b_kdim] != b_sl.shape[..b_kdim]
         {
             break;
         }
@@ -1013,15 +1033,15 @@ fn try_collapse_mma_run(stmts: &[Stmt]) -> Option<(Stmt, usize)> {
     }
 
     // Build the coalesced operands: K offset = first's, K extent = full span.
-    let mut a_full = a.clone();
-    let mut b_full = b.clone();
+    let mut a_full = a_sl.clone();
+    let mut b_full = b_sl.clone();
     a_full.shape[a_kdim] = ScalarValue::Int(a_khi - a_k0);
     b_full.shape[b_kdim] = ScalarValue::Int(b_khi - b_k0);
 
     let collapsed = Stmt::Tcgen05Mma {
         dst: dst.clone(),
-        a: a_full,
-        b: b_full,
+        a: MmaOperand::Slice(a_full),
+        b: MmaOperand::Slice(b_full),
         m: *m,
         n: *n,
         k: total_k as u32,
@@ -1062,7 +1082,6 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
     //   - ab dtype, no layout -> `d_smem{i}`  (D writeback rings; we synthesize a
     //                            swizzle layout from the row byte width)
     let mut tmem_idx = 0usize;
-    let mut sf_tmem_idx = 0usize;
     let mut reg_idx = 0usize;
     let mut ab_idx = 0usize;
     let mut d_idx = 0usize;
@@ -1099,29 +1118,13 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
                 }
             }
             MemorySpace::Tmem => {
-                // SF-usage TMEM (an MMA sfa/sfb operand or a tcgen05.cp destination)
-                // → named SFA_tmem / SFB_tmem (alloc_sf'd).
-                if sf.tmem.contains(&t.id) {
-                    let n = if sf_tmem_idx == 0 {
-                        "SFA_tmem".to_string()
-                    } else {
-                        "SFB_tmem".to_string()
-                    };
-                    sf_tmem_idx += 1;
-                    n
-                } else {
-                    // First TMEM tensor is the base allocation; the second is the accum
-                    // view at col_start 0. Name base "tmem"; views are emitted as
-                    // tmem[:, lo:hi] at the slice site, but the tensor still needs a name
-                    // (only used if referenced as a whole tensor, e.g. tmem_alloc).
-                    let n = if tmem_idx == 0 {
-                        "tmem".to_string()
-                    } else {
-                        format!("tmem_view{tmem_idx}")
-                    };
-                    tmem_idx += 1;
-                    n
-                }
+                // TMEM is not a tensor anymore: no IR op references a TMEM tensor
+                // (all TMEM addressing is physical). A stray TMEM-space tensor can
+                // only come from a leftover TensorDef; name it so the walk stays
+                // total — nothing references the name.
+                let n = format!("tmem_view{tmem_idx}");
+                tmem_idx += 1;
+                n
             }
             MemorySpace::Reg => {
                 let n = match reg_idx {
@@ -1245,27 +1248,28 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
         }
     }
 
-    // The base TMEM tensor = the TMEM allocation with the most columns (512); the
-    // accum (128,N) view aliases it at col 0.
-    let tmem_base = tensors
-        .values()
-        .filter(|t| t.space == MemorySpace::Tmem)
-        .max_by_key(|t| t.shape.get(1).copied().unwrap_or(0))
-        .cloned();
-
-    // The TMEM alloc n_cols (the view must match it, not the base tensor's cols).
-    let mut tmem_alloc_cols = None;
-    fn find_alloc_cols(stmts: &[Stmt], out: &mut Option<u32>) {
+    // The single TMEM view buffer spans every allocated column band:
+    // `max(base_col + n_cols)` over the kernel's TmemAllocs.
+    let mut tmem_view_cols: Option<usize> = None;
+    fn find_tmem_view_cols(stmts: &[Stmt], out: &mut Option<usize>) {
         for s in stmts {
-            if let Stmt::TmemAlloc { n_cols, .. } = s {
-                out.get_or_insert(*n_cols);
+            if let Stmt::TmemAlloc {
+                base_col, n_cols, ..
+            } = s
+            {
+                let end = (*base_col + *n_cols) as usize;
+                *out = Some(out.map_or(end, |e: usize| e.max(end)));
             }
             for body in s.child_bodies() {
-                find_alloc_cols(body, out);
+                find_tmem_view_cols(body, out);
             }
         }
     }
-    find_alloc_cols(&k.body, &mut tmem_alloc_cols);
+    find_tmem_view_cols(&k.body, &mut tmem_view_cols);
+
+    // NVFP4 SF TMEM views, keyed by the operands' physical base columns.
+    let mut sf_views: Vec<SfView> = Vec::new();
+    collect_sf_views(&k.body, &mut sf_views)?;
 
     // Per-REG-tensor width after the epilogue collapse. Walk the collapsed bodies and
     // record, for each REG fragment, `max(offset + width)` over every slice — the band
@@ -1337,17 +1341,102 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
         var_names: HashMap::new(),
         scalar_names,
         cta_group,
-        tmem_base,
-        tmem_alloc_cols,
+        tmem_view_cols,
         reg_widths,
         tma_leader_mbars,
         num_clusters: (k.launch_cta_count() / (cta_group as usize).max(1)).max(1),
-        sf_tmems: collect_tensors(k)
-            .into_iter()
-            .filter(|t| t.space == MemorySpace::Tmem && sf.tmem.contains(&t.id))
-            .collect(),
+        sf_views,
         sf,
     })
+}
+
+/// Register one SF view per physical base column, in first-use order
+/// (`SFA_tmem`, `SFB_tmem`, then `sf_tmem{i}`). `rows` is the scaled-row count
+/// of this use; the view's logical rows round it up to whole 128-lane
+/// super-blocks — exactly canon's `(128 * n_chunks, SF_K)` decl_buffer.
+fn note_sf_view(
+    views: &mut Vec<SfView>,
+    op: &TmemOperand,
+    rows: usize,
+    nblocks: usize,
+) -> Result<(), String> {
+    let Some(col) = as_int(&op.col) else {
+        return Err(
+            "codegen: SF TMEM operand base column must be a compile-time constant".to_string(),
+        );
+    };
+    if col < 0 {
+        return Err("codegen: SF TMEM operand base column is negative".to_string());
+    }
+    let col = col as usize;
+    let logical_rows = rows.div_ceil(128) * 128;
+    let logical_cols = nblocks;
+    if let Some(v) = views.iter().find(|v| v.col == col) {
+        if v.logical_rows != logical_rows || v.logical_cols != logical_cols {
+            return Err(format!(
+                "codegen: SF TMEM views at col {col} disagree on the logical shape"
+            ));
+        }
+        return Ok(());
+    }
+    let name = match views.len() {
+        0 => "SFA_tmem".to_string(),
+        1 => "SFB_tmem".to_string(),
+        i => format!("sf_tmem{i}"),
+    };
+    views.push(SfView {
+        name,
+        col,
+        logical_rows,
+        logical_cols,
+    });
+    Ok(())
+}
+
+fn collect_sf_views(stmts: &[Stmt], views: &mut Vec<SfView>) -> Result<(), String> {
+    for s in stmts {
+        match s {
+            Stmt::Tcgen05Mma {
+                m,
+                n,
+                k,
+                cta_group,
+                sfa: Some(sfa),
+                sfb: Some(sfb),
+                sf_block,
+                ..
+            } => {
+                let nblocks = if *sf_block == 0 {
+                    1
+                } else {
+                    (*k / *sf_block) as usize
+                };
+                let a_rows = (if *cta_group == 1 { *m } else { *m / 2 }) as usize;
+                note_sf_view(views, sfa, a_rows, nblocks)?;
+                note_sf_view(views, sfb, *n as usize, nblocks)?;
+            }
+            Stmt::Tcgen05Cp { dst, src, .. } if dst.dtype == DType::F8E4M3 => {
+                // The src is the staged SF SMEM tile (..., rows, SF_CTA_K); its
+                // trailing dims are the view's logical (rows, cols).
+                let (Some(rows), Some(sf_k)) = (
+                    src.shape
+                        .get(src.shape.len().saturating_sub(2))
+                        .and_then(as_int),
+                    src.shape.last().and_then(as_int),
+                ) else {
+                    return Err(
+                        "codegen: tcgen05_cp src shape must be static for the SF view".to_string(),
+                    );
+                };
+                note_sf_view(views, dst, rows.max(0) as usize, sf_k.max(0) as usize)?;
+            }
+            _ => {}
+        }
+        for body in s.child_bodies() {
+            collect_sf_views(body, views)?;
+        }
+    }
+    Ok(())
 }
 
 /// The declared (full) width of a REG fragment's wg tile = its collapsed band width.
@@ -1699,33 +1788,14 @@ fn emit_scalar_load(s: &TensorSlice, ctx: &Ctx) -> Result<String, String> {
     emit_scalar_addr(s, ctx)
 }
 
-/// A TMEM tensor's *view* (accum) maps to the base `tmem` buffer; emit `tmem[:, lo:hi]`.
-/// Purely structural: a 2-D slice (`offsets.len()==2`) whose row offset is `0` spans all
-/// 128 lanes (`:`); the column band comes from `offsets[1]`/`shape[1]`. No shape literal.
-fn emit_tmem_dst(s: &TensorSlice, ctx: &Ctx) -> Result<String, String> {
-    // The MMA dst / ld src is `accum[:, 0:N]`; map to `tmem[:, 0:N]`.
-    // Row dim spans the whole 128 lanes -> ":"; col dim from offsets/shape.
-    let row = if s.offsets.len() == 2 {
-        let lo = emit_scalar(&s.offsets[0], ctx);
-        let hi = add_bound(&s.offsets[0], &s.shape[0], ctx);
-        if lo == "0" {
-            // whole-lane span
-            ":".to_string()
-        } else {
-            format!("{lo}:{hi}")
-        }
-    } else {
-        ":".to_string()
-    };
-    let (clo, chi) = if s.offsets.len() == 2 {
-        (
-            emit_scalar(&s.offsets[1], ctx),
-            add_bound(&s.offsets[1], &s.shape[1], ctx),
-        )
-    } else {
-        ("0".to_string(), "0".to_string())
-    };
-    Ok(format!("tmem[{row}, {clo}:{chi}]"))
+/// The MMA accumulator dst: an absolute column slice of the single `tmem`
+/// view — `tmem[:, col:col+n]`. The accumulator is lane-anchored at row 0, so
+/// the lane axis spans all 128 lanes; the column band is the operand's
+/// absolute physical base plus the MMA's n.
+fn emit_tmem_dst(op: &TmemOperand, n: u32, ctx: &Ctx) -> Result<String, String> {
+    let col_s = emit_scalar(&op.col, ctx);
+    let hi = add_bound(&op.col, &ScalarValue::Int(i64::from(n)), ctx);
+    Ok(format!("tmem[:, {col_s}:{hi}]"))
 }
 
 // ===========================================================================
@@ -1950,7 +2020,7 @@ fn emit_stmt(
         // ---- definitions handled in the header; skip in the body walk ----
         TensorDef { .. } | MBarDef { .. } => Ok(()),
 
-        // ---- TMEM alloc / dealloc (already under warp==0 role guard) ----
+        // ---- TMEM alloc / dealloc / relinquish (already under warp==0 role guard) ----
         TmemAlloc { n_cols, .. } => {
             // The TMEM view buffer `tmem` is declared at function scope (after the
             // KernelInit block), not here; this only emits the alloc call.
@@ -1963,10 +2033,16 @@ fn emit_stmt(
         TmemDealloc { n_cols, .. } => {
             let cta_group = ctx.cta_group;
             out.push_str(&format!(
-                "{p}T.ptx.tcgen05.relinquish_alloc_permit(cta_group={cta_group})\n"
-            ));
-            out.push_str(&format!(
                 "{p}T.ptx.tcgen05.dealloc(tmem_addr[0], n_cols={n_cols}, cta_group={cta_group})\n"
+            ));
+            Ok(())
+        }
+        TmemRelinquish { .. } => {
+            // 1:1 translation — the IR makes the permit release explicit (it used
+            // to ride along with the dealloc implicitly).
+            let cta_group = ctx.cta_group;
+            out.push_str(&format!(
+                "{p}T.ptx.tcgen05.relinquish_alloc_permit(cta_group={cta_group})\n"
             ));
             Ok(())
         }
@@ -1979,68 +2055,36 @@ fn emit_stmt(
             } else {
                 emit_body(out, body, indent, ctx, scope)?;
             }
-            // Declare the TMEM view buffer at function scope (mirrors the template's
-            // line 490: `tmem` is visible to the MMA + epilogue, so it must NOT be
-            // nested under the warp==0 alloc guard).
-            if let Some(base) = &ctx.tmem_base {
-                // The view's column count must match the `tcgen05.alloc` n_cols, not
-                // the base tensor's (512) — a view wider than the allocation is an
-                // illegal tcgen05 access. (suspect 4)
-                let cols = ctx
-                    .tmem_alloc_cols
-                    .map(|c| c as usize)
-                    .unwrap_or(base.shape[1]);
-                // allocated_addr=0 (not tmem_addr[0], the SMEM-stored alloc result): the
-                // single tcgen05.alloc always bases at TMEM column 0, so the view address is
-                // a compile-time constant — exactly canon's form. Using tmem_addr[0] makes
-                // every tcgen05_ld re-load the base from SMEM (LDS) + add the column (VIADD)
-                // + convert to uniform (R2UR); pinning it to 0 cuts that epilogue address
-                // math (VIADD/LOP3/LDS) roughly in half.
+            // Declare the single TMEM view buffer at function scope (mirrors the
+            // template's line 490: `tmem` is visible to the MMA + epilogue, so it
+            // must NOT be nested under the warp==0 alloc guard). TMEM is not a
+            // tensor: one (128, cols) f32 view over the whole allocated band,
+            // addressed everywhere by absolute column slices. allocated_addr=0
+            // (not tmem_addr[0], the SMEM-stored alloc result): the single
+            // tcgen05.alloc always bases at TMEM column 0, so the view address is
+            // a compile-time constant — exactly canon's form; pinning it to 0 cuts
+            // the epilogue address math (VIADD/LOP3/LDS) roughly in half.
+            if let Some(cols) = ctx.tmem_view_cols {
                 out.push_str(&format!(
-                    "{p}tmem = T.decl_buffer(({d0}, {d1}), \"{dt}\", scope=\"tmem\", allocated_addr=0, layout=TileLayout(S[({d0}, {d1}) : (1 @ TLane, 1 @ TCol)]))\n",
-                    d0 = base.shape[0],
-                    d1 = cols,
-                    dt = dtype_str(base.dtype),
+                    "{p}tmem = T.decl_buffer((128, {cols}), \"float32\", scope=\"tmem\", allocated_addr=0, layout=TileLayout(S[(128, {cols}) : (1 @ TLane, 1 @ TCol)]))\n",
                 ));
             }
-            // NVFP4 e4m3 scale-factor TMEM (canon's tmem_pool.alloc_sf(..., sf_per_mma=4)).
-            // The TileLayout follows `sf_tmem_layout(rows, SF_K, sf_per_mma=4)`: with
-            // SF_K=16, sf_per_mma=4 (so the outer K=4, pack_factor=1) the atom is
-            // `S[(32, 4):(1@TLane,1@TCol)] + R[4:32@TLane]` direct-summed with
-            // `outer = S[(M, 4):(epc=4 @TCol, M*4 @TCol)]` (M = rows//32), giving
-            // `S[(M, 32, 4, 4):(4@TCol, 1@TLane, M*4 @TCol, 1@TCol)] + R[4:32@TLane]`.
-            // rows=128 (M=4): (4,32,4,4):(4,1,16,1); rows=256 (M=8): (8,32,4,4):(4,1,32,1).
-            //
-            // UN-FOLD: the IR/value-model tensor is the PHYSICAL (128, SF_K * n_chunks)
-            // (TMEM is 128 lanes; canon's `128 * SFB_n_chunks`-row SFB band folds its extra
-            // super-blocks into columns). The decl_buffer the gemm dispatch reads is canon's
-            // LOGICAL (128 * n_chunks, SF_K): the block-scaled dispatch derives N from
-            // SFB_tmem's logical row count and needs SFB_rows >= N=MMA_N. The per-super-block
-            // SF_K is the nvfp4 invariant CTA_K//SF_BLOCK = 16 (sf_per_mma=4 × MMA_K_BLOCKS=4),
-            // so n_chunks = physical_cols // 16, logical_rows = 128 * n_chunks.
-            const BASE_SF_K: usize = 16;
-            for sf in &ctx.sf_tmems {
-                let name = ctx.tensor_name(sf.id)?;
-                // The decl_buffer below is the NVFP4 e4m3 SF view — the only SF TMEM
-                // form this codegen emits (the u32 UE8M0 fp8 mode has no lowering).
-                if sf.dtype != DType::F8E4M3 {
-                    return Err(format!(
-                        "codegen: SF TMEM tensor {name} must be e4m3 (got {:?})",
-                        sf.dtype
-                    ));
-                }
-                let col = match &sf.layout {
-                    Some(Layout::Tmem(tm)) => tm.col_start,
-                    _ => 0,
-                };
-                let phys_cols = sf.shape[1];
-                let n_chunks = (phys_cols / BASE_SF_K).max(1);
-                let logical_rows = 128 * n_chunks;
-                let logical_cols = phys_cols / n_chunks;
-                let m_super = logical_rows / 32; // sf_tmem_layout's M = rows // 32
+            // NVFP4 e4m3 scale-factor TMEM views (canon's tmem_pool.alloc_sf(...,
+            // sf_per_mma=4)). The TileLayout follows `sf_tmem_layout(rows, SF_K,
+            // sf_per_mma=4)`: S[(M, 32, 4, 4) : (4 @ TCol, 1 @ TLane, M*4 @ TCol,
+            // 1 @ TCol)] + R[4:32 @ TLane], M = rows // 32. The view's logical
+            // (rows, SF_K) re-materializes the folded physical band the IR operand
+            // addresses directly (a 256-row SFB folds into 2 column super-blocks).
+            for view in &ctx.sf_views {
+                let m_super = view.logical_rows / 32;
                 out.push_str(&format!(
-                    "{p}{name} = T.decl_buffer(({logical_rows}, {logical_cols}), \"float8_e4m3fn\", scope=\"tmem\", layout=TileLayout(S[({m_super}, 32, 4, 4) : (4 @ TCol, 1 @ TLane, {m_stride} @ TCol, 1 @ TCol)] + R[4:32 @ TLane]), allocated_addr={col})\n",
+                    "{p}{name} = T.decl_buffer(({rows}, {cols}), \"float8_e4m3fn\", scope=\"tmem\", layout=TileLayout(S[({m_super}, 32, 4, 4) : (4 @ TCol, 1 @ TLane, {m_stride} @ TCol, 1 @ TCol)] + R[4:32 @ TLane]), allocated_addr={col})\n",
+                    name = view.name,
+                    rows = view.logical_rows,
+                    cols = view.logical_cols,
+                    m_super = m_super,
                     m_stride = m_super * 4,
+                    col = view.col,
                 ));
             }
             // KernelInit emits ONLY the warp-0 body (tmem alloc + mbarrier inits). The entire
@@ -2529,6 +2573,9 @@ fn emit_stmt(
             dst,
             a,
             b,
+            m,
+            n,
+            k,
             accum,
             sfa,
             sfb,
@@ -2590,19 +2637,44 @@ fn emit_stmt(
                     return Err("codegen: Tcgen05Mma sfa/sfb must be set together".to_string());
                 }
             }
-            let dst_s = emit_tmem_dst(dst, ctx)?;
+            let dst_s = emit_tmem_dst(dst, *n, ctx)?;
             // The A/B operands are staged SMEM tiles: drop the leading ring index so
             // the operand is the 2D `(M, K)` / `(N, K)` MMA tile (canonical
-            // `Asmem[stage, warp_id]` / `Bsmem[stage]`).
-            let mut a_s = emit_smem_tile(a, ctx)?;
-            let mut b_s = emit_smem_tile(b, ctx)?;
+            // `Asmem[stage, warp_id]` / `Bsmem[stage]`). A TMEM operand (the GDN
+            // accumulator-readback) is an absolute (lane, col) slice of the single
+            // `tmem` view.
+            let emit_ab = |op: &MmaOperand, rows: u32| -> Result<String, String> {
+                match op {
+                    MmaOperand::Slice(s) => emit_smem_tile(s, ctx),
+                    MmaOperand::Tmem(t) => {
+                        let row_s = emit_scalar(&t.row, ctx);
+                        let col_s = emit_scalar(&t.col, ctx);
+                        let row_hi = add_bound(&t.row, &ScalarValue::Int(i64::from(rows)), ctx);
+                        let cells = match t.dtype {
+                            DType::F16 | DType::Bf16 => *k as i64 / 2,
+                            _ => i64::from(*k),
+                        };
+                        let col_hi = add_bound(&t.col, &ScalarValue::Int(cells), ctx);
+                        Ok(format!("tmem[{row_s}:{row_hi}, {col_s}:{col_hi}]"))
+                    }
+                }
+            };
+            let a_rows = if *cta_group == 1 { *m } else { *m / 2 };
+            let b_rows = if *cta_group == 1 { *n } else { *n / 2 };
+            let mut a_s = emit_ab(a, a_rows)?;
+            let mut b_s = emit_ab(b, b_rows)?;
             let accum_s = if *accum { "True" } else { "False" };
             if let (Some(sfa), Some(sfb)) = (sfa.as_ref(), sfb.as_ref()) {
                 // NVFP4 block-scaled: view the packed-u8 operand BUFFER as e2m1 fp4 (the
                 // last dim doubles: bytes -> fp4 elems), then slice — `.view` is on the
                 // buffer, not a region (canon: A_smem = A_smem_packed.view(...); A_smem[stage]).
                 if *a_fp4 {
-                    let view = |s: &TensorSlice| -> Result<String, String> {
+                    let view = |op: &MmaOperand| -> Result<String, String> {
+                        let MmaOperand::Slice(s) = op else {
+                            return Err(
+                                "codegen: fp4 Tcgen05Mma operands must be SMEM slices".to_string()
+                            );
+                        };
                         let buf = ctx.tensor_name(s.tensor.id)?;
                         let stage =
                             emit_scalar(s.offsets.first().unwrap_or(&ScalarValue::Int(0)), ctx);
@@ -2615,20 +2687,26 @@ fn emit_stmt(
                     a_s = view(a)?;
                     b_s = view(b)?;
                 }
-                // Emit the SF operands as EXPLICIT logical slices `[0:rows, 0:cols]`,
-                // exactly like canon (`SFA_tmem[0:128, 0:16], SFB_tmem[0:256, 0:16]`),
-                // NOT the bare buffer — the gemm's block-scaled dispatch addresses the SF
-                // through this slice's logical (rows, cols). Un-fold the physical
-                // `(128, SF_K * n_chunks)` TMEM tensor to its logical `(128*n_chunks, SF_K)`
-                // (per-super-block SF_K=16), matching the SFB_tmem decl_buffer.
-                let sf_slice = |sf: &TensorSlice| -> Result<String, String> {
-                    const BASE_SF_K_MMA: usize = 16;
-                    let name = ctx.tensor_name(sf.tensor.id)?;
-                    let phys_cols = sf.tensor.shape.get(1).copied().unwrap_or(0);
-                    let n_chunks = (phys_cols / BASE_SF_K_MMA).max(1);
-                    let rows = sf.tensor.shape.first().copied().unwrap_or(128) * n_chunks;
-                    let cols = phys_cols / n_chunks;
-                    Ok(format!("{name}[0:{rows}, 0:{cols}]"))
+                // Emit the SF operands as EXPLICIT logical slices `[0:rows, 0:cols]`
+                // of their views, exactly like canon (`SFA_tmem[0:128, 0:16]`,
+                // `SFB_tmem[0:256, 0:16]`) — the view at the operand's physical base
+                // column re-materializes the folded logical shape.
+                let sf_slice = |op: &TmemOperand| -> Result<String, String> {
+                    let Some(col) = as_int(&op.col) else {
+                        return Err(
+                            "codegen: SF TMEM operand col must be a compile-time constant"
+                                .to_string(),
+                        );
+                    };
+                    let view = ctx
+                        .sf_views
+                        .iter()
+                        .find(|v| v.col as i64 == col)
+                        .ok_or_else(|| format!("codegen: no SF TMEM view at col {col}"))?;
+                    Ok(format!(
+                        "{}[0:{}, 0:{}]",
+                        view.name, view.logical_rows, view.logical_cols
+                    ))
                 };
                 let sfa_s = sf_slice(sfa)?;
                 let sfb_s = sf_slice(sfb)?;
@@ -2657,27 +2735,39 @@ fn emit_stmt(
             src,
             cta_group,
         } => {
-            let dst_name = ctx.tensor_name(dst.tensor.id)?;
             // Emit canon's EXACT cp form: `Tx.copy_async(SFB_tmem[0:256, 0:16],
-            // SFB_smem[stage, 0:256, 0:16], cta_group=2)` — explicit logical slices on
-            // BOTH ends. Un-fold the dst's physical `(128, SF_K * n_chunks)` TMEM tensor
-            // to its logical `(128*n_chunks, SF_K)` (per-super-block SF_K=16), matching the
-            // SFB_tmem decl_buffer; the src is the staged SF SMEM `(rows, SF_CTA_K)`.
-            const BASE_SF_K_CP: usize = 16;
-            let phys_dst_cols = dst.tensor.shape.get(1).copied().unwrap_or(0);
-            let n_chunks = (phys_dst_cols / BASE_SF_K_CP).max(1);
-            let dst_rows = dst.tensor.shape.first().copied().unwrap_or(128) * n_chunks;
-            let dst_cols = phys_dst_cols / n_chunks;
+            // SFB_smem[stage, 0:256, 0:16], cta_group=2)` — explicit logical slices
+            // on BOTH ends. The dst's view comes from its physical base column;
+            // the src is the staged SF SMEM `(rows, SF_CTA_K)`.
+            let Some(col) = as_int(&dst.col) else {
+                return Err(
+                    "codegen: tcgen05_cp dst col must be a compile-time constant".to_string(),
+                );
+            };
+            let view = ctx
+                .sf_views
+                .iter()
+                .find(|v| v.col as i64 == col)
+                .ok_or_else(|| format!("codegen: no SF TMEM view at col {col}"))?;
             let src_name = ctx.tensor_name(src.tensor.id)?;
             let stage = emit_scalar(src.offsets.first().unwrap_or(&ScalarValue::Int(0)), ctx);
             // src is a staged SF SMEM tile `(SMEM_DEPTH, rows, SF_CTA_K)`; its full
-            // (rows, SF_CTA_K) at this stage.
-            let r = src.tensor.shape.get(1).copied().unwrap_or(0);
-            let c = src.tensor.shape.get(2).copied().unwrap_or(0);
+            // (rows, SF_CTA_K) at this stage — the trailing slice dims.
+            let (Some(r), Some(c)) = (
+                src.shape
+                    .get(src.shape.len().saturating_sub(2))
+                    .and_then(as_int),
+                src.shape.last().and_then(as_int),
+            ) else {
+                return Err("codegen: tcgen05_cp src shape must be static".to_string());
+            };
             emit_guarded(
                 out,
                 &format!(
-                    "Tx.copy_async({dst_name}[0:{dst_rows}, 0:{dst_cols}], {src_name}[{stage}, 0:{r}, 0:{c}], cta_group={cta_group})"
+                    "Tx.copy_async({name}[0:{rows}, 0:{cols}], {src_name}[{stage}, 0:{r}, 0:{c}], cta_group={cta_group})",
+                    name = view.name,
+                    rows = view.logical_rows,
+                    cols = view.logical_cols,
                 ),
             );
             Ok(())
@@ -2708,15 +2798,14 @@ fn emit_stmt(
 
         // ---- epilogue: tcgen05_ld -> Tx.wg.copy_async, wait_ld, reg_cvt -> Tx.wg.cast,
         // reg_store -> Tx.copy. Whole warpgroup participates (no per-thread guard). ----
-        Tcgen05Ld {
-            dst, num, row, col, ..
-        } => {
+        Tcgen05Ld { dst, src, num, .. } => {
             // dst is the f32 reg fragment (read as a wg view of `num` cols); src is the
-            // tmem accum band at `col`. The fragment is filled from column 0 (scratch
-            // reused per drain group), so the view slice starts at 0.
+            // tmem band at the operand's absolute physical `col`. The fragment is
+            // filled from column 0 (scratch reused per drain group), so the view
+            // slice starts at 0.
             let width = *num as usize;
-            let _ = emit_scalar(row, ctx); // row is the lane axis, captured by the view
-            let col_s = emit_scalar(col, ctx);
+            let _ = emit_scalar(&src.row, ctx); // row is the lane axis, captured by the view
+            let col_s = emit_scalar(&src.col, ctx);
             // Read this atom into its sub-slice of the (wide) read fragment: the
             // epilogue issues a whole band's atoms into distinct slices, THEN a
             // single wait_ld (matching the canonical fence structure). A legacy
