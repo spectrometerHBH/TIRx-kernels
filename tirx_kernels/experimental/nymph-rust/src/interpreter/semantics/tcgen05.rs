@@ -23,8 +23,8 @@ use super::super::values::mbars::{MbarCell, MbarCellKey};
 use super::super::values::tcgen05_datapath::{
     datapath_has_cell_aliases_cached, datapath_index_arrays_cached, datapath_index_summary_cached,
 };
-use super::super::values::tmem::{tmem_layout_for, TMEM_COLS, TMEM_ROWS};
-use crate::ir::{MemorySpace, Stmt, TensorSlice};
+use super::super::values::tmem::{TMEM_COLS, TMEM_ROWS};
+use crate::ir::{DType, MemorySpace, MmaOperand, Stmt, TensorSlice, TmemOperand};
 use ndarray::{Array1, Array2};
 use std::collections::HashMap;
 
@@ -187,7 +187,6 @@ fn resolve_datapath(
     stmt_col: &crate::ir::ScalarValue,
     shape: &str,
     num: u32,
-    tmem_tensor: &crate::ir::Tensor,
     label: &str,
 ) -> IResult<(Array2<usize>, Array2<usize>, usize)> {
     ctx.check_full_warp_cohort(
@@ -200,7 +199,6 @@ fn resolve_datapath(
     check_subpartition_span(row, shape, label)?;
     let (lane_idx, col_idx) = datapath_index_arrays_cached(shape, num as usize)?;
     let reg_size = lane_idx.ncols();
-    let col_start = tmem_layout_for(tmem_tensor)?.col_start;
     let a = ctx.cohort.len();
     let mut lanes = Array2::<usize>::zeros((a, reg_size));
     let mut cols = Array2::<usize>::zeros((a, reg_size));
@@ -208,7 +206,7 @@ fn resolve_datapath(
         let subpart = (32 * (t.warp_id % 4)) as i64;
         for r in 0..reg_size {
             let lane = row + subpart + lane_idx[[t.lane_id, r]] as i64;
-            let col = col_start as i64 + col + col_idx[[t.lane_id, r]] as i64;
+            let col = col + col_idx[[t.lane_id, r]] as i64;
             if lane < 0 || lane >= TMEM_ROWS as i64 || col < 0 || col >= TMEM_COLS as i64 {
                 return Err(InterpreterError::new(
                     format!("tcgen05_{label}_out_of_range"),
@@ -228,7 +226,6 @@ fn resolve_datapath_bounds(
     stmt_col: &crate::ir::ScalarValue,
     shape: &str,
     num: u32,
-    tmem_tensor: &crate::ir::Tensor,
     label: &str,
 ) -> IResult<DatapathBounds> {
     ctx.check_full_warp_cohort(
@@ -240,9 +237,8 @@ fn resolve_datapath_bounds(
     check_row_alignment(row, shape, label)?;
     check_subpartition_span(row, shape, label)?;
     let summary = datapath_index_summary_cached(shape, num as usize)?;
-    let layout_col_start = tmem_layout_for(tmem_tensor)?.col_start;
-    let abs_col_start = layout_col_start as i64 + col + summary.col_min as i64;
-    let abs_col_end = layout_col_start as i64 + col + summary.col_max as i64;
+    let abs_col_start = col + summary.col_min as i64;
+    let abs_col_end = col + summary.col_max as i64;
     if abs_col_start < 0 || abs_col_end >= TMEM_COLS as i64 {
         return Err(InterpreterError::new(
             format!("tcgen05_{label}_out_of_range"),
@@ -284,7 +280,6 @@ fn trace_ldst_tmem_region(
     stmt_col: &crate::ir::ScalarValue,
     shape: &str,
     num: u32,
-    tmem_tensor: &crate::ir::Tensor,
     label: &str,
 ) -> IResult<(Region, usize)> {
     ctx.check_full_warp_cohort(
@@ -296,9 +291,8 @@ fn trace_ldst_tmem_region(
     check_row_alignment(row, shape, label)?;
     check_subpartition_span(row, shape, label)?;
     let summary = datapath_index_summary_cached(shape, num as usize)?;
-    let layout_col_start = tmem_layout_for(tmem_tensor)?.col_start;
-    let col_start = layout_col_start as i64 + col + summary.col_min as i64;
-    let col_end = layout_col_start as i64 + col + summary.col_max as i64 + 1;
+    let col_start = col + summary.col_min as i64;
+    let col_end = col + summary.col_max as i64 + 1;
     if col_start < 0 || col_end > TMEM_COLS as i64 {
         return Err(InterpreterError::new(
             format!("tcgen05_{label}_out_of_range"),
@@ -335,38 +329,39 @@ fn trace_ldst_tmem_region(
             format!("tcgen05_{label} must be issued by one or more full warps"),
         ));
     }
+    // TMEM regions carry no tensor identity (0): the (lane, lane_byte) box IS
+    // the address now that TMEM is not a tensor.
     Ok((
-        region::tmem_region_from_rects(tmem_tensor.id, ctx.stream.cta_id, rects)?,
+        region::tmem_region_from_rects(0, ctx.stream.cta_id, rects)?,
         summary.reg_size,
     ))
 }
 
 fn execute_ld<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
-    let (dst, src, shape, num, row, col) = match stmt {
+    let (dst, src, shape, num) = match stmt {
         Stmt::Tcgen05Ld {
             dst,
             src,
             shape,
             num,
-            row,
-            col,
-        } => (dst, src, shape_str(shape), *num, row, col),
+        } => (dst, src, shape_str(shape), *num),
         _ => unreachable!(),
     };
+    let (row, col) = (&src.row, &src.col);
     if ctx.trace_mode() && !ctx.state.trace.records_events() {
         let t_resolve = super::super::runner::prof_now();
-        let bounds = resolve_datapath_bounds(ctx, row, col, shape, num, src, "ld")?;
+        let bounds = resolve_datapath_bounds(ctx, row, col, shape, num, "ld")?;
         super::super::runner::prof_end("TcLd:resolve", t_resolve);
         let t_dst = super::super::runner::prof_now();
         let dst_r = ctx.eval_slice(dst)?;
-        check_reg_fragment(&dst_r, src, bounds.reg_size, "ld")?;
+        check_reg_fragment(&dst_r, src.dtype, bounds.reg_size, "ld")?;
         if is_packed_tmem_dtype(src.dtype) {
             let _ = packed_half_register_slice(&dst_r, bounds.reg_size, "ld")?;
         }
         super::super::runner::prof_end("TcLd:dst_check", t_dst);
         let t_alloc = super::super::runner::prof_now();
         if !tmem_col_range_allocated(ctx, ctx.stream.cta_id, bounds.col_start, bounds.col_end) {
-            let (_, cols, _) = resolve_datapath(ctx, row, col, shape, num, src, "ld")?;
+            let (_, cols, _) = resolve_datapath(ctx, row, col, shape, num, "ld")?;
             check_tmem_cells_allocated(ctx, ctx.stream.cta_id, cols.iter().copied(), "tcgen05_ld")?;
         }
         super::super::runner::prof_end("TcLd:alloc_check", t_alloc);
@@ -374,11 +369,11 @@ fn execute_ld<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResul
     }
     if ctx.trace_mode() {
         let t_resolve = super::super::runner::prof_now();
-        let (region, reg_size) = trace_ldst_tmem_region(ctx, row, col, shape, num, src, "ld")?;
+        let (region, reg_size) = trace_ldst_tmem_region(ctx, row, col, shape, num, "ld")?;
         super::super::runner::prof_end("TcLd:resolve", t_resolve);
         let t_dst = super::super::runner::prof_now();
         let dst_r = ctx.eval_slice(dst)?;
-        check_reg_fragment(&dst_r, src, reg_size, "ld")?;
+        check_reg_fragment(&dst_r, src.dtype, reg_size, "ld")?;
         let packed_dst = if is_packed_tmem_dtype(src.dtype) {
             Some(packed_half_register_slice(&dst_r, reg_size, "ld")?)
         } else {
@@ -399,11 +394,11 @@ fn execute_ld<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResul
         return Ok(StepStatus::advance());
     }
     let t_resolve = super::super::runner::prof_now();
-    let (lanes, cols, reg_size) = resolve_datapath(ctx, row, col, shape, num, src, "ld")?;
+    let (lanes, cols, reg_size) = resolve_datapath(ctx, row, col, shape, num, "ld")?;
     super::super::runner::prof_end("TcLd:resolve", t_resolve);
     let t_dst = super::super::runner::prof_now();
     let dst_r = ctx.eval_slice(dst)?;
-    check_reg_fragment(&dst_r, src, reg_size, "ld")?;
+    check_reg_fragment(&dst_r, src.dtype, reg_size, "ld")?;
     let packed_dst = if is_packed_tmem_dtype(src.dtype) {
         Some(packed_half_register_slice(&dst_r, reg_size, "ld")?)
     } else {
@@ -417,7 +412,7 @@ fn execute_ld<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResul
         let values = {
             let scratch = ctx.state.values.tmem.scratchpad_for(ctx.stream.cta_id)?;
             let timer = super::super::runner::prof_now();
-            let values = scratch.read_packed_half_cells(src, &flat_lanes, &flat_cols)?;
+            let values = scratch.read_packed_half_cells(src.dtype, &flat_lanes, &flat_cols)?;
             super::super::runner::prof_end("TcLd:tmem_read_cells", timer);
             values
         };
@@ -435,7 +430,7 @@ fn execute_ld<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResul
         let values = {
             let scratch = ctx.state.values.tmem.scratchpad_for(ctx.stream.cta_id)?;
             let timer = super::super::runner::prof_now();
-            let values = scratch.read_cells(src, &flat_lanes, &flat_cols)?;
+            let values = scratch.read_cells(src.dtype, &flat_lanes, &flat_cols)?;
             super::super::runner::prof_end("TcLd:tmem_read_cells", timer);
             values
         };
@@ -448,24 +443,23 @@ fn execute_ld<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResul
 }
 
 fn execute_st<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
-    let (dst, src, shape, num, row, col) = match stmt {
+    let (dst, src, shape, num) = match stmt {
         Stmt::Tcgen05St {
             dst,
             src,
             shape,
             num,
-            row,
-            col,
-        } => (dst, src, shape_str(shape), *num, row, col),
+        } => (dst, src, shape_str(shape), *num),
         _ => unreachable!(),
     };
+    let (row, col) = (&dst.row, &dst.col);
     if ctx.trace_mode() && !ctx.state.trace.records_events() {
         let t_resolve = super::super::runner::prof_now();
-        let bounds = resolve_datapath_bounds(ctx, row, col, shape, num, dst, "st")?;
+        let bounds = resolve_datapath_bounds(ctx, row, col, shape, num, "st")?;
         super::super::runner::prof_end("TcSt:resolve", t_resolve);
         let t_src = super::super::runner::prof_now();
         let src_r = ctx.eval_slice(src)?;
-        check_reg_fragment(&src_r, dst, bounds.reg_size, "st")?;
+        check_reg_fragment(&src_r, dst.dtype, bounds.reg_size, "st")?;
         if is_packed_tmem_dtype(dst.dtype) {
             let _ = packed_half_register_slice(&src_r, bounds.reg_size, "st")?;
         }
@@ -475,7 +469,7 @@ fn execute_st<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResul
         super::super::runner::prof_end("TcSt:overlap", t_overlap);
         let t_alloc = super::super::runner::prof_now();
         if !tmem_col_range_allocated(ctx, ctx.stream.cta_id, bounds.col_start, bounds.col_end) {
-            let (_, cols, _) = resolve_datapath(ctx, row, col, shape, num, dst, "st")?;
+            let (_, cols, _) = resolve_datapath(ctx, row, col, shape, num, "st")?;
             check_tmem_cells_allocated(ctx, ctx.stream.cta_id, cols.iter().copied(), "tcgen05_st")?;
         }
         super::super::runner::prof_end("TcSt:alloc_check", t_alloc);
@@ -483,11 +477,11 @@ fn execute_st<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResul
     }
     if ctx.trace_mode() {
         let t_resolve = super::super::runner::prof_now();
-        let (region, reg_size) = trace_ldst_tmem_region(ctx, row, col, shape, num, dst, "st")?;
+        let (region, reg_size) = trace_ldst_tmem_region(ctx, row, col, shape, num, "st")?;
         super::super::runner::prof_end("TcSt:resolve", t_resolve);
         let t_src = super::super::runner::prof_now();
         let src_r = ctx.eval_slice(src)?;
-        check_reg_fragment(&src_r, dst, reg_size, "st")?;
+        check_reg_fragment(&src_r, dst.dtype, reg_size, "st")?;
         let packed_src = if is_packed_tmem_dtype(dst.dtype) {
             Some(packed_half_register_slice(&src_r, reg_size, "st")?)
         } else {
@@ -511,11 +505,11 @@ fn execute_st<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResul
         return Ok(StepStatus::advance());
     }
     let t_resolve = super::super::runner::prof_now();
-    let (lanes, cols, reg_size) = resolve_datapath(ctx, row, col, shape, num, dst, "st")?;
+    let (lanes, cols, reg_size) = resolve_datapath(ctx, row, col, shape, num, "st")?;
     super::super::runner::prof_end("TcSt:resolve", t_resolve);
     let t_src = super::super::runner::prof_now();
     let src_r = ctx.eval_slice(src)?;
-    check_reg_fragment(&src_r, dst, reg_size, "st")?;
+    check_reg_fragment(&src_r, dst.dtype, reg_size, "st")?;
     let packed_src = if is_packed_tmem_dtype(dst.dtype) {
         Some(packed_half_register_slice(&src_r, reg_size, "st")?)
     } else {
@@ -548,7 +542,7 @@ fn execute_st<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResul
                 )
             })?;
         let timer = super::super::runner::prof_now();
-        sp.write_packed_half_cells(dst, &flat_lanes, &flat_cols, &packed_values)?;
+        sp.write_packed_half_cells(dst.dtype, &flat_lanes, &flat_cols, &packed_values)?;
         super::super::runner::prof_end("TcSt:tmem_write_cells", timer);
     } else {
         let timer = super::super::runner::prof_now();
@@ -568,7 +562,7 @@ fn execute_st<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResul
                 )
             })?;
         let timer = super::super::runner::prof_now();
-        sp.write_cells(dst, &flat_lanes, &flat_cols, &flat_values)?;
+        sp.write_cells(dst.dtype, &flat_lanes, &flat_cols, &flat_values)?;
         super::super::runner::prof_end("TcSt:tmem_write_cells", timer);
     }
     Ok(StepStatus::advance())
@@ -625,11 +619,11 @@ fn packed_half_register_slice(
 
 fn check_reg_fragment(
     reg_slice: &ResolvedSlice,
-    tmem_tensor: &crate::ir::Tensor,
+    tmem_dtype: DType,
     reg_size: usize,
     label: &str,
 ) -> IResult<()> {
-    if reg_slice.tensor.dtype != tmem_tensor.dtype {
+    if reg_slice.tensor.dtype != tmem_dtype {
         return Err(InterpreterError::new(
             format!("tcgen05_{label}_dtype"),
             format!("tcgen05_{label} REG and TMEM operands must share a dtype"),
@@ -772,8 +766,8 @@ fn execute_mma<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResu
     #[allow(clippy::type_complexity)]
     let (
         dst,
-        a_sl,
-        b_sl,
+        a,
+        b,
         m,
         n,
         k,
@@ -870,31 +864,36 @@ fn execute_mma<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResu
 
     if ctx.trace_mode() {
         trace_mma(
-            ctx, dst, a_sl, b_sl, m, n, k, cta_group, accum, trans_a, trans_b, &cta_ids, sfa, sfb,
-            a_fp4, b_fp4, lane_align,
+            ctx, dst, a, b, m, n, k, cta_group, accum, trans_a, trans_b, &cta_ids, sfa, sfb,
+            sf_block, a_fp4, b_fp4, lane_align,
         )?;
         return Ok(StepStatus::advance());
     }
-    if dst.tensor.dtype != crate::ir::DType::F32 {
+    if dst.dtype != DType::F32 {
         return Err(InterpreterError::new(
             "tcgen05_mma_dtype",
             "tcgen05_mma dst dtype must be f32",
         ));
     }
     // Contiguous layouts (D: cta_group=1 m=128; A: cta_group=2 m=256). Non-transposed
-    // rank-2 operands take the in-place path: SMEM bytes are materialized into
+    // rank-2 SMEM operands take the in-place path: SMEM bytes are materialized into
     // reusable f32 scratch, then sgemm writes f32 bits directly into TMEM cells.
     let contiguous = (cta_group == 1 && m == 128) || (cta_group == 2 && m == 256);
-    let inplace_ok = contiguous
-        && !trans_a
-        && !trans_b
-        && a_sl.tensor.space == MemorySpace::Smem
-        && b_sl.tensor.space == MemorySpace::Smem
-        && a_sl.offsets.len() >= 2
-        && b_sl.offsets.len() >= 2;
-    if inplace_ok {
+    let smem_slices = match (a, b) {
+        (MmaOperand::Slice(a_sl), MmaOperand::Slice(b_sl))
+            if a_sl.tensor.space == MemorySpace::Smem
+                && b_sl.tensor.space == MemorySpace::Smem
+                && a_sl.offsets.len() >= 2
+                && b_sl.offsets.len() >= 2 =>
+        {
+            Some((a_sl, b_sl))
+        }
+        _ => None,
+    };
+    let inplace_ok = contiguous && !trans_a && !trans_b && smem_slices.is_some();
+    if let (true, Some((a_sl, b_sl))) = (inplace_ok, smem_slices) {
         let scales = match (sfa, sfb) {
-            (Some(sfa_sl), Some(sfb_sl)) => Some((sfa_sl, sfb_sl, sf_byte)),
+            (Some(sfa_op), Some(sfb_op)) => Some((sfa_op, sfb_op, sf_byte)),
             _ => None,
         };
         accumulate_inplace(
@@ -913,11 +912,13 @@ fn execute_mma<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResu
         ));
     }
 
+    let a_rows = if cta_group == 1 { m } else { m / 2 };
+    let b_rows = if cta_group == 1 { n } else { n / 2 };
     let t_read = super::super::runner::prof_now();
-    let a = read_operand_ctas(ctx, a_sl, trans_a, &cta_ids)?;
+    let a = read_mma_operand_ctas(ctx, a, a_rows, k, trans_a, &cta_ids)?;
     super::super::runner::prof_end("MMA:fallback_read_a", t_read);
     let t_read = super::super::runner::prof_now();
-    let b = read_operand_ctas(ctx, b_sl, trans_b, &cta_ids)?;
+    let b = read_mma_operand_ctas(ctx, b, b_rows, k, trans_b, &cta_ids)?;
     super::super::runner::prof_end("MMA:fallback_read_b", t_read);
     check_mma_operand_shapes(&a, &b, m, n, k)?;
     // Fallback for everything `accumulate_inplace` can't take (transposed or
@@ -926,7 +927,7 @@ fn execute_mma<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResu
     let t_matmul = super::super::runner::prof_now();
     let mut product = matmul_f32(&a, &b);
     super::super::runner::prof_end("MMA:fallback_matmul", t_matmul);
-    if let (Some(sfa_sl), Some(sfb_sl)) = (sfa, sfb) {
+    if let (Some(sfa_op), Some(sfb_op)) = (sfa, sfb) {
         // Block-scaled MMA: D += (A . 2^(sfa[m]-127)) @ (B . 2^(sfb[n]-127))^T. The
         // scales are per row and constant over this MMA's k-slice, so scaling the
         // product is exact (powers of two). A's scales are split by M across the
@@ -939,7 +940,7 @@ fn execute_mma<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResu
         for &cta in cta_ids.iter() {
             sa.extend(read_scale_blocks(
                 ctx,
-                sfa_sl,
+                sfa_op,
                 sf_byte,
                 1,
                 rows_per_cta,
@@ -949,7 +950,7 @@ fn execute_mma<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResu
         }
         let mut sb: Vec<Vec<f32>> = Vec::with_capacity(cta_ids.len());
         for &cta in cta_ids.iter() {
-            sb.push(read_scale_blocks(ctx, sfb_sl, sf_byte, 1, n, false, cta)?);
+            sb.push(read_scale_blocks(ctx, sfb_op, sf_byte, 1, n, false, cta)?);
         }
         for mm in 0..m {
             let half = mm / rows_per_cta;
@@ -970,9 +971,9 @@ fn execute_mma<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResu
 #[allow(clippy::too_many_arguments)]
 fn trace_mma(
     ctx: &mut CohortContext,
-    dst: &TensorSlice,
-    a_sl: &TensorSlice,
-    b_sl: &TensorSlice,
+    dst: &TmemOperand,
+    a: &MmaOperand,
+    b: &MmaOperand,
     m: usize,
     n: usize,
     k: usize,
@@ -981,51 +982,69 @@ fn trace_mma(
     trans_a: bool,
     trans_b: bool,
     cta_ids: &[usize],
-    sfa: Option<&TensorSlice>,
-    sfb: Option<&TensorSlice>,
+    sfa: Option<&TmemOperand>,
+    sfb: Option<&TmemOperand>,
+    sf_block: usize,
     a_fp4: bool,
     b_fp4: bool,
     lane_align: u8,
 ) -> IResult<()> {
-    let a_r = ctx.eval_slice(a_sl)?;
-    let b_r = ctx.eval_slice(b_sl)?;
-    let a_eff = trace_mma_effective_shape(&a_r.shape, trans_a, cta_ids.len())?;
-    let b_eff = trace_mma_effective_shape(&b_r.shape, trans_b, cta_ids.len())?;
+    // SMEM operands carry their tile as a slice; a TMEM operand's tile extent is
+    // implied by m/n/k (the operand is just the physical base address).
+    let check_slice_eff =
+        |sl: &TensorSlice, transpose: bool, want: (usize, usize)| -> IResult<()> {
+            let r = ctx.eval_slice(sl)?;
+            let eff = trace_mma_effective_shape(&r.shape, transpose, cta_ids.len())?;
+            if eff != want {
+                return Err(InterpreterError::new(
+                    "tcgen05_mma_shape",
+                    "tcgen05_mma operand shape does not match m/n/k",
+                ));
+            }
+            Ok(())
+        };
     // fp4 operands are packed 2 e2m1 per byte, so the byte-extent is k/2.
     let a_k = if a_fp4 { k / 2 } else { k };
     let b_k = if b_fp4 { k / 2 } else { k };
-    if a_eff != (m, a_k) || b_eff != (n, b_k) {
-        return Err(InterpreterError::new(
-            "tcgen05_mma_shape",
-            "tcgen05_mma operand shape does not match m/n/k",
-        ));
+    let a_rows = if cta_group == 1 { m } else { m / 2 };
+    let b_rows = if cta_group == 1 { n } else { n / 2 };
+    if let MmaOperand::Slice(sl) = a {
+        check_slice_eff(sl, trans_a, (m, a_k))?;
     }
-    let dst_off = eval_uniform_usize(ctx, &dst.offsets, "mma dst offset")?;
-    if dst_off[0] != 0 {
+    if let MmaOperand::Slice(sl) = b {
+        check_slice_eff(sl, trans_b, (n, b_k))?;
+    }
+    let dst_row = ctx.eval_scalar_uniform(&dst.row, "mma dst row", "divergent_operands")?;
+    if dst_row != 0 {
         return Err(InterpreterError::new(
             "tcgen05_mma_dst_offset",
             "mma dst row offset must be 0",
         ));
     }
-    let layout = tmem_layout_for(&dst.tensor)?;
+    let dst_col = ctx.eval_scalar_uniform(&dst.col, "mma dst col", "divergent_operands")?;
+    if dst_col < 0 {
+        return Err(InterpreterError::new(
+            "tcgen05_mma_out_of_range",
+            "tcgen05_mma addresses a TMEM cell out of range",
+        ));
+    }
     let blocks = mma_blocks(
         m,
         n,
         cta_group,
         lane_align,
-        layout.col_start,
-        dst_off[1],
+        dst_col as usize,
         TMEM_ROWS,
         TMEM_COLS,
     )?;
-    let regions = tmem_regions_from_mma_blocks(&dst.tensor, cta_ids, &blocks)?;
+    let regions = tmem_regions_from_mma_blocks(cta_ids, &blocks)?;
     for region in &regions {
         check_tmem_region_allocated(ctx, region, "tcgen05_mma")?;
     }
     let scope = ctx.access_scope();
-    let operand_regions = mma_operand_regions(ctx, a_sl, &a_r, cta_ids)?
+    let operand_regions = mma_operand_regions(ctx, a, a_rows, k, trans_a, cta_ids)?
         .into_iter()
-        .chain(mma_operand_regions(ctx, b_sl, &b_r, cta_ids)?);
+        .chain(mma_operand_regions(ctx, b, b_rows, k, trans_b, cta_ids)?);
     for region in operand_regions {
         ctx.emit(TraceEventKind::Read {
             region,
@@ -1034,24 +1053,31 @@ fn trace_mma(
             scope: scope.clone(),
         })?;
     }
-    // Block-scaled MMA reads its UE8M0 scale vectors from every CTA in the pair
+    // Block-scaled MMA reads its UE8M0/e4m3 scale vectors from every CTA in the pair
     // (A's scales split by M like A; B's duplicated per CTA): a TMEM read window
-    // of the MMA, drained by tcgen05_commit like the accumulator access.
-    if let (Some(sfa_sl), Some(sfb_sl)) = (sfa, sfb) {
-        for sl in [sfa_sl, sfb_sl] {
-            let sf_r = ctx.eval_slice(sl)?;
-            let offsets = eval_uniform_usize(ctx, &sl.offsets, "mma scale offset")?;
-            for &cta in cta_ids {
-                let region =
-                    region::tensor_region_from_uniform(&sf_r.tensor, cta, &offsets, &sf_r.shape)?;
-                check_tmem_region_allocated(ctx, &region, "tcgen05_mma scale")?;
-                ctx.emit(TraceEventKind::Read {
-                    region,
-                    proxy: MemoryProxy::Async,
-                    access_kind: MemoryAccessKind::Tmem(TmemAsyncKind::Mma),
-                    scope: scope.clone(),
-                })?;
-            }
+    // of the MMA, drained by tcgen05_commit like the accumulator access. The window
+    // is the exact folded footprint the value-side read_scale_blocks touches:
+    // ceil(rows/128) super-blocks of `nblocks` columns.
+    let nblocks = if sf_block == 0 { 1 } else { k / sf_block };
+    for (sf, rows) in [(sfa, a_rows), (sfb, n)] {
+        let Some(sf) = sf else { continue };
+        let sf_cols = rows.div_ceil(TMEM_ROWS) * nblocks;
+        let (sf_row, sf_col) = eval_tmem_operand(ctx, sf, "mma scale operand")?;
+        if sf_row != 0 {
+            return Err(InterpreterError::new(
+                "tcgen05_mma_scale",
+                "mma scale operand row (lane) must be 0",
+            ));
+        }
+        for &cta in cta_ids {
+            let region = region::tmem_region_from_rects(0, cta, [(0, TMEM_ROWS, sf_col, sf_cols)])?;
+            check_tmem_region_allocated(ctx, &region, "tcgen05_mma scale")?;
+            ctx.emit(TraceEventKind::Read {
+                region,
+                proxy: MemoryProxy::Async,
+                access_kind: MemoryAccessKind::Tmem(TmemAsyncKind::Mma),
+                scope: scope.clone(),
+            })?;
         }
     }
     for region in regions {
@@ -1073,53 +1099,55 @@ fn trace_mma(
     Ok(())
 }
 
-/// Read per-(row, block) block scales from a (128, cols) packed-u32 scale-vector
-/// TMEM slice on one CTA. Logical row r sits at cell (lane = r % 128,
-/// col = col_start + col_offset + r / 128); within the cell, block `bi` reads
-/// byte `byte_base + bi`. Decode is either e4m3 (nvfp4) or UE8M0 biased exponent
-/// `2^(byte-127)` (fp8). Returns `rows * nblocks` scales, row-major (a row's
-/// blocks contiguous). fp8 calls this with `nblocks=1` (one scale per row).
+/// Evaluate a TMEM operand's absolute (lane, col) base uniformly.
+fn eval_tmem_operand(
+    ctx: &CohortContext,
+    op: &TmemOperand,
+    label: &str,
+) -> IResult<(usize, usize)> {
+    let row = ctx.eval_scalar_uniform(&op.row, label, "divergent_operands")?;
+    let col = ctx.eval_scalar_uniform(&op.col, label, "divergent_operands")?;
+    if row < 0 || col < 0 {
+        return Err(InterpreterError::new(
+            "trace_region_oob",
+            "TMEM operand address is negative",
+        ));
+    }
+    Ok((row as usize, col as usize))
+}
+
+/// Read per-(row, block) block scales from a packed-u32 (fp8/UE8M0) or raw-byte
+/// (nvfp4 e4m3) scale-vector TMEM operand on one CTA. Logical row r sits at cell
+/// (lane = r % 128, col = col + r / 128) for the packed-u32 path; within the cell,
+/// block `bi` reads byte `byte_base + bi`. The e4m3 path folds 128-row
+/// super-blocks into `nblocks`-wide column bands: logical row r, block b -> cell
+/// (lane = r % 128, col = col + (r / 128) * nblocks + b). Decode is either e4m3
+/// (nvfp4) or UE8M0 biased exponent `2^(byte-127)` (fp8). Returns `rows *
+/// nblocks` scales, row-major (a row's blocks contiguous). fp8 calls this with
+/// `nblocks=1` (one scale per row).
 fn read_scale_blocks(
     ctx: &CohortContext,
-    sl: &TensorSlice,
+    op: &TmemOperand,
     byte_base: usize,
     nblocks: usize,
     rows: usize,
     e4m3: bool,
     cta_id: usize,
 ) -> IResult<Vec<f32>> {
-    let offsets = eval_uniform_usize(ctx, &sl.offsets, "mma scale offset")?;
-    let shape = eval_uniform_usize(ctx, &sl.shape, "mma scale shape")?;
-    if offsets.len() != 2 || shape.len() != 2 || offsets[0] != 0 {
+    let (row0, col0) = eval_tmem_operand(ctx, op, "mma scale operand")?;
+    if row0 != 0 {
         return Err(InterpreterError::new(
             "tcgen05_mma_scale",
-            "mma scale slice must be a (128, cols) TMEM slice at lane 0",
+            "mma scale operand row (lane) must be 0",
         ));
     }
-    if rows > shape[0] * shape[1] {
-        return Err(InterpreterError::new(
-            "tcgen05_mma_scale",
-            "mma scale slice does not cover the scaled rows",
-        ));
-    }
-    let layout = tmem_layout_for(&sl.tensor)?;
-    let col0 = layout.col_start + offsets[1];
-    // nvfp4 e4m3 SF datapath: the scale tile is an f8e4m3 (rows, nblocks) TMEM
-    // tensor with one e4m3 byte per (lane = row, col = col0 + block) cell (laid
-    // out by execute_cp's F8E4M3 branch). Read it row-major — `nblocks` is one
-    // scale per 16-K block (k/16), so it is NOT capped at the 4 bytes of a u32
-    // cell the fp8/UE8M0 packed path uses.
-    if sl.tensor.dtype == crate::ir::DType::F8E4M3 {
+    // nvfp4 e4m3 SF datapath: one e4m3 byte per (lane, col) cell (laid out by
+    // execute_cp's F8E4M3 branch). `nblocks` is one scale per 16-K block (k/16).
+    if op.dtype == DType::F8E4M3 {
         if !e4m3 {
             return Err(InterpreterError::new(
                 "tcgen05_mma_scale",
                 "f8e4m3 scale tensor requires the e4m3 decode path",
-            ));
-        }
-        if nblocks > shape[1] {
-            return Err(InterpreterError::new(
-                "tcgen05_mma_scale",
-                "mma scale slice does not cover the scaled blocks",
             ));
         }
         let sp = ctx.state.values.tmem.scratchpad_for(cta_id)?;
@@ -1127,8 +1155,7 @@ fn read_scale_blocks(
         // Rows ≥ 128 fold into column super-blocks (execute_cp's write folding): logical
         // row r -> lane = r % 128, col = col0 + (r // 128) * nblocks + b. For SFA (≤128
         // rows) this is the identity; for a 256-row SFB the second 128-row super-block
-        // reads from the next SF_CTA_K column band. `nblocks` here == the per-row block
-        // count (SF_CTA_K), the same super-block column stride execute_cp wrote with.
+        // reads from the next SF_CTA_K column band.
         for r in 0..rows {
             let lane = r % 128;
             let super_col = col0 + (r / 128) * nblocks;
@@ -1137,6 +1164,12 @@ fn read_scale_blocks(
             }
         }
         return Ok(out);
+    }
+    if op.dtype != DType::U32 {
+        return Err(InterpreterError::new(
+            "tcgen05_mma_scale",
+            "mma scale tensor dtype must be u32",
+        ));
     }
     if byte_base + nblocks > 4 {
         return Err(InterpreterError::new(
@@ -1151,7 +1184,7 @@ fn read_scale_blocks(
         lanes.push(r % 128);
         cols.push(col0 + r / 128);
     }
-    let packed = sp.read_cells(&sl.tensor, &lanes, &cols)?;
+    let packed = sp.read_cells(DType::U32, &lanes, &cols)?;
     let ValueArray1::U32(packed) = packed else {
         return Err(InterpreterError::new(
             "tcgen05_mma_scale",
@@ -1172,13 +1205,16 @@ fn read_scale_blocks(
     Ok(out)
 }
 
-/// `tcgen05.cp` — copy packed u32 scale cells from SMEM into TMEM. One leader
-/// issue drives every CTA in the group: each CTA copies from its OWN SMEM into
-/// its OWN TMEM (logical row r -> cell (lane = r % 128, col base + r / 128)).
-/// The value lands at issue: the tcgen05 pipe executes its ops in issue order,
-/// so a later same-stream MMA read can never observe a stale cell; retirement
-/// toward other streams is observed through `tcgen05_commit` (the trace records
-/// an async `Tmem(Cp)` write window drained by the commit).
+/// `tcgen05.cp` — copy packed u32 scale cells (or raw e4m3 scale bytes) from
+/// SMEM into TMEM. One leader issue drives every CTA in the group: each CTA
+/// copies from its OWN SMEM into its OWN TMEM (element r of the flat src tile
+/// lands at cell (lane = r % 128, col = dst.col + r / 128); the e4m3 path folds
+/// 128-row super-blocks into nblocks-wide column bands — the IR operand already
+/// carries the folded physical base column). The value lands at issue: the
+/// tcgen05 pipe executes its ops in issue order, so a later same-stream MMA
+/// read can never observe a stale cell; retirement toward other streams is
+/// observed through `tcgen05_commit` (the trace records an async `Tmem(Cp)`
+/// write window drained by the commit).
 fn execute_cp<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
     // Same issue-granularity rule as the MMA: a full warp or a single elected
     // lane — a ragged partial cohort is a real divergence bug.
@@ -1208,25 +1244,23 @@ fn execute_cp<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResul
     } else {
         vec![ctx.stream.cta_id]
     };
-    let dst_off = eval_uniform_usize(ctx, &dst.offsets, "tcgen05_cp dst offset")?;
-    let dst_r = ctx.eval_slice(dst)?;
     let src_off = eval_uniform_usize(ctx, &src.offsets, "tcgen05_cp src offset")?;
     let src_r = ctx.eval_slice(src)?;
-    if dst_off.len() != 2 || dst_r.shape.len() != 2 || dst_off[0] != 0 || dst_r.shape[0] != 128 {
+    let (dst_row, col0) = eval_tmem_operand(ctx, dst, "tcgen05_cp dst")?;
+    if dst_row != 0 {
         return Err(InterpreterError::new(
             "tcgen05_cp_shape",
-            "tcgen05_cp dst must be a (128, cols) TMEM slice at lane 0",
+            "tcgen05_cp dst row (lane) must be 0",
         ));
     }
-    let count = numel(&dst_r.shape);
-    if numel(&src_r.shape) != count {
+    let count = numel(&src_r.shape);
+    let cp_cols = count.div_ceil(TMEM_ROWS);
+    if col0 + cp_cols > TMEM_COLS {
         return Err(InterpreterError::new(
-            "tcgen05_cp_shape",
-            "tcgen05_cp src/dst element counts must match",
+            "tcgen05_cp_out_of_range",
+            "tcgen05_cp addresses a TMEM cell outside the scratchpad",
         ));
     }
-    let layout = tmem_layout_for(&dst.tensor)?;
-    let col0 = layout.col_start + dst_off[1];
     let mut lanes = Vec::with_capacity(count);
     let mut cols = Vec::with_capacity(count);
     for r in 0..count {
@@ -1239,7 +1273,7 @@ fn execute_cp<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResul
             let src_region =
                 region::tensor_region_from_uniform(&src_r.tensor, cta, &src_off, &src_r.shape)?;
             let dst_region =
-                region::tensor_region_from_uniform(&dst_r.tensor, cta, &dst_off, &dst_r.shape)?;
+                region::tmem_region_from_rects(0, cta, [(0, TMEM_ROWS, col0, cp_cols)])?;
             check_tmem_region_allocated(ctx, &dst_region, "tcgen05_cp")?;
             ctx.emit(TraceEventKind::Read {
                 region: src_region,
@@ -1270,7 +1304,7 @@ fn execute_cp<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResul
             // fp8/UE8M0 datapath: packed-u32 scale cells (4 e4m3/UE8M0 bytes per
             // cell), one cell per (lane, col) — the typed write_cells path.
             ValueArray1::U32(_) => {
-                sp.write_cells(&dst_r.tensor, &lanes, &cols, &flat)?;
+                sp.write_cells(dst.dtype, &lanes, &cols, &flat)?;
             }
             // nvfp4 datapath: the SF is an f8e4m3 (rows, K//16) tile — one e4m3
             // scale byte per 16-K block. Store it row-major as one byte per TMEM
@@ -1279,20 +1313,12 @@ fn execute_cp<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResul
             // every finite e4m3 byte exactly.)
             //
             // `nblocks` is the SF blocks PER LOGICAL ROW — the src tile's innermost
-            // dim (SF_CTA_K), NOT the dst slice's column count. For a multi-super-block
-            // SFB (canon's 256-row SFB_tmem = `128 * SFB_n_chunks`) the IR cp dst is a
-            // `(128, SF_CTA_K * n_chunks)` slice (validate.rs/cp require dst rows == 128),
-            // so dst.shape[1] over-counts the per-row blocks by n_chunks; the src's last
-            // dim recovers the true SF_CTA_K and row-major-indexes all logical rows.
-            //
-            // Rows ≥ 128 FOLD into column super-blocks (TMEM is physically 128 lanes):
-            // logical row r -> lane = r % 128, and the super-block s = r // 128 shifts the
-            // column by `s * SF_CTA_K`. This mirrors sf_tmem_layout's M_super TCol stride
-            // — canon's 256-row SFB packs its second 128-row half into the next SF_CTA_K
-            // column band (cols col0+16..col0+32), which read_scale_blocks reads back the
-            // same way.
+            // dim (SF_CTA_K). Rows ≥ 128 FOLD into column super-blocks (TMEM is
+            // physically 128 lanes): logical row r -> lane = r % 128, and the
+            // super-block s = r // 128 shifts the column by `s * nblocks` — the
+            // dst operand's col is the already-folded physical base.
             ValueArray1::F8E4M3(vals) => {
-                let nblocks = *src_r.shape.last().unwrap_or(&dst_r.shape[1]);
+                let nblocks = *src_r.shape.last().unwrap_or(&cp_cols);
                 for (e, &v) in vals.iter().enumerate() {
                     let row = e / nblocks;
                     let blk = e % nblocks;
@@ -1312,30 +1338,73 @@ fn execute_cp<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResul
     Ok(StepStatus::advance())
 }
 
-/// THE definition of which pools a pair-MMA operand read touches: the same
-/// (offsets, shape) box — per-row runs, never one linear interval — in EVERY
-/// CTA of `cta_ids` (cta_group=2 operands are split across the pair's pools;
-/// cta_group=1 degenerates to the issuing CTA). The trace events iterate this
-/// list and the value reads (`read_operand_ctas`, `accumulate_inplace`)
-/// iterate the same `cta_ids` — deriving the CTA set independently per path
-/// is how peer-SMEM reads went unrecorded.
+/// THE definition of which pools a pair-MMA operand read touches: for an SMEM
+/// slice, the same (offsets, shape) box — per-row runs, never one linear
+/// interval — in EVERY CTA of `cta_ids`; for a TMEM operand, the physical
+/// (lane, col) box its m/n/k extent implies. cta_group=2 operands are split
+/// across the pair's pools; cta_group=1 degenerates to the issuing CTA. The
+/// trace events iterate this list and the value reads
+/// (`read_mma_operand_ctas`, `accumulate_inplace`) iterate the same `cta_ids`
+/// — deriving the CTA set independently per path is how peer-SMEM reads went
+/// unrecorded.
 fn mma_operand_regions(
     ctx: &CohortContext,
-    slice: &TensorSlice,
-    resolved: &ResolvedSlice,
+    operand: &MmaOperand,
+    rows_per_cta: usize,
+    k_cols: usize,
+    transpose: bool,
     cta_ids: &[usize],
 ) -> IResult<Vec<Region>> {
-    let offsets = eval_uniform_usize(ctx, &slice.offsets, "mma operand offset")?;
-    let mut regions = Vec::with_capacity(cta_ids.len());
-    for &cta in cta_ids {
-        let region =
-            region::tensor_region_from_uniform(&resolved.tensor, cta, &offsets, &resolved.shape)?;
-        if matches!(resolved.tensor.space, MemorySpace::Tmem) {
-            check_tmem_region_allocated(ctx, &region, "tcgen05_mma operand")?;
+    match operand {
+        MmaOperand::Slice(slice) => {
+            let resolved = ctx.eval_slice(slice)?;
+            let offsets = eval_uniform_usize(ctx, &slice.offsets, "mma operand offset")?;
+            let mut regions = Vec::with_capacity(cta_ids.len());
+            for &cta in cta_ids {
+                regions.push(region::tensor_region_from_uniform(
+                    &resolved.tensor,
+                    cta,
+                    &offsets,
+                    &resolved.shape,
+                )?);
+            }
+            Ok(regions)
         }
-        regions.push(region);
+        MmaOperand::Tmem(op) => {
+            let (row, col) = eval_tmem_operand(ctx, op, "mma operand")?;
+            // Stored tile: `rows` lanes x `elems` logical columns, packed per dtype.
+            let (rows, elems) = if transpose {
+                (k_cols, rows_per_cta)
+            } else {
+                (rows_per_cta, k_cols)
+            };
+            let cells = match op.dtype {
+                DType::F16 | DType::Bf16 => {
+                    if elems % 2 != 0 {
+                        return Err(InterpreterError::new(
+                            "tcgen05_mma_operand",
+                            "packed-half TMEM operand needs an even column extent",
+                        ));
+                    }
+                    elems / 2
+                }
+                _ => elems,
+            };
+            if row + rows > TMEM_ROWS || col + cells > TMEM_COLS {
+                return Err(InterpreterError::new(
+                    "tcgen05_mma_out_of_range",
+                    "tcgen05_mma addresses a TMEM cell out of range",
+                ));
+            }
+            let mut regions = Vec::with_capacity(cta_ids.len());
+            for &cta in cta_ids {
+                let region = region::tmem_region_from_rects(0, cta, [(row, rows, col, cells)])?;
+                check_tmem_region_allocated(ctx, &region, "tcgen05_mma operand")?;
+                regions.push(region);
+            }
+            Ok(regions)
+        }
     }
-    Ok(regions)
 }
 
 fn trace_mma_effective_shape(
@@ -1376,14 +1445,13 @@ struct MmaBlock {
 }
 
 /// Closed-form block decomposition of an MMA accumulator layout (replaces the per-element
-/// `mma_placement`/`mma_scatter_plan` table). `col_start` of each block already folds in
-/// the layout's column base and the `dst_col` destination offset.
+/// `mma_placement`/`mma_scatter_plan` table). `dst_col` is the accumulator's absolute
+/// physical base column (the IR operand carries it directly).
 fn mma_blocks(
     m: usize,
     n: usize,
     cta_group: u8,
     lane_align: u8,
-    layout_col_start: usize,
     dst_col: usize,
     n_lanes: usize,
     n_cols: usize,
@@ -1395,7 +1463,7 @@ fn mma_blocks(
         )
     };
     let la = lane_align as usize;
-    let base_col = layout_col_start.checked_add(dst_col).ok_or_else(oob)?;
+    let base_col = dst_col;
     let mut blocks: Vec<MmaBlock> = Vec::new();
     if cta_group == 1 && m == 64 {
         // Layout F: four lane-runs of 16 at stride 32, plus the lane-align offset;
@@ -1475,11 +1543,7 @@ fn mma_blocks(
     Ok(blocks)
 }
 
-fn tmem_regions_from_mma_blocks(
-    tensor: &crate::ir::Tensor,
-    cta_ids: &[usize],
-    blocks: &[MmaBlock],
-) -> IResult<Vec<Region>> {
+fn tmem_regions_from_mma_blocks(cta_ids: &[usize], blocks: &[MmaBlock]) -> IResult<Vec<Region>> {
     let mut rects_by_cta: HashMap<usize, Vec<(usize, usize, usize, usize)>> = HashMap::new();
     for block in blocks {
         let Some(&cta_id) = cta_ids.get(block.cta_idx) else {
@@ -1497,7 +1561,7 @@ fn tmem_regions_from_mma_blocks(
     }
     rects_by_cta
         .into_iter()
-        .map(|(cta_id, rects)| region::tmem_region_from_rects(tensor.id, cta_id, rects))
+        .map(|(cta_id, rects)| region::tmem_region_from_rects(0, cta_id, rects))
         .collect()
 }
 
@@ -1549,7 +1613,7 @@ fn apply_block_scales(buf: &mut [f32], scales: &[f32], k: usize, nblocks: usize)
 #[allow(clippy::too_many_arguments)]
 fn accumulate_inplace(
     ctx: &mut CohortContext,
-    dst: &TensorSlice,
+    dst: &TmemOperand,
     a_sl: &TensorSlice,
     b_sl: &TensorSlice,
     m: usize,
@@ -1558,7 +1622,7 @@ fn accumulate_inplace(
     cta_group: u8,
     accum: bool,
     cta_ids: &[usize],
-    scales: Option<(&TensorSlice, &TensorSlice, usize)>,
+    scales: Option<(&TmemOperand, &TmemOperand, usize)>,
     sf_e4m3: bool,
     sf_block: usize,
     a_fp4: bool,
@@ -1834,21 +1898,10 @@ fn read_operand(
             super::super::runner::prof_end("MMA:smem_read_block", t_read);
             flat
         }
-        MemorySpace::Tmem => {
-            let t_read = super::super::runner::prof_now();
-            let flat = ctx
-                .state
-                .values
-                .tmem
-                .scratchpad_for(cta_id)?
-                .read_slice(&sl.tensor, &offsets, &shape)?;
-            super::super::runner::prof_end("MMA:tmem_read_slice", t_read);
-            flat
-        }
         _ => {
             return Err(InterpreterError::new(
                 "tcgen05_mma_operand_space",
-                "tcgen05_mma operands must be SMEM or TMEM in value mode",
+                "tcgen05_mma slice operands must be SMEM in value mode",
             ))
         }
     };
@@ -1863,18 +1916,100 @@ fn read_operand(
     Ok(out)
 }
 
+/// Read a TMEM A/B operand tile: the logical (rows, cols) element tile at the
+/// operand's absolute physical base, unpacked per the operand dtype (f16/bf16
+/// pack two elements per cell, low half first). This is the value model's
+/// accumulator-readback abstraction (the GDN state read straight out of TMEM).
+fn read_tmem_operand(
+    ctx: &CohortContext,
+    op: &TmemOperand,
+    rows: usize,
+    cols: usize,
+    transpose: bool,
+    cta_id: usize,
+) -> IResult<Array2<f32>> {
+    let (row0, col0) = eval_tmem_operand(ctx, op, "mma operand")?;
+    let oob = || {
+        InterpreterError::new(
+            "tcgen05_mma_out_of_range",
+            "tcgen05_mma addresses a TMEM cell out of range",
+        )
+    };
+    if row0 + rows > TMEM_ROWS {
+        return Err(oob());
+    }
+    let sp = ctx.state.values.tmem.scratchpad_for(cta_id)?;
+    let mat = if is_packed_tmem_dtype(op.dtype) {
+        if cols % 2 != 0 {
+            return Err(InterpreterError::new(
+                "tcgen05_mma_operand",
+                "packed-half TMEM operand needs an even column extent",
+            ));
+        }
+        let cell_cols = cols / 2;
+        if col0 + cell_cols > TMEM_COLS {
+            return Err(oob());
+        }
+        let mut lanes = Vec::with_capacity(rows * cell_cols);
+        let mut cell_cols_v = Vec::with_capacity(rows * cell_cols);
+        for r in 0..rows {
+            for c in 0..cell_cols {
+                lanes.push(row0 + r);
+                cell_cols_v.push(col0 + c);
+            }
+        }
+        let pairs = sp.read_packed_half_cells(op.dtype, &lanes, &cell_cols_v)?;
+        let mut flat = Vec::with_capacity(rows * cols);
+        for (lo, hi) in pairs {
+            flat.push(lo);
+            flat.push(hi);
+        }
+        Array2::from_shape_vec((rows, cols), flat).map_err(|_| {
+            InterpreterError::new(
+                "tcgen05_mma_shape",
+                "mma operand shape does not match m/n/k",
+            )
+        })?
+    } else {
+        if col0 + cols > TMEM_COLS {
+            return Err(oob());
+        }
+        sp.read_cell_block(op.dtype, row0, row0 + rows, col0, col0 + cols)?
+            .to_f32_compute()
+            .into_shape_with_order((rows, cols))
+            .unwrap()
+    };
+    Ok(if transpose { mat.t().to_owned() } else { mat })
+}
+
+fn read_mma_operand(
+    ctx: &CohortContext,
+    operand: &MmaOperand,
+    rows: usize,
+    cols: usize,
+    transpose: bool,
+    cta_id: usize,
+) -> IResult<Array2<f32>> {
+    match operand {
+        MmaOperand::Slice(sl) => read_operand(ctx, sl, transpose, cta_id),
+        MmaOperand::Tmem(op) => read_tmem_operand(ctx, op, rows, cols, transpose, cta_id),
+    }
+}
+
 /// Value-side mirror of `mma_operand_regions`: read the operand box from
 /// EVERY CTA in `cta_ids` (row-concatenated in cta order; one CTA for
 /// cta_group=1).
-fn read_operand_ctas(
+fn read_mma_operand_ctas(
     ctx: &CohortContext,
-    sl: &TensorSlice,
+    operand: &MmaOperand,
+    rows_per_cta: usize,
+    k_cols: usize,
     transpose: bool,
     cta_ids: &[usize],
 ) -> IResult<Array2<f32>> {
     let halves: Vec<Array2<f32>> = cta_ids
         .iter()
-        .map(|&c| read_operand(ctx, sl, transpose, c))
+        .map(|&c| read_mma_operand(ctx, operand, rows_per_cta, k_cols, transpose, c))
         .collect::<IResult<_>>()?;
     if halves.len() == 1 {
         return Ok(halves.into_iter().next().unwrap());
@@ -1884,28 +2019,22 @@ fn read_operand_ctas(
         .map_err(|_| InterpreterError::new("tcgen05_mma_shape", "mma operand pair concat failed"))
 }
 
-/// For each logical (m,n): (cta_idx, lane, col_local).
+/// Base column and rows-per-CTA of the in-place accumulator window. The dst
+/// operand carries the absolute physical (lane, col); lane must be 0 (the
+/// full-datapath layouts are lane-anchored).
 fn inplace_geometry(
     ctx: &CohortContext,
-    dst: &TensorSlice,
+    dst: &TmemOperand,
     cta_group: u8,
     lane_align: u8,
 ) -> IResult<(usize, usize)> {
-    let dst_off: Vec<usize> = dst
-        .offsets
-        .iter()
-        .map(|o| {
-            ctx.eval_scalar_uniform(o, "mma dst offset", "divergent_operands")
-                .map(|x| x as usize)
-        })
-        .collect::<IResult<_>>()?;
-    if dst_off[0] != 0 {
+    let (row, col) = eval_tmem_operand(ctx, dst, "mma dst")?;
+    if row != 0 {
         return Err(InterpreterError::new(
             "tcgen05_mma_dst_offset",
             "mma dst row offset must be 0",
         ));
     }
-    let layout = tmem_layout_for(&dst.tensor)?;
     if lane_align != 0 {
         return Err(InterpreterError::new(
             "tcgen05_mma_lane_align",
@@ -1913,18 +2042,8 @@ fn inplace_geometry(
         ));
     }
     // Layout D: the whole accumulator (m rows); Layout A: 128 rows per CTA.
-    let rows_per_cta = if cta_group == 1 {
-        dst.tensor.shape[0]
-    } else {
-        128
-    };
-    let c0 = layout.col_start.checked_add(dst_off[1]).ok_or_else(|| {
-        InterpreterError::new(
-            "tcgen05_mma_out_of_range",
-            "tcgen05_mma addresses a TMEM cell out of range",
-        )
-    })?;
-    Ok((c0, rows_per_cta))
+    let rows_per_cta = if cta_group == 1 { TMEM_ROWS } else { 128 };
+    Ok((col, rows_per_cta))
 }
 
 /// Non-contiguous Layout F/B (and transposed / non-rank-2 contiguous operands): take the
@@ -1933,7 +2052,7 @@ fn inplace_geometry(
 #[allow(clippy::too_many_arguments)]
 fn accumulate_blocks(
     ctx: &mut CohortContext,
-    dst: &TensorSlice,
+    dst: &TmemOperand,
     product: &Array2<f32>,
     m: usize,
     n: usize,
@@ -1942,22 +2061,13 @@ fn accumulate_blocks(
     cta_ids: &[usize],
     lane_align: u8,
 ) -> IResult<()> {
-    let dst_off: Vec<usize> = dst
-        .offsets
-        .iter()
-        .map(|o| {
-            ctx.eval_scalar_uniform(o, "mma dst offset", "divergent_operands")
-                .map(|x| x as usize)
-        })
-        .collect::<IResult<_>>()?;
-    if dst_off[0] != 0 {
+    let (row, dst_col) = eval_tmem_operand(ctx, dst, "mma dst")?;
+    if row != 0 {
         return Err(InterpreterError::new(
             "tcgen05_mma_dst_offset",
             "mma dst row offset must be 0",
         ));
     }
-    let dst_col = dst_off[1];
-    let layout = tmem_layout_for(&dst.tensor)?;
     let first = cta_ids.first().ok_or_else(|| {
         InterpreterError::new(
             "tcgen05_mma_unsupported",
@@ -1979,18 +2089,9 @@ fn accumulate_blocks(
             ));
         }
     }
-    let blocks = mma_blocks(
-        m,
-        n,
-        cta_group,
-        lane_align,
-        layout.col_start,
-        dst_col,
-        n_lanes,
-        n_cols,
-    )?;
+    let blocks = mma_blocks(m, n, cta_group, lane_align, dst_col, n_lanes, n_cols)?;
 
-    if dst.tensor.dtype == crate::ir::DType::F32 {
+    if dst.dtype == DType::F32 {
         let timer = super::super::runner::prof_now();
         for block in &blocks {
             let cta_id = cta_ids[block.cta_idx];
@@ -2007,7 +2108,7 @@ fn accumulate_blocks(
                     )
                 })?;
             if !sp.accumulate_f32_cell_block_from(
-                &dst.tensor,
+                dst.dtype,
                 block.lane_start,
                 block.rows,
                 block.col_start,
@@ -2056,18 +2157,18 @@ mod tests {
     #[test]
     fn mma_blocks_model_m64_lane_align_halves() {
         // Layout F: four lane-runs of 16 at stride 32, plus the lane-align offset.
-        let low = mma_blocks(64, 8, 1, 0, 4, 2, TMEM_ROWS, TMEM_COLS).unwrap();
+        let low = mma_blocks(64, 8, 1, 0, 6, TMEM_ROWS, TMEM_COLS).unwrap();
         assert_eq!(low.len(), 4);
         for (g, b) in low.iter().enumerate() {
             assert_eq!(b.cta_idx, 0);
             assert_eq!(b.m_lo, g * 16);
             assert_eq!(b.rows, 16);
             assert_eq!((b.n_lo, b.cols), (0, 8));
-            assert_eq!(b.col_start, 6); // col_start 4 + dst_col 2
+            assert_eq!(b.col_start, 6); // absolute dst col
             assert_eq!(b.lane_start, 32 * g); // lane_align 0
         }
 
-        let high = mma_blocks(64, 8, 1, 16, 4, 2, TMEM_ROWS, TMEM_COLS).unwrap();
+        let high = mma_blocks(64, 8, 1, 16, 6, TMEM_ROWS, TMEM_COLS).unwrap();
         assert_eq!(high[0].lane_start, 16);
         assert_eq!(high[3].lane_start, 112); // 96 + lane_align 16
     }
@@ -2075,7 +2176,7 @@ mod tests {
     #[test]
     fn mma_blocks_model_cta2_m128_layout_b() {
         // m split across the CTA pair; n split in half into the upper 64 lanes.
-        let blocks = mma_blocks(128, 32, 2, 0, 0, 3, TMEM_ROWS, TMEM_COLS).unwrap();
+        let blocks = mma_blocks(128, 32, 2, 0, 3, TMEM_ROWS, TMEM_COLS).unwrap();
         assert_eq!(blocks.len(), 4);
         let has = |cta, m_lo, n_lo, lane_start| {
             blocks.iter().any(|b| {
@@ -2096,7 +2197,7 @@ mod tests {
 
     #[test]
     fn mma_blocks_model_cta2_m256_layout_a_pair_split() {
-        let blocks = mma_blocks(256, 32, 2, 0, 7, 5, TMEM_ROWS, TMEM_COLS).unwrap();
+        let blocks = mma_blocks(256, 32, 2, 0, 12, TMEM_ROWS, TMEM_COLS).unwrap();
         assert_eq!(blocks.len(), 2);
         assert_eq!(
             (blocks[0].cta_idx, blocks[0].m_lo, blocks[0].rows),
@@ -2110,13 +2211,13 @@ mod tests {
             (blocks[1].cta_idx, blocks[1].m_lo, blocks[1].lane_start),
             (1, 128, 0)
         );
-        assert_eq!(blocks[1].col_start, 12); // 7 + 5
+        assert_eq!(blocks[1].col_start, 12); // absolute dst col
     }
 
     #[test]
     fn mma_blocks_reject_lane_align_for_full_datapath_layouts() {
         for (m, cta_group) in [(128, 1), (128, 2), (256, 2)] {
-            let err = mma_blocks(m, 32, cta_group, 16, 0, 0, 128, 512).unwrap_err();
+            let err = mma_blocks(m, 32, cta_group, 16, 0, 128, 512).unwrap_err();
             assert_eq!(err.code, "tcgen05_mma_lane_align");
         }
     }
@@ -2124,10 +2225,10 @@ mod tests {
     #[test]
     fn mma_blocks_reject_tmem_bounds() {
         // Layout F at lane_align 16: the top run reaches lane 128 > 127.
-        let err = mma_blocks(64, 8, 1, 16, 0, 0, 127, TMEM_COLS).unwrap_err();
+        let err = mma_blocks(64, 8, 1, 16, 0, 127, TMEM_COLS).unwrap_err();
         assert_eq!(err.code, "tcgen05_mma_out_of_range");
         // col_start 500 + 32 cols overruns the 512-column grid.
-        let err = mma_blocks(128, 32, 1, 0, 500, 0, TMEM_ROWS, TMEM_COLS).unwrap_err();
+        let err = mma_blocks(128, 32, 1, 0, 500, TMEM_ROWS, TMEM_COLS).unwrap_err();
         assert_eq!(err.code, "tcgen05_mma_out_of_range");
     }
 

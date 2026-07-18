@@ -1983,9 +1983,7 @@ fn record_reg_operand(tensors: &mut HashMap<u32, TensorInfo>, operand: &crate::i
 fn walk_tensors(body: &[Stmt], tensors: &mut HashMap<u32, TensorInfo>) {
     for stmt in body {
         match stmt {
-            Stmt::TensorDef { tensor }
-            | Stmt::TmemAlloc { tensor, .. }
-            | Stmt::TmemDealloc { tensor, .. } => record_tensor(tensors, tensor),
+            Stmt::TensorDef { tensor } => record_tensor(tensors, tensor),
             Stmt::StoreScalar { dst, .. } => record_slice(tensors, dst),
             Stmt::TmaLoad { dst, src, .. } => {
                 record_slice(tensors, dst);
@@ -1995,17 +1993,19 @@ fn walk_tensors(body: &[Stmt], tensors: &mut HashMap<u32, TensorInfo>) {
                 record_tensor(tensors, dst);
                 record_slice(tensors, src);
             }
-            Stmt::Tcgen05Mma { dst, a, b, .. } => {
-                record_slice(tensors, dst);
-                record_slice(tensors, a);
-                record_slice(tensors, b);
+            Stmt::Tcgen05Mma { a, b, .. } => {
+                // TMEM operands (dst/sfa/sfb, and a/b in TmemOperand form) carry
+                // no tensor — the checker's TMEM windows key on physical boxes.
+                for op in [a, b] {
+                    if let crate::ir::MmaOperand::Slice(s) = op {
+                        record_slice(tensors, s);
+                    }
+                }
             }
-            Stmt::Tcgen05Ld { dst, src, .. } => {
+            Stmt::Tcgen05Ld { dst, .. } => {
                 record_slice(tensors, dst);
-                record_tensor(tensors, src);
             }
-            Stmt::Tcgen05St { dst, src, .. } => {
-                record_tensor(tensors, dst);
+            Stmt::Tcgen05St { src, .. } => {
                 record_slice(tensors, src);
             }
             Stmt::LdMatrix { dst, src, .. }

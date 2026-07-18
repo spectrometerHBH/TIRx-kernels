@@ -1,4 +1,8 @@
 //! TMEM alloc/dealloc lifecycle + CTA-pair collective — port of `semantics/tmem.py`.
+//!
+//! TMEM is not a tensor: `TmemAlloc`/`TmemDealloc` name an explicit physical
+//! column band `[base_col, base_col + n_cols)`, and `TmemRelinquish` drops the
+//! CTA's right to allocate further bands.
 
 use super::super::cohort::CohortContext;
 use super::super::diagnostics::{IResult, InterpreterError};
@@ -12,13 +16,12 @@ use super::super::threads::ThreadMask;
 use super::super::tmem::{
     TmemAllocation, TmemAllocationKey, TmemCollectiveArrival, TmemCollectiveKey,
 };
-use super::super::values::tmem::tmem_physical_range;
-use crate::ir::{Stmt, Tensor};
-use std::sync::Arc;
+use crate::ir::Stmt;
 
 pub fn register(reg: &mut StmtExecutorRegistry) {
     reg.register(StmtKind::TmemAlloc, execute_tmem_alloc);
     reg.register(StmtKind::TmemDealloc, execute_tmem_dealloc);
+    reg.register(StmtKind::TmemRelinquish, execute_tmem_relinquish);
 }
 
 fn execute_tmem_alloc<'a, 'k>(
@@ -34,18 +37,31 @@ fn execute_tmem_dealloc<'a, 'k>(
     lifecycle(ctx, stmt, "dealloc")
 }
 
-fn fields<'k>(stmt: &'k Stmt) -> (&'k Arc<Tensor>, usize, u8) {
+/// `tcgen05.relinquish_alloc_permit` — warp-collective like alloc/dealloc. It
+/// has no value-model or trace footprint (the permit flag only constrains
+/// FUTURE allocs, which the IR already makes explicit); the checker sees the
+/// band lifecycle through the alloc/dealloc events.
+fn execute_tmem_relinquish<'a, 'k>(
+    ctx: &mut CohortContext<'a, 'k>,
+    stmt: &'k Stmt,
+) -> IResult<StepStatus> {
+    check_full_warp_issue(&ctx.cohort)?;
+    let _ = stmt;
+    Ok(StepStatus::advance())
+}
+
+fn fields(stmt: &Stmt) -> (usize, usize, u8) {
     match stmt {
         Stmt::TmemAlloc {
-            tensor,
+            base_col,
             n_cols,
             cta_group,
         }
         | Stmt::TmemDealloc {
-            tensor,
+            base_col,
             n_cols,
             cta_group,
-        } => (tensor, *n_cols as usize, *cta_group),
+        } => (*base_col as usize, *n_cols as usize, *cta_group),
         _ => unreachable!(),
     }
 }
@@ -75,9 +91,7 @@ fn lifecycle<'a, 'k>(
     op: &'static str,
 ) -> IResult<StepStatus> {
     check_full_warp_issue(&ctx.cohort)?;
-    let (tensor, n_cols, cta_group) = fields(stmt);
-    let (col_start, n_cols_phys) = tmem_physical_range(tensor, n_cols).map_err(|e| e)?;
-    let _ = n_cols_phys;
+    let (col_start, n_cols, cta_group) = fields(stmt);
     if cta_group == 1 {
         let cta_id = ctx.stream.cta_id;
         lifecycle_apply(ctx, stmt, op, &[cta_id], col_start, n_cols)?;
@@ -96,7 +110,7 @@ fn lifecycle_apply(
     col_start: usize,
     n_cols: usize,
 ) -> IResult<()> {
-    let (tensor, _n, cta_group) = fields(stmt);
+    let (_, _, cta_group) = fields(stmt);
     let mut sorted = cta_ids.to_vec();
     sorted.sort_unstable();
     if op == "alloc" {
@@ -143,7 +157,10 @@ fn lifecycle_apply(
     if ctx.trace_mode() {
         let scope = ctx.access_scope();
         for &cta_id in &sorted {
-            let region = region::tmem_allocation_region(tensor.id, cta_id, col_start, n_cols)?;
+            // The region's tensor_id slot carries the allocation's base column —
+            // TMEM has no tensor identity; the band base is the alloc identity.
+            let region =
+                region::tmem_allocation_region(col_start as u32, cta_id, col_start, n_cols)?;
             if op == "alloc" {
                 ctx.emit(TraceEventKind::TmemAlloc {
                     cta_ids: vec![cta_id],

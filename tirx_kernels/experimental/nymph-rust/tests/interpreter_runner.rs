@@ -23,19 +23,14 @@ fn var(id: u32, binding: VarBinding) -> Var {
     }
 }
 
-fn tmem_tensor(id: u32, col_start: usize) -> Arc<Tensor> {
-    Arc::new(Tensor {
-        id,
-        space: MemorySpace::Tmem,
+/// A TMEM accumulator operand at absolute physical (lane 0, col): the f32 cell
+/// interpretation the MMA writes.
+fn tmem_accum(col: i64) -> TmemOperand {
+    TmemOperand {
+        row: ScalarValue::Int(0),
+        col: ScalarValue::Int(col),
         dtype: DType::F32,
-        shape: vec![128, 128],
-        layout: Some(Layout::Tmem(TmemLayout {
-            kind: TmemLayoutKind::Lane128,
-            col_start,
-        })),
-        byte_offset: None,
-        reg_frag: None,
-    })
+    }
 }
 
 fn reg_tensor(id: u32, dtype: DType, shape: Vec<usize>) -> Arc<Tensor> {
@@ -228,18 +223,17 @@ fn failed_runs_do_not_expose_partial_values() {
 
 #[test]
 fn tmem_cta_group2_collective_success_populates_peer_scratchpads() {
-    let paired = tmem_tensor(20, 0);
     let kernel = Kernel {
         name: "tmem_cta_group2_success".into(),
         args: vec![],
         body: vec![
             kernel_init(vec![Stmt::TmemAlloc {
-                tensor: paired.clone(),
+                base_col: 0,
                 n_cols: 128,
                 cta_group: 2,
             }]),
             kernel_finalize(vec![Stmt::TmemDealloc {
-                tensor: paired,
+                base_col: 0,
                 n_cols: 128,
                 cta_group: 2,
             }]),
@@ -1107,7 +1101,6 @@ fn tcgen05_mma_inplace_accum_requires_written_accumulator() {
     let b_g = gmem_tensor(721, DType::F16, vec![16, 16]);
     let a_s = smem_tensor(722, DType::F16, vec![128, 16], 0);
     let b_s = smem_tensor(723, DType::F16, vec![16, 16], 4096);
-    let acc = tmem_tensor(724, 0);
     let mbar = Arc::new(MBar {
         id: 720,
         kind: MBarKind::Tma,
@@ -1115,9 +1108,9 @@ fn tcgen05_mma_inplace_accum_requires_written_accumulator() {
         arrive_count: None,
     });
     let mma = |accum: bool| Stmt::Tcgen05Mma {
-        dst: full_slice(acc.clone()),
-        a: full_slice(a_s.clone()),
-        b: full_slice(b_s.clone()),
+        dst: tmem_accum(0),
+        a: MmaOperand::Slice(full_slice(a_s.clone())),
+        b: MmaOperand::Slice(full_slice(b_s.clone())),
         m: 128,
         n: 16,
         k: 16,
@@ -1186,7 +1179,7 @@ fn tcgen05_mma_inplace_accum_requires_written_accumulator() {
                 Stmt::MBarDef { mbar: mbar.clone() },
                 kernel_init(vec![
                     Stmt::TmemAlloc {
-                        tensor: acc.clone(),
+                        base_col: 0,
                         n_cols: 32,
                         cta_group: 1,
                     },
@@ -1204,7 +1197,7 @@ fn tcgen05_mma_inplace_accum_requires_written_accumulator() {
                     maxnreg: None,
                 },
                 kernel_finalize(vec![Stmt::TmemDealloc {
-                    tensor: acc.clone(),
+                    base_col: 0,
                     n_cols: 32,
                     cta_group: 1,
                 }]),
