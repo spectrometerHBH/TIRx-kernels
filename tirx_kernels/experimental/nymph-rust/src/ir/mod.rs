@@ -3,7 +3,7 @@
 //! Layout (mirrors the Python module structure):
 //! - `dtype`  — the simple enums (MemorySpace, DType, ScalarOp, ...)
 //! - `scalar` — Var (identity model), ScalarExpr, ScalarValue, ScalarInitial
-//! - `tensor` — Tensor (table/id model), TensorSlice, Layout, TmemLayout
+//! - `tensor` — Tensor (table/id model), TensorSlice, Layout, TmemOperand
 //! - `mbar`   — MBar (table/id model), MBarRef
 //! - `stmt`   — the big Stmt enum (~41 variants)
 //! - `kernel` — Kernel (owns the tensor/mbar tables)

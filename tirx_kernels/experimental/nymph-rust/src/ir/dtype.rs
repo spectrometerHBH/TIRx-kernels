@@ -62,14 +62,6 @@ pub enum Swizzle {
     B128,
 }
 
-/// `TmemLayoutKind` — logical row->lane mapping for a TMEM tensor.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum TmemLayoutKind {
-    Lane128,
-    Lane64Upper,
-    Lane64Lower,
-}
-
 /// `MBarKind` — what kind of work an mbarrier tracks.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum MBarKind {

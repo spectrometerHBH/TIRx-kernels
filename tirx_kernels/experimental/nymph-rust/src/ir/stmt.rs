@@ -9,7 +9,7 @@ use super::dtype::{DType, FenceKind, FenceScope};
 use super::mbar::{MBar, MBarRef};
 use super::scalar::{ScalarInitial, ScalarValue, Var};
 use super::scheduler::Scheduler;
-use super::tensor::{Tensor, TensorSlice};
+use super::tensor::{MmaOperand, Tensor, TensorSlice, TmemOperand};
 use std::sync::Arc;
 
 /// RegCvt rounding mode (Python `Literal["rn"]` — only RN exists).
@@ -323,14 +323,27 @@ pub enum Stmt {
     TensorDef {
         tensor: Arc<Tensor>,
     },
+    /// `tcgen05.alloc` — allocate the TMEM column band `[base_col, base_col +
+    /// n_cols)`. TMEM is not a tensor: the allocation only declares the column
+    /// interval; every TMEM instruction addresses cells by absolute physical
+    /// (lane, col) via `TmemOperand`.
     TmemAlloc {
-        tensor: Arc<Tensor>,
+        base_col: u32,
         n_cols: u32,
         cta_group: u8,
     },
+    /// `tcgen05.dealloc` — release the column band `[base_col, base_col +
+    /// n_cols)` (must match a live allocation).
     TmemDealloc {
-        tensor: Arc<Tensor>,
+        base_col: u32,
         n_cols: u32,
+        cta_group: u8,
+    },
+    /// `tcgen05.relinquish_alloc_permit` — give up the right to issue further
+    /// `tcgen05.alloc`s. Explicit in the IR (codegen translates 1:1); it used
+    /// to be emitted implicitly with the dealloc, which was not a faithful
+    /// translation.
+    TmemRelinquish {
         cta_group: u8,
     },
     ScalarDef {
@@ -560,9 +573,13 @@ pub enum Stmt {
 
     // ---- tcgen05 (tensor core + TMEM) ----
     Tcgen05Mma {
-        dst: TensorSlice,
-        a: TensorSlice,
-        b: TensorSlice,
+        /// Accumulator destination: absolute physical TMEM address (lane, col)
+        /// + f32 cell interpretation. The accumulator's (rows, n) footprint is
+        /// implied by `m`/`n`/`cta_group`/`lane_align`; `row` must be 0 (the
+        /// full-datapath layouts are lane-anchored).
+        dst: TmemOperand,
+        a: MmaOperand,
+        b: MmaOperand,
         m: u32,
         n: u32,
         k: u32,
@@ -571,7 +588,8 @@ pub enum Stmt {
         trans_b: bool,
         cta_group: u8,
         /// Block-scaled MMA scale vectors for A and B, held in TMEM as packed u32
-        /// cells (4 scale bytes each).
+        /// cells (4 scale bytes each) or raw e4m3 bytes (nvfp4), addressed by
+        /// absolute physical (lane, col).
         ///
         /// Two scale modes share this field set:
         /// * fp8 block-128 (UE8M0): one scale per operand row, constant over the
@@ -580,8 +598,8 @@ pub enum Stmt {
         /// * nvfp4 block-16 (e4m3): one scale per 16 contiguous k-elements.
         ///   `sf_e4m3=true`, `sf_block=16`; this MMA's k spans `k/16` blocks whose
         ///   scales are bytes `0..k/16` of the cell, each decoded as e4m3.
-        sfa: Option<TensorSlice>,
-        sfb: Option<TensorSlice>,
+        sfa: Option<TmemOperand>,
+        sfb: Option<TmemOperand>,
         sf_byte: u8,
         /// scale decode: e4m3 (nvfp4) when true, UE8M0 biased exponent (fp8) when false.
         sf_e4m3: bool,
@@ -592,18 +610,20 @@ pub enum Stmt {
         b_fp4: bool,
         /// d-tmem accumulator lane field (0 or 16): only the cta_group=1 m=64
         /// (Layout F) accumulator uses 16 to place its second 64-row half at
-        /// lane 16+. A property of THIS MMA's accumulator write, not of the TMEM
-        /// tensor's view — so it rides on the op, not on `TmemLayout`.
+        /// lane 16+. A property of THIS MMA's accumulator write — hardware
+        /// D-lane placement, not a layout.
         lane_align: u8,
     },
-    /// `tcgen05.cp` — bulk SMEM -> TMEM copy of packed u32 scale-factor cells.
-    /// With `cta_group=2` one leader issue drives both CTAs' datapaths: each CTA
-    /// copies from its own SMEM into its own TMEM. Retirement is observed via
-    /// `tcgen05_commit`, like the MMA; in the value model the copy is applied at
-    /// issue (the tcgen05 engine executes its ops in issue order, so a same-stream
-    /// MMA reading the destination never observes a stale value).
+    /// `tcgen05.cp` — bulk SMEM -> TMEM copy of packed u32 scale-factor cells
+    /// (or raw e4m3 scale bytes for nvfp4). `dst` is the absolute physical TMEM
+    /// base (lane 0, col); `src` stays an SMEM tile. With `cta_group=2` one
+    /// leader issue drives both CTAs' datapaths: each CTA copies from its own
+    /// SMEM into its own TMEM. Retirement is observed via `tcgen05_commit`,
+    /// like the MMA; in the value model the copy is applied at issue (the
+    /// tcgen05 engine executes its ops in issue order, so a same-stream MMA
+    /// reading the destination never observes a stale value).
     Tcgen05Cp {
-        dst: TensorSlice,
+        dst: TmemOperand,
         src: TensorSlice,
         cta_group: u8,
     },
@@ -613,22 +633,22 @@ pub enum Stmt {
         cta_group: u8,
         multicast_cta_mask: Option<u16>,
     },
+    /// `tcgen05.ld` — TMEM -> REG datapath read. `src` is the absolute physical
+    /// TMEM base address (lane, col) + cell dtype; `dst` the REG fragment.
     Tcgen05Ld {
         dst: TensorSlice,
-        src: Arc<Tensor>,
+        src: TmemOperand,
         shape: LdStShape,
         num: u32,
-        row: ScalarValue,
-        col: ScalarValue,
     },
     Tcgen05WaitLd,
+    /// `tcgen05.st` — REG -> TMEM datapath write. `dst` is the absolute physical
+    /// TMEM base address (lane, col) + cell dtype; `src` the REG fragment.
     Tcgen05St {
-        dst: Arc<Tensor>,
+        dst: TmemOperand,
         src: TensorSlice,
         shape: LdStShape,
         num: u32,
-        row: ScalarValue,
-        col: ScalarValue,
     },
     Tcgen05WaitSt,
 
