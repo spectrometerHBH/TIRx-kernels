@@ -31,7 +31,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from math import gcd as _math_gcd
 
-from ..builder import IRBuilder
+from ..builder import IRBuilder, TmemBand
 from ..nymph_rs import (
     DType,
     FenceKind,
@@ -41,8 +41,6 @@ from ..nymph_rs import (
     MBarKind,
     MemorySpace,
     TensorSlice,
-    TmemLayout,
-    TmemLayoutKind,
 )
 from ..nymph_rs import (
     max as scalar_max,  # runtime ScalarExpr max(a,b) — used to clamp m_block_min >= 0
@@ -91,6 +89,15 @@ def _sl(t, offs, shape):
     return TensorSlice(tensor=t, offsets=offs, shape=shape)
 
 
+def _mma_op(x, row, col, rows, cols):
+    # An MMA A/B operand: the SMEM (rows, cols) element tile at (row, col), or the
+    # TMEM band's absolute physical operand at that ELEMENT offset (the old TMEM
+    # slice-offset unit — f16/bf16 bands pack two elements per 32-bit cell).
+    if isinstance(x, TmemBand):
+        return x.elem(row, col)
+    return _sl(x, (row, col), (rows, cols))
+
+
 _VALID_TC = (128, 64, 32, 16, 8, 4, 2, 1)  # legal 32x32b .x{N} counts (tcgen05_datapath.rs:61)
 
 
@@ -115,9 +122,7 @@ def _tc_ld(k, frag, src, num, col=0, base=0, row=0):
     (hd96 bwd PTX = 32x32b.x16 + .x32). One tcgen05_wait_ld after the call drains all chunks."""
     off = 0
     for c in _tc_chunks(num):
-        k.tcgen05_ld(
-            _sl(frag, (base + off,), (c,)), src, shape="32x32b", num=c, row=row, col=col + off
-        )
+        k.tcgen05_ld(_sl(frag, (base + off,), (c,)), src.at(row, col + off), shape="32x32b", num=c)
         off += c
 
 
@@ -607,23 +612,16 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
         sdOt = sQt = sKt = sdS_full = sdS_xchg = None
         sdS = sm("sdS", iod, (TILE_N, TILE_M))  # 1-CTA dQ A-operand (dS, trans_a)
 
-    # ---- TMEM (sub-views at the derived column offsets; all 128-row -> LANE_128) ----
-    def tmem(dt, shape, col):
-        return k.tensor(
-            space=MemorySpace.TMEM,
-            dtype=dt,
-            shape=shape,
-            layout=TmemLayout(TmemLayoutKind.LANE_128, col_start=col),
-        )
-
-    tmem_base = tmem(DType.F32, (128, N_COLS_TMEM), 0)
-    tS = tmem(DType.F32, (TILE_N, TILE_M), d["tmem_S"])
-    tP = tmem(iod, (TILE_N, TILE_M), d["tmem_P"])
-    tdV = tmem(DType.F32, (TILE_N, hdimv), d["tmem_dV"])
-    tdP = tmem(DType.F32, (TILE_N, TILE_M), d["tmem_dP"])
-    tdQ = tmem(DType.F32, (TILE_M, hdim), d["tmem_dQ"])
-    tdK = tmem(DType.F32, (TILE_N, hdim), d["tmem_dK"])
-    tdS = tmem(iod, (TILE_N, TILE_M), d["tmem_dS"])
+    # ---- TMEM (bands at the derived column offsets; all lane0 = 0 — the old views were
+    # all 128-row LANE_128; deliberately overlapping views like P@S / dS@dP / dQ@S are just
+    # bands over the same physical columns now) ----
+    tS = TmemBand(col0=d["tmem_S"], dtype=DType.F32)
+    tP = TmemBand(col0=d["tmem_P"], dtype=iod)
+    tdV = TmemBand(col0=d["tmem_dV"], dtype=DType.F32)
+    tdP = TmemBand(col0=d["tmem_dP"], dtype=DType.F32)
+    tdQ = TmemBand(col0=d["tmem_dQ"], dtype=DType.F32)
+    tdK = TmemBand(col0=d["tmem_dK"], dtype=DType.F32)
+    tdS = TmemBand(col0=d["tmem_dS"], dtype=iod)
 
     def reg(dt, shape):
         return k.tensor(space=MemorySpace.REG, dtype=dt, shape=shape)
@@ -767,7 +765,7 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
     cta_in_cluster = k.ctaid_in_cluster() if use_2cta else 0
 
     with k.kernel_init(warp=0):
-        k.tmem_alloc(tmem_base, n_cols=N_COLS_TMEM, cta_group=cg)
+        k.tmem_alloc(0, N_COLS_TMEM, cg)
         for nm, spec in bar_spec.items():
             stg = spec[2] if len(spec) > 2 else 1
             for s in range(stg):
@@ -979,6 +977,7 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
         # tcgen05.mma.cta_group::N.kind::f16 — per-instruction MMA-K=16, loop kk//16.
         # nymph default is dst[m,n]=Σ_k A[m,k]·B[n,k] (A·Bᵀ); trans_a/b slice the operand
         # as [16,m]/[16,n] (contraction-major). Mirrors gdn_prefill issue().
+        # dst is the accumulator band's base TmemOperand (dst_band.at(0, 0)).
         # a_row0/b_row0 = base row offset into the operand (the double-buffer stage row
         # (mb%2)*TILE_M for sQ/sdO). accum=True keeps the accumulator across m-blocks
         # (dV/dK accumulate); done=None skips the consumer commit (commit only on the LAST mb).
@@ -1001,20 +1000,20 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
             # COMMIT must be leader-only (it multicasts the done-mbar to both CTAs — a
             # per-CTA commit would double-arrive). So issue on both, commit on leader.
             for g in range(kk // 16):
-                a_sl = (
-                    _sl(a, (a_row0 + g * 16, 0), (16, a_m))
+                a_op = (
+                    _mma_op(a, a_row0 + g * 16, 0, 16, a_m)
                     if trans_a
-                    else _sl(a, (a_row0, g * 16), (a_m, 16))
+                    else _mma_op(a, a_row0, g * 16, a_m, 16)
                 )
-                b_sl = (
-                    _sl(b, (b_row0 + g * 16, 0), (16, n_b))
+                b_op = (
+                    _mma_op(b, b_row0 + g * 16, 0, 16, n_b)
                     if trans_b
-                    else _sl(b, (b_row0, g * 16), (n_b, 16))
+                    else _mma_op(b, b_row0, g * 16, n_b, 16)
                 )
                 k.tcgen05_mma(
                     dst,
-                    a_sl,
-                    b_sl,
+                    a_op,
+                    b_op,
                     m=m,
                     n=n,
                     k=16,
@@ -1028,20 +1027,20 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
                     k.tcgen05_commit(bars[done], cta_group=cg, multicast_cta_mask=0b11)
             return
         for g in range(kk // 16):
-            a_sl = (
-                _sl(a, (a_row0 + g * 16, 0), (16, m))
+            a_op = (
+                _mma_op(a, a_row0 + g * 16, 0, 16, m)
                 if trans_a
-                else _sl(a, (a_row0, g * 16), (m, 16))
+                else _mma_op(a, a_row0, g * 16, m, 16)
             )
-            b_sl = (
-                _sl(b, (b_row0 + g * 16, 0), (16, n))
+            b_op = (
+                _mma_op(b, b_row0 + g * 16, 0, 16, n)
                 if trans_b
-                else _sl(b, (b_row0, g * 16), (n, 16))
+                else _mma_op(b, b_row0, g * 16, n, 16)
             )
             k.tcgen05_mma(
                 dst,
-                a_sl,
-                b_sl,
+                a_op,
+                b_op,
                 m=m,
                 n=n,
                 k=16,
@@ -1370,16 +1369,7 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
                     if use_2cta:
                         with k.if_(is_leader):
                             k.mbarrier_wait(peer_bars["tq"], phase=occ % 2)
-                    gemm(
-                        _sl(tS, (0, 0), (TILE_N, TILE_M)),
-                        sK,
-                        sQ,
-                        mma_m,
-                        TILE_M,
-                        hdim,
-                        "s_ready",
-                        b_row0=rM,
-                    )
+                    gemm(tS.at(0, 0), sK, sQ, mma_m, TILE_M, hdim, "s_ready", b_row0=rM)
                     if use_2cta and not is_hd192:
                         # general 2-CTA: sQ (S B-operand) is read ONLY by gS -> gS frees its stage.
                         # (1-CTA's sQ is read by gS AND gdK, so 1-CTA frees q_free at gdK after the LAST
@@ -1429,15 +1419,7 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
                             k.mbarrier_wait(peer_bars["tdo"], phase=occ % 2)
                             k.mbarrier_wait(peer_bars["tdot"], phase=occ % 2)
                         # dP B-operand from the dedicated transposed buffer sdOt (rM=0, single).
-                        gemm(
-                            _sl(tdP, (0, 0), (TILE_N, TILE_M)),
-                            sV,
-                            sdOt,
-                            mma_m,
-                            TILE_M,
-                            hdimv,
-                            "dp_ready",
-                        )
+                        gemm(tdP.at(0, 0), sV, sdOt, mma_m, TILE_M, hdimv, "dp_ready")
                         # 2-CTA: sdOt (dP B-operand) is read ONLY by gdP -> the leader frees BOTH CTAs'
                         # stage (local + peer multicast) so the load warp may reload sdOt for the next
                         # mb (single-stage WAR serialize; leader read both CTAs' sdOt halves).
@@ -1445,16 +1427,7 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
                             k.mbarrier_arrive(bars["dot_free"], stage=st)
                             k.mbarrier_arrive(peer_free["dot_free"], stage=st)
                     else:
-                        gemm(
-                            _sl(tdP, (0, 0), (TILE_N, TILE_M)),
-                            sV,
-                            sdO,
-                            TILE_N,
-                            TILE_M,
-                            hdimv,
-                            "dp_ready",
-                            b_row0=rM,
-                        )
+                        gemm(tdP.at(0, 0), sV, sdO, TILE_N, TILE_M, hdimv, "dp_ready", b_row0=rM)
 
             def gdV(mb):  # dV[kv,dv] = Σ_q Pᵀ·dO -> tdV (accum after 1st executed; waits p_ready)
                 with _skip(
@@ -1470,7 +1443,7 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
                     gemm_acc(
                         mb,
                         mmin,
-                        _sl(tdV, (0, 0), (TILE_N, hdimv)),
+                        tdV.at(0, 0),
                         tP,
                         sdO,
                         mma_m,
@@ -1507,7 +1480,7 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
                         gemm_acc(
                             mb,
                             mmin,
-                            _sl(tdK, (0, 0), (TILE_N, hdim)),
+                            tdK.at(0, 0),
                             tdS,
                             sQt,
                             mma_m,
@@ -1538,7 +1511,7 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
                         gemm_acc(
                             mb,
                             mmin,
-                            _sl(tdK, (0, 0), (TILE_N, hdim)),
+                            tdK.at(0, 0),
                             tdS,
                             sQ,
                             TILE_N,
@@ -1607,7 +1580,7 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
                             # halves landed cluster-wide). count=2 -> both CTAs' relays released.
                             k.mbarrier_wait(bars["dS_cluster_leader"], phase=mb % 2)
                         gemm(
-                            _sl(tdQ, (0, 0), (TILE_M, hdim)),
+                            tdQ.at(0, 0),
                             sdS_full,
                             sKt,
                             TILE_M,
@@ -1627,7 +1600,7 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
                                 k.mbarrier_arrive(peer_free["dS_free"])
                         return
                     gemm(
-                        _sl(tdQ, (0, 0), (TILE_M, hdim)),
+                        tdQ.at(0, 0),
                         sdS,
                         sK,
                         TILE_M,
@@ -1744,7 +1717,7 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
                 k.reg_fill(cscale, scale_log2)
                 # P[kv,q] = exp2(S[kv,q]·scale_log2 − LSE[q])  (LSE per q-col)
                 k.mbarrier_wait(bars["s_ready"], phase=ph)
-                k.tcgen05_ld(fragS, tS, shape="32x32b", num=NCOL, row=0, col=col_base)
+                k.tcgen05_ld(fragS, tS.at(0, col_base), shape="32x32b", num=NCOL)
                 k.tcgen05_wait_ld()
                 if is_hd192:
                     # hd192: S fully read into rmem (wait_ld drained the t2r). Signal s_free so the
@@ -1841,7 +1814,7 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
                 # clobber the other wg's still-unread S cols (flashattn line ~3136-3139).
                 k.fence(kind=af, scope=FenceScope.CTA)
                 k.named_barrier(barrier_id=1, num_warps=8)
-                k.tcgen05_st(tP, _sl(fragP, (0,), (NCOL // 2,)), num=NCOL // 2, row=0, col=cbc)
+                k.tcgen05_st(tP.at(0, cbc), _sl(fragP, (0,), (NCOL // 2,)), num=NCOL // 2)
                 k.tcgen05_wait_st()
                 k.fence(kind=af, scope=FenceScope.CTA)
                 # (a) P r2t-write into tmem fenced+visible — rendezvous both wgs so the full P tile
@@ -1850,7 +1823,7 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
                 k.mbarrier_arrive(bars["p_ready"])
                 # dS[kv,q] = P[kv,q]·(dP[kv,q] − dPsum[q])  (dPsum per q-col)
                 k.mbarrier_wait(bars["dp_ready"], phase=ph)
-                k.tcgen05_ld(fragdP, tdP, shape="32x32b", num=NCOL, row=0, col=col_base)
+                k.tcgen05_ld(fragdP, tdP.at(0, col_base), shape="32x32b", num=NCOL)
                 k.tcgen05_wait_ld()
                 k.fence(kind=af, scope=FenceScope.CTA)
                 # (b) dP t2r-read fenced; dS overwrites dP's tmem cols (dS@dP overlap) — rendezvous
@@ -1867,7 +1840,7 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
                     k.reg_cvt(_sl(fragdS, (c,), (2,)), rt2)
                 # NEW-3/F5: this wg has read all its sdPsum[st] cols -> free the stage (count=2).
                 k.mbarrier_arrive(bars["dps_free"], stage=st)
-                k.tcgen05_st(tdS, _sl(fragdS, (0,), (NCOL // 2,)), num=NCOL // 2, row=0, col=cbc)
+                k.tcgen05_st(tdS.at(0, cbc), _sl(fragdS, (0,), (NCOL // 2,)), num=NCOL // 2)
                 k.tcgen05_wait_st()
                 # stage dS to SMEM sdS (dQ B-operand path: A=sdS trans_a) — each wg writes its cols.
                 # F8: vectorized slice copy of the whole NCOL-wide fragdS row into sdS[tid, col_base:
@@ -2528,5 +2501,6 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
             pass
 
     with k.kernel_finalize(warp=0):
-        k.tmem_dealloc(tmem_base, n_cols=N_COLS_TMEM, cta_group=cg)
+        k.tmem_relinquish(cg)
+        k.tmem_dealloc(0, N_COLS_TMEM, cg)
     return k.build()

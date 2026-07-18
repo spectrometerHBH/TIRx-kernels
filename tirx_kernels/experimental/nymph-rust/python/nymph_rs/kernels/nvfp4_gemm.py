@@ -45,7 +45,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ..builder import IRBuilder
+from ..builder import IRBuilder, SfTmemBand, TmemBand
 from ..nymph_rs import (
     DType,
     FenceKind,
@@ -56,8 +56,6 @@ from ..nymph_rs import (
     MemorySpace,
     ScalarDType,
     TensorSlice,
-    TmemLayout,
-    TmemLayoutKind,
 )
 
 CTA_M = 128  # per-CTA A tile rows (one M tile)
@@ -408,8 +406,6 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     cta_n = _cfg_cta_n(config)
     l2_group_size = _cfg_l2_group_size(config)
     mma_n = cta_n * CTA_GROUP  # the pair's shared N band (256 default; 128 for cta_n=64)
-    sfb_n_chunks = mma_n // 128  # 1 (mma_n=128) or 2 (mma_n=256) SF column super-blocks
-    sfb_cols = SF_CTA_K * sfb_n_chunks  # the full N band's SF cells per lane (folded)
     epi_tile = _cfg_epi_tile(config)
     smem_depth = _cfg_smem_depth(config)
     d_depth = _cfg_d_depth(config)  # output store-ring depth (canon WB_PIPE_DEPTH)
@@ -503,43 +499,20 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     )
 
     # TMEM: accumulator (one MMA_N stage) at col 0; the e4m3 scale vectors at canon's
-    # fixed SF cols (448 / 464). The codegen emits these as `alloc_sf(...,
-    # "float8_e4m3fn", sf_per_mma=4)` (recognized by the e4m3 TMEM dtype).
-    sfa_col0 = 448
-    sfb_col0 = 464
-    tmem_base = k.tensor(
-        space=MemorySpace.TMEM,
-        dtype=DType.F32,
-        shape=(128, N_COLS_TMEM),
-        layout=TmemLayout(TmemLayoutKind.LANE_128, col_start=0),
-    )
-    accum = k.tensor(
-        space=MemorySpace.TMEM,
-        dtype=DType.F32,
-        shape=(128, ACC_DEPTH * mma_n),
-        layout=TmemLayout(TmemLayoutKind.LANE_128, col_start=0),
-    )
-    sfa_tmem = k.tensor(
-        space=MemorySpace.TMEM,
-        dtype=DType.F8E4M3,
-        shape=(128, SF_CTA_K),
-        layout=TmemLayout(TmemLayoutKind.LANE_128, col_start=sfa_col0),
-    )
+    # fixed SF base col (448), the SFB band derived from the SFA band's folded span.
+    # The codegen emits these as `alloc_sf(..., "float8_e4m3fn", sf_per_mma=4)`
+    # (recognized by the e4m3 TMEM dtype).
+    accum = TmemBand(col0=0, dtype=DType.F32)
+    sfa_tmem = SfTmemBand(col0=448, rows=blk_m, nblocks=SF_CTA_K)
     # The FULL N band's B scales — canon's SFB_tmem = `128 * SFB_n_chunks` LOGICAL rows
     # with SFB_n_chunks = SFB_N//128 = MMA_N//128 = 2 (a 256-row SF band). The block-scaled
     # gemm dispatch requires SFB_rows >= N=MMA_N=256, so the EMITTED SFB_tmem is logically
     # (256, SF_CTA_K). But TMEM is physically 128 lanes: the 256 logical rows fold into
-    # SFB_n_chunks=2 column super-blocks, so the IR/value-model tensor is the PHYSICAL
-    # (128, SF_CTA_K * SFB_n_chunks) = (128, 32) — validate.rs/the cp/mma SF slices require
-    # a 128-lane TMEM slice. The codegen un-folds this back to canon's logical (256, 16)
-    # decl_buffer (sf_tmem_layout(rows=256) packs the 2nd super-block into cols 16..32).
-    # Folded (128, 32) at col_start=464 spans cols 464..496, clear of SFA's 448..464.
-    sfb_tmem = k.tensor(
-        space=MemorySpace.TMEM,
-        dtype=DType.F8E4M3,
-        shape=(128, SF_CTA_K * sfb_n_chunks),
-        layout=TmemLayout(TmemLayoutKind.LANE_128, col_start=sfb_col0),
-    )
+    # SFB_n_chunks=2 column super-blocks — logical row r -> lane = r % 128,
+    # col = col0 + (r // 128) * SF_CTA_K + block (canon's sf_tmem_layout packs the 2nd
+    # super-block into cols 16..32). Folded at col0=464 the band spans cols 464..496,
+    # clear of SFA's 448..464.
+    sfb_tmem = SfTmemBand(col0=sfa_tmem.col0 + sfa_tmem.n_cols, rows=mma_n, nblocks=SF_CTA_K)
 
     # The epilogue drains a full epi_tile-wide column band per store tile in ONE
     # tcgen05_ld (canon's `Tx.wg.copy_async(reg_ldst[:, :], tmem[:, n:n+EPI_TILE])`),
@@ -648,7 +621,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
         return m_idx, n_idx
 
     with k.kernel_init(warp=0):
-        k.tmem_alloc(tmem_base, n_cols=N_COLS_TMEM, cta_group=cta_group)
+        k.tmem_alloc(0, N_COLS_TMEM, cta_group)
         for s in range(smem_depth):
             k.mbarrier_init(smem_full, count=1, stage=s)
             k.mbarrier_init(sf_full, count=1, stage=s)
@@ -788,11 +761,11 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     # No permute warp (canon has none): the TMA lands the e4m3 scales in the
     # cp-ready layout, the MMA warp copies them SMEM->TMEM and issues ONE
     # block-scaled gemm over the full CTA_K tile, exactly like canon's execute_mma.
-    # The physical folded SFB SF-TMEM is (128, SF_CTA_K * SFB_N_CHUNKS): the MMA_N-wide
-    # band's 256 logical rows fold into SFB_N_CHUNKS column super-blocks. The cp dst and
-    # the mma sfb slice address the full (128, sfb_cols) physical band (covers both
-    # super-blocks → numel matches the (256, SF_CTA_K) src, and the MMA read region spans
-    # the whole written footprint).
+    # The physical folded SFB SF-TMEM band is (128, SF_CTA_K * SFB_N_CHUNKS) cells:
+    # the MMA_N-wide band's 256 logical rows fold into SFB_N_CHUNKS column
+    # super-blocks (the SfTmemBand rule); the cp dst and the mma sfb operand address
+    # the band's folded physical base col0 (the MMA read region spans the whole
+    # written footprint).
     # elected=True: the WHOLE MMA worker loop runs single-issue (canon's `if elect_sync():
     # while ...`). The B200 tensor pipe needs the cp/cp/gemm/commit burst issued by one
     # converged lane — per-op elect guards that reconverge the warp between tcgen05 issues
@@ -813,9 +786,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
             with k.if_(cta_rank.eq(0)):
                 tmem_idx = local_iter % ACC_DEPTH
                 k.mbarrier_wait(tmem_empty, stage=tmem_idx, phase=(local_iter // ACC_DEPTH + 1) % 2)
-                acc_slice = TensorSlice(
-                    tensor=accum, offsets=(0, tmem_idx * mma_n), shape=(128, mma_n)
-                )
+                acc_op = accum.at(0, tmem_idx * mma_n)
 
                 def mma_ktile(t, accum_flag):
                     # one k-tile: wait the staged loads, cp the e4m3 scales SMEM->TMEM,
@@ -842,14 +813,14 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                     k.mbarrier_wait(peer_sf_full, stage=stage, phase=occ % 2)
                     k.mbarrier_wait(peer_smem_full, stage=stage, phase=occ % 2)
                     k.tcgen05_cp(
-                        TensorSlice(tensor=sfa_tmem, offsets=(0, 0), shape=(128, SF_CTA_K)),
+                        sfa_tmem.at(),
                         TensorSlice(
                             tensor=sfa_smem, offsets=(stage, 0, 0), shape=(1, blk_m, SF_CTA_K)
                         ),
                         cta_group=cta_group,
                     )
                     k.tcgen05_cp(
-                        TensorSlice(tensor=sfb_tmem, offsets=(0, 0), shape=(128, sfb_cols)),
+                        sfb_tmem.at(),
                         TensorSlice(
                             tensor=sfb_smem, offsets=(stage, 0, 0), shape=(1, mma_n, SF_CTA_K)
                         ),
@@ -869,7 +840,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                         tensor=b_smem, offsets=(stage, 0, 0), shape=(1, blk_n, BLK_K_BYTES)
                     )
                     k.tcgen05_mma(
-                        acc_slice,
+                        acc_op,
                         a_op,
                         b_op,
                         m=MMA_M,
@@ -877,8 +848,8 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                         k=CTA_K,
                         accum=accum_flag,
                         cta_group=cta_group,
-                        sfa=TensorSlice(tensor=sfa_tmem, offsets=(0, 0), shape=(128, SF_CTA_K)),
-                        sfb=TensorSlice(tensor=sfb_tmem, offsets=(0, 0), shape=(128, sfb_cols)),
+                        sfa=sfa_tmem.at(),
+                        sfb=sfb_tmem.at(),
                         sf_e4m3=True,
                         sf_block=SF_BLOCK,
                         a_fp4=True,
@@ -964,10 +935,8 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                 for ot in range(store_tiles):
                     k.tcgen05_ld(
                         TensorSlice(tensor=accum_frag, offsets=(ot * epi_tile,), shape=(epi_tile,)),
-                        accum,
+                        accum.at(0, acc_col0 + ot * epi_tile),
                         num=epi_tile,
-                        row=0,
-                        col=acc_col0 + ot * epi_tile,
                     )
                 k.tcgen05_wait_ld()
                 # Free the accumulator TMEM for the MMA's next tile BEFORE the scale/cast/
@@ -986,9 +955,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                 # ONE mul + ONE cast — not epi_tile//8 narrow 8-col loads each with its own
                 # wait_ld (which serialized the drain on 8x the async-load fences canon pays).
                 for ot in range(store_tiles):
-                    k.tcgen05_ld(
-                        accum_frag, accum, num=epi_tile, row=0, col=acc_col0 + ot * epi_tile
-                    )
+                    k.tcgen05_ld(accum_frag, accum.at(0, acc_col0 + ot * epi_tile), num=epi_tile)
                     k.tcgen05_wait_ld()
                     k.reg_mul(accum_frag, accum_frag, config.alpha)
                     k.reg_cvt(out_frag, accum_frag)
@@ -1011,7 +978,8 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     with k.kernel_finalize(warp=epilogue_warp):
         k.mbarrier_arrive(k.mbar_ref(tmem_fin, remote_coord=1 - cta_rank), stage=0)
         k.mbarrier_wait(tmem_fin, stage=0, phase=0)
-        k.tmem_dealloc(tmem_base, n_cols=N_COLS_TMEM, cta_group=cta_group)
+        k.tmem_relinquish(cta_group)
+        k.tmem_dealloc(0, N_COLS_TMEM, cta_group)
 
     return k.build()
 

@@ -15,7 +15,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-from ..builder import IRBuilder
+from ..builder import IRBuilder, TmemBand
 from ..nymph_rs import (
     DType,
     FenceKind,
@@ -30,8 +30,6 @@ from ..nymph_rs import (
     Swizzle,
     Tensor,
     TensorSlice,
-    TmemLayout,
-    TmemLayoutKind,
 )
 
 BLK_M = 128
@@ -216,25 +214,20 @@ def build_flash_attention4(config: FlashAttention4Config = FlashAttention4Config
         shape=(TASK_BROADCAST_STAGES, TASK_BROADCAST_FIELDS),
         byte_offset=task_offset,
     )
-    tmem_base = k.tensor(
-        space=MemorySpace.TMEM,
-        dtype=DType.F32,
-        shape=(BLK_M, N_COLS_TMEM),
-        layout=TmemLayout(TmemLayoutKind.LANE_128, col_start=0),
-    )
+    # TMEM bands at the old views' absolute physical columns (pure Python — the IR
+    # carries flat TmemOperands).
     s_tmem = tuple(
-        _tmem_view(k, DType.F32, stage * BLK_N, (BLK_M, BLK_N))
-        for stage in range(SMEM_PIPE_DEPTH_Q)
+        TmemBand(col0=stage * BLK_N, dtype=DType.F32) for stage in range(SMEM_PIPE_DEPTH_Q)
     )
     o_tmem = tuple(
-        _tmem_view(k, DType.F32, BLK_N * SMEM_PIPE_DEPTH_Q + stage * BLK_N, (BLK_M, BLK_N))
+        TmemBand(col0=BLK_N * SMEM_PIPE_DEPTH_Q + stage * BLK_N, dtype=DType.F32)
         for stage in range(TMEM_PIPE_DEPTH)
     )
-    # Nymph's TMEM layout col_start is a physical 32-bit cell column. This
-    # matches baseline P_region's f16 logical col_start=MMA_N and
-    # stride=TMEM_STAGE_STRIDE * 2 as physical starts 64 and 192.
+    # A band's col0 is a physical 32-bit cell column. This matches baseline
+    # P_region's f16 logical col_start=MMA_N and stride=TMEM_STAGE_STRIDE * 2 as
+    # physical starts 64 and 192 (f16 packs two elements per cell).
     p_tmem = tuple(
-        _tmem_view(k, DType.F16, (BLK_N // 2) + stage * BLK_N, (BLK_M, BLK_N))
+        TmemBand(col0=(BLK_N // 2) + stage * BLK_N, dtype=DType.F16)
         for stage in range(SMEM_PIPE_DEPTH_Q)
     )
 
@@ -287,7 +280,7 @@ def build_flash_attention4(config: FlashAttention4Config = FlashAttention4Config
     scheduler = k.scheduler(task_space, policy="custom")
 
     with k.kernel_init(warp=0):
-        k.tmem_alloc(tmem_base, n_cols=N_COLS_TMEM, cta_group=config.cta_group)
+        k.tmem_alloc(0, N_COLS_TMEM, config.cta_group)
         for mbar in [*q_full, *q_empty]:
             _init_stages(k, mbar, stages=1, count=1)
         _init_stages(k, k_full, stages=SMEM_PIPE_DEPTH_KV, count=1)
@@ -448,7 +441,8 @@ def build_flash_attention4(config: FlashAttention4Config = FlashAttention4Config
     )
 
     with k.kernel_finalize(warp=0):
-        k.tmem_dealloc(tmem_base, n_cols=N_COLS_TMEM, cta_group=config.cta_group)
+        k.tmem_relinquish(config.cta_group)
+        k.tmem_dealloc(0, N_COLS_TMEM, config.cta_group)
 
     return k.build()
 
@@ -729,9 +723,9 @@ def _emit_mma_role(
     q_smem: tuple[Tensor, Tensor],
     k_smem: tuple[Tensor, Tensor, Tensor],
     v_smem: tuple[Tensor, Tensor, Tensor],
-    s_tmem: tuple[Tensor, Tensor],
-    p_tmem: tuple[Tensor, Tensor],
-    o_tmem: tuple[Tensor, Tensor],
+    s_tmem: tuple[TmemBand, TmemBand],
+    p_tmem: tuple[TmemBand, TmemBand],
+    o_tmem: tuple[TmemBand, TmemBand],
     q_full: tuple[MBar, MBar],
     q_empty: tuple[MBar, MBar],
     k_full: MBar,
@@ -826,16 +820,16 @@ def _emit_mma_role(
 def _emit_pv_mma(
     k: IRBuilder,
     config: FlashAttention4Config,
-    o_stage: Tensor,
-    p_stage: Tensor,
+    o_stage: TmemBand,
+    p_stage: TmemBand,
     v_stage: Tensor,
     k_group: int,
     kv_idx: int,
 ) -> None:
     k_offset = k_group * MMA_K
     k.tcgen05_mma(
-        o_stage,
-        p_stage[:, k_offset : k_offset + MMA_K],
+        o_stage.at(0, 0),
+        p_stage.elem(0, k_offset),
         v_stage[k_offset : k_offset + MMA_K, :],
         m=BLK_M,
         n=HEAD_DIM,
@@ -847,12 +841,12 @@ def _emit_pv_mma(
 
 
 def _emit_qk_mma(
-    k: IRBuilder, config: FlashAttention4Config, s_stage: Tensor, q_stage: Tensor, k_stage: Tensor
+    k: IRBuilder, config: FlashAttention4Config, s_stage: TmemBand, q_stage: Tensor, k_stage: Tensor
 ) -> None:
     for k_group in range(HEAD_DIM // MMA_K):
         k_offset = k_group * MMA_K
         k.tcgen05_mma(
-            s_stage,
+            s_stage.at(0, 0),
             q_stage[:, k_offset : k_offset + MMA_K],
             k_stage[:, k_offset : k_offset + MMA_K],
             m=BLK_M,
@@ -869,8 +863,8 @@ def _emit_softmax_roles(
     task_smem: Tensor,
     task_full: MBar,
     task_empty: MBar,
-    s_tmem: tuple[Tensor, Tensor],
-    p_tmem: tuple[Tensor, Tensor],
+    s_tmem: tuple[TmemBand, TmemBand],
+    p_tmem: tuple[TmemBand, TmemBand],
     s_scale: Tensor,
     s_frags: tuple[Tensor, ...],
     p_frags: tuple[Tensor, ...],
@@ -925,7 +919,7 @@ def _emit_softmax_roles(
                         for chunk in range(SOFTMAX_NUM_CHUNKS):
                             col = chunk * SOFTMAX_CHUNK_CELLS
                             k.tcgen05_ld(
-                                s_frags[chunk], s_tmem[i_q], num=SOFTMAX_CHUNK_CELLS, row=0, col=col
+                                s_frags[chunk], s_tmem[i_q].at(0, col), num=SOFTMAX_CHUNK_CELLS
                             )
                         k.tcgen05_wait_ld()
                         if config.is_causal:
@@ -984,11 +978,9 @@ def _emit_softmax_roles(
                             k.reg_cvt(p_frags[chunk], s_frags[chunk])
                         for chunk in range(SOFTMAX_NUM_CHUNKS):
                             k.tcgen05_st(
-                                p_tmem[i_q],
+                                p_tmem[i_q].at(0, chunk * P_STORE_CELLS),
                                 p_frags[chunk][0:P_STORE_CELLS],
                                 num=P_STORE_CELLS,
-                                row=0,
-                                col=chunk * P_STORE_CELLS,
                             )
                             if chunk == P_FIRST_READY_CHUNKS - 1:
                                 k.tcgen05_wait_st()
@@ -1015,7 +1007,7 @@ def _emit_correction_epilogue_role(
     task_smem: Tensor,
     task_full: MBar,
     task_empty: MBar,
-    o_tmem: tuple[Tensor, Tensor],
+    o_tmem: tuple[TmemBand, TmemBand],
     o_smem: tuple[Tensor, Tensor],
     s_scale: Tensor,
     o_frag: Tensor,
@@ -1067,7 +1059,7 @@ def _emit_correction_epilogue_role(
                 k.reg_min(row_scale, 1.0, row_scale)
                 for d_tile in range(HEAD_DIM // O_CHUNK_CELLS):
                     col = d_tile * O_CHUNK_CELLS
-                    k.tcgen05_ld(o_frag, o_tmem[i_q], num=O_CHUNK_CELLS, row=0, col=col)
+                    k.tcgen05_ld(o_frag, o_tmem[i_q].at(0, col), num=O_CHUNK_CELLS)
                     k.tcgen05_wait_ld()
                     k.reg_mul(o_frag, o_frag, row_scale)
                     k.reg_cvt(o_frag_f16, o_frag)
@@ -1083,13 +1075,13 @@ def _emit_correction_epilogue_role(
                 k.mbarrier_arrive(corr_epi_full, stage=i_q)
 
 
-def _emit_o_rescale(k: IRBuilder, o_stage: Tensor, o_frag: Tensor, row_scale: Tensor) -> None:
+def _emit_o_rescale(k: IRBuilder, o_stage: TmemBand, o_frag: Tensor, row_scale: Tensor) -> None:
     for d_tile in range(HEAD_DIM // O_CHUNK_CELLS):
         col = d_tile * O_CHUNK_CELLS
-        k.tcgen05_ld(o_frag, o_stage, num=O_CHUNK_CELLS, row=0, col=col)
+        k.tcgen05_ld(o_frag, o_stage.at(0, col), num=O_CHUNK_CELLS)
         k.tcgen05_wait_ld()
         k.reg_cond_rescale(o_frag, o_frag, row_scale, threshold=1.0, scope="warpgroup")
-        k.tcgen05_st(o_stage, o_frag, num=O_CHUNK_CELLS, row=0, col=col)
+        k.tcgen05_st(o_stage.at(0, col), o_frag, num=O_CHUNK_CELLS)
     k.tcgen05_wait_st()
 
 
@@ -1169,15 +1161,6 @@ def _smem_tile(k: IRBuilder, byte_offset: int, layout: SmemSwizzleLayout | None)
         shape=(BLK_M, HEAD_DIM),
         layout=layout,
         byte_offset=byte_offset,
-    )
-
-
-def _tmem_view(k: IRBuilder, dtype: DType, col_start: int, shape: tuple[int, int]) -> Tensor:
-    return k.tensor(
-        space=MemorySpace.TMEM,
-        dtype=dtype,
-        shape=shape,
-        layout=TmemLayout(TmemLayoutKind.LANE_128, col_start=col_start),
     )
 
 

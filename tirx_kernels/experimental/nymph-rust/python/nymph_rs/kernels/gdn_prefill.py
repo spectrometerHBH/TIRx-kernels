@@ -34,7 +34,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ..builder import IRBuilder
+from ..builder import IRBuilder, TmemBand
 from ..nymph_rs import (
     DType,
     FenceKind,
@@ -44,8 +44,6 @@ from ..nymph_rs import (
     MBarKind,
     MemorySpace,
     TensorSlice,
-    TmemLayout,
-    TmemLayoutKind,
 )
 
 HQK = 4
@@ -75,6 +73,15 @@ def _ceil_div(a: int, b: int) -> int:
 
 def _sl(t, offs, shape):
     return TensorSlice(tensor=t, offsets=offs, shape=shape)
+
+
+def _mma_op(x, row, col, rows, cols):
+    # An MMA A/B operand: the SMEM (rows, cols) element tile at (row, col), or the
+    # TMEM band's absolute physical operand at that ELEMENT offset (the old TMEM
+    # slice-offset unit — f16/bf16 bands pack two elements per 32-bit cell).
+    if isinstance(x, TmemBand):
+        return x.elem(row, col)
+    return _sl(x, (row, col), (rows, cols))
 
 
 @dataclass(frozen=True, slots=True)
@@ -306,63 +313,19 @@ def build_gdn_prefill(config: GdnPrefillConfig = GdnPrefillConfig()) -> Kernel:
 
     # TMEM regions matching flashinfer's separate allocations (gated_delta_net_chunked.py
     # :319-330): state S (f32), state_inp (fp16 undecayed-S copy for GEMM3/4), q_state acc
-    # (GEMM4/6), shared_acc (GEMM1/2/3/5), shared_inp (fp16 delta/NV for GEMM5/6/7).
-    tmem_base = k.tensor(
-        space=MemorySpace.TMEM,
-        dtype=DType.F32,
-        shape=(128, N_COLS_TMEM),
-        layout=TmemLayout(TmemLayoutKind.LANE_128, col_start=0),
-    )
-    s_tmem = k.tensor(
-        space=MemorySpace.TMEM,
-        dtype=DType.F32,
-        shape=(128, V_DIM),
-        layout=TmemLayout(TmemLayoutKind.LANE_128, col_start=0),
-    )  # 0-127
-    state_inp = k.tensor(
-        space=MemorySpace.TMEM,
-        dtype=iod,
-        shape=(128, V_DIM),
-        layout=TmemLayout(TmemLayoutKind.LANE_128, col_start=128),
-    )  # 128-191 (64 cols bf16)
-    qstate_tmem = k.tensor(
-        space=MemorySpace.TMEM,
-        dtype=DType.F32,
-        shape=(64, V_DIM),
-        layout=TmemLayout(TmemLayoutKind.LANE_64_UPPER, col_start=192),
-    )  # 192-319
+    # (GEMM4/6), shared_acc (GEMM1/2/3/5), shared_inp (fp16 delta/NV for GEMM5/6/7). Each
+    # is a TmemBand at the old tensor's absolute physical column band (the old
+    # LANE_128/LANE_64_UPPER kinds both map lane = row, so lane0 = 0 throughout).
+    s_tmem = TmemBand(col0=0, dtype=DType.F32)  # (128, V_DIM) f32, cols 0-127
+    state_inp = TmemBand(col0=128, dtype=iod)  # (128, V_DIM) fp16, cols 128-191 (64 cells)
+    qstate_tmem = TmemBand(col0=192, dtype=DType.F32)  # (64, V_DIM) f32, cols 192-319
     # shared_acc = 2 stages of 64 cols (flashinfer 64-col × 2): kk→stage0, qk→stage1
     # (pipeline); the V-output GEMMs (ks/nv, [BT,V_DIM]) use the contiguous union view.
-    acc_s0 = k.tensor(
-        space=MemorySpace.TMEM,
-        dtype=DType.F32,
-        shape=(64, BT),
-        layout=TmemLayout(TmemLayoutKind.LANE_64_UPPER, col_start=320),
-    )  # stage 0: 320-383
-    acc_s1 = k.tensor(
-        space=MemorySpace.TMEM,
-        dtype=DType.F32,
-        shape=(64, BT),
-        layout=TmemLayout(TmemLayoutKind.LANE_64_UPPER, col_start=384),
-    )  # stage 1: 384-447
-    acc_tmem = k.tensor(
-        space=MemorySpace.TMEM,
-        dtype=DType.F32,
-        shape=(64, V_DIM),
-        layout=TmemLayout(TmemLayoutKind.LANE_64_UPPER, col_start=320),
-    )  # union view (ks/nv)
-    shared_inp = k.tensor(
-        space=MemorySpace.TMEM,
-        dtype=iod,
-        shape=(V_DIM, BT),
-        layout=TmemLayout(TmemLayoutKind.LANE_128, col_start=448),
-    )  # stage A: delta(G5)→NV(G6)
-    shared_inp_b = k.tensor(
-        space=MemorySpace.TMEM,
-        dtype=iod,
-        shape=(V_DIM, BT),
-        layout=TmemLayout(TmemLayoutKind.LANE_128, col_start=480),
-    )  # stage B: vnew_gated(G7)
+    acc_s0 = TmemBand(col0=320, dtype=DType.F32)  # stage 0: 320-383
+    acc_s1 = TmemBand(col0=384, dtype=DType.F32)  # stage 1: 384-447
+    acc_tmem = TmemBand(col0=320, dtype=DType.F32)  # union view (ks/nv)
+    shared_inp = TmemBand(col0=448, dtype=iod)  # stage A: delta(G5)→NV(G6)
+    shared_inp_b = TmemBand(col0=480, dtype=iod)  # stage B: vnew_gated(G7)
 
     def reg(dt, shape):
         return k.tensor(space=MemorySpace.REG, dtype=dt, shape=shape)
@@ -431,7 +394,7 @@ def build_gdn_prefill(config: GdnPrefillConfig = GdnPrefillConfig()) -> Kernel:
     sched = k.scheduler(k.task_space(grid=(num_work,), fields=("work",)))
 
     with k.kernel_init(warp=0):
-        k.tmem_alloc(tmem_base, n_cols=N_COLS_TMEM)
+        k.tmem_alloc(0, N_COLS_TMEM)
         for nm, spec in bar_spec.items():
             stg = spec[2] if len(spec) > 2 else 1
             for s in range(stg):
@@ -469,7 +432,8 @@ def build_gdn_prefill(config: GdnPrefillConfig = GdnPrefillConfig()) -> Kernel:
     )
 
     with k.kernel_finalize(warp=0):
-        k.tmem_dealloc(tmem_base, n_cols=N_COLS_TMEM)
+        k.tmem_relinquish()
+        k.tmem_dealloc(0, N_COLS_TMEM)
     return k.build()
 
 
@@ -516,20 +480,20 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
         # a_row0/b_row0 = base row offset into the operand tensor (for the K double-buffer
         # stage = (c%2)*BT, which is compile-time for fixed-length and runtime for varlen).
         for g in range(kk // 16):
-            a_sl = (
-                _sl(a, (a_row0 + g * 16, 0), (16, m))
+            a_op = (
+                _mma_op(a, a_row0 + g * 16, 0, 16, m)
                 if trans_a
-                else _sl(a, (a_row0, g * 16), (m, 16))
+                else _mma_op(a, a_row0, g * 16, m, 16)
             )
-            b_sl = (
-                _sl(b, (b_row0 + g * 16, 0), (16, n))
+            b_op = (
+                _mma_op(b, b_row0 + g * 16, 0, 16, n)
                 if trans_b
-                else _sl(b, (b_row0, g * 16), (n, 16))
+                else _mma_op(b, b_row0, g * 16, n, 16)
             )
             k.tcgen05_mma(
-                dst,
-                a_sl,
-                b_sl,
+                dst.at(0, 0),
+                a_op,
+                b_op,
                 m=m,
                 n=n,
                 k=16,
@@ -543,7 +507,7 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
         # kk_epi / qk_epi (CG0): read M=64 acc via tcgen05.ld.16x256b, scale by the
         # T-pairwise factor exp2(gcs[i]-gcs[j]) and (-beta[i] | scale), mask, store.
         k.tcgen05_ld(
-            frag, acc if acc is not None else acc_tmem, shape="16x256b", num=LD_NUM, row=0, col=0
+            frag, (acc if acc is not None else acc_tmem).at(0, 0), shape="16x256b", num=LD_NUM
         )
         k.tcgen05_wait_ld()
         for va in range(2):
@@ -923,7 +887,7 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
         with k.for_each_task(sched) as task:
             seq, eh, q_head, k_head, v_head, tok_base, NCH, slen = task_geom(task)
             k.reg_fill(zrow, 0.0)  # per-tile state reset: S_prev = 0 (each sequence)
-            k.tcgen05_st(s_tmem, zrow, num=V_DIM, row=0, col=0)
+            k.tcgen05_st(s_tmem.at(0, 0), zrow, num=V_DIM)
             k.tcgen05_wait_st()
             with k.for_loop(stop=NCH) as c:
                 with k.if_(gc > 0):
@@ -939,18 +903,16 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                     # (flashinfer @3345-3399 stage-then-decay), so GEMM3/4 read a stable copy.
                     k.reg_unary(r1, glast, op="exp2")  # Phi = exp2(glast) (gcs log2-units)
                     for half in range(2):
-                        k.tcgen05_ld(frag32, s_tmem, shape="32x32b", num=64, row=0, col=half * 64)
+                        k.tcgen05_ld(frag32, s_tmem.at(0, half * 64), shape="32x32b", num=64)
                         k.tcgen05_wait_ld()
                         for cc in range(64):
                             k.reg_cvt(
                                 _sl(sinp_reg, (half * 64 + cc,), (1,)), _sl(frag32, (cc,), (1,))
                             )
                             k.reg_mul(_sl(frag32, (cc,), (1,)), _sl(frag32, (cc,), (1,)), r1)
-                        k.tcgen05_st(
-                            s_tmem, frag32, num=64, row=0, col=half * 64
-                        )  # decayed main state
+                        k.tcgen05_st(s_tmem.at(0, half * 64), frag32, num=64)  # decayed main state
                     k.tcgen05_st(
-                        state_inp, _sl(sinp_reg, (0,), (64,)), num=64, row=0, col=0
+                        state_inp.at(0, 0), _sl(sinp_reg, (0,), (64,)), num=64
                     )  # fp16 copy
                     k.tcgen05_wait_st()
                     k.wg_sync(barrier_id=11)
@@ -973,7 +935,7 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                         for j in range(BT):
                             k.reg_load(_sl(sinp_reg, (j,), (1,)), _sl(tmpt_s, (tid, j), (1, 1)))
                         k.tcgen05_st(
-                            shared_inp, _sl(sinp_reg, (0,), (BT // 2,)), num=BT // 2, row=0, col=0
+                            shared_inp.at(0, 0), _sl(sinp_reg, (0,), (BT // 2,)), num=BT // 2
                         )
                     k.tcgen05_wait_st()
                     k.wg_sync(barrier_id=11)
@@ -1011,13 +973,11 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                 with k.if_(tid < V_DIM):
                     for j in range(BT):
                         k.reg_load(_sl(sinp_reg, (j,), (1,)), _sl(vnewt_s, (tid, j), (1, 1)))
-                    k.tcgen05_st(
-                        shared_inp, _sl(sinp_reg, (0,), (BT // 2,)), num=BT // 2, row=0, col=0
-                    )
+                    k.tcgen05_st(shared_inp.at(0, 0), _sl(sinp_reg, (0,), (BT // 2,)), num=BT // 2)
                     for j in range(BT):
                         k.reg_load(_sl(sinp_reg, (j,), (1,)), _sl(tmpt_s, (tid, j), (1, 1)))
                     k.tcgen05_st(
-                        shared_inp_b, _sl(sinp_reg, (0,), (BT // 2,)), num=BT // 2, row=0, col=0
+                        shared_inp_b.at(0, 0), _sl(sinp_reg, (0,), (BT // 2,)), num=BT // 2
                     )
                 k.tcgen05_wait_st()
                 k.wg_sync(barrier_id=11)
@@ -1046,7 +1006,7 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
             seq = work // NEFF
             eh = work % NEFF
             for half in range(2):
-                k.tcgen05_ld(frag32, s_tmem, shape="32x32b", num=64, row=0, col=half * 64)
+                k.tcgen05_ld(frag32, s_tmem.at(0, half * 64), shape="32x32b", num=64)
                 k.tcgen05_wait_ld()
                 k.reg_store(_sl(state_g, (seq, eh, tid, half * 64), (1, 1, 1, 64)), frag32)
 
@@ -1097,7 +1057,7 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
 def _read128(k, acc, frag):
     # yields (row, col, r) for a 64×128 acc read via two tcgen05.ld.16x256b blocks.
     for blk in range(2):
-        k.tcgen05_ld(frag, acc, shape="16x256b", num=8, row=0, col=blk * 64)
+        k.tcgen05_ld(frag, acc.at(0, blk * 64), shape="16x256b", num=8)
         k.tcgen05_wait_ld()
         for va in range(2):
             for vb in range(8):
