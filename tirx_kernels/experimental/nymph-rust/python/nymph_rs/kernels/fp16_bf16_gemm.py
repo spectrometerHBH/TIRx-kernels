@@ -500,12 +500,14 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
             # Hoist the per-task tile coords into registers ONCE per task (canon's
             # `buffer_5`/`buffer_6`), instead of re-deriving the L2-raster expression
             # `(task>>6)*4 + (task&63)&3` inline in every TMA address (3x/k-tile here).
-            # shuffle_sync: the task id comes from a scheduler-mailbox LDS (a vector
-            # load ptxas can't prove warp-uniform), but the TMA issue is a UNIFORM-pipe
-            # instruction (UTMALDG) whose coords live in URs — unwrapped, every TMA
-            # issue pays vector math + R2UR moves (ncu fp16 1024: R2UR 13.5K vs canon
-            # 1.8K, clustered on the two g2cluster lines). Same treatment as nvfp4's
-            # task loops (which wrap under elected=True as well).
+            # They are deliberately NOT wrapped in shuffle_sync: the task id comes from
+            # a scheduler-mailbox LDS (a vector load ptxas can't prove warp-uniform) and
+            # a shuffle would force the uniform datapath, but __shfl_sync in this
+            # single-lane elected region is UB (flaky GPU hang). nvfp4 wraps only its
+            # NON-elected task loops for the same reason; its elected MMA warp is
+            # likewise unwrapped. Unwrapped, every TMA issue pays vector math + R2UR
+            # moves (ncu fp16 1024: R2UR 13.5K vs canon 1.8K, clustered on the two
+            # g2cluster lines) — closing that needs a UB-free uniform mechanism.
             m_idx_e, n_idx_e = work_coords(task_id)
             m_idx = k.scalar(initial=m_idx_e, dtype=ScalarDType.I32)
             n_idx = k.scalar(initial=n_idx_e, dtype=ScalarDType.I32)

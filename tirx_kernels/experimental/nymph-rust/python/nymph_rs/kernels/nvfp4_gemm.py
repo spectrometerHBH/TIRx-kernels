@@ -54,6 +54,7 @@ from ..nymph_rs import (
     LaunchShape,
     MBarKind,
     MemorySpace,
+    ScalarDType,
     TensorSlice,
     TmemLayout,
     TmemLayoutKind,
@@ -800,7 +801,15 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     # checker's tcgen05 issuer rule accepts a single elected lane).
     with k.role(warp=0, elected=True):
         with k.for_each_task(task_scheduler) as task:
-            local_iter = k.shuffle_sync((task.task_id - task_start) // task_step)
+            # NO shuffle_sync here: __shfl_sync(0xffffffff) inside this single-lane
+            # elected region is UB on GPU (the mask demands all 32 lanes converge;
+            # reproduced as a flaky launch hang on the fp16 producer). local_iter
+            # stays a plain scalar — the derived stage/phase math pays R2UR until a
+            # UB-free uniform mechanism lands. The NON-elected task loops (TMA
+            # producer, consumer wg) do wrap with shuffle_sync.
+            local_iter = k.scalar(
+                initial=(task.task_id - task_start) // task_step, dtype=ScalarDType.I32
+            )
             with k.if_(cta_rank.eq(0)):
                 tmem_idx = local_iter % ACC_DEPTH
                 k.mbarrier_wait(tmem_empty, stage=tmem_idx, phase=(local_iter // ACC_DEPTH + 1) % 2)
