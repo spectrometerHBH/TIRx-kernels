@@ -2225,11 +2225,19 @@ fn check_tmem_alloc_bands(kernel: &Kernel) -> R {
                 sf_block,
                 ..
             } => {
-                // The accumulator is f32: one cell per (lane, n-column).
+                // The accumulator is f32: one cell per (lane, n-column). Layout B
+                // (cta_group=2, m=128) splits n in half per CTA — the two n-halves
+                // stack into the lower/upper 64 lanes over the SAME column range,
+                // so the per-CTA column span is ceil(n/2), not n (mma_blocks).
+                let dst_cols = if *cta_group == 2 && *m == 128 {
+                    (*n as usize).div_ceil(2)
+                } else {
+                    *n as usize
+                };
                 uses.push(Use {
                     op: dst,
                     rows: None,
-                    cols: Some(*n as usize),
+                    cols: Some(dst_cols),
                     label: "tcgen05_mma dst",
                 });
                 let kk = *k as usize;

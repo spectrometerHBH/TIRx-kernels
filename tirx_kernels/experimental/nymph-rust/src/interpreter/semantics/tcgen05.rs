@@ -1928,6 +1928,14 @@ fn read_tmem_operand(
     transpose: bool,
     cta_id: usize,
 ) -> IResult<Array2<f32>> {
+    // A transposed operand is physically stored (k_cols, rows) and read back
+    // transposed to (rows, k_cols) — the same extent swap mma_operand_regions
+    // makes for the trace region (this fn is its value-side mirror).
+    let (phys_rows, phys_cols) = if transpose {
+        (cols, rows)
+    } else {
+        (rows, cols)
+    };
     let (row0, col0) = eval_tmem_operand(ctx, op, "mma operand")?;
     let oob = || {
         InterpreterError::new(
@@ -1935,48 +1943,48 @@ fn read_tmem_operand(
             "tcgen05_mma addresses a TMEM cell out of range",
         )
     };
-    if row0 + rows > TMEM_ROWS {
+    if row0 + phys_rows > TMEM_ROWS {
         return Err(oob());
     }
     let sp = ctx.state.values.tmem.scratchpad_for(cta_id)?;
     let mat = if is_packed_tmem_dtype(op.dtype) {
-        if cols % 2 != 0 {
+        if phys_cols % 2 != 0 {
             return Err(InterpreterError::new(
                 "tcgen05_mma_operand",
                 "packed-half TMEM operand needs an even column extent",
             ));
         }
-        let cell_cols = cols / 2;
+        let cell_cols = phys_cols / 2;
         if col0 + cell_cols > TMEM_COLS {
             return Err(oob());
         }
-        let mut lanes = Vec::with_capacity(rows * cell_cols);
-        let mut cell_cols_v = Vec::with_capacity(rows * cell_cols);
-        for r in 0..rows {
+        let mut lanes = Vec::with_capacity(phys_rows * cell_cols);
+        let mut cell_cols_v = Vec::with_capacity(phys_rows * cell_cols);
+        for r in 0..phys_rows {
             for c in 0..cell_cols {
                 lanes.push(row0 + r);
                 cell_cols_v.push(col0 + c);
             }
         }
         let pairs = sp.read_packed_half_cells(op.dtype, &lanes, &cell_cols_v)?;
-        let mut flat = Vec::with_capacity(rows * cols);
+        let mut flat = Vec::with_capacity(phys_rows * phys_cols);
         for (lo, hi) in pairs {
             flat.push(lo);
             flat.push(hi);
         }
-        Array2::from_shape_vec((rows, cols), flat).map_err(|_| {
+        Array2::from_shape_vec((phys_rows, phys_cols), flat).map_err(|_| {
             InterpreterError::new(
                 "tcgen05_mma_shape",
                 "mma operand shape does not match m/n/k",
             )
         })?
     } else {
-        if col0 + cols > TMEM_COLS {
+        if col0 + phys_cols > TMEM_COLS {
             return Err(oob());
         }
-        sp.read_cell_block(op.dtype, row0, row0 + rows, col0, col0 + cols)?
+        sp.read_cell_block(op.dtype, row0, row0 + phys_rows, col0, col0 + phys_cols)?
             .to_f32_compute()
-            .into_shape_with_order((rows, cols))
+            .into_shape_with_order((phys_rows, phys_cols))
             .unwrap()
     };
     Ok(if transpose { mat.t().to_owned() } else { mat })
