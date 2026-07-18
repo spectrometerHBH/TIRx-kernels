@@ -50,7 +50,8 @@ shape parameter or a per-config knob.
 | `cta_group` | cluster CTA-group (1 or 2) | the kernel's cluster shape |
 | `tmem_view_cols`, `sf_views` | the single f32 `tmem` view's column count + the e4m3 SF view decls (`SFA_tmem`/`SFB_tmem`) | structural: `max(base_col + n_cols)` over the kernel's `TmemAlloc`s; each SF view's folded logical shape from its `TmemOperand` base column |
 | `reg_widths` | REG-tensor id → collapsed band width | `walk_reg_widths` takes `max(offset+width)` over every slice of each REG fragment in the body — a property of the IR's accesses, not the shape |
-| `tma_leader_mbar` | the single mbar whose TMA tx is routed to CTA-0 (`smem_full`'s leader view) | structural: the one mbar a `TmaLoad` names through its CTA-0 peer view |
+| `nonneg_vars` | var ids provably non-negative (the `%`/`//` strength-reduction gate) | computed by `collect_nonneg_vars`: ForLoop induction vars with a non-negative-literal start and positive-literal step, plus scalar vars whose every definition is provably non-negative (a fixpoint over `ScalarDef`/`ScalarStore`/`ShuffleSync`; mailbox loads and `ClcQueryCancel` results are never assumed) |
+| `tma_leader_mbars` | the mbar ids whose TMA tx is routed to CTA-0 (`smem_full`'s/`sf_full`'s leader view) | **explicit IR**: `MBar::leader_routed` set by the builder; validate requires a peer reference and TMA-load/expect_tx-only use. No structural guessing |
 
 ## Scope
 
@@ -78,14 +79,19 @@ intentionally partial, and partiality always surfaces as an `Err`, on two axes:
 
 - **Unlowered variants** (the flash-attention set: `WarpMma`, `RegUnary`, `RegFill`,
   `GmemAtomicAdd`/`GmemWaitEq`, `CpAsyncBulkS2Cluster`, `SchedNext`, `LdMatrix`/
-  `StMatrix`, …) return `Err("codegen: … not yet supported")` — either an explicit
-  stub arm or `emit_stmt`'s catch-all. No `unimplemented!`/panic paths remain.
+  `StMatrix`, …) return `Err("codegen: … not yet supported")` — each with an
+  explicit arm in `emit_stmt`. There is NO catch-all: match exhaustiveness makes
+  a variant added without a lowering decision a **compile error**, and the
+  `variant_coverage_tests` gate (see below) greps all four consumers
+  (validate / codegen / interpreter dispatch / protocol checker) per variant.
 - **Unrepresentable field values on lowered variants**: the emitted TVMScript form
   fixes some conventions, and any IR value outside them is rejected rather than
   silently coerced — `TmaStore.reduce_add` (no `Tx.copy_async` reduce dispatch),
   per-op `cta_group` differing from the kernel-level engine group (TmaLoad / MMA /
-  commit), MMA `trans_a`/`trans_b`/`lane_align != 0`, `a_fp4 != b_fp4`, and any
-  block-scaled mode other than NVFP4 (`sf_e4m3=true, sf_block=16, sf_byte=0`).
+  commit), MMA `trans_a`/`trans_b`/`lane_align != 0`, `a_fp4 != b_fp4`, any
+  block-scaled mode other than NVFP4 (`sf_e4m3=true, sf_block=16, sf_byte=0`),
+  a `ScalarOp` with no TVMScript lowering (e.g. `Xor`), and a `ForLoop { unroll }`
+  whose range is not literal start=0/step=1.
 
 ### Scale-factor classification (usage-derived)
 
@@ -108,7 +114,7 @@ parameters. An SF-classified tensor with a non-e4m3 dtype is an `Err`.
 | `KernelFinalize` | `if warp_id==w:` guard around the body (relinquish + dealloc) | the `warp` field on the node |
 | `Role` | `if warp_id==w:` / `if wg_id==c:`; if `elected`, a single role-wide `if elect_sync():` then the body at `Scope::Elected` | the `warp`/`warpgroup`/`elected` fields. A **leading** `ClusterBarrierWait` is hoisted out of the elect to warp scope (a cluster wait is warp-collective; a single-thread wait deadlocks) — a structural rule on the node, not a shape |
 | `If` | `if <cond>:` + body | 1:1 |
-| `ForLoop` | `for v in T.serial(N):` — or `for v in T.unroll(N):` when `unroll` is set | the `unroll` IR flag only; `T.serial` keeps the induction var in a uniform register |
+| `ForLoop` | `for v in T.serial(N):` — or `for v in T.unroll(N):` when `unroll` is set | the `unroll` IR flag only; `T.serial` keeps the induction var in a uniform register. `unroll` requires literal start=0/step=1 (the emitted `T.unroll(stop)` form) — anything else fails closed with an `Err` |
 | `Loop` / `BreakIf` | `while True:` / `if <cond>: break` | 1:1 |
 | `SchedulerImpl` | transparent — emits its body (the explicit CLC scheduler IR) | 1:1 |
 | `ScalarDef` / `ScalarStore` | `name: T.int32 = <init>` / `name = <expr>` (SSA register var, not an `alloc_local(1)` cell) | 1:1; the register-var form matches canon and avoids defeating ptxas's uniform-register analysis |
@@ -117,11 +123,11 @@ parameters. An SF-classified tensor with a non-e4m3 dtype is an `Err`.
 | `StoreScalar` | `task_smem[stage, field] = <value>` (SMEM mailbox write) | 1:1 |
 | `MBarrierInit` | `T.ptx.mbarrier.init(bar.ptr_to([stage]), count)` | 1:1 |
 | `MBarrierArrive` | `T.ptx.mbarrier.arrive(...)` (local) or `arrive(..., cta_id=…, pred=…)` (remote) | branches on `MBarRef.remote_coord` presence — a property of the node |
-| `MBarrierExpectTx` / `MBarrierArriveExpectTx` | `arrive.expect_tx(bar, bytes)` (the `ArriveExpectTx` of the `tma_leader_mbar` collapses to nothing — the TMA's own tx supplies it; the loader emits the bare `expect_tx`) | the `tma_leader_mbar` id match — one structural routing, not a shape |
+| `MBarrierExpectTx` / `MBarrierArriveExpectTx` | `arrive.expect_tx(bar, bytes)` (a `leader_routed` mbar's expect_tx nests under `if cbx == 0:` and targets the CTA-0 `_cta0` view with the full cluster byte count) | the `MBar::leader_routed` IR flag — explicit routing metadata, not a shape |
 | `MBarrierWait` | `T.ptx.mbarrier.try_wait(bar.ptr_to([stage]), phase)`; a *run* of consecutive waits is coalesced, and at **function scope only** a trailing `tcgen05.fence.after_thread_sync() + cta_sync()` is appended | scope-based (`scope.is_function()`): the prologue needs the init-visibility fence; role-scope hot loops do not (the mbar handshake orders the async engines) |
 | `TmaLoad` | `Tx.copy_async(smem[slice], gmem[slice], dispatch="tma", cta_group=…, mbar=…, prefetch_tensormap=True)` | the per-CTA A-row / B-band split is in the IR's coords; codegen prints them |
 | `TmaStore` | `Tx.copy_async(C[slice], d_smem[slice], dispatch="tma", …)` | 1:1 |
-| `Tcgen05Mma` | `Tx.gemm_async(tmem[band], a_smem[slice], b_smem[slice], accum=<bool>, dispatch="tcgen05", cta_group=…)` | a **run** of consecutive same-target `k=MMA_K` MMAs is collapsed into one full-`BLK_K` `gemm_async` by `try_collapse_mma_run` — a structural source-merge over any K (a 16-wide sub-slice of a 128B-swizzle atom would otherwise fault); value/fence-neutral |
+| `Tcgen05Mma` | `Tx.gemm_async(tmem[band], a_smem[slice], b_smem[slice], accum=<bool>, dispatch="tcgen05", cta_group=…)` | 1:1 — the IR carries the MMA at the FULL k-tile granularity: a dense f16/bf16 `k` is any positive multiple of the k=16 atom (validate reads it as an ordered run of atomic MMAs), exactly canon's one-issue full-K `gemm_async` (a 16-wide sub-slice of a 128B-swizzle atom would fault). There is NO run-collapse pass — the IR, not codegen, owns the MMA granularity |
 | `Tcgen05Commit` | `T.ptx.tcgen05.commit(bar.ptr_to([stage]), cta_group=…, cta_mask=…)` | 1:1 |
 | `Tcgen05Ld` | `Tx.wg.copy_async(reg[:, col:col+w], tmem[:, col:col+w])` | 1:1 |
 | `Tcgen05WaitLd` | `T.ptx.tcgen05.wait.ld()` | 1:1 |
@@ -141,7 +147,7 @@ parameters. An SF-classified tensor with a non-e4m3 dtype is an `Err`.
 Every branch in `src/ir/codegen.rs` falls into one of five generic categories. None tests
 a shape, an `N`, a config knob, or a runtime value. (Line numbers approximate.) The rows
 below are representative; the remaining branches not listed (the `swizzle_for_row_bytes`
-row-byte thresholds, the `emit_expr` non-negative div/mod strength-reduction, the
+row-byte thresholds, the `emit_expr` div/mod strength-reduction, the
 `MBarrierArrive` `count==1` vs explicit-count form, the `RegStore` SMEM-vs-GMEM dst split,
 the `strip_tid_in_wg` lane-term strip) each fall into the same dtype / tensor-property /
 emit-scope / structural / expression-printing categories — none introduces a shape or
@@ -155,21 +161,38 @@ config dependence. Decisively, the config knobs the doc disclaims (`mma_n`, `pip
 | `dtype_str`, `element_bytes`, `is_int_dtype` (~170, 200, 211) | **dtype** | one uniform mapping per dtype; every dtype handled the same way |
 | `t.space != Smem` / `t.layout.is_some()` (261, 368, 811, 824) | **tensor property** | SMEM vs REG vs TMEM and the declared layout — read off the tensor, not the shape |
 | `reg_widths` / `walk_reg_widths` (992, 1066) | **IR-derived width** | `max(offset+width)` over the IR's own slices; a different shape simply has different slices |
-| `try_collapse_mma_run` (578, 668), `try_collapse_store_run` (603) | **structural run-merge** | merges *consecutive same-target* ops by their shape-independent structure (any K / any contiguous SMEM run); value- and fence-neutral |
-| `tma_leader_mbar == Some(id)` (1580, 1950, 2069) | **structural routing** | one mbar (the loader's CTA-0 `smem_full` view) — identified by the IR, routes its tx; independent of shape |
+| `MBar::leader_routed` (build_ctx) | **IR flag** | explicit routing metadata set by the builder on the cluster TMA-completion barriers; codegen honors it, never infers it. Validate enforces consistency (peer reference present; TmaLoad/expect_tx-only use) |
+| `cta_id_in_cluster([cx, cy])` from `k.cluster_shape` | **kernel field** | the cluster geometry is a Kernel field, not a shape knob; a rank>2 cluster fails closed |
+| vendored `mma_shared_layout` header helper | **self-containment** | the emitted source re-implements the layout helper on the public `tvm.tirx.layout` algebra — no TVM-private import path; verified layout-identical to TVM's for every (dtype, mode, shape) the kernels use |
+| `WARP_LANES`/`WG_WARPS`/`WG_THREADS` consts | **hardware constant** | warp width / warpgroup width / TMEM lane rows are silicon invariants, not kernel parameters; `num_warps` (validated a multiple of 4) only decides the warpgroup COUNT |
 | `scope.is_function()` (1525, 2262, 2276), `CtaSync` gate (2273) | **emit scope** | prologue (all CTA threads converge) vs role (partial) — position in the role tree |
 | `matches!(scope, Scope::Elected)` on `ClusterBarrierWait` (2300) | **emit scope (guard)** | a warp-collective op must not be single-thread; fails loudly |
 | `if *elected` on `Role` (1745), leading-`ClusterBarrierWait` hoist (1760) | **IR flag + structural** | the node's `elected` flag; the hoist is a structural rule on the node's body |
-| `if *unroll` on `ForLoop` (1794) | **IR flag** | the builder set it; `T.unroll` vs `T.serial` |
+| `if *unroll` on `ForLoop` (1794) | **IR flag** | the builder set it; `T.unroll` vs `T.serial`. `unroll` with a non-literal start=0/step=1 range fails closed |
 | `MBarRef.remote_coord` present (in `MBarrierArrive`) | **node property** | local vs remote arrive — read off the ref |
 | `matches!(off, TidInWg)` (1398, 2393) | **structural axis** | the per-thread row axis of a wg-collective slice |
 | `needs_paren` (1313), operator/precedence tables (1117, 1177) | **expression printing** | standard precedence; value-independent |
 | mbarrier-wait-run coalescing (1484, 1509) | **structural run-merge** | collapses a run of consecutive `MBarrierWait`; structure, not shape |
+| `merge_guards` single-issue-guard merge | **structured run-merge** | folds adjacent same-guard single-issue blocks keyed on the emission-site guard ANNOTATION (a line attribute), never on the line text — an IR `If` with a guard-looking condition is untouched |
+| `is_nonneg` / `nonneg_vars` (the `%`/`//` strength-reduction gate) | **provable expression property** | the pow2 bit-op rewrite is an unconditional two's-complement identity (no gate); the trunc rewrite for other positive divisors is gated on the computed provably-non-negative var set — a sentinel-negative scalar keeps its floordiv/floormod form |
+| unsupported `ScalarOp` (e.g. `Xor`) | **fail closed** | a codegen `Err`, never a placeholder literal in the Python source |
+| `arg_name` (A–Z then `arg{i}`) | **id-derived naming** | positional, cosmetic (TVM matches args positionally); no fixed table to overflow |
 
 The only place a *number* literal influences output is a tensor's declared shape/layout
-and the collapsed REG/MMA widths — all of which are themselves properties of the IR the
+and the REG-band widths — all of which are themselves properties of the IR the
 builder emitted, printed verbatim. Two different bench shapes reach the codegen as two
 different `ir::Kernel`s; the codegen contains no code that asks which shape it is.
+
+## Exhaustiveness gate
+
+`variant_coverage_tests::every_stmt_variant_is_consumed_everywhere` (in `src/ir/mod.rs`)
+parses the `Stmt` variant list out of `stmt.rs` and requires every variant to appear in
+all four consumers: `validate.rs` (`validate_stmt`), `codegen.rs` (`emit_stmt`), the
+interpreter dispatch (`registry.rs::stmt_kind`), and the protocol checker's metadata walk
+(`checker.rs::walk_tensors`). None of the four matches has a wildcard arm, so adding a
+variant without a decision is additionally a **compile error** (the codegen/checker arms
+for unlowered variants are explicit `Err` / explicit no-op entries, so a text-level grep
+also stays truthful).
 
 ## Boundary
 

@@ -2079,7 +2079,50 @@ fn walk_tensors(body: &[Stmt], tensors: &mut HashMap<u32, TensorInfo>) {
                 record_slice(tensors, dst);
                 record_slice(tensors, src);
             }
-            _ => {}
+            // Explicit no-op arms (no catch-all): every variant either records
+            // its tensor metadata above or is listed HERE, so adding a variant
+            // that carries a tensor is a compile error instead of a silently
+            // skipped metadata record. The control/scalar/mbarrier/fence/sync
+            // variants name no tensor slice; the async datapath ops below do
+            // carry slices, but their trace regions are validated through the
+            // interpreter-emitted events, so the metadata walk intentionally
+            // skips them (same as before — now explicit rather than a `_`).
+            Stmt::TmemAlloc { .. } | Stmt::TmemDealloc { .. } | Stmt::TmemRelinquish { .. } => {}
+            Stmt::ScalarDef { .. } | Stmt::ScalarStore { .. } | Stmt::ShuffleSync { .. } => {}
+            Stmt::MBarDef { .. } => {}
+            Stmt::KernelInit { .. }
+            | Stmt::KernelFinalize { .. }
+            | Stmt::Role { .. }
+            | Stmt::ForLoop { .. }
+            | Stmt::ForEachTask { .. }
+            | Stmt::SchedulerImpl { .. }
+            | Stmt::SchedNext { .. }
+            | Stmt::Loop { .. }
+            | Stmt::BreakIf { .. }
+            | Stmt::If { .. } => {}
+            Stmt::ClcTryCancel { .. } | Stmt::ClcQueryCancel { .. } => {}
+            Stmt::MBarrierInit { .. }
+            | Stmt::MBarrierArrive { .. }
+            | Stmt::MBarrierWait { .. }
+            | Stmt::MBarrierExpectTx { .. }
+            | Stmt::MBarrierArriveExpectTx { .. } => {}
+            Stmt::Tcgen05Cp { .. } | Stmt::Tcgen05Commit { .. } | Stmt::Tcgen05WaitLd => {}
+            Stmt::CpAsyncBulkS2Cluster { .. }
+            | Stmt::GmemAtomicAdd { .. }
+            | Stmt::GmemWaitEq { .. } => {}
+            Stmt::CpAsyncBulkCommitGroup | Stmt::CpAsyncBulkWaitGroupRead { .. } => {}
+            Stmt::Tcgen05WaitSt => {}
+            Stmt::WarpMma { .. } => {}
+            Stmt::RegCausalMask { .. } => {}
+            Stmt::Fence { .. }
+            | Stmt::CtaSync
+            | Stmt::WgSync { .. }
+            | Stmt::NamedBarrier { .. }
+            | Stmt::WarpSync
+            | Stmt::ClusterSync
+            | Stmt::ClusterBarrierArrive
+            | Stmt::ClusterBarrierWait
+            | Stmt::SetMaxNReg { .. } => {}
         }
         for child in stmt.child_bodies() {
             walk_tensors(child, tensors);

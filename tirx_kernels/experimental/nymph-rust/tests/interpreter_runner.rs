@@ -290,6 +290,7 @@ fn tma_roundtrip_mbar_cell_parity_is_rust_internal() {
         kind: MBarKind::Tma,
         stages: 1,
         arrive_count: None,
+        leader_routed: false,
     });
     let kernel = Kernel {
         name: "tma_roundtrip".into(),
@@ -365,6 +366,7 @@ fn tma_multicast_group2_mbar_targets_are_deduplicated() {
         kind: MBarKind::Tma,
         stages: 1,
         arrive_count: None,
+        leader_routed: false,
     });
     // The issuer is CTA0 (the cta_eq(0) guard below), so its own-cell reference
     // resolves to the same cell a peer-reference to CTA0 would — and keeps the
@@ -436,6 +438,7 @@ fn mbarrier_wait_success_and_blocked_frontier_are_rust_internal() {
         kind: MBarKind::Tma,
         stages: 1,
         arrive_count: None,
+        leader_routed: false,
     });
     let kernel = Kernel {
         name: "mbar_wait_wake".into(),
@@ -502,6 +505,7 @@ fn mbarrier_wait_success_and_blocked_frontier_are_rust_internal() {
         kind: MBarKind::Tma,
         stages: 1,
         arrive_count: None,
+        leader_routed: false,
     });
     let expect_tx_kernel = Kernel {
         name: "mbarrier_expect_tx_deadlock".into(),
@@ -558,6 +562,7 @@ fn mbarrier_wait_success_and_blocked_frontier_are_rust_internal() {
         kind: MBarKind::Tma,
         stages: 1,
         arrive_count: None,
+        leader_routed: false,
     });
     let remote_success_kernel = Kernel {
         name: "mbar_remote_arrive_success".into(),
@@ -861,6 +866,7 @@ fn tcgen05_commit_success_paths_update_rust_internal_mbar_cells() {
         kind: MBarKind::Tcgen05,
         stages: 1,
         arrive_count: None,
+        leader_routed: false,
     });
     let group2_kernel = Kernel {
         name: "tcgen05_commit_group2".into(),
@@ -905,6 +911,7 @@ fn tcgen05_commit_success_paths_update_rust_internal_mbar_cells() {
         kind: MBarKind::Tcgen05,
         stages: 1,
         arrive_count: None,
+        leader_routed: false,
     });
     let multicast_kernel = Kernel {
         name: "tcgen05_commit_multicast_direct_mask".into(),
@@ -1026,6 +1033,7 @@ fn s2cluster_bytes_and_self_target_fail_closed() {
         kind: MBarKind::Tma,
         stages: 1,
         arrive_count: None,
+        leader_routed: false,
     });
     let peer = ScalarValue::expr(
         ScalarOp::Sub,
@@ -1106,6 +1114,7 @@ fn tcgen05_mma_inplace_accum_requires_written_accumulator() {
         kind: MBarKind::Tma,
         stages: 1,
         arrive_count: None,
+        leader_routed: false,
     });
     let mma = |accum: bool| Stmt::Tcgen05Mma {
         dst: tmem_accum(0),

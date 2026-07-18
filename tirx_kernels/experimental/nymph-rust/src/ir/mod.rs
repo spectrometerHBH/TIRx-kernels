@@ -222,3 +222,75 @@ mod tests {
         );
     }
 }
+
+/// Mechanical anti-drift gate: every `Stmt` variant must be handled (or
+/// explicitly rejected) in each consumer — validate.rs, codegen.rs, the
+/// interpreter dispatch (registry.rs `stmt_kind`), and the protocol checker's
+/// metadata walk (checker.rs `walk_tensors`). The variant list is PARSED out
+/// of `stmt.rs`, so adding a variant without touching the consumers fails
+/// this test. (Three of the four matches are additionally compiler-enforced
+/// exhaustive — no wildcard arms — so a missing arm is a compile error; this
+/// test guards the remaining text-level drift and documents the contract.)
+#[cfg(test)]
+mod variant_coverage_tests {
+    use std::collections::BTreeSet;
+
+    /// Parse the `Stmt` variant names out of stmt.rs: the enum body at 4-space
+    /// indent, `Name {` (struct) or `Name,` (unit), doc/comment lines skipped.
+    fn stmt_variants() -> BTreeSet<String> {
+        let src = include_str!("stmt.rs");
+        let start = src.find("pub enum Stmt {").expect("Stmt enum");
+        let mut out = BTreeSet::new();
+        for line in src[start..].lines().skip(1) {
+            if line.trim_end() == "}" {
+                break;
+            }
+            let t = line.trim_start();
+            if t.is_empty() || t.starts_with("//") || t.starts_with('#') {
+                continue;
+            }
+            // Variant decls are at exactly 4-space indent (fields are deeper).
+            if !line.starts_with("    ") || line.starts_with("     ") {
+                continue;
+            }
+            let name: String = t
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if name.chars().next().is_some_and(char::is_uppercase) {
+                out.insert(name);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_stmt_variant_is_consumed_everywhere() {
+        let consumers: [(&str, &str); 4] = [
+            ("validate.rs", include_str!("validate.rs")),
+            ("codegen.rs", include_str!("codegen.rs")),
+            (
+                "registry.rs (interpreter dispatch)",
+                include_str!("../interpreter/registry.rs"),
+            ),
+            (
+                "checker.rs (protocol checker)",
+                include_str!("../interpreter/checker.rs"),
+            ),
+        ];
+        let variants = stmt_variants();
+        assert!(
+            variants.len() >= 60,
+            "expected the full Stmt variant set, parsed {}",
+            variants.len()
+        );
+        for (label, src) in consumers {
+            for v in &variants {
+                assert!(
+                    src.contains(v.as_str()),
+                    "Stmt::{v} is not handled (or explicitly rejected) in {label}"
+                );
+            }
+        }
+    }
+}

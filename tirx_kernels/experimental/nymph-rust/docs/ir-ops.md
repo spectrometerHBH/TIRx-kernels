@@ -46,7 +46,10 @@ fixtures), mxf8f6f4 (k=32, UE8M0), mxf4nvf4 (k=64, e4m3 block-16, cg2 m=256),
 k=128/256 as explicit IR-level k-tile folding.
 
 Envelope gaps → **fixed in audit batch** (validate fail-closed):
-- k×dtype coupling: dense no-sf ⇒ k=16 only; UE8M0 sf ⇒ k=32; fp4 ⇒ k∈{64,128,256}
+- k×dtype coupling: dense no-sf ⇒ k any positive multiple of 16 (one IR MMA
+  with k=16q means the q atomic k=16 MMAs accumulated in issue order — canon's
+  one-issue full-K gemm_async, lowered by TVM to the atom sequence); UE8M0 sf
+  ⇒ k∈{32,128,256}; fp4 ⇒ k∈{64,128,256}
 - cg1 m=64 ⇒ no scale modes (mxf* cg1 is M=128 only)
 - fp4 ⇒ (cg1,m=128)|(cg2,m=256), and no trans (Table 54); trace mode aligned
 - B operand must be SMEM (PTX residency table); A-in-TMEM kept (GDN state)

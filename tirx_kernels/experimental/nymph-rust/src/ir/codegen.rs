@@ -3251,7 +3251,30 @@ fn emit_stmt(
             out.push_str(&format!("{p}Tx.wg.mul({dst_s}, {lhs_s}, {rhs_s})\n"));
             Ok(())
         }
-        other => Err(format!("codegen: unimplemented stmt {other:?}")),
+        // ---- Fail closed, per variant (no catch-all): every Stmt variant is
+        // either lowered above or rejected HERE with an explicit Err, so adding
+        // a variant without a lowering is a compile error (match exhaustiveness)
+        // and never a silent different-semantics emission. The flash-attention /
+        // flash-bwd datapath set has no GEMM-codegen lowering yet.
+        SchedNext { .. } => Err("codegen: SchedNext not yet supported".to_string()),
+        Tcgen05St { .. } => Err("codegen: Tcgen05St not yet supported".to_string()),
+        Tcgen05WaitSt => Err("codegen: Tcgen05WaitSt not yet supported".to_string()),
+        LdMatrix { .. } => Err("codegen: LdMatrix not yet supported".to_string()),
+        StMatrix { .. } => Err("codegen: StMatrix not yet supported".to_string()),
+        RegFill { .. } => Err("codegen: RegFill not yet supported".to_string()),
+        RegAdd { .. } => Err("codegen: RegAdd not yet supported".to_string()),
+        RegSub { .. } => Err("codegen: RegSub not yet supported".to_string()),
+        RegFma { .. } => Err("codegen: RegFma not yet supported".to_string()),
+        RegMax { .. } => Err("codegen: RegMax not yet supported".to_string()),
+        RegMin { .. } => Err("codegen: RegMin not yet supported".to_string()),
+        RegBitwise { .. } => Err("codegen: RegBitwise not yet supported".to_string()),
+        RegReduce { .. } => Err("codegen: RegReduce not yet supported".to_string()),
+        RegCondRescale { .. } => Err("codegen: RegCondRescale not yet supported".to_string()),
+        RegSoftmaxRescale { .. } => Err("codegen: RegSoftmaxRescale not yet supported".to_string()),
+        RegCausalMask { .. } => Err("codegen: RegCausalMask not yet supported".to_string()),
+        RegCombineIntFracEx2 { .. } => {
+            Err("codegen: RegCombineIntFracEx2 not yet supported".to_string())
+        }
     }
 }
 
