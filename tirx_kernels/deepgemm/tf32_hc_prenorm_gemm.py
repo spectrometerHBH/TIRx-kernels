@@ -635,12 +635,7 @@ def get_kernel(**kwargs: Any):
                 layout=tcgen05_atom_layout("16x256b", (block_m, block_k), "float32"),
                 scope="local",
             )
-            a_fp32 = T.alloc_buffer(
-                (block_m, block_k),
-                "float32",
-                layout=tcgen05_atom_layout("16x256b", (block_m, block_k), "float32"),
-                scope="local",
-            )
+            a_fp32 = T.alloc_tcgen05_ldst_frag("16x256b", (block_m, block_k), "float32")
             # Dual packed fma.f32x2 sum-of-squares accumulators (hand's sum0/sum1);
             # the fused form is the only no-regression reduce shape.
             sqr0 = T.alloc_local((2,), "float32")
