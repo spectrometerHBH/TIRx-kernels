@@ -375,7 +375,9 @@ class IRBuilder:
         the prerequisite for multicast loads). Explicit IR routing metadata —
         codegen honors it, it never guesses it from the usage structure.
         Validate requires a peer reference and TMA-load/expect_tx-only use."""
-        mbar = MBar(kind=kind, stages=stages, arrive_count=arrive_count, leader_routed=leader_routed)
+        mbar = MBar(
+            kind=kind, stages=stages, arrive_count=arrive_count, leader_routed=leader_routed
+        )
         self._append(MBarDef(mbar))
         return mbar
 
