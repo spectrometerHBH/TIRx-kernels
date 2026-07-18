@@ -16,19 +16,24 @@
 //! the issue ops that are single-thread (mbarrier init/arrive, TMA, MMA, commit).
 //! See the per-op map in `emit_stmt`.
 //!
-//! Three further codegen passes recover the full-operand / correct-thread forms
-//! TIRx requires from the nymph IR's instruction-granularity ops (see
-//! `collapse_body` and `emit_body`):
-//!   1. MMA-run collapse: fold the k=16-sliced `Tcgen05Mma` run into one full-K
-//!      `gemm_async` (a 16-wide slice breaks the 128B swizzle atom -> illegal).
-//!   2. Epilogue collapse: fold the 8-col `tcgen05.ld`/cvt/store run into one
-//!      full-width `wg.copy_async` + `wg.cast` + `Tx.copy`.
-//!   3. Peer-wait skip: a `try_wait` on a `map_shared_rank` (DSMEM) peer mbarrier
+//! Two codegen behaviors recover the correct-thread forms TIRx requires from
+//! the nymph IR's cohort-implicit ops (see `emit_body`):
+//!   1. Peer-wait skip: a `try_wait` on a `map_shared_rank` (DSMEM) peer mbarrier
 //!      is illegal and unnecessary (cta_group=2 TMA + cluster_sync already order
 //!      the peer load); the canonical template has no peer wait either.
+//!   2. Single-issue guard coalescing: a run of same-guard single-issue ops is
+//!      emitted under ONE `if <guard>:` block (canon's shape; one elect instead
+//!      of a predicated branch per op).
 //! `cta_sync()` after a wait is emitted only at function scope (a CTA-wide
 //! `__syncthreads` inside a single-warp/wg role would not be reached by all CTA
 //! threads).
+//!
+//! The MMA is emitted at the IR's own granularity: a dense f16/bf16 `Tcgen05Mma`
+//! carries k = the full k-tile (validate reads it as an ordered run of k/16
+//! atomic MMAs), which is exactly canon's one-issue full-K `gemm_async` (a
+//! 16-wide sub-slice of a 128B-swizzle atom would be illegal, and TVM lowers
+//! the full-K form to the atom sequence on hardware). The IR, not codegen,
+//! owns the MMA and fence granularity — there is no run-collapse pass.
 
 use super::dtype::{DType, MemorySpace, ScalarOp, ScopeValueKind, Swizzle, VarBinding};
 use super::kernel::Kernel;
@@ -231,10 +236,9 @@ struct Ctx {
     /// `decl_buffer((128, cols), allocated_addr=0)` — TMEM is not a tensor, so
     /// every TMEM instruction references it by absolute column slice.
     tmem_view_cols: Option<usize>,
-    /// Per-REG-tensor declared width AFTER the epilogue collapse widens the band.
-    /// The fragment is declared `T.alloc_local(8)` in the nymph IR (instruction
-    /// granularity); the collapsed wide read/cast/store needs it sized to the full
-    /// column band. id -> width.
+    /// Per-REG-tensor declared width: the fragment is declared `T.alloc_local(8)`
+    /// in the nymph IR (instruction granularity); the wide read/cast/store band
+    /// needs it sized to the full column band. id -> width.
     reg_widths: HashMap<u32, usize>,
     /// mbar ids of the TMA-load completion barriers (`smem_full`, `sf_full`, ...) in a
     /// cta_group=2 cluster kernel — every TMA barrier carrying a peer reference. In
@@ -968,178 +972,6 @@ fn as_int(sv: &ScalarValue) -> Option<i64> {
     }
 }
 
-/// Collapse the MMA's value-model granularity into the single coalesced op TIRx
-/// wants. The nymph IR emits MMA at the value-model's k=16 sub-slice unit, but
-/// TIRx's `gemm_async` takes the *full* BLK_K operand and tiles internally (a
-/// 16-wide / 32-byte sub-slice of a 128B-swizzle atom hits
-/// `cudaErrorIllegalInstruction`); `try_collapse_mma_run` recovers the full-operand
-/// form. This is a value/protocol-neutral source-form merge — same atoms, no fence
-/// or accumulation change.
-///
-/// NOTE: the epilogue tmem->reg fence structure (one `wait_ld` per EPI_N / NOL band)
-/// is expressed in the IR itself and verified by the protocol checker — it is NOT
-/// recovered here. The per-8-col `tcgen05.ld` atoms are emitted 1:1 (they are legal
-/// and run bit-exact); the IR, not codegen, owns the fence granularity.
-///
-/// Applied to every statement list (a body) before emission. General over K and
-/// over the column width — not hardcoded to the bootstrap's K=64 / N=128.
-fn collapse_body(stmts: &[Stmt]) -> Vec<Stmt> {
-    let mut out: Vec<Stmt> = Vec::with_capacity(stmts.len());
-    let mut i = 0;
-    while i < stmts.len() {
-        if let Some((collapsed, consumed)) = try_collapse_mma_run(&stmts[i..]) {
-            out.push(collapsed);
-            i += consumed;
-            continue;
-        }
-        // NOTE: the reg->smem store run is intentionally NOT collapsed. The canonical
-        // epilogue stores reg->smem in 8-element (128-bit) sub-slices so the copy
-        // dispatches to STSM; a wider `Tx.wg.copy` drops to STS.128 or, when the
-        // swizzle atom doesn't tile the wide slice, to the scalar fallback (which does
-        // a direct thread-axis BufferStore and is rejected by LowerTIRxCleanup).
-        out.push(stmts[i].clone());
-        i += 1;
-    }
-    out
-}
-
-/// Suspect 1: a run of `Tcgen05Mma` with identical dst, same A/B tensors, the K
-/// (last) dim advancing by `k` each step, and accum = (False, True, True, …).
-/// Collapse to ONE `gemm_async` over the full coalesced K range with the first
-/// op's accum. Returns (collapsed_stmt, num_consumed) or None.
-fn try_collapse_mma_run(stmts: &[Stmt]) -> Option<(Stmt, usize)> {
-    let Stmt::Tcgen05Mma {
-        dst,
-        a,
-        b,
-        m,
-        n,
-        k,
-        accum,
-        trans_a,
-        trans_b,
-        cta_group,
-        sfa,
-        sfb,
-        sf_byte,
-        ..
-    } = &stmts[0]
-    else {
-        return None;
-    };
-    // Only collapse the simple (non block-scaled) GEMM run.
-    if sfa.is_some() || sfb.is_some() {
-        return None;
-    }
-    // K is the last operand dim of an SMEM slice (a TMEM operand names no
-    // K-offset to advance, so it never collapses).
-    let (MmaOperand::Slice(a_sl), MmaOperand::Slice(b_sl)) = (a, b) else {
-        return None;
-    };
-    // Record the first op's K offset/extent.
-    let a_kdim = a_sl.offsets.len().checked_sub(1)?;
-    let b_kdim = b_sl.offsets.len().checked_sub(1)?;
-    let a_k0 = as_int(&a_sl.offsets[a_kdim])?;
-    let b_k0 = as_int(&b_sl.offsets[b_kdim])?;
-    let a_kext = as_int(&a_sl.shape[a_kdim])?;
-    let b_kext = as_int(&b_sl.shape[b_kdim])?;
-
-    let mut count = 1usize;
-    let mut a_khi = a_k0 + a_kext;
-    let mut b_khi = b_k0 + b_kext;
-    let mut total_k = *k as i64;
-
-    for s in &stmts[1..] {
-        let Stmt::Tcgen05Mma {
-            dst: d2,
-            a: a2,
-            b: b2,
-            accum: accum2,
-            sfa: sfa2,
-            sfb: sfb2,
-            ..
-        } = s
-        else {
-            break;
-        };
-        if sfa2.is_some() || sfb2.is_some() {
-            break;
-        }
-        let (MmaOperand::Slice(a2), MmaOperand::Slice(b2)) = (a2, b2) else {
-            break;
-        };
-        // Same dst (accumulator), same A/B tensors, accum True (continuation).
-        if d2 != dst
-            || !Arc::ptr_eq(&a2.tensor, &a_sl.tensor)
-            || !Arc::ptr_eq(&b2.tensor, &b_sl.tensor)
-        {
-            break;
-        }
-        if !*accum2 {
-            break;
-        }
-        // K must advance contiguously from the previous hi.
-        let (Some(a2k0), Some(b2k0)) = (as_int(&a2.offsets[a_kdim]), as_int(&b2.offsets[b_kdim]))
-        else {
-            break;
-        };
-        let (Some(a2ke), Some(b2ke)) = (as_int(&a2.shape[a_kdim]), as_int(&b2.shape[b_kdim]))
-        else {
-            break;
-        };
-        if a2k0 != a_khi || b2k0 != b_khi {
-            break;
-        }
-        // All non-K dims of A/B must match the first op (same tile).
-        if a2.offsets[..a_kdim] != a_sl.offsets[..a_kdim]
-            || a2.shape[..a_kdim] != a_sl.shape[..a_kdim]
-            || b2.offsets[..b_kdim] != b_sl.offsets[..b_kdim]
-            || b2.shape[..b_kdim] != b_sl.shape[..b_kdim]
-        {
-            break;
-        }
-        a_khi = a2k0 + a2ke;
-        b_khi = b2k0 + b2ke;
-        total_k += a2ke; // K extent of this step
-        count += 1;
-    }
-
-    if count < 2 {
-        return None; // nothing to collapse — emit as-is
-    }
-
-    // Build the coalesced operands: K offset = first's, K extent = full span.
-    let mut a_full = a_sl.clone();
-    let mut b_full = b_sl.clone();
-    a_full.shape[a_kdim] = ScalarValue::Int(a_khi - a_k0);
-    b_full.shape[b_kdim] = ScalarValue::Int(b_khi - b_k0);
-
-    let collapsed = Stmt::Tcgen05Mma {
-        dst: dst.clone(),
-        a: MmaOperand::Slice(a_full),
-        b: MmaOperand::Slice(b_full),
-        m: *m,
-        n: *n,
-        k: total_k as u32,
-        accum: *accum,
-        trans_a: *trans_a,
-        trans_b: *trans_b,
-        cta_group: *cta_group,
-        sfa: None,
-        sfb: None,
-        sf_byte: *sf_byte,
-        // The collapse only runs on the non-scaled GEMM (bailed above on any SF),
-        // so the NVFP4 flags are always their dense defaults here; the dense
-        // cta_group=2 m=128/256 accumulator never uses lane_align.
-        sf_e4m3: false,
-        sf_block: 0,
-        a_fp4: false,
-        b_fp4: false,
-        lane_align: 0,
-    };
-    Some((collapsed, count))
-}
-
 /// Build the naming context: A/B/C for args by position; SMEM/TMEM/REG/mbar by role.
 fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
     let mut names: HashMap<u32, String> = HashMap::new();
@@ -1347,10 +1179,10 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
     let mut sf_views: Vec<SfView> = Vec::new();
     collect_sf_views(&k.body, &mut sf_views)?;
 
-    // Per-REG-tensor width after the epilogue collapse. Walk the collapsed bodies and
-    // record, for each REG fragment, `max(offset + width)` over every slice — the band
-    // a single `.view(...)` alias must span. (A capped drain writes the 256-wide output
-    // reg in two 128-col groups, so the FULL extent comes from offset+width, not the
+    // Per-REG-tensor width. Walk the bodies and record, for each REG fragment,
+    // `max(offset + width)` over every slice — the band a single `.view(...)`
+    // alias must span. (A capped drain writes the 256-wide output reg in two
+    // 128-col groups, so the FULL extent comes from offset+width, not the
     // per-op width alone.)
     let mut reg_widths: HashMap<u32, usize> = HashMap::new();
     fn note_reg_width(s: &TensorSlice, widths: &mut HashMap<u32, usize>) {
@@ -1362,8 +1194,8 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
         }
     }
     fn walk_reg_widths(stmts: &[Stmt], widths: &mut HashMap<u32, usize>) {
-        for s in collapse_body(stmts) {
-            match &s {
+        for s in stmts {
+            match s {
                 Stmt::Tcgen05Ld { dst, num, .. } => {
                     if dst.tensor.space == MemorySpace::Reg {
                         let off = dst.offsets.first().and_then(as_int).unwrap_or(0).max(0) as usize;
@@ -1516,7 +1348,7 @@ fn collect_sf_views(stmts: &[Stmt], views: &mut Vec<SfView>) -> Result<(), Strin
     Ok(())
 }
 
-/// The declared (full) width of a REG fragment's wg tile = its collapsed band width.
+/// The declared (full) width of a REG fragment's wg tile = its spanned band width.
 fn reg_view_width(t: &Arc<Tensor>, ctx: &Ctx) -> usize {
     ctx.reg_widths
         .get(&t.id)
@@ -1887,11 +1719,10 @@ fn emit_tmem_dst(op: &TmemOperand, n: u32, ctx: &Ctx) -> Result<String, String> 
 // statement walk
 // ===========================================================================
 
-/// Emit a statement list, applying the instruction-granularity collapses
-/// (MMA-run, epilogue-run) first. Every body walk goes through here so the
-/// transforms apply uniformly at any nesting depth.
+/// Emit a statement list. Every body walk goes through here so the run-level
+/// coalescings below apply uniformly at any nesting depth.
 ///
-/// Also coalesces the fence/sync that follows a run of consecutive `MBarrierWait`s:
+/// Coalesces the fence/sync that follows a run of consecutive `MBarrierWait`s:
 /// the template issues all the `try_wait`s, then ONE
 /// `tcgen05.fence.after_thread_sync()` + ONE `T.cuda.cta_sync()` — not a
 /// fence per wait and no cta_sync (the nymph IR leaves those implicit). (suspect 3)
@@ -1902,11 +1733,10 @@ fn emit_body(
     ctx: &Ctx,
     scope: Scope,
 ) -> Result<(), String> {
-    let collapsed = collapse_body(stmts);
     let p = pad(indent);
     let mut i = 0;
-    while i < collapsed.len() {
-        if matches!(collapsed[i], Stmt::MBarrierWait { .. }) {
+    while i < stmts.len() {
+        if matches!(stmts[i], Stmt::MBarrierWait { .. }) {
             // Emit every `try_wait` in the run, then one fence. The
             // `T.cuda.cta_sync()` (a CTA-wide `__syncthreads`) is only emitted at
             // function scope: inside a single-warp / single-warpgroup role branch
@@ -1931,8 +1761,8 @@ fn emit_body(
             // barrier (which both CTAs fill). See `TmaLoad` / `MBarrierArriveExpectTx`.
             let mut j = i;
             let mut emitted_any = false;
-            while j < collapsed.len() && matches!(collapsed[j], Stmt::MBarrierWait { .. }) {
-                if let Stmt::MBarrierWait { mbar, phase, stage } = &collapsed[j] {
+            while j < stmts.len() && matches!(stmts[j], Stmt::MBarrierWait { .. }) {
+                if let Stmt::MBarrierWait { mbar, phase, stage } = &stmts[j] {
                     if mbar.remote_coord.is_none() {
                         let slot_ptr = mbar_slot_ptr(mbar, stage, ctx)?;
                         let phase_s = phase
@@ -1971,23 +1801,21 @@ fn emit_body(
         // `elect.sync` + 18 predicated branches into 1. This is a generic peephole keyed
         // ONLY on guard-string identity (a structural property of the emitted stream), not
         // on any kernel/shape/op — every run of same-guard single-issue ops coalesces.
-        if let Some(guard) = single_issue_guard(&collapsed[i], scope, ctx) {
+        if let Some(guard) = single_issue_guard(&stmts[i], scope, ctx) {
             let mut j = i;
-            while j < collapsed.len()
-                && single_issue_guard(&collapsed[j], scope, ctx) == Some(guard)
-            {
+            while j < stmts.len() && single_issue_guard(&stmts[j], scope, ctx) == Some(guard) {
                 j += 1;
             }
             if j - i >= 2 {
                 out.push_str(&format!("{p}if {guard}:\n"));
-                for s in &collapsed[i..j] {
+                for s in &stmts[i..j] {
                     emit_stmt(out, s, indent + 1, ctx, scope, true)?;
                 }
                 i = j;
                 continue;
             }
         }
-        emit_stmt(out, &collapsed[i], indent, ctx, scope, false)?;
+        emit_stmt(out, &stmts[i], indent, ctx, scope, false)?;
         i += 1;
     }
     Ok(())

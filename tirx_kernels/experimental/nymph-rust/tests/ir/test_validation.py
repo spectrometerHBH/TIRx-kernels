@@ -122,7 +122,7 @@ def test_rejects_mma_dst_dtype():
 
 def test_rejects_mma_bad_k():
     dst, a, b = mma_operands()
-    with pytest.raises(ValueError, match="k must be 16"):
+    with pytest.raises(ValueError, match="positive multiple of 16"):
         make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=256, k=8)], tmem_cg=1)
 
 
@@ -162,10 +162,19 @@ def test_accepts_block_scaled_f8_and_nvfp4_mma():
     make([n.Tcgen05Mma(dst=dst, a=a, b=b, sfa=sfa, sfb=sfb, **fp4_kwargs())], tmem_cg=2)
 
 
-def test_rejects_mma_dense_k_not_16():
+def test_accepts_mma_dense_full_k():
+    """Dense f16/bf16 k is any positive multiple of the k=16 atom — one IR MMA
+    is an ordered run of k/16 atomic MMAs (canon's one-issue full-K gemm_async)."""
+    dst = tmem_op(0, 0)
+    a = smem([128, 64])[:, :]
+    b = smem([256, 64])[:, :]
+    make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=256, k=64)], tmem_cg=1)
+
+
+def test_rejects_mma_dense_k_not_multiple_of_16():
     dst, a, b = mma_operands()
-    for k in (32, 64, 128):
-        with pytest.raises(ValueError, match="k must be 16 for dense"):
+    for k in (24, 40):
+        with pytest.raises(ValueError, match="positive multiple of 16"):
             make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=256, k=k)], tmem_cg=1)
 
 

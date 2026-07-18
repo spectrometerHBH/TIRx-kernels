@@ -875,6 +875,16 @@ fn execute_mma<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResu
             "tcgen05_mma dst dtype must be f32",
         ));
     }
+    // A dense (no-sf) MMA with k = 16q means the q atomic k=16 MMAs accumulated
+    // in issue order (validate admits any positive multiple of 16; canon issues
+    // one full-K gemm_async per k-tile and TVM lowers it to the atom sequence).
+    // The value model computes the whole k-slice in one exact f32 sgemm: in exact
+    // arithmetic that equals the ordered atom-by-atom f32 accumulation, and the
+    // tcgen05 f32 accumulator add is itself order-exact per k=16 atom, so the
+    // collapsed and sliced forms are bit-identical here. Protocol-side, the one
+    // IR MMA is one async-engine issue drained by the next tcgen05_commit —
+    // exactly canon's one-issue/one-commit full-K tracking.
+    //
     // Contiguous layouts (D: cta_group=1 m=128; A: cta_group=2 m=256). Non-transposed
     // rank-2 SMEM operands take the in-place path: SMEM bytes are materialized into
     // reusable f32 scratch, then sgemm writes f32 bits directly into TMEM cells.

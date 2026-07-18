@@ -65,18 +65,18 @@ def build_bootstrap_gemm(M=256, N=128, K=64, dtype=DType.F16):
         with k.if_(cr.eq(0)):
             k.mbarrier_wait(smem_full, phase=0)
             k.mbarrier_wait(peer_full, phase=0)
-            for kg in range(K // 16):
-                ko = kg * 16
-                k.tcgen05_mma(
-                    accum.at(0, 0),
-                    a_s[:, ko : ko + 16],
-                    b_s[:, ko : ko + 16],
-                    m=M,
-                    n=N,
-                    k=16,
-                    accum=(kg > 0),
-                    cta_group=CTA_GROUP,
-                )
+            # ONE full-K MMA over the whole K extent — the IR's dense k is an
+            # ordered run of k/16 atomic MMAs (canon's one-issue full-K gemm_async).
+            k.tcgen05_mma(
+                accum.at(0, 0),
+                a_s[:, :],
+                b_s[:, :],
+                m=M,
+                n=N,
+                k=K,
+                accum=False,
+                cta_group=CTA_GROUP,
+            )
             k.tcgen05_commit(mma_done, cta_group=CTA_GROUP, multicast_cta_mask=0b11)
     with k.role(warpgroup=0):  # epilogue
         k.mbarrier_wait(mma_done, phase=0)

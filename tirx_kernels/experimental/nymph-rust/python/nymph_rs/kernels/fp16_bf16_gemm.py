@@ -79,7 +79,7 @@ _ELEMENT_BYTES = {DType.F16: 2, DType.BF16: 2}
 CTA_GROUP = 2
 CTA_M = 256  # cluster M tile (2-SM MMA combines the pair)
 BLK_M = CTA_M // CTA_GROUP  # per-CTA A rows = 128
-MMA_K = 16  # fp16/bf16 MMA instruction K
+MMA_K = 16  # the dense fp16/bf16 atomic MMA K (a full-K IR MMA is an ordered run of k/16 atoms)
 # Per-warpgroup register rebalance for the no-overlap epilogue (canon's setmaxnreg):
 # drop the producer warpgroup, raise the consumers so the MMA_N-wide writeback fragment
 # stays in registers (no LDL/STL spill). (56, 224) is canon's exact pair; with two
@@ -193,7 +193,6 @@ class _Resolved:
         "blk_k",
         "blk_n",
         "epi_n",
-        "k_groups",
         "k_tiles",
         "l2_group_size",
         "mma_n",
@@ -235,7 +234,6 @@ class _Resolved:
         self.num_n_tiles = config.n // self.mma_n
         self.pair_tasks = self.num_m_tiles * self.num_n_tiles
         self.k_tiles = config.k // self.blk_k
-        self.k_groups = self.blk_k // MMA_K
         self.num_warps = (self.num_consumer + 1) * 4
         self.producer_wg_base = self.num_consumer * 4  # first warp of producer wg
 
@@ -559,33 +557,32 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
                     acc_op = accum.at(0, slot * r.mma_n)
 
                     def _mma_kstep(first_ktile):
-                        # One k-tile: wait both smem_full barriers, issue the k_groups k=16
-                        # MMAs (codegen collapses them to one gemm_async over BLK_K), commit
-                        # smem_empty, advance the ring. accum=False ONLY on the first MMA of the
-                        # first k-tile (overwrite the accumulator), else True — kept a Python
-                        # bool by peeling the first k-tile.
+                        # One k-tile: wait both smem_full barriers, issue ONE full-K
+                        # (k=BLK_K) MMA — the IR's dense k is an ordered run of k/16
+                        # atomic MMAs, exactly canon's one-issue full-K gemm_async —
+                        # commit smem_empty, advance the ring. accum=False ONLY on the
+                        # first k-tile (overwrite the accumulator), else True — kept a
+                        # Python bool by peeling the first k-tile.
                         k.mbarrier_wait(smem_full, stage=mma_stage, phase=mma_phase)
                         k.mbarrier_wait(peer_smem_full, stage=mma_stage, phase=mma_phase)
-                        for kg in range(r.k_groups):
-                            ko = kg * MMA_K
-                            k.tcgen05_mma(
-                                acc_op,
-                                TensorSlice(
-                                    tensor=a_smem[c],
-                                    offsets=(mma_stage, 0, ko),
-                                    shape=(1, BLK_M, MMA_K),
-                                ),
-                                TensorSlice(
-                                    tensor=b_smem,
-                                    offsets=(mma_stage, 0, ko),
-                                    shape=(1, r.blk_n, MMA_K),
-                                ),
-                                m=CTA_M,
-                                n=r.mma_n,
-                                k=MMA_K,
-                                accum=((not first_ktile) or kg > 0),
-                                cta_group=CTA_GROUP,
-                            )
+                        k.tcgen05_mma(
+                            acc_op,
+                            TensorSlice(
+                                tensor=a_smem[c],
+                                offsets=(mma_stage, 0, 0),
+                                shape=(1, BLK_M, r.blk_k),
+                            ),
+                            TensorSlice(
+                                tensor=b_smem,
+                                offsets=(mma_stage, 0, 0),
+                                shape=(1, r.blk_n, r.blk_k),
+                            ),
+                            m=CTA_M,
+                            n=r.mma_n,
+                            k=r.blk_k,
+                            accum=not first_ktile,
+                            cta_group=CTA_GROUP,
+                        )
                         k.tcgen05_commit(
                             smem_empty,
                             stage=mma_stage,

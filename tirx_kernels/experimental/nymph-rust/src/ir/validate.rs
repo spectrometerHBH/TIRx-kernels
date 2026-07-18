@@ -181,16 +181,18 @@ fn smem_extent_bytes(tensor: &Tensor) -> Result<usize, IrError> {
         .ok_or_else(|| err("smem tensor byte extent overflows usize"))
 }
 
-/// `_check_tcgen05_mma_shape`.
-fn check_mma_shape(m: u32, n: u32, k: u32, cta_group: u8) -> R {
+/// `_check_tcgen05_mma_shape`. `block_scaled_f8` selects the block-scaled f8
+/// instruction family (sfa/sfb present, non-fp4) — only it may step N by 16.
+fn check_mma_shape(m: u32, n: u32, k: u32, cta_group: u8, block_scaled_f8: bool) -> R {
     check_positive(m, "tcgen05_mma m")?;
     check_positive(n, "tcgen05_mma n")?;
     check_positive(k, "tcgen05_mma k")?;
-    // 16 dense f16/bf16; 32 block-scaled f8; 64 the nvfp4 MMA-K instruction; 128/256 a
-    // full block-scaled k-tile issued as one gemm_async (canon issues one per k-tile).
-    if k != 16 && k != 32 && k != 64 && k != 128 && k != 256 {
-        return bail("tcgen05_mma k must be 16, 32, 64, 128, or 256");
-    }
+    // The k rule itself is per operand KIND and lives at the Tcgen05Mma arm
+    // (which sees the dtypes): dense f16/bf16 is any positive multiple of the
+    // k=16 atom (an ordered run of atomic MMAs — canon issues one full-K
+    // gemm_async per k-tile and TVM lowers it to the atoms); the block-scaled
+    // f8 instruction is k=32 (128/256 its folded k-tile forms); fp4 (mxf4) is
+    // k in {64, 128, 256}.
     match cta_group {
         1 => {
             let granularity = if m == 64 { 8 } else { 16 };
@@ -203,7 +205,7 @@ fn check_mma_shape(m: u32, n: u32, k: u32, cta_group: u8) -> R {
             // The block-scaled f8 instruction (k=32) steps N by 16 (DeepGEMM's
             // swap_ab grid uses N = block_m in 16-element steps, e.g. 240);
             // the dense f16/bf16 and nvfp4 (k=64) shapes keep the 32-step rule.
-            let granularity = if k == 32 { 16 } else { 32 };
+            let granularity = if block_scaled_f8 && k == 32 { 16 } else { 32 };
             if (m != 128 && m != 256) || n > 256 || n % granularity != 0 {
                 return bail("tcgen05_mma matrix shape is invalid for cta_group=2");
             }
@@ -963,16 +965,24 @@ fn validate_stmt(s: &Stmt) -> R {
             validate_ab(a, "a")?;
             validate_ab(b, "b")?;
             check_cta_group(*cta_group, "tcgen05_mma cta_group")?;
-            check_mma_shape(*m, *n, *k, *cta_group)?;
+            // k is coupled to the operand kind (the PTX tcgen05.mma instruction
+            // shapes): dense f16/bf16 is any positive multiple of the k=16 atom
+            // — one IR MMA with k = 16q means the q atomic k=16 MMAs accumulated
+            // in order (canon issues ONE full-K gemm_async per k-tile; TVM
+            // lowers it to the atom sequence on hardware) — the block-scaled f8
+            // instruction is k=32 (k=128/256 stay valid as the explicit folded
+            // k-tile abstraction, but ONLY with scale vectors); fp4 (mxf4) is
+            // k in {64, 128, 256}. Anything else was silently computed with a k
+            // the silicon does not have.
+            check_mma_shape(
+                *m,
+                *n,
+                *k,
+                *cta_group,
+                (sfa.is_some() || sfb.is_some()) && !*a_fp4,
+            )?;
             let a_dtype = mma_operand_dtype(a);
             let b_dtype = mma_operand_dtype(b);
-            // k is coupled to the operand kind (the PTX tcgen05.mma instruction
-            // shapes): dense f16/bf16 is k=16 only; the block-scaled f8
-            // instruction is k=32 (k=128/256 stay valid as the explicit folded
-            // k-tile abstraction, but ONLY with scale vectors — a dense no-sf
-            // k>=32 is not a hardware MMA); fp4 (mxf4) is k in {64, 128, 256}.
-            // Anything else was silently computed with a k the silicon does
-            // not have (e.g. k=32/64 dense f16).
             if *a_fp4 || *b_fp4 {
                 if !matches!(*k, 64 | 128 | 256) {
                     return bail("tcgen05_mma fp4 (mxf4) k must be 64, 128, or 256");
@@ -981,8 +991,11 @@ fn validate_stmt(s: &Stmt) -> R {
                 if !matches!(*k, 32 | 128 | 256) {
                     return bail("tcgen05_mma block-scaled f8 k must be 32, 128, or 256");
                 }
-            } else if *k != 16 && a_dtype != DType::F8E4M3 && b_dtype != DType::F8E4M3 {
-                return bail("tcgen05_mma k must be 16 for dense f16/bf16 operands");
+            } else if *k % 16 != 0 && a_dtype != DType::F8E4M3 && b_dtype != DType::F8E4M3 {
+                return bail(
+                    "tcgen05_mma dense f16/bf16 k must be a positive multiple of 16 \
+                     (an ordered run of k/16 atomic MMAs — the full-K gemm_async)",
+                );
             }
             if *lane_align != 0 && *lane_align != 16 {
                 return bail("tcgen05_mma lane_align must be 0 or 16");
