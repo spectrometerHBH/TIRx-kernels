@@ -584,7 +584,7 @@ def get_kernel(**kwargs: Any):
             tmem_pipe.wait(0, 0)
             # D epilogue, hand-aligned: 8 x [tcgen05.ld.32x32b.x4 + wait.ld +
             # st.shared.v4 (lane<16) + syncwarp] into the 128B-swizzled smem_cd.
-            d_frag = T.alloc_local((4,), "uint32")
+            d_frag = T.alloc_local((4,), "float32")
             for i in T.unroll(block_n // 4):
                 taddr_d: T.uint32 = T.uint32(d_tmem_start_col + i * 4)
                 T.ptx.tcgen05.ld(
@@ -592,21 +592,10 @@ def get_kernel(**kwargs: Any):
                 )
                 T.ptx.tcgen05.wait.ld()
                 if lane_u32 < T.uint32(16):
-                    cd_off: T.uint32 = (
-                        T.cast(warp_idx, "uint32") * T.uint32(2048)
-                        + lane_u32 * T.uint32(128)
-                        + (T.uint32(i) ^ (lane_u32 & T.uint32(7))) * T.uint32(16)
-                    )
-                    T.ptx.st(
-                        smem.ptr_to([cd_off]),
-                        d_frag[0],
-                        d_frag[1],
-                        d_frag[2],
-                        d_frag[3],
-                        space="shared",
-                        vec="v4",
-                        ptx_type="b32",
-                    )
+                    # Per-thread 4-col slice store; the swizzled layout of
+                    # smem_cd_mma computes the address, the 16B chunk emits v4.
+                    m_row: T.uint32 = T.cast(warp_idx, "uint32") * T.uint32(16) + lane_u32
+                    Tx.copy(smem_cd_mma[m_row, i * 4 : (i + 1) * 4], d_frag[:])
                 T.cuda.warp_sync()
 
             T.ptx.fence.proxy_async("shared::cta")
