@@ -41,6 +41,14 @@ commit 76600421 (codegen-side rejections + sf_block validation).
    level differences otherwise. Hardware fixtures use exact small integers.
 6. **elect = fixed lane 0**; PTX elect.sync picks deterministically but does
    not promise lane 0 (low risk).
+7. **sim⇄GPU bit-exactness is measured, not assumed**:
+   `tests/gpu/test_gpu_sim_parity.py` runs one kernel + one input set through
+   BOTH the value simulator and the tirx codegen + `tvm.compile` on a real GPU
+   and compares the outputs bitwise. On B200, the nvfp4 1024³ (exact-recipe
+   e2m1 codes / power-of-two e4m3 scales / power-of-two alpha) and fp16 1024³
+   (small-integer inputs) GEMMs match sim bit-for-bit — for exact-arithmetic
+   recipes, abstractions 1/4/5 introduce no observable divergence. (Skipped
+   without a CUDA device.)
 
 ## tcgen05.mma (§9.7.17.10.9, Table 42 §9.7.17.2.1, Tables 45-47, 54-55, 59-60)
 
