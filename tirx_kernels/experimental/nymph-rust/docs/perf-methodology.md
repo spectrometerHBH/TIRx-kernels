@@ -84,6 +84,22 @@ diff against canon (method established in commit 9ef5a61a / 034ae826):
   viable. The actionable direction (not yet done): shrink the whole-kernel
   static complexity until ptxas's placement flips — canon is ~29% smaller
   in SASS than nymph on this shape.
+- **Full executed-opcode diff** (fp16 1024, single launch each, ncu
+  `sass__inst_executed_per_opcode`, 2026-07-18; canon `_kernel_kernel` vs
+  nymph `main_kernel`). Total 267,182 vs 310,063 = **+42,881 (+16.0%)**,
+  in three clusters:
+  - *uniform-placement* (the ptxas whole-function issue above): R2UR +11,712
+    (1,792 -> 13,504); IMAD +9,414; ISETP +8,359; VIADD +5,952; MOV +4,992;
+    LEA +3,584; ULEA +3,328 — scalar index/address math executed on the
+    vector pipe that canon keeps on the uniform pipe.
+  - *synchronization structure*: SYNCS +10,228 (30,013 -> 40,241, mbarrier
+    family); NANOSLEEP +5,497 (try_wait backoff); ELECT +2,496; BSSY/BSYNC
+    +1,280; YIELD +1,088; WARPSYNC +512 — nymph's guard/wait structure
+    executes more sync work per task.
+  - *control flow*: BRA +8,730; SEL +2,752 — more branches around guards
+    and loop forms.
+  Partial offsets (nymph executes FEWER): MEMBAR -1,024, UTMACMDFLUSH -768,
+  S2R -704, LDCU -640.
 
 ## 4. Rules of engagement
 
