@@ -847,8 +847,34 @@ fn validate_stmt(s: &Stmt) -> R {
             validate_slice(b, "tcgen05_mma b")?;
             check_cta_group(*cta_group, "tcgen05_mma cta_group")?;
             check_mma_shape(*m, *n, *k, *cta_group)?;
+            // k is coupled to the operand kind (the PTX tcgen05.mma instruction
+            // shapes): dense f16/bf16 is k=16 only; the block-scaled f8
+            // instruction is k=32 (k=128/256 stay valid as the explicit folded
+            // k-tile abstraction, but ONLY with scale vectors — a dense no-sf
+            // k>=32 is not a hardware MMA); fp4 (mxf4) is k in {64, 128, 256}.
+            // Anything else was silently computed with a k the silicon does
+            // not have (e.g. k=32/64 dense f16).
+            if *a_fp4 || *b_fp4 {
+                if !matches!(*k, 64 | 128 | 256) {
+                    return bail("tcgen05_mma fp4 (mxf4) k must be 64, 128, or 256");
+                }
+            } else if sfa.is_some() || sfb.is_some() {
+                if !matches!(*k, 32 | 128 | 256) {
+                    return bail("tcgen05_mma block-scaled f8 k must be 32, 128, or 256");
+                }
+            } else if *k != 16 && a.tensor.dtype != DType::F8E4M3 && b.tensor.dtype != DType::F8E4M3
+            {
+                return bail("tcgen05_mma k must be 16 for dense f16/bf16 operands");
+            }
             if *lane_align != 0 && *lane_align != 16 {
                 return bail("tcgen05_mma lane_align must be 0 or 16");
+            }
+            // lane_align shifts the accumulator lane field and exists only for
+            // the cta_group=1 m=64 (Layout F) accumulator; the interpreter's
+            // mma_blocks/inplace_geometry reject every other layout at run
+            // time — reject it here instead of after the IR was trusted.
+            if *lane_align != 0 && !(*cta_group == 1 && *m == 64) {
+                return bail("tcgen05_mma lane_align != 0 requires cta_group=1 and m=64");
             }
             if dst.tensor.space != MemorySpace::Tmem {
                 return bail("tcgen05_mma dst must be TMEM");
@@ -857,6 +883,20 @@ fn validate_stmt(s: &Stmt) -> R {
                 || !matches!(b.tensor.space, MemorySpace::Smem | MemorySpace::Tmem)
             {
                 return bail("tcgen05_mma operands must be SMEM or TMEM");
+            }
+            // A TMEM operand is the value model's accumulator-readback
+            // abstraction (the GDN state read straight out of TMEM). It is
+            // exact only for the dtypes the TMEM readback path models —
+            // f16/bf16 (packed halves) and f32; an f8e4m3 or packed-fp4 (u8)
+            // TMEM operand has no modeled readback semantics.
+            for (sl, lbl) in [(a, "a"), (b, "b")] {
+                if sl.tensor.space == MemorySpace::Tmem
+                    && !matches!(sl.tensor.dtype, DType::F16 | DType::Bf16 | DType::F32)
+                {
+                    return bail(format!(
+                        "tcgen05_mma {lbl} TMEM operand dtype must be f16, bf16, or f32"
+                    ));
+                }
             }
             // A TMEM operand may be the f32 accumulator read directly as the MMA
             // operand (e.g. the GDN state S, kept in TMEM); the value model reads
@@ -872,6 +912,19 @@ fn validate_stmt(s: &Stmt) -> R {
                 if a.tensor.dtype != DType::U8 || b.tensor.dtype != DType::U8 {
                     return bail("tcgen05_mma fp4 operands must be u8 (2 packed e2m1 per byte)");
                 }
+                // PTX Table 54: the mxf4* shapes have no transposed form and
+                // exist only as (cta_group=1, M=128) or (cta_group=2, M=256);
+                // the value model's fp4 path is the in-place SMEM datapath, so
+                // a TMEM fp4 operand is out too (the TMEM-operand dtype rule
+                // above already rejects u8 TMEM operands with that message).
+                if *trans_a || *trans_b {
+                    return bail("tcgen05_mma fp4 (mxf4) does not support trans_a/trans_b");
+                }
+                if !((*cta_group == 1 && *m == 128) || (*cta_group == 2 && *m == 256)) {
+                    return bail(
+                        "tcgen05_mma fp4 requires (cta_group=1, m=128) or (cta_group=2, m=256)",
+                    );
+                }
             } else {
                 // Operands are f16/bf16/f8e4m3 one-per-slot, OR an f32 TMEM operand
                 // (e.g. the GDN state S read directly out of TMEM).
@@ -884,10 +937,22 @@ fn validate_stmt(s: &Stmt) -> R {
                         "tcgen05_mma operand dtype must be f16, bf16, f8e4m3, or an f32 TMEM operand",
                     );
                 }
-                // Operand dtypes must match, EXCEPT a bf16/f16 operand paired with an
-                // f32 TMEM operand (both materialize to f32 in value mode).
-                if a.tensor.dtype != b.tensor.dtype && !tmem_f32(a) && !tmem_f32(b) {
-                    return bail("tcgen05_mma a and b operand dtype must match");
+                // Operand dtypes must match, EXCEPT an f16/bf16 operand paired
+                // with an f32 TMEM operand (the accumulator-readback
+                // abstraction; both materialize to f32 in value mode). Any
+                // other mix — e.g. f8e4m3 against an f32 TMEM operand — has no
+                // modeled (or hardware) semantics.
+                if a.tensor.dtype != b.tensor.dtype {
+                    let f32_tmem_with_b16 = |tmem_side: &TensorSlice, other: &TensorSlice| {
+                        tmem_f32(tmem_side)
+                            && matches!(other.tensor.dtype, DType::F16 | DType::Bf16)
+                    };
+                    if !f32_tmem_with_b16(a, b) && !f32_tmem_with_b16(b, a) {
+                        return bail(
+                            "tcgen05_mma a and b operand dtype must match \
+                             (an f32 TMEM operand mixes only with f16/bf16)",
+                        );
+                    }
                 }
             }
             if dst.tensor.dtype != DType::F32 {
@@ -928,8 +993,19 @@ fn validate_stmt(s: &Stmt) -> R {
                     }
                 }
                 (Some(sfa), Some(sfb)) => {
+                    // PTX: the block-scaled kinds (mxf8f6f4/mxf4) with
+                    // cta_group::1 exist only at M=128 — an m=64 cg1 MMA has no
+                    // scale mode, so sfa/sfb there is unemittable.
+                    if *cta_group == 1 && *m == 64 {
+                        return bail(
+                            "tcgen05_mma m=64 cta_group=1 does not support block-scaled \
+                             (sfa/sfb) modes",
+                        );
+                    }
                     // UE8M0 path requires f8e4m3 operands; NVFP4 (sf_e4m3) uses fp4 operands.
-                    if !*sf_e4m3 && a.tensor.dtype != DType::F8E4M3 {
+                    if !*sf_e4m3
+                        && (a.tensor.dtype != DType::F8E4M3 || b.tensor.dtype != DType::F8E4M3)
+                    {
                         return bail("tcgen05_mma sfa/sfb require f8e4m3 operands");
                     }
                     if *sf_e4m3 && !*a_fp4 {
@@ -937,6 +1013,12 @@ fn validate_stmt(s: &Stmt) -> R {
                     }
                     if *sf_byte >= 4 {
                         return bail("tcgen05_mma sf_byte must be in 0..4");
+                    }
+                    // The NVFP4 e4m3 decode reads scale bytes 0..k/16 of each
+                    // cell — sf_byte exists only in the packed-UE8M0 (fp8)
+                    // layout and is silently ignored on the e4m3 path.
+                    if *sf_e4m3 && *sf_byte != 0 {
+                        return bail("tcgen05_mma sf_byte must be 0 for sf_e4m3 (NVFP4) scales");
                     }
                     // The two supported scale modes fix sf_block: nvfp4 block-16
                     // (sf_e4m3) or fp8 per-row (sf_block=0). Anything else would be

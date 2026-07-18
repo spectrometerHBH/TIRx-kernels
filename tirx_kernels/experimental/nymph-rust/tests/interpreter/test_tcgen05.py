@@ -1,5 +1,6 @@
 import numpy as np
 import nymph_rs as nr
+import pytest
 from helpers import (
     builder,
     expect_runtime_error,
@@ -362,8 +363,10 @@ def _build_mma_failure(
 
 
 def test_tcgen05_mma_fail_closed_before_panics_or_wrong_writes():
-    with expect_runtime_error("tcgen05_mma_lane_align"):
-        run(_build_mma_failure(lane_align=16))
+    # lane_align on a non-(cg1, m=64) layout is rejected by the validator now
+    # (it used to reach the interpreter's mma_blocks fail-closed error).
+    with pytest.raises(ValueError, match=r"lane_align != 0 requires cta_group=1 and m=64"):
+        _build_mma_failure(lane_align=16)
 
     with expect_runtime_error("tcgen05_mma_dst_offset"):
         run(_build_mma_failure(dst_shape=(129, 16), dst_slice=lambda dst: dst[1:129, :]))

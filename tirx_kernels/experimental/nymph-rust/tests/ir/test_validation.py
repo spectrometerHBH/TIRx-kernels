@@ -122,6 +122,146 @@ def test_rejects_mma_bad_k():
         make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=256, k=8)])
 
 
+# ---- tcgen05_mma hardware-coupled rules (fail-closed) -----------------------
+
+
+def mma_f8_operands():
+    """A valid block-scaled f8 (UE8M0) MMA operand set: cg1, m=128, n=32, k=32."""
+    dst = tmem([128, 32])[:, :]
+    a = smem([128, 32], dtype=n.DType.F8E4M3)[:, :]
+    b = smem([32, 32], dtype=n.DType.F8E4M3)[:, :]
+    sfa = tmem([128, 4], dtype=n.DType.U32)[:, :]
+    sfb = tmem([128, 4], dtype=n.DType.U32)[:, :]
+    return dst, a, b, sfa, sfb
+
+
+def mma_fp4_operands():
+    """A valid NVFP4 MMA operand set: cg2, m=256, n=256, k=64 (32 packed bytes)."""
+    dst = tmem([128, 256])[:, :]
+    a = smem([128, 32], dtype=n.DType.U8)[:, :]
+    b = smem([128, 32], dtype=n.DType.U8)[:, :]
+    sfa = tmem([128, 16], dtype=n.DType.F8E4M3)[:, :]
+    sfb = tmem([128, 16], dtype=n.DType.F8E4M3)[:, :]
+    return dst, a, b, sfa, sfb
+
+
+def fp4_kwargs(**overrides):
+    kw = dict(m=256, n=256, k=64, cta_group=2, sf_e4m3=True, sf_block=16, a_fp4=True, b_fp4=True)
+    kw.update(overrides)
+    return kw
+
+
+def test_accepts_block_scaled_f8_and_nvfp4_mma():
+    dst, a, b, sfa, sfb = mma_f8_operands()
+    make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=32, k=32, sfa=sfa, sfb=sfb)])
+    dst, a, b, sfa, sfb = mma_fp4_operands()
+    make([n.Tcgen05Mma(dst=dst, a=a, b=b, sfa=sfa, sfb=sfb, **fp4_kwargs())])
+
+
+def test_rejects_mma_dense_k_not_16():
+    dst, a, b = mma_operands()
+    for k in (32, 64, 128):
+        with pytest.raises(ValueError, match="k must be 16 for dense"):
+            make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=256, k=k)])
+
+
+def test_rejects_mma_block_scaled_f8_k():
+    dst, a, b, sfa, sfb = mma_f8_operands()
+    with pytest.raises(ValueError, match="block-scaled f8 k must be 32, 128, or 256"):
+        make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=32, k=16, sfa=sfa, sfb=sfb)])
+
+
+def test_rejects_mma_fp4_k():
+    dst, a, b, sfa, sfb = mma_fp4_operands()
+    with pytest.raises(ValueError, match=r"fp4 \(mxf4\) k must be 64, 128, or 256"):
+        make([n.Tcgen05Mma(dst=dst, a=a, b=b, sfa=sfa, sfb=sfb, **fp4_kwargs(k=32))])
+
+
+def test_rejects_mma_m64_cg1_scale_mode():
+    dst = tmem([64, 32])[:, :]
+    a = smem([64, 32], dtype=n.DType.F8E4M3)[:, :]
+    b = smem([32, 32], dtype=n.DType.F8E4M3)[:, :]
+    sfa = tmem([128, 4], dtype=n.DType.U32)[:, :]
+    sfb = tmem([128, 4], dtype=n.DType.U32)[:, :]
+    with pytest.raises(ValueError, match="m=64 cta_group=1 does not support block-scaled"):
+        make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=64, n=32, k=32, sfa=sfa, sfb=sfb)])
+
+
+def test_rejects_mma_fp4_transposed():
+    dst, a, b, sfa, sfb = mma_fp4_operands()
+    with pytest.raises(ValueError, match="does not support trans_a/trans_b"):
+        make([n.Tcgen05Mma(dst=dst, a=a, b=b, sfa=sfa, sfb=sfb, **fp4_kwargs(trans_b=True))])
+
+
+def test_rejects_mma_fp4_shape():
+    dst = tmem([64, 32])[:, :]
+    a = smem([64, 32], dtype=n.DType.U8)[:, :]
+    b = smem([32, 32], dtype=n.DType.U8)[:, :]
+    sfa = tmem([128, 16], dtype=n.DType.F8E4M3)[:, :]
+    sfb = tmem([128, 16], dtype=n.DType.F8E4M3)[:, :]
+    with pytest.raises(ValueError, match="fp4 requires"):
+        make(
+            [
+                n.Tcgen05Mma(
+                    dst=dst,
+                    a=a,
+                    b=b,
+                    m=64,
+                    n=32,
+                    k=64,
+                    sfa=sfa,
+                    sfb=sfb,
+                    sf_e4m3=True,
+                    sf_block=16,
+                    a_fp4=True,
+                    b_fp4=True,
+                )
+            ]
+        )
+
+
+def test_rejects_mma_tmem_operand_dtype():
+    dst, a, _b = mma_operands()
+    b_e4m3_tmem = tmem([256, 16], dtype=n.DType.F8E4M3)[:, :]
+    with pytest.raises(ValueError, match="b TMEM operand dtype must be f16, bf16, or f32"):
+        make([n.Tcgen05Mma(dst=dst, a=a, b=b_e4m3_tmem, m=128, n=256, k=16)])
+    dst, a, b, sfa, sfb = mma_fp4_operands()
+    a_u8_tmem = tmem([128, 32], dtype=n.DType.U8)[:, :]
+    with pytest.raises(ValueError, match="a TMEM operand dtype must be f16, bf16, or f32"):
+        make([n.Tcgen05Mma(dst=dst, a=a_u8_tmem, b=b, sfa=sfa, sfb=sfb, **fp4_kwargs())])
+
+
+def test_accepts_mma_tmem_b_operand_f32():
+    # The accumulator-readback abstraction: an f32 TMEM B operand mixes with an
+    # f16/bf16 SMEM A (the test_tmem_operand_mma / GDN configuration).
+    dst = tmem([128, 16])[:, :]
+    a = smem([128, 16], dtype=n.DType.BF16)[:, :]
+    b = tmem([16, 16])[:, :]
+    make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=16, k=16)])
+
+
+def test_rejects_mma_mixed_dtype_not_b16():
+    dst = tmem([128, 32])[:, :]
+    a = smem([128, 32], dtype=n.DType.F8E4M3)[:, :]
+    b = tmem([32, 32])[:, :]  # f32 TMEM
+    sfa = tmem([128, 4], dtype=n.DType.U32)[:, :]
+    sfb = tmem([128, 4], dtype=n.DType.U32)[:, :]
+    with pytest.raises(ValueError, match="a and b operand dtype must match"):
+        make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=32, k=32, sfa=sfa, sfb=sfb)])
+
+
+def test_rejects_mma_lane_align_wrong_layout():
+    dst, a, b = mma_operands()
+    with pytest.raises(ValueError, match=r"lane_align != 0 requires cta_group=1 and m=64"):
+        make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=256, k=16, lane_align=16)])
+
+
+def test_rejects_mma_nvfp4_sf_byte():
+    dst, a, b, sfa, sfb = mma_fp4_operands()
+    with pytest.raises(ValueError, match="sf_byte must be 0 for sf_e4m3"):
+        make([n.Tcgen05Mma(dst=dst, a=a, b=b, sfa=sfa, sfb=sfb, **fp4_kwargs(sf_byte=2))])
+
+
 # ---- tma ------------------------------------------------------------------
 
 
