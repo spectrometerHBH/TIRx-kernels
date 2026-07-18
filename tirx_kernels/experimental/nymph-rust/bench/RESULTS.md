@@ -27,6 +27,33 @@ R2UR work. Per-round spread in brackets.
 | bf16 | 8192 | 0.998 | 0.950-1.037 | 702.0 | 703.3 |
 | bf16 | 16384 | 1.001 | 0.938-1.103 | 5777.3 | 5772.7 |
 
+## 2026-07-18 codegen genericity refactor (items 1-6) — no regression
+
+B200, GPU1 (idle), rounds=10. After the codegen-genericity refactor (per-variant
+fail-closed Errs, cluster-derived ids, vendored mma_shared_layout, full-K dense
+MMA without the codegen run-collapse, explicit MBar.leader_routed, tightened
+is_nonneg, structured guard merge, exhaustiveness gate). Emission was
+byte-identical for fp16/bootstrap and import-swap-only + the nvfp4 %5 form for
+nvfp4, so no movement is expected; all cells within noise of the baseline.
+
+| kernel | shape | ratio | spread | canon (us) | nymph (us) |
+|---|---|---|---|---|---|
+| nvfp4 | 1024 | 0.998 | 0.995-1.002 | 5.4 | 5.4 |
+| nvfp4 | 2048 | 0.989 | 0.987-0.995 | 8.5 | 8.6 |
+| nvfp4 | 4096 | 0.981 | 0.980-0.983 | 29.6 | 30.1 |
+| nvfp4 | 8192 | 1.015 | 0.994-1.051 | 189.4 | 186.6 |
+| nvfp4 | 16384 | 1.007 | 0.941-1.073 | 1513.2 | 1503.1 |
+| fp16 | 1024 | 0.985 | 0.983-0.986 | 6.9 | 7.0 |
+| fp16 | 2048 | 0.994 | 0.992-0.995 | 16.6 | 16.7 |
+| fp16 | 4096 | 0.998 | 0.973-1.010 | 96.5 | 96.7 |
+| fp16 | 8192 | 1.009 | 0.956-1.069 | 741.2 | 734.8 |
+| fp16 | 16384 | 1.044 | 0.975-1.280 | 6281.8 | 6019.7 |
+| bf16 | 1024 | 0.985 | 0.983-0.985 | 6.9 | 7.0 |
+| bf16 | 2048 | 0.994 | 0.992-0.995 | 16.5 | 16.6 |
+| bf16 | 4096 | 1.001 | 0.993-1.012 | 94.2 | 94.1 |
+| bf16 | 8192 | 0.994 | 0.923-1.024 | 705.8 | 710.3 |
+| bf16 | 16384 | 1.012 | 0.948-1.107 | 5756.4 | 5690.9 |
+
 Shapes below the 0.99 target (perf work items, R2UR investigation see
 `docs/perf-methodology.md` once it lands):
 
