@@ -828,9 +828,6 @@ py_enum!(PyDType = "DType" => DType {
 py_enum!(PySwizzle = "Swizzle" => Swizzle {
     NONE => None, B32 => B32, B64 => B64, B128 => B128,
 });
-py_enum!(PyTmemLayoutKind = "TmemLayoutKind" => TmemLayoutKind {
-    LANE_128 => Lane128, LANE_64_UPPER => Lane64Upper, LANE_64_LOWER => Lane64Lower,
-});
 py_enum!(PyMBarKind = "MBarKind" => MBarKind {
     TMA => Tma, TCGEN05 => Tcgen05, THREAD => Thread,
 });
@@ -1199,40 +1196,77 @@ impl PySmemSwizzleLayout {
     }
 }
 
-/// `TmemLayout`.
-#[pyclass(name = "TmemLayout")]
-#[derive(Clone)]
-pub struct PyTmemLayout(pub ir::TmemLayout);
-#[pymethods]
-impl PyTmemLayout {
-    #[new]
-    #[pyo3(signature = (kind = PyTmemLayoutKind::LANE_128, col_start = 0))]
-    fn new(kind: PyTmemLayoutKind, col_start: usize) -> Self {
-        PyTmemLayout(ir::TmemLayout {
-            kind: kind.into(),
-            col_start,
-        })
-    }
-    #[getter]
-    fn kind(&self) -> PyTmemLayoutKind {
-        self.0.kind.into()
-    }
-    #[getter]
-    fn col_start(&self) -> usize {
-        self.0.col_start
-    }
-}
-
 fn coerce_layout(obj: &Bound<'_, PyAny>) -> PyResult<ir::Layout> {
-    if let Ok(l) = obj.extract::<PyTmemLayout>() {
-        return Ok(ir::Layout::Tmem(l.0));
-    }
     if let Ok(l) = obj.extract::<PySmemSwizzleLayout>() {
         return Ok(ir::Layout::Swizzle(l.0));
     }
     Err(PyTypeError::new_err(
-        "expected a Layout (TmemLayout or SmemSwizzleLayout)",
+        "expected a Layout (SmemSwizzleLayout)",
     ))
+}
+
+/// `TmemOperand` — an absolute physical TMEM (lane, col) address + the dtype
+/// the addressed cells are (un)packed as. TMEM is not a tensor: no layout, no
+/// shape — the extent is implied by the op the operand feeds.
+#[pyclass(name = "TmemOperand")]
+#[derive(Clone)]
+pub struct PyTmemOperand(pub ir::TmemOperand);
+#[pymethods]
+impl PyTmemOperand {
+    #[new]
+    #[pyo3(signature = (row, col, dtype))]
+    fn new(row: Bound<'_, PyAny>, col: Bound<'_, PyAny>, dtype: PyDType) -> PyResult<Self> {
+        Ok(PyTmemOperand(ir::TmemOperand {
+            row: coerce_scalar(&row)?,
+            col: coerce_scalar(&col)?,
+            dtype: dtype.into(),
+        }))
+    }
+    #[getter]
+    fn row(&self, py: Python<'_>) -> PyResult<PyObject> {
+        scalar_to_py(py, &self.0.row)
+    }
+    #[getter]
+    fn col(&self, py: Python<'_>) -> PyResult<PyObject> {
+        scalar_to_py(py, &self.0.col)
+    }
+    #[getter]
+    fn dtype(&self) -> PyDType {
+        self.0.dtype.into()
+    }
+}
+
+/// Accept a `TmemOperand` or a `(row, col, dtype)` tuple.
+fn coerce_tmem_operand(obj: &Bound<'_, PyAny>) -> PyResult<ir::TmemOperand> {
+    if let Ok(op) = obj.extract::<PyTmemOperand>() {
+        return Ok(op.0);
+    }
+    if let Ok((row, col, dtype)) = obj.extract::<(Bound<'_, PyAny>, Bound<'_, PyAny>, PyDType)>() {
+        return Ok(ir::TmemOperand {
+            row: coerce_scalar(&row)?,
+            col: coerce_scalar(&col)?,
+            dtype: dtype.into(),
+        });
+    }
+    Err(PyTypeError::new_err(
+        "expected a TmemOperand or a (row, col, dtype) tuple",
+    ))
+}
+
+/// An MMA A/B operand: an SMEM `TensorSlice`, or a `TmemOperand` for the
+/// TMEM-resident (accumulator-readback) form.
+fn coerce_mma_operand(obj: &Bound<'_, PyAny>) -> PyResult<ir::MmaOperand> {
+    if let Ok(s) = obj.extract::<PyTensorSlice>() {
+        return Ok(ir::MmaOperand::Slice(s.0));
+    }
+    Ok(ir::MmaOperand::Tmem(coerce_tmem_operand(obj)?))
+}
+
+fn mma_operand_to_py(py: Python<'_>, op: &ir::MmaOperand) -> PyResult<PyObject> {
+    match op {
+        ir::MmaOperand::Slice(s) => Ok(Py::new(py, PyTensorSlice(s.clone()))?.into_any()),
+        ir::MmaOperand::Tmem(t) => Ok(Py::new(py, PyTmemOperand(t.clone()))?.into_any()),
+    }
 }
 
 /// `Tensor` — shared via Arc; identity is its auto-assigned id.
@@ -1693,25 +1727,28 @@ impl PyStmt {
         }
     }
     #[getter]
-    fn dst(&self) -> PyResult<PyTensorSlice> {
+    fn dst(&self, py: Python<'_>) -> PyResult<PyObject> {
         match &self.0 {
-            ir::Stmt::Tcgen05Mma { dst, .. } | ir::Stmt::StoreScalar { dst, .. } => {
-                Ok(PyTensorSlice(dst.clone()))
+            ir::Stmt::Tcgen05Mma { dst, .. } | ir::Stmt::Tcgen05St { dst, .. } => {
+                Ok(Py::new(py, PyTmemOperand(dst.clone()))?.into_any())
+            }
+            ir::Stmt::StoreScalar { dst, .. } => {
+                Ok(Py::new(py, PyTensorSlice(dst.clone()))?.into_any())
             }
             _ => Err(PyAttributeError::new_err("dst")),
         }
     }
     #[getter]
-    fn a(&self) -> PyResult<PyTensorSlice> {
+    fn a(&self, py: Python<'_>) -> PyResult<PyObject> {
         match &self.0 {
-            ir::Stmt::Tcgen05Mma { a, .. } => Ok(PyTensorSlice(a.clone())),
+            ir::Stmt::Tcgen05Mma { a, .. } => mma_operand_to_py(py, a),
             _ => Err(PyAttributeError::new_err("a")),
         }
     }
     #[getter]
-    fn b(&self) -> PyResult<PyTensorSlice> {
+    fn b(&self, py: Python<'_>) -> PyResult<PyObject> {
         match &self.0 {
-            ir::Stmt::Tcgen05Mma { b, .. } => Ok(PyTensorSlice(b.clone())),
+            ir::Stmt::Tcgen05Mma { b, .. } => mma_operand_to_py(py, b),
             _ => Err(PyAttributeError::new_err("b")),
         }
     }
@@ -1802,22 +1839,27 @@ fn tensor_def(tensor: PyTensor) -> PyStmt {
     PyStmt(ir::Stmt::TensorDef { tensor: tensor.0 })
 }
 #[pyfunction]
-#[pyo3(name = "TmemAlloc", signature = (tensor, n_cols, cta_group = 1))]
-fn tmem_alloc(tensor: PyTensor, n_cols: u32, cta_group: u8) -> PyStmt {
+#[pyo3(name = "TmemAlloc", signature = (base_col, n_cols, cta_group = 1))]
+fn tmem_alloc(base_col: u32, n_cols: u32, cta_group: u8) -> PyStmt {
     PyStmt(ir::Stmt::TmemAlloc {
-        tensor: tensor.0,
+        base_col,
         n_cols,
         cta_group,
     })
 }
 #[pyfunction]
-#[pyo3(name = "TmemDealloc", signature = (tensor, n_cols, cta_group = 1))]
-fn tmem_dealloc(tensor: PyTensor, n_cols: u32, cta_group: u8) -> PyStmt {
+#[pyo3(name = "TmemDealloc", signature = (base_col, n_cols, cta_group = 1))]
+fn tmem_dealloc(base_col: u32, n_cols: u32, cta_group: u8) -> PyStmt {
     PyStmt(ir::Stmt::TmemDealloc {
-        tensor: tensor.0,
+        base_col,
         n_cols,
         cta_group,
     })
+}
+#[pyfunction]
+#[pyo3(name = "TmemRelinquish", signature = (cta_group = 1))]
+fn tmem_relinquish(cta_group: u8) -> PyStmt {
+    PyStmt(ir::Stmt::TmemRelinquish { cta_group })
 }
 #[pyfunction]
 #[pyo3(name = "ScalarDef", signature = (var, initial = None))]
@@ -2208,9 +2250,9 @@ fn tcgen05_mma(
     lane_align: u8,
 ) -> PyResult<PyStmt> {
     Ok(PyStmt(ir::Stmt::Tcgen05Mma {
-        dst: coerce_slice(&dst)?,
-        a: coerce_slice(&a)?,
-        b: coerce_slice(&b)?,
+        dst: coerce_tmem_operand(&dst)?,
+        a: coerce_mma_operand(&a)?,
+        b: coerce_mma_operand(&b)?,
         m,
         n,
         k,
@@ -2218,8 +2260,8 @@ fn tcgen05_mma(
         trans_a,
         trans_b,
         cta_group,
-        sfa: sfa.map(|v| coerce_slice(&v)).transpose()?,
-        sfb: sfb.map(|v| coerce_slice(&v)).transpose()?,
+        sfa: sfa.map(|v| coerce_tmem_operand(&v)).transpose()?,
+        sfb: sfb.map(|v| coerce_tmem_operand(&v)).transpose()?,
         sf_byte,
         sf_e4m3,
         sf_block,
@@ -2232,7 +2274,7 @@ fn tcgen05_mma(
 #[pyo3(name = "Tcgen05Cp", signature = (dst, src, cta_group = 1))]
 fn tcgen05_cp(dst: Bound<'_, PyAny>, src: Bound<'_, PyAny>, cta_group: u8) -> PyResult<PyStmt> {
     Ok(PyStmt(ir::Stmt::Tcgen05Cp {
-        dst: coerce_slice(&dst)?,
+        dst: coerce_tmem_operand(&dst)?,
         src: coerce_slice(&src)?,
         cta_group,
     }))
@@ -2253,24 +2295,20 @@ fn tcgen05_commit(
     }))
 }
 #[pyfunction]
-#[pyo3(name = "Tcgen05Ld", signature = (dst, src, shape = "32x32b", num = 1, row = None, col = None))]
+#[pyo3(name = "Tcgen05Ld", signature = (dst, src, shape = "32x32b", num = 1))]
 fn tcgen05_ld(
     dst: Bound<'_, PyAny>,
-    src: PyTensor,
+    src: Bound<'_, PyAny>,
     shape: &str,
     num: u32,
-    row: Option<Bound<'_, PyAny>>,
-    col: Option<Bound<'_, PyAny>>,
 ) -> PyResult<PyStmt> {
     let shape = ir::LdStShape::parse(shape)
         .ok_or_else(|| PyValueError::new_err("tcgen05_ld shape is unsupported"))?;
     Ok(PyStmt(ir::Stmt::Tcgen05Ld {
         dst: coerce_slice(&dst)?,
-        src: src.0,
+        src: coerce_tmem_operand(&src)?,
         shape,
         num,
-        row: opt_scalar_or(row, 0)?,
-        col: opt_scalar_or(col, 0)?,
     }))
 }
 #[pyfunction]
@@ -2279,24 +2317,20 @@ fn tcgen05_wait_ld() -> PyStmt {
     PyStmt(ir::Stmt::Tcgen05WaitLd)
 }
 #[pyfunction]
-#[pyo3(name = "Tcgen05St", signature = (dst, src, shape = "32x32b", num = 1, row = None, col = None))]
+#[pyo3(name = "Tcgen05St", signature = (dst, src, shape = "32x32b", num = 1))]
 fn tcgen05_st(
-    dst: PyTensor,
+    dst: Bound<'_, PyAny>,
     src: Bound<'_, PyAny>,
     shape: &str,
     num: u32,
-    row: Option<Bound<'_, PyAny>>,
-    col: Option<Bound<'_, PyAny>>,
 ) -> PyResult<PyStmt> {
     let shape = ir::LdStShape::parse(shape)
         .ok_or_else(|| PyValueError::new_err("tcgen05_st shape is unsupported"))?;
     Ok(PyStmt(ir::Stmt::Tcgen05St {
-        dst: dst.0,
+        dst: coerce_tmem_operand(&dst)?,
         src: coerce_slice(&src)?,
         shape,
         num,
-        row: opt_scalar_or(row, 0)?,
-        col: opt_scalar_or(col, 0)?,
     }))
 }
 #[pyfunction]
@@ -2764,7 +2798,6 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMemorySpace>()?;
     m.add_class::<PyDType>()?;
     m.add_class::<PySwizzle>()?;
-    m.add_class::<PyTmemLayoutKind>()?;
     m.add_class::<PyMBarKind>()?;
     m.add_class::<PyFenceKind>()?;
     m.add_class::<PyFenceScope>()?;
@@ -2781,9 +2814,9 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(scalar_and, m)?)?;
     m.add_function(wrap_pyfunction!(scalar_or, m)?)?;
     m.add_function(wrap_pyfunction!(scalar_not, m)?)?;
-    // chunk 3 — tensors / slices / layouts
+    // chunk 3 — tensors / slices / layouts / TMEM operands
     m.add_class::<PySmemSwizzleLayout>()?;
-    m.add_class::<PyTmemLayout>()?;
+    m.add_class::<PyTmemOperand>()?;
     m.add_class::<PyTensor>()?;
     m.add_class::<PyTensorSlice>()?;
     // chunk 4 — mbarriers
@@ -2798,6 +2831,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(tensor_def, m)?,
         wrap_pyfunction!(tmem_alloc, m)?,
         wrap_pyfunction!(tmem_dealloc, m)?,
+        wrap_pyfunction!(tmem_relinquish, m)?,
         wrap_pyfunction!(scalar_def, m)?,
         wrap_pyfunction!(scalar_store, m)?,
         wrap_pyfunction!(shuffle_sync, m)?,
