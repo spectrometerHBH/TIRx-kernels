@@ -48,7 +48,7 @@ shape parameter or a per-config knob.
 | `mbar_stages` | mbar id → stage count | read off each `MBarDef` |
 | `var_names` / `scalar_names` | loop-var / scalar id → name (`v0`, `s4`, …); scalars emit as SSA `T.int32` register vars (not `alloc_local(1)` cells) | deterministic by id order |
 | `cta_group` | cluster CTA-group (1 or 2) | the kernel's cluster shape |
-| `tmem_base`, `tmem_alloc_cols` | the base TMEM tensor (the alloc with the most columns) + its width | structural: the widest TMEM allocation |
+| `tmem_view_cols`, `sf_views` | the single f32 `tmem` view's column count + the e4m3 SF view decls (`SFA_tmem`/`SFB_tmem`) | structural: `max(base_col + n_cols)` over the kernel's `TmemAlloc`s; each SF view's folded logical shape from its `TmemOperand` base column |
 | `reg_widths` | REG-tensor id → collapsed band width | `walk_reg_widths` takes `max(offset+width)` over every slice of each REG fragment in the body — a property of the IR's accesses, not the shape |
 | `tma_leader_mbar` | the single mbar whose TMA tx is routed to CTA-0 (`smem_full`'s leader view) | structural: the one mbar a `TmaLoad` names through its CTA-0 peer view |
 

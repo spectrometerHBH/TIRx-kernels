@@ -54,14 +54,10 @@ def f32(values, shape=None):
     return arr.reshape(shape) if shape is not None else arr
 
 
-def tmem_layout(*, col_start=0):
-    return nr.TmemLayout(nr.TmemLayoutKind.LANE_128, col_start)
-
-
-def tmem_tensor(b, *, dtype=nr.DType.F32, shape=(128, 128), col_start=0):
-    return b.tensor(
-        space=nr.MemorySpace.TMEM, dtype=dtype, shape=shape, layout=tmem_layout(col_start=col_start)
-    )
+def tmem_operand(row=0, col=0, dtype=None):
+    """An absolute physical TMEM (lane, col) operand — the de-tensored TMEM
+    reference (no tensor, no layout; the extent is implied by the op)."""
+    return nr.TmemOperand(row, col, dtype or nr.DType.F32)
 
 
 def reg_tensor(b, *, dtype=nr.DType.U32, shape=(1,)):

@@ -18,8 +18,9 @@ def smem(shape, dtype=n.DType.F16):
     return n.Tensor(space=n.MemorySpace.SMEM, dtype=dtype, shape=shape, byte_offset=0)
 
 
-def tmem(shape, dtype=n.DType.F32):
-    return n.Tensor(space=n.MemorySpace.TMEM, dtype=dtype, shape=shape)
+def tmem_op(row=0, col=0, dtype=n.DType.F32):
+    # A TMEM reference is an absolute physical (lane, col) + cell dtype — no tensor.
+    return n.TmemOperand(row, col, dtype)
 
 
 def gmem(shape, dtype=n.DType.F16):
@@ -30,8 +31,11 @@ def reg(shape, dtype=n.DType.F32):
     return n.Tensor(space=n.MemorySpace.REG, dtype=dtype, shape=shape)
 
 
-def make(body, *, num_warps=4, launch=(2,), cluster=(2,), args=()):
-    """Build a kernel (validates on construction)."""
+def make(body, *, num_warps=4, launch=(2,), cluster=(2,), args=(), tmem_cg=None):
+    """Build a kernel (validates on construction). `tmem_cg` prepends a warp-scope
+    512-column TMEM alloc (with that cta_group) so TMEM operands have a live band."""
+    if tmem_cg is not None:
+        body = (n.KernelInit(body=(n.TmemAlloc(0, 512, cta_group=tmem_cg),), warp=0), *body)
     return n.Kernel(
         name="t",
         args=args,
@@ -44,8 +48,8 @@ def make(body, *, num_warps=4, launch=(2,), cluster=(2,), args=()):
 
 
 def mma_operands():
-    """A valid cta_group=1 MMA's (dst, a, b) slices — m=128, n=256, k=16."""
-    return tmem([128, 256])[:, :], smem([128, 16])[:, :], smem([256, 16])[:, :]
+    """A valid cta_group=1 MMA's (dst, a, b) operands — m=128, n=256, k=16."""
+    return tmem_op(0, 0), smem([128, 16])[:, :], smem([256, 16])[:, :]
 
 
 # ---- kernel geometry -------------------------------------------------------
@@ -85,41 +89,41 @@ def test_rejects_smem_tensor_outside_pool():
 def test_rejects_mma_dst_not_tmem():
     _, a, b = mma_operands()
     dst = smem([128, 256])[:, :]
-    with pytest.raises(ValueError, match="dst must be TMEM"):
-        make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=256, k=16)])
+    with pytest.raises(TypeError, match="TmemOperand"):
+        make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=256, k=16)], tmem_cg=1)
 
 
 def test_rejects_mma_operand_not_smem_or_tmem():
     dst, _, b = mma_operands()
     a = gmem([128, 16])[:, :]
-    with pytest.raises(ValueError, match="operands must be SMEM or TMEM"):
-        make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=256, k=16)])
+    with pytest.raises(ValueError, match="slice operand must be SMEM"):
+        make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=256, k=16)], tmem_cg=1)
 
 
 def test_accepts_mma_tmem_operand():
     dst, _, b = mma_operands()
-    a = tmem([128, 16], dtype=n.DType.F16)[:, :]
-    make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=256, k=16)])
+    a = tmem_op(0, 0, dtype=n.DType.F16)
+    make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=256, k=16)], tmem_cg=1)
 
 
 def test_rejects_mma_operand_dtype():
     dst, _, b = mma_operands()
     a = smem([128, 16], dtype=n.DType.F32)[:, :]  # f32 SMEM operand is still rejected
     with pytest.raises(ValueError, match="operand dtype must be f16, bf16, f8e4m3"):
-        make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=256, k=16)])
+        make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=256, k=16)], tmem_cg=1)
 
 
 def test_rejects_mma_dst_dtype():
     _, a, b = mma_operands()
-    dst = tmem([128, 256], dtype=n.DType.F16)[:, :]
+    dst = tmem_op(0, 0, dtype=n.DType.F16)
     with pytest.raises(ValueError, match="dst dtype must be f32"):
-        make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=256, k=16)])
+        make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=256, k=16)], tmem_cg=1)
 
 
 def test_rejects_mma_bad_k():
     dst, a, b = mma_operands()
     with pytest.raises(ValueError, match="k must be 16"):
-        make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=256, k=8)])
+        make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=256, k=8)], tmem_cg=1)
 
 
 # ---- tcgen05_mma hardware-coupled rules (fail-closed) -----------------------
@@ -127,21 +131,21 @@ def test_rejects_mma_bad_k():
 
 def mma_f8_operands():
     """A valid block-scaled f8 (UE8M0) MMA operand set: cg1, m=128, n=32, k=32."""
-    dst = tmem([128, 32])[:, :]
+    dst = tmem_op(0, 0)
     a = smem([128, 32], dtype=n.DType.F8E4M3)[:, :]
     b = smem([32, 32], dtype=n.DType.F8E4M3)[:, :]
-    sfa = tmem([128, 4], dtype=n.DType.U32)[:, :]
-    sfb = tmem([128, 4], dtype=n.DType.U32)[:, :]
+    sfa = tmem_op(0, 32, dtype=n.DType.U32)
+    sfb = tmem_op(0, 36, dtype=n.DType.U32)
     return dst, a, b, sfa, sfb
 
 
 def mma_fp4_operands():
     """A valid NVFP4 MMA operand set: cg2, m=256, n=256, k=64 (32 packed bytes)."""
-    dst = tmem([128, 256])[:, :]
+    dst = tmem_op(0, 0)
     a = smem([128, 32], dtype=n.DType.U8)[:, :]
     b = smem([128, 32], dtype=n.DType.U8)[:, :]
-    sfa = tmem([128, 16], dtype=n.DType.F8E4M3)[:, :]
-    sfb = tmem([128, 16], dtype=n.DType.F8E4M3)[:, :]
+    sfa = tmem_op(0, 448, dtype=n.DType.F8E4M3)
+    sfb = tmem_op(0, 464, dtype=n.DType.F8E4M3)
     return dst, a, b, sfa, sfb
 
 
@@ -153,52 +157,55 @@ def fp4_kwargs(**overrides):
 
 def test_accepts_block_scaled_f8_and_nvfp4_mma():
     dst, a, b, sfa, sfb = mma_f8_operands()
-    make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=32, k=32, sfa=sfa, sfb=sfb)])
+    make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=32, k=32, sfa=sfa, sfb=sfb)], tmem_cg=1)
     dst, a, b, sfa, sfb = mma_fp4_operands()
-    make([n.Tcgen05Mma(dst=dst, a=a, b=b, sfa=sfa, sfb=sfb, **fp4_kwargs())])
+    make([n.Tcgen05Mma(dst=dst, a=a, b=b, sfa=sfa, sfb=sfb, **fp4_kwargs())], tmem_cg=2)
 
 
 def test_rejects_mma_dense_k_not_16():
     dst, a, b = mma_operands()
     for k in (32, 64, 128):
         with pytest.raises(ValueError, match="k must be 16 for dense"):
-            make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=256, k=k)])
+            make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=256, k=k)], tmem_cg=1)
 
 
 def test_rejects_mma_block_scaled_f8_k():
     dst, a, b, sfa, sfb = mma_f8_operands()
     with pytest.raises(ValueError, match="block-scaled f8 k must be 32, 128, or 256"):
-        make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=32, k=16, sfa=sfa, sfb=sfb)])
+        make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=32, k=16, sfa=sfa, sfb=sfb)], tmem_cg=1)
 
 
 def test_rejects_mma_fp4_k():
     dst, a, b, sfa, sfb = mma_fp4_operands()
     with pytest.raises(ValueError, match=r"fp4 \(mxf4\) k must be 64, 128, or 256"):
-        make([n.Tcgen05Mma(dst=dst, a=a, b=b, sfa=sfa, sfb=sfb, **fp4_kwargs(k=32))])
+        make([n.Tcgen05Mma(dst=dst, a=a, b=b, sfa=sfa, sfb=sfb, **fp4_kwargs(k=32))], tmem_cg=2)
 
 
 def test_rejects_mma_m64_cg1_scale_mode():
-    dst = tmem([64, 32])[:, :]
+    dst = tmem_op(0, 0)
     a = smem([64, 32], dtype=n.DType.F8E4M3)[:, :]
     b = smem([32, 32], dtype=n.DType.F8E4M3)[:, :]
-    sfa = tmem([128, 4], dtype=n.DType.U32)[:, :]
-    sfb = tmem([128, 4], dtype=n.DType.U32)[:, :]
+    sfa = tmem_op(0, 32, dtype=n.DType.U32)
+    sfb = tmem_op(0, 36, dtype=n.DType.U32)
     with pytest.raises(ValueError, match="m=64 cta_group=1 does not support block-scaled"):
-        make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=64, n=32, k=32, sfa=sfa, sfb=sfb)])
+        make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=64, n=32, k=32, sfa=sfa, sfb=sfb)], tmem_cg=1)
 
 
 def test_rejects_mma_fp4_transposed():
     dst, a, b, sfa, sfb = mma_fp4_operands()
     with pytest.raises(ValueError, match="does not support trans_a/trans_b"):
-        make([n.Tcgen05Mma(dst=dst, a=a, b=b, sfa=sfa, sfb=sfb, **fp4_kwargs(trans_b=True))])
+        make(
+            [n.Tcgen05Mma(dst=dst, a=a, b=b, sfa=sfa, sfb=sfb, **fp4_kwargs(trans_b=True))],
+            tmem_cg=2,
+        )
 
 
 def test_rejects_mma_fp4_shape():
-    dst = tmem([64, 32])[:, :]
+    dst = tmem_op(0, 0)
     a = smem([64, 32], dtype=n.DType.U8)[:, :]
     b = smem([32, 32], dtype=n.DType.U8)[:, :]
-    sfa = tmem([128, 16], dtype=n.DType.F8E4M3)[:, :]
-    sfb = tmem([128, 16], dtype=n.DType.F8E4M3)[:, :]
+    sfa = tmem_op(0, 448, dtype=n.DType.F8E4M3)
+    sfb = tmem_op(0, 464, dtype=n.DType.F8E4M3)
     with pytest.raises(ValueError, match="fp4 requires"):
         make(
             [
@@ -216,83 +223,89 @@ def test_rejects_mma_fp4_shape():
                     a_fp4=True,
                     b_fp4=True,
                 )
-            ]
+            ],
+            tmem_cg=1,
         )
 
 
 def test_rejects_mma_tmem_operand_dtype():
     dst, a, _b = mma_operands()
-    b_e4m3_tmem = tmem([256, 16], dtype=n.DType.F8E4M3)[:, :]
+    b_e4m3_tmem = tmem_op(0, 0, dtype=n.DType.F8E4M3)
     with pytest.raises(ValueError, match="b TMEM operand dtype must be f16, bf16, or f32"):
-        make([n.Tcgen05Mma(dst=dst, a=a, b=b_e4m3_tmem, m=128, n=256, k=16)])
+        make([n.Tcgen05Mma(dst=dst, a=a, b=b_e4m3_tmem, m=128, n=256, k=16)], tmem_cg=1)
     dst, a, b, sfa, sfb = mma_fp4_operands()
-    a_u8_tmem = tmem([128, 32], dtype=n.DType.U8)[:, :]
+    a_u8_tmem = tmem_op(0, 0, dtype=n.DType.U8)
     with pytest.raises(ValueError, match="a TMEM operand dtype must be f16, bf16, or f32"):
-        make([n.Tcgen05Mma(dst=dst, a=a_u8_tmem, b=b, sfa=sfa, sfb=sfb, **fp4_kwargs())])
+        make([n.Tcgen05Mma(dst=dst, a=a_u8_tmem, b=b, sfa=sfa, sfb=sfb, **fp4_kwargs())], tmem_cg=2)
 
 
 def test_accepts_mma_tmem_b_operand_f32():
     # The accumulator-readback abstraction: an f32 TMEM B operand mixes with an
     # f16/bf16 SMEM A (the test_tmem_operand_mma / GDN configuration).
-    dst = tmem([128, 16])[:, :]
+    dst = tmem_op(0, 0)
     a = smem([128, 16], dtype=n.DType.BF16)[:, :]
-    b = tmem([16, 16])[:, :]
-    make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=16, k=16)])
+    b = tmem_op(0, 32)
+    make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=16, k=16)], tmem_cg=1)
 
 
 def test_rejects_mma_mixed_dtype_not_b16():
-    dst = tmem([128, 32])[:, :]
+    dst = tmem_op(0, 0)
     a = smem([128, 32], dtype=n.DType.F8E4M3)[:, :]
-    b = tmem([32, 32])[:, :]  # f32 TMEM
-    sfa = tmem([128, 4], dtype=n.DType.U32)[:, :]
-    sfb = tmem([128, 4], dtype=n.DType.U32)[:, :]
+    b = tmem_op(0, 32)  # f32 TMEM
+    sfa = tmem_op(0, 64, dtype=n.DType.U32)
+    sfb = tmem_op(0, 68, dtype=n.DType.U32)
     with pytest.raises(ValueError, match="a and b operand dtype must match"):
-        make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=32, k=32, sfa=sfa, sfb=sfb)])
+        make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=32, k=32, sfa=sfa, sfb=sfb)], tmem_cg=1)
 
 
 def test_rejects_mma_lane_align_wrong_layout():
     dst, a, b = mma_operands()
     with pytest.raises(ValueError, match=r"lane_align != 0 requires cta_group=1 and m=64"):
-        make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=256, k=16, lane_align=16)])
+        make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=256, k=16, lane_align=16)], tmem_cg=1)
 
 
 def test_rejects_mma_nvfp4_sf_byte():
     dst, a, b, sfa, sfb = mma_fp4_operands()
     with pytest.raises(ValueError, match="sf_byte must be 0 for sf_e4m3"):
-        make([n.Tcgen05Mma(dst=dst, a=a, b=b, sfa=sfa, sfb=sfb, **fp4_kwargs(sf_byte=2))])
+        make(
+            [n.Tcgen05Mma(dst=dst, a=a, b=b, sfa=sfa, sfb=sfb, **fp4_kwargs(sf_byte=2))], tmem_cg=2
+        )
 
 
 # ---- tcgen05_cp --------------------------------------------------------------
 
 
 def test_accepts_tcgen05_cp_u32_and_e4m3():
-    dst = tmem([128, 4], dtype=n.DType.U32)[:, :]
+    dst = tmem_op(0, 0, dtype=n.DType.U32)
     src = smem([512], dtype=n.DType.U32)[:]
-    make([n.Tcgen05Cp(dst=dst, src=src)])
-    dst = tmem([128, 32], dtype=n.DType.F8E4M3)[:, :]
+    make([n.Tcgen05Cp(dst=dst, src=src)], tmem_cg=1)
+    dst = tmem_op(0, 0, dtype=n.DType.F8E4M3)
     src = smem([1, 256, 16], dtype=n.DType.F8E4M3)[:, :, :]
-    make([n.Tcgen05Cp(dst=dst, src=src)])
+    make([n.Tcgen05Cp(dst=dst, src=src)], tmem_cg=1)
 
 
 def test_rejects_tcgen05_cp_dtype_mismatch():
-    dst = tmem([128, 4], dtype=n.DType.U32)[:, :]
+    dst = tmem_op(0, 0, dtype=n.DType.U32)
     src = smem([512], dtype=n.DType.F8E4M3)[:]
     with pytest.raises(ValueError, match="tcgen05_cp dst and src dtype must match"):
-        make([n.Tcgen05Cp(dst=dst, src=src)])
+        make([n.Tcgen05Cp(dst=dst, src=src)], tmem_cg=1)
 
 
 def test_rejects_tcgen05_cp_u32_src_not_1d():
-    dst = tmem([128, 4], dtype=n.DType.U32)[:, :]
+    dst = tmem_op(0, 0, dtype=n.DType.U32)
     src = smem([128, 4], dtype=n.DType.U32)[:, :]
     with pytest.raises(ValueError, match="u32 src must be effectively 1-D"):
-        make([n.Tcgen05Cp(dst=dst, src=src)])
+        make([n.Tcgen05Cp(dst=dst, src=src)], tmem_cg=1)
 
 
-def test_rejects_tcgen05_cp_e4m3_dst_not_block_multiple():
-    dst = tmem([128, 3], dtype=n.DType.F8E4M3)[:, :]
+def test_rejects_tcgen05_cp_dst_row_nonzero():
+    # The copy is lane-anchored: the dst operand's row (base lane) must be 0. (The
+    # old dst-tensor column-extent multiple check is gone — the de-tensored operand
+    # carries no extent; the fold is implied by the src tile.)
+    dst = tmem_op(8, 0, dtype=n.DType.F8E4M3)
     src = smem([1, 64, 6], dtype=n.DType.F8E4M3)[:, :, :]
-    with pytest.raises(ValueError, match="must be a multiple of the src's innermost"):
-        make([n.Tcgen05Cp(dst=dst, src=src)])
+    with pytest.raises(ValueError, match=r"tcgen05_cp dst row \(lane\) must be 0"):
+        make([n.Tcgen05Cp(dst=dst, src=src)], tmem_cg=1)
 
 
 # ---- shuffle_sync ------------------------------------------------------------
@@ -574,7 +587,7 @@ def test_rejects_mbarrier_init_zero_count():
 
 def test_rejects_tmem_alloc_bad_ncols():
     with pytest.raises(ValueError, match=r"power-of-two integer in \[32, 512\]"):
-        make([n.TmemAlloc(tmem([128, 256]), n_cols=33)])
+        make([n.TmemAlloc(0, 33)])
 
 
 # ---- role / scope ----------------------------------------------------------
@@ -612,14 +625,14 @@ def test_rejects_cta_sync_inside_role():
 
 def test_rejects_tmem_alloc_outside_warp_scope():
     with pytest.raises(ValueError, match="must be in warp scope"):
-        make([n.TmemAlloc(tmem([128, 256]), n_cols=64)])  # at CTA scope
+        make([n.TmemAlloc(0, 64)])  # at CTA scope
 
 
 # ---- tcgen05 ld/st ---------------------------------------------------------
 
 
 def test_accepts_non_32x32b_tcgen05_ld_st_atom():
-    tm = tmem([128, 32], dtype=n.DType.U32)
+    tm = tmem_op(0, 0, dtype=n.DType.U32)
     frag = reg([4], dtype=n.DType.U32)
     make(
         [
@@ -633,11 +646,12 @@ def test_accepts_non_32x32b_tcgen05_ld_st_atom():
         ],
         launch=(1,),
         cluster=(1,),
+        tmem_cg=1,
     )
 
 
 def test_rejects_invalid_tcgen05_ld_st_atom_num():
-    tm = tmem([128, 32], dtype=n.DType.U32)
+    tm = tmem_op(0, 0, dtype=n.DType.U32)
     frag = reg([128], dtype=n.DType.U32)
     with pytest.raises(ValueError, match="shape/num"):
         make([n.Role(body=(n.Tcgen05Ld(dst=frag[:], src=tm, shape="16x128b", num=128),))])
@@ -695,10 +709,7 @@ def test_rejects_var_defined_twice():
 
 def test_rejects_inconsistent_cta_group():
     # two tmem allocs (in warp scope) with different cta_group
-    body = (
-        n.TmemAlloc(tmem([128, 256]), n_cols=64, cta_group=1),
-        n.TmemAlloc(tmem([128, 256]), n_cols=64, cta_group=2),
-    )
+    body = (n.TmemAlloc(0, 64, cta_group=1), n.TmemAlloc(64, 64, cta_group=2))
     with pytest.raises(ValueError, match="cta_group must be consistent"):
         make([n.Role(body=body, warp=0)])
 

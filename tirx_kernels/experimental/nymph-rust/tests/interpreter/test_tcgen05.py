@@ -9,7 +9,7 @@ from helpers import (
     reg_tensor,
     run,
     smem_tensor,
-    tmem_tensor,
+    tmem_operand,
     u32,
 )
 
@@ -123,27 +123,29 @@ def u32_sentinels(rows, cols):
 
 def _tcgen05_role_failure_kernel(op, *, row=0, col=0, elected=False, shape="32x32b"):
     b = builder("tcgen05_datapath_failure")
-    src = tmem_tensor(b, dtype=nr.DType.F32, shape=(128, 128), col_start=0)
     dst = reg_tensor(b, dtype=nr.DType.F32, shape=(1,))
     with b.kernel_init(warp=0):
-        b.tmem_alloc(src, n_cols=64)
+        b.tmem_alloc(0, 64)
     with b.role(warp=0, elected=elected):
         if op == "ld":
-            b.tcgen05_ld(dst, src, shape=shape, row=row, col=col)
+            b.tcgen05_ld(dst, tmem_operand(row, col, nr.DType.F32), shape=shape)
         else:
-            b.tcgen05_st(src, dst, shape=shape, row=row, col=col)
+            b.tcgen05_st(tmem_operand(row, col, nr.DType.F32), dst, shape=shape)
     return b.build()
 
 
 def test_tcgen05_ld_st_reject_partial_warp_and_tmem_bounds_fail_closed():
     with expect_runtime_error("tcgen05_ld_mask"):
         run(_tcgen05_role_failure_kernel("ld", elected=True))
-    with expect_runtime_error("tcgen05_ld_out_of_range"):
-        run(_tcgen05_role_failure_kernel("ld", row=128))
     with expect_runtime_error("tcgen05_st_mask"):
         run(_tcgen05_role_failure_kernel("st", elected=True))
-    with expect_runtime_error("tcgen05_st_out_of_range"):
-        run(_tcgen05_role_failure_kernel("st", col=512))
+    # An out-of-range absolute (lane, col) operand address is now rejected by the
+    # IR validator at Kernel construction (it used to reach the interpreter's
+    # tcgen05_ld/st_out_of_range bounds check).
+    with pytest.raises(ValueError, match=r"row \(TMEM lane\) must be in \[0, 128\)"):
+        _tcgen05_role_failure_kernel("ld", row=128)
+    with pytest.raises(ValueError, match=r"col \(TMEM column\) must be in \[0, 512\)"):
+        _tcgen05_role_failure_kernel("st", col=512)
 
 
 def test_tcgen05_ld_st_reject_row_escaping_subpartition():
@@ -162,15 +164,15 @@ def test_tcgen05_cp_commit_wait_reject_partial_warp_cohort():
     # cp/commit are single-thread-ISSUE like the MMA: a full warp or a single
     # elected lane. A ragged partial cohort is a real divergence bug.
     b = builder("tcgen05_cp_partial", smem_size_bytes=512)
-    dst = tmem_tensor(b, dtype=nr.DType.U32, shape=(128, 1), col_start=0)
     src = smem_tensor(b, dtype=nr.DType.U32, shape=(128,), byte_offset=0)
     with b.kernel_init(warp=0):
-        b.tmem_alloc(dst, n_cols=32)
+        b.tmem_alloc(0, 32)
     with b.role(warp=0):
         with b.if_(b.lane_id() < 16):
-            b.tcgen05_cp(dst, src)
+            b.tcgen05_cp(tmem_operand(0, 0, nr.DType.U32), src)
     with b.kernel_finalize(warp=0):
-        b.tmem_dealloc(dst, n_cols=32)
+        b.tmem_relinquish()
+        b.tmem_dealloc(0, 32)
     with expect_runtime_error("tcgen05_cp_mask"):
         run(b.build())
 
@@ -204,7 +206,6 @@ def _reg_row_cols(b, tensor, col, cols):
 def _tcgen05_datapath_kernel(shape, num, mode, row=0):
     reg_size = register_count(shape, num)
     b = builder(f"tcgen05_{mode}_datapath")
-    tmem = tmem_tensor(b, dtype=nr.DType.U32, shape=(128, 256), col_start=0)
     seed_g = gmem_arg(b, shape=(128, 256))
     source_g = gmem_arg(b, shape=(128, reg_size))
     out = gmem_arg(b, shape=(128, 256 if mode == "st" else reg_size))
@@ -214,25 +215,26 @@ def _tcgen05_datapath_kernel(shape, num, mode, row=0):
     chunk_reg = reg_tensor(b, shape=(128,))
 
     with b.kernel_init(warp=0):
-        b.tmem_alloc(tmem, n_cols=256)
+        b.tmem_alloc(0, 256)
 
     with b.role(warpgroup=0):
         for col in [0, 128]:
             b.reg_load(seed_reg, _reg_row_cols(b, seed_g, col, 128))
-            b.tcgen05_st(tmem, seed_reg, shape="32x32b", num=128, row=0, col=col)
+            b.tcgen05_st(tmem_operand(0, col, nr.DType.U32), seed_reg, shape="32x32b", num=128)
 
         if mode == "st":
             b.reg_load(source_reg, _reg_row_cols(b, source_g, 0, reg_size))
-            b.tcgen05_st(tmem, source_reg, shape=shape, num=num, row=row, col=0)
+            b.tcgen05_st(tmem_operand(row, 0, nr.DType.U32), source_reg, shape=shape, num=num)
             for col in [0, 128]:
-                b.tcgen05_ld(chunk_reg, tmem, shape="32x32b", num=128, row=0, col=col)
+                b.tcgen05_ld(chunk_reg, tmem_operand(0, col, nr.DType.U32), shape="32x32b", num=128)
                 b.reg_store(_reg_row_cols(b, out, col, 128), chunk_reg)
         else:
-            b.tcgen05_ld(out_reg, tmem, shape=shape, num=num, row=row, col=0)
+            b.tcgen05_ld(out_reg, tmem_operand(row, 0, nr.DType.U32), shape=shape, num=num)
             b.reg_store(_reg_row_cols(b, out, 0, reg_size), out_reg)
 
     with b.kernel_finalize(warp=0):
-        b.tmem_dealloc(tmem, n_cols=256)
+        b.tmem_relinquish()
+        b.tmem_dealloc(0, 256)
 
     return b.build(), seed_g, source_g, out
 
@@ -316,17 +318,17 @@ def _mma64_kernel(dtype, lane_align, accum, trans_a, trans_b):
     out = gmem_arg(b, dtype=nr.DType.F32, shape=(128, n))
     a_s = smem_tensor(b, dtype=dtype, shape=a_shape, byte_offset=0)
     b_s = smem_tensor(b, dtype=dtype, shape=b_shape, byte_offset=a_bytes)
-    dst = tmem_tensor(b, dtype=nr.DType.F32, shape=(m, n), col_start=0)
+    dst = tmem_operand(0, 0, nr.DType.F32)  # accumulator band at physical col 0
     frag = reg_tensor(b, dtype=nr.DType.F32, shape=(n,))
     ma = b.mbar(kind=nr.MBarKind.TMA)
     mb = b.mbar(kind=nr.MBarKind.TMA)
 
     with b.kernel_init(warp=0):
-        b.tmem_alloc(dst, n_cols=32)
+        b.tmem_alloc(0, 32)
 
     with b.role(warpgroup=0):
         b.reg_load(frag, zero_g[b.tid_in_wg(), 0:n])
-        b.tcgen05_st(dst, frag, shape="32x32b", num=n, row=0, col=0)
+        b.tcgen05_st(dst, frag, shape="32x32b", num=n)
         b.mbarrier_init(ma, count=1)
         b.mbarrier_expect_tx(ma, bytes=a_bytes)
         b.tma_load(a_s, a_g, mbar=ma, bytes=a_bytes, coords=(0, 0), shape=a_shape)
@@ -358,11 +360,12 @@ def _mma64_kernel(dtype, lane_align, accum, trans_a, trans_b):
                 trans_b=trans_b,
                 lane_align=lane_align,
             )
-        b.tcgen05_ld(frag, dst, shape="32x32b", num=n, row=0, col=0)
+        b.tcgen05_ld(frag, dst, shape="32x32b", num=n)
         b.reg_store(out[b.tid_in_wg(), 0:n], frag)
 
     with b.kernel_finalize(warp=0):
-        b.tmem_dealloc(dst, n_cols=32)
+        b.tmem_relinquish()
+        b.tmem_dealloc(0, 32)
 
     return b.build(), a_g, b_g, zero_g, out
 
@@ -408,25 +411,16 @@ def test_tcgen05_mma_m64_layout_f_transpose_accum_and_dtype():
                         assert got == expected
 
 
-def _build_mma_failure(
-    *,
-    dst_shape=(128, 16),
-    col_start=0,
-    lane_align=0,
-    a_shape=(128, 16),
-    dst_slice=None,
-    allocate=True,
-):
+def _build_mma_failure(*, dst_row=0, dst_col=0, lane_align=0, a_shape=(128, 16), allocate=True):
     b = builder("mma_failure", smem_size_bytes=1 << 16)
-    dst = tmem_tensor(b, dtype=nr.DType.F32, shape=dst_shape, col_start=col_start)
     a = smem_tensor(b, dtype=nr.DType.F16, shape=a_shape, byte_offset=0)
     b_s = smem_tensor(b, dtype=nr.DType.F16, shape=(16, 16), byte_offset=4096)
     if allocate:
         with b.kernel_init(warp=0):
-            b.tmem_alloc(dst, n_cols=32)
+            b.tmem_alloc(0, 32)
     with b.role(warp=0):
         b.tcgen05_mma(
-            dst if dst_slice is None else dst_slice(dst),
+            tmem_operand(dst_row, dst_col, nr.DType.F32),
             a,
             b_s,
             m=128,
@@ -443,17 +437,24 @@ def test_tcgen05_mma_fail_closed_before_panics_or_wrong_writes():
     with pytest.raises(ValueError, match=r"lane_align != 0 requires cta_group=1 and m=64"):
         _build_mma_failure(lane_align=16)
 
-    with expect_runtime_error("tcgen05_mma_dst_offset"):
-        run(_build_mma_failure(dst_shape=(129, 16), dst_slice=lambda dst: dst[1:129, :]))
+    # A nonzero dst base lane is a build-time error now (the full-datapath
+    # accumulator layouts are lane-anchored; it used to be the interpreter's
+    # tcgen05_mma_dst_offset error).
+    with pytest.raises(ValueError, match=r"dst row \(lane\) must be 0"):
+        _build_mma_failure(dst_row=1)
 
-    with expect_runtime_error("tcgen05_mma_out_of_range"):
-        run(_build_mma_failure(col_start=500))
+    # A dst column span escaping every live allocation band is a build-time
+    # error now (it used to be the interpreter's tcgen05_mma_out_of_range).
+    with pytest.raises(ValueError, match="not inside a live tmem allocation band"):
+        _build_mma_failure(dst_col=500)
 
     with expect_runtime_error("tcgen05_mma_shape"):
         run(_build_mma_failure(a_shape=(129, 16)))
 
-    with expect_runtime_error("missing_tmem_scratchpad"):
-        run(_build_mma_failure(allocate=False))
+    # No allocation at all: every live-band check fails at build time (it used
+    # to be the interpreter's missing_tmem_scratchpad).
+    with pytest.raises(ValueError, match="not inside a live tmem allocation band"):
+        _build_mma_failure(allocate=False)
 
 
 def _tmem_operand_mma_kernel():
@@ -462,8 +463,10 @@ def _tmem_operand_mma_kernel():
     p_g = gmem_arg(b, dtype=nr.DType.F16, shape=(128, k))
     b_g = gmem_arg(b, dtype=nr.DType.F16, shape=(n, k))
     out = gmem_arg(b, dtype=nr.DType.F32, shape=(128, n))
-    p = tmem_tensor(b, dtype=nr.DType.F16, shape=(m, k), col_start=0)
-    dst = tmem_tensor(b, dtype=nr.DType.F32, shape=(m, n), col_start=32)
+    # Two TMEM column bands: the packed-f16 operand P at col 0, the f32
+    # accumulator at col 32.
+    p = tmem_operand(0, 0, nr.DType.F16)
+    dst = tmem_operand(0, 32, nr.DType.F32)
     b_s = smem_tensor(b, dtype=nr.DType.F16, shape=(n, k), byte_offset=0)
     p_frag = reg_tensor(b, dtype=nr.DType.F16, shape=(k,))
     out_frag = reg_tensor(b, dtype=nr.DType.F32, shape=(n,))
@@ -471,14 +474,14 @@ def _tmem_operand_mma_kernel():
     mc = b.mbar(kind=nr.MBarKind.TCGEN05)
 
     with b.kernel_init(warp=0):
-        b.tmem_alloc(p, n_cols=32)
-        b.tmem_alloc(dst, n_cols=32)
+        b.tmem_alloc(0, 32)
+        b.tmem_alloc(32, 32)
     with b.role(warpgroup=0):
         b.reg_fill(out_frag, 0.0)
-        b.tcgen05_st(dst, out_frag, shape="32x32b", num=n, row=0, col=0)
+        b.tcgen05_st(dst, out_frag, shape="32x32b", num=n)
         b.tcgen05_wait_st()
         b.reg_load(p_frag, p_g[b.tid_in_wg(), 0:k])
-        b.tcgen05_st(p, p_frag[0 : k // 2], shape="32x32b", num=k // 2, row=0, col=0)
+        b.tcgen05_st(p, p_frag[0 : k // 2], shape="32x32b", num=k // 2)
         b.tcgen05_wait_st()
         b.mbarrier_init(mb, count=1)
         with b.if_(b.tid_in_wg().eq(0)):
@@ -488,11 +491,13 @@ def _tmem_operand_mma_kernel():
         b.mbarrier_init(mc, count=1)
         b.tcgen05_mma(dst, p, b_s, m=m, n=n, k=k)
         b.tcgen05_commit(mc)
-        b.tcgen05_ld(out_frag, dst, shape="32x32b", num=n, row=0, col=0)
+        b.tcgen05_ld(out_frag, dst, shape="32x32b", num=n)
         b.reg_store(out[b.tid_in_wg(), 0:n], out_frag)
     with b.kernel_finalize(warp=0):
-        b.tmem_dealloc(dst, n_cols=32)
-        b.tmem_dealloc(p, n_cols=32)
+        b.tmem_relinquish()
+        b.tmem_dealloc(32, 32)
+        b.tmem_relinquish()
+        b.tmem_dealloc(0, 32)
 
     return b.build(), p_g, b_g, out
 
@@ -529,20 +534,21 @@ def test_tcgen05_mma_value_mode_accepts_tmem_operand():
 def _f16_tmem_store_kernel():
     b = builder("f16_tmem_store")
     out = gmem_arg(b, dtype=nr.DType.F16, shape=(32, 2))
-    tmem = tmem_tensor(b, dtype=nr.DType.F16, shape=(128, 32), col_start=0)
+    tmem = tmem_operand(0, 0, nr.DType.F16)
     frag = reg_tensor(b, dtype=nr.DType.F16, shape=(2,))
     loaded = reg_tensor(b, dtype=nr.DType.F16, shape=(2,))
     with b.kernel_init(warp=0):
-        b.tmem_alloc(tmem, n_cols=32)
+        b.tmem_alloc(0, 32)
     with b.role(warp=0):
         b.reg_fill(frag[0], 1.0)
         b.reg_fill(frag[1], 2.0)
-        b.tcgen05_st(tmem, frag[0:1], shape="32x32b", num=1, row=0, col=0)
+        b.tcgen05_st(tmem, frag[0:1], shape="32x32b", num=1)
         b.tcgen05_wait_st()
-        b.tcgen05_ld(loaded[0:1], tmem, shape="32x32b", num=1, row=0, col=0)
+        b.tcgen05_ld(loaded[0:1], tmem, shape="32x32b", num=1)
         b.reg_store(out[b.tid_in_wg(), 0:2], loaded)
     with b.kernel_finalize(warp=0):
-        b.tmem_dealloc(tmem, n_cols=32)
+        b.tmem_relinquish()
+        b.tmem_dealloc(0, 32)
     return b.build(), out
 
 
@@ -601,16 +607,11 @@ def _mma_cg2_peer_smem_kernel(synced):
     )
     a_smem = smem_tensor(b, dtype=nr.DType.F16, shape=(128, mma_k), byte_offset=0)
     b_smem = smem_tensor(b, dtype=nr.DType.F16, shape=(n // 2, mma_k), byte_offset=a_bytes)
-    accum = b.tensor(
-        space=nr.MemorySpace.TMEM,
-        dtype=nr.DType.F32,
-        shape=(128, n),
-        layout=nr.TmemLayout(nr.TmemLayoutKind.LANE_128, col_start=0),
-    )
+    accum = tmem_operand(0, 0, nr.DType.F32)  # accumulator band at physical col 0
     ready = b.mbar(kind=nr.MBarKind.THREAD)
     ready_leader = b.mbar_ref(ready, remote_coord=0)  # absolute coord: the leader's cell
     with b.kernel_init(warp=0):
-        b.tmem_alloc(accum, n_cols=32, cta_group=2)
+        b.tmem_alloc(0, 32, cta_group=2)
         b.mbarrier_init(ready, count=1)
     with b.role(warp=0):
         cta = b.ctaid_in_cluster()
@@ -629,7 +630,8 @@ def _mma_cg2_peer_smem_kernel(synced):
                 b.mbarrier_wait(ready, phase=0)
             b.tcgen05_mma(accum, a_smem, b_smem, m=m, n=n, k=mma_k, accum=False, cta_group=2)
     with b.kernel_finalize(warp=0):
-        b.tmem_dealloc(accum, n_cols=32, cta_group=2)
+        b.tmem_relinquish(cta_group=2)
+        b.tmem_dealloc(0, 32, cta_group=2)
     return b.build()
 
 
@@ -661,15 +663,10 @@ def _mma_operand_overwrite_kernel(drain):
     )
     a = smem_tensor(b, dtype=nr.DType.F16, shape=(128, 16), byte_offset=0)
     bb = smem_tensor(b, dtype=nr.DType.F16, shape=(16, 16), byte_offset=128 * 16 * 2)
-    acc = b.tensor(
-        space=nr.MemorySpace.TMEM,
-        dtype=nr.DType.F32,
-        shape=(128, 16),
-        layout=nr.TmemLayout(nr.TmemLayoutKind.LANE_128, col_start=0),
-    )
+    acc = tmem_operand(0, 0, nr.DType.F32)  # accumulator band at physical col 0
     done = b.mbar(kind=nr.MBarKind.TCGEN05)
     with b.kernel_init(warp=0):
-        b.tmem_alloc(acc, n_cols=32, cta_group=1)
+        b.tmem_alloc(0, 32, cta_group=1)
         b.mbarrier_init(done, count=1)
     with b.role(warp=0):
         with b.if_(b.lane_id().eq(0)):
@@ -683,7 +680,8 @@ def _mma_operand_overwrite_kernel(drain):
         with b.if_(b.lane_id().eq(0)):
             b.store_scalar(nr.TensorSlice(tensor=a, offsets=(0, 0), shape=(1, 1)), 1)
     with b.kernel_finalize(warp=0):
-        b.tmem_dealloc(acc, n_cols=32, cta_group=1)
+        b.tmem_relinquish(cta_group=1)
+        b.tmem_dealloc(0, 32, cta_group=1)
     return b.build()
 
 
@@ -708,16 +706,11 @@ def _mma_acc_read_release_kernel(commit_release):
     )
     a = smem_tensor(b, dtype=nr.DType.F16, shape=(128, 16), byte_offset=0)
     bb = smem_tensor(b, dtype=nr.DType.F16, shape=(16, 16), byte_offset=128 * 16 * 2)
-    acc = b.tensor(
-        space=nr.MemorySpace.TMEM,
-        dtype=nr.DType.F32,
-        shape=(128, 16),
-        layout=nr.TmemLayout(nr.TmemLayoutKind.LANE_128, col_start=0),
-    )
+    acc = tmem_operand(0, 0, nr.DType.F32)  # accumulator band at physical col 0
     frag = reg_tensor(b, dtype=nr.DType.F32, shape=(16,))
     done = b.mbar(kind=nr.MBarKind.TCGEN05 if commit_release else nr.MBarKind.THREAD)
     with b.kernel_init(warp=0):
-        b.tmem_alloc(acc, n_cols=32, cta_group=1)
+        b.tmem_alloc(0, 32, cta_group=1)
         b.mbarrier_init(done, count=1)
     with b.role(warp=0):
         with b.if_(b.lane_id().eq(0)):
@@ -732,10 +725,11 @@ def _mma_acc_read_release_kernel(commit_release):
                 b.mbarrier_arrive(done)
     with b.role(warp=4):
         b.mbarrier_wait(done, phase=0)
-        b.tcgen05_ld(frag, acc, num=16, row=0, col=0)
+        b.tcgen05_ld(frag, acc, num=16)
         b.tcgen05_wait_ld()
     with b.kernel_finalize(warp=0):
-        b.tmem_dealloc(acc, n_cols=32, cta_group=1)
+        b.tmem_relinquish(cta_group=1)
+        b.tmem_dealloc(0, 32, cta_group=1)
     return b.build()
 
 

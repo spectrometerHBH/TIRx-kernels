@@ -5,7 +5,7 @@ from helpers import (
     gmem_arg,
     reg_tensor,
     smem_tensor,
-    tmem_tensor,
+    tmem_operand,
     u32,
 )
 from nymph_rs.kernels import build_fp16_bf16_gemm
@@ -293,14 +293,15 @@ def test_protocol_tmem_mma_layout_f_emits_union_boxes():
     b = builder("protocol_tmem_layout_f_boxes", smem_size_bytes=a_bytes + b_bytes)
     a_s = smem_tensor(b, dtype=nr.DType.F16, shape=(m, k), byte_offset=0)
     b_s = smem_tensor(b, dtype=nr.DType.F16, shape=(n, k), byte_offset=a_bytes)
-    dst = tmem_tensor(b, dtype=nr.DType.F32, shape=(m, n), col_start=0)
+    dst = tmem_operand(0, 0, nr.DType.F32)  # accumulator band at physical col 0
 
     with b.kernel_init(warp=0):
-        b.tmem_alloc(dst, n_cols=32)
+        b.tmem_alloc(0, 32)
     with b.role(warpgroup=0):
         b.tcgen05_mma(dst, a_s, b_s, m=m, n=n, k=k, accum=False, cta_group=1)
     with b.kernel_finalize(warp=0):
-        b.tmem_dealloc(dst, n_cols=32)
+        b.tmem_relinquish()
+        b.tmem_dealloc(0, 32)
 
     report = nr.check_protocol(b.build(), include_events=True)
     assert report["status"] == "Passed"
@@ -324,16 +325,17 @@ def test_protocol_tmem_mma_layout_f_emits_union_boxes():
 
 def test_protocol_tmem_async_overlap_fails_before_wait():
     b = builder("protocol_tmem_async_overlap")
-    tmem = tmem_tensor(b, dtype=nr.DType.F32, shape=(128, 32), col_start=0)
+    tmem = tmem_operand(0, 0, nr.DType.F32)
     reg = reg_tensor(b, dtype=nr.DType.F32, shape=(1,))
 
     with b.kernel_init(warp=0):
-        b.tmem_alloc(tmem, n_cols=32)
+        b.tmem_alloc(0, 32)
     with b.role(warp=0):
-        b.tcgen05_st(tmem, reg, shape="32x32b", num=1, row=0, col=0)
-        b.tcgen05_st(tmem, reg, shape="32x32b", num=1, row=0, col=0)
+        b.tcgen05_st(tmem, reg, shape="32x32b", num=1)
+        b.tcgen05_st(tmem, reg, shape="32x32b", num=1)
     with b.kernel_finalize(warp=0):
-        b.tmem_dealloc(tmem, n_cols=32)
+        b.tmem_relinquish()
+        b.tmem_dealloc(0, 32)
 
     report = nr.check_protocol(b.build())
     assert report["status"] == "Failed"
