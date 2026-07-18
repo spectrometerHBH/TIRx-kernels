@@ -189,6 +189,63 @@ mod tests {
     }
 
     #[test]
+    fn let_binding_validates_and_feeds_later_defs() {
+        // A `ScalarLet` defines its var (later uses resolve) and stays single-shot.
+        let s = Var {
+            id: VarId(0),
+            binding: VarBinding::Scalar,
+            dtype: ScalarDType::I32,
+        };
+        let t = Var {
+            id: VarId(1),
+            binding: VarBinding::Scalar,
+            dtype: ScalarDType::I32,
+        };
+        let body = vec![
+            Stmt::ScalarLet {
+                var: s,
+                value: ScalarValue::expr(
+                    ScalarOp::Add,
+                    vec![ScalarValue::Int(1), ScalarValue::Int(2)],
+                ),
+            },
+            Stmt::ScalarDef {
+                var: t,
+                initial: ScalarInitial::Value(ScalarValue::Var(s)),
+            },
+            Stmt::CtaSync,
+        ];
+        assert!(kernel(body, 4).validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_scalar_store_to_let_var() {
+        // The let contract is single-assignment: a ScalarStore to the var is
+        // rejected even though the var is defined at that point.
+        let s = Var {
+            id: VarId(0),
+            binding: VarBinding::Scalar,
+            dtype: ScalarDType::I32,
+        };
+        let e = kernel(
+            vec![
+                Stmt::ScalarLet {
+                    var: s,
+                    value: ScalarValue::Int(0),
+                },
+                Stmt::ScalarStore {
+                    var: s,
+                    value: ScalarValue::Int(5),
+                },
+            ],
+            4,
+        )
+        .validate()
+        .unwrap_err();
+        assert!(e.message.contains("single assignment"), "{}", e.message);
+    }
+
+    #[test]
     fn rejects_cta_sync_in_warp_scope() {
         // cta_sync inside a warp-scope init block -> scope walk fails.
         let body = vec![Stmt::KernelInit {

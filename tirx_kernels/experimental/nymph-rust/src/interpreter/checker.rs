@@ -2089,6 +2089,7 @@ fn walk_tensors(body: &[Stmt], tensors: &mut HashMap<u32, TensorInfo>) {
             // skips them (same as before — now explicit rather than a `_`).
             Stmt::TmemAlloc { .. } | Stmt::TmemDealloc { .. } | Stmt::TmemRelinquish { .. } => {}
             Stmt::ScalarDef { .. } | Stmt::ScalarStore { .. } | Stmt::ShuffleSync { .. } => {}
+            Stmt::ScalarLet { .. } => {}
             Stmt::MBarDef { .. } => {}
             Stmt::KernelInit { .. }
             | Stmt::KernelFinalize { .. }

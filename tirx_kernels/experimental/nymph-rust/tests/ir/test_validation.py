@@ -713,6 +713,21 @@ def test_rejects_var_defined_twice():
         make([n.ScalarDef(var=v, initial=0), n.ScalarDef(var=v, initial=1)])
 
 
+# ---- scalar let (single-assignment SSA binding) -----------------------------
+
+
+def test_scalar_let_defines_and_feeds_later_uses():
+    v = n.Var(binding=n.VarBinding.SCALAR, dtype=n.ScalarDType.I32)
+    w = n.Var(binding=n.VarBinding.SCALAR, dtype=n.ScalarDType.I32)
+    make([n.ScalarLet(var=v, value=1 + 2), n.ScalarDef(var=w, initial=v), n.CtaSync()])
+
+
+def test_rejects_scalar_store_to_let_var():
+    v = n.Var(binding=n.VarBinding.SCALAR, dtype=n.ScalarDType.I32)
+    with pytest.raises(ValueError, match="single assignment"):
+        make([n.ScalarLet(var=v, value=0), n.ScalarStore(var=v, value=5)])
+
+
 # ---- cross-statement walks -------------------------------------------------
 
 

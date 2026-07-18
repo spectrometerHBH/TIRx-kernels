@@ -1308,6 +1308,7 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
         for s in stmts {
             let defined = match s {
                 Stmt::ScalarDef { var, .. }
+                | Stmt::ScalarLet { var, .. }
                 | Stmt::ShuffleSync { var, .. }
                 | Stmt::ClcQueryCancel { var, .. } => Some(var),
                 _ => None,
@@ -1608,7 +1609,8 @@ fn is_nonneg(sv: &ScalarValue, nonneg_vars: &HashSet<u32>) -> bool {
 ///   * scalar vars whose EVERY definition is provably non-negative: the
 ///     `ScalarDef` initial (a `ScalarInitial::Tensor` mailbox load is never
 ///     assumed non-negative — it can carry the -1 sentinel), every
-///     `ScalarStore` source, and every `ShuffleSync` source. Seeded
+///     `ScalarStore` source, every `ScalarLet` value, and every `ShuffleSync`
+///     source. Seeded
 ///     optimistically, then dropped to a fixpoint (a ring counter defined
 ///     through its own non-negative update chain converges). A
 ///     `ClcQueryCancel` result is never non-negative (0xFFFFFFFF -> -1 on drain).
@@ -1651,6 +1653,9 @@ fn collect_nonneg_vars(k: &Kernel) -> HashSet<u32> {
                     }
                 }
                 Stmt::ScalarStore { var, value } => {
+                    defs.entry(var.id.0).or_default().exprs.push(value.clone());
+                }
+                Stmt::ScalarLet { var, value } => {
                     defs.entry(var.id.0).or_default().exprs.push(value.clone());
                 }
                 Stmt::ShuffleSync { var, src, .. } => {
@@ -2491,6 +2496,24 @@ fn emit_stmt(
             // Reassign the SSA register var (canon's `sa_stage = …`), no `[0]` cell index.
             out.push_str(&format!(
                 "{p}{name} = {}\n",
+                emit_scalar(value, ctx)?,
+                name = name
+            ));
+            Ok(())
+        }
+        // Single-assignment `let`: `name: T.let[T.int32] = expr` — an immutable
+        // SSA `T.Bind` (canon's tile-coord decode chain form), NOT the mutable
+        // `local_scalar` cell a `T.int32 = …` annotation lowers to. The SSA
+        // dataflow is what lets ptxas keep the value (and everything derived
+        // from it) on the uniform datapath; a mutable local forces vector regs
+        // + R2UR moves at every uniform-sink use (the fp16 1024 R2UR gap).
+        ScalarLet { var, value } => {
+            let name = ctx
+                .scalar_names
+                .get(&var.id.0)
+                .ok_or_else(|| format!("codegen: no name for scalar var {}", var.id.0))?;
+            out.push_str(&format!(
+                "{p}{name}: T.let[T.int32] = {}\n",
                 emit_scalar(value, ctx)?,
                 name = name
             ));
@@ -3648,6 +3671,25 @@ mod tests {
                 .contains("must only be used by TmaLoad/expect_tx"),
             "{err}"
         );
+    }
+
+    /// A `ScalarLet` emits the immutable SSA form `name: T.let[T.int32] = expr`
+    /// (canon's tile-decode chain), NOT the mutable `name: T.int32 = …`
+    /// local-scalar cell a plain annotation lowers to.
+    #[test]
+    fn scalar_let_emits_the_t_let_form() {
+        let v = scalar_var(0);
+        let k = kernel(vec![Stmt::ScalarLet {
+            var: v,
+            value: ScalarValue::expr(
+                ScalarOp::Add,
+                vec![ScalarValue::Int(1), ScalarValue::Int(2)],
+            ),
+        }]);
+        let src = kernel_to_tirx_source(&k).unwrap();
+        assert!(src.contains("s0: T.let[T.int32] = 1 + 2"), "{src}");
+        // And the var-defs bookkeeping names it like any scalar def.
+        assert!(!src.contains("s0 ="), "{src}");
     }
 
     /// The structured guard merge keys on the emission-site annotation, not the

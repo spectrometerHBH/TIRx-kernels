@@ -1772,6 +1772,7 @@ impl PyStmt {
             | ir::Stmt::SchedNext { var, .. }
             | ir::Stmt::ScalarDef { var, .. }
             | ir::Stmt::ScalarStore { var, .. }
+            | ir::Stmt::ScalarLet { var, .. }
             | ir::Stmt::ShuffleSync { var, .. }
             | ir::Stmt::ClcQueryCancel { var, .. } => Ok(PyVar(*var)),
             _ => Err(PyAttributeError::new_err("var")),
@@ -1892,6 +1893,14 @@ fn scalar_def(var: PyVar, initial: Option<Bound<'_, PyAny>>) -> PyResult<PyStmt>
 #[pyo3(name = "ScalarStore")]
 fn scalar_store(var: PyVar, value: Bound<'_, PyAny>) -> PyResult<PyStmt> {
     Ok(PyStmt(ir::Stmt::ScalarStore {
+        var: var.0,
+        value: coerce_scalar(&value)?,
+    }))
+}
+#[pyfunction]
+#[pyo3(name = "ScalarLet")]
+fn scalar_let(var: PyVar, value: Bound<'_, PyAny>) -> PyResult<PyStmt> {
+    Ok(PyStmt(ir::Stmt::ScalarLet {
         var: var.0,
         value: coerce_scalar(&value)?,
     }))
@@ -2848,6 +2857,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(tmem_relinquish, m)?,
         wrap_pyfunction!(scalar_def, m)?,
         wrap_pyfunction!(scalar_store, m)?,
+        wrap_pyfunction!(scalar_let, m)?,
         wrap_pyfunction!(shuffle_sync, m)?,
         wrap_pyfunction!(store_scalar, m)?,
         wrap_pyfunction!(mbar_def, m)?,

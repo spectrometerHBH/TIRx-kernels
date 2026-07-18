@@ -15,6 +15,7 @@ use ndarray::Array1;
 pub fn register(reg: &mut StmtExecutorRegistry) {
     reg.register(StmtKind::ScalarDef, execute_scalar_def);
     reg.register(StmtKind::ScalarStore, execute_scalar_store);
+    reg.register(StmtKind::ScalarLet, execute_scalar_let);
     reg.register(StmtKind::StoreScalar, execute_store_scalar);
     reg.register(StmtKind::ShuffleSync, execute_shuffle_sync);
 }
@@ -121,6 +122,21 @@ fn execute_scalar_store<'a, 'k>(
 ) -> IResult<StepStatus> {
     let (var, value) = match stmt {
         Stmt::ScalarStore { var, value } => (var, value),
+        _ => unreachable!(),
+    };
+    let var_id = var.id.0;
+    let values = ctx.eval_scalar_vec(value)?.to_vec();
+    Ok(scalar_commit(ctx, var_id, &values))
+}
+
+/// `let` binding: value-wise identical to a scalar store (evaluate + bind). Its
+/// single-assignment contract is a validate-time rule; the interpreter just binds.
+fn execute_scalar_let<'a, 'k>(
+    ctx: &mut CohortContext<'a, 'k>,
+    stmt: &'k Stmt,
+) -> IResult<StepStatus> {
+    let (var, value) = match stmt {
+        Stmt::ScalarLet { var, value } => (var, value),
         _ => unreachable!(),
     };
     let var_id = var.id.0;

@@ -66,6 +66,7 @@ from .nymph_rs import (
     Role,
     ScalarDef,
     ScalarDType,
+    ScalarLet,
     ScalarStore,
     ScalarValue,
     SchedNext,
@@ -322,6 +323,18 @@ class IRBuilder:
 
     def scalar_store(self, var: Var, value: ScalarValue) -> None:
         self._append(ScalarStore(var=var, value=value))
+
+    def let(self, value: ScalarValue, *, dtype: ScalarDType = ScalarDType.I32) -> Var:
+        """Single-assignment ``let`` binding (canon's ``name: T.let = expr``): an
+        immutable SSA value, NOT a mutable local-scalar cell. Called inside a task
+        loop body it re-binds once per iteration — canon's ``while``-loop ``T.let``
+        form. The SSA dataflow is what lets ptxas keep the value (and the index
+        chain derived from it) on the uniform datapath; a mutable scalar forces
+        vector regs + R2UR moves at every uniform-sink use. ``scalar_store`` to a
+        let-bound var is rejected by validate (single assignment)."""
+        var = Var(binding=VarBinding.SCALAR, dtype=dtype)
+        self._append(ScalarLet(var=var, value=value))
+        return var
 
     def shuffle_sync(
         self, src: ScalarValue, src_lane: ScalarValue = 0, *, dtype: ScalarDType = ScalarDType.I32

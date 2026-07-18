@@ -354,6 +354,15 @@ pub enum Stmt {
         var: Var,
         value: ScalarValue,
     },
+    /// Single-assignment `let` binding (canon's `name: T.let = expr` — an immutable
+    /// SSA `T.Bind`, NOT a `local_scalar` cell). Every execution of the statement
+    /// binds `var` once; validate REJECTS any `ScalarStore` to it. Codegen emits the
+    /// `T.let` form so ptxas sees a pure SSA dataflow (mutable locals defeat its
+    /// uniform-register analysis — the R2UR problem; see docs/perf-methodology.md).
+    ScalarLet {
+        var: Var,
+        value: ScalarValue,
+    },
     /// Warp shuffle/broadcast that DEFINES a scalar: `var` gets the value of `src`
     /// evaluated on lane `src_lane` of each warp, broadcast to all lanes (a faithful
     /// `__shfl_sync`). First-class so the value-sim verifies it — broadcasting a value

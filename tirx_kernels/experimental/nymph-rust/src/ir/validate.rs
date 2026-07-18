@@ -580,6 +580,12 @@ fn validate_stmt(s: &Stmt) -> R {
             }
             validate_scalar(value)?;
         }
+        Stmt::ScalarLet { var, value } => {
+            if var.binding != VarBinding::Scalar {
+                return bail("scalar_let var binding must be scalar");
+            }
+            validate_scalar(value)?;
+        }
         Stmt::ShuffleSync { var, src, src_lane } => {
             if var.binding != VarBinding::Scalar {
                 return bail("shuffle_sync var binding must be scalar");
@@ -1949,6 +1955,12 @@ fn check_context(
                 collect_vars(value, &mut vars);
                 require_defined(&vars, defined, "scalar_store value")?;
             }
+            Stmt::ScalarLet { var, value } => {
+                let mut vars = Vec::new();
+                collect_vars(value, &mut vars);
+                require_defined(&vars, defined, "scalar_let value")?;
+                define_var(*var, defined)?;
+            }
             Stmt::ShuffleSync { var, src, src_lane } => {
                 let mut vars = Vec::new();
                 collect_vars(src, &mut vars);
@@ -2661,6 +2673,34 @@ impl Kernel {
         check_cta_group_consistency(&self.body)?;
         check_tmem_alloc_bands(self)?;
         check_leader_routed_mbars(self)?;
+        check_let_single_assignment(&self.body)?;
         Ok(())
     }
+}
+
+/// A `ScalarLet` var is single-assignment: reject any `ScalarStore` targeting it
+/// (the immutable SSA binding is what lets ptxas keep the value on the uniform
+/// datapath; a store would reintroduce the mutable-local form that breaks it).
+fn check_let_single_assignment(body: &[Stmt]) -> R {
+    fn walk(stmts: &[Stmt], let_vars: &mut HashSet<Var>, stores: &mut Vec<Var>) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::ScalarLet { var, .. } => {
+                    let_vars.insert(*var);
+                }
+                Stmt::ScalarStore { var, .. } => stores.push(*var),
+                _ => {}
+            }
+            for child in stmt.child_bodies() {
+                walk(child, let_vars, stores);
+            }
+        }
+    }
+    let mut let_vars = HashSet::new();
+    let mut stores = Vec::new();
+    walk(body, &mut let_vars, &mut stores);
+    if stores.iter().any(|v| let_vars.contains(v)) {
+        return bail("scalar_store cannot write a let-bound var (single assignment)");
+    }
+    Ok(())
 }

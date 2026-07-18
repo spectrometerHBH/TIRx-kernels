@@ -50,7 +50,7 @@ shape parameter or a per-config knob.
 | `cta_group` | cluster CTA-group (1 or 2) | the kernel's cluster shape |
 | `tmem_view_cols`, `sf_views` | the single f32 `tmem` view's column count + the e4m3 SF view decls (`SFA_tmem`/`SFB_tmem`) | structural: `max(base_col + n_cols)` over the kernel's `TmemAlloc`s; each SF view's folded logical shape from its `TmemOperand` base column |
 | `reg_widths` | REG-tensor id → collapsed band width | `walk_reg_widths` takes `max(offset+width)` over every slice of each REG fragment in the body — a property of the IR's accesses, not the shape |
-| `nonneg_vars` | var ids provably non-negative (the `%`/`//` strength-reduction gate) | computed by `collect_nonneg_vars`: ForLoop induction vars with a non-negative-literal start and positive-literal step, plus scalar vars whose every definition is provably non-negative (a fixpoint over `ScalarDef`/`ScalarStore`/`ShuffleSync`; mailbox loads and `ClcQueryCancel` results are never assumed) |
+| `nonneg_vars` | var ids provably non-negative (the `%`/`//` strength-reduction gate) | computed by `collect_nonneg_vars`: ForLoop induction vars with a non-negative-literal start and positive-literal step, plus scalar vars whose every definition is provably non-negative (a fixpoint over `ScalarDef`/`ScalarStore`/`ScalarLet`/`ShuffleSync`; mailbox loads and `ClcQueryCancel` results are never assumed) |
 | `tma_leader_mbars` | the mbar ids whose TMA tx is routed to CTA-0 (`smem_full`'s/`sf_full`'s leader view) | **explicit IR**: `MBar::leader_routed` set by the builder; validate requires a peer reference and TMA-load/expect_tx-only use. No structural guessing |
 
 ## Scope
@@ -117,7 +117,8 @@ parameters. An SF-classified tensor with a non-e4m3 dtype is an `Err`.
 | `ForLoop` | `for v in T.serial(N):` — or `for v in T.unroll(N):` when `unroll` is set | the `unroll` IR flag only; `T.serial` keeps the induction var in a uniform register. `unroll` requires literal start=0/step=1 (the emitted `T.unroll(stop)` form) — anything else fails closed with an `Err` |
 | `Loop` / `BreakIf` | `while True:` / `if <cond>: break` | 1:1 |
 | `SchedulerImpl` | transparent — emits its body (the explicit CLC scheduler IR) | 1:1 |
-| `ScalarDef` / `ScalarStore` | `name: T.int32 = <init>` / `name = <expr>` (SSA register var, not an `alloc_local(1)` cell) | 1:1; the register-var form matches canon and avoids defeating ptxas's uniform-register analysis |
+| `ScalarDef` / `ScalarStore` | `name: T.int32 = <init>` / `name = <expr>` (a mutable `local_scalar` cell in the tirx parser) | 1:1; kept for genuinely loop-carried values (ring counters, task id) |
+| `ScalarLet` | `name: T.let[T.int32] = <expr>` (an immutable `T.Bind` SSA value — canon's tile-decode form) | 1:1; single-assignment (validate rejects `ScalarStore` to it); used for per-iteration derived values so the def-use chain is pure SSA |
 | `ShuffleSync` / `ClcQueryCancel` | `name: T.int32 = T.cuda.__shfl_sync(...)` / `= T.ptx.clc_query_cancel(...)` | 1:1 |
 | `ClcTryCancel` | `T.ptx.clc_try_cancel(handle, mbar)` | 1:1 |
 | `StoreScalar` | `task_smem[stage, field] = <value>` (SMEM mailbox write) | 1:1 |
