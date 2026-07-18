@@ -21,6 +21,8 @@ scheduler.
   by statement family and the current proof boundary.
 - [IR Op Semantics Ledger](docs/ir-ops.md) - per-op PTX conformance:
   modeled / abstracted / rejected / silently-accepted configurations.
+- [Limitations](LIMITATIONS.md) - the sim ↔ silicon trust boundary; read
+  before trusting a green sim/check run.
 - [Hardware Verification](docs/hardware-verification.md) - B200 validation for
   the tcgen05 ld/st datapath and MMA accumulator layouts.
 - [Port Status](STATUS.md) - current implementation, correctness, performance,
