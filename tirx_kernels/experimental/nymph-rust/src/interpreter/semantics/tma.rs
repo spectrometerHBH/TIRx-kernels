@@ -309,6 +309,7 @@ fn execute_tma_load<'a, 'k>(
                 mbar_stage,
                 multicast_cta_mask,
                 cache_hint: _,
+                prefetch_tensormap: _,
                 cta_group,
             } => (
                 dst,
@@ -573,6 +574,9 @@ fn execute_tma_store<'a, 'k>(
             shape,
             gmem_shape,
             reduce_add,
+            // Pure HW hints — no value/trace semantics.
+            cache_hint: _,
+            prefetch_tensormap: _,
         } => (dst, src, coords, shape, gmem_shape, *reduce_add),
         _ => unreachable!(),
     };

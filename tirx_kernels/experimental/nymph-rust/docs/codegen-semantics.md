@@ -74,10 +74,29 @@ the epilogue — generically, by position.
 ## Statement Families
 
 This table covers the `Stmt` variants the GEMM lowering implements. The codegen is
-intentionally partial: variants not listed here (the REG-ALU family `RegAdd`/`RegFma`/…,
-`Tcgen05Cp`/`Tcgen05St`/`Tcgen05WaitSt`, `LdMatrix`/`StMatrix`, `ForEachTask`/`SchedNext`,
-etc.) fall through to `emit_stmt`'s catch-all and return `Err("codegen: unimplemented
-stmt …")` — they fail closed, never emit a wrong form.
+intentionally partial, and partiality always surfaces as an `Err`, on two axes:
+
+- **Unlowered variants** (the flash-attention set: `WarpMma`, `RegUnary`, `RegFill`,
+  `GmemAtomicAdd`/`GmemWaitEq`, `CpAsyncBulkS2Cluster`, `SchedNext`, `LdMatrix`/
+  `StMatrix`, …) return `Err("codegen: … not yet supported")` — either an explicit
+  stub arm or `emit_stmt`'s catch-all. No `unimplemented!`/panic paths remain.
+- **Unrepresentable field values on lowered variants**: the emitted TVMScript form
+  fixes some conventions, and any IR value outside them is rejected rather than
+  silently coerced — `TmaStore.reduce_add` (no `Tx.copy_async` reduce dispatch),
+  per-op `cta_group` differing from the kernel-level engine group (TmaLoad / MMA /
+  commit), MMA `trans_a`/`trans_b`/`lane_align != 0`, `a_fp4 != b_fp4`, and any
+  block-scaled mode other than NVFP4 (`sf_e4m3=true, sf_block=16, sf_byte=0`).
+
+### Scale-factor classification (usage-derived)
+
+A tensor is treated as an NVFP4 scale factor **iff the IR uses it as one**: the
+`sfa`/`sfb` operand of a `Tcgen05Mma`, an endpoint of a `tcgen05.cp` staging copy, or
+the GMEM source of a `TmaLoad` filling an SF SMEM ring (`collect_sf_ids`). dtype is
+never consulted — a plain fp8 e4m3 *data* tensor keeps its normal MMA swizzle/layout.
+SF-classified tensors get canon's `sf_smem_layout(rows, sf_k, sf_per_mma=4)` /
+SF-TMEM decl forms; the constants there (`sf_per_mma=4`, per-super-block `SF_K=16`)
+are NVFP4 *format* invariants (`CTA_K // SF_BLOCK` with `SF_BLOCK=16`), not shape
+parameters. An SF-classified tensor with a non-e4m3 dtype is an `Err`.
 
 | Statement family | Emitted TVMScript | Conditional emission (and why it is generic) |
 | --- | --- | --- |

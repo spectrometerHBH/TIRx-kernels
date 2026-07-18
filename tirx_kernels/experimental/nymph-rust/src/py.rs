@@ -2073,7 +2073,7 @@ fn mbarrier_arrive_expect_tx(
     }))
 }
 #[pyfunction]
-#[pyo3(name = "TmaLoad", signature = (dst, src, mbar, bytes, coords, shape, gmem_shape = None, mbar_stage = None, multicast_cta_mask = None, cache_hint = None, cta_group = 1))]
+#[pyo3(name = "TmaLoad", signature = (dst, src, mbar, bytes, coords, shape, gmem_shape = None, mbar_stage = None, multicast_cta_mask = None, cache_hint = None, prefetch_tensormap = true, cta_group = 1))]
 #[allow(clippy::too_many_arguments)]
 fn tma_load(
     dst: Bound<'_, PyAny>,
@@ -2086,6 +2086,7 @@ fn tma_load(
     mbar_stage: Option<Bound<'_, PyAny>>,
     multicast_cta_mask: Option<u16>,
     cache_hint: Option<String>,
+    prefetch_tensormap: bool,
     cta_group: u8,
 ) -> PyResult<PyStmt> {
     Ok(PyStmt(ir::Stmt::TmaLoad {
@@ -2099,6 +2100,7 @@ fn tma_load(
         mbar_stage: coerce_opt_scalar(mbar_stage)?,
         multicast_cta_mask,
         cache_hint,
+        prefetch_tensormap,
         cta_group,
     }))
 }
@@ -2149,7 +2151,8 @@ fn gmem_wait_eq(
     }))
 }
 #[pyfunction]
-#[pyo3(name = "TmaStore", signature = (dst, src, coords, shape, gmem_shape = None, reduce_add = false))]
+#[pyo3(name = "TmaStore", signature = (dst, src, coords, shape, gmem_shape = None, reduce_add = false, cache_hint = None, prefetch_tensormap = true))]
+#[allow(clippy::too_many_arguments)]
 fn tma_store(
     dst: PyTensor,
     src: Bound<'_, PyAny>,
@@ -2157,6 +2160,8 @@ fn tma_store(
     shape: Vec<usize>,
     gmem_shape: Option<Vec<usize>>,
     reduce_add: bool,
+    cache_hint: Option<String>,
+    prefetch_tensormap: bool,
 ) -> PyResult<PyStmt> {
     Ok(PyStmt(ir::Stmt::TmaStore {
         dst: dst.0,
@@ -2165,6 +2170,8 @@ fn tma_store(
         shape,
         gmem_shape,
         reduce_add,
+        cache_hint,
+        prefetch_tensormap,
     }))
 }
 #[pyfunction]

@@ -83,10 +83,10 @@ CTA_M = 256  # cluster M tile (2-SM MMA combines the pair)
 BLK_M = CTA_M // CTA_GROUP  # per-CTA A rows = 128
 MMA_K = 16  # fp16/bf16 MMA instruction K
 # Per-warpgroup register rebalance for the no-overlap epilogue (canon's setmaxnreg):
-# drop the producer warpgroup, raise the consumer so its MMA_N-wide writeback fragment
-# stays in registers (no LDL/STL spill). The pair leaves register-file headroom — canon's
-# tighter (56, 224) hits the 65536-reg/SM ceiling and exposes a timing-sensitive race here
-# (the producer warpgroup carries an idle scheduler warp in direct mode); (72, 208) clears it.
+# drop the producer warpgroup, raise the consumers so the MMA_N-wide writeback fragment
+# stays in registers (no LDL/STL spill). (56, 224) is canon's exact pair; with two
+# consumer warpgroups it sums to 128*(56+224+224) = 64512 regs, inside the 65536/SM
+# file. This pair is what every bench-suite run and GPU-numerics check has validated.
 PRODUCER_MAXNREG = 56
 CONSUMER_MAXNREG = 224
 TMEM_LD_SIZE = 8  # tcgen05.ld fragment width (cols per warp-collective load)
@@ -528,6 +528,7 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
                         shape=(1, BLK_M, r.blk_k),
                         gmem_shape=(BLK_M, r.blk_k),
                         mbar_stage=ld_stage,
+                        cta_group=CTA_GROUP,
                     )
                 k.tma_load(
                     TensorSlice(
@@ -540,6 +541,7 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
                     shape=(1, r.blk_n, r.blk_k),
                     gmem_shape=(r.blk_n, r.blk_k),
                     mbar_stage=ld_stage,
+                    cta_group=CTA_GROUP,
                 )
                 _advance_ring(k, ld_stage, ld_phase, r.pipe_depth)
 

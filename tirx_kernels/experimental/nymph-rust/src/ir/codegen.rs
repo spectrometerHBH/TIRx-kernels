@@ -1,14 +1,20 @@
 //! Rust codegen: lower a nymph `ir::Kernel` to a TVMScript (`tvm.script.tirx`)
-//! source string. First working draft, scoped to ONE kernel — the bootstrap
-//! cta_group=2 fp16 GEMM (M=256, N=128, K=64). The emitted source is a
-//! `@T.prim_func def main(...)` whose forms mirror
-//! `test_gemm_async.py::test_gemm_tcgen05_cta_group_2`, which compiles via
+//! source string. Covers the GEMM datapath — the full pipelined cta_group=2
+//! fp16/bf16 GEMM and the NVFP4 block-scaled GEMM (every bench shape) — plus the
+//! generic scaffolding they exercise (roles, rings, mbars, scheduler loop, TMA,
+//! tcgen05, epilogue). IR nodes with no lowering (the flash-attention set:
+//! `WarpMma`, `RegUnary`, `RegFill`, GMEM semaphores, `TmaStore.reduce_add`, …)
+//! and IR field values the emitted forms cannot represent (per-op `cta_group`
+//! overrides, MMA `trans_a/trans_b/lane_align`, non-NVFP4 scale modes) fail
+//! closed with `Err` — never a silent different-semantics emission. The emitted
+//! source is a `@T.prim_func def main(...)` that compiles via
 //! `tvm.compile(..., tir_pipeline="tirx")` and runs on B200.
 //!
 //! The nymph cohort model leaves per-thread guards implicit; TIRx needs them, so
-//! this pass inserts `if lane_id == 0:` (lane 0 of the issuing warp) around the
-//! issue ops that are single-thread (mbarrier init/arrive, TMA, MMA, commit). See
-//! the per-op map in `emit_stmt`.
+//! this pass inserts a scope-derived single-issue guard (`Scope::issue_guard`:
+//! `tid_in_wg == 0` in a warpgroup role, `elect_sync()` in a warp role) around
+//! the issue ops that are single-thread (mbarrier init/arrive, TMA, MMA, commit).
+//! See the per-op map in `emit_stmt`.
 //!
 //! Three further codegen passes recover the full-operand / correct-thread forms
 //! TIRx requires from the nymph IR's instruction-granularity ops (see
@@ -29,7 +35,7 @@ use super::kernel::Kernel;
 use super::scalar::{ScalarExpr, ScalarInitial, ScalarValue, Var};
 use super::stmt::{RegOperand, Stmt};
 use super::tensor::{Layout, Tensor, TensorSlice};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// The imports the emitted source needs (prepended so the file is self-contained).
@@ -208,6 +214,9 @@ struct Ctx {
     /// NVFP4 e4m3 scale-factor TMEM tensors (SFA_tmem, SFB_tmem), in declaration order;
     /// declared via `alloc_sf` right after the `tmem` view in KernelInit.
     sf_tmems: Vec<Arc<Tensor>>,
+    /// Usage-derived scale-factor tensor ids (see `collect_sf_ids`) — the ONLY
+    /// authority on "is this tensor a scale factor"; dtype is never consulted.
+    sf: SfIds,
 }
 
 impl Ctx {
@@ -347,9 +356,17 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
             .map(|d| d.to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        // e4m3 SMEM = NVFP4 scale factors → canon's sf_smem_layout(rows, sf_k,
-        // sf_per_mma=4, pipe_depth). The TMA lands the bytes in cp-ready order.
-        if t.dtype == DType::F8E4M3 {
+        // SF-usage SMEM (a tcgen05.cp source ring) → canon's sf_smem_layout(rows,
+        // sf_k, sf_per_mma=4, pipe_depth). The TMA lands the bytes in cp-ready
+        // order. Classified by USAGE, not dtype — a plain fp8 DATA ring is also
+        // e4m3 but must take the normal MMA swizzle below.
+        if ctx.sf.smem.contains(&t.id) {
+            if t.dtype != DType::F8E4M3 {
+                return Err(format!(
+                    "codegen: SF SMEM tensor {name} must be e4m3 (got {:?})",
+                    t.dtype
+                ));
+            }
             let (rows, sf_k, pipe) = if t.shape.len() == 3 {
                 (t.shape[1], t.shape[2], Some(t.shape[0]))
             } else {
@@ -401,9 +418,10 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
             .map(|d| d.to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        // e4m3 GMEM args are the NVFP4 scale factors: lay them out with canon's
-        // sf_smem_layout(rows, sf_k, sf_per_mma=4) so the TMA reads cp-ready bytes.
-        let layout = if t.dtype == DType::F8E4M3 && t.shape.len() == 2 {
+        // SF-usage GMEM args (the TMA sources of an SF SMEM ring): lay them out with
+        // canon's sf_smem_layout(rows, sf_k, sf_per_mma=4) so the TMA reads cp-ready
+        // bytes. Usage-derived — a plain fp8 GMEM data arg keeps its natural layout.
+        let layout = if ctx.sf.gmem.contains(&t.id) && t.shape.len() == 2 {
             format!(
                 ", layout={}",
                 sf_smem_tile_layout(t.shape[0], t.shape[1], 4, None)
@@ -745,6 +763,57 @@ fn merge_adjacent_guards(src: &str) -> String {
 
 /// Collect every tensor referenced anywhere (args + defs + slices), deduped by id,
 /// in a deterministic (id-sorted) order.
+/// Scale-factor tensor ids derived from USAGE, not dtype. A tensor is a scale
+/// factor iff it feeds the block-scaled MMA datapath: the `sfa`/`sfb` operand of a
+/// `Tcgen05Mma`, an endpoint of a `tcgen05.cp` (the SMEM→TMEM SF staging copy), or
+/// the GMEM source of a `TmaLoad` that fills an SF SMEM ring. dtype alone proves
+/// nothing — a plain fp8 DATA tensor is also e4m3, and laying it out as SF bytes
+/// would silently corrupt it.
+#[derive(Default)]
+struct SfIds {
+    tmem: HashSet<u32>,
+    smem: HashSet<u32>,
+    gmem: HashSet<u32>,
+}
+
+fn collect_sf_ids(k: &Kernel) -> SfIds {
+    fn walk(stmts: &[Stmt], f: &mut dyn FnMut(&Stmt)) {
+        for s in stmts {
+            f(s);
+            for body in s.child_bodies() {
+                walk(body, f);
+            }
+        }
+    }
+    let mut ids = SfIds::default();
+    // Pass 1: MMA sf operands (TMEM) + tcgen05.cp endpoints (TMEM dst, SMEM src).
+    walk(&k.body, &mut |s| match s {
+        Stmt::Tcgen05Mma {
+            sfa: Some(sfa),
+            sfb: Some(sfb),
+            ..
+        } => {
+            ids.tmem.insert(sfa.tensor.id);
+            ids.tmem.insert(sfb.tensor.id);
+        }
+        Stmt::Tcgen05Cp { dst, src, .. } => {
+            ids.tmem.insert(dst.tensor.id);
+            ids.smem.insert(src.tensor.id);
+        }
+        _ => {}
+    });
+    // Pass 2: GMEM sources of the TMA loads that fill an SF SMEM ring (one level —
+    // SF bytes flow gmem -> smem -> tmem, there are no longer chains).
+    walk(&k.body, &mut |s| {
+        if let Stmt::TmaLoad { dst, src, .. } = s {
+            if ids.smem.contains(&dst.tensor.id) {
+                ids.gmem.insert(src.id);
+            }
+        }
+    });
+    ids
+}
+
 fn collect_tensors(k: &Kernel) -> Vec<Arc<Tensor>> {
     let mut map: HashMap<u32, Arc<Tensor>> = HashMap::new();
     for t in &k.args {
@@ -847,76 +916,6 @@ fn collapse_body(stmts: &[Stmt]) -> Vec<Stmt> {
         i += 1;
     }
     out
-}
-
-/// No-overlap epilogue STORE: a run of `RegStore` (SMEM dst) writing consecutive
-/// `num`-wide column bands of the SAME staged D tile from consecutive bands of the
-/// SAME wide output reg. Collapse to ONE wide `Tx.wg.copy` over the full band
-/// (mirrors the canonical per-chunk store fused to one wide reg->smem copy). General
-/// over the chunk width; only fires for SMEM-dst stores (the GMEM bootstrap store is
-/// untouched). Currently UNUSED — the store run is kept at 8-element granularity so
-/// the reg->smem copy dispatches to STSM (a wide copy drops to STS.128 / scalar
-/// fallback). Retained for a future shape where a wider STS atom is preferable.
-#[allow(dead_code)]
-fn try_collapse_store_run(stmts: &[Stmt]) -> Option<(Stmt, usize)> {
-    let smem_store = |s: &Stmt| -> Option<(i64, i64)> {
-        // (dst_last_off, src_off) of a SMEM-dst RegStore, both column offsets.
-        let Stmt::RegStore { dst, src } = s else {
-            return None;
-        };
-        if dst.tensor.space != MemorySpace::Smem {
-            return None;
-        }
-        let dst_col = as_int(dst.offsets.last()?)?;
-        let src_off = as_int(src.offsets.first()?)?;
-        Some((dst_col, src_off))
-    };
-    let first = smem_store(&stmts[0])?;
-    // Width of one chunk (the dst last-dim extent).
-    let Stmt::RegStore { dst: d0, .. } = &stmts[0] else {
-        return None;
-    };
-    let step = as_int(d0.shape.last()?)?;
-    if step <= 0 {
-        return None;
-    }
-
-    let mut count = 1usize;
-    let mut next_dst = first.0 + step;
-    let mut next_src = first.1 + step;
-    let mut idx = 1;
-    while idx < stmts.len() {
-        if let Some((dst_col, src_off)) = smem_store(&stmts[idx]) {
-            // require equal chunk width
-            if let Stmt::RegStore { dst, .. } = &stmts[idx] {
-                if as_int(dst.shape.last().unwrap()) == Some(step)
-                    && dst_col == next_dst
-                    && src_off == next_src
-                {
-                    count += 1;
-                    next_dst += step;
-                    next_src += step;
-                    idx += 1;
-                    continue;
-                }
-            }
-        }
-        break;
-    }
-    if count < 2 {
-        return None;
-    }
-    let total = step * count as i64;
-    let mut store = stmts[0].clone();
-    if let Stmt::RegStore { dst, src } = &mut store {
-        if let Some(sh) = dst.shape.last_mut() {
-            *sh = ScalarValue::Int(total);
-        }
-        if let Some(sh) = src.shape.first_mut() {
-            *sh = ScalarValue::Int(total);
-        }
-    }
-    Some((store, count))
 }
 
 /// Suspect 1: a run of `Tcgen05Mma` with identical dst, same A/B tensors, the K
@@ -1037,7 +1036,7 @@ fn try_collapse_mma_run(stmts: &[Stmt]) -> Option<(Stmt, usize)> {
         // so the NVFP4 flags are always their dense defaults here; the dense
         // cta_group=2 m=128/256 accumulator never uses lane_align.
         sf_e4m3: false,
-        sf_block: 32,
+        sf_block: 0,
         a_fp4: false,
         b_fp4: false,
         lane_align: 0,
@@ -1049,6 +1048,7 @@ fn try_collapse_mma_run(stmts: &[Stmt]) -> Option<(Stmt, usize)> {
 fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
     let mut names: HashMap<u32, String> = HashMap::new();
     let mut tensors: HashMap<u32, Arc<Tensor>> = HashMap::new();
+    let sf = collect_sf_ids(k);
     for (i, t) in k.args.iter().enumerate() {
         names.insert(t.id, arg_name(i));
         tensors.insert(t.id, t.clone());
@@ -1099,8 +1099,9 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
                 }
             }
             MemorySpace::Tmem => {
-                // e4m3 TMEM = NVFP4 scale factors → named SFA_tmem / SFB_tmem (alloc_sf'd).
-                if t.dtype == DType::F8E4M3 {
+                // SF-usage TMEM (an MMA sfa/sfb operand or a tcgen05.cp destination)
+                // → named SFA_tmem / SFB_tmem (alloc_sf'd).
+                if sf.tmem.contains(&t.id) {
                     let n = if sf_tmem_idx == 0 {
                         "SFA_tmem".to_string()
                     } else {
@@ -1343,8 +1344,9 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
         num_clusters: (k.launch_cta_count() / (cta_group as usize).max(1)).max(1),
         sf_tmems: collect_tensors(k)
             .into_iter()
-            .filter(|t| t.space == MemorySpace::Tmem && t.dtype == DType::F8E4M3)
+            .filter(|t| t.space == MemorySpace::Tmem && sf.tmem.contains(&t.id))
             .collect(),
+        sf,
     })
 }
 
@@ -1631,25 +1633,6 @@ fn add_bound(lo: &ScalarValue, extent: &ScalarValue, ctx: &Ctx) -> String {
             emit_scalar_prec(extent, ctx, 5)
         ),
     }
-}
-
-/// Emit `Name[lo0:hi0, lo1:hi1, ...]` from a slice's offsets+shape (every dim a
-/// range). Generic full-rank slice form; the staged operands use `emit_smem_tile`
-/// (which drops size-1 ring dims). Kept for non-staged slices in later shapes.
-#[allow(dead_code)]
-fn emit_slice(s: &TensorSlice, ctx: &Ctx) -> Result<String, String> {
-    emit_slice_named(s, ctx, ctx.tensor_name(s.tensor.id)?)
-}
-
-#[allow(dead_code)]
-fn emit_slice_named(s: &TensorSlice, ctx: &Ctx, name: &str) -> Result<String, String> {
-    let mut dims = Vec::new();
-    for (off, ext) in s.offsets.iter().zip(s.shape.iter()) {
-        let lo = emit_scalar(off, ctx);
-        let hi = add_bound(off, ext, ctx);
-        dims.push(format!("{lo}:{hi}"));
-    }
-    Ok(format!("{name}[{}]", dims.join(", ")))
 }
 
 /// Emit a staged SMEM tile operand for a TMA copy / wg copy. A leading ring/d-tile
@@ -2038,6 +2021,14 @@ fn emit_stmt(
             const BASE_SF_K: usize = 16;
             for sf in &ctx.sf_tmems {
                 let name = ctx.tensor_name(sf.id)?;
+                // The decl_buffer below is the NVFP4 e4m3 SF view — the only SF TMEM
+                // form this codegen emits (the u32 UE8M0 fp8 mode has no lowering).
+                if sf.dtype != DType::F8E4M3 {
+                    return Err(format!(
+                        "codegen: SF TMEM tensor {name} must be e4m3 (got {:?})",
+                        sf.dtype
+                    ));
+                }
                 let col = match &sf.layout {
                     Some(Layout::Tmem(tm)) => tm.col_start,
                     _ => 0,
@@ -2462,8 +2453,20 @@ fn emit_stmt(
             mbar_stage,
             multicast_cta_mask,
             cache_hint,
+            prefetch_tensormap,
+            cta_group,
             ..
         } => {
+            // The emitted `Tx.copy_async(..., cta_group=)` uses the KERNEL-level engine
+            // group (`ctx.cta_group`, from the cluster size). A per-op override the IR
+            // carries but codegen would silently drop is "validate one semantics, run
+            // another" — reject the mismatch instead.
+            if *cta_group != ctx.cta_group {
+                return Err(format!(
+                    "codegen: TmaLoad cta_group={} != kernel cta_group={}",
+                    cta_group, ctx.cta_group
+                ));
+            }
             // The completion mbarrier indexes the ring slot it signals. In cluster mode
             // the TMA-load barrier is leader-routed: BOTH CTAs signal the LEADER's
             // (CTA-0) barrier via its `_cta0` map_shared_rank(.., 0) view (identity on
@@ -2501,14 +2504,20 @@ fn emit_stmt(
                 Some(hint) => format!(", cache_hint=\"{hint}\""),
                 None => String::new(),
             };
-            // `prefetch_tensormap=True`: the canonical prefetches the A/B tensormaps at
-            // entry (a `warp_id_in_cta==0`-guarded `prefetch.tensormap`, synthesized by
-            // the TMA dispatch from this config flag). On the latency-bound small shapes
-            // this hides the first descriptor fetch behind the prologue.
+            // `prefetch_tensormap` (IR-carried; the canonical prefetches the A/B
+            // tensormaps at entry — a `warp_id_in_cta==0`-guarded `prefetch.tensormap`,
+            // synthesized by the TMA dispatch from this config flag). On the
+            // latency-bound small shapes this hides the first descriptor fetch behind
+            // the prologue.
+            let prefetch_kw = if *prefetch_tensormap {
+                ", prefetch_tensormap=True"
+            } else {
+                ""
+            };
             emit_guarded(
                 out,
                 &format!(
-                    "Tx.copy_async({dst_s}, {src_s}, dispatch=\"tma\", mbar={mbar_name}.ptr_to([{mbar_slot}]), cta_group={cg}{cta_mask}{cache_hint_kw}, prefetch_tensormap=True)",
+                    "Tx.copy_async({dst_s}, {src_s}, dispatch=\"tma\", mbar={mbar_name}.ptr_to([{mbar_slot}]), cta_group={cg}{cta_mask}{cache_hint_kw}{prefetch_kw})",
                     cg = ctx.cta_group,
                 ),
             );
@@ -2524,8 +2533,63 @@ fn emit_stmt(
             sfa,
             sfb,
             a_fp4,
+            b_fp4,
+            trans_a,
+            trans_b,
+            cta_group,
+            sf_byte,
+            sf_e4m3,
+            sf_block,
+            lane_align,
             ..
         } => {
+            // `Tx.gemm_async` fixes the operand convention the slices are emitted in:
+            // A=(M,K), B=(N,K), full-datapath accumulator, kernel-level cta_group. Any
+            // IR field the emitted form cannot represent is rejected — the validator
+            // and value model honor these fields, so dropping one here would run a
+            // different semantics than was verified. (`m/n/k` vs the operand slice
+            // shapes is already enforced by the validator, incl. the trans variants.)
+            if *trans_a || *trans_b {
+                return Err(
+                    "codegen: Tcgen05Mma trans_a/trans_b have no gemm_async lowering".to_string(),
+                );
+            }
+            if *lane_align != 0 {
+                return Err(
+                    "codegen: Tcgen05Mma lane_align != 0 (m=64 Layout F) not supported".to_string(),
+                );
+            }
+            if *cta_group != ctx.cta_group {
+                return Err(format!(
+                    "codegen: Tcgen05Mma cta_group={} != kernel cta_group={}",
+                    cta_group, ctx.cta_group
+                ));
+            }
+            if *a_fp4 != *b_fp4 {
+                return Err("codegen: Tcgen05Mma a_fp4/b_fp4 must match".to_string());
+            }
+            match (sfa.as_ref(), sfb.as_ref()) {
+                // Block-scaled path: the emitted SFA/SFB slice form is the NVFP4
+                // block-16 e4m3 layout (BASE_SF_K=16, byte 0..k/16 per cell) — the
+                // only mode the SF slice math below encodes.
+                (Some(_), Some(_)) => {
+                    if !*sf_e4m3 || *sf_block != 16 || *sf_byte != 0 {
+                        return Err(format!(
+                            "codegen: block-scaled Tcgen05Mma supports only the NVFP4 mode \
+                             (sf_e4m3=true, sf_block=16, sf_byte=0); got sf_e4m3={sf_e4m3}, \
+                             sf_block={sf_block}, sf_byte={sf_byte}"
+                        ));
+                    }
+                }
+                (None, None) => {
+                    if *a_fp4 {
+                        return Err("codegen: fp4 Tcgen05Mma operands require sfa/sfb".to_string());
+                    }
+                }
+                _ => {
+                    return Err("codegen: Tcgen05Mma sfa/sfb must be set together".to_string());
+                }
+            }
             let dst_s = emit_tmem_dst(dst, ctx)?;
             // The A/B operands are staged SMEM tiles: drop the leading ring index so
             // the operand is the 2D `(M, K)` / `(N, K)` MMA tile (canonical
@@ -2622,8 +2686,14 @@ fn emit_stmt(
             mbar,
             multicast_cta_mask,
             stage,
-            ..
+            cta_group,
         } => {
+            if *cta_group != ctx.cta_group {
+                return Err(format!(
+                    "codegen: Tcgen05Commit cta_group={} != kernel cta_group={}",
+                    cta_group, ctx.cta_group
+                ));
+            }
             let slot_ptr = mbar_slot_ptr(mbar, stage, ctx)?;
             let mask = multicast_cta_mask.unwrap_or(0);
             emit_guarded(
@@ -2743,27 +2813,47 @@ fn emit_stmt(
             coords,
             shape,
             gmem_shape,
-            ..
+            reduce_add,
+            cache_hint,
+            prefetch_tensormap,
         } => {
+            // `reduce_add` (`cp.reduce.async.bulk...add`) has no `Tx.copy_async`-level
+            // dispatch in TIRx (only the raw PTX intrinsic exists) — emitting a plain
+            // overwrite store here would VALIDATE one semantics and RUN another. Fail
+            // closed until a real reduce-add lowering lands with the flash-bwd datapath.
+            if *reduce_add {
+                return Err("codegen: TmaStore reduce_add has no TIRx lowering yet".to_string());
+            }
             // The SMEM source tile (the staged D writeback band) and the GMEM
-            // destination region. Single-issue from thread 0 of the warpgroup.
+            // destination region. Single-issue: one thread of the enclosing role
+            // (thread 0 of a warpgroup role, the elected lane of a warp role).
             let src_s = emit_smem_tile(src, ctx)?;
             let dst_s = emit_gmem_region(dst, coords, gmem_extents(gmem_shape, shape), ctx)?;
-            out.push_str(&format!("{p}if tid_in_wg == 0:\n"));
-            // `cache_hint="evict_first"`: the store band is write-once output, never
-            // re-read by this kernel. Marking it evict-first keeps the persistent
-            // grid's many in-flight D tiles from packing L2 with dead lines and
-            // evicting the live operand tiles / TMA tensormaps. Without it, a fully
+            // Both hints are IR-carried (builder defaults = the canonical epilogue
+            // store's policy). `cache_hint="evict_first"`: the store band is write-once
+            // output, never re-read by this kernel — dead lines must not pack L2 and
+            // evict the live operand tiles / TMA tensormaps. Without it, a fully
             // occupied persistent launch (148 CTAs each streaming many output tiles
             // through L2) pressures the memory subsystem until a TMA store reads a
             // stale descriptor and the launch faults (cudaErrorLaunchFailure 719) —
             // an L2-policy hazard, invisible to the happens-before protocol model
             // (the checker stays green), occupancy-driven, and masked by any
-            // serialization. canon's epilogue store carries the same hint.
-            // Prefetch the D (store) tensormap too, matching the canonical epilogue store.
-            out.push_str(&format!(
-                "{p}    Tx.copy_async({dst_s}, {src_s}, dispatch=\"tma\", cache_hint=\"evict_first\", prefetch_tensormap=True)\n"
-            ));
+            // serialization.
+            let cache_hint_kw = match cache_hint {
+                Some(hint) => format!(", cache_hint=\"{hint}\""),
+                None => String::new(),
+            };
+            let prefetch_kw = if *prefetch_tensormap {
+                ", prefetch_tensormap=True"
+            } else {
+                ""
+            };
+            emit_guarded(
+                out,
+                &format!(
+                    "Tx.copy_async({dst_s}, {src_s}, dispatch=\"tma\"{cache_hint_kw}{prefetch_kw})"
+                ),
+            );
             Ok(())
         }
         CpAsyncBulkCommitGroup => {
@@ -2779,8 +2869,7 @@ fn emit_stmt(
             if scope.is_function() {
                 out.push_str(&format!("{p}T.ptx.cp_async.bulk.commit_group()\n"));
             } else {
-                out.push_str(&format!("{p}if tid_in_wg == 0:\n"));
-                out.push_str(&format!("{p}    T.ptx.cp_async.bulk.commit_group()\n"));
+                emit_guarded(out, "T.ptx.cp_async.bulk.commit_group()");
             }
             Ok(())
         }
@@ -2896,26 +2985,17 @@ fn emit_stmt(
         // ---- Set B: dev-framework ops belonging to the flash-attention / flash-bwd
         // datapaths. The GEMM/nvfp4 codegen has no warp-fragment reg-view, GMEM-
         // semaphore, or DSMEM cluster-copy lowering machinery, and no smoke-test kernel
-        // (nvfp4 / fp16) exercises them. Their correct TVMScript form is non-obvious in
-        // this codegen, so each is an explicit, greppable stub (per the task's allowance)
-        // rather than a silent fall-through. ----
-        WarpMma { .. } => {
-            unimplemented!("codegen: WarpMma not yet supported")
-        }
-        GmemAtomicAdd { .. } => {
-            unimplemented!("codegen: GmemAtomicAdd not yet supported")
-        }
-        GmemWaitEq { .. } => {
-            unimplemented!("codegen: GmemWaitEq not yet supported")
-        }
+        // (nvfp4 / fp16) exercises them. Fail closed with `Err` (a PyValueError through
+        // the wrapper) like every other unsupported node — never panic. ----
+        WarpMma { .. } => Err("codegen: WarpMma not yet supported".to_string()),
+        GmemAtomicAdd { .. } => Err("codegen: GmemAtomicAdd not yet supported".to_string()),
+        GmemWaitEq { .. } => Err("codegen: GmemWaitEq not yet supported".to_string()),
         CpAsyncBulkS2Cluster { .. } => {
-            unimplemented!("codegen: CpAsyncBulkS2Cluster not yet supported")
+            Err("codegen: CpAsyncBulkS2Cluster not yet supported".to_string())
         }
-        RegUnary { .. } => {
-            // Carries the `Log2`/`Exp2`/`Rcp`/`Neg` RegUnaryOp; applied over flash
-            // reg fragments (no GEMM-codegen reg-view path).
-            unimplemented!("codegen: RegUnary not yet supported")
-        }
+        // Carries the `Log2`/`Exp2`/`Rcp`/`Neg` RegUnaryOp; applied over flash
+        // reg fragments (no GEMM-codegen reg-view path).
+        RegUnary { .. } => Err("codegen: RegUnary not yet supported".to_string()),
 
         // NVFP4 epilogue alpha rescale: Tx.wg.mul(frag, frag, alpha). lhs is a reg slice,
         // rhs the alpha literal (or vice versa).

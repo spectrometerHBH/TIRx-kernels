@@ -710,6 +710,7 @@ fn validate_stmt(s: &Stmt) -> R {
             mbar_stage,
             multicast_cta_mask,
             cache_hint: _,
+            prefetch_tensormap: _,
             cta_group,
         } => {
             validate_slice(dst, "tma_load dst")?;
@@ -785,6 +786,8 @@ fn validate_stmt(s: &Stmt) -> R {
             shape,
             gmem_shape,
             reduce_add,
+            cache_hint: _,
+            prefetch_tensormap: _,
         } => {
             validate_slice(src, "tma_store src")?;
             validate_tensor(dst)?;
@@ -833,6 +836,7 @@ fn validate_stmt(s: &Stmt) -> R {
             sfb,
             sf_byte,
             sf_e4m3,
+            sf_block,
             a_fp4,
             b_fp4,
             lane_align,
@@ -933,6 +937,23 @@ fn validate_stmt(s: &Stmt) -> R {
                     }
                     if *sf_byte >= 4 {
                         return bail("tcgen05_mma sf_byte must be in 0..4");
+                    }
+                    // The two supported scale modes fix sf_block: nvfp4 block-16
+                    // (sf_e4m3) or fp8 per-row (sf_block=0). Anything else would be
+                    // silently mis-divided by the k/sf_block block math downstream.
+                    match (*sf_e4m3, *sf_block) {
+                        (true, 16) => {
+                            if *k % 16 != 0 {
+                                return bail(
+                                    "tcgen05_mma nvfp4 k must be a multiple of sf_block=16",
+                                );
+                            }
+                        }
+                        (true, _) => return bail("tcgen05_mma sf_e4m3 requires sf_block=16"),
+                        (false, 0) => {}
+                        (false, _) => {
+                            return bail("tcgen05_mma UE8M0 (fp8) mode requires sf_block=0")
+                        }
                     }
                     for (sf, rows, label) in [
                         (sfa, a_rows as usize, "tcgen05_mma sfa"),

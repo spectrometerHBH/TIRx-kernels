@@ -376,8 +376,9 @@ GEMM_CONFIGS = {
         "epi_tile": 32,
     },
     # 16384: left at default (the same OVERLAP launch-fault caveat applies at the nymph
-    # default here). Benches ~0.985 vs canon under the fair bench; the residual is canon's
-    # legitimate runtime-alpha rescale (nymph bakes alpha=1.0), not a kernel inefficiency.
+    # default here). The bench builds nymph with the SAME alpha value canon applies at
+    # runtime — the residual asymmetry is only canon's alpha LOAD vs nymph's build-time
+    # immediate (a capability difference, not a different computation).
 }
 
 
@@ -715,6 +716,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                     gmem_shape=(blk_m, BLK_K_BYTES),
                     mbar_stage=stage,
                     cache_hint=load_cache_hint,
+                    cta_group=cta_group,
                 )
                 k.tma_load(
                     TensorSlice(
@@ -728,6 +730,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                     gmem_shape=(blk_n, BLK_K_BYTES),
                     mbar_stage=stage,
                     cache_hint=load_cache_hint,
+                    cta_group=cta_group,
                 )
                 # SFA: this CTA's M rows; SFB: the full N band. e4m3 (rows, SF_CTA_K)
                 # straight from the (rows, K//16) GMEM at this k-tile's column band,
@@ -743,6 +746,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                     gmem_shape=(blk_m, SF_CTA_K),
                     mbar_stage=stage,
                     cache_hint=load_cache_hint,
+                    cta_group=cta_group,
                 )
                 # SFB: the FULL MMA_N=256-wide N band (rank-independent sf_n), so both
                 # CTAs hold the same full-band scales (canon's SFB_N==MMA_N path). The B
@@ -775,6 +779,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                     gmem_shape=(mma_n, SF_CTA_K),
                     mbar_stage=stage,
                     cache_hint=load_cache_hint,
+                    cta_group=cta_group,
                 )
 
     # ---- MMA (wg0/warp0, cluster leader only — canon's WarpRole.MMA) ----

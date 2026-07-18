@@ -486,11 +486,16 @@ pub enum Stmt {
         /// = a plain per-CTA (unicast) load.
         multicast_cta_mask: Option<u16>,
         /// L2 cache-eviction policy hint (canon's `cache_hint` on its g2c loads). `None`
-        /// = no hint (codegen-default policy); `Some(hint)` emits `cache_hint="<hint>"`
-        /// (e.g. `"evict_normal"` — a tile read once per k-tile should not pin an L2 line
-        /// the next tile evicts anyway). Bounding the L2 cache-policy traffic is the lever
-        /// that stops the full-cube launch fault. Codegen passes the string through.
+        /// = no hint; `Some(hint)` emits `cache_hint="<hint>"` (e.g. `"evict_normal"` —
+        /// a tile read once per k-tile should not pin an L2 line the next tile evicts
+        /// anyway). Bounding the L2 cache-policy traffic is the lever that stops the
+        /// full-cube launch fault. Codegen passes the string through.
         cache_hint: Option<String>,
+        /// Prefetch the source tensormap at kernel entry (canon's config flag on its
+        /// g2c loads — hides the first descriptor fetch behind the prologue). A pure
+        /// HW hint with no value/protocol semantics, but IR-carried so the same IR
+        /// always produces the same code shape.
+        prefetch_tensormap: bool,
         cta_group: u8,
     },
     TmaStore {
@@ -503,6 +508,12 @@ pub enum Stmt {
         /// accumulates `dst += src` instead of overwriting. Trace/protocol treat it
         /// like a store (a GMEM-output bulk async write).
         reduce_add: bool,
+        /// L2 eviction policy for the store (canon's epilogue store carries
+        /// `"evict_first"`: the output band is write-once, never re-read — dead lines
+        /// must not pack L2 and evict live operand tiles / tensormaps). `None` = no hint.
+        cache_hint: Option<String>,
+        /// Prefetch the destination tensormap, matching the canonical epilogue store.
+        prefetch_tensormap: bool,
     },
     /// `cp.async.bulk.shared::cluster.shared::cta` — async bulk copy from this CTA's
     /// SMEM (`src`) to a PEER CTA's SMEM (`dst`, the peer instance), signalling the
