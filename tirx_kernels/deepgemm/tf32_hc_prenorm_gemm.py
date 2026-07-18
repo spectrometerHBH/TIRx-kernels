@@ -210,12 +210,62 @@ DEEPGEMM_TEST_COVERAGE = [
     )
 ]
 
+# ── Bench shape set ─────────────────────────────────────────────────────────
+# num_splits follows SGLang's _compute_num_split_for_mhc_pre with n_sms pinned
+# to 148 (SM100 / B200):
+#   grid = ceil(M/64); num_block_k = ceil(K/64)
+#   num_splits = max(1, min(n_sms // max(grid, 1), num_block_k // 4))
+_MHC_NUM_SMS = 148
+
+
+def _compute_num_split_for_mhc_pre(num_tokens: int, hc_hidden_size: int) -> int:
+    grid_size = (num_tokens + 63) // 64
+    num_block_k = (hc_hidden_size + 63) // 64
+    return max(1, min(_MHC_NUM_SMS // max(grid_size, 1), num_block_k // 4))
+
+
+def _mhc_pre_token_count_representatives(
+    max_num_tokens: int, hc_hidden_size: int
+) -> tuple[int, ...]:
+    """One representative M per distinct num_splits bucket over [1, max_tokens]
+    (SGLang's get_mhc_pre_token_count_representatives)."""
+    reps = {}
+    for grid in range(1, (max(1, max_num_tokens) + 63) // 64 + 1):
+        num_tokens = min(grid * 64, max_num_tokens)
+        reps[_compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)] = num_tokens
+    return tuple(sorted(reps.values()))
+
+
+# Main set: the two production hc_hidden sizes x the M buckets from
+# max_tokens 2048/4096/8192, deduped by (m, k, num_splits).
+_PROD_HC_HIDDENS = (16384, 28672)
+_MHC_PRE_MAX_TOKENS = (2048, 4096, 8192)
+
 CONFIGS = [
-    _make_case(m=13, n=24, k=7168, num_splits=1, seed=2000),
-    _make_case(m=137, n=24, k=7680, num_splits=16, seed=2001),
-    _make_case(m=4096, n=24, k=7168, num_splits=1, seed=2002),
+    _make_case(m=m, n=24, k=k, num_splits=s, seed=3000 + i)
+    for i, (m, k, s) in enumerate(
+        sorted(
+            {
+                (m, k, _compute_num_split_for_mhc_pre(m, k))
+                for k in _PROD_HC_HIDDENS
+                for max_tokens in _MHC_PRE_MAX_TOKENS
+                for m in _mhc_pre_token_count_representatives(max_tokens, k)
+            }
+        )
+    )
+]
+
+# Legacy shapes kept for regression continuity with the pinned baseline. The
+# k=7168/7680 ones are edge (hidden=1792/1920, non-production) and stay out of
+# the main set.
+LEGACY_CONFIGS = [
+    _make_case(m=13, n=24, k=7168, num_splits=1, seed=2000),  # edge: hidden=1792
+    _make_case(m=137, n=24, k=7680, num_splits=16, seed=2001),  # edge: hidden=1920
+    _make_case(m=4096, n=24, k=7168, num_splits=1, seed=2002),  # edge: hidden=1792
     _make_case(m=4096, n=24, k=28672, num_splits=16, seed=2003),
 ]
+
+BENCH_CONFIGS = CONFIGS + LEGACY_CONFIGS
 
 
 def load_deep_gemm_hc() -> tuple[Any, str]:
