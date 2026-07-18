@@ -330,13 +330,14 @@ fn pad(indent: usize) -> String {
 }
 
 /// Entry point: lower a kernel to a TVMScript source string.
-/// Positional arg name: A, B, C, D, E, … (then Arg{i} past the alphabet).
+/// Positional arg name: A, B, C, …, Z (the whole alphabet), then `arg{i}` past it.
+/// The first 8 (A–H) cover every existing kernel; the extension is id-derived so a
+/// 9th+ argument names stably instead of falling off the table.
 fn arg_name(i: usize) -> String {
-    const NAMES: [&str; 8] = ["A", "B", "C", "D", "E", "F", "G", "H"];
-    NAMES
-        .get(i)
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("Arg{i}"))
+    if i < 26 {
+        return ((b'A' + i as u8) as char).to_string();
+    }
+    format!("arg{i}")
 }
 
 pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
@@ -1464,7 +1465,7 @@ fn emit_reg_view_slice(
     if as_int(off) == Some(0) && width == full {
         Ok(format!("{name}[:, :]"))
     } else {
-        let off_s = emit_scalar(off, ctx);
+        let off_s = emit_scalar(off, ctx)?;
         Ok(format!("{name}[:, {off_s}:{off_s} + {width}]"))
     }
 }
@@ -1536,15 +1537,15 @@ fn var_ref(ctx: &Ctx, v: &Var) -> String {
 }
 
 /// Emit a scalar value as a Python expression, parenthesizing per precedence.
-fn emit_scalar(sv: &ScalarValue, ctx: &Ctx) -> String {
+fn emit_scalar(sv: &ScalarValue, ctx: &Ctx) -> Result<String, String> {
     emit_scalar_prec(sv, ctx, 0)
 }
 
-fn emit_scalar_prec(sv: &ScalarValue, ctx: &Ctx, parent_prec: u8) -> String {
+fn emit_scalar_prec(sv: &ScalarValue, ctx: &Ctx, parent_prec: u8) -> Result<String, String> {
     match sv {
-        ScalarValue::Int(i) => i.to_string(),
-        ScalarValue::Var(v) => var_ref(ctx, v),
-        ScalarValue::Scope(k) => scope_name(*k).to_string(),
+        ScalarValue::Int(i) => Ok(i.to_string()),
+        ScalarValue::Var(v) => Ok(var_ref(ctx, v)),
+        ScalarValue::Scope(k) => Ok(scope_name(*k).to_string()),
         ScalarValue::Expr(e) => emit_expr(e, ctx, parent_prec),
     }
 }
@@ -1613,7 +1614,7 @@ fn positive_int_divisor(sv: &ScalarValue) -> Option<i64> {
     }
 }
 
-fn emit_expr(e: &ScalarExpr, ctx: &Ctx, parent_prec: u8) -> String {
+fn emit_expr(e: &ScalarExpr, ctx: &Ctx, parent_prec: u8) -> Result<String, String> {
     let prec = op_prec(e.op);
     // ---- Non-negative div/mod strength reduction (generic, driven by `is_nonneg`) ----
     // The nymph IR's ring/slot/phase indices and the L2-swizzle coords are all built
@@ -1637,13 +1638,13 @@ fn emit_expr(e: &ScalarExpr, ctx: &Ctx, parent_prec: u8) -> String {
     // wrap the whole result for any parent binding tighter than bitand/shift.
     if (e.op == ScalarOp::Mod || e.op == ScalarOp::FloorDiv) && is_nonneg(&e.args[0]) {
         if let Some(k) = as_pow2_shift(&e.args[1]) {
-            let lhs = emit_scalar_prec(&e.args[0], ctx, 0);
+            let lhs = emit_scalar_prec(&e.args[0], ctx, 0)?;
             let s = if e.op == ScalarOp::Mod {
                 format!("({lhs}) & {mask}", mask = (1u64 << k) - 1)
             } else {
                 format!("({lhs}) >> {k}")
             };
-            return if parent_prec > 0 { format!("({s})") } else { s };
+            return Ok(if parent_prec > 0 { format!("({s})") } else { s });
         }
         if let Some(d) = positive_int_divisor(&e.args[1]) {
             let fname = if e.op == ScalarOp::Mod {
@@ -1652,39 +1653,47 @@ fn emit_expr(e: &ScalarExpr, ctx: &Ctx, parent_prec: u8) -> String {
                 "T.truncdiv"
             };
             // A function call is atomic — no surrounding parens needed for any parent.
-            return format!("{fname}({}, {d})", emit_scalar_prec(&e.args[0], ctx, 0));
+            return Ok(format!(
+                "{fname}({}, {d})",
+                emit_scalar_prec(&e.args[0], ctx, 0)?
+            ));
         }
     }
     let s = match e.op {
-        ScalarOp::Neg => format!("-{}", emit_scalar_prec(&e.args[0], ctx, prec)),
-        ScalarOp::Not => format!("not {}", emit_scalar_prec(&e.args[0], ctx, prec)),
+        ScalarOp::Neg => format!("-{}", emit_scalar_prec(&e.args[0], ctx, prec)?),
+        ScalarOp::Not => format!("not {}", emit_scalar_prec(&e.args[0], ctx, prec)?),
         ScalarOp::Select => format!(
             "({} if {} else {})",
-            emit_scalar_prec(&e.args[1], ctx, 0),
-            emit_scalar_prec(&e.args[0], ctx, 0),
-            emit_scalar_prec(&e.args[2], ctx, 0),
+            emit_scalar_prec(&e.args[1], ctx, 0)?,
+            emit_scalar_prec(&e.args[0], ctx, 0)?,
+            emit_scalar_prec(&e.args[2], ctx, 0)?,
         ),
         ScalarOp::Min => format!(
             "T.min({}, {})",
-            emit_scalar_prec(&e.args[0], ctx, 0),
-            emit_scalar_prec(&e.args[1], ctx, 0)
+            emit_scalar_prec(&e.args[0], ctx, 0)?,
+            emit_scalar_prec(&e.args[1], ctx, 0)?
         ),
         ScalarOp::Max => format!(
             "T.max({}, {})",
-            emit_scalar_prec(&e.args[0], ctx, 0),
-            emit_scalar_prec(&e.args[1], ctx, 0)
+            emit_scalar_prec(&e.args[0], ctx, 0)?,
+            emit_scalar_prec(&e.args[1], ctx, 0)?
         ),
         _ => {
-            if let Some(sym) = binop_symbol(e.op) {
-                format!(
-                    "{} {} {}",
-                    emit_scalar_prec(&e.args[0], ctx, prec),
-                    sym,
-                    emit_scalar_prec(&e.args[1], ctx, prec + 1)
-                )
-            } else {
-                format!("<unsupported op {:?}>", e.op)
-            }
+            let Some(sym) = binop_symbol(e.op) else {
+                // An op with no TVMScript lowering (e.g. `Xor`) must not leak a
+                // placeholder literal into the emitted Python source (a syntax
+                // error at best) — fail closed like every other unsupported node.
+                return Err(format!(
+                    "codegen: scalar op {:?} has no TVMScript lowering",
+                    e.op
+                ));
+            };
+            format!(
+                "{} {} {}",
+                emit_scalar_prec(&e.args[0], ctx, prec)?,
+                sym,
+                emit_scalar_prec(&e.args[1], ctx, prec + 1)?
+            )
         }
     };
     // Parenthesize if this binds looser than the parent context demands.
@@ -1705,22 +1714,22 @@ fn emit_expr(e: &ScalarExpr, ctx: &Ctx, parent_prec: u8) -> String {
             | ScalarOp::Ge
     ) && prec < parent_prec;
     if needs_paren {
-        format!("({s})")
+        Ok(format!("({s})"))
     } else {
-        s
+        Ok(s)
     }
 }
 
 /// Fold `lo + extent` for the hi bound when both are literals; otherwise emit `lo + extent`.
-fn add_bound(lo: &ScalarValue, extent: &ScalarValue, ctx: &Ctx) -> String {
+fn add_bound(lo: &ScalarValue, extent: &ScalarValue, ctx: &Ctx) -> Result<String, String> {
     match (lo, extent) {
-        (ScalarValue::Int(a), ScalarValue::Int(b)) => (a + b).to_string(),
+        (ScalarValue::Int(a), ScalarValue::Int(b)) => Ok((a + b).to_string()),
         (ScalarValue::Int(0), _) => emit_scalar(extent, ctx),
-        _ => format!(
+        _ => Ok(format!(
             "{} + {}",
-            emit_scalar_prec(lo, ctx, 4),
-            emit_scalar_prec(extent, ctx, 5)
-        ),
+            emit_scalar_prec(lo, ctx, 4)?,
+            emit_scalar_prec(extent, ctx, 5)?
+        )),
     }
 }
 
@@ -1735,10 +1744,10 @@ fn emit_smem_tile(s: &TensorSlice, ctx: &Ctx) -> Result<String, String> {
     for (off, ext) in s.offsets.iter().zip(s.shape.iter()) {
         if as_int(ext) == Some(1) {
             // size-1 ring index: drop the axis
-            dims.push(emit_scalar(off, ctx));
+            dims.push(emit_scalar(off, ctx)?);
         } else {
-            let lo = emit_scalar(off, ctx);
-            let hi = add_bound(off, ext, ctx);
+            let lo = emit_scalar(off, ctx)?;
+            let hi = add_bound(off, ext, ctx)?;
             dims.push(format!("{lo}:{hi}"));
         }
     }
@@ -1759,10 +1768,10 @@ fn emit_smem_wg_store_tile(s: &TensorSlice, ctx: &Ctx) -> Result<String, String>
             // per-thread row -> the full warpgroup row span
             dims.push(":".to_string());
         } else if as_int(ext) == Some(1) {
-            dims.push(emit_scalar(off, ctx)); // size-1 ring index: drop the axis
+            dims.push(emit_scalar(off, ctx)?); // size-1 ring index: drop the axis
         } else {
-            let lo = emit_scalar(off, ctx);
-            let hi = add_bound(off, ext, ctx);
+            let lo = emit_scalar(off, ctx)?;
+            let hi = add_bound(off, ext, ctx)?;
             dims.push(format!("{lo}:{hi}"));
         }
     }
@@ -1778,7 +1787,7 @@ fn emit_scalar_addr(s: &TensorSlice, ctx: &Ctx) -> Result<String, String> {
         .offsets
         .iter()
         .map(|off| emit_scalar(off, ctx))
-        .collect::<Vec<_>>()
+        .collect::<Result<Vec<_>, _>>()?
         .join(", ");
     Ok(format!("{name}[{dims}]"))
 }
@@ -1793,8 +1802,8 @@ fn emit_scalar_load(s: &TensorSlice, ctx: &Ctx) -> Result<String, String> {
 /// the lane axis spans all 128 lanes; the column band is the operand's
 /// absolute physical base plus the MMA's n.
 fn emit_tmem_dst(op: &TmemOperand, n: u32, ctx: &Ctx) -> Result<String, String> {
-    let col_s = emit_scalar(&op.col, ctx);
-    let hi = add_bound(&op.col, &ScalarValue::Int(i64::from(n)), ctx);
+    let col_s = emit_scalar(&op.col, ctx)?;
+    let hi = add_bound(&op.col, &ScalarValue::Int(i64::from(n)), ctx)?;
     Ok(format!("tmem[:, {col_s}:{hi}]"))
 }
 
@@ -1853,6 +1862,7 @@ fn emit_body(
                         let phase_s = phase
                             .as_ref()
                             .map(|ph| emit_scalar(ph, ctx))
+                            .transpose()?
                             .unwrap_or_else(|| "0".to_string());
                         out.push_str(&format!(
                             "{p}T.ptx.mbarrier.try_wait({slot_ptr}, {phase_s})\n"
@@ -2165,7 +2175,7 @@ fn emit_stmt(
             Ok(())
         }
         If { cond, then_body } => {
-            out.push_str(&format!("{p}if {}:\n", emit_scalar(cond, ctx)));
+            out.push_str(&format!("{p}if {}:\n", emit_scalar(cond, ctx)?));
             emit_body(out, then_body, indent + 1, ctx, scope)?;
             Ok(())
         }
@@ -2178,13 +2188,21 @@ fn emit_stmt(
             unroll,
         } => {
             let name = var_name(ctx, var);
-            let start_s = emit_scalar(start, ctx);
-            let stop_s = emit_scalar(stop, ctx);
-            let step_s = emit_scalar(step, ctx);
+            let start_s = emit_scalar(start, ctx)?;
+            let stop_s = emit_scalar(stop, ctx)?;
+            let step_s = emit_scalar(step, ctx)?;
             // `unroll`: emit `T.unroll(N)` — a compile-time-unrolled `for` (same SASS as a
             // manual unroll, but written as a loop in the source, matching canon's
-            // `for i in T.unroll(N)` for fixed-count loops). Only valid for start=0, step=1.
+            // `for i in T.unroll(N)` for fixed-count loops). The emitted form only
+            // expresses start=0, step=1 — anything else would be silently re-timed, so
+            // reject it instead of emitting a loop with different trip semantics.
             if *unroll {
+                if as_int(start) != Some(0) || as_int(step) != Some(1) {
+                    return Err(format!(
+                        "codegen: ForLoop unroll requires literal start=0, step=1 \
+                         (got start={start_s}, step={step_s})"
+                    ));
+                }
                 out.push_str(&format!("{p}for {name} in T.unroll({stop_s}):\n"));
                 emit_body(out, body, indent + 1, ctx, scope)?;
                 return Ok(());
@@ -2260,7 +2278,7 @@ fn emit_stmt(
             Ok(())
         }
         BreakIf { cond } => {
-            out.push_str(&format!("{p}if {}:\n", emit_scalar(cond, ctx)));
+            out.push_str(&format!("{p}if {}:\n", emit_scalar(cond, ctx)?));
             out.push_str(&format!("{p}    break\n"));
             Ok(())
         }
@@ -2272,7 +2290,7 @@ fn emit_stmt(
                 .get(&var.id.0)
                 .ok_or_else(|| format!("codegen: no name for scalar var {}", var.id.0))?;
             let init = match initial {
-                ScalarInitial::Value(v) => emit_scalar(v, ctx),
+                ScalarInitial::Value(v) => emit_scalar(v, ctx)?,
                 // Mailbox load: read the 1-element SMEM slice (drops to a scalar load).
                 ScalarInitial::Tensor(ts) => emit_scalar_load(ts, ctx)?,
             };
@@ -2294,8 +2312,8 @@ fn emit_stmt(
             // lowers to the uniform datapath instead of vector + R2UR.
             out.push_str(&format!(
                 "{p}{name}: T.int32 = T.cuda.__shfl_sync(0xffffffff, {src}, {lane}, 32)\n",
-                src = emit_scalar(src, ctx),
-                lane = emit_scalar(src_lane, ctx),
+                src = emit_scalar(src, ctx)?,
+                lane = emit_scalar(src_lane, ctx)?,
             ));
             Ok(())
         }
@@ -2323,6 +2341,7 @@ fn emit_stmt(
             let slot = stage
                 .as_ref()
                 .map(|s| emit_scalar(s, ctx))
+                .transpose()?
                 .unwrap_or_else(|| "0".to_string());
             emit_guarded(
                 out,
@@ -2356,7 +2375,7 @@ fn emit_stmt(
             // Reassign the SSA register var (canon's `sa_stage = …`), no `[0]` cell index.
             out.push_str(&format!(
                 "{p}{name} = {}\n",
-                emit_scalar(value, ctx),
+                emit_scalar(value, ctx)?,
                 name = name
             ));
             Ok(())
@@ -2366,7 +2385,7 @@ fn emit_stmt(
         // 32 redundant STS to the same address.
         StoreScalar { dst, value } => {
             let dst_s = emit_scalar_addr(dst, ctx)?;
-            emit_guarded(out, &format!("{dst_s} = {}", emit_scalar(value, ctx)));
+            emit_guarded(out, &format!("{dst_s} = {}", emit_scalar(value, ctx)?));
             Ok(())
         }
 
@@ -2385,6 +2404,7 @@ fn emit_stmt(
                 let slot = stage
                     .as_ref()
                     .map(|s| emit_scalar(s, ctx))
+                    .transpose()?
                     .unwrap_or_else(|| "0".to_string());
                 let total_bytes = *bytes as u64 * ctx.cta_group as u64;
                 // Nest the CTA selector and the single-issue guard as separate `if`s
@@ -2442,10 +2462,11 @@ fn emit_stmt(
                 let slot = stage
                     .as_ref()
                     .map(|s| emit_scalar(s, ctx))
+                    .transpose()?
                     .unwrap_or_else(|| "0".to_string());
                 format!(
                     "T.ptx.mbarrier.arrive({local_name}.ptr_to([{slot}]), remote={cta}, pred=True)",
-                    cta = emit_scalar(remote, ctx),
+                    cta = emit_scalar(remote, ctx)?,
                 )
             } else {
                 let slot_ptr = mbar_slot_ptr(mbar, stage, ctx)?;
@@ -2473,6 +2494,7 @@ fn emit_stmt(
             let phase_s = phase
                 .as_ref()
                 .map(|p| emit_scalar(p, ctx))
+                .transpose()?
                 .unwrap_or_else(|| "0".to_string());
             out.push_str(&format!(
                 "{p}T.ptx.mbarrier.try_wait({slot_ptr}, {phase_s})\n"
@@ -2523,6 +2545,7 @@ fn emit_stmt(
             let mbar_slot = mbar_stage
                 .as_ref()
                 .map(|s| emit_scalar(s, ctx))
+                .transpose()?
                 .unwrap_or_else(|| "0".to_string());
             // The SMEM dst is a staged tile (a leading size-1 ring dim): drop it to an
             // integer index so the operand rank matches the 2D GMEM region.
@@ -2647,14 +2670,14 @@ fn emit_stmt(
                 match op {
                     MmaOperand::Slice(s) => emit_smem_tile(s, ctx),
                     MmaOperand::Tmem(t) => {
-                        let row_s = emit_scalar(&t.row, ctx);
-                        let col_s = emit_scalar(&t.col, ctx);
-                        let row_hi = add_bound(&t.row, &ScalarValue::Int(i64::from(rows)), ctx);
+                        let row_s = emit_scalar(&t.row, ctx)?;
+                        let col_s = emit_scalar(&t.col, ctx)?;
+                        let row_hi = add_bound(&t.row, &ScalarValue::Int(i64::from(rows)), ctx)?;
                         let cells = match t.dtype {
                             DType::F16 | DType::Bf16 => *k as i64 / 2,
                             _ => i64::from(*k),
                         };
-                        let col_hi = add_bound(&t.col, &ScalarValue::Int(cells), ctx);
+                        let col_hi = add_bound(&t.col, &ScalarValue::Int(cells), ctx)?;
                         Ok(format!("tmem[{row_s}:{row_hi}, {col_s}:{col_hi}]"))
                     }
                 }
@@ -2677,7 +2700,7 @@ fn emit_stmt(
                         };
                         let buf = ctx.tensor_name(s.tensor.id)?;
                         let stage =
-                            emit_scalar(s.offsets.first().unwrap_or(&ScalarValue::Int(0)), ctx);
+                            emit_scalar(s.offsets.first().unwrap_or(&ScalarValue::Int(0)), ctx)?;
                         let rows = s.shape.get(1).and_then(as_int).unwrap_or(0);
                         let cols = s.shape.get(2).and_then(as_int).unwrap_or(0) * 2;
                         Ok(format!(
@@ -2750,7 +2773,7 @@ fn emit_stmt(
                 .find(|v| v.col as i64 == col)
                 .ok_or_else(|| format!("codegen: no SF TMEM view at col {col}"))?;
             let src_name = ctx.tensor_name(src.tensor.id)?;
-            let stage = emit_scalar(src.offsets.first().unwrap_or(&ScalarValue::Int(0)), ctx);
+            let stage = emit_scalar(src.offsets.first().unwrap_or(&ScalarValue::Int(0)), ctx)?;
             // src is a staged SF SMEM tile `(SMEM_DEPTH, rows, SF_CTA_K)`; its full
             // (rows, SF_CTA_K) at this stage — the trailing slice dims.
             let (Some(r), Some(c)) = (
@@ -2804,8 +2827,8 @@ fn emit_stmt(
             // filled from column 0 (scratch reused per drain group), so the view
             // slice starts at 0.
             let width = *num as usize;
-            let _ = emit_scalar(&src.row, ctx); // row is the lane axis, captured by the view
-            let col_s = emit_scalar(&src.col, ctx);
+            let _ = emit_scalar(&src.row, ctx)?; // row is the lane axis, captured by the view
+            let col_s = emit_scalar(&src.col, ctx)?;
             // Read this atom into its sub-slice of the (wide) read fragment: the
             // epilogue issues a whole band's atoms into distinct slices, THEN a
             // single wait_ld (matching the canonical fence structure). A legacy
@@ -3137,6 +3160,7 @@ fn mbar_slot_ptr(
     let slot = stage
         .as_ref()
         .map(|s| emit_scalar(s, ctx))
+        .transpose()?
         .unwrap_or_else(|| "0".to_string());
     Ok(format!("{name}.ptr_to([{slot}])"))
 }
@@ -3162,9 +3186,9 @@ fn emit_gmem_region(
     }
     let mut dims = Vec::new();
     for (coord, ext) in coords.iter().zip(extents.iter()) {
-        let lo = emit_scalar(coord, ctx);
+        let lo = emit_scalar(coord, ctx)?;
         let ext_sv = ScalarValue::Int(*ext as i64);
-        let hi = add_bound(coord, &ext_sv, ctx);
+        let hi = add_bound(coord, &ext_sv, ctx)?;
         dims.push(format!("{lo}:{hi}"));
     }
     Ok(format!("{name}[{}]", dims.join(", ")))
@@ -3201,16 +3225,111 @@ fn emit_gmem_row_store(dst: &TensorSlice, ctx: &Ctx) -> Result<String, String> {
     if dst.offsets.len() != 2 {
         return Err("codegen: reg_store dst must be 2D".to_string());
     }
-    let clo = emit_scalar(&dst.offsets[1], ctx);
-    let chi = add_bound(&dst.offsets[1], &dst.shape[1], ctx);
+    let clo = emit_scalar(&dst.offsets[1], ctx)?;
+    let chi = add_bound(&dst.offsets[1], &dst.shape[1], ctx)?;
     if let Some(base) = strip_tid_in_wg(&dst.offsets[0]) {
-        let lo = emit_scalar(&base, ctx);
-        let hi = add_bound(&base, &ScalarValue::Int(128), ctx);
+        let lo = emit_scalar(&base, ctx)?;
+        let hi = add_bound(&base, &ScalarValue::Int(128), ctx)?;
         Ok(format!("{name}[{lo}:{hi}, {clo}:{chi}]"))
     } else {
         // No lane term (already a tile base): emit a 128-row band from the offset.
-        let lo = emit_scalar(&dst.offsets[0], ctx);
-        let hi = add_bound(&dst.offsets[0], &ScalarValue::Int(128), ctx);
+        let lo = emit_scalar(&dst.offsets[0], ctx)?;
+        let hi = add_bound(&dst.offsets[0], &ScalarValue::Int(128), ctx)?;
         Ok(format!("{name}[{lo}:{hi}, {clo}:{chi}]"))
+    }
+}
+
+// ===========================================================================
+// tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::dtype::ScalarDType;
+    use crate::ir::scalar::VarId;
+    use crate::ir::tensor::Tensor;
+
+    fn gmem_arg(id: u32) -> Arc<Tensor> {
+        Arc::new(Tensor {
+            id,
+            space: MemorySpace::Gmem,
+            dtype: DType::F32,
+            shape: vec![16, 16],
+            layout: None,
+            byte_offset: None,
+            reg_frag: None,
+        })
+    }
+
+    fn kernel(body: Vec<Stmt>) -> Kernel {
+        Kernel {
+            name: "t".to_string(),
+            args: vec![gmem_arg(0)],
+            body,
+            num_warps: 4,
+            smem_size_bytes: 0,
+            launch_shape: vec![2],
+            cluster_shape: vec![2],
+            smem_pool: false,
+        }
+    }
+
+    /// A scalar op with no TVMScript lowering (Xor) must fail closed with a
+    /// codegen `Err` — never leak an `<unsupported op …>` placeholder into the
+    /// emitted Python source (that was a syntax error at exec time).
+    #[test]
+    fn unsupported_scalar_op_is_an_err_not_source_text() {
+        let cond = ScalarValue::expr(
+            ScalarOp::Xor,
+            vec![ScalarValue::Int(1), ScalarValue::Int(2)],
+        );
+        let k = kernel(vec![Stmt::BreakIf { cond }]);
+        let err = kernel_to_tirx_source(&k).unwrap_err();
+        assert!(err.contains("no TVMScript lowering"), "{err}");
+    }
+
+    /// `ForLoop { unroll }` emits `T.unroll(stop)`, which only expresses
+    /// start=0/step=1 — a wider range must be rejected, not silently re-timed.
+    #[test]
+    fn unroll_loop_requires_zero_start_unit_step() {
+        let var = Var {
+            id: VarId(0),
+            binding: VarBinding::Loop,
+            dtype: ScalarDType::I32,
+        };
+        let bad = Stmt::ForLoop {
+            var,
+            start: ScalarValue::Int(1),
+            stop: ScalarValue::Int(4),
+            step: ScalarValue::Int(1),
+            body: vec![],
+            unroll: true,
+        };
+        let err = kernel_to_tirx_source(&kernel(vec![bad])).unwrap_err();
+        assert!(err.contains("unroll requires literal start=0"), "{err}");
+
+        let ok = Stmt::ForLoop {
+            var,
+            start: ScalarValue::Int(0),
+            stop: ScalarValue::Int(4),
+            step: ScalarValue::Int(1),
+            body: vec![],
+            unroll: true,
+        };
+        let src = kernel_to_tirx_source(&kernel(vec![ok])).unwrap();
+        assert!(src.contains("for v0 in T.unroll(4):"), "{src}");
+    }
+
+    /// Arg names: A–H for the existing kernels, the full alphabet after, then
+    /// id-derived `arg{i}` — no panic past 8 args.
+    #[test]
+    fn arg_names_extend_past_the_alphabet() {
+        assert_eq!(arg_name(0), "A");
+        assert_eq!(arg_name(7), "H");
+        assert_eq!(arg_name(8), "I");
+        assert_eq!(arg_name(25), "Z");
+        assert_eq!(arg_name(26), "arg26");
+        assert_eq!(arg_name(40), "arg40");
     }
 }
