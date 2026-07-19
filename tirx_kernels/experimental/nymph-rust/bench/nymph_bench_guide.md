@@ -17,14 +17,18 @@ cache at import time** — then the standard `load_kernel(name)` /
 runs internally) resolves it, with **no `registry={...}` argument** at the call
 site and **no changes to canon**.
 
-## The interface: one module per nymph kernel
+## The interface: in the kernel file (canon's single-file structure)
 
-Each nymph kernel gets its **own** bench-suite interface module under `bench/`,
-mirroring the corresponding canon kernel's interface (see canon's
-`tirx_kernels/gemm/nvfp4_gemm.py` / `fp16_bf16_gemm.py`). Do NOT combine several
-kernels behind one `kind=` switch — one module, one kernel, same shape as canon.
+Each nymph kernel carries its bench-suite interface **in its own kernel
+module** (`python/nymph_rs/kernels/<kernel>.py`), mirroring canon's
+single-file layout (see `tirx_kernels/gemm/nvfp4_gemm.py`). Do NOT put several
+kernels behind one `kind=` switch — one module, one kernel, same shape as
+canon.
 
-A module exposes the three bench-suite names, plus a one-line self-registration:
+The interface is three module-level names plus one registrar. **Pure data at
+module level; bench-only deps (tvm / torch / canon) imported lazily inside the
+functions** — the `nymph_rs` package must stay importable without them
+(CPU-only value sim, wheel installs):
 
 ```python
 # 1. KERNEL_META — identity. name = "nymph_<canon-kernel-name>"; category is
@@ -37,11 +41,15 @@ KERNEL_META = {"name": "nymph_nvfp4_gemm", "category": "experimental", "compute_
 CONFIGS = [{"M": s, "N": s, "K": s, "label": f"{s}x{s}x{s}"} for s in [1024, 2048, 4096, 8192, 16384]]
 
 # 3. run_bench — build BOTH impls into ONE funcs dict and hand it to bench() ONCE.
-#    canon is imported read-only; both impls go through the identical bench() call,
-#    so they get the identical methodology (cold-cache + rounds). Forward
-#    warmup/repeat/timer/**kwargs straight through — do NOT hardcode them, and do
-#    NOT add your own cooldowns / warm-L2 / CUDA-event timing (see "Don't" below).
+#    canon is imported read-only (lazily, here); both impls go through the
+#    identical bench() call, so they get the identical methodology (cold-cache
+#    + rounds). Forward warmup/repeat/timer/**kwargs straight through — do NOT
+#    hardcode them, and do NOT add your own cooldowns / warm-L2 / CUDA-event
+#    timing (see "Don't" below).
 def run_bench(M, N, K, *, warmup=None, repeat=None, timer=None, **kwargs):
+    import torch, tvm
+    from tirx_kernels.gemm.nvfp4_gemm import prepare_data, tir_ws_kernel
+    from tvm.tirx.bench import bench
     ...  # compile canon + nymph; allocate inputs once (Triton pure-launch)
     # Impl names MUST be "tir" (canon) / "tirx" (nymph): the bench-suite's
     # OURS_IMPLS contract (`bench_suite/impls.py::is_our_impl`) recognizes only
@@ -49,12 +57,15 @@ def run_bench(M, N, K, *, warmup=None, repeat=None, timer=None, **kwargs):
     funcs = {"tir": lambda: canon(...), "tirx": lambda: nymph(...)}
     return bench(funcs, warmup=warmup, repeat=repeat, timer=timer, **kwargs)
 
-# 4. Self-register into the bench-suite kernel cache so `load_kernel(name)` finds
-#    it (the dir-scan discovery skips experimental/). This is the whole "plug into
-#    the bench-suite" step — no canon/registry edits, no per-call injection.
-import sys
-from tirx_kernels.registry import _KERNEL_CACHE
-_KERNEL_CACHE[KERNEL_META["name"]] = sys.modules[__name__]
+# 4. register_bench_interface — self-register into the bench-suite kernel
+#    cache so `load_kernel(name)` finds the kernel (the dir-scan discovery
+#    skips experimental/). Called by bench/_nymph_bench_autoreg.py under
+#    NYMPH_BENCH_SUITE=1 — NOT at import time, so plain `import nymph_rs` has
+#    no registry side effects.
+def register_bench_interface() -> None:
+    import sys
+    from tirx_kernels.registry import _KERNEL_CACHE
+    _KERNEL_CACHE[KERNEL_META["name"]] = sys.modules[__name__]
 ```
 
 Signature note: the config-dict keys ARE the run_bench parameters. nvfp4 uses
@@ -117,8 +128,8 @@ and compare — canon's `tir` there is stable, so match that setup.
 
 ## Files
 
-- `bench/nvfp4_gemm.py`     — nymph NVFP4 GEMM interface (`run_bench(M, N, K, ...)`)
-- `bench/fp16_bf16_gemm.py` — nymph fp16/bf16 GEMM interface (`run_bench(dtype, M, N, K, ...)`)
+- `python/nymph_rs/kernels/nvfp4_gemm.py`     — the kernel AND its bench interface
+- `python/nymph_rs/kernels/fp16_bf16_gemm.py` — the kernel AND its bench interface
 - `bench/run_suite.py`      — THE bench entry: thin wrapper over the bench-suite orchestrator
 - `bench/nymph_workloads.yaml` — the workload list the orchestrator consumes
 - `bench/_nymph_bench_autoreg.py` — env-gated (NYMPH_BENCH_SUITE=1) registration hook

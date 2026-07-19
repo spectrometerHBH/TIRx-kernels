@@ -1051,3 +1051,86 @@ def _validate_launch_shape(launch_shape: LaunchShape, cta_group: int) -> None:
         raise ValueError("nvfp4_gemm launch_shape[0] must be a positive integer")
     if count % cta_group != 0:
         raise ValueError("nvfp4_gemm launch_shape[0] must be divisible by cta_group")
+
+
+# ---------------------------------------------------------------------------
+# Bench-suite interface (see bench/nymph_bench_guide.md). Lives IN the kernel
+# file, mirroring canon's single-file structure: pure data at module level;
+# bench-only deps (tvm / torch / canon) imported lazily so the nymph_rs
+# package stays importable without them (CPU-only value sim, wheel installs).
+# ---------------------------------------------------------------------------
+
+KERNEL_META = {"name": "nymph_nvfp4_gemm", "category": "experimental", "compute_capability": 10}
+CONFIGS = [
+    {"M": s, "N": s, "K": s, "label": f"{s}x{s}x{s}"} for s in [1024, 2048, 4096, 8192, 16384]
+]
+
+
+def _compile_nymph(M, N, K, alpha):
+    import importlib.util
+    import os
+    import tempfile
+
+    import tvm
+
+    from ..nymph_rs import kernel_to_tirx_source
+
+    src = kernel_to_tirx_source(
+        build_nvfp4_gemm(NvFp4GemmConfig(m=M, n=N, k=K, alpha=alpha, **gemm_config_for(M, N, K)))
+    )
+    p = os.path.join(tempfile.mkdtemp(prefix="nymph_nvfp4_"), "g.py")
+    with open(p, "w") as f:
+        f.write(src)
+    spec = importlib.util.spec_from_file_location("nymph_nvfp4_emitted", p)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return tvm.compile(
+        tvm.IRModule({"main": m.main}), tvm.target.Target("cuda"), tir_pipeline="tirx"
+    )
+
+
+def run_bench(M, N, K, *, warmup=None, repeat=None, timer=None, **kwargs):
+    """Bench canon vs nymph with the bench-suite's exact methodology.
+
+    Canon is imported read-only; both impls go through the identical
+    ``bench()`` call, and each is correctness-gated before timing (a ratio of
+    two kernels computing different results fails loudly).
+    """
+    import torch
+
+    import tvm
+    from tirx_kernels.gemm.nvfp4_gemm import prepare_data, tir_ws_kernel
+    from tvm.tirx.bench import bench
+
+    target = tvm.target.Target("cuda")
+    with target:
+        canon = tvm.compile(
+            tvm.IRModule({"main": tir_ws_kernel(M, N, K)}), target, tir_pipeline="tirx"
+        )
+    A, B, Asf, Bsf, alpha, Cref = prepare_data(M, N, K)
+    # Same math on both sides: canon applies the runtime-alpha rescale, nymph bakes
+    # the SAME alpha as a build-time immediate (the remaining asymmetry is the alpha
+    # LOAD, a known capability difference — not a different computation).
+    nymph = _compile_nymph(M, N, K, float(alpha))
+    at = torch.tensor([float(alpha)], device="cuda", dtype=torch.float)
+    Ae, Be = Asf.view(torch.float8_e4m3fn), Bsf.view(torch.float8_e4m3fn)
+    oc = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
+    on = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
+    funcs = {"tir": lambda: canon(A, B, Asf, Bsf, at, oc), "tirx": lambda: nymph(A, B, Ae, Be, on)}
+    for fn in funcs.values():
+        fn()
+    torch.cuda.synchronize()
+    for name, out in (("tir", oc), ("tirx", on)):
+        cos = torch.nn.functional.cosine_similarity(out.float().flatten(), Cref.flatten(), dim=0)
+        if cos < 0.98:
+            raise AssertionError(f"{name} output diverges from reference (cosine={cos:.4f})")
+    return bench(funcs, warmup=warmup, repeat=repeat, timer=timer, **kwargs)
+
+
+def register_bench_interface() -> None:
+    """Self-register into the bench-suite kernel cache (see bench/nymph_bench_guide.md)."""
+    import sys
+
+    from tirx_kernels.registry import _KERNEL_CACHE
+
+    _KERNEL_CACHE[KERNEL_META["name"]] = sys.modules[__name__]

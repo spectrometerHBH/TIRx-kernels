@@ -53,26 +53,18 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument(
-        "--rounds", type=int, default=5, help="standard-timer rounds per workload"
-    )
-    ap.add_argument(
-        "--max-shape", type=int, default=8192, help="skip configs with M above this"
-    )
+    ap.add_argument("--rounds", type=int, default=5, help="standard-timer rounds per workload")
+    ap.add_argument("--max-shape", type=int, default=8192, help="skip configs with M above this")
     ap.add_argument("--filter", default=None, help="kernel-name substring filter")
     ap.add_argument("--label", default=None, help="run label (default: git short sha)")
-    ap.add_argument(
-        "--cooldown", type=float, default=None, help="per-impl cooldown seconds"
-    )
+    ap.add_argument("--cooldown", type=float, default=None, help="per-impl cooldown seconds")
     args = ap.parse_args()
 
     yaml_path = _filtered_workloads(args.max_shape)
     env = os.environ.copy()
     env["NYMPH_BENCH_SUITE"] = "1"
     env["PYTHONPATH"] = os.pathsep.join(
-        p
-        for p in [os.path.join(_NYMPH_RUST, "python"), _REPO, env.get("PYTHONPATH", "")]
-        if p
+        p for p in [os.path.join(_NYMPH_RUST, "python"), _REPO, env.get("PYTHONPATH", "")] if p
     )
     cmd = [
         sys.executable,
@@ -98,8 +90,7 @@ def main() -> None:
         sys.exit(r.returncode)
 
     new = sorted(
-        set(glob.glob(os.path.join(out_dir, "runs", "*.json"))) - before,
-        key=os.path.getmtime,
+        set(glob.glob(os.path.join(out_dir, "runs", "*.json"))) - before, key=os.path.getmtime
     )
     if not new:
         sys.exit("run_suite: no run json produced")

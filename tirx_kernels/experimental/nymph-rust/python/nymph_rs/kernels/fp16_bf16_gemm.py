@@ -949,3 +949,80 @@ def _validate_launch_shape(launch_shape: LaunchShape) -> None:
         raise ValueError("fp16_bf16_gemm launch_shape[0] must be a positive integer")
     if count % CTA_GROUP != 0:
         raise ValueError("fp16_bf16_gemm launch_shape[0] must be divisible by cta_group")
+
+
+# ---------------------------------------------------------------------------
+# Bench-suite interface (see bench/nymph_bench_guide.md). Lives IN the kernel
+# file, mirroring canon's single-file structure: pure data at module level;
+# bench-only deps (tvm / torch / canon) imported lazily so the nymph_rs
+# package stays importable without them (CPU-only value sim, wheel installs).
+# ---------------------------------------------------------------------------
+
+KERNEL_META = {"name": "nymph_fp16_bf16_gemm", "category": "experimental", "compute_capability": 10}
+CONFIGS = [
+    {"dtype": d, "M": s, "N": s, "K": s, "label": f"{d}_{s}x{s}x{s}"}
+    for d in ["fp16", "bf16"]
+    for s in [1024, 2048, 4096, 8192, 16384]
+]
+
+
+def _compile_nymph(dtype, M, N, K):
+    import importlib.util
+    import os
+    import tempfile
+
+    import tvm
+
+    from ..nymph_rs import kernel_to_tirx_source
+
+    ndt = DType.F16 if dtype == "fp16" else DType.BF16
+    src = kernel_to_tirx_source(build_fp16_bf16_gemm(Fp16Bf16GemmConfig(m=M, n=N, k=K, dtype=ndt)))
+    p = os.path.join(tempfile.mkdtemp(prefix="nymph_gemm_"), "g.py")
+    with open(p, "w") as f:
+        f.write(src)
+    spec = importlib.util.spec_from_file_location("nymph_gemm_emitted", p)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return tvm.compile(
+        tvm.IRModule({"main": m.main}), tvm.target.Target("cuda"), tir_pipeline="tirx"
+    )
+
+
+def run_bench(dtype, M, N, K, *, warmup=None, repeat=None, timer=None, **kwargs):
+    """Bench canon vs nymph with the bench-suite's exact methodology.
+
+    Canon is imported read-only; both impls go through the identical
+    ``bench()`` call, and each is correctness-gated before timing (a ratio of
+    two kernels computing different results fails loudly).
+    """
+    import torch
+
+    from tirx_kernels.gemm.fp16_bf16_gemm import prepare_data, tir_kernel
+    from tirx_kernels.runner import compile_kernel
+    from tvm.tirx.bench import bench
+
+    canon = compile_kernel(tir_kernel(dtype, M, N, K))
+    nymph = _compile_nymph(dtype, M, N, K)
+    a, b, c = prepare_data(dtype, M, N, K)
+    oc, on = torch.zeros_like(c, device="cuda"), torch.zeros_like(c, device="cuda")
+    funcs = {"tir": lambda: canon(a, b, oc), "tirx": lambda: nymph(a, b, on)}
+    for fn in funcs.values():
+        fn()
+    torch.cuda.synchronize()
+    ref = torch.mm(a, b.T)
+    for name, out in (("tir", oc), ("tirx", on)):
+        cos = torch.nn.functional.cosine_similarity(
+            out.float().flatten(), ref.float().flatten(), dim=0
+        )
+        if cos < 0.99:
+            raise AssertionError(f"{name} output diverges from reference (cosine={cos:.4f})")
+    return bench(funcs, warmup=warmup, repeat=repeat, timer=timer, **kwargs)
+
+
+def register_bench_interface() -> None:
+    """Self-register into the bench-suite kernel cache (see bench/nymph_bench_guide.md)."""
+    import sys
+
+    from tirx_kernels.registry import _KERNEL_CACHE
+
+    _KERNEL_CACHE[KERNEL_META["name"]] = sys.modules[__name__]
