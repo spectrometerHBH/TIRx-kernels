@@ -48,8 +48,20 @@ Per-op detail lives in `docs/ir-ops.md`; this file is the short trust boundary.
 ## sim-only ops (no codegen lowering — sim-green means nothing for silicon)
 
 WarpMma, RegUnary, GmemAtomicAdd, GmemWaitEq, CpAsyncBulkS2Cluster,
-TmaStore.reduce_add. Compile gates reject them; do not treat their sim
-validation as GPU evidence.
+TmaStore.reduce_add, Tcgen05St / Tcgen05WaitSt, Fence Memory/View, and any
+Tcgen05Ld outside (shape=32x32b, row=0, f32). Compile gates reject them; do
+not treat their sim validation as GPU evidence.
+
+## IR restrictions that keep validate and codegen on one semantics
+
+- **TMEM**: one base-0 column band per kernel, live at most once; every
+  alloc/dealloc/relinquish carries the kernel cta_group; no alloc after a
+  `relinquish_alloc_permit` (also enforced per CTA at runtime, PTX
+  §9.7.17.7.1). Multi-band/base-offset TMEM plans are IR-illegal on purpose
+  (the generated code is a single base-0 view).
+- **codegen destructures no Stmt field silently**: `, .. }` is banned in
+  codegen.rs (compile-gated text check); an IR field the emission cannot
+  honor is an `Err`, never a dropped default.
 
 ## Environment / config hardcodes
 

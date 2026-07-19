@@ -124,6 +124,36 @@ Modeled: arrive-one per target; multicast_cta_mask retargets same-offset mbar
 wait::ld/st are markers in value mode, drain points in trace/checker. Both
 documented abstractions, no known divergence.
 
+## tcgen05.alloc / dealloc / relinquish_alloc_permit (§9.7.17.7)
+
+Modeled: physical column-band lifecycle (overlap, order, mismatch, missing —
+all fail closed), cta_group=2 two-CTA collective rendezvous, and the alloc
+PERMIT: `relinquish_alloc_permit` flips a per-CTA flag (idempotent — giving
+the permit up twice is a no-op); a later `tcgen05.alloc` targeting a
+relinquished CTA errors `tmem_alloc_after_relinquish` (PTX §9.7.17.7.1).
+
+The IR deliberately admits only what the codegen lowers — the generated code
+carries ONE base-0 TMEM view fed by a single alloc — so validate walk 4
+additionally rejects (**fixed in audit batch**): `base_col != 0`, a second
+concurrently-live alloc, a lifecycle op whose cta_group differs from the
+kernel-level group (cluster-size derived, mirroring the codegen per-op
+checks of commit 76600421), and any alloc after a relinquish. Codegen
+re-checks base_col/cta_group per op (it is reachable without validate);
+before this batch it dropped both fields via `..`, emitting one alloc for
+any number of IR bands.
+
+## tcgen05.ld / tcgen05.st codegen support set
+
+The interpreter models all five shapes; the CODEGEN lowers only
+`tcgen05.ld` with **shape=32x32b, row=static 0, dtype=f32** — the single
+(128, cols) f32 base-0 view window `Tx.wg.copy_async` encodes (a `.16x*b`
+atom reads col_factor×num columns from a 16-lane half-slab; the dropped
+`..` used to emit the 32x32b text for it anyway). Anything else fails
+closed at codegen (**fixed in audit batch**). `tcgen05.st` and
+`tcgen05.wait::st` stay sim-only (codegen `Err`). The `.16x*b` atoms DO
+still reach silicon — via a REG fragment declared `reg_frag`, whose TIRx
+dispatch is driven by the fragment layout, not by this IR field.
+
 ## mbarrier (§9.7.14.16)
 
 Core algebra (init/arrive/expect_tx/complete_tx/phase completion/reset/parity
@@ -165,6 +195,15 @@ SILENT / known divergences:
 Modeled: CtaSync / WgSync / NamedBarrier (rendezvous + reuse), ClusterSync
 (peer liveness), fences trace-only, SetMaxNReg range checks (interpreter
 no-op by design).
+
+Fence codegen (**fixed in audit batch**): `AsyncProxy` lowers its IR `scope`
+1:1 to the `fence.proxy.async` space qualifier — Cta → `shared::cta`,
+Cluster → `shared::cluster`, Gpu → unqualified (orders every space, exactly
+the checker's `Gpu => covers any access`; a `.global` narrowing would run a
+weaker fence than sim validates). Was: the scope field was `..`-dropped and
+every proxy fence emitted `shared::cta`. `Memory`/`View` fences are sim-only
+ordering markers (trace `Generic` events) with no TIRx lowering — codegen
+now fails closed on them instead of silently emitting nothing.
 
 Envelope gaps → **fixed in audit batch**: ShuffleSync src_lane must be in
 [0,32) (was: negatives silently clamped to lane 0) and is REJECTED inside
