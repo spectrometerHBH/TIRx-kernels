@@ -292,8 +292,14 @@ class IRBuilder:
         return tensor
 
     def tmem_alloc(self, base_col: int, n_cols: int, cta_group: Literal[1, 2] = 1) -> None:
-        """Allocate the TMEM column band [base_col, base_col + n_cols) — the bands
-        of a kernel's live allocs must not overlap and must sum to ≤ 512 columns."""
+        """Allocate the TMEM column band [base_col, base_col + n_cols). The IR's
+        lifecycle is deliberately narrower than raw PTX (validate enforces it,
+        because codegen lowers the band as ONE base-0 view): a single live
+        base-0 band per kernel (the next alloc needs a matching dealloc first),
+        every lifecycle op carries the kernel-level cta_group, no alloc after
+        `tmem_relinquish` (PTX §9.7.17.7.1), and lifecycle ops are top-level
+        only — never inside a loop/conditional (ForLoop/Loop/If/ForEachTask/
+        SchedulerImpl body)."""
         self._append(TmemAlloc(base_col=base_col, n_cols=n_cols, cta_group=cta_group))
 
     def tmem_dealloc(self, base_col: int, n_cols: int, cta_group: Literal[1, 2] = 1) -> None:

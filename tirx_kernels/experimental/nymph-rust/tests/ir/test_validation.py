@@ -380,10 +380,33 @@ def test_rejects_clc_try_cancel_mbar_kind_and_handle_size():
         [
             n.SchedulerImpl(
                 scheduler=sched,
-                body=(n.ClcTryCancel(sched, smem([4], dtype=n.DType.U32), ok_mbar),),
+                body=(n.ClcTryCancel(sched, smem([4], dtype=n.DType.U32), ok_mbar, cta_group=1),),
             )
         ]
     )
+
+
+def test_rejects_clc_try_cancel_cta_group_mismatch():
+    # The cta_group field has no codegen emission site (TIRx's clc lowering
+    # implies the multicast width), so a mismatch with the kernel-level engine
+    # group is rejected at validate instead of running one semantics in sim and
+    # another in the generated code.
+    sched = _clc_scheduler()
+    mbar = n.MBar(kind=n.MBarKind.TMA)
+    handle = smem([4], dtype=n.DType.U32)
+
+    def impl(cta_group):
+        return n.SchedulerImpl(
+            scheduler=sched, body=(n.ClcTryCancel(sched, handle, mbar, cta_group=cta_group),)
+        )
+
+    with pytest.raises(ValueError, match=r"clc_try_cancel cta_group=2 != kernel cta_group=1"):
+        make([impl(2)])
+    with pytest.raises(ValueError, match=r"clc_try_cancel cta_group=1 != kernel cta_group=2"):
+        make([impl(1)], launch=(2,), cluster=(2,))
+    # The matching value validates in both geometries.
+    make([impl(1)])
+    make([impl(2)], launch=(2,), cluster=(2,))
 
 
 # ---- setmaxnreg --------------------------------------------------------------
@@ -419,6 +442,16 @@ def test_rejects_tma_load_bad_cache_hint():
         make([_tma_load("evict_last")])
     make([_tma_load("evict_normal")])
     make([_tma_load("evict_first")])
+
+
+def test_rejects_tma_load_bytes_mismatch():
+    # `bytes` feeds the sim's tx accounting while TIRx derives the transfer
+    # size from the tile extents: a statically-known mismatch is rejected at
+    # validate (the interpreter re-checks the evaluated value per launch).
+    # The default tile is 128x64 f16 = 16384 bytes.
+    with pytest.raises(ValueError, match=r"tma_load bytes=8192 != dst tile bytes \(16384\)"):
+        make([_tma_load(None, bytes=8192)])
+    make([_tma_load(None, bytes=16384)])
 
 
 def test_rejects_tma_load_group2_multicast_shared_mbar():
@@ -741,6 +774,77 @@ def test_rejects_inconsistent_cta_group():
     body = (n.TmemAlloc(0, 64, cta_group=1), n.TmemAlloc(64, 64, cta_group=2))
     with pytest.raises(ValueError, match="cta_group must be consistent"):
         make([n.Role(body=body, warp=0)])
+
+
+# ---- tmem lifecycle placement (top-level only) -------------------------------
+
+
+def test_rejects_tmem_lifecycle_inside_loop_or_conditional():
+    # A lifecycle op inside a loop/conditional body used to pass the one-pass
+    # lifecycle walk (which visits a loop body once) and then double-allocate
+    # on the second iteration at runtime. Placement is rejected outright until
+    # a path-sensitive analysis exists. (The Role wrapper puts the ops in warp
+    # scope so the placement rule — not the earlier scope rule — is exercised.)
+    i = n.Var()
+    v = n.Var(binding=n.VarBinding.SCALAR, dtype=n.ScalarDType.I32)
+    with pytest.raises(ValueError, match="not allowed inside a loop or conditional"):
+        make(
+            [
+                n.Role(
+                    body=(
+                        n.ForLoop(
+                            var=i, start=0, stop=2, step=1, body=(n.TmemAlloc(0, 128, cta_group=1),)
+                        ),
+                    ),
+                    warp=0,
+                ),
+                n.KernelFinalize(body=(n.TmemDealloc(0, 128, cta_group=1),), warp=0),
+            ]
+        )
+    with pytest.raises(ValueError, match="not allowed inside a loop or conditional"):
+        make(
+            [
+                n.KernelInit(body=(n.TmemAlloc(0, 128, cta_group=1),), warp=0),
+                n.Role(
+                    body=(
+                        n.ScalarDef(var=v, initial=1),
+                        n.If(cond=v < 2, then_body=(n.TmemDealloc(0, 128, cta_group=1),)),
+                    ),
+                    warp=0,
+                ),
+            ]
+        )
+    with pytest.raises(ValueError, match="not allowed inside a loop or conditional"):
+        make(
+            [
+                n.KernelInit(body=(n.TmemAlloc(0, 128, cta_group=1),), warp=0),
+                n.Role(
+                    body=(
+                        n.ScalarDef(var=v, initial=1),
+                        n.Loop(body=(n.TmemRelinquish(cta_group=1), n.BreakIf(v < 2))),
+                    ),
+                    warp=0,
+                ),
+            ]
+        )
+    # Top-level placement (KernelInit / KernelFinalize / Role body) is fine.
+    make(
+        [
+            n.KernelInit(body=(n.TmemAlloc(0, 128, cta_group=1),), warp=0),
+            n.KernelFinalize(
+                body=(n.TmemRelinquish(cta_group=1), n.TmemDealloc(0, 128, cta_group=1)), warp=0
+            ),
+        ]
+    )
+    make(
+        [
+            n.KernelInit(body=(n.TmemAlloc(0, 128, cta_group=1),), warp=0),
+            n.KernelFinalize(
+                body=(n.TmemRelinquish(cta_group=1), n.TmemDealloc(0, 128, cta_group=1)), warp=0
+            ),
+            n.Role(body=(), warp=1),
+        ]
+    )
 
 
 def test_rejects_if_branching_on_role_scope():

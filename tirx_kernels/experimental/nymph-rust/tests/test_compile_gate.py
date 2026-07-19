@@ -8,22 +8,39 @@ fails) — hence the tmp_path round-trip.
 
 import importlib.util
 
+import nymph_rs as nr
 import pytest
+from nymph_rs.kernels import build_bootstrap_gemm, build_fp16_bf16_gemm, build_nvfp4_gemm
 
 tvm = pytest.importorskip("tvm", reason="tvm not importable in this environment")
-
-import nymph_rs as nr
-from nymph_rs.kernels import (
-    build_bootstrap_gemm,
-    build_fp16_bf16_gemm,
-    build_nvfp4_gemm,
-)
 
 BUILDERS = {
     "bootstrap_gemm": build_bootstrap_gemm,
     "fp16_bf16_gemm": build_fp16_bf16_gemm,
     "nvfp4_gemm": build_nvfp4_gemm,
 }
+
+
+def test_empty_kernel_init_emits_valid_python(tmp_path):
+    # An empty KernelInit body used to render `if warp_id == 0:` with no
+    # indented statement — invalid Python. The structured emitter fills empty
+    # blocks with `pass` generically. (2-CTA cluster geometry: the tirx
+    # pipeline requires a real cluster launch — every shipped kernel has one.)
+    b = nr.IRBuilder(
+        "empty_init", num_warps=4, smem_size_bytes=0, launch_shape=(2,), cluster_shape=(2,)
+    )
+    b.arg(space=nr.MemorySpace.GMEM, dtype=nr.DType.F32, shape=(1,))  # codegen requires an arg
+    with b.kernel_init(warp=0):
+        pass
+    src = nr.kernel_to_tirx_source(b.build())
+    assert "pass" in src
+    mod_path = tmp_path / "emitted_empty_init.py"
+    mod_path.write_text(src)
+    spec = importlib.util.spec_from_file_location("emitted_empty_init", mod_path)
+    emitted = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(emitted)  # parse gate — a bare `if ...:` header would raise
+    mod = tvm.IRModule({"main": emitted.main})
+    tvm.compile(mod, tvm.target.Target("cuda"), tir_pipeline="tirx")
 
 
 @pytest.mark.parametrize("name", sorted(BUILDERS))

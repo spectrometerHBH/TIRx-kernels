@@ -120,20 +120,20 @@ parameters. An SF-classified tensor with a non-e4m3 dtype is an `Err`.
 | `ScalarDef` / `ScalarStore` | `name: T.int32 = <init>` / `name = <expr>` (a mutable `local_scalar` cell in the tirx parser) | 1:1; kept for genuinely loop-carried values (ring counters, task id) |
 | `ScalarLet` | `name: T.let[T.int32] = <expr>` (an immutable `T.Bind` SSA value — canon's tile-decode form) | 1:1; single-assignment (validate rejects `ScalarStore` to it); used for per-iteration derived values so the def-use chain is pure SSA |
 | `ShuffleSync` / `ClcQueryCancel` | `name: T.int32 = T.cuda.__shfl_sync(...)` / `= T.ptx.clc_query_cancel(...)` | 1:1 |
-| `ClcTryCancel` | `T.ptx.clc_try_cancel(handle, mbar)` | 1:1 |
+| `ClcTryCancel` | `T.ptx.clc_try_cancel(handle, mbar)` | 1:1 — the `cta_group` field has no emission site (TIRx's clc lowering implies the multicast width) but is NOT unchecked: validate requires it == the kernel-level cta_group and codegen re-checks (`Err`) |
 | `StoreScalar` | `task_smem[stage, field] = <value>` (SMEM mailbox write) | 1:1 |
 | `MBarrierInit` | `T.ptx.mbarrier.init(bar.ptr_to([stage]), count)` | 1:1 |
 | `MBarrierArrive` | `T.ptx.mbarrier.arrive(...)` (local) or `arrive(..., cta_id=…, pred=…)` (remote) | branches on `MBarRef.remote_coord` presence — a property of the node |
 | `MBarrierExpectTx` / `MBarrierArriveExpectTx` | `arrive.expect_tx(bar, bytes)` (a `leader_routed` mbar's expect_tx nests under `if cbx == 0:` and targets the CTA-0 `_cta0` view with the full cluster byte count) | the `MBar::leader_routed` IR flag — explicit routing metadata, not a shape |
 | `MBarrierWait` | `T.ptx.mbarrier.try_wait(bar.ptr_to([stage]), phase)`; a *run* of consecutive waits is coalesced, and at **function scope only** a trailing `tcgen05.fence.after_thread_sync() + cta_sync()` is appended | scope-based (`scope.is_function()`): the prologue needs the init-visibility fence; role-scope hot loops do not (the mbar handshake orders the async engines) |
-| `TmaLoad` | `Tx.copy_async(smem[slice], gmem[slice], dispatch="tma", cta_group=…, mbar=…, prefetch_tensormap=True)` | the per-CTA A-row / B-band split is in the IR's coords; codegen prints them |
+| `TmaLoad` | `Tx.copy_async(smem[slice], gmem[slice], dispatch="tma", cta_group=…, mbar=…, prefetch_tensormap=True)` | the per-CTA A-row / B-band split is in the IR's coords; codegen prints them. The transfer size is derived from the tile extents — the IR `bytes` is cross-checked, not emitted: validate rejects a statically-known mismatch with the tile (shape × dtype), and the interpreter re-checks per launch (`tma_bytes_mismatch`) |
 | `TmaStore` | `Tx.copy_async(C[slice], d_smem[slice], dispatch="tma", …)` | 1:1 |
 | `Tcgen05Mma` | `Tx.gemm_async(tmem[band], a_smem[slice], b_smem[slice], accum=<bool>, dispatch="tcgen05", cta_group=…)` | 1:1 — the IR carries the MMA at the FULL k-tile granularity: a dense f16/bf16 `k` is any positive multiple of the k=16 atom (validate reads it as an ordered run of atomic MMAs), exactly canon's one-issue full-K `gemm_async` (a 16-wide sub-slice of a 128B-swizzle atom would fault). There is NO run-collapse pass — the IR, not codegen, owns the MMA granularity |
 | `Tcgen05Commit` | `T.ptx.tcgen05.commit(bar.ptr_to([stage]), cta_group=…, cta_mask=…)` | 1:1 |
 | `Tcgen05Ld` | `Tx.wg.copy_async(reg[:, col:col+w], tmem[:, col:col+w])` | 1:1 |
 | `Tcgen05WaitLd` | `T.ptx.tcgen05.wait.ld()` | 1:1 |
 | `RegCvt` / `RegStore` | `Tx.wg.cast(out[slice], in[slice])` / `Tx.wg.copy(smem[slice], reg[slice])` | 1:1; the lane-axis (`tid_in_wg`) row offset is recognized structurally for the slice form |
-| `Fence` | `MbarrierInit` → `fence.mbarrier_init()`; `AsyncProxy` → `fence.proxy_async("shared::cta")`, **all-thread at function scope, single-thread (`if tid_in_wg==0:`) in a role** | scope-based, generic; the kind is read off the node |
+| `Fence` | `MbarrierInit` → `fence.mbarrier_init()`; `AsyncProxy` → `fence.proxy_async(space)` with the IR `scope` lowered 1:1 — `Cta` → `"shared::cta"`, `Cluster` → `"shared::cluster"`, `Gpu` → the unqualified form (orders every address space); **all-thread at function scope, single-thread (`if tid_in_wg==0:`) in a role**. `Memory`/`View` are sim-only ordering markers — codegen `Err` | scope-based, generic; the kind and scope are read off the node |
 | `CtaSync` | `T.cuda.cta_sync()` — **only at function scope** (a partial-CTA `__syncthreads` is illegal) | scope-based |
 | `ClusterSync` | `T.cuda.cluster_sync()` | 1:1 |
 | `ClusterBarrierArrive` | `T.ptx.barrier.cluster.arrive(sem="relaxed", aligned=True)` | 1:1 |
@@ -175,6 +175,7 @@ config dependence. Decisively, the config knobs the doc disclaims (`mma_n`, `pip
 | `needs_paren` (1313), operator/precedence tables (1117, 1177) | **expression printing** | standard precedence; value-independent |
 | mbarrier-wait-run coalescing (1484, 1509) | **structural run-merge** | collapses a run of consecutive `MBarrierWait`; structure, not shape |
 | `merge_guards` single-issue-guard merge | **structured run-merge** | folds adjacent same-guard single-issue blocks keyed on the emission-site guard ANNOTATION (a line attribute), never on the line text — an IR `If` with a guard-looking condition is untouched |
+| `fill_empty_blocks` empty-block `pass` fill | **structural** | any block opener (`if`/`else`/`for`/`while`/`def` …) with no body line gets a `pass` — an empty KernelInit/Role/If body otherwise renders invalid Python; one generic line-structure rule, not a per-construct ban |
 | `is_nonneg` / `nonneg_vars` (the `%`/`//` strength-reduction gate) | **provable expression property** | the pow2 bit-op rewrite is an unconditional two's-complement identity (no gate); the trunc rewrite for other positive divisors is gated on the computed provably-non-negative var set — a sentinel-negative scalar keeps its floordiv/floormod form |
 | unsupported `ScalarOp` (e.g. `Xor`) | **fail closed** | a codegen `Err`, never a placeholder literal in the Python source |
 | `arg_name` (A–Z then `arg{i}`) | **id-derived naming** | positional, cosmetic (TVM matches args positionally); no fixed table to overflow |

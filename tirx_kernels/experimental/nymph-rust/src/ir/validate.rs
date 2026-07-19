@@ -808,6 +808,21 @@ fn validate_stmt(s: &Stmt) -> R {
             if dst.tensor.dtype != src.dtype {
                 return bail("tma_load dst and src dtype must match");
             }
+            // `bytes` feeds the sim's tx accounting while TIRx derives the
+            // transfer size from the tile extents: when the value is statically
+            // known it must equal the tile's byte size (shape x dtype), or sim
+            // and codegen run different transfer sizes (fail closed — the
+            // interpreter re-checks the evaluated value per launch:
+            // `tma_bytes_mismatch`). A shape-dependent (non-literal) value
+            // skips the static check and relies on that runtime re-check.
+            if let (Some(b), Some(numel)) = (static_int(bytes), tensor_numel(shape)) {
+                let expected = numel as i64 * dtype_size_bytes(src.dtype) as i64;
+                if b != expected {
+                    return bail(format!(
+                        "tma_load bytes={b} != dst tile bytes ({expected}) from shape x dtype"
+                    ));
+                }
+            }
             for c in coords {
                 validate_scalar(c)?;
             }
@@ -2194,11 +2209,31 @@ fn check_context(
     Ok(())
 }
 
+/// The kernel-level tcgen05 engine group, derived from the cluster size the
+/// same way codegen's `ctx.cta_group` is — cluster-scope ops must carry
+/// exactly this value.
+fn kernel_cta_group(kernel: &Kernel) -> u8 {
+    kernel.cluster_shape.iter().product::<usize>().max(1) as u8
+}
+
 /// Walk 3: `_check_tcgen05_cta_group_consistency`.
-fn check_cta_group_consistency(body: &[Stmt]) -> R {
+fn check_cta_group_consistency(kernel: &Kernel) -> R {
+    let kernel_group = kernel_cta_group(kernel);
     let mut group: Option<u8> = None;
-    fn walk(body: &[Stmt], group: &mut Option<u8>) -> R {
+    fn walk(body: &[Stmt], group: &mut Option<u8>, kernel_group: u8) -> R {
         for s in body {
+            // The CLC multicast width must be the kernel-level engine group —
+            // the same fail-closed rule as the TMEM lifecycle ops in walk 4.
+            // The field has no codegen emission site (TIRx's clc lowering
+            // implies it), so an unchecked mismatch would validate one
+            // semantics and run another.
+            if let Stmt::ClcTryCancel { cta_group, .. } = s {
+                if *cta_group != kernel_group {
+                    return bail(format!(
+                        "clc_try_cancel cta_group={cta_group} != kernel cta_group={kernel_group}"
+                    ));
+                }
+            }
             let g = match s {
                 Stmt::TmemAlloc { cta_group, .. }
                 | Stmt::TmemDealloc { cta_group, .. }
@@ -2218,12 +2253,12 @@ fn check_cta_group_consistency(body: &[Stmt]) -> R {
                 }
             }
             for child in s.child_bodies() {
-                walk(child, group)?;
+                walk(child, group, kernel_group)?;
             }
         }
         Ok(())
     }
-    walk(body, &mut group)
+    walk(&kernel.body, &mut group, kernel_group)
 }
 
 /// Walk 4: TMEM allocation bands. TMEM is not a tensor: an allocation declares
@@ -2381,24 +2416,41 @@ fn check_tmem_alloc_bands(kernel: &Kernel) -> R {
         Ok(uses)
     }
 
-    // The kernel-level tcgen05 engine group, derived from the cluster size the
-    // same way codegen's `ctx.cta_group` is — every TMEM lifecycle op must
-    // carry exactly this value.
-    let kernel_cta_group = kernel.cluster_shape.iter().product::<usize>().max(1) as u8;
+    // Every TMEM lifecycle op must carry the kernel-level engine group
+    // (derived from the cluster size, mirroring codegen's `ctx.cta_group`).
+    let kernel_group = kernel_cta_group(kernel);
 
     fn walk(
         stmts: &[Stmt],
         live: &mut Vec<(i64, i64)>,
         relinquished: &mut bool,
         kernel_cta_group: u8,
+        lifecycle_banned: bool,
     ) -> R {
         for s in stmts {
+            // Lifecycle ops are TOP-LEVEL ONLY (a Role / KernelInit /
+            // KernelFinalize body is fine — those execute once, mutually
+            // exclusively). Inside a loop or conditional the one-pass walk
+            // below is unsound: it visits the body once, so a
+            // `for_loop(stop=2)` alloc + outside dealloc passed build/codegen
+            // but double-allocated on the second iteration
+            // (`tmem_already_allocated`). Until a path-sensitive analysis
+            // exists, reject the placement outright.
+            let banned_here = || {
+                lifecycle_banned.then(|| {
+                    "tmem lifecycle ops (alloc/dealloc/relinquish) are not allowed inside \
+                     a loop or conditional body (ForLoop/Loop/If/ForEachTask/SchedulerImpl)"
+                })
+            };
             match s {
                 Stmt::TmemAlloc {
                     base_col,
                     n_cols,
                     cta_group,
                 } => {
+                    if let Some(msg) = banned_here() {
+                        return bail(msg);
+                    }
                     if *cta_group != kernel_cta_group {
                         return bail(format!(
                             "tmem_alloc cta_group={cta_group} != kernel cta_group={kernel_cta_group}"
@@ -2430,6 +2482,9 @@ fn check_tmem_alloc_bands(kernel: &Kernel) -> R {
                     n_cols,
                     cta_group,
                 } => {
+                    if let Some(msg) = banned_here() {
+                        return bail(msg);
+                    }
                     if *cta_group != kernel_cta_group {
                         return bail(format!(
                             "tmem_dealloc cta_group={cta_group} != kernel cta_group={kernel_cta_group}"
@@ -2442,6 +2497,9 @@ fn check_tmem_alloc_bands(kernel: &Kernel) -> R {
                     live.remove(pos);
                 }
                 Stmt::TmemRelinquish { cta_group } => {
+                    if let Some(msg) = banned_here() {
+                        return bail(msg);
+                    }
                     if *cta_group != kernel_cta_group {
                         return bail(format!(
                             "tmem_relinquish cta_group={cta_group} != kernel cta_group={kernel_cta_group}"
@@ -2472,8 +2530,21 @@ fn check_tmem_alloc_bands(kernel: &Kernel) -> R {
                     }
                 }
             }
+            // The taint propagates downward: a Role nested inside a loop still
+            // re-executes with its parent, so only a fresh top-level scope
+            // (Role / KernelInit / KernelFinalize at an untainted point) keeps
+            // the current value.
+            let child_ban = lifecycle_banned
+                || matches!(
+                    s,
+                    Stmt::ForLoop { .. }
+                        | Stmt::Loop { .. }
+                        | Stmt::If { .. }
+                        | Stmt::ForEachTask { .. }
+                        | Stmt::SchedulerImpl { .. }
+                );
             for body in s.child_bodies() {
-                walk(body, live, relinquished, kernel_cta_group)?;
+                walk(body, live, relinquished, kernel_cta_group, child_ban)?;
             }
         }
         Ok(())
@@ -2481,7 +2552,13 @@ fn check_tmem_alloc_bands(kernel: &Kernel) -> R {
 
     let mut live = Vec::new();
     let mut relinquished = false;
-    walk(&kernel.body, &mut live, &mut relinquished, kernel_cta_group)
+    walk(
+        &kernel.body,
+        &mut live,
+        &mut relinquished,
+        kernel_group,
+        false,
+    )
 }
 /// Walk 5: the `leader_routed` IR flag is the ONLY authority on cluster
 /// TMA-completion routing — codegen honors it and never guesses it from the
@@ -2733,7 +2810,7 @@ impl Kernel {
             0,
             false,
         )?;
-        check_cta_group_consistency(&self.body)?;
+        check_cta_group_consistency(self)?;
         check_tmem_alloc_bands(self)?;
         check_leader_routed_mbars(self)?;
         check_let_single_assignment(&self.body)?;

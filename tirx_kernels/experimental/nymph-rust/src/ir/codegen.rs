@@ -811,7 +811,53 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
     let chained_body = chain_top_level_roles(&k.body);
     emit_body(&mut out, &chained_body, ind, &ctx, Scope::Function)?;
 
-    Ok(render_lines(merge_guards(out.finish())))
+    Ok(render_lines(fill_empty_blocks(merge_guards(out.finish()))))
+}
+
+/// Every emitted block opener (`if`/`else`/`for`/`while`/`def` …) must own at
+/// least one body line: an empty KernelInit/Role/If/guard body otherwise
+/// renders a header with no indented statement — invalid Python. Fill the gap
+/// with `pass`, generically at the structured-line level (covers empty `else`
+/// arms, an elected role whose body was fully peeled as leading
+/// ClusterBarrierWaits, and empty guard blocks alike) — a per-construct
+/// validator ban would have to enumerate every one of these sites.
+fn fill_empty_blocks(lines: Vec<Line>) -> Vec<Line> {
+    let is_opener = |text: &str| {
+        text.ends_with(':')
+            && text.split_whitespace().next().is_some_and(|kw| {
+                matches!(
+                    kw,
+                    "if" | "elif"
+                        | "else:"
+                        | "for"
+                        | "while"
+                        | "with"
+                        | "def"
+                        | "try:"
+                        | "except"
+                        | "finally:"
+                )
+            })
+    };
+    let mut out: Vec<Line> = Vec::with_capacity(lines.len());
+    for (i, line) in lines.iter().enumerate() {
+        let opener = is_opener(&line.text);
+        out.push(line.clone());
+        if !opener {
+            continue;
+        }
+        // The body begins at the next non-blank line; it must sit strictly
+        // deeper than the opener, else the block is empty.
+        let body = lines[i + 1..].iter().find(|l| !l.text.is_empty());
+        if body.is_none_or(|b| b.indent <= line.indent) {
+            out.push(Line {
+                indent: line.indent + 1,
+                text: "pass".into(),
+                guard: None,
+            });
+        }
+    }
+    out
 }
 
 /// Emission-time re-nesting of ADJACENT TOP-LEVEL roles into canon's if/else
@@ -2902,8 +2948,19 @@ fn emit_stmt(
             handle,
             mbar,
             stage,
-            cta_group: _, // the multicast width is implied by TIRx's clc lowering
+            // The multicast width is implied by TIRx's clc lowering, so the field
+            // has no emission site — but it is NOT unchecked: validate requires it
+            // == the kernel-level cta_group, and the same fail-closed re-check
+            // runs here (codegen is reachable without validate), mirroring
+            // TmaLoad's `cta_group` guard below.
+            cta_group,
         } => {
+            if *cta_group != ctx.cta_group {
+                return Err(format!(
+                    "codegen: ClcTryCancel cta_group={} != kernel cta_group={}",
+                    cta_group, ctx.cta_group
+                ));
+            }
             let handle_name = ctx.tensor_name(handle.id)?;
             // Both args are `T.address_of(buf[i])` — exactly canon's
             // `clc_try_cancel(T.address_of(clc_handle[0]), T.address_of(sched_arr.full.buf[0]))`.
@@ -3128,8 +3185,11 @@ fn emit_stmt(
             src,
             mbar,
             // The transfer size is derived from the tile extents, not the IR's
-            // `bytes` (that field feeds the interpreter's tx accounting; the
-            // matching expect_tx carries its own byte count).
+            // `bytes` — but the field is NOT unchecked: validate rejects a
+            // statically-known mismatch with the dst tile (shape × dtype), and
+            // the interpreter re-checks the evaluated value per launch
+            // (`tma_bytes_mismatch`). The matching expect_tx carries its own
+            // byte count.
             bytes: _,
             coords,
             shape,
@@ -4555,6 +4615,35 @@ mod tests {
             let err =
                 kernel_to_tirx_source(&kernel(vec![fence(kind, FenceScope::Gpu)])).unwrap_err();
             assert!(err.contains("sim-only"), "{err}");
+        }
+    }
+
+    #[test]
+    fn empty_kernel_init_body_emits_pass() {
+        // An empty KernelInit body used to render a bare `if warp_id == 0:`
+        // header with no indented statement — invalid Python. The structured
+        // emitter fills every empty block with `pass`.
+        let k = kernel(vec![Stmt::KernelInit {
+            body: vec![],
+            warp: Some(0),
+            lane: None,
+            elected: false,
+        }]);
+        let src = kernel_to_tirx_source(&k).unwrap();
+        assert!(src.contains("if warp_id == 0:\n        pass"), "{src}");
+        // And every block opener still owns a body line.
+        let lines: Vec<&str> = src.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if !line.trim_end().ends_with(':') {
+                continue;
+            }
+            let indent = line.len() - line.trim_start().len();
+            let body = lines[i + 1..]
+                .iter()
+                .find(|l| !l.trim().is_empty())
+                .expect("block opener must be followed by a body");
+            let body_indent = body.len() - body.trim_start().len();
+            assert!(body_indent > indent, "empty block at: {line}");
         }
     }
 }
