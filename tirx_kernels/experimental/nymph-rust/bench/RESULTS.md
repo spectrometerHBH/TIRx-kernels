@@ -23,19 +23,22 @@ divergences: docs/perf-methodology.md §5.
 | nvfp4 | 2048 | 0.991 | 0.989-0.996 | 8.5 | 8.6 |
 | nvfp4 | 4096 | 1.018 | 1.017-1.019 | 29.6 | 29.1 |
 | nvfp4 | 8192 | 1.013 | 0.994-1.033 | 187.6 | 185.1 |
+| nvfp4 | 16384 | 1.021 | 0.971-1.048 | 1520.3 | 1488.9 |
 | fp16 | 1024 | **1.019** | 1.018-1.020 | 6.8 | 6.7 |
 | fp16 | 2048 | 1.010 | 1.009-1.011 | 16.6 | 16.5 |
 | fp16 | 4096 | 1.002 | 0.988-1.015 | 96.1 | 95.9 |
 | fp16 | 8192 | 0.993 | 0.960-1.032 | 731.1 | 736.6 |
+| fp16 | 16384 | 1.001 | 0.964-1.078 | 5886.6 | 5882.4 |
 | bf16 | 1024 | **1.018** | 1.017-1.020 | 6.9 | 6.8 |
 | bf16 | 2048 | 1.011 | 1.010-1.012 | 16.4 | 16.3 |
 | bf16 | 4096 | 0.999 | 0.987-1.010 | 93.4 | 93.5 |
 | bf16 | 8192 | 1.000 | 0.966-1.038 | 705.6 | 705.9 |
+| bf16 | 16384 | 0.993 | 0.939-1.025 | 5621.1 | 5662.0 |
 
 (fp16/bf16 1024 move 0.981 -> 1.019/1.018 — target ≥0.99 met with margin; the
 uniform-placement flip also pays +1.0-1.5% on 2048 and +0.3-0.5% on 4096. nvfp4
-unchanged within noise. 16384 rows pending from the same-day `--max-shape 16384`
-rerun; added when it completes.)
+unchanged within noise. bf16 16384 reads 0.993 but spread 0.939-1.025 —
+noise-dominated, same band as the 0.999 [0.950-1.052] baseline read.)
 
 ## 2026-07-18 R2UR/uniform batch (ScalarLet) + shape retune — new baseline
 
