@@ -61,37 +61,38 @@ Signature note: the config-dict keys ARE the run_bench parameters. nvfp4 uses
 `{M,N,K}` → `run_bench(M, N, K, ...)`. fp16/bf16 adds `dtype` →
 `run_bench(dtype, M, N, K, ...)` (exactly canon's signature).
 
-## Running it (standard bench-suite path, no injection)
+## Running it (the orchestrator — the ONE default way)
 
-Import the interface modules (they self-register), then use the standard
-`load_kernel` + `run_kernel_bench` — no `registry={...}`:
-
-```python
-import importlib.util, sys
-from tirx_kernels.registry import load_kernel
-from tirx_kernels.runner import run_kernel_bench   # the bench-suite runner
-
-# import the interface module so it self-registers (in sys.modules before exec)
-spec = importlib.util.spec_from_file_location("nvfp4_iface", "bench/nvfp4_gemm.py")
-m = importlib.util.module_from_spec(spec); sys.modules["nvfp4_iface"] = m; spec.loader.exec_module(m)
-
-mod = load_kernel("nymph_nvfp4_gemm")        # STANDARD lookup (via the registry cache)
-for cfg in mod.CONFIGS:                      # each module iterates its OWN CONFIGS
-    r = run_kernel_bench("nymph_nvfp4_gemm", cfg, rounds=10, timer="proton")  # no registry=
-    im = r["impls"]                          # {"tir": us, "tirx": us} — round-aggregate
-    print(f"{cfg['label']}: tir/tirx = {im['tir'] / im['tirx']:.3f}")
-```
-
-`bench/run_suite.py` in this dir does exactly this for all nymph GEMM kernels:
+`bench/run_suite.py` is a thin wrapper over the bench-suite **orchestrator**
+(`python -m tirx_kernels.bench_suite`): automatic GPU selection + interference
+requeue, per-workload subprocess isolation, json/report artifacts under
+`<tirx-kernels>/.bench-suite/`. There is no per-GPU flag on purpose — the
+orchestrator probes the visible cards and skips occupied ones.
 
 ```
-CUDA_VISIBLE_DEVICES=<idle gpu> python bench/run_suite.py --rounds 10
+python bench/run_suite.py [--rounds 5] [--max-shape 8192] [--filter nvfp4] [--label L]
+```
+
+Registration inside every orchestrator worker is env-gated: with
+`NYMPH_BENCH_SUITE=1` (the wrapper sets it), the sitecustomize hook loads
+`bench/_nymph_bench_autoreg.py`, which imports the interface modules (they
+self-register). Direct invocation without the wrapper:
+
+```
+NYMPH_BENCH_SUITE=1 python -m tirx_kernels.bench_suite --workloads bench/nymph_workloads.yaml --no-report
 ```
 
 `ratio = canon_us / nymph_us` (`>= 1.0` means nymph is at least as fast as
-canon). Read the **round-aggregate** `r["impls"]` — that is what the bench-suite
-reports; `r["round_samples"]` is the raw per-round series (fine for a spread
-sanity-check, but the aggregate is the number).
+canon). Read the **round-aggregate** `impls` — that is what the bench-suite
+reports; `round_samples` is the raw per-round series (fine for a spread
+sanity-check, but the aggregate is the number). The historical numbers live in
+`bench/RESULTS.md`.
+
+For programmatic use (tests, one-off A/B), the runner path also works
+in-process: import an interface module (self-registers), then
+`tirx_kernels.runner.run_kernel_bench("nymph_...", cfg, ...)` — but note this
+runs on the ambient `CUDA_VISIBLE_DEVICES` with no selection/requeue; it is
+NOT the default bench method.
 
 ## Don't roll your own timing
 
@@ -118,4 +119,7 @@ and compare — canon's `tir` there is stable, so match that setup.
 
 - `bench/nvfp4_gemm.py`     — nymph NVFP4 GEMM interface (`run_bench(M, N, K, ...)`)
 - `bench/fp16_bf16_gemm.py` — nymph fp16/bf16 GEMM interface (`run_bench(dtype, M, N, K, ...)`)
-- `bench/run_suite.py`      — driver: import interfaces → standard `run_kernel_bench`
+- `bench/run_suite.py`      — THE bench entry: thin wrapper over the bench-suite orchestrator
+- `bench/nymph_workloads.yaml` — the workload list the orchestrator consumes
+- `bench/_nymph_bench_autoreg.py` — env-gated (NYMPH_BENCH_SUITE=1) registration hook
+- `bench/RESULTS.md`        — dated bench records (ground truth for past numbers)

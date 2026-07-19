@@ -8,8 +8,11 @@ in chat.
 ## 1. Measuring
 
 ```bash
-CUDA_VISIBLE_DEVICES=<idle gpu> python bench/run_suite.py --rounds 10 --max-shape 16384
+python bench/run_suite.py --rounds 10 --max-shape 16384
 ```
+
+(run_suite.py is the thin wrapper over the bench-suite orchestrator — automatic
+GPU selection/requeue; no CUDA_VISIBLE_DEVICES needed.)
 
 - bench-suite standard path (`load_kernel` + `run_kernel_bench`), proton
   timer, cold cache; both impls (tir=canon, tirx=nymph) share the same data
