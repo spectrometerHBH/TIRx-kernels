@@ -31,9 +31,12 @@ def reg(shape, dtype=n.DType.F32):
     return n.Tensor(space=n.MemorySpace.REG, dtype=dtype, shape=shape)
 
 
-def make(body, *, num_warps=4, launch=(2,), cluster=(2,), args=(), tmem_cg=None):
+def make(body, *, num_warps=4, launch=(2,), cluster=(1,), args=(), tmem_cg=None):
     """Build a kernel (validates on construction). `tmem_cg` prepends a warp-scope
-    512-column TMEM alloc (with that cta_group) so TMEM operands have a live band."""
+    512-column TMEM alloc (with that cta_group) so TMEM operands have a live band.
+    The default geometry is a single CTA (kernel cta_group=1), matching the
+    cg=1 op vocabulary these tests use; validate pins every TMEM lifecycle op
+    to that kernel-level group."""
     if tmem_cg is not None:
         body = (n.KernelInit(body=(n.TmemAlloc(0, 512, cta_group=tmem_cg),), warp=0), *body)
     return n.Kernel(
@@ -159,7 +162,9 @@ def test_accepts_block_scaled_f8_and_nvfp4_mma():
     dst, a, b, sfa, sfb = mma_f8_operands()
     make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=32, k=32, sfa=sfa, sfb=sfb)], tmem_cg=1)
     dst, a, b, sfa, sfb = mma_fp4_operands()
-    make([n.Tcgen05Mma(dst=dst, a=a, b=b, sfa=sfa, sfb=sfb, **fp4_kwargs())], tmem_cg=2)
+    make(
+        [n.Tcgen05Mma(dst=dst, a=a, b=b, sfa=sfa, sfb=sfb, **fp4_kwargs())], tmem_cg=2, cluster=(2,)
+    )
 
 
 def test_accepts_mma_dense_full_k():

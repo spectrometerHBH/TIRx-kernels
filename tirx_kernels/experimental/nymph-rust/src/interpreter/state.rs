@@ -16,6 +16,12 @@ pub struct InterpreterState {
     pub tmem_allocations: HashMap<TmemAllocationKey, TmemAllocation>,
     pub tmem_last_alloc_cols: HashMap<usize, usize>,
     pub tmem_collectives: HashMap<TmemCollectiveKey, TmemCollective>,
+    /// CTAs that have executed `tcgen05.relinquish_alloc_permit` (PTX
+    /// §9.7.17.7.1): the permit is per CTA and gone for the rest of the
+    /// kernel, so a later `tcgen05.alloc` targeting the CTA fails closed.
+    /// Absent from the set = the CTA still holds its permit (the initial
+    /// state). Relinquishing again is a no-op — what is illegal is the alloc.
+    pub tmem_relinquished: std::collections::HashSet<usize>,
     pub cp_async_bulk_groups: HashMap<usize, i64>,
     pub scheduler_next_cursors: HashMap<(u32, usize), usize>,
     /// CLC handle slot: `clc_try_cancel` (the canonical oracle) writes the next work

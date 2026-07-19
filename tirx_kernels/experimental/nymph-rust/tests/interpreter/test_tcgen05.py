@@ -463,8 +463,9 @@ def _tmem_operand_mma_kernel():
     p_g = gmem_arg(b, dtype=nr.DType.F16, shape=(128, k))
     b_g = gmem_arg(b, dtype=nr.DType.F16, shape=(n, k))
     out = gmem_arg(b, dtype=nr.DType.F32, shape=(128, n))
-    # Two TMEM column bands: the packed-f16 operand P at col 0, the f32
-    # accumulator at col 32.
+    # ONE TMEM column band (validate's single-live-alloc rule): the packed-f16
+    # operand P at absolute col 0, the f32 accumulator at absolute col 32 —
+    # both addressed by physical column inside the one band.
     p = tmem_operand(0, 0, nr.DType.F16)
     dst = tmem_operand(0, 32, nr.DType.F32)
     b_s = smem_tensor(b, dtype=nr.DType.F16, shape=(n, k), byte_offset=0)
@@ -474,8 +475,7 @@ def _tmem_operand_mma_kernel():
     mc = b.mbar(kind=nr.MBarKind.TCGEN05)
 
     with b.kernel_init(warp=0):
-        b.tmem_alloc(0, 32)
-        b.tmem_alloc(32, 32)
+        b.tmem_alloc(0, 64)
     with b.role(warpgroup=0):
         b.reg_fill(out_frag, 0.0)
         b.tcgen05_st(dst, out_frag, shape="32x32b", num=n)
@@ -495,9 +495,7 @@ def _tmem_operand_mma_kernel():
         b.reg_store(out[b.tid_in_wg(), 0:n], out_frag)
     with b.kernel_finalize(warp=0):
         b.tmem_relinquish()
-        b.tmem_dealloc(32, 32)
-        b.tmem_relinquish()
-        b.tmem_dealloc(0, 32)
+        b.tmem_dealloc(0, 64)
 
     return b.build(), p_g, b_g, out
 

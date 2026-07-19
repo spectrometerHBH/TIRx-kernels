@@ -2229,11 +2229,25 @@ fn check_cta_group_consistency(body: &[Stmt]) -> R {
 /// Walk 4: TMEM allocation bands. TMEM is not a tensor: an allocation declares
 /// a column band `[base_col, base_col + n_cols)` and every TMEM operand is an
 /// absolute physical (lane, col) address whose extent the op implies. With
-/// constant addresses this statically proves: (a) concurrently live bands
-/// never overlap, (b) a dealloc matches a live band, (c) every operand's
-/// column span lands inside a band that is live at that program point. The
-/// interpreter re-checks all of this on the evaluated addresses at run time —
-/// this walk only rejects what is statically provably wrong.
+/// constant addresses this statically proves: (a) a dealloc matches a live
+/// band, (b) every operand's column span lands inside a band that is live at
+/// that program point. The interpreter re-checks both on the evaluated
+/// addresses at run time — this walk only rejects what is statically provably
+/// wrong.
+///
+/// The lifecycle itself is deliberately narrower than raw PTX, because the
+/// codegen lowers the whole TMEM band as ONE base-0 view (`decl_buffer(...,
+/// allocated_addr=0)`) fed by a single `tcgen05.alloc`; anything outside that
+/// shape would validate one semantics and run another:
+///   * every `TmemAlloc` has `base_col == 0`,
+///   * at most one allocation is live at any program point (the next
+///     `TmemAlloc` requires a matching `TmemDealloc` first),
+///   * every alloc/dealloc/relinquish carries the kernel-level cta_group
+///     (derived from the cluster size, mirroring the per-op checks codegen
+///     runs against `ctx.cta_group` — commit 76600421), and
+///   * no `TmemAlloc` follows a `TmemRelinquish` (PTX §9.7.17.7.1: the permit
+///     is gone for the rest of the kernel; the interpreter enforces the same
+///     rule per CTA at run time).
 fn check_tmem_alloc_bands(kernel: &Kernel) -> R {
     /// One TMEM operand use with its static (lane, column) extent, when known.
     struct Use<'a> {
@@ -2367,28 +2381,75 @@ fn check_tmem_alloc_bands(kernel: &Kernel) -> R {
         Ok(uses)
     }
 
-    fn walk(stmts: &[Stmt], live: &mut Vec<(i64, i64)>) -> R {
+    // The kernel-level tcgen05 engine group, derived from the cluster size the
+    // same way codegen's `ctx.cta_group` is — every TMEM lifecycle op must
+    // carry exactly this value.
+    let kernel_cta_group = kernel.cluster_shape.iter().product::<usize>().max(1) as u8;
+
+    fn walk(
+        stmts: &[Stmt],
+        live: &mut Vec<(i64, i64)>,
+        relinquished: &mut bool,
+        kernel_cta_group: u8,
+    ) -> R {
         for s in stmts {
             match s {
                 Stmt::TmemAlloc {
-                    base_col, n_cols, ..
+                    base_col,
+                    n_cols,
+                    cta_group,
                 } => {
-                    let (b, n) = (i64::from(*base_col), i64::from(*n_cols));
-                    for &(lb, ln) in live.iter() {
-                        if b < lb + ln && lb < b + n {
-                            return bail("tmem_alloc column band overlaps a live allocation");
-                        }
+                    if *cta_group != kernel_cta_group {
+                        return bail(format!(
+                            "tmem_alloc cta_group={cta_group} != kernel cta_group={kernel_cta_group}"
+                        ));
                     }
-                    live.push((b, n));
+                    // PTX §9.7.17.7.1: the permit is gone for the rest of the
+                    // kernel once relinquished.
+                    if *relinquished {
+                        return bail("tmem_alloc after tmem_relinquish_alloc_permit");
+                    }
+                    // The generated code bases the single TMEM view at column 0;
+                    // a nonzero base would be silently dropped there.
+                    if *base_col != 0 {
+                        return bail("tmem_alloc base_col must be 0");
+                    }
+                    // One live band at a time — a second alloc would alias the
+                    // same single view in the generated code. (With base_col==0
+                    // enforced, two live bands always overlap; this check just
+                    // says so directly.)
+                    if !live.is_empty() {
+                        return bail(
+                            "tmem_alloc while another allocation is still live (dealloc it first)",
+                        );
+                    }
+                    live.push((i64::from(*base_col), i64::from(*n_cols)));
                 }
                 Stmt::TmemDealloc {
-                    base_col, n_cols, ..
+                    base_col,
+                    n_cols,
+                    cta_group,
                 } => {
+                    if *cta_group != kernel_cta_group {
+                        return bail(format!(
+                            "tmem_dealloc cta_group={cta_group} != kernel cta_group={kernel_cta_group}"
+                        ));
+                    }
                     let band = (i64::from(*base_col), i64::from(*n_cols));
                     let Some(pos) = live.iter().position(|&x| x == band) else {
                         return bail("tmem_dealloc does not match a live allocation");
                     };
                     live.remove(pos);
+                }
+                Stmt::TmemRelinquish { cta_group } => {
+                    if *cta_group != kernel_cta_group {
+                        return bail(format!(
+                            "tmem_relinquish cta_group={cta_group} != kernel cta_group={kernel_cta_group}"
+                        ));
+                    }
+                    // Idempotent to give up (a second relinquish is a no-op);
+                    // what is illegal is a later alloc — see the alloc arm.
+                    *relinquished = true;
                 }
                 _ => {}
             }
@@ -2412,14 +2473,15 @@ fn check_tmem_alloc_bands(kernel: &Kernel) -> R {
                 }
             }
             for body in s.child_bodies() {
-                walk(body, live)?;
+                walk(body, live, relinquished, kernel_cta_group)?;
             }
         }
         Ok(())
     }
 
     let mut live = Vec::new();
-    walk(&kernel.body, &mut live)
+    let mut relinquished = false;
+    walk(&kernel.body, &mut live, &mut relinquished, kernel_cta_group)
 }
 /// Walk 5: the `leader_routed` IR flag is the ONLY authority on cluster
 /// TMA-completion routing — codegen honors it and never guesses it from the

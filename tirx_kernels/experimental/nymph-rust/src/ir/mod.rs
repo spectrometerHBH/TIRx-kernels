@@ -280,6 +280,93 @@ mod tests {
             e.message
         );
     }
+
+    // ---- TMEM lifecycle (validate walk 4) ----
+    // The codegen lowers exactly ONE base-0 TMEM band per kernel, so validate
+    // pins the IR to that shape: base_col==0, one live alloc at a time, the
+    // kernel-level cta_group on every lifecycle op, and no alloc after a
+    // relinquish (PTX §9.7.17.7.1). TMEM ops require warp scope, hence warp0.
+
+    fn warp0(body: Vec<Stmt>) -> Stmt {
+        Stmt::Role {
+            else_body: Vec::new(),
+            body,
+            warp: Some(0),
+            warpgroup: None,
+            elected: false,
+            maxnreg: None,
+        }
+    }
+
+    fn tmem_alloc(base_col: u32, n_cols: u32, cta_group: u8) -> Stmt {
+        Stmt::TmemAlloc {
+            base_col,
+            n_cols,
+            cta_group,
+        }
+    }
+
+    fn tmem_dealloc(base_col: u32, n_cols: u32, cta_group: u8) -> Stmt {
+        Stmt::TmemDealloc {
+            base_col,
+            n_cols,
+            cta_group,
+        }
+    }
+
+    #[test]
+    fn tmem_single_band_lifecycle_passes() {
+        // The shape every shipped kernel uses: one base-0 alloc up front,
+        // matching dealloc + relinquish in the teardown (the test kernel's
+        // cluster is 2 CTAs, so the kernel cta_group is 2).
+        let body = vec![warp0(vec![
+            tmem_alloc(0, 512, 2),
+            tmem_dealloc(0, 512, 2),
+            Stmt::TmemRelinquish { cta_group: 2 },
+        ])];
+        assert!(kernel(body, 4).validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_two_live_tmem_allocs() {
+        // Two allocations live at once would alias the single generated TMEM
+        // view — the next alloc needs a matching dealloc first.
+        let body = vec![warp0(vec![tmem_alloc(0, 256, 2), tmem_alloc(0, 256, 2)])];
+        let e = kernel(body, 4).validate().unwrap_err();
+        assert!(e.message.contains("still live"), "{}", e.message);
+    }
+
+    #[test]
+    fn rejects_tmem_alloc_nonzero_base() {
+        let body = vec![warp0(vec![tmem_alloc(64, 64, 2)])];
+        let e = kernel(body, 4).validate().unwrap_err();
+        assert!(e.message.contains("base_col must be 0"), "{}", e.message);
+    }
+
+    #[test]
+    fn rejects_tmem_lifecycle_cta_group_mismatch() {
+        for s in [
+            tmem_alloc(0, 512, 1),
+            tmem_dealloc(0, 512, 1),
+            Stmt::TmemRelinquish { cta_group: 1 },
+        ] {
+            let e = kernel(vec![warp0(vec![s])], 4).validate().unwrap_err();
+            assert!(e.message.contains("!= kernel cta_group=2"), "{}", e.message);
+        }
+    }
+
+    #[test]
+    fn rejects_tmem_alloc_after_relinquish() {
+        // PTX §9.7.17.7.1: the permit is gone for the rest of the kernel.
+        let body = vec![warp0(vec![
+            tmem_alloc(0, 512, 2),
+            tmem_dealloc(0, 512, 2),
+            Stmt::TmemRelinquish { cta_group: 2 },
+            tmem_alloc(0, 512, 2),
+        ])];
+        let e = kernel(body, 4).validate().unwrap_err();
+        assert!(e.message.contains("after tmem_relinquish"), "{}", e.message);
+    }
 }
 
 /// Mechanical anti-drift gate: every `Stmt` variant must be handled (or
