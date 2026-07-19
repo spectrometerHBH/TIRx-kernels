@@ -603,6 +603,7 @@ class IRBuilder:
         start: ScalarValue = 0,
         step: ScalarValue = 1,
         unroll: bool = False,
+        no_unroll: bool = False,
     ) -> Iterator[Var]:
         var = Var()
         body: list[Stmt] = []
@@ -615,7 +616,15 @@ class IRBuilder:
         else:
             self._body_stack.pop()
             self._append(
-                ForLoop(var=var, start=start, stop=stop, step=step, body=tuple(body), unroll=unroll)
+                ForLoop(
+                    var=var,
+                    start=start,
+                    stop=stop,
+                    step=step,
+                    body=tuple(body),
+                    unroll=unroll,
+                    no_unroll=no_unroll,
+                )
             )
 
     def task_space(self, *, grid: tuple[int, ...], fields: tuple[str, ...]) -> TaskSpace:
@@ -731,7 +740,7 @@ class IRBuilder:
         m: int,
         n: int,
         k: int = 16,
-        accum: bool = False,
+        accum: bool | ScalarValue = False,
         trans_a: bool = False,
         trans_b: bool = False,
         cta_group: Literal[1, 2] = 1,

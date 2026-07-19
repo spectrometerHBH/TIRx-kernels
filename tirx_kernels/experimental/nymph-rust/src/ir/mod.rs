@@ -95,6 +95,7 @@ mod tests {
 
         let body = vec![
             Stmt::ForLoop {
+                no_unroll: false,
                 var: k,
                 start: ScalarValue::Int(0),
                 stop: ScalarValue::Int(16),
@@ -265,6 +266,7 @@ mod tests {
     #[test]
     fn rejects_cta_sync_inside_role() {
         let body = vec![Stmt::Role {
+            else_body: Vec::new(),
             body: vec![Stmt::CtaSync],
             warp: None,
             warpgroup: None,

@@ -413,7 +413,6 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
         return m_idx, n_idx
 
     with k.kernel_init(warp=0):
-        k.tmem_alloc(0, N_COLS_TMEM, CTA_GROUP)
         _init_stages(k, smem_full, stages=r.pipe_depth, count=1)
         _init_stages(k, smem_empty, stages=r.pipe_depth, count=r.num_consumer)
         _init_stages(k, tmem_full, stages=r.tmem_slots, count=1)
@@ -425,10 +424,12 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
         _init_stages(k, sched_fin, stages=1, count=finish_arrivals)
         if r.overlap:
             _init_stages(k, tmem_fin, stages=1, count=1)  # canon's tmem_fin (init_full=1)
+        k.tmem_alloc(0, N_COLS_TMEM, CTA_GROUP)
 
     # Seal the mbarrier-init epoch: a `fence.mbarrier_init` makes the inits above visible to
     # the async engines before any role touches a barrier (canon's `T.ptx.fence.mbarrier_init`).
     # Written EXPLICITLY here — codegen does not fabricate it.
+    k.fence(kind=FenceKind.ASYNC_PROXY, scope=FenceScope.CTA)
     k.fence(kind=FenceKind.MBARRIER_INIT)
 
     # Cross-CTA prologue barrier — written EXPLICITLY here (codegen never fabricates it or
@@ -441,7 +442,6 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
     if r.overlap:
         k.cluster_barrier_arrive()
     else:
-        k.fence(kind=FenceKind.ASYNC_PROXY, scope=FenceScope.CTA)
         k.cluster_sync()
 
     # Producer warpgroup register reduction. canon emits `setmaxnreg(False, 56)` on the
@@ -452,36 +452,6 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
     with k.role(warpgroup=r.num_consumer, maxnreg=PRODUCER_MAXNREG):
         pass
 
-    # ---- CLC scheduler warp (producer-wg warp 2, both CTAs) ----
-    # Written out explicitly in nymph IR (policy="custom"), the same primitive sequence as
-    # canon's `run_scheduler`: the dedicated scheduler warp issues clc_try_cancel and hands
-    # tiles to the workers through sched_arr / sched_fin.
-    with k.role(warp=r.producer_wg_base + 2, elected=True):
-        if r.overlap:
-            k.cluster_barrier_wait()
-        with k.scheduler_impl(sched):
-            sched_iter = k.scalar(initial=0, dtype=ScalarDType.I32)
-            with k.loop():
-                # canon's CLC scheduler handshake (barrier set = sched_arr + sched_fin, NO extra
-                # sched_sync rendezvous). The leader waits the finished barrier; BOTH CTAs arm
-                # expect_tx; the leader then issues try_cancel (its multicast response tx lands
-                # in the already-armed sched_arr); both wait the handle. (sched_fin starts
-                # satisfied at phase 1 so iter 0 runs.) The earlier nymph "expect_tx/tx race on
-                # 16384" that motivated the sched_sync rendezvous was actually the elect-only
-                # cluster.wait deadlock (now fixed) — verified race-free on 16384x5 without it.
-                with k.if_(cta_rank.eq(0)):
-                    k.mbarrier_wait(sched_fin, stage=0, phase=(sched_iter + 1) % 2)
-                k.mbarrier_arrive_expect_tx(sched_arr_full, bytes=CLC_HANDLE_BYTES, stage=0)
-                with k.if_(cta_rank.eq(0)):
-                    k.clc_try_cancel(sched, clc_handle, sched_arr_full, stage=0)
-                k.mbarrier_wait(sched_arr_full, stage=0, phase=sched_iter % 2)
-                raw = k.clc_query_cancel(sched, clc_handle)
-                k.mbarrier_arrive(sched_fin_leader, stage=0)
-                k.break_if(raw < 0)
-                k.scalar_store(sched_iter, sched_iter + 1)
-
-    # ---- TMA loader (TIRx producer-wg warp 3) — single-elect (canon's `if elect_sync():
-    # while: tma_load`): one issuing thread runs the whole loop, collapsing the per-op
     # elect guards (ELECT/BRA) that nymph otherwise emits at every TMA. No tcgen05 here,
     # so single-elect is checker-legal. ----
     with k.role(warp=r.producer_wg_base + 3, elected=True):
@@ -545,6 +515,35 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
 
     # ---- MMA (TIRx producer-wg warps 0..NUM_CONSUMER-1, cluster leader only) ----
     # Single-elect the whole MMA worker loop (canon's `if elect_sync(): while ...`): one
+
+    # ---- CLC scheduler warp (producer-wg warp 2, both CTAs) ----
+    # Written out explicitly in nymph IR (policy="custom"), the same primitive sequence as
+    # canon's `run_scheduler`: the dedicated scheduler warp issues clc_try_cancel and hands
+    # tiles to the workers through sched_arr / sched_fin.
+    with k.role(warp=r.producer_wg_base + 2, elected=True):
+        if r.overlap:
+            k.cluster_barrier_wait()
+        with k.scheduler_impl(sched):
+            sf_phase = k.scalar(initial=1, dtype=ScalarDType.I32)
+            sa_phase = k.scalar(initial=0, dtype=ScalarDType.I32)
+            sched_done = k.scalar(initial=0, dtype=ScalarDType.I32)
+            with k.loop():
+                k.break_if(sched_done.ne(0))
+                with k.if_(cta_rank.eq(0)):
+                    k.mbarrier_wait(sched_fin, stage=0, phase=sf_phase)
+                    k.scalar_store(sf_phase, (sf_phase + 1) % 2)
+                k.mbarrier_arrive_expect_tx(sched_arr_full, bytes=CLC_HANDLE_BYTES, stage=0)
+                with k.if_(cta_rank.eq(0)):
+                    k.clc_try_cancel(sched, clc_handle, sched_arr_full, stage=0)
+                k.mbarrier_wait(sched_arr_full, stage=0, phase=sa_phase)
+                k.scalar_store(sa_phase, (sa_phase + 1) % 2)
+                raw = k.clc_query_cancel(sched, clc_handle)
+                k.mbarrier_arrive(sched_fin_leader, stage=0)
+                with k.if_(raw < 0):
+                    k.scalar_store(sched_done, 1)
+
+    # ---- TMA loader (TIRx producer-wg warp 3) — single-elect (canon's `if elect_sync():
+    # while: tma_load`): one issuing thread runs the whole loop, collapsing the per-op
     # elect at the role top, so every single-issue op inside (mbar waits, gemm, commits)
     # inherits it instead of carrying its own ELECT/VOTEU/PLOP3 guard.
     for c in range(r.num_consumer):
@@ -567,13 +566,8 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
                     k.mbarrier_wait(tmem_empty, stage=slot, phase=tmem_empty_phase)
                     acc_op = accum.at(0, slot * r.mma_n)
 
-                    def _mma_kstep(first_ktile):
-                        # One k-tile: wait both smem_full barriers, issue ONE full-K
-                        # (k=BLK_K) MMA — the IR's dense k is an ordered run of k/16
-                        # atomic MMAs, exactly canon's one-issue full-K gemm_async —
-                        # commit smem_empty, advance the ring. accum=False ONLY on the
-                        # first k-tile (overwrite the accumulator), else True — kept a
-                        # Python bool by peeling the first k-tile.
+                    accum_flag = k.scalar(initial=0, dtype=ScalarDType.I32)
+                    with k.for_loop(stop=r.k_tiles, no_unroll=True) as _kt:
                         k.mbarrier_wait(smem_full, stage=mma_stage, phase=mma_phase)
                         k.mbarrier_wait(peer_smem_full, stage=mma_stage, phase=mma_phase)
                         k.tcgen05_mma(
@@ -591,9 +585,10 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
                             m=CTA_M,
                             n=r.mma_n,
                             k=r.blk_k,
-                            accum=not first_ktile,
+                            accum=accum_flag,
                             cta_group=CTA_GROUP,
                         )
+                        k.scalar_store(accum_flag, 1)
                         k.tcgen05_commit(
                             smem_empty,
                             stage=mma_stage,
@@ -601,12 +596,6 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
                             multicast_cta_mask=0b11,
                         )
                         _advance_ring(k, mma_stage, mma_phase, r.pipe_depth)
-
-                    # Peel the first k-tile (accum overwrite); ROLL the remaining k_tiles-1
-                    # with accum=True via a serial loop (uniform iteration count).
-                    _mma_kstep(first_ktile=True)
-                    with k.for_loop(stop=r.k_tiles - 1) as _kt:
-                        _mma_kstep(first_ktile=False)
                     k.tcgen05_commit(
                         tmem_full, stage=slot, cta_group=CTA_GROUP, multicast_cta_mask=0b11
                     )
@@ -921,10 +910,7 @@ def _init_stages(k: IRBuilder, mbar: MBar, *, stages: int, count: int) -> None:
     # Emit `for i in T.unroll(stages): mbarrier.init(buf[i], count)` (canon's form) instead of
     # `stages` flattened init statements. T.unroll is compile-time-unrolled (same SASS) but the
     # source reads as a loop. Single-stage barriers stay a plain unguarded init (no loop).
-    if stages == 1:
-        k.mbarrier_init(mbar, count=count, stage=0)
-        return
-    with k.for_loop(stop=stages, unroll=True) as i:
+    for i in range(stages):
         k.mbarrier_init(mbar, count=count, stage=i)
 
 

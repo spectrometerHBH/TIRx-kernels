@@ -1721,9 +1721,15 @@ impl PyStmt {
         }
     }
     #[getter]
-    fn accum(&self) -> PyResult<bool> {
+    fn accum(&self, py: Python<'_>) -> PyResult<PyObject> {
         match &self.0 {
-            ir::Stmt::Tcgen05Mma { accum, .. } => Ok(*accum),
+            // Literal 0/1 keep the historical bool API; a runtime expr returns the
+            // scalar object.
+            ir::Stmt::Tcgen05Mma {
+                accum: ir::ScalarValue::Int(v),
+                ..
+            } => Ok((*v != 0).into_pyobject(py)?.to_owned().into_any().unbind()),
+            ir::Stmt::Tcgen05Mma { accum, .. } => scalar_to_py(py, accum),
             _ => Err(PyAttributeError::new_err("accum")),
         }
     }
@@ -1958,13 +1964,14 @@ fn kernel_finalize(
     }))
 }
 #[pyfunction]
-#[pyo3(name = "Role", signature = (body = None, warp = None, warpgroup = None, elected = false, maxnreg = None))]
+#[pyo3(name = "Role", signature = (body = None, warp = None, warpgroup = None, elected = false, maxnreg = None, else_body = None))]
 fn role(
     body: Option<Bound<'_, PyAny>>,
     warp: Option<u32>,
     warpgroup: Option<u32>,
     elected: bool,
     maxnreg: Option<u32>,
+    else_body: Option<Bound<'_, PyAny>>,
 ) -> PyResult<PyStmt> {
     Ok(PyStmt(ir::Stmt::Role {
         body: opt_body(body)?,
@@ -1972,10 +1979,11 @@ fn role(
         warpgroup,
         elected,
         maxnreg,
+        else_body: opt_body(else_body)?,
     }))
 }
 #[pyfunction]
-#[pyo3(name = "ForLoop", signature = (var, start = None, stop = None, step = None, body = None, unroll = false))]
+#[pyo3(name = "ForLoop", signature = (var, start = None, stop = None, step = None, body = None, unroll = false, no_unroll = false))]
 fn for_loop(
     var: PyVar,
     start: Option<Bound<'_, PyAny>>,
@@ -1983,6 +1991,7 @@ fn for_loop(
     step: Option<Bound<'_, PyAny>>,
     body: Option<Bound<'_, PyAny>>,
     unroll: bool,
+    no_unroll: bool,
 ) -> PyResult<PyStmt> {
     Ok(PyStmt(ir::Stmt::ForLoop {
         var: var.0,
@@ -1991,6 +2000,7 @@ fn for_loop(
         step: opt_scalar_or(step, 1)?,
         body: opt_body(body)?,
         unroll,
+        no_unroll,
     }))
 }
 #[pyfunction]
@@ -2250,7 +2260,7 @@ fn cp_async_bulk_wait_group_read(n: u8) -> PyStmt {
     PyStmt(ir::Stmt::CpAsyncBulkWaitGroupRead { n })
 }
 #[pyfunction]
-#[pyo3(name = "Tcgen05Mma", signature = (dst, a, b, m, n, k = 16, accum = false, trans_a = false, trans_b = false, cta_group = 1, sfa = None, sfb = None, sf_byte = 0, sf_e4m3 = false, sf_block = 0, a_fp4 = false, b_fp4 = false, lane_align = 0))]
+#[pyo3(name = "Tcgen05Mma", signature = (dst, a, b, m, n, k = 16, accum = None, trans_a = false, trans_b = false, cta_group = 1, sfa = None, sfb = None, sf_byte = 0, sf_e4m3 = false, sf_block = 0, a_fp4 = false, b_fp4 = false, lane_align = 0))]
 #[allow(clippy::too_many_arguments)]
 fn tcgen05_mma(
     dst: Bound<'_, PyAny>,
@@ -2259,7 +2269,7 @@ fn tcgen05_mma(
     m: u32,
     n: u32,
     k: u32,
-    accum: bool,
+    accum: Option<Bound<'_, PyAny>>,
     trans_a: bool,
     trans_b: bool,
     cta_group: u8,
@@ -2272,6 +2282,15 @@ fn tcgen05_mma(
     b_fp4: bool,
     lane_align: u8,
 ) -> PyResult<PyStmt> {
+    // accum: None/False -> 0 (overwrite), True -> 1 (accumulate), any scalar expr ->
+    // the runtime accum predicate (canon's loop-carried accum cell).
+    let accum = match accum {
+        None => ir::ScalarValue::Int(0),
+        Some(v) if v.is_instance_of::<PyBool>() => {
+            ir::ScalarValue::Int(if v.extract::<bool>()? { 1 } else { 0 })
+        }
+        Some(v) => coerce_scalar(&v)?,
+    };
     Ok(PyStmt(ir::Stmt::Tcgen05Mma {
         dst: coerce_tmem_operand(&dst)?,
         a: coerce_mma_operand(&a)?,

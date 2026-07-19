@@ -57,17 +57,27 @@ fn execute_kernel_scope<'a, 'k>(
 }
 
 fn execute_role<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
-    let (body, warp, warpgroup, elected) = match stmt {
+    let (body, warp, warpgroup, elected, else_body) = match stmt {
         Stmt::Role {
             body,
             warp,
             warpgroup,
             elected,
+            else_body,
             ..
-        } => (body, *warp, *warpgroup, *elected),
+        } => (body, *warp, *warpgroup, *elected, else_body),
         _ => unreachable!(),
     };
     let child = filter_thread_mask(&ctx.cohort, |t| role_matches(t, warp, warpgroup, elected));
+    // The role-dispatch else-chain: cohort threads the role does NOT claim take the
+    // else frame. Pushed before the then-frame so the then-body steps first (the two
+    // masks are disjoint, so interleaving order is a scheduling detail only).
+    if !else_body.is_empty() {
+        let rest = filter_thread_mask(&ctx.cohort, |t| !role_matches(t, warp, warpgroup, elected));
+        if !rest.is_empty() {
+            push_frame(ctx.stream, else_body.as_slice(), rest);
+        }
+    }
     if !child.is_empty() && !body.is_empty() {
         push_frame(ctx.stream, body.as_slice(), child);
     }
@@ -97,6 +107,7 @@ fn execute_loop<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IRes
             step,
             body,
             unroll: _,
+            no_unroll: _,
         } => (var, start, stop, step, body),
         _ => unreachable!(),
     };

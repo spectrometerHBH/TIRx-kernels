@@ -187,6 +187,7 @@ fn has_mbar_arrive_for_cta(result: &RunResult, ctaid_in_cluster: usize) -> bool 
 #[test]
 fn failed_runs_do_not_expose_partial_values() {
     let body = vec![Stmt::Role {
+        else_body: Vec::new(),
         body: vec![Stmt::ScalarDef {
             var: var(0, VarBinding::Scalar),
             initial: ScalarInitial::Value(ScalarValue::Int(0)),
@@ -303,6 +304,7 @@ fn tma_roundtrip_mbar_cell_parity_is_rust_internal() {
                 stage: None,
             }]),
             Stmt::Role {
+                else_body: Vec::new(),
                 body: vec![
                     Stmt::MBarrierArriveExpectTx {
                         mbar: mbar_ref(&mbar),
@@ -384,6 +386,7 @@ fn tma_multicast_group2_mbar_targets_are_deduplicated() {
                 stage: None,
             }]),
             Stmt::Role {
+                else_body: Vec::new(),
                 body: vec![
                     Stmt::If {
                         cond: cta_eq(0),
@@ -452,6 +455,7 @@ fn mbarrier_wait_success_and_blocked_frontier_are_rust_internal() {
                 stage: None,
             }]),
             Stmt::Role {
+                else_body: Vec::new(),
                 body: vec![
                     Stmt::MBarrierArriveExpectTx {
                         mbar: mbar_ref(&mbar),
@@ -470,6 +474,7 @@ fn mbarrier_wait_success_and_blocked_frontier_are_rust_internal() {
                 maxnreg: None,
             },
             Stmt::Role {
+                else_body: Vec::new(),
                 body: vec![Stmt::TmaLoad {
                     dst: full_slice(smem),
                     src: source.clone(),
@@ -521,6 +526,7 @@ fn mbarrier_wait_success_and_blocked_frontier_are_rust_internal() {
                 stage: None,
             }]),
             Stmt::Role {
+                else_body: Vec::new(),
                 body: vec![
                     Stmt::MBarrierExpectTx {
                         mbar: mbar_ref(&expect_tx),
@@ -578,6 +584,7 @@ fn mbarrier_wait_success_and_blocked_frontier_are_rust_internal() {
                 stage: None,
             }]),
             Stmt::Role {
+                else_body: Vec::new(),
                 body: vec![
                     Stmt::If {
                         cond: cta_eq(0),
@@ -633,6 +640,7 @@ fn scalar_tensor_initial_loads_per_thread_gmem() {
         name: "scalar_tensor_initial".into(),
         args: vec![source.clone()],
         body: vec![Stmt::Role {
+            else_body: Vec::new(),
             body: vec![Stmt::ScalarDef {
                 var: scalar,
                 initial: ScalarInitial::Tensor(element_slice(
@@ -690,6 +698,7 @@ fn fence_cp_async_trace_limit_fail_closed() {
         name: "fence_cp_async_noop".into(),
         args: vec![source.clone(), out.clone()],
         body: vec![Stmt::Role {
+            else_body: Vec::new(),
             body: vec![
                 Stmt::CpAsyncBulkCommitGroup,
                 Stmt::CpAsyncBulkCommitGroup,
@@ -740,6 +749,7 @@ fn tma_and_reg_runtime_failures_expose_no_partial_values() {
         name: "tma_store_missing_source".into(),
         args: vec![],
         body: vec![Stmt::Role {
+            else_body: Vec::new(),
             body: vec![Stmt::TmaStore {
                 dst: out.clone(),
                 src: full_slice(smem.clone()),
@@ -774,6 +784,7 @@ fn tma_and_reg_runtime_failures_expose_no_partial_values() {
         name: "tma_store_divergent_coords".into(),
         args: vec![],
         body: vec![Stmt::Role {
+            else_body: Vec::new(),
             body: vec![Stmt::TmaStore {
                 dst: out.clone(),
                 src: full_slice(smem.clone()),
@@ -810,6 +821,7 @@ fn tma_and_reg_runtime_failures_expose_no_partial_values() {
         name: "reg_load_oob_source".into(),
         args: vec![short.clone()],
         body: vec![Stmt::Role {
+            else_body: Vec::new(),
             body: vec![Stmt::RegLoad {
                 dst: element_slice(reg.clone(), ScalarValue::Int(0)),
                 src: element_slice(short.clone(), ScalarValue::Scope(ScopeValueKind::LaneId)),
@@ -838,6 +850,7 @@ fn tma_and_reg_runtime_failures_expose_no_partial_values() {
         name: "reg_store_missing_source".into(),
         args: vec![out.clone()],
         body: vec![Stmt::Role {
+            else_body: Vec::new(),
             body: vec![Stmt::RegStore {
                 dst: element_slice(out, ScalarValue::Int(0)),
                 src: element_slice(reg, ScalarValue::Int(0)),
@@ -882,6 +895,7 @@ fn tcgen05_commit_success_paths_update_rust_internal_mbar_cells() {
                 stage: None,
             }]),
             Stmt::Role {
+                else_body: Vec::new(),
                 body: vec![Stmt::If {
                     cond: cta_eq(0),
                     then_body: vec![Stmt::Tcgen05Commit {
@@ -929,6 +943,7 @@ fn tcgen05_commit_success_paths_update_rust_internal_mbar_cells() {
                 stage: None,
             }]),
             Stmt::Role {
+                else_body: Vec::new(),
                 body: vec![Stmt::If {
                     cond: cta_eq(0),
                     then_body: vec![Stmt::Tcgen05Commit {
@@ -974,6 +989,7 @@ fn shuffle_sync_lane_range_fail_closed() {
         name: "shuffle_lane".into(),
         args: vec![],
         body: vec![Stmt::Role {
+            else_body: Vec::new(),
             body: vec![
                 Stmt::ScalarDef {
                     var: var(700, VarBinding::Scalar),
@@ -1059,6 +1075,7 @@ fn s2cluster_bytes_and_self_target_fail_closed() {
                     stage: None,
                 }]),
                 Stmt::Role {
+                    else_body: Vec::new(),
                     body: vec![Stmt::CpAsyncBulkS2Cluster {
                         dst: full_slice(dst.clone()),
                         src: src_sl,
@@ -1119,25 +1136,28 @@ fn tcgen05_mma_inplace_accum_requires_written_accumulator() {
         arrive_count: None,
         leader_routed: false,
     });
-    let mma = |accum: bool| Stmt::Tcgen05Mma {
-        dst: tmem_accum(0),
-        a: MmaOperand::Slice(full_slice(a_s.clone())),
-        b: MmaOperand::Slice(full_slice(b_s.clone())),
-        m: 128,
-        n: 16,
-        k: 16,
-        accum,
-        trans_a: false,
-        trans_b: false,
-        cta_group: 1,
-        sfa: None,
-        sfb: None,
-        sf_byte: 0,
-        sf_e4m3: false,
-        sf_block: 0,
-        a_fp4: false,
-        b_fp4: false,
-        lane_align: 0,
+    let mma = |accum: bool| {
+        let accum = ScalarValue::Int(if accum { 1 } else { 0 });
+        Stmt::Tcgen05Mma {
+            dst: tmem_accum(0),
+            a: MmaOperand::Slice(full_slice(a_s.clone())),
+            b: MmaOperand::Slice(full_slice(b_s.clone())),
+            m: 128,
+            n: 16,
+            k: 16,
+            accum,
+            trans_a: false,
+            trans_b: false,
+            cta_group: 1,
+            sfa: None,
+            sfb: None,
+            sf_byte: 0,
+            sf_e4m3: false,
+            sf_block: 0,
+            a_fp4: false,
+            b_fp4: false,
+            lane_align: 0,
+        }
     };
     let mk = |first_overwrite: bool| {
         let mut role_body = vec![
@@ -1202,6 +1222,7 @@ fn tcgen05_mma_inplace_accum_requires_written_accumulator() {
                     },
                 ]),
                 Stmt::Role {
+                    else_body: Vec::new(),
                     body: role_body,
                     warp: Some(0),
                     warpgroup: None,

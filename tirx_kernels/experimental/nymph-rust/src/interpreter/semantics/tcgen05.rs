@@ -14,6 +14,7 @@ use super::super::protocol::{
 };
 use super::super::region;
 use super::super::registry::{StmtExecutorRegistry, StmtKind};
+use super::super::scalar_eval;
 use super::super::scheduler::CtaActivityStatus;
 use super::super::slice_indexing::ResolvedSlice;
 use super::super::values::arrays::ValueArray1;
@@ -810,7 +811,7 @@ fn execute_mma<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResu
             *m as usize,
             *n as usize,
             *k as usize,
-            *accum,
+            accum,
             *trans_a,
             *trans_b,
             *cta_group,
@@ -860,6 +861,20 @@ fn execute_mma<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResu
             ));
         }
         vec![ctx.stream.cta_id]
+    };
+
+    // The runtime accum flag (canon's loop-carried accum cell): 0 = overwrite the
+    // accumulator, nonzero = accumulate. Uniform across the issuing cohort (a
+    // single elected lane or a whole warp), so one evaluation decides.
+    let accum = {
+        let v = if let Some(v) =
+            scalar_eval::eval_scalar_known_uniform(accum, &ctx.cohort, &ctx.state.values.scalars)?
+        {
+            v
+        } else {
+            scalar_eval::eval_scalar_at(accum, &ctx.cohort[0], &ctx.state.values.scalars)?
+        };
+        v != 0
     };
 
     if ctx.trace_mode() {

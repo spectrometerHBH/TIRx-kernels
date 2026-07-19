@@ -805,9 +805,181 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
     out.push('\n');
 
     // ---- walk the body ----
-    emit_body(&mut out, &k.body, ind, &ctx, Scope::Function)?;
+    // Adjacent TOP-LEVEL roles are re-nested into canon's if/else role-dispatch
+    // chain for emission (pure CUDA branch layout; the IR the interpreter
+    // consumes stays flat).
+    let chained_body = chain_top_level_roles(&k.body);
+    emit_body(&mut out, &chained_body, ind, &ctx, Scope::Function)?;
 
     Ok(render_lines(merge_guards(out.finish())))
+}
+
+/// Emission-time re-nesting of ADJACENT TOP-LEVEL roles into canon's if/else
+/// role-dispatch chain (`if (warp & 3) == 3 { … } else { if (warp & 3) == 2 { … }
+/// else { … } }`). Purely a CUDA branch-layout transform: the interpreter always
+/// consumes the FLAT list (each top-level role is its own epoch stream), and the
+/// chained form is guard-equivalent — the roles are mutually exclusive, so an
+/// if/else decision tree runs exactly the same bodies on the same threads. The
+/// flat form's per-role branch overhead measurably inflates whole-function SASS,
+/// which on fp16 1024 is what tips ptxas's uniform-register placement (R2UR
+/// 13.5K vs canon 1.8K — docs/perf-methodology.md §5).
+///
+/// Grouping: a run of ≥2 consecutive top-level roles partitions by warpgroup
+/// (`role.warpgroup`, else `role.warp / 4`). Within a group, at most one
+/// warpgroup-level role (its body/maxnreg is the group prefix) plus the warp
+/// roles chained behind it in source order; groups chain in first-occurrence
+/// order. Duplicate guards merge their bodies when their elected/maxnreg match
+/// (same threads, same order — flat-equivalent). Anything else leaves the run
+/// flat.
+fn chain_top_level_roles(body: &[Stmt]) -> Vec<Stmt> {
+    #[derive(Clone)]
+    struct RoleParts<'a> {
+        body: &'a [Stmt],
+        warp: Option<u32>,
+        warpgroup: Option<u32>,
+        elected: bool,
+        maxnreg: Option<u32>,
+    }
+
+    fn chain_warp_roles(members: &[RoleParts<'_>], else_body: Vec<Stmt>) -> Option<Vec<Stmt>> {
+        // Merge duplicate warp ids (concat bodies) when elected/maxnreg agree.
+        let mut merged: Vec<(u32, Vec<Stmt>, bool, Option<u32>)> = Vec::new();
+        'next: for r in members.iter().filter(|r| r.warp.is_some()) {
+            let w = r.warp.unwrap();
+            for m in merged.iter_mut() {
+                if m.0 == w {
+                    if m.2 != r.elected || m.3 != r.maxnreg {
+                        return None;
+                    }
+                    m.1.extend_from_slice(r.body);
+                    continue 'next;
+                }
+            }
+            merged.push((w, r.body.to_vec(), r.elected, r.maxnreg));
+        }
+        let mut else_body = else_body;
+        for (w, b, elected, maxnreg) in merged.into_iter().rev() {
+            else_body = vec![Stmt::Role {
+                body: b,
+                warp: Some(w),
+                warpgroup: None,
+                elected,
+                maxnreg,
+                else_body,
+            }];
+        }
+        Some(else_body)
+    }
+
+    fn chain_role_run(run: &[Stmt]) -> Option<Vec<Stmt>> {
+        let mut groups: Vec<(u32, Vec<RoleParts<'_>>)> = Vec::new();
+        for s in run {
+            let Stmt::Role {
+                body,
+                warp,
+                warpgroup,
+                elected,
+                maxnreg,
+                ..
+            } = s
+            else {
+                return None;
+            };
+            let group = match (warp, warpgroup) {
+                (Some(w), _) => w / 4,
+                (None, Some(g)) => *g,
+                (None, None) => return None,
+            };
+            let parts = RoleParts {
+                body,
+                warp: *warp,
+                warpgroup: *warpgroup,
+                elected: *elected,
+                maxnreg: *maxnreg,
+            };
+            if let Some((_, members)) = groups.iter_mut().find(|(g, _)| *g == group) {
+                members.push(parts);
+            } else {
+                groups.push((group, vec![parts]));
+            }
+        }
+        let mut else_body: Vec<Stmt> = Vec::new();
+        for (g, members) in groups.into_iter().rev() {
+            let wg_roles: Vec<&RoleParts<'_>> =
+                members.iter().filter(|r| r.warp.is_none()).collect();
+            if wg_roles.len() > 1 {
+                // Multiple warpgroup-level roles in one group: merge only when
+                // elected/maxnreg agree (concat bodies, flat-equivalent), else bail.
+                let first = wg_roles[0];
+                if wg_roles[1..]
+                    .iter()
+                    .any(|r| r.elected != first.elected || r.maxnreg != first.maxnreg)
+                {
+                    return None;
+                }
+            }
+            let warp_chain = chain_warp_roles(&members, Vec::new())?;
+            match wg_roles.first() {
+                Some(wg) => {
+                    let mut body = Vec::new();
+                    for r in &wg_roles {
+                        body.extend_from_slice(r.body);
+                    }
+                    body.extend(warp_chain);
+                    else_body = vec![Stmt::Role {
+                        body,
+                        warp: None,
+                        warpgroup: Some(g),
+                        elected: wg.elected,
+                        maxnreg: wg.maxnreg,
+                        else_body,
+                    }];
+                }
+                None => {
+                    else_body = vec![Stmt::Role {
+                        body: warp_chain,
+                        warp: None,
+                        warpgroup: Some(g),
+                        elected: false,
+                        maxnreg: None,
+                        else_body,
+                    }];
+                }
+            }
+        }
+        Some(else_body)
+    }
+
+    let mut out: Vec<Stmt> = Vec::with_capacity(body.len());
+    let mut i = 0;
+    while i < body.len() {
+        if !matches!(body[i], Stmt::Role { .. }) {
+            out.push(body[i].clone());
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < body.len() && matches!(body[j], Stmt::Role { .. }) {
+            j += 1;
+        }
+        let run = &body[i..j];
+        // Runs of ≥2 chain; a run carrying an explicit else_body is already
+        // author-structured and left alone.
+        if run.len() >= 2
+            && run
+                .iter()
+                .all(|s| matches!(s, Stmt::Role { else_body, .. } if else_body.is_empty()))
+        {
+            if let Some(chained) = chain_role_run(run) {
+                out.extend(chained);
+                i = j;
+                continue;
+            }
+        }
+        out.extend_from_slice(run);
+        i = j;
+    }
+    out
 }
 
 /// One emitted source line: its indent in 4-space units, its text WITHOUT the
@@ -1619,7 +1791,11 @@ fn collect_nonneg_vars(k: &Kernel) -> HashSet<u32> {
     fn seed_loop_vars(stmts: &[Stmt], nonneg: &mut HashSet<u32>) {
         for s in stmts {
             if let Stmt::ForLoop {
-                var, start, step, ..
+                no_unroll: false,
+                var,
+                start,
+                step,
+                ..
             } = s
             {
                 if as_int(start).is_some_and(|v| v >= 0) && as_int(step).is_some_and(|v| v >= 1) {
@@ -2043,6 +2219,14 @@ fn single_issue_guard(stmt: &Stmt, scope: Scope, ctx: &Ctx) -> Option<&'static s
     match stmt {
         // The leader expect_tx nests under `cbx == 0` first — not a plain single guard.
         MBarrierArriveExpectTx { mbar, .. } if ctx.is_tma_leader_mbar(mbar.mbar.id) => None,
+        // mbarrier.init at FUNCTION scope (the kernel_init prologue): guard with
+        // `T.cuda.thread_rank() == 0` — canon's exact prologue form (a CTA-thread-0
+        // predicate, no elect.sync). The run coalescing below then folds a whole
+        // contiguous init group into ONE guarded block (canon's grouped inits), instead
+        // of one `elect.sync` + branch per barrier. Only at function scope: inside a
+        // warp/warpgroup role the CTA thread 0 may not be in the role's mask, so the
+        // scope guard stays.
+        MBarrierInit { .. } if scope.is_function() => Some("T.cuda.thread_rank() == 0"),
         MBarrierInit { .. }
         | MBarrierArriveExpectTx { .. }
         | MBarrierExpectTx { .. }
@@ -2177,9 +2361,14 @@ fn emit_stmt(
 
         // ---- structural ----
         KernelInit { body, warp, .. } => {
+            // Emit the body at FUNCTION scope (KernelInit is a function-scope prologue
+            // block; its own `if warp_id == w` is the only granularity guard). This is
+            // what lets a function-scope single-issue guard — `T.cuda.thread_rank() == 0`
+            // for the mbarrier-init group, canon's exact prologue form — apply inside,
+            // instead of the warp-scope `elect.sync` per barrier.
             if let Some(w) = warp {
                 out.push_str(&format!("{p}if warp_id == {w}:\n"));
-                emit_body(out, body, indent + 1, ctx, Scope::Warp)?;
+                emit_body(out, body, indent + 1, ctx, Scope::Function)?;
             } else {
                 emit_body(out, body, indent, ctx, scope)?;
             }
@@ -2238,6 +2427,7 @@ fn emit_stmt(
             warpgroup,
             elected,
             maxnreg,
+            else_body,
         } => {
             // The role's thread scope drives the single-issue guard: a warp role
             // elects `lane_id == 0` (1 thread), a warpgroup role `tid_in_wg == 0`
@@ -2293,6 +2483,14 @@ fn emit_stmt(
             } else {
                 emit_body(out, body, indent + 1, ctx, body_scope)?;
             }
+            // The role-dispatch else-chain: `else:` attaches to the role's GUARD if
+            // (not to an inner elected block). Chained roles nest inside, so a run of
+            // mutually-exclusive roles lowers to canon's `if A { … } else { if B { … }
+            // else { … } }` decision tree instead of a flat run of guards.
+            if !else_body.is_empty() {
+                out.push_str(&format!("{p}else:\n"));
+                emit_body(out, else_body, indent + 1, ctx, scope)?;
+            }
             Ok(())
         }
         If { cond, then_body } => {
@@ -2307,6 +2505,7 @@ fn emit_stmt(
             step,
             body,
             unroll,
+            no_unroll,
         } => {
             let name = var_name(ctx, var);
             let start_s = emit_scalar(start, ctx)?;
@@ -2342,6 +2541,15 @@ fn emit_stmt(
                 }
             } else {
                 format!("T.serial({start_s}, {stop_s}, {step_s})")
+            };
+            // `no_unroll`: `T.serial(N, unroll=False)` — the `disable_unroll` annotation
+            // lowers to `#pragma unroll 1` in the CUDA source, pinning the loop rolled at
+            // ptxas (otherwise ptxas re-unrolls a merged MMA loop and re-inflates the
+            // whole-function static size that gates uniform placement).
+            let range = if *no_unroll {
+                format!("{}, unroll=False)", range.strip_suffix(')').unwrap())
+            } else {
+                range
             };
             out.push_str(&format!("{p}for {name} in {range}:\n"));
             emit_body(out, body, indent + 1, ctx, scope)?;
@@ -2531,7 +2739,20 @@ fn emit_stmt(
         // ---- mbarrier (every op carries an optional `stage` -> slot index) ----
         MBarrierInit { mbar, count, stage } => {
             let slot_ptr = mbar_slot_ptr(mbar, stage, ctx)?;
-            emit_guarded(out, &format!("T.ptx.mbarrier.init({slot_ptr}, {count})"));
+            if scope.is_function() && !bare {
+                // Function scope (the kernel_init prologue): canon's grouped-init form —
+                // `if T.cuda.thread_rank() == 0:` (a CTA-thread-0 predicate, no
+                // elect.sync). The coalesced run (bare) shares this same guard string
+                // via `single_issue_guard`.
+                let guard = "T.cuda.thread_rank() == 0";
+                out.push_str(&format!("{p}if {guard}:\n"));
+                out.mark_guard(guard);
+                out.push_str(&format!(
+                    "{p}    T.ptx.mbarrier.init({slot_ptr}, {count})\n"
+                ));
+            } else {
+                emit_guarded(out, &format!("T.ptx.mbarrier.init({slot_ptr}, {count})"));
+            }
             Ok(())
         }
         MBarrierArriveExpectTx { mbar, bytes, stage } => {
@@ -2827,7 +3048,14 @@ fn emit_stmt(
             let b_rows = if *cta_group == 1 { *n } else { *n / 2 };
             let mut a_s = emit_ab(a, a_rows)?;
             let mut b_s = emit_ab(b, b_rows)?;
-            let accum_s = if *accum { "True" } else { "False" };
+            // Runtime accum flag: literal 0/1 keep the old True/False form (every
+            // existing kernel); a real scalar expr (canon's loop-carried accum cell)
+            // emits as-is — `Tx.gemm_async` takes a runtime accum predicate.
+            let accum_s = match accum {
+                ScalarValue::Int(0) => "False".to_string(),
+                ScalarValue::Int(1) => "True".to_string(),
+                other => emit_scalar(other, ctx)?,
+            };
             if let (Some(sfa), Some(sfb)) = (sfa.as_ref(), sfb.as_ref()) {
                 // NVFP4 block-scaled: view the packed-u8 operand BUFFER as e2m1 fp4 (the
                 // last dim doubles: bytes -> fp4 elems), then slice — `.view` is on the
@@ -3111,20 +3339,16 @@ fn emit_stmt(
             Ok(())
         }
         CpAsyncBulkCommitGroup => {
-            // Scope-aware like the async-proxy fence: `commit_group` batches the TMA
-            // stores issued BY THIS THREAD, and the store itself is single-issue
-            // (`if tid_in_wg == 0`). Inside a role branch, guard the commit to that
-            // same issuing thread — canon's shape (`fence; store; commit` under ONE
-            // `tid%128==0` guard). Unguarded, all 4 warps of the epilogue warpgroup
-            // execute the uniform UTMACMDFLUSH (ncu: 4x canon's count) committing
-            // empty groups; the non-issuing threads' wait_group is already vacuous
-            // (no groups outstanding) and the wg_sync after the wait is the real
-            // cross-thread barrier.
-            if scope.is_function() {
-                out.push_str(&format!("{p}T.ptx.cp_async.bulk.commit_group()\n"));
-            } else {
-                emit_guarded(out, "T.ptx.cp_async.bulk.commit_group()");
-            }
+            // `commit_group` batches the TMA stores issued BY THIS THREAD. Emit it
+            // UNGUARDED at every scope — canon's exact shape (`if <lane0>: fence; store`
+            // then an unguarded `commit_group` every thread executes). Threads with no
+            // outstanding groups commit an empty group (vacuous); the wg_sync around the
+            // wait_group is the real cross-thread barrier. The earlier single-thread
+            // guarded form (a 2026-05 UTMACMDFLUSH-count fix) was reverted for the fp16
+            // 1024 uniform-placement convergence: the guard's ISETP/BRA pairs cost more
+            // whole-function static complexity than the empty commits (see
+            // docs/perf-methodology.md §5).
+            out.push_str(&format!("{p}T.ptx.cp_async.bulk.commit_group()\n"));
             Ok(())
         }
         CpAsyncBulkWaitGroupRead { n } => {
@@ -3467,6 +3691,7 @@ mod tests {
             dtype: ScalarDType::I32,
         };
         let bad = Stmt::ForLoop {
+            no_unroll: false,
             var,
             start: ScalarValue::Int(1),
             stop: ScalarValue::Int(4),
@@ -3478,6 +3703,7 @@ mod tests {
         assert!(err.contains("unroll requires literal start=0"), "{err}");
 
         let ok = Stmt::ForLoop {
+            no_unroll: false,
             var,
             start: ScalarValue::Int(0),
             stop: ScalarValue::Int(4),
@@ -3732,6 +3958,7 @@ mod tests {
             init(),
         ];
         let role = Stmt::Role {
+            else_body: Vec::new(),
             body,
             warp: None,
             warpgroup: Some(0),
@@ -3747,6 +3974,7 @@ mod tests {
         assert_eq!(count, 3, "{src}");
         // And the two adjacent inits inside ONE guard when the If is absent.
         let role2 = Stmt::Role {
+            else_body: Vec::new(),
             body: vec![init(), init()],
             warp: None,
             warpgroup: Some(0),

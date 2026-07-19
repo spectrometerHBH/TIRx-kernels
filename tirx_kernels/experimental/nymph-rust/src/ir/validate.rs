@@ -2002,6 +2002,7 @@ fn check_context(
                 step,
                 body,
                 unroll: _,
+                no_unroll: _,
             } => {
                 let mut vars = Vec::new();
                 collect_vars(start, &mut vars);

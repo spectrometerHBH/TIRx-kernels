@@ -212,12 +212,23 @@ pub fn cta_epoch_specs<'k>(kernel: &'k Kernel, mask: &ThreadMask) -> Vec<EpochSp
                     warp,
                     warpgroup,
                     elected,
+                    else_body,
                     ..
                 } = stmt
                 {
                     let m =
                         filter_thread_mask(mask, |t| role_matches(t, *warp, *warpgroup, *elected));
                     epoch.push((body.as_slice(), m));
+                    // The role-dispatch else-chain: the role's complement threads run
+                    // `else_body` in the SAME epoch. Without this a top-level chained
+                    // role (e.g. the epilogue sitting in the producer warpgroup's else)
+                    // would never be scheduled — execute_role only fires for NESTED roles.
+                    if !else_body.is_empty() {
+                        let rest = filter_thread_mask(mask, |t| {
+                            !role_matches(t, *warp, *warpgroup, *elected)
+                        });
+                        epoch.push((else_body.as_slice(), rest));
+                    }
                 }
             }
         } else {

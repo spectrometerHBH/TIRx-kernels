@@ -401,6 +401,15 @@ pub enum Stmt {
         warpgroup: Option<u32>,
         elected: bool,
         maxnreg: Option<u32>,
+        /// Threads of the enclosing cohort NOT claimed by this role run this body
+        /// instead — the role-dispatch else-chain (canon's `if (warp & 3) == 3 { … }
+        /// else { if (warp & 3) == 2 { … } else { … } }`). Empty = no else branch.
+        /// Nesting roles in `body`/`else_body` is what the chain is built from; the
+        /// emitted branch layout (mutually-exclusive if/else arms sharing one decision
+        /// tree) is measurably smaller than a flat run of role guards, and on fp16 1024
+        /// that whole-function size decides ptxas's uniform placement (see
+        /// docs/perf-methodology.md §5).
+        else_body: Vec<Stmt>,
     },
     ForLoop {
         var: Var,
@@ -413,6 +422,12 @@ pub enum Stmt {
         /// the same SASS as a manual unroll) but written as a `for` in the source, matching
         /// canon's `for i in T.unroll(N)` for fixed-count loops (mbarrier inits, etc.).
         unroll: bool,
+        /// Emit `T.serial(N, unroll=False)` — the CUDA source then carries
+        /// `#pragma unroll 1`, pinning the loop ROLLED at ptxas (the `disable_unroll`
+        /// annotation). Without it ptxas re-unrolls a merged loop whose body is a run
+        /// of tcgen05 MMAs, re-inflating the whole-function static size that decides
+        /// the uniform-placement threshold (docs/perf-methodology.md §5).
+        no_unroll: bool,
     },
     ForEachTask {
         scheduler: Arc<Scheduler>,
@@ -602,7 +617,13 @@ pub enum Stmt {
         m: u32,
         n: u32,
         k: u32,
-        accum: bool,
+        /// Overwrite (0) vs accumulate (nonzero) the accumulator. A RUNTIME scalar so
+        /// a merged k-tile loop can carry canon's `accum` cell: 0 on the first k-tile
+        /// (overwrite), 1 after — one static MMA site instead of a peeled first tile
+        /// plus a rolled rest (the peel doubles the static MMA code, which on fp16 1024
+        /// tips ptxas's whole-function uniform placement — docs/perf-methodology.md §5).
+        /// Literal 0/1 fold to the old compile-time behavior everywhere else.
+        accum: ScalarValue,
         trans_a: bool,
         trans_b: bool,
         cta_group: u8,
@@ -857,11 +878,19 @@ impl Stmt {
         match self {
             Stmt::KernelInit { body, .. }
             | Stmt::KernelFinalize { body, .. }
-            | Stmt::Role { body, .. }
             | Stmt::ForLoop { body, .. }
             | Stmt::ForEachTask { body, .. }
             | Stmt::SchedulerImpl { body, .. }
             | Stmt::Loop { body } => vec![body],
+            Stmt::Role {
+                body, else_body, ..
+            } => {
+                if else_body.is_empty() {
+                    vec![body]
+                } else {
+                    vec![body, else_body]
+                }
+            }
             Stmt::If { then_body, .. } => vec![then_body],
             _ => vec![],
         }

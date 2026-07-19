@@ -101,6 +101,105 @@ diff against canon (method established in commit 9ef5a61a / 034ae826):
   Partial offsets (nymph executes FEWER): MEMBAR -1,024, UTMACMDFLUSH -768,
   S2R -704, LDCU -640.
 
+## 5. fp16 1024: CUDA-level convergence and the R2UR flip (2026-07-19)
+
+The R2UR placement failure is a **whole-function static-complexity threshold**,
+now proven directly (§3 had it as a hypothesis):
+
+- *Padding test*: injecting a never-taken (`blockIdx.x >= 1000`, so ptxas cannot
+  fold it) dead block of TMA-shaped code into **canon's** CUDA flips canon's own
+  placement: 1155 SASS/4 R2UR -> 1398/121. Even +135 lines (1290) flips it to
+  106. The same pad on the converged nymph kernel (1104) flips it back to 74.
+  So there is no "bad construct" to fix line-by-line — ptxas's uniform-datapath
+  selection degrades globally once the function crosses a size/complexity
+  budget (~1100-1200 SASS lines for this kernel shape). All the §3 morphs that
+  "did not flip it" were single-region edits that could never move the total.
+- *lineinfo attribution* of the 90 R2UR lines (nvrtc `-lineinfo` +
+  `nvdisasm -gi`): 56 in the producer k-tile loop (TMA coords + ring advance
+  feeding UTMALDG), 12 in the MMA region, ~13 epilogue (commit_group / cvt /
+  tail), ~9 prologue (mbarrier-init addresses). These are the places a
+  vector-computed scalar feeds an instruction that needs a uniform operand —
+  the whole class disappears once under budget.
+
+### 5.1 Structural diff inventory (canon `_kernel_kernel` vs nymph `main_kernel`, fp16 1024)
+
+Region-by-region classification of the pre-convergence dumps
+(/tmp/canon_1024.cu 945 lines vs /tmp/nymph_1024.cu 875 lines):
+
+- **(a) naming / dead code**: 8 dead `(((int)threadIdx.x) & 127);` exprs + dead
+  `v_1..v_7` vars; duplicate `descA_1`/`descB_1` descriptor encodes (used only
+  by the rolled MMA loop); dead `cse_vN` temporaries both sides carry. Zero
+  SASS effect (ptxas DCEs); the descriptor dedup is real and came free with the
+  MMA merge.
+- **(b) equivalent logic, different form**: scheduler loop counter+`break_if`
+  vs canon done-flag + phase cells; ring advance `nxt>=5` vs `stage==5`;
+  phase `(s7+1)&1` vs cell `phase^0`; epilogue `if (1 <= s25)` warmup guards
+  vs canon's unconditional wait_group+wg_sync; `commit_group` inside the
+  single-thread guard vs canon's all-threads commit; mbarrier-init under
+  per-barrier `elect.sync` vs canon's grouped `thread_rank()==0`; missing
+  prologue `fence.proxy_async` + `warp_sync` after tcgen05.alloc; loop-carried
+  cell coords vs `T.let` SSA (measured neutral in §3). Individually all
+  flip-neutral — they matter only through total size.
+- **(c) really different logic**: **MMA peel+roll** (16 static MMA call sites
+  vs canon's 8 in one rolled loop with a runtime accum cell); **flat role
+  dispatch** (5 top-level guards) vs canon's nested if/else decision tree;
+  epilogue CLC query at loop bottom vs canon query-at-top with coord cells;
+  scheduler `expect_tx` before `clc_try_cancel` vs canon's reverse; MMA's
+  `cbx==0` guard inside the elect vs canon's at role level; teardown handshake
+  placement. Of these, the flip needed only: the MMA merge (pinned rolled),
+  the dispatch chain, and the size from (b) — the query positions, scheduler
+  order, and elect nesting were each measured flip-NEUTRAL at the threshold
+  (A/B on the converged kernel).
+
+### 5.2 The convergence set and the flip point
+
+Applied in order (R2UR lines / total SASS lines, nvrtc+nvdisasm A/B):
+1. desc dedup + sched order + warmup-guard removal + commit unguard: 90/1482
+   -> 90/1472 (no flip, as expected under threshold).
+2. MMA peel+roll -> ONE rolled 8-tile loop + runtime accum cell: 112/1447
+   (worse R2UR — ptxas re-unrolled the merged loop); + `#pragma unroll 1`:
+   **77/1349** (the pin is what banks the merge's ~130 lines).
+3. Prologue batching (grouped `thread_rank()==0` inits + canon order + the
+   proxy fence): **74/1225**.
+4. Scheduler canon form + MMA canon form + dispatch if/else chain:
+   **4/1104 — FLIP**. (Epilogue/producer canon-form rewrites were tried too:
+   +25/+16 lines, flip-neutral, reverted.) Flat dispatch instead of the chain:
+   74/1214 (flips back); nested-without-else: 65/1142 (flips back) — the
+   else-chain shape itself is required, not just guard sharing.
+5. MMA query-at-top vs bottom: neutral (1088/4). Scheduler expect_tx/try_cancel
+   order: neutral (1079/4).
+
+Final real-pipeline state: **1100 SASS / 3 R2UR** vs canon 1155/4. Threshold
+for this content measured by padding: flips back between 1104 (4) and 1240 (74).
+
+### 5.3 What changed in the tree (and what it cost)
+
+- IR: `Role.else_body` (role-dispatch chains), `ForLoop.no_unroll` (->
+  `T.serial(N, unroll=False)` -> `#pragma unroll 1`), `Tcgen05Mma.accum:
+  bool -> ScalarValue` (runtime accum predicate, canon's accum cell).
+- codegen: top-level flat roles re-nest into the if/else chain at emission
+  (the interpreter always sees the flat list; grouping by warpgroup,
+  disjoint-guard equivalence); `commit_group` emits unguarded (canon's actual
+  shape — the 2026-05 guarded form was a deliberate UTMACMDFLUSH trade, now
+  reverted for size); mbarrier-init at function scope guards with
+  `T.cuda.thread_rank() == 0` and coalesces into one block; `KernelInit` body
+  emits at function scope.
+- builder (fp16_bf16_gemm): scheduler done-flag + phase cells; MMA single
+  merged k-loop + per-task accum cell + `no_unroll`; prologue inits grouped
+  before the alloc + proxy fence on both paths; `_init_stages` flat (so the
+  inits coalesce); loader section now precedes the scheduler (canon's order).
+- **Residual divergences (deliberate)**: the epilogue keeps the
+  `store_iter >= num_d_tiles` guard on the pacing wait_group — the protocol
+  checker's `deadlock_freedom_missing_release_witness` rule requires a
+  committed group before any wait_group on a stream, so canon's unconditional
+  form is rejected (~8 SASS lines, under threshold regardless); nymph keeps
+  `expect_tx` before `try_cancel` in the scheduler (flip-neutral, and the
+  checker's ordering assumptions were validated on it); epilogue/producer keep
+  the query-at-bottom loop rotation (flip-neutral, less churn than canon's
+  query-at-top rotation); no `warp_sync` after the tcgen05.alloc (SMEM
+  visibility is already forced by the later cluster barriers); `If` has no
+  else, so the chain is a codegen transform, not an IR-author-level construct.
+
 ## 4. Rules of engagement
 
 - One knob at a time, and record the A/B pair (config, ratio, rounds) in the
