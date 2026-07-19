@@ -90,6 +90,7 @@ lanes.
 | `WaitGroup` | `n`, `scope` | A cp.async bulk wait group marker was executed. |
 | `MbarInit` / `MbarArrive` / `MbarExpectTx` / `MbarCompleteTx` / `MbarWait` | mbar target/count/phase fields plus `scope` | Mbarrier state-machine events. |
 | `SyncArrive` / `Sync` | sync kind, count/thread count, cycle, optional bar id, `scope` | Sync arrival and completion events. |
+| `ClusterBarrierArrive` / `ClusterBarrierWait` | thread count, cumulative count, `scope` (wait: `scope` only) | Split cluster barrier: the non-blocking arrive (a release; emitted once per cluster thread cohort in the prologue) and a passing per-role wait (an acquire). |
 | `SchedulerNext` | scheduler id, CTA id, task id, `scope` | Dynamic scheduler handoff. |
 
 Every event carries `stmt_id` and `stmt_kind`.

@@ -294,11 +294,22 @@ def test_protocol_tmem_mma_layout_f_emits_union_boxes():
     a_s = smem_tensor(b, dtype=nr.DType.F16, shape=(m, k), byte_offset=0)
     b_s = smem_tensor(b, dtype=nr.DType.F16, shape=(n, k), byte_offset=a_bytes)
     dst = tmem_operand(0, 0, nr.DType.F32)  # accumulator band at physical col 0
+    done = b.mbar(kind=nr.MBarKind.TCGEN05)
 
     with b.kernel_init(warp=0):
         b.tmem_alloc(0, 32)
+        b.mbarrier_init(done, count=1)
+    # Prologue barrier: warps 1-3 of the MMA warpgroup have no program-order
+    # path from warp 0's alloc — the checker's lifecycle proof requires the
+    # happens-before edge (a fused CTA barrier), not just the sampled order.
+    b.cta_sync()
     with b.role(warpgroup=0):
         b.tcgen05_mma(dst, a_s, b_s, m=m, n=n, k=k, accum=False, cta_group=1)
+        # Drain the MMA before the teardown: the dealloc must be ordered after
+        # the accumulator write's completion (commit + wait), per PTX
+        # §9.7.17.7.1 ("all prior accesses complete" before dealloc).
+        b.tcgen05_commit(done, cta_group=1)
+        b.mbarrier_wait(done, phase=0)
     with b.kernel_finalize(warp=0):
         b.tmem_relinquish()
         b.tmem_dealloc(0, 32)

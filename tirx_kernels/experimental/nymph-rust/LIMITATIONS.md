@@ -57,8 +57,11 @@ not treat their sim validation as GPU evidence.
 - **TMEM**: one base-0 column band per kernel, live at most once; every
   alloc/dealloc/relinquish carries the kernel cta_group; no alloc after a
   `relinquish_alloc_permit` (also enforced per CTA at runtime, PTX
-  §9.7.17.7.1). Multi-band/base-offset TMEM plans are IR-illegal on purpose
-  (the generated code is a single base-0 view).
+  §9.7.17.7.1); lifecycle ops are top-level only (never inside a
+  loop/conditional body — validate rejects them there). Multi-band/base-offset
+  TMEM plans are IR-illegal on purpose (the generated code is a single base-0
+  view). The checker's lifecycle pass requires happens-before edges
+  alloc→access→dealloc (real sync, not the sampled interleaving).
 - **codegen destructures no Stmt field silently**: `, .. }` is banned in
   codegen.rs (compile-gated text check); an IR field the emission cannot
   honor is an `Err`, never a dropped default.

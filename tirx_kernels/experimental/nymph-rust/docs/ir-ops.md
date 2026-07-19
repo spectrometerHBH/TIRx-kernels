@@ -140,7 +140,19 @@ kernel-level group (cluster-size derived, mirroring the codegen per-op
 checks of commit 76600421), and any alloc after a relinquish. Codegen
 re-checks base_col/cta_group per op (it is reachable without validate);
 before this batch it dropped both fields via `..`, emitting one alloc for
-any number of IR bands.
+any number of IR bands. Walk 4 also rejects lifecycle ops (alloc/dealloc/
+relinquish) nested inside a `ForLoop`/`Loop`/`If`/`ForEachTask`/
+`SchedulerImpl` body — a loop-carried lifecycle is only safe under a
+path-sensitive analysis the IR does not have yet (a `for_loop(stop=2)`
+alloc passed the one-pass walk but double-allocated on iteration two).
+
+The protocol checker's `tmem_lifecycle_order` pass proves the lifetime
+against ALL legal interleavings, not the sampled one: every TMEM access
+must be happens-before-after a covering alloc and happens-before-before
+its dealloc (cross-stream edges must come from real synchronization —
+mbar handshakes, fused cta/cluster syncs, the split cluster barrier —
+recorded in `OrderingAnalysis`; the sampled epoch interleaving alone
+proves nothing). Missing edges fail `tmem_lifecycle_hb_missing`.
 
 ## tcgen05.ld / tcgen05.st codegen support set
 

@@ -476,6 +476,10 @@ def _tmem_operand_mma_kernel():
 
     with b.kernel_init(warp=0):
         b.tmem_alloc(0, 64)
+    # Prologue barrier: the MMA warpgroup's warps 1-3 have no program-order
+    # path from warp 0's alloc — the checker's lifecycle proof requires the
+    # happens-before edge (a fused CTA barrier), not just the sampled order.
+    b.cta_sync()
     with b.role(warpgroup=0):
         b.reg_fill(out_frag, 0.0)
         b.tcgen05_st(dst, out_frag, shape="32x32b", num=n)
@@ -493,6 +497,10 @@ def _tmem_operand_mma_kernel():
         b.tcgen05_commit(mc)
         b.tcgen05_ld(out_frag, dst, shape="32x32b", num=n)
         b.reg_store(out[b.tid_in_wg(), 0:n], out_frag)
+    # Teardown barrier: the warpgroup's TMEM writes/reads (warps 1-3's cohort
+    # instances) must be happens-before warp 0's dealloc — a fused CTA barrier,
+    # not just the sampled epoch order.
+    b.cta_sync()
     with b.kernel_finalize(warp=0):
         b.tmem_relinquish()
         b.tmem_dealloc(0, 64)
@@ -725,6 +733,9 @@ def _mma_acc_read_release_kernel(commit_release):
         b.mbarrier_wait(done, phase=0)
         b.tcgen05_ld(frag, acc, num=16)
         b.tcgen05_wait_ld()
+    # Teardown barrier: warp 4's accumulator read must be happens-before warp
+    # 0's dealloc — without it the dealloc can legally precede the read.
+    b.cta_sync()
     with b.kernel_finalize(warp=0):
         b.tmem_relinquish(cta_group=1)
         b.tmem_dealloc(0, 32, cta_group=1)

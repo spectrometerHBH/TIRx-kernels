@@ -543,6 +543,22 @@ pub enum TraceEventKind {
         bar_id: Option<u32>,
         scope: AccessScope,
     },
+    /// Split cluster barrier (`barrier.cluster.arrive`, aligned): a RELEASE —
+    /// every cluster thread arrives exactly once (non-blocking) in the prologue;
+    /// `count` is the cumulative cluster-wide arrived-thread total after this
+    /// arrival. `OrderingAnalysis` accumulates the arrivals per cluster and
+    /// publishes the join as the release clock once `count == thread_count`.
+    ClusterBarrierArrive {
+        thread_count: usize,
+        count: usize,
+        scope: AccessScope,
+    },
+    /// Split cluster barrier (`barrier.cluster.wait`, per role): an ACQUIRE —
+    /// emitted only when the wait passes (every cluster thread's arrive is in),
+    /// so it joins the cluster's full arrival clock into the waiting chains.
+    ClusterBarrierWait {
+        scope: AccessScope,
+    },
     /// GMEM semaphore atomic-add ("signal") — a SYNC op, NOT a data access. Carries
     /// the semaphore cell key and the POST-increment counter value; in
     /// `OrderingAnalysis` it publishes this stream's clock as the RELEASE clock for

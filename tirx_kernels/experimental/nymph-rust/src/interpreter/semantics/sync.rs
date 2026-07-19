@@ -48,10 +48,12 @@ fn cluster_barrier_key(first: &ThreadId) -> String {
 /// `barrier.cluster.arrive` (aligned): every cluster thread records its arrival and
 /// CONTINUES — non-blocking, unlike the fused `ClusterSync` rendezvous. The matching
 /// per-role `ClusterBarrierWait`s block until the set is complete. Modeled as a
-/// one-shot collective (the prologue issues it exactly once before the role loops);
-/// no trace event is emitted — the checker's Sync witness model is for fused barriers,
-/// and this barrier's *effect* (no peer access before all inits are visible) is
-/// verified by the mbarrier semantics, its liveness by no-progress detection.
+/// one-shot collective (the prologue issues it exactly once before the role loops).
+/// The arrive emits a `ClusterBarrierArrive` trace event (a RELEASE: hardware
+/// `barrier.cluster.arrive` is `.release` by default); the checker's ordering
+/// analysis publishes the join of all arrivals once the set is complete, and each
+/// passing wait acquires it — that edge is what proves the prologue inits/alloc
+/// happen-before any role's peer-visible accesses.
 fn execute_cluster_barrier_arrive<'a, 'k>(
     ctx: &mut CohortContext<'a, 'k>,
     _stmt: &'k Stmt,
@@ -74,6 +76,14 @@ fn execute_cluster_barrier_arrive<'a, 'k>(
         ));
     }
     arrived.extend(arriving);
+    let arrived_count = arrived.len();
+    if ctx.trace_mode() {
+        ctx.emit(TraceEventKind::ClusterBarrierArrive {
+            thread_count: expected.len(),
+            count: arrived_count,
+            scope: ctx.access_scope(),
+        })?;
+    }
     Ok(StepStatus::advance())
 }
 
@@ -97,6 +107,13 @@ fn execute_cluster_barrier_wait<'a, 'k>(
         .unwrap_or_default();
     check_cluster_peer_liveness(ctx, &expected, &arrived)?;
     if expected.is_subset(&arrived) {
+        // The wait passes — emit the ACQUIRE witness (hardware `barrier.cluster.wait`
+        // is `.acquire`): the checker joins the cluster's published arrival clock.
+        if ctx.trace_mode() {
+            ctx.emit(TraceEventKind::ClusterBarrierWait {
+                scope: ctx.access_scope(),
+            })?;
+        }
         Ok(StepStatus::advance())
     } else {
         Ok(StepStatus::block(WakeCondition::Polled))

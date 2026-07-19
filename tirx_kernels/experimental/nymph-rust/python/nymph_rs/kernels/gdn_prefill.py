@@ -400,6 +400,13 @@ def build_gdn_prefill(config: GdnPrefillConfig = GdnPrefillConfig()) -> Kernel:
             for s in range(stg):
                 k.mbarrier_init(bars[nm], count=spec[1], stage=s)
 
+    # Prologue seal (canon's `fence.mbarrier_init` + CTA barrier): the mbarrier
+    # inits and the TMEM alloc must complete before any role touches a barrier
+    # or the TMEM band — the checker's lifecycle proof requires the
+    # happens-before edge, not just the sampled epoch order.
+    k.fence(kind=FenceKind.MBARRIER_INIT)
+    k.cta_sync()
+
     _emit(
         k,
         config,
@@ -431,6 +438,10 @@ def build_gdn_prefill(config: GdnPrefillConfig = GdnPrefillConfig()) -> Kernel:
         bars,
     )
 
+    # CTA-wide barrier before the TMEM teardown: every warpgroup's TMEM reads
+    # must be done before warp 0 frees the band — the checker requires the
+    # happens-before edge, not just drained task loops.
+    k.cta_sync()
     with k.kernel_finalize(warp=0):
         k.tmem_relinquish()
         k.tmem_dealloc(0, N_COLS_TMEM)

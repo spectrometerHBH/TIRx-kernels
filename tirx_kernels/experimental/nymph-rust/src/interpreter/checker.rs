@@ -355,6 +355,19 @@ fn trace_schema_audit(cx: &mut CheckerCx<'_>) -> CheckResult {
                     ));
                 }
             }
+            TraceEventKind::ClusterBarrierArrive {
+                thread_count,
+                count,
+                ..
+            } => {
+                if *thread_count == 0 || *count == 0 || count > thread_count {
+                    return Err(cx.fail(
+                        "trace_schema_invalid_cluster_barrier_arrive",
+                        "ClusterBarrierArrive count must be in 1..=thread_count",
+                        Some(event),
+                    ));
+                }
+            }
             TraceEventKind::Sync { thread_count, .. } if *thread_count == 0 => {
                 return Err(cx.fail(
                     "trace_schema_invalid_sync",
@@ -408,6 +421,7 @@ fn trace_region_audit(cx: &mut CheckerCx<'_>) -> CheckResult {
 fn barrier_cycle_audit(cx: &mut CheckerCx<'_>) -> CheckResult {
     let mut mbars: HashMap<MbarKey, MbarCycle> = HashMap::new();
     let mut sync_counts: HashMap<SyncKey, usize> = HashMap::new();
+    let mut cb_counts: HashMap<usize, (usize, usize)> = HashMap::new();
     for event in cx.event_index.events {
         match &event.payload {
             TraceEventKind::MbarInit { target, count, .. } => {
@@ -530,6 +544,24 @@ fn barrier_cycle_audit(cx: &mut CheckerCx<'_>) -> CheckResult {
                     return Err(cx.fail(
                         "barrier_cycle_sync_without_full_arrival",
                         "sync completion has no full SyncArrive witness",
+                        Some(event),
+                    ));
+                }
+            }
+            TraceEventKind::ClusterBarrierArrive {
+                thread_count,
+                count,
+                scope,
+            } => {
+                cb_counts.insert(scope.cluster_id, (*thread_count, *count));
+            }
+            TraceEventKind::ClusterBarrierWait { scope } => {
+                let (thread_count, count) =
+                    cb_counts.get(&scope.cluster_id).copied().unwrap_or((0, 0));
+                if thread_count == 0 || count < thread_count {
+                    return Err(cx.fail(
+                        "barrier_cycle_cluster_barrier_wait_without_full_arrival",
+                        "cluster barrier wait has no full cluster arrive witness",
                         Some(event),
                     ));
                 }
@@ -1383,19 +1415,43 @@ fn check_tmem_window_conflicts(
 }
 
 fn tmem_lifecycle_order_local(cx: &mut CheckerCx<'_>) -> CheckResult {
-    let mut active: HashMap<PoolId, Vec<Region>> = HashMap::new();
-    for event in cx.event_index.events {
+    // Two layers. The SAMPLED walk (active ranges in trace order) keeps the
+    // structural pairing proofs: no overlapping live allocations, every access
+    // covered by an active allocation, every dealloc matching an active one.
+    // The HB layer then proves the hardware lifetime constraint (PTX
+    // §9.7.17.7.1) against ALL legal interleavings, not just the sampled one:
+    // every access must be happens-before-after a covering alloc, and every
+    // dealloc must be happens-before-after its alloc and every access of its
+    // generation. Within one stream program order supplies the edges; across
+    // streams they must come from real synchronization (mbar / barrier /
+    // semaphore edges in `OrderingAnalysis`) — an alloc in kernel_init and an
+    // access in a role on another warp have NO edge without one, however the
+    // sampled schedule happened to interleave the epochs.
+    let mut active: HashMap<PoolId, Vec<(usize, Region)>> = HashMap::new();
+    // alloc event idx -> paired dealloc event idx (region-equality match).
+    let mut paired_dealloc: HashMap<usize, usize> = HashMap::new();
+    // (owner, idx, region) of every alloc / dealloc, for the access-side lookup.
+    let mut allocs: HashMap<PoolId, Vec<(usize, Region)>> = HashMap::new();
+    let mut accesses: Vec<(usize, Region)> = Vec::new();
+    for (event_idx, event) in cx.event_index.events.iter().enumerate() {
         match &event.payload {
             TraceEventKind::TmemAlloc { region, .. } => {
                 let ranges = active.entry(region.owner.clone()).or_default();
-                if ranges.iter().any(|range| regions_overlap(range, region)) {
+                if ranges
+                    .iter()
+                    .any(|(_, range)| regions_overlap(range, region))
+                {
                     return Err(cx.fail(
                         "tmem_lifecycle_allocation_overlap",
                         "TMEM allocation overlaps an active allocation",
                         Some(event),
                     ));
                 }
-                ranges.push(region.clone());
+                ranges.push((event_idx, region.clone()));
+                allocs
+                    .entry(region.owner.clone())
+                    .or_default()
+                    .push((event_idx, region.clone()));
             }
             TraceEventKind::Read {
                 region,
@@ -1407,9 +1463,9 @@ fn tmem_lifecycle_order_local(cx: &mut CheckerCx<'_>) -> CheckResult {
                 access_kind: MemoryAccessKind::Tmem(_),
                 ..
             } => {
-                let covered = active
-                    .get(&region.owner)
-                    .is_some_and(|ranges| ranges.iter().any(|range| region_covers(range, region)));
+                let covered = active.get(&region.owner).is_some_and(|ranges| {
+                    ranges.iter().any(|(_, range)| region_covers(range, region))
+                });
                 if !covered {
                     return Err(cx.fail(
                         "tmem_lifecycle_use_without_allocation",
@@ -1417,19 +1473,84 @@ fn tmem_lifecycle_order_local(cx: &mut CheckerCx<'_>) -> CheckResult {
                         Some(event),
                     ));
                 }
+                accesses.push((event_idx, region.clone()));
             }
             TraceEventKind::TmemDealloc { region, .. } => {
                 let ranges = active.entry(region.owner.clone()).or_default();
-                let Some(pos) = ranges.iter().position(|range| range == region) else {
+                let Some(pos) = ranges.iter().position(|(_, range)| range == region) else {
                     return Err(cx.fail(
                         "tmem_lifecycle_dealloc_without_allocation",
                         "TMEM deallocation does not match an active allocation",
                         Some(event),
                     ));
                 };
-                ranges.remove(pos);
+                let (alloc_idx, _) = ranges.remove(pos);
+                paired_dealloc.insert(alloc_idx, event_idx);
             }
             _ => {}
+        }
+    }
+
+    // Access-side HB: some covering alloc must be provably ordered before the
+    // access, and the access before that alloc's dealloc (when the band is
+    // deallocated at all).
+    for (access_idx, region) in &accesses {
+        let event = &cx.event_index.events[*access_idx];
+        let ordered = allocs.get(&region.owner).is_some_and(|bands| {
+            bands.iter().any(|(alloc_idx, band)| {
+                region_covers(band, region)
+                    && cx.ordering.happens_before(*alloc_idx, *access_idx)
+                    && paired_dealloc.get(alloc_idx).is_none_or(|dealloc_idx| {
+                        cx.ordering.happens_before(*access_idx, *dealloc_idx)
+                    })
+            })
+        });
+        if !ordered {
+            return Err(cx.fail(
+                "tmem_lifecycle_hb_missing",
+                "TMEM access has no happens-before edge from a covering allocation \
+                 (and to its deallocation); cross-stream lifetime needs a real sync \
+                 (mbar / barrier), not just a favorable sampled interleaving",
+                Some(event),
+            ));
+        }
+    }
+
+    // Dealloc-side HB: the dealloc must follow its alloc and every access of
+    // that alloc's generation (accesses HB-after the alloc that overlap the
+    // band). Rogue accesses not HB-after any covering alloc already failed
+    // above; an access HB-after this alloc but unordered w.r.t. the dealloc
+    // could still execute after it on hardware — reject.
+    for (alloc_idx, dealloc_idx) in &paired_dealloc {
+        let dealloc_event = &cx.event_index.events[*dealloc_idx];
+        let TraceEventKind::TmemDealloc { region, .. } = &dealloc_event.payload else {
+            unreachable!()
+        };
+        if !cx.ordering.happens_before(*alloc_idx, *dealloc_idx) {
+            return Err(cx.fail(
+                "tmem_lifecycle_hb_missing",
+                "TMEM deallocation has no happens-before edge from its allocation",
+                Some(dealloc_event),
+            ));
+        }
+        for (access_idx, access_region) in &accesses {
+            if access_region.owner != region.owner
+                || !regions_overlap(access_region, region)
+                || !cx.ordering.happens_before(*alloc_idx, *access_idx)
+            {
+                continue;
+            }
+            if !cx.ordering.happens_before(*access_idx, *dealloc_idx) {
+                let event = &cx.event_index.events[*access_idx];
+                return Err(cx.fail(
+                    "tmem_lifecycle_hb_missing",
+                    "TMEM deallocation has no happens-before edge from an access to \
+                     its band; the accessing warp must synchronize with the \
+                     deallocating warp (and, for cta_group=2, across the CTA pair) \
+                     before the band is freed",
+                    Some(event),
+                ));
+            }
         }
     }
     Ok(())
@@ -2360,6 +2481,7 @@ impl BlockingGraph {
         let mut nodes = Vec::new();
         collect_mbar_blockers(events, &mut nodes)?;
         collect_sync_blockers(events, &mut nodes)?;
+        collect_cluster_barrier_blockers(events, &mut nodes)?;
         collect_wait_group_blockers(events, &mut nodes)?;
         collect_tmem_wait_blockers(events, &mut nodes)?;
         // Edges feed only `find_cycle`, which is disabled (see DETECT_WAIT_FOR_CYCLES).
@@ -2689,6 +2811,56 @@ fn collect_sync_blockers(
     Ok(())
 }
 
+fn collect_cluster_barrier_blockers(
+    events: &[TraceEvent],
+    nodes: &mut Vec<BlockingNode>,
+) -> Result<(), DeadlockGraphError> {
+    // The split cluster barrier: a passing wait must have the full cluster
+    // arrival set as its release witness (the wait blocks until then at runtime;
+    // on a completed trace the witness must be present).
+    let mut arrivals: HashMap<usize, (usize, usize, Vec<usize>)> = HashMap::new();
+    for (idx, event) in events.iter().enumerate() {
+        if let TraceEventKind::ClusterBarrierArrive {
+            thread_count,
+            count,
+            scope,
+        } = &event.payload
+        {
+            let entry = arrivals.entry(scope.cluster_id).or_default();
+            entry.0 = *thread_count;
+            entry.1 = *count;
+            entry.2.push(idx);
+        }
+    }
+    for (idx, event) in events.iter().enumerate() {
+        let TraceEventKind::ClusterBarrierWait { scope } = &event.payload else {
+            continue;
+        };
+        let Some((thread_count, count, arrives)) = arrivals.get(&scope.cluster_id) else {
+            return Err(DeadlockGraphError::failed(
+                "deadlock_freedom_missing_release_witness",
+                "cluster barrier wait has no arrive release witness",
+                idx,
+                format!("cluster_barrier:cluster{}", scope.cluster_id),
+            ));
+        };
+        if count < thread_count {
+            return Err(DeadlockGraphError::failed(
+                "deadlock_freedom_missing_release_witness",
+                "cluster barrier wait does not have enough arrivals to release it",
+                idx,
+                format!("cluster_barrier:cluster{}", scope.cluster_id),
+            ));
+        }
+        nodes.push(BlockingNode {
+            event_idx: idx,
+            resource_key: format!("cluster_barrier:cluster{}", scope.cluster_id),
+            release_events: arrives.clone(),
+        });
+    }
+    Ok(())
+}
+
 fn collect_wait_group_blockers(
     events: &[TraceEvent],
     nodes: &mut Vec<BlockingNode>,
@@ -2817,6 +2989,8 @@ fn event_kind_name(payload: &TraceEventKind) -> &'static str {
         TraceEventKind::MbarWait { .. } => "mbar_wait",
         TraceEventKind::SyncArrive { .. } => "sync_arrive",
         TraceEventKind::Sync { .. } => "sync",
+        TraceEventKind::ClusterBarrierArrive { .. } => "cluster_barrier_arrive",
+        TraceEventKind::ClusterBarrierWait { .. } => "cluster_barrier_wait",
         TraceEventKind::SemRelease { .. } => "sem_release",
         TraceEventKind::SemAcquire { .. } => "sem_acquire",
         TraceEventKind::TmemAlloc { .. } => "tmem_alloc",
@@ -2840,6 +3014,8 @@ fn event_scope(payload: &TraceEventKind) -> Option<&super::protocol::AccessScope
         | TraceEventKind::MbarWait { scope, .. }
         | TraceEventKind::SyncArrive { scope, .. }
         | TraceEventKind::Sync { scope, .. }
+        | TraceEventKind::ClusterBarrierArrive { scope, .. }
+        | TraceEventKind::ClusterBarrierWait { scope, .. }
         | TraceEventKind::SemRelease { scope, .. }
         | TraceEventKind::SemAcquire { scope, .. }
         | TraceEventKind::TmemAlloc { scope, .. }
@@ -2862,28 +3038,52 @@ impl OrderingAnalysis {
     }
 
     fn new(events: &[TraceEvent]) -> Self {
-        let stream_count = events
-            .iter()
-            .filter_map(|event| event_scope(&event.payload).map(|scope| scope.stream_id))
-            .max()
-            .map(|max_stream| max_stream + 1)
-            .unwrap_or(0);
+        // HB substrate: one vector-clock process per (cta_id, warp_id) WARP CHAIN,
+        // not per simulator stream. The scheduler fragments one hardware warp's
+        // execution across many streams (kernel_init epoch, loose prologue epoch,
+        // role epoch, finalize epoch), so stream-keyed clocks lose the per-thread
+        // program order hardware guarantees across those bodies — the order the
+        // TMEM lifecycle proof (alloc -> access -> dealloc) rests on. A NON-sync
+        // event advances each covered chain INDEPENDENTLY: a multi-warp cohort
+        // stepping together is not a synchronization point (warp A's instance of
+        // a shared stmt does not order warp B's later events). Only the barrier
+        // events below merge chains, because merging IS their semantics.
+        // `event_clocks[e]` records the join (supremum) of the event's covered
+        // post-clocks; happens_before compares those supremums, i.e. "every
+        // covered warp-chain instance of `from` is ordered before `to`".
         let mut event_clocks = vec![Clock::new(); events.len()];
-        let mut stream_clocks = vec![Clock::new(); stream_count];
+        let mut proc_ids: HashMap<(usize, usize), usize> = HashMap::new();
+        let mut chains: HashMap<(usize, usize), Clock> = HashMap::new();
         let mut mbars: HashMap<MbarKey, MbarCycle> = HashMap::new();
         let mut last_release_clocks: HashMap<MbarKey, Clock> = HashMap::new();
         // Named-barrier (cross-warpgroup bar.sync) ordering. Unlike mbarriers'
         // producer/consumer split, a named barrier is a symmetric full barrier:
         // every participant's pre-barrier events happen-before every participant's
         // post-barrier events. `nb_arrival` accumulates the join of all arriving
-        // streams' clocks for the open generation; at completion that join becomes
+        // chains' clocks for the open generation; at completion that join becomes
         // `nb_release`, which each participant joins (acquire) when it passes —
         // including stragglers that re-emit SyncArrive after completion.
         let mut nb_arrival: HashMap<(usize, Option<u32>), Clock> = HashMap::new();
         let mut nb_release: HashMap<(usize, Option<u32>), Clock> = HashMap::new();
+        // Fused CLUSTER sync (`barrier.cluster.arrive/wait` fused as ClusterSync):
+        // the one barrier whose participants are separate per-CTA cohorts, so the
+        // chain merge cannot come from the event's own coverage. Arrivals
+        // accumulate per (stmt, cluster, cycle) generation; the completing
+        // cohort's Sync folds the full join into its chains and publishes it for
+        // the peer CTA's (later) Sync. The CTA-scope fused syncs (cta/warpgroup/
+        // warp) rendezvous as ONE cohort in every real kernel, so their Sync
+        // event merges exactly the covered chains — no cross-cohort accumulator.
+        let mut cl_arrival: HashMap<(usize, usize, u64), Clock> = HashMap::new();
+        let mut cl_release: HashMap<(usize, usize), Clock> = HashMap::new();
+        // Split cluster barrier (ClusterBarrierArrive + per-role waits): arrivals
+        // publish their clocks into `cb_arrival`; once every cluster thread has
+        // arrived the join becomes `cb_release`, which each passing
+        // ClusterBarrierWait acquires (hardware arrive=.release / wait=.acquire).
+        let mut cb_arrival: HashMap<usize, Clock> = HashMap::new();
+        let mut cb_release: HashMap<usize, Clock> = HashMap::new();
         // GMEM-semaphore value-keyed release/acquire (gmem_atomic_add / gmem_wait_eq).
         // VALUE-KEYED, not cell-keyed: each `atomic_add(order=release)` publishes this
-        // stream's clock under `(SemKey, post_increment_value)`; each `wait_eq(value)`
+        // event's clock under `(SemKey, post_increment_value)`; each `wait_eq(value)`
         // joins the release published for THAT SPECIFIC value — i.e. the release of the
         // atomic_add that PRODUCED the observed counter, exactly as the mbar phase-keyed
         // lookup does with the counter-value in place of parity. This closes the
@@ -2894,14 +3094,43 @@ impl OrderingAnalysis {
             let Some(scope) = event_scope(&event.payload) else {
                 continue;
             };
-            let stream_id = scope.stream_id;
+            if scope.warp_ids.is_empty() {
+                continue;
+            }
+            let cta = scope.cta_id;
+            // Dense process id per covered warp chain.
+            let warps: Vec<((usize, usize), usize)> = scope
+                .warp_ids
+                .iter()
+                .map(|&w| {
+                    let key = (cta, w);
+                    let pid = match proc_ids.get(&key) {
+                        Some(&pid) => pid,
+                        None => {
+                            let pid = proc_ids.len();
+                            proc_ids.insert(key, pid);
+                            pid
+                        }
+                    };
+                    (key, pid)
+                })
+                .collect();
+            // acquire: join the release clock this event observes into EVERY
+            // covered chain (before the bump, so the event's own clock carries it).
+            let acquire = |chains: &mut HashMap<(usize, usize), Clock>,
+                           warps: &[((usize, usize), usize)],
+                           rel: &Clock| {
+                for (key, _) in warps {
+                    join_clock(chains.entry(*key).or_default(), rel);
+                }
+            };
             match &event.payload {
                 TraceEventKind::MbarWait { target, phase, .. } => {
                     let key = MbarKey::from_target(target);
                     let released = mbars.get(&key).is_none_or(|cycle| *phase != cycle.parity);
                     if released {
                         if let Some(release_clock) = last_release_clocks.get(&key) {
-                            join_clock(&mut stream_clocks[stream_id], release_clock);
+                            acquire(&mut chains, &warps, release_clock);
                         }
                     }
                 }
@@ -2912,7 +3141,26 @@ impl OrderingAnalysis {
                     sync_kind, bar_id, ..
                 } if sync_kind == "named" => {
                     if let Some(rel) = nb_release.get(&(scope.cta_id, *bar_id)) {
-                        join_clock(&mut stream_clocks[stream_id], rel);
+                        acquire(&mut chains, &warps, rel);
+                    }
+                }
+                // acquire: a cluster-sync arrival picks up the last completed
+                // generation of the same barrier stmt (the peer CTA may complete
+                // before this CTA re-polls).
+                TraceEventKind::SyncArrive {
+                    sync_kind,
+                    cycle: _,
+                    ..
+                } if sync_kind == "cluster" => {
+                    if let Some(rel) = cl_release.get(&(event.stmt_id, scope.cluster_id)) {
+                        acquire(&mut chains, &warps, rel);
+                    }
+                }
+                // acquire: the split cluster barrier's wait joins the cluster's full
+                // arrival clock (published once every cluster thread arrived).
+                TraceEventKind::ClusterBarrierWait { .. } => {
+                    if let Some(rel) = cb_release.get(&scope.cluster_id) {
+                        acquire(&mut chains, &warps, rel);
                     }
                 }
                 // semaphore acquire (gmem_wait_eq): join the release published for the
@@ -2921,14 +3169,40 @@ impl OrderingAnalysis {
                 // dominates the producer's add (and its drained reduce-add).
                 TraceEventKind::SemAcquire { key, value, .. } => {
                     if let Some(rel) = sem_releases.get(&(*key, *value)) {
-                        join_clock(&mut stream_clocks[stream_id], rel);
+                        acquire(&mut chains, &warps, rel);
                     }
                 }
                 _ => {}
             }
 
-            bump_clock(&mut stream_clocks[stream_id], stream_id);
-            event_clocks[idx] = stream_clocks[stream_id].clone();
+            // local advance: bump each covered chain at its own process; the event
+            // clock is the join of the post-bump chains.
+            let mut event_clock = Clock::new();
+            for (key, pid) in &warps {
+                let chain = chains.entry(*key).or_default();
+                bump_clock(chain, *pid);
+                join_clock(&mut event_clock, chain);
+            }
+            event_clocks[idx] = event_clock;
+            // Merge the covered chains into one clock (barrier completion only) and
+            // re-record the event clock so the event itself sits after the merge.
+            let merge_covered = |chains: &mut HashMap<(usize, usize), Clock>,
+                                 warps: &[((usize, usize), usize)],
+                                 extra: Option<&Clock>|
+             -> Clock {
+                let mut merged = Clock::new();
+                if let Some(extra) = extra {
+                    join_clock(&mut merged, extra);
+                }
+                for (key, _) in warps {
+                    let chain = chains.entry(*key).or_default();
+                    join_clock(&mut merged, chain);
+                }
+                for (key, _) in warps {
+                    chains.insert(*key, merged.clone());
+                }
+                merged
+            };
 
             match &event.payload {
                 TraceEventKind::MbarInit { target, count, .. } => {
@@ -2974,29 +3248,75 @@ impl OrderingAnalysis {
                     let acc = nb_arrival.entry(key).or_default();
                     join_clock(acc, &event_clocks[idx]);
                 }
-                // completion: fold the full arrival join into the completer's clock
+                // completion: fold the full arrival join into the completer's chains
                 // and publish it as this generation's release; reset the accumulator.
                 TraceEventKind::Sync {
                     sync_kind, bar_id, ..
                 } if sync_kind == "named" => {
                     let key = (scope.cta_id, *bar_id);
-                    if let Some(acc) = nb_arrival.remove(&key) {
-                        join_clock(&mut stream_clocks[stream_id], &acc);
-                        event_clocks[idx] = stream_clocks[stream_id].clone();
+                    let acc = nb_arrival.remove(&key);
+                    let merged = merge_covered(&mut chains, &warps, acc.as_ref());
+                    event_clocks[idx] = merged.clone();
+                    nb_release.insert(key, merged);
+                }
+                // cluster sync arrival: accumulate this CTA cohort's clock into the
+                // (stmt, cluster, cycle) generation.
+                TraceEventKind::SyncArrive {
+                    sync_kind, cycle, ..
+                } if sync_kind == "cluster" => {
+                    let acc = cl_arrival
+                        .entry((event.stmt_id, scope.cluster_id, *cycle))
+                        .or_default();
+                    join_clock(acc, &event_clocks[idx]);
+                }
+                // cluster sync completion: the completer's chains fold the full
+                // cross-CTA arrival join; publish it for the peer CTA's later Sync
+                // (the accumulator stays — the peer completes against the same
+                // generation key).
+                TraceEventKind::Sync {
+                    sync_kind, cycle, ..
+                } if sync_kind == "cluster" => {
+                    let gen_key = (event.stmt_id, scope.cluster_id, *cycle);
+                    let acc = cl_arrival.get(&gen_key).cloned();
+                    let merged = merge_covered(&mut chains, &warps, acc.as_ref());
+                    event_clocks[idx] = merged.clone();
+                    cl_release.insert((event.stmt_id, scope.cluster_id), merged);
+                }
+                // CTA-scope fused syncs (cta / warpgroup / warp): the participants
+                // rendezvous as one cohort, so the completion merges exactly the
+                // covered chains (a partial-cohort arrival that somehow completed
+                // merges only its own chains — fail closed, never fabricated).
+                TraceEventKind::Sync { sync_kind, .. }
+                    if matches!(sync_kind.as_str(), "cta" | "warpgroup" | "warp") =>
+                {
+                    let merged = merge_covered(&mut chains, &warps, None);
+                    event_clocks[idx] = merged;
+                }
+                // split cluster barrier arrive: publish this cohort's clock into the
+                // cluster accumulator; once every cluster thread has arrived the join
+                // becomes the release the per-role waits acquire.
+                TraceEventKind::ClusterBarrierArrive {
+                    thread_count,
+                    count,
+                    ..
+                } => {
+                    let acc = cb_arrival.entry(scope.cluster_id).or_default();
+                    join_clock(acc, &event_clocks[idx]);
+                    if count >= thread_count {
+                        cb_release.insert(scope.cluster_id, acc.clone());
                     }
-                    nb_release.insert(key, stream_clocks[stream_id].clone());
                 }
                 // semaphore release (gmem_atomic_add, order=release): publish this
-                // stream's now-bumped clock under (cell, POST-increment value) — the
-                // value-keyed release a wait_eq on that value will acquire. Relaxed
-                // order publishes nothing (no happens-before edge), mirroring hardware.
+                // event's clock under (cell, POST-increment value) — the value-keyed
+                // release a wait_eq on that value will acquire. Relaxed order
+                // publishes nothing (no happens-before edge), mirroring hardware.
                 TraceEventKind::SemRelease {
                     key,
                     new_value,
                     order,
                     ..
                 } if *order == super::protocol::GmemAtomicOrderEvent::Release => {
-                    sem_releases.insert((*key, *new_value), stream_clocks[stream_id].clone());
+                    sem_releases.insert((*key, *new_value), event_clocks[idx].clone());
                 }
                 _ => {}
             }
@@ -3078,7 +3398,10 @@ mod tests {
             cta_id: 0,
             ctaid_in_cluster: 0,
             cohort_size: 32,
-            warp_ids: vec![0],
+            // Concurrent test streams model concurrent WARPS: the ordering
+            // analysis keys per-thread program order on (cta_id, warp_id), so
+            // distinct streams need distinct warp ids to stay unordered.
+            warp_ids: vec![stream_id],
         }
     }
 
@@ -4698,5 +5021,416 @@ mod tests {
             ProtocolStatus::Passed
         );
         assert!(diagnostic_codes(&report).contains("memory_data_race"));
+    }
+
+    fn scope_warps(
+        stream_id: usize,
+        cta_id: usize,
+        cluster_id: usize,
+        warp_ids: Vec<usize>,
+    ) -> super::super::protocol::AccessScope {
+        super::super::protocol::AccessScope {
+            stream_id,
+            cluster_id,
+            cta_id,
+            ctaid_in_cluster: cta_id,
+            cohort_size: 32 * warp_ids.len(),
+            warp_ids,
+        }
+    }
+
+    fn tmem_ld(stream: usize) -> TraceEvent {
+        event(
+            7,
+            TraceEventKind::Read {
+                region: tmem_region(0, 32),
+                proxy: MemoryProxy::Async,
+                access_kind: MemoryAccessKind::Tmem(TmemAsyncKind::Ld),
+                scope: scope(stream),
+            },
+        )
+    }
+
+    fn tmem_alloc_event(stream: usize) -> TraceEvent {
+        event(
+            1,
+            TraceEventKind::TmemAlloc {
+                cta_ids: vec![0],
+                region: tmem_region(0, 32),
+                scope: scope(stream),
+            },
+        )
+    }
+
+    fn tmem_dealloc_event(stream: usize) -> TraceEvent {
+        event(
+            2,
+            TraceEventKind::TmemDealloc {
+                cta_ids: vec![0],
+                region: tmem_region(0, 32),
+                scope: scope(stream),
+            },
+        )
+    }
+
+    fn cta_sync_events(stream: usize, warps: Vec<usize>, cycle: u64) -> Vec<TraceEvent> {
+        let scope = scope_warps(stream, 0, 0, warps);
+        let thread_count = scope.cohort_size;
+        vec![
+            event(
+                10,
+                TraceEventKind::SyncArrive {
+                    sync_kind: "cta".into(),
+                    thread_count,
+                    count: thread_count,
+                    cycle,
+                    bar_id: None,
+                    scope: scope.clone(),
+                },
+            ),
+            event(
+                11,
+                TraceEventKind::Sync {
+                    sync_kind: "cta".into(),
+                    thread_count,
+                    cycle,
+                    bar_id: None,
+                    scope,
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn tmem_lifecycle_rejects_unsynchronized_cross_role_order() {
+        // The review's motivating case: three mutually-unsynchronized roles alloc /
+        // ld / dealloc one TMEM band. The SAMPLED order (alloc -> ld -> dealloc)
+        // covers the access, so the old sampled-order check passed it — but a
+        // legal hardware interleaving runs the ld (or the dealloc) first. The
+        // HB-based check must reject: no sync edge, no proof.
+        let kernel = empty_kernel("tmem_lifecycle_hb", vec![]);
+        let events = vec![tmem_alloc_event(0), tmem_ld(1), tmem_dealloc_event(2)];
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(report.status, ProtocolStatus::Failed);
+        assert_eq!(
+            pass_status(&report, "tmem_lifecycle_order"),
+            ProtocolStatus::Failed
+        );
+        assert!(diagnostic_codes(&report).contains("tmem_lifecycle_hb_missing"));
+    }
+
+    #[test]
+    fn tmem_lifecycle_rejects_unsynchronized_dealloc() {
+        // alloc and ld are ordered (both before the same barrier), but the
+        // dealloc runs on a warp with no edge from the ld.
+        let kernel = empty_kernel("tmem_lifecycle_hb_dealloc", vec![]);
+        let mut events = vec![tmem_alloc_event(0)];
+        events.extend(cta_sync_events(3, vec![0, 1], 0));
+        events.push(tmem_ld(1));
+        events.push(tmem_dealloc_event(2));
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(report.status, ProtocolStatus::Failed);
+        assert_eq!(
+            pass_status(&report, "tmem_lifecycle_order"),
+            ProtocolStatus::Failed
+        );
+        assert!(diagnostic_codes(&report).contains("tmem_lifecycle_hb_missing"));
+    }
+
+    #[test]
+    fn tmem_lifecycle_accepts_barrier_ordered_roles() {
+        // The real-kernel shape: alloc in kernel_init (warp 0), a fused cta
+        // barrier (one cohort covering every warp — the loose prologue stmt),
+        // the ld in a role, a second barrier, then dealloc on another warp.
+        // The barrier merges the warp chains, so every required HB edge exists.
+        let kernel = empty_kernel("tmem_lifecycle_hb_ok", vec![]);
+        let mut events = vec![tmem_alloc_event(0)];
+        events.extend(cta_sync_events(3, vec![0, 1, 2], 0));
+        events.push(tmem_ld(1));
+        events.extend(cta_sync_events(4, vec![0, 1, 2], 1));
+        events.push(tmem_dealloc_event(2));
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(report.status, ProtocolStatus::Passed);
+        assert_eq!(
+            pass_status(&report, "tmem_lifecycle_order"),
+            ProtocolStatus::Passed
+        );
+    }
+
+    #[test]
+    fn tmem_lifecycle_accepts_mbar_ordered_roles() {
+        // The handshake shape (canon's tmem_fin): alloc -> arrive -> wait -> ld
+        // -> arrive -> wait -> dealloc, all on different warps.
+        let kernel = empty_kernel("tmem_lifecycle_hb_mbar", vec![]);
+        let target = mbar_target();
+        let events = vec![
+            event(
+                0,
+                TraceEventKind::MbarInit {
+                    target: target.clone(),
+                    count: 1,
+                    scope: scope(0),
+                },
+            ),
+            tmem_alloc_event(0),
+            event(
+                3,
+                TraceEventKind::MbarArrive {
+                    target: target.clone(),
+                    count: 1,
+                    scope: scope(0),
+                },
+            ),
+            event(
+                4,
+                TraceEventKind::MbarWait {
+                    target: target.clone(),
+                    phase: 0,
+                    scope: scope(1),
+                },
+            ),
+            tmem_ld(1),
+            event(
+                5,
+                TraceEventKind::MbarArrive {
+                    target: target.clone(),
+                    count: 1,
+                    scope: scope(1),
+                },
+            ),
+            event(
+                6,
+                TraceEventKind::MbarWait {
+                    target,
+                    phase: 1,
+                    scope: scope(2),
+                },
+            ),
+            tmem_dealloc_event(2),
+        ];
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(report.status, ProtocolStatus::Passed);
+        assert_eq!(
+            pass_status(&report, "tmem_lifecycle_order"),
+            ProtocolStatus::Passed
+        );
+    }
+
+    #[test]
+    fn tmem_lifecycle_accepts_cluster_sync_ordered_pair() {
+        // cta_group=2 shape: the collective alloc emits BOTH CTAs' bands on the
+        // completing CTA's init stream; the peer CTA's access is ordered through
+        // the fused cluster sync (cross-CTA barrier edge), the dealloc through a
+        // second one.
+        let kernel = empty_kernel("tmem_lifecycle_hb_cluster", vec![]);
+        let mut events = vec![event(
+            1,
+            TraceEventKind::TmemAlloc {
+                cta_ids: vec![1],
+                region: Region {
+                    owner: PoolId::Tmem { cta_id: 1 },
+                    ..tmem_region(0, 32)
+                },
+                scope: scope_warps(0, 0, 0, vec![0]),
+            },
+        )];
+        // fused cluster sync, generation 0: cta0 arrives first, cta1 completes,
+        // cta0 re-polls and completes (the interpreter's exact emission shape).
+        let cluster_sync = |stream: usize, cta: usize, count: usize, cycle: u64, kind: &str| {
+            event(
+                10,
+                if kind == "arrive" {
+                    TraceEventKind::SyncArrive {
+                        sync_kind: "cluster".into(),
+                        thread_count: 256,
+                        count,
+                        cycle,
+                        bar_id: None,
+                        scope: scope_warps(stream, cta, 0, vec![0, 1, 2, 3]),
+                    }
+                } else {
+                    TraceEventKind::Sync {
+                        sync_kind: "cluster".into(),
+                        thread_count: 256,
+                        cycle,
+                        bar_id: None,
+                        scope: scope_warps(stream, cta, 0, vec![0, 1, 2, 3]),
+                    }
+                },
+            )
+        };
+        events.push(cluster_sync(1, 0, 128, 0, "arrive"));
+        events.push(cluster_sync(2, 1, 256, 0, "arrive"));
+        events.push(cluster_sync(2, 1, 256, 0, "sync"));
+        events.push(cluster_sync(1, 0, 256, 0, "arrive"));
+        events.push(cluster_sync(1, 0, 256, 0, "sync"));
+        // the peer CTA's role loads its own band (allocated on cta0's stream).
+        events.push(event(
+            7,
+            TraceEventKind::Read {
+                region: Region {
+                    owner: PoolId::Tmem { cta_id: 1 },
+                    ..tmem_region(0, 32)
+                },
+                proxy: MemoryProxy::Async,
+                access_kind: MemoryAccessKind::Tmem(TmemAsyncKind::Ld),
+                scope: scope_warps(3, 1, 0, vec![1]),
+            },
+        ));
+        // teardown barrier, generation 1, then the collective dealloc emitting
+        // cta1's band on cta0's finalize stream.
+        events.push(cluster_sync(4, 1, 128, 1, "arrive"));
+        events.push(cluster_sync(5, 0, 256, 1, "arrive"));
+        events.push(cluster_sync(5, 0, 256, 1, "sync"));
+        events.push(cluster_sync(4, 1, 256, 1, "arrive"));
+        events.push(cluster_sync(4, 1, 256, 1, "sync"));
+        events.push(event(
+            2,
+            TraceEventKind::TmemDealloc {
+                cta_ids: vec![1],
+                region: Region {
+                    owner: PoolId::Tmem { cta_id: 1 },
+                    ..tmem_region(0, 32)
+                },
+                scope: scope_warps(6, 0, 0, vec![0]),
+            },
+        ));
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(report.status, ProtocolStatus::Passed);
+        assert_eq!(
+            pass_status(&report, "tmem_lifecycle_order"),
+            ProtocolStatus::Passed
+        );
+    }
+
+    #[test]
+    fn tmem_lifecycle_accepts_split_cluster_barrier_order() {
+        // The overlap prologue shape: a split cluster barrier (collective arrive,
+        // per-role wait) orders the init alloc before the role's access, and a
+        // second round orders the access before the finalize dealloc.
+        let kernel = empty_kernel("tmem_lifecycle_hb_cluster_barrier", vec![]);
+        let arrive = |stream: usize, count: usize| {
+            event(
+                12,
+                TraceEventKind::ClusterBarrierArrive {
+                    thread_count: 96,
+                    count,
+                    scope: scope_warps(stream, 0, 0, vec![0, 1, 2]),
+                },
+            )
+        };
+        let wait = |stream: usize, warps: Vec<usize>| {
+            event(
+                13,
+                TraceEventKind::ClusterBarrierWait {
+                    scope: scope_warps(stream, 0, 0, warps),
+                },
+            )
+        };
+        let events = vec![
+            tmem_alloc_event(0),
+            arrive(8, 96),
+            wait(9, vec![0, 1]),
+            tmem_ld(1),
+            arrive(10, 96),
+            wait(11, vec![0, 2]),
+            tmem_dealloc_event(2),
+        ];
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(report.status, ProtocolStatus::Passed);
+        assert_eq!(
+            pass_status(&report, "tmem_lifecycle_order"),
+            ProtocolStatus::Passed
+        );
+    }
+
+    #[test]
+    fn tmem_lifecycle_rejects_split_cluster_barrier_without_wait() {
+        // Arrives alone do not order a role that never waits: the role's access
+        // can run before the barrier completes.
+        let kernel = empty_kernel("tmem_lifecycle_hb_cluster_barrier_neg", vec![]);
+        let events = vec![
+            tmem_alloc_event(0),
+            event(
+                12,
+                TraceEventKind::ClusterBarrierArrive {
+                    thread_count: 96,
+                    count: 96,
+                    scope: scope_warps(8, 0, 0, vec![0, 1, 2]),
+                },
+            ),
+            tmem_ld(1),
+            tmem_dealloc_event(2),
+        ];
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(report.status, ProtocolStatus::Failed);
+        assert_eq!(
+            pass_status(&report, "tmem_lifecycle_order"),
+            ProtocolStatus::Failed
+        );
+        assert!(diagnostic_codes(&report).contains("tmem_lifecycle_hb_missing"));
+    }
+
+    #[test]
+    fn ordering_analysis_tracks_warp_chains_across_streams() {
+        // The epoch repair: two events on DIFFERENT streams sharing a (cta,
+        // warp) chain are program-ordered across the boundary (kernel_init
+        // epoch -> loose epoch -> role epoch on the same hardware warp); a
+        // multi-warp NON-sync event does NOT merge its chains (a shared stmt
+        // is not a synchronization point).
+        let fence = |stream: usize, warps: Vec<usize>| {
+            event(
+                1,
+                TraceEventKind::Fence {
+                    fence_kind: FenceEventKind::Generic,
+                    fence_scope: FenceScope::Cta,
+                    scope: scope_warps(stream, 0, 0, warps),
+                },
+            )
+        };
+        let events = vec![
+            fence(0, vec![0]),    // init epoch, warp 0
+            fence(1, vec![0, 1]), // loose epoch, warps 0+1 (not a barrier)
+            fence(2, vec![1]),    // role epoch, warp 1
+        ];
+        let ordering = OrderingAnalysis::new(&events);
+        // warp 0's init event is program-before the loose event (its warp-0
+        // instance), and warp 1's role event is program-after the loose event's
+        // warp-1 instance.
+        assert!(ordering.happens_before(0, 1));
+        // ...but the loose event's warp-0 instance is NOT ordered before the
+        // role event (event-level HB asks: every covered instance of `from` is
+        // ordered before `to`), and warp 0's init event does not reach warp 1's
+        // role event through the shared stmt — that would need a real barrier.
+        assert!(!ordering.happens_before(1, 2));
+        assert!(!ordering.happens_before(0, 2));
     }
 }

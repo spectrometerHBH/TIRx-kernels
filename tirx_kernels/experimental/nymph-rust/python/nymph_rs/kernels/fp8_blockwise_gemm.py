@@ -423,6 +423,15 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
             # One arrival per CTA's epilogue warpgroup.
             k.mbarrier_init(tmem_empty, count=cta_group, stage=s)
 
+    # Prologue seal (canon's `T.ptx.fence.mbarrier_init` + cluster barrier): the
+    # mbarrier inits and the TMEM alloc must be complete and visible before ANY
+    # role touches a barrier or the shared TMEM. Without the barrier the first
+    # MMA/epilogue races the still-pending alloc on the peer CTA — the protocol
+    # checker's lifecycle proof requires this happens-before edge, not just a
+    # favorable sampled epoch order (the fp8 port previously had none).
+    k.fence(kind=FenceKind.MBARRIER_INIT)
+    k.cluster_sync()
+
     # ---- TMA producer (TIRx wg0/warp0) ----
     with k.role(warp=0):
         with k.for_each_task(task_scheduler) as task:
@@ -686,6 +695,11 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
         k.cp_async_bulk_wait_group_read(0)
         k.wg_sync(barrier_id=10)
 
+    # Cluster-wide barrier before the TMEM teardown (canon's `cluster_sync()`
+    # right before relinquish + dealloc): both CTAs' MMA writes and epilogue
+    # TMEM reads must be done before either CTA frees the shared band — the
+    # checker requires the happens-before edge, not just drained task loops.
+    k.cluster_sync()
     with k.kernel_finalize(warp=0):
         k.tmem_relinquish(cta_group)
         k.tmem_dealloc(0, N_COLS_TMEM, cta_group)

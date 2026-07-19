@@ -2,7 +2,15 @@
 M=256 (128/CTA), N=128, K=64. No scheduler warp, no ring, no persistent loop, direct reg->gmem epilogue."""
 
 from nymph_rs.builder import IRBuilder, TmemBand
-from nymph_rs.nymph_rs import DType, MBarKind, MemorySpace, SmemSwizzleLayout, Swizzle, TensorSlice
+from nymph_rs.nymph_rs import (
+    DType,
+    FenceKind,
+    MBarKind,
+    MemorySpace,
+    SmemSwizzleLayout,
+    Swizzle,
+    TensorSlice,
+)
 
 
 def build_bootstrap_gemm(M=256, N=128, K=64, dtype=DType.F16):
@@ -39,6 +47,12 @@ def build_bootstrap_gemm(M=256, N=128, K=64, dtype=DType.F16):
         k.tmem_alloc(0, N, CTA_GROUP)
         k.mbarrier_init(smem_full, count=1)
         k.mbarrier_init(mma_done, count=1)
+    # Prologue seal (canon's `fence.mbarrier_init` + cluster barrier): the inits
+    # and the TMEM alloc must be complete before any role touches a barrier or
+    # the shared TMEM — the checker's lifecycle proof needs this happens-before
+    # edge, not just the sampled epoch order.
+    k.fence(kind=FenceKind.MBARRIER_INIT)
+    k.cluster_sync()
     with k.role(warp=4):  # loader
         a_m = cr * BLK_M
         b_n = cr * BLK_N
@@ -89,6 +103,10 @@ def build_bootstrap_gemm(M=256, N=128, K=64, dtype=DType.F16):
                 TensorSlice(tensor=c_g, offsets=(cr * BLK_M + k.tid_in_wg(), col), shape=(1, 8)),
                 out_frag,
             )
+    # Cluster-wide barrier before freeing TMEM (canon's `cluster_sync()` right
+    # before relinquish + dealloc): both CTAs' MMA writes and epilogue TMEM
+    # reads must be done before either CTA frees the shared band.
+    k.cluster_sync()
     with k.kernel_finalize(warp=0):
         k.tmem_relinquish(CTA_GROUP)
         k.tmem_dealloc(0, N, CTA_GROUP)

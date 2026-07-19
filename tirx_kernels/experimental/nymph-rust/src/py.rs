@@ -648,6 +648,20 @@ fn event_to_py<'py>(py: Python<'py>, event: &TraceEvent) -> PyResult<Bound<'py, 
             out.set_item("bar_id", bar_id)?;
             out.set_item("scope", scope_to_py(py, scope)?)?;
         }
+        TraceEventKind::ClusterBarrierArrive {
+            thread_count,
+            count,
+            scope,
+        } => {
+            out.set_item("kind", "cluster_barrier_arrive")?;
+            out.set_item("thread_count", thread_count)?;
+            out.set_item("count", count)?;
+            out.set_item("scope", scope_to_py(py, scope)?)?;
+        }
+        TraceEventKind::ClusterBarrierWait { scope } => {
+            out.set_item("kind", "cluster_barrier_wait")?;
+            out.set_item("scope", scope_to_py(py, scope)?)?;
+        }
         TraceEventKind::SemRelease {
             key,
             new_value,

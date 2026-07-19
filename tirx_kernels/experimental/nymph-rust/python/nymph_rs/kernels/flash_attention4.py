@@ -440,6 +440,16 @@ def build_flash_attention4(config: FlashAttention4Config = FlashAttention4Config
         seq_q_per_tile,
     )
 
+    # CTA-wide (cta_group=2: cluster-wide) barrier before the TMEM teardown:
+    # the last task's TMEM writes/reads (e.g. a softmax wg's tcgen05_st) do NOT
+    # all reach warp 0 through the task handshakes — the scheduler drains
+    # without another round-trip for the final iteration — so warp 0 could
+    # dealloc while another warpgroup's access is still in flight. The checker
+    # requires the happens-before edge; canon has the barrier.
+    if config.cta_group == 2:
+        k.cluster_sync()
+    else:
+        k.cta_sync()
     with k.kernel_finalize(warp=0):
         k.tmem_relinquish(config.cta_group)
         k.tmem_dealloc(0, N_COLS_TMEM, config.cta_group)

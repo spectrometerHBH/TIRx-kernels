@@ -771,6 +771,16 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
             for s in range(stg):
                 k.mbarrier_init(bars[nm], count=spec[1], stage=s)
 
+    # Prologue seal: the mbarrier inits and the TMEM alloc must complete before
+    # any role touches a barrier or the TMEM band — the checker's lifecycle
+    # proof requires the happens-before edge (a fused CTA/cluster barrier), not
+    # just the sampled epoch order.
+    k.fence(kind=FenceKind.MBARRIER_INIT)
+    if use_2cta:
+        k.cluster_sync()
+    else:
+        k.cta_sync()
+
     def task_geom(task):
         # 1-CTA: `work` indexes (nb, head, batch) directly. 2-CTA: `work` indexes a
         # CLUSTER (cluster_nb, head, batch); this CTA's kv-tile = cluster_nb*cg + ctaid.
@@ -2506,6 +2516,14 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
         with k.for_each_task(sched) as task:
             pass
 
+    # CTA/cluster-wide barrier before the TMEM teardown: the compute wgs' final
+    # epilogue TMEM reads (and, 2-CTA, the peer CTA's accesses to the shared
+    # band) must be done before warp 0 frees the band — the checker's lifecycle
+    # proof requires the happens-before edge, not just drained task loops.
+    if use_2cta:
+        k.cluster_sync()
+    else:
+        k.cta_sync()
     with k.kernel_finalize(warp=0):
         k.tmem_relinquish(cg)
         k.tmem_dealloc(0, N_COLS_TMEM, cg)

@@ -95,8 +95,13 @@ happens_before(a_event_idx, b_event_idx) -> bool
 
 Ordering facts are schedule-independent:
 
-- same-stream program order;
-- mbar release to matching mbar wait.
+- per-thread program order (one clock chain per `(cta_id, warp_id)` — a
+  kernel_init / loose / role / finalize epoch boundary does not break the
+  chain, because those bodies run on the same hardware warp);
+- mbar release to matching mbar wait;
+- fused cta/cluster syncs (the cluster barrier folds both CTAs' arrival
+  clocks), named barriers, the split cluster barrier arrive→wait, and
+  value-keyed GMEM semaphore release/acquire.
 
 Cross-stream trace vector order is not a happens-before edge.
 
