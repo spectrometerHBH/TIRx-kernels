@@ -171,6 +171,11 @@ Applied in order (R2UR lines / total SASS lines, nvrtc+nvdisasm A/B):
 
 Final real-pipeline state: **1100 SASS / 3 R2UR** vs canon 1155/4. Threshold
 for this content measured by padding: flips back between 1104 (4) and 1240 (74).
+Runtime confirmation (ncu, single launch each): executed R2UR 13,504 -> 768
+(canon 1,792), total instructions 310,063 -> 279,092 (canon 267,352, +16.0% ->
++4.4%). Bench (rounds=10, same-day baseline comparison): **fp16 1024 0.981 ->
+1.019, bf16 1024 0.981 -> 1.018** (target ≥0.99), fp16/bf16 2048 ~1.01,
+4096 ~1.00, 8192 ~0.99-1.00, nvfp4 unchanged (bench/RESULTS.md).
 
 ### 5.3 What changed in the tree (and what it cost)
 

@@ -4,6 +4,39 @@ Method: `CUDA_VISIBLE_DEVICES=<idle> python bench/run_suite.py --rounds 10 --max
 (bench-suite standard path, proton timer, cold cache, correctness cosine gate on both impls).
 Ratio = `tir / tirx` = canon_time / nymph_time; **>1 means nymph is faster**.
 
+## 2026-07-19 fp16 1024 CUDA-level convergence — uniform placement flipped, 1024 at 1.017
+
+B200, GPU1 (idle), rounds=10. After commit `3fbb7c27` (perf(kernel): fp16 1024
+CUDA-level convergence): MMA peel+roll merged into one rolled k-loop with a
+runtime accum cell (`#pragma unroll 1`), canon-form scheduler (done-flag +
+phase cells), prologue grouped `thread_rank()==0` inits, unguarded
+commit_group, and the role dispatch emitted as canon's if/else decision tree
+(codegen `chain_top_level_roles`). ptxas's whole-function uniform placement
+flips: nvrtc+nvdisasm fp16 1024 R2UR 90 -> 3 (canon 4), SASS 1492 -> 1100
+(canon 1155); ncu executed R2UR 13,504 -> 768 (canon 1,792), total
+instructions +16.0% -> +4.4%. Mechanism + diff inventory + residual
+divergences: docs/perf-methodology.md §5.
+
+| kernel | shape | ratio | spread | canon (us) | nymph (us) |
+|---|---|---|---|---|---|
+| nvfp4 | 1024 | 1.009 | 1.005-1.011 | 5.4 | 5.4 |
+| nvfp4 | 2048 | 0.991 | 0.989-0.996 | 8.5 | 8.6 |
+| nvfp4 | 4096 | 1.018 | 1.017-1.019 | 29.6 | 29.1 |
+| nvfp4 | 8192 | 1.013 | 0.994-1.033 | 187.6 | 185.1 |
+| fp16 | 1024 | **1.019** | 1.018-1.020 | 6.8 | 6.7 |
+| fp16 | 2048 | 1.010 | 1.009-1.011 | 16.6 | 16.5 |
+| fp16 | 4096 | 1.002 | 0.988-1.015 | 96.1 | 95.9 |
+| fp16 | 8192 | 0.993 | 0.960-1.032 | 731.1 | 736.6 |
+| bf16 | 1024 | **1.018** | 1.017-1.020 | 6.9 | 6.8 |
+| bf16 | 2048 | 1.011 | 1.010-1.012 | 16.4 | 16.3 |
+| bf16 | 4096 | 0.999 | 0.987-1.010 | 93.4 | 93.5 |
+| bf16 | 8192 | 1.000 | 0.966-1.038 | 705.6 | 705.9 |
+
+(fp16/bf16 1024 move 0.981 -> 1.019/1.018 — target ≥0.99 met with margin; the
+uniform-placement flip also pays +1.0-1.5% on 2048 and +0.3-0.5% on 4096. nvfp4
+unchanged within noise. 16384 rows pending from the same-day `--max-shape 16384`
+rerun; added when it completes.)
+
 ## 2026-07-18 R2UR/uniform batch (ScalarLet) + shape retune — new baseline
 
 B200, GPU2 (idle), rounds=10. After: (1) the `ScalarLet` single-assignment IR +
