@@ -85,9 +85,14 @@ python bench/run_suite.py [--rounds 5] [--max-shape 8192] [--filter nvfp4] [--la
 ```
 
 Registration inside every orchestrator worker is env-gated: with
-`NYMPH_BENCH_SUITE=1` (the wrapper sets it), the sitecustomize hook loads
+`NYMPH_BENCH_SUITE=1` (the wrapper sets it), the repo-local
+`bench/sitecustomize.py` — auto-imported by every child python because the
+wrapper prepends `bench/` to the subprocess `PYTHONPATH` — loads
 `bench/_nymph_bench_autoreg.py`, which imports the interface modules (they
-self-register). Direct invocation without the wrapper:
+self-register). This is fully repo-contained: the registration no longer
+depends on any machine-local sitecustomize outside the repo (a legacy hook
+may still exist in a dev shell — it is idempotent and unused by the bench
+path now). Direct invocation without the wrapper:
 
 ```
 NYMPH_BENCH_SUITE=1 python -m tirx_kernels.bench_suite --workloads bench/nymph_workloads.yaml --no-report
@@ -131,6 +136,7 @@ and compare — canon's `tir` there is stable, so match that setup.
 - `python/nymph_rs/kernels/nvfp4_gemm.py`     — the kernel AND its bench interface
 - `python/nymph_rs/kernels/fp16_bf16_gemm.py` — the kernel AND its bench interface
 - `bench/run_suite.py`      — THE bench entry: thin wrapper over the bench-suite orchestrator
+- `bench/sitecustomize.py`  — repo-local auto-imported hook: worker env repair + registration
 - `bench/nymph_workloads.yaml` — the workload list the orchestrator consumes
 - `bench/_nymph_bench_autoreg.py` — env-gated (NYMPH_BENCH_SUITE=1) registration hook
 - `bench/RESULTS.md`        — dated bench records (ground truth for past numbers)

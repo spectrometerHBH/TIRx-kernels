@@ -1,9 +1,12 @@
 """Env-gated auto-registration of the nymph bench-suite kernel interfaces.
 
-Loaded at interpreter startup via the sitecustomize hook. Does NOTHING unless
-NYMPH_BENCH_SUITE=1; with the gate on, every python in the tree — including
-the bench-suite orchestrator's per-workload subprocesses — resolves the
-``nymph_*`` kernels through the standard registry path.
+Loaded at interpreter startup via the REPO-LOCAL ``bench/sitecustomize.py``
+(auto-imported by every python that has ``bench/`` on its PYTHONPATH —
+``bench/run_suite.py`` arranges that for the orchestrator and its workers).
+Does NOTHING unless NYMPH_BENCH_SUITE=1; with the gate on, every python in
+the tree — including the bench-suite orchestrator's per-workload
+subprocesses — resolves the ``nymph_*`` kernels through the standard
+registry path.
 
 The interfaces (KERNEL_META / CONFIGS / run_bench) live IN the kernel modules
 (``python/nymph_rs/kernels/``); this hook just makes them importable and calls

@@ -3,8 +3,10 @@
 Thin wrapper over ``python -m tirx_kernels.bench_suite``: automatic GPU
 selection + interference requeue, per-workload subprocess isolation,
 json/report artifacts under ``<tirx-kernels>/.bench-suite/``. The nymph
-kernels self-register in every worker via the ``NYMPH_BENCH_SUITE=1``
-sitecustomize hook (see ``_nymph_bench_autoreg.py``).
+kernels self-register in every worker via the REPO-LOCAL
+``bench/sitecustomize.py`` (this directory is prepended to the subprocess
+PYTHONPATH below): zero machine-local dependencies, a clean checkout works
+as-is (see ``_nymph_bench_autoreg.py``).
 
     python bench/run_suite.py [--rounds 5] [--max-shape 8192] [--filter nvfp4] [--label L]
 
@@ -63,8 +65,13 @@ def main() -> None:
     yaml_path = _filtered_workloads(args.max_shape)
     env = os.environ.copy()
     env["NYMPH_BENCH_SUITE"] = "1"
+    # `bench/` first: its repo-local `sitecustomize.py` runs in EVERY child
+    # python (orchestrator + per-workload workers) and performs the nymph
+    # kernel auto-registration — no out-of-repo hook required.
     env["PYTHONPATH"] = os.pathsep.join(
-        p for p in [os.path.join(_NYMPH_RUST, "python"), _REPO, env.get("PYTHONPATH", "")] if p
+        p
+        for p in [_HERE, os.path.join(_NYMPH_RUST, "python"), _REPO, env.get("PYTHONPATH", "")]
+        if p
     )
     cmd = [
         sys.executable,

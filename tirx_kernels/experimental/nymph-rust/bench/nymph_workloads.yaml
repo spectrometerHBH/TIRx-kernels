@@ -2,8 +2,9 @@
 #
 # Driven via bench/run_suite.py (the thin wrapper), or directly:
 #   NYMPH_BENCH_SUITE=1 python -m tirx_kernels.bench_suite --workloads <this file>
-# Registration: the NYMPH_BENCH_SUITE=1 sitecustomize hook loads
-# bench/_nymph_bench_autoreg.py in every python (incl. orchestrator workers).
+# Registration: the repo-local bench/sitecustomize.py (auto-imported in every
+# python with bench/ on its PYTHONPATH, incl. orchestrator workers) loads
+# bench/_nymph_bench_autoreg.py under NYMPH_BENCH_SUITE=1.
 workloads:
   - {kernel: nymph_nvfp4_gemm, config: 1024x1024x1024}
   - {kernel: nymph_nvfp4_gemm, config: 2048x2048x2048}
