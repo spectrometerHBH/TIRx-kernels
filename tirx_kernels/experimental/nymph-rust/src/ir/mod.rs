@@ -439,4 +439,36 @@ mod variant_coverage_tests {
             }
         }
     }
+
+    /// Field-dropping destructures (`{ field, .. }`) are how "validate one
+    /// semantics, run another" kept happening in the codegen: `TmemAlloc`'s
+    /// base_col/cta_group, `Tcgen05Ld`'s row/shape/dtype, and `Fence`'s scope
+    /// were all silently dropped that way while the interpreter honored them.
+    /// codegen.rs must therefore destructure `Stmt` variants EXPLICITLY — a
+    /// new field then fails to compile at every consumer that has not decided
+    /// what it means, instead of being silently dropped. This gate bans the
+    /// two text forms of a rest pattern: trailing `, .. }` and a standalone
+    /// `..` line. A bare `Variant { .. }` (no bound field — variant test or
+    /// fail-closed Err arm) stays allowed: nothing is bound, so nothing can
+    /// be silently USED with the wrong semantics. Non-Stmt struct patterns
+    /// may opt out with a `gate: rest-ok` comment on the same line.
+    #[test]
+    fn codegen_has_no_rest_destructure() {
+        let src = include_str!("codegen.rs");
+        for (i, line) in src.lines().enumerate() {
+            if line.contains("gate: rest-ok") {
+                continue;
+            }
+            assert!(
+                !line.contains(", .. }"),
+                "codegen.rs:{}: rest destructure `, .. }}` — list every field explicitly",
+                i + 1
+            );
+            assert!(
+                line.trim() != "..",
+                "codegen.rs:{}: standalone rest destructure — list every field explicitly",
+                i + 1
+            );
+        }
+    }
 }

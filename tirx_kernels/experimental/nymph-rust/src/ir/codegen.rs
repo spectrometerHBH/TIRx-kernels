@@ -38,7 +38,7 @@
 use super::dtype::{DType, MemorySpace, ScalarOp, ScopeValueKind, Swizzle, VarBinding};
 use super::kernel::Kernel;
 use super::scalar::{ScalarExpr, ScalarInitial, ScalarValue, Var};
-use super::stmt::{RegOperand, Stmt};
+use super::stmt::{LdStShape, RegOperand, Stmt};
 use super::tensor::{Layout, MmaOperand, Tensor, TensorSlice, TmemOperand};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -836,7 +836,6 @@ fn chain_top_level_roles(body: &[Stmt]) -> Vec<Stmt> {
     struct RoleParts<'a> {
         body: &'a [Stmt],
         warp: Option<u32>,
-        warpgroup: Option<u32>,
         elected: bool,
         maxnreg: Option<u32>,
     }
@@ -874,13 +873,15 @@ fn chain_top_level_roles(body: &[Stmt]) -> Vec<Stmt> {
     fn chain_role_run(run: &[Stmt]) -> Option<Vec<Stmt>> {
         let mut groups: Vec<(u32, Vec<RoleParts<'_>>)> = Vec::new();
         for s in run {
+            // `else_body` is read by the caller's run filter (it leaves
+            // author-structured chains alone), so only its absence matters here.
             let Stmt::Role {
                 body,
                 warp,
                 warpgroup,
                 elected,
                 maxnreg,
-                ..
+                else_body: _,
             } = s
             else {
                 return None;
@@ -893,7 +894,6 @@ fn chain_top_level_roles(body: &[Stmt]) -> Vec<Stmt> {
             let parts = RoleParts {
                 body,
                 warp: *warp,
-                warpgroup: *warpgroup,
                 elected: *elected,
                 maxnreg: *maxnreg,
             };
@@ -966,9 +966,19 @@ fn chain_top_level_roles(body: &[Stmt]) -> Vec<Stmt> {
         // Runs of ≥2 chain; a run carrying an explicit else_body is already
         // author-structured and left alone.
         if run.len() >= 2
-            && run
-                .iter()
-                .all(|s| matches!(s, Stmt::Role { else_body, .. } if else_body.is_empty()))
+            && run.iter().all(|s| {
+                matches!(
+                    s,
+                    Stmt::Role {
+                        body: _,
+                        warp: _,
+                        warpgroup: _,
+                        elected: _,
+                        maxnreg: _,
+                        else_body,
+                    } if else_body.is_empty()
+                )
+            })
         {
             if let Some(chained) = chain_role_run(run) {
                 out.extend(chained);
@@ -1149,14 +1159,33 @@ fn collect_sf_ids(k: &Kernel) -> SfIds {
     let mut ids = SfIds::default();
     // Pass 1: tcgen05.cp sources (SMEM).
     walk(&k.body, &mut |s| {
-        if let Stmt::Tcgen05Cp { src, .. } = s {
+        if let Stmt::Tcgen05Cp {
+            dst: _,
+            src,
+            cta_group: _,
+        } = s
+        {
             ids.smem.insert(src.tensor.id);
         }
     });
     // Pass 2: GMEM sources of the TMA loads that fill an SF SMEM ring (one level —
     // SF bytes flow gmem -> smem -> tmem, there are no longer chains).
     walk(&k.body, &mut |s| {
-        if let Stmt::TmaLoad { dst, src, .. } = s {
+        if let Stmt::TmaLoad {
+            dst,
+            src,
+            mbar: _,
+            bytes: _,
+            coords: _,
+            shape: _,
+            gmem_shape: _,
+            mbar_stage: _,
+            multicast_cta_mask: _,
+            cache_hint: _,
+            prefetch_tensormap: _,
+            cta_group: _,
+        } = s
+        {
             if ids.smem.contains(&dst.tensor.id) {
                 ids.gmem.insert(src.id);
             }
@@ -1195,15 +1224,57 @@ fn collect_from_stmt(s: &Stmt, map: &mut HashMap<u32, Arc<Tensor>>) {
     use Stmt::*;
     match s {
         TensorDef { tensor } => note_tensor(tensor, map),
-        TmaLoad { dst, src, .. } => {
+        TmaLoad {
+            dst,
+            src,
+            mbar: _,
+            bytes: _,
+            coords: _,
+            shape: _,
+            gmem_shape: _,
+            mbar_stage: _,
+            multicast_cta_mask: _,
+            cache_hint: _,
+            prefetch_tensormap: _,
+            cta_group: _,
+        } => {
             note_slice(dst, map);
             note_tensor(src, map);
         }
-        TmaStore { dst, src, .. } => {
+        TmaStore {
+            dst,
+            src,
+            coords: _,
+            shape: _,
+            gmem_shape: _,
+            reduce_add: _,
+            allow_nondet_reduce: _,
+            cache_hint: _,
+            prefetch_tensormap: _,
+        } => {
             note_tensor(dst, map);
             note_slice(src, map);
         }
-        Tcgen05Mma { a, b, .. } => {
+        Tcgen05Mma {
+            dst: _,
+            a,
+            b,
+            m: _,
+            n: _,
+            k: _,
+            accum: _,
+            trans_a: _,
+            trans_b: _,
+            cta_group: _,
+            sfa: _,
+            sfb: _,
+            sf_byte: _,
+            sf_e4m3: _,
+            sf_block: _,
+            a_fp4: _,
+            b_fp4: _,
+            lane_align: _,
+        } => {
             // TMEM operands (dst/sfa/sfb, TmemOperand-form a/b) carry no tensor.
             for op in [a, b] {
                 if let MmaOperand::Slice(s) = op {
@@ -1211,16 +1282,36 @@ fn collect_from_stmt(s: &Stmt, map: &mut HashMap<u32, Arc<Tensor>>) {
                 }
             }
         }
-        Tcgen05Cp { src, .. } => {
+        Tcgen05Cp {
+            dst: _,
+            src,
+            cta_group: _,
+        } => {
             note_slice(src, map);
         }
-        Tcgen05Ld { dst, .. } => {
+        Tcgen05Ld {
+            dst,
+            src: _,
+            shape: _,
+            num: _,
+        } => {
             note_slice(dst, map);
         }
-        Tcgen05St { src, .. } => {
+        Tcgen05St {
+            dst: _,
+            src,
+            shape: _,
+            num: _,
+        } => {
             note_slice(src, map);
         }
-        RegCvt { dst, src, .. } | RegLoad { dst, src } | RegStore { dst, src } => {
+        RegCvt {
+            dst,
+            src,
+            rounding: _,
+        }
+        | RegLoad { dst, src }
+        | RegStore { dst, src } => {
             note_slice(dst, map);
             note_slice(src, map);
         }
@@ -1417,7 +1508,9 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
     fn find_tmem_view_cols(stmts: &[Stmt], out: &mut Option<usize>) {
         for s in stmts {
             if let Stmt::TmemAlloc {
-                base_col, n_cols, ..
+                base_col,
+                n_cols,
+                cta_group: _,
             } = s
             {
                 let end = (*base_col + *n_cols) as usize;
@@ -1451,18 +1544,27 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
     fn walk_reg_widths(stmts: &[Stmt], widths: &mut HashMap<u32, usize>) {
         for s in stmts {
             match s {
-                Stmt::Tcgen05Ld { dst, num, .. } => {
+                Stmt::Tcgen05Ld {
+                    dst,
+                    src: _,
+                    shape: _,
+                    num,
+                } => {
                     if dst.tensor.space == MemorySpace::Reg {
                         let off = dst.offsets.first().and_then(as_int).unwrap_or(0).max(0) as usize;
                         let e = widths.entry(dst.tensor.id).or_insert(0);
                         *e = (*e).max(off + *num as usize);
                     }
                 }
-                Stmt::RegCvt { dst, src, .. } => {
+                Stmt::RegCvt {
+                    dst,
+                    src,
+                    rounding: _,
+                } => {
                     note_reg_width(dst, widths);
                     note_reg_width(src, widths);
                 }
-                Stmt::RegStore { src, .. } => note_reg_width(src, widths),
+                Stmt::RegStore { dst: _, src } => note_reg_width(src, widths),
                 _ => {}
             }
             for body in s.child_bodies() {
@@ -1479,10 +1581,18 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
     fn walk_scalar_defs(stmts: &[Stmt], scalar_names: &mut HashMap<u32, String>) {
         for s in stmts {
             let defined = match s {
-                Stmt::ScalarDef { var, .. }
-                | Stmt::ScalarLet { var, .. }
-                | Stmt::ShuffleSync { var, .. }
-                | Stmt::ClcQueryCancel { var, .. } => Some(var),
+                Stmt::ScalarDef { var, initial: _ }
+                | Stmt::ScalarLet { var, value: _ }
+                | Stmt::ShuffleSync {
+                    var,
+                    src: _,
+                    src_lane: _,
+                }
+                | Stmt::ClcQueryCancel {
+                    scheduler: _,
+                    var,
+                    handle: _,
+                } => Some(var),
                 _ => None,
             };
             if let Some(var) = defined {
@@ -1563,14 +1673,24 @@ fn collect_sf_views(stmts: &[Stmt], views: &mut Vec<SfView>) -> Result<(), Strin
     for s in stmts {
         match s {
             Stmt::Tcgen05Mma {
+                dst: _,
+                a: _,
+                b: _,
                 m,
                 n,
                 k,
+                accum: _,
+                trans_a: _,
+                trans_b: _,
                 cta_group,
                 sfa: Some(sfa),
                 sfb: Some(sfb),
+                sf_byte: _,
+                sf_e4m3: _,
                 sf_block,
-                ..
+                a_fp4: _,
+                b_fp4: _,
+                lane_align: _,
             } => {
                 let nblocks = if *sf_block == 0 {
                     1
@@ -1581,7 +1701,11 @@ fn collect_sf_views(stmts: &[Stmt], views: &mut Vec<SfView>) -> Result<(), Strin
                 note_sf_view(views, sfa, a_rows, nblocks)?;
                 note_sf_view(views, sfb, *n as usize, nblocks)?;
             }
-            Stmt::Tcgen05Cp { dst, src, .. } if dst.dtype == DType::F8E4M3 => {
+            Stmt::Tcgen05Cp {
+                dst,
+                src,
+                cta_group: _,
+            } if dst.dtype == DType::F8E4M3 => {
                 // The src is the staged SF SMEM tile (..., rows, SF_CTA_K); its
                 // trailing dims are the view's logical (rows, cols).
                 let (Some(rows), Some(sf_k)) = (
@@ -1639,13 +1763,51 @@ fn emit_reg_view_slice(
 fn stmt_mbar_refs(s: &Stmt) -> Vec<&super::mbar::MBarRef> {
     use Stmt::*;
     match s {
-        MBarrierInit { mbar, .. }
-        | MBarrierArrive { mbar, .. }
-        | MBarrierWait { mbar, .. }
-        | MBarrierExpectTx { mbar, .. }
-        | MBarrierArriveExpectTx { mbar, .. }
-        | Tcgen05Commit { mbar, .. } => vec![mbar],
-        TmaLoad { mbar, .. } => vec![mbar],
+        MBarrierInit {
+            mbar,
+            count: _,
+            stage: _,
+        }
+        | MBarrierArrive {
+            mbar,
+            stage: _,
+            count: _,
+        }
+        | MBarrierWait {
+            mbar,
+            stage: _,
+            phase: _,
+        }
+        | MBarrierExpectTx {
+            mbar,
+            bytes: _,
+            stage: _,
+        }
+        | MBarrierArriveExpectTx {
+            mbar,
+            bytes: _,
+            stage: _,
+        }
+        | Tcgen05Commit {
+            mbar,
+            stage: _,
+            cta_group: _,
+            multicast_cta_mask: _,
+        } => vec![mbar],
+        TmaLoad {
+            dst: _,
+            src: _,
+            mbar,
+            bytes: _,
+            coords: _,
+            shape: _,
+            gmem_shape: _,
+            mbar_stage: _,
+            multicast_cta_mask: _,
+            cache_hint: _,
+            prefetch_tensormap: _,
+            cta_group: _,
+        } => vec![mbar],
         _ => vec![],
     }
 }
@@ -1794,8 +1956,10 @@ fn collect_nonneg_vars(k: &Kernel) -> HashSet<u32> {
                 no_unroll: false,
                 var,
                 start,
+                stop: _,
                 step,
-                ..
+                body: _,
+                unroll: _,
             } = s
             {
                 if as_int(start).is_some_and(|v| v >= 0) && as_int(step).is_some_and(|v| v >= 1) {
@@ -1834,10 +1998,18 @@ fn collect_nonneg_vars(k: &Kernel) -> HashSet<u32> {
                 Stmt::ScalarLet { var, value } => {
                     defs.entry(var.id.0).or_default().exprs.push(value.clone());
                 }
-                Stmt::ShuffleSync { var, src, .. } => {
+                Stmt::ShuffleSync {
+                    var,
+                    src,
+                    src_lane: _,
+                } => {
                     defs.entry(var.id.0).or_default().exprs.push(src.clone());
                 }
-                Stmt::ClcQueryCancel { var, .. } => {
+                Stmt::ClcQueryCancel {
+                    scheduler: _,
+                    var,
+                    handle: _,
+                } => {
                     defs.entry(var.id.0).or_default().poisoned = true;
                 }
                 _ => {}
@@ -2218,7 +2390,11 @@ fn single_issue_guard(stmt: &Stmt, scope: Scope, ctx: &Ctx) -> Option<&'static s
     use Stmt::*;
     match stmt {
         // The leader expect_tx nests under `cbx == 0` first — not a plain single guard.
-        MBarrierArriveExpectTx { mbar, .. } if ctx.is_tma_leader_mbar(mbar.mbar.id) => None,
+        MBarrierArriveExpectTx {
+            mbar,
+            bytes: _,
+            stage: _,
+        } if ctx.is_tma_leader_mbar(mbar.mbar.id) => None,
         // mbarrier.init at FUNCTION scope (the kernel_init prologue): guard with
         // `T.cuda.thread_rank() == 0` — canon's exact prologue form (a CTA-thread-0
         // predicate, no elect.sync). The run coalescing below then folds a whole
@@ -2333,26 +2509,67 @@ fn emit_stmt(
         TensorDef { .. } | MBarDef { .. } => Ok(()),
 
         // ---- TMEM alloc / dealloc / relinquish (already under warp==0 role guard) ----
-        TmemAlloc { n_cols, .. } => {
+        // The generated code carries exactly ONE TMEM view buffer (`tmem`) based at
+        // column 0, one alloc writing `tmem_addr`, and one dealloc of `tmem_addr[0]`
+        // — validate (walk 4) has already proven the kernel fits that shape
+        // (base_col==0, one live band at a time, alloc only before relinquish, and
+        // the kernel-level cta_group on every op). The arms below still check the
+        // fields they cannot honor instead of dropping them: codegen is reachable
+        // without validate, and a silently-dropped field is how "validate one
+        // semantics, run another" used to happen here.
+        TmemAlloc {
+            base_col,
+            n_cols,
+            cta_group,
+        } => {
+            if *base_col != 0 {
+                return Err(format!(
+                    "codegen: TmemAlloc base_col={base_col} has no lowering (the TMEM view is base-0)"
+                ));
+            }
+            if *cta_group != ctx.cta_group {
+                return Err(format!(
+                    "codegen: TmemAlloc cta_group={} != kernel cta_group={}",
+                    cta_group, ctx.cta_group
+                ));
+            }
             // The TMEM view buffer `tmem` is declared at function scope (after the
             // KernelInit block), not here; this only emits the alloc call.
             out.push_str(&format!(
-                "{p}T.ptx.tcgen05.alloc(T.address_of(tmem_addr), n_cols={n_cols}, cta_group={cg})\n",
-                cg = ctx.cta_group,
+                "{p}T.ptx.tcgen05.alloc(T.address_of(tmem_addr), n_cols={n_cols}, cta_group={cta_group})\n",
             ));
             Ok(())
         }
-        TmemDealloc { n_cols, .. } => {
-            let cta_group = ctx.cta_group;
+        TmemDealloc {
+            base_col,
+            n_cols,
+            cta_group,
+        } => {
+            if *base_col != 0 {
+                return Err(format!(
+                    "codegen: TmemDealloc base_col={base_col} has no lowering (the TMEM view is base-0)"
+                ));
+            }
+            if *cta_group != ctx.cta_group {
+                return Err(format!(
+                    "codegen: TmemDealloc cta_group={} != kernel cta_group={}",
+                    cta_group, ctx.cta_group
+                ));
+            }
             out.push_str(&format!(
                 "{p}T.ptx.tcgen05.dealloc(tmem_addr[0], n_cols={n_cols}, cta_group={cta_group})\n"
             ));
             Ok(())
         }
-        TmemRelinquish { .. } => {
+        TmemRelinquish { cta_group } => {
+            if *cta_group != ctx.cta_group {
+                return Err(format!(
+                    "codegen: TmemRelinquish cta_group={} != kernel cta_group={}",
+                    cta_group, ctx.cta_group
+                ));
+            }
             // 1:1 translation — the IR makes the permit release explicit (it used
             // to ride along with the dealloc implicitly).
-            let cta_group = ctx.cta_group;
             out.push_str(&format!(
                 "{p}T.ptx.tcgen05.relinquish_alloc_permit(cta_group={cta_group})\n"
             ));
@@ -2360,7 +2577,23 @@ fn emit_stmt(
         }
 
         // ---- structural ----
-        KernelInit { body, warp, .. } => {
+        KernelInit {
+            body,
+            warp,
+            lane,
+            elected,
+        } => {
+            // The emitted guard below is `if warp_id == w:` — it cannot narrow to a
+            // lane or an elect, while the interpreter DOES filter the cohort by
+            // lane/elected (kernel_scope_matches). Fail closed rather than run the
+            // body on more threads than sim validated. (No kernel uses them here:
+            // lane/elected granularity lives in the role bodies.)
+            if lane.is_some() || *elected {
+                return Err(
+                    "codegen: KernelInit lane/elected have no lowering (warp-guard only)"
+                        .to_string(),
+                );
+            }
             // Emit the body at FUNCTION scope (KernelInit is a function-scope prologue
             // block; its own `if warp_id == w` is the only granularity guard). This is
             // what lets a function-scope single-issue guard — `T.cuda.thread_rank() == 0`
@@ -2412,7 +2645,20 @@ fn emit_stmt(
             // fabricates a sync here and has no overlap/no-overlap knowledge.
             Ok(())
         }
-        KernelFinalize { body, warp, .. } => {
+        KernelFinalize {
+            body,
+            warp,
+            lane,
+            elected,
+        } => {
+            // Same fail-closed rule as KernelInit: the emitted warp guard cannot
+            // narrow to a lane/elect, but the interpreter honors them.
+            if lane.is_some() || *elected {
+                return Err(
+                    "codegen: KernelFinalize lane/elected have no lowering (warp-guard only)"
+                        .to_string(),
+                );
+            }
             if let Some(w) = warp {
                 out.push_str(&format!("{p}if warp_id == {w}:\n"));
                 emit_body(out, body, indent + 1, ctx, Scope::Warp)?;
@@ -2601,8 +2847,9 @@ fn emit_stmt(
         }
         // `scheduler_impl` is a sim/checker marker for the trusted scheduler region;
         // it carries no code of its own, so codegen emits its body transparently
-        // (same indent + scope) — the CLC primitives inside translate 1:1.
-        SchedulerImpl { body, .. } => {
+        // (same indent + scope) — the CLC primitives inside translate 1:1. The
+        // `scheduler` metadata is sim-only (it keys the oracles there).
+        SchedulerImpl { scheduler: _, body } => {
             emit_body(out, body, indent, ctx, scope)?;
             Ok(())
         }
@@ -2651,10 +2898,11 @@ fn emit_stmt(
         // (the kernel's own `sched_arr` full barrier). Single-issue (the role's elect
         // guard), exactly like canon's `if T.ptx.elect_sync(): clc_try_cancel(...)`.
         ClcTryCancel {
+            scheduler: _, // sim-only metadata (keys the CLC handle slot; no emission arg)
             handle,
             mbar,
             stage,
-            ..
+            cta_group: _, // the multicast width is implied by TIRx's clc lowering
         } => {
             let handle_name = ctx.tensor_name(handle.id)?;
             // Both args are `T.address_of(buf[i])` — exactly canon's
@@ -2684,7 +2932,11 @@ fn emit_stmt(
         // scalar (the cancelled cluster's first ctaid.x, or 0xFFFFFFFF -> -1 as int32).
         // Unguarded — every thread of the cohort reads the same handle and gets the
         // same value (a pure uniform decode), like `ShuffleSync`.
-        ClcQueryCancel { var, handle, .. } => {
+        ClcQueryCancel {
+            scheduler: _, // sim-only metadata (keys the handle-slot read)
+            var,
+            handle,
+        } => {
             let name = ctx
                 .scalar_names
                 .get(&var.id.0)
@@ -2875,6 +3127,10 @@ fn emit_stmt(
             dst,
             src,
             mbar,
+            // The transfer size is derived from the tile extents, not the IR's
+            // `bytes` (that field feeds the interpreter's tx accounting; the
+            // matching expect_tx carries its own byte count).
+            bytes: _,
             coords,
             shape,
             gmem_shape,
@@ -2883,7 +3139,6 @@ fn emit_stmt(
             cache_hint,
             prefetch_tensormap,
             cta_group,
-            ..
         } => {
             // The emitted `Tx.copy_async(..., cta_group=)` uses the KERNEL-level engine
             // group (`ctx.cta_group`, from the cluster size). A per-op override the IR
@@ -2973,7 +3228,6 @@ fn emit_stmt(
             sf_e4m3,
             sf_block,
             lane_align,
-            ..
         } => {
             // `Tx.gemm_async` fixes the operand convention the slices are emitted in:
             // A=(M,K), B=(N,K), full-datapath accumulator, kernel-level cta_group. Any
@@ -3190,13 +3444,52 @@ fn emit_stmt(
 
         // ---- epilogue: tcgen05_ld -> Tx.wg.copy_async, wait_ld, reg_cvt -> Tx.wg.cast,
         // reg_store -> Tx.copy. Whole warpgroup participates (no per-thread guard). ----
-        Tcgen05Ld { dst, src, num, .. } => {
+        Tcgen05Ld {
+            dst,
+            src,
+            shape,
+            num,
+        } => {
+            // Fail closed on every field the emission cannot honor — the
+            // `Tx.wg.copy_async` below reads the single base-0 (128, cols) f32
+            // `tmem` view, so:
+            //   * shape: only .32x32b addresses exactly the (all-128-lanes,
+            //     num-col) window the emission encodes. A .16x*b atom reads
+            //     col_factor*num columns from a 16-lane half-slab — the old
+            //     `..` emitted the SAME text for it (fp8_blockwise's sim-only
+            //     .16x256b epilogue), validating one semantics and running
+            //     another. (.16x*b reads DO reach silicon — via a fragment
+            //     declared with `reg_frag`, whose TIRx dispatch is driven by
+            //     the fragment layout, not by this field.)
+            //   * dtype: the tmem view is f32 and TIRx requires the fragment
+            //     dtype to equal it.
+            //   * row: the lane base of the read. The view always starts at
+            //     lane 0, and for .32x32b row must be 0 anyway (the atom spans
+            //     each warp's whole 32-lane subpartition) — anything else reads
+            //     different lanes in the interpreter than on silicon.
+            if *shape != LdStShape::B32x32 {
+                return Err(format!(
+                    "codegen: Tcgen05Ld shape={} has no lowering (only 32x32b)",
+                    shape.as_str()
+                ));
+            }
+            if src.dtype != DType::F32 {
+                return Err(format!(
+                    "codegen: Tcgen05Ld dtype {:?} has no lowering (the TMEM view is f32)",
+                    src.dtype
+                ));
+            }
+            if as_int(&src.row) != Some(0) {
+                return Err(
+                    "codegen: Tcgen05Ld row must be a static 0 (the TMEM view bases at lane 0)"
+                        .to_string(),
+                );
+            }
             // dst is the f32 reg fragment (read as a wg view of `num` cols); src is the
             // tmem band at the operand's absolute physical `col`. The fragment is
             // filled from column 0 (scratch reused per drain group), so the view
             // slice starts at 0.
             let width = *num as usize;
-            let _ = emit_scalar(&src.row, ctx)?; // row is the lane axis, captured by the view
             let col_s = emit_scalar(&src.col, ctx)?;
             // Read this atom into its sub-slice of the (wide) read fragment: the
             // epilogue issues a whole band's atoms into distinct slices, THEN a
@@ -3214,7 +3507,15 @@ fn emit_stmt(
             out.push_str(&format!("{p}T.ptx.tcgen05.wait.ld()\n"));
             Ok(())
         }
-        RegCvt { dst, src, .. } => {
+        RegCvt {
+            dst,
+            src,
+            // Inert on both sides today: the interpreter's cvt path coerces to the
+            // dst dtype without consulting `rounding`, and `Tx.wg.cast` carries no
+            // rounding argument. Listed explicitly so a future rounding-aware cvt
+            // must touch both sides (and validate) at once.
+            rounding: _,
+        } => {
             // Cast a band of the f32 read fragment to the matching band of the wide
             // output reg. Both bands are sliced by their (offset, width) so a capped
             // (≤128-col) drain group writes the right slice of the 256-wide output reg.
@@ -3367,8 +3668,11 @@ fn emit_stmt(
         // was the dominant stall" — the preceding warpgroup_sync already makes the reg->smem
         // writes CTA-visible, so only the single TMA-issuing thread needs the proxy fence.
         // (The kernel orders the wg_sync BEFORE this fence so the writes are visible first.)
-        Fence { kind, .. } => {
-            use super::dtype::FenceKind;
+        Fence {
+            kind,
+            scope: fence_scope,
+        } => {
+            use super::dtype::{FenceKind, FenceScope};
             match kind {
                 // `fence.mbarrier_init` — the prologue init-epoch fence (all threads).
                 FenceKind::MbarrierInit => {
@@ -3380,18 +3684,37 @@ fn emit_stmt(
                 // — canon's "an all-128-thread fence was the dominant stall", the preceding
                 // wg_sync already made the writes visible. Generic on the emit scope, no
                 // overlap/no-overlap knowledge.
+                //
+                // The IR `scope` field selects the PTX address-space qualifier 1:1
+                // (`T.ptx.fence.proxy_async(space)` accepts ""/"global"/"shared::cta"/
+                // "shared::cluster"). Cta/Cluster are the two shared-memory levels — the
+                // checker's proxy-fence visibility test reads exactly this distinction.
+                // Gpu lowers to the UNQUALIFIED form, which orders every address space:
+                // that is what the checker models for it (`FenceScope::Gpu => covers any
+                // access`), so a weaker `.global` would run a narrower fence than sim
+                // validates.
                 FenceKind::AsyncProxy => {
+                    let space = match fence_scope {
+                        FenceScope::Cta => "shared::cta",
+                        FenceScope::Cluster => "shared::cluster",
+                        FenceScope::Gpu => "",
+                    };
                     if scope.is_function() {
-                        out.push_str(&format!("{p}T.ptx.fence.proxy_async(\"shared::cta\")\n"));
+                        out.push_str(&format!("{p}T.ptx.fence.proxy_async(\"{space}\")\n"));
                     } else {
                         out.push_str(&format!("{p}if tid_in_wg == 0:\n"));
                         out.mark_guard("tid_in_wg == 0");
-                        out.push_str(&format!(
-                            "{p}    T.ptx.fence.proxy_async(\"shared::cta\")\n"
-                        ));
+                        out.push_str(&format!("{p}    T.ptx.fence.proxy_async(\"{space}\")\n"));
                     }
                 }
-                FenceKind::Memory | FenceKind::View => {}
+                // Memory/View fences are sim-only ordering markers — the interpreter
+                // folds them into trace `Generic` events and there is no TIRx
+                // lowering. Fail closed instead of silently emitting nothing.
+                FenceKind::Memory | FenceKind::View => {
+                    return Err(format!(
+                        "codegen: Fence {kind:?} is sim-only (no TIRx lowering)"
+                    ));
+                }
             }
             Ok(())
         }
@@ -3505,7 +3828,14 @@ fn emit_stmt(
         // and never a silent different-semantics emission. The flash-attention /
         // flash-bwd datapath set has no GEMM-codegen lowering yet.
         SchedNext { .. } => Err("codegen: SchedNext not yet supported".to_string()),
-        Tcgen05St { .. } => Err("codegen: Tcgen05St not yet supported".to_string()),
+        // sim-only (the flash/gdn datapaths write TMEM from REG fragments); a
+        // future lowering must honor dst's (row, col, dtype) like Tcgen05Ld does.
+        Tcgen05St {
+            dst: _,
+            src: _,
+            shape: _,
+            num: _,
+        } => Err("codegen: Tcgen05St not yet supported".to_string()),
         Tcgen05WaitSt => Err("codegen: Tcgen05WaitSt not yet supported".to_string()),
         LdMatrix { .. } => Err("codegen: LdMatrix not yet supported".to_string()),
         StMatrix { .. } => Err("codegen: StMatrix not yet supported".to_string()),
@@ -3986,5 +4316,245 @@ mod tests {
                 .unwrap();
         assert_eq!(src2.matches("if tid_in_wg == 0:").count(), 1, "{src2}");
         assert_eq!(src2.matches("mbarrier.init").count(), 2, "{src2}");
+    }
+
+    // ------------------------------------------------------------------
+    // Differential tests for the dropped-field bug class: two IRs that
+    // differ ONLY in a field the codegen used to `..`-drop must no longer
+    // produce the same code — it either rejects the unrepresentable one
+    // or emits different text.
+    // ------------------------------------------------------------------
+
+    fn tmem_alloc(base_col: u32, n_cols: u32, cta_group: u8) -> Stmt {
+        Stmt::TmemAlloc {
+            base_col,
+            n_cols,
+            cta_group,
+        }
+    }
+
+    fn warp0(body: Vec<Stmt>) -> Stmt {
+        Stmt::Role {
+            else_body: Vec::new(),
+            body,
+            warp: Some(0),
+            warpgroup: None,
+            elected: false,
+            maxnreg: None,
+        }
+    }
+
+    /// The canonical single-band teardown every shipped kernel uses.
+    fn tmem_kernel(prefix: Vec<Stmt>, suffix: Vec<Stmt>) -> Kernel {
+        let mut body = vec![Stmt::KernelInit {
+            body: vec![tmem_alloc(0, 512, 2)],
+            warp: Some(0),
+            lane: None,
+            elected: false,
+        }];
+        body.extend(prefix);
+        body.push(Stmt::KernelFinalize {
+            body: suffix,
+            warp: Some(0),
+            lane: None,
+            elected: false,
+        });
+        kernel(body)
+    }
+
+    #[test]
+    fn tmem_alloc_fields_are_honored_or_rejected() {
+        // Legal: base-0, kernel cta_group (the test kernel's cluster is 2) —
+        // the alloc/dealloc/relinquish text carries the IR's own values.
+        let k = tmem_kernel(
+            vec![],
+            vec![
+                Stmt::TmemDealloc {
+                    base_col: 0,
+                    n_cols: 512,
+                    cta_group: 2,
+                },
+                Stmt::TmemRelinquish { cta_group: 2 },
+            ],
+        );
+        assert!(k.validate().is_ok(), "{:?}", k.validate().unwrap_err());
+        let src = kernel_to_tirx_source(&k).unwrap();
+        assert!(
+            src.contains("T.ptx.tcgen05.alloc(T.address_of(tmem_addr), n_cols=512, cta_group=2)"),
+            "{src}"
+        );
+        assert!(
+            src.contains("T.ptx.tcgen05.dealloc(tmem_addr[0], n_cols=512, cta_group=2)"),
+            "{src}"
+        );
+        assert!(
+            src.contains("T.ptx.tcgen05.relinquish_alloc_permit(cta_group=2)"),
+            "{src}"
+        );
+
+        // A nonzero base band used to silently generate the SAME base-0 code.
+        let k = tmem_kernel(vec![warp0(vec![tmem_alloc(64, 64, 2)])], vec![]);
+        let err = kernel_to_tirx_source(&k).unwrap_err();
+        assert!(err.contains("base_col"), "{err}");
+
+        // A cta_group that disagrees with the kernel used to be silently
+        // replaced by the kernel-level value.
+        let k = tmem_kernel(vec![], vec![Stmt::TmemRelinquish { cta_group: 1 }]);
+        let err = kernel_to_tirx_source(&k).unwrap_err();
+        assert!(err.contains("cta_group"), "{err}");
+
+        // Two live allocs: validate rejects (every Python-built kernel is
+        // validated at construction, so this shape can never reach codegen).
+        let k = kernel(vec![warp0(vec![
+            tmem_alloc(0, 256, 2),
+            tmem_alloc(0, 256, 2),
+        ])]);
+        let err = k.validate().unwrap_err();
+        assert!(err.message.contains("still live"), "{err}");
+
+        // alloc after relinquish: rejected by validate (PTX §9.7.17.7.1).
+        let k = tmem_kernel(
+            vec![],
+            vec![
+                Stmt::TmemDealloc {
+                    base_col: 0,
+                    n_cols: 512,
+                    cta_group: 2,
+                },
+                Stmt::TmemRelinquish { cta_group: 2 },
+                tmem_alloc(0, 512, 2),
+            ],
+        );
+        let err = k.validate().unwrap_err();
+        assert!(err.message.contains("after tmem_relinquish"), "{err}");
+    }
+
+    fn reg_frag_tensor(id: u32) -> Arc<Tensor> {
+        Arc::new(Tensor {
+            id,
+            space: MemorySpace::Reg,
+            dtype: DType::F32,
+            shape: vec![8],
+            layout: None,
+            byte_offset: None,
+            reg_frag: None,
+        })
+    }
+
+    fn tcgen05_ld(row: i64, shape: LdStShape, dtype: DType) -> Stmt {
+        Stmt::Tcgen05Ld {
+            dst: TensorSlice {
+                tensor: reg_frag_tensor(7),
+                offsets: vec![ScalarValue::Int(0)],
+                shape: vec![ScalarValue::Int(8)],
+            },
+            src: TmemOperand {
+                row: ScalarValue::Int(row),
+                col: ScalarValue::Int(0),
+                dtype,
+            },
+            shape,
+            num: 8,
+        }
+    }
+
+    fn epilogue_kernel(ld: Stmt) -> Kernel {
+        let mut body = vec![Stmt::KernelInit {
+            body: vec![tmem_alloc(0, 512, 2)],
+            warp: Some(0),
+            lane: None,
+            elected: false,
+        }];
+        body.push(Stmt::TensorDef {
+            tensor: reg_frag_tensor(7),
+        });
+        body.push(Stmt::Role {
+            else_body: Vec::new(),
+            body: vec![ld],
+            warp: None,
+            warpgroup: Some(0),
+            elected: false,
+            maxnreg: None,
+        });
+        body.push(Stmt::KernelFinalize {
+            body: vec![Stmt::TmemDealloc {
+                base_col: 0,
+                n_cols: 512,
+                cta_group: 2,
+            }],
+            warp: Some(0),
+            lane: None,
+            elected: false,
+        });
+        kernel(body)
+    }
+
+    #[test]
+    fn tcgen05_ld_dropped_fields_are_rejected() {
+        // row=0 / 32x32b / f32: lowered (and the two row variants no longer
+        // share one emission).
+        let ok = kernel_to_tirx_source(&epilogue_kernel(tcgen05_ld(
+            0,
+            LdStShape::B32x32,
+            DType::F32,
+        )))
+        .unwrap();
+        assert!(ok.contains("Tx.wg.copy_async"), "{ok}");
+
+        let err = kernel_to_tirx_source(&epilogue_kernel(tcgen05_ld(
+            16,
+            LdStShape::B32x32,
+            DType::F32,
+        )))
+        .unwrap_err();
+        assert!(err.contains("row"), "{err}");
+
+        let err = kernel_to_tirx_source(&epilogue_kernel(tcgen05_ld(
+            0,
+            LdStShape::B16x256,
+            DType::F32,
+        )))
+        .unwrap_err();
+        assert!(err.contains("32x32b"), "{err}");
+
+        let err = kernel_to_tirx_source(&epilogue_kernel(tcgen05_ld(
+            0,
+            LdStShape::B32x32,
+            DType::F16,
+        )))
+        .unwrap_err();
+        assert!(err.contains("dtype"), "{err}");
+    }
+
+    #[test]
+    fn fence_scope_is_lowered_memory_view_rejected() {
+        use super::super::dtype::{FenceKind, FenceScope};
+        let fence = |kind, scope| Stmt::Fence { kind, scope };
+        // Cta vs Cluster: both lowered, to DIFFERENT qualifiers (was: both
+        // emitted "shared::cta" regardless of the IR scope).
+        let cta =
+            kernel_to_tirx_source(&kernel(vec![fence(FenceKind::AsyncProxy, FenceScope::Cta)]))
+                .unwrap();
+        let cluster = kernel_to_tirx_source(&kernel(vec![fence(
+            FenceKind::AsyncProxy,
+            FenceScope::Cluster,
+        )]))
+        .unwrap();
+        assert!(
+            cta.contains("T.ptx.fence.proxy_async(\"shared::cta\")"),
+            "{cta}"
+        );
+        assert!(
+            cluster.contains("T.ptx.fence.proxy_async(\"shared::cluster\")"),
+            "{cluster}"
+        );
+        assert_ne!(cta, cluster);
+        // Memory/View are sim-only ordering markers: fail closed (was: a
+        // silent no-op emission).
+        for kind in [FenceKind::Memory, FenceKind::View] {
+            let err =
+                kernel_to_tirx_source(&kernel(vec![fence(kind, FenceScope::Gpu)])).unwrap_err();
+            assert!(err.contains("sim-only"), "{err}");
+        }
     }
 }
