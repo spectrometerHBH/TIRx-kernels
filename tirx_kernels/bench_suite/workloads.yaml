@@ -11,6 +11,59 @@ defaults:
   # Override warmup/repeat/timer per-workload only for a specific exception.
 
 workloads:
+  # ── gemm_comm
+  # AllGather+GEMM: four representative model shapes at TP1 and TP4.
+  # Qwen3-8B
+  - {kernel: allgather_gemm, config: tp1_m8192_n24576_k4096_fp16_dynamic, timer: kineto, num_gpus: 1}
+  - {kernel: allgather_gemm, config: tp4_m8192_n24576_k4096_fp16_dynamic, timer: kineto, num_gpus: 4}
+  # Deferred: LLaMA-3.1-8B
+  # - {kernel: allgather_gemm, config: tp1_m8192_n28672_k4096_fp16_dynamic, timer: kineto, num_gpus: 1}
+  # - {kernel: allgather_gemm, config: tp4_m8192_n28672_k4096_fp16_dynamic, timer: kineto, num_gpus: 4}
+  # Deferred: Gemma-2-9B
+  # - {kernel: allgather_gemm, config: tp1_m8192_n28672_k3584_fp16_dynamic, timer: kineto, num_gpus: 1}
+  # - {kernel: allgather_gemm, config: tp4_m8192_n28672_k3584_fp16_dynamic, timer: kineto, num_gpus: 4}
+  # Deferred: Gemma-2-27B
+  # - {kernel: allgather_gemm, config: tp1_m8192_n73728_k4608_fp16_dynamic, timer: kineto, num_gpus: 1}
+  # - {kernel: allgather_gemm, config: tp4_m8192_n73728_k4608_fp16_dynamic, timer: kineto, num_gpus: 4}
+  # Qwen3-32B
+  - {kernel: allgather_gemm, config: tp1_m8192_n51200_k5120_fp16_dynamic, timer: kineto, num_gpus: 1}
+  - {kernel: allgather_gemm, config: tp4_m8192_n51200_k5120_fp16_dynamic, timer: kineto, num_gpus: 4}
+  # LLaMA-3.1-70B
+  - {kernel: allgather_gemm, config: tp1_m8192_n57344_k8192_fp16_dynamic, timer: kineto, num_gpus: 1}
+  - {kernel: allgather_gemm, config: tp4_m8192_n57344_k8192_fp16_dynamic, timer: kineto, num_gpus: 4}
+  # Deferred: GPT-3-175B
+  # - {kernel: allgather_gemm, config: tp1_m8192_n98304_k12288_fp16_dynamic, timer: kineto, num_gpus: 1}
+  # - {kernel: allgather_gemm, config: tp4_m8192_n98304_k12288_fp16_dynamic, timer: kineto, num_gpus: 4}
+  # LLaMA-3.1-405B
+  - {kernel: allgather_gemm, config: tp1_m8192_n106496_k16384_fp16_dynamic, timer: kineto, num_gpus: 1}
+  - {kernel: allgather_gemm, config: tp4_m8192_n106496_k16384_fp16_dynamic, timer: kineto, num_gpus: 4}
+
+  # GEMM+ReduceScatter: the matching four model shapes at TP1 and TP4.
+  # Qwen3-8B
+  - {kernel: gemm_reduce_scatter, config: tp1_m8192_n4096_k12288_fp16_dynamic, timer: kineto, num_gpus: 1}
+  - {kernel: gemm_reduce_scatter, config: tp4_m8192_n4096_k12288_fp16_dynamic, timer: kineto, num_gpus: 4}
+  # Deferred: LLaMA-3.1-8B
+  # - {kernel: gemm_reduce_scatter, config: tp1_m8192_n4096_k14336_fp16_dynamic, timer: kineto, num_gpus: 1}
+  # - {kernel: gemm_reduce_scatter, config: tp4_m8192_n4096_k14336_fp16_dynamic, timer: kineto, num_gpus: 4}
+  # Deferred: Gemma-2-9B
+  # - {kernel: gemm_reduce_scatter, config: tp1_m8192_n3584_k14336_fp16_dynamic, timer: kineto, num_gpus: 1}
+  # - {kernel: gemm_reduce_scatter, config: tp4_m8192_n3584_k14336_fp16_dynamic, timer: kineto, num_gpus: 4}
+  # Deferred: Gemma-2-27B
+  # - {kernel: gemm_reduce_scatter, config: tp1_m8192_n4608_k36864_fp16_dynamic, timer: kineto, num_gpus: 1}
+  # - {kernel: gemm_reduce_scatter, config: tp4_m8192_n4608_k36864_fp16_dynamic, timer: kineto, num_gpus: 4}
+  # Qwen3-32B
+  - {kernel: gemm_reduce_scatter, config: tp1_m8192_n5120_k25600_fp16_dynamic, timer: kineto, num_gpus: 1}
+  - {kernel: gemm_reduce_scatter, config: tp4_m8192_n5120_k25600_fp16_dynamic, timer: kineto, num_gpus: 4}
+  # LLaMA-3.1-70B
+  - {kernel: gemm_reduce_scatter, config: tp1_m8192_n8192_k28672_fp16_dynamic, timer: kineto, num_gpus: 1}
+  - {kernel: gemm_reduce_scatter, config: tp4_m8192_n8192_k28672_fp16_dynamic, timer: kineto, num_gpus: 4}
+  # Deferred: GPT-3-175B
+  # - {kernel: gemm_reduce_scatter, config: tp1_m8192_n12288_k49152_fp16_dynamic, timer: kineto, num_gpus: 1}
+  # - {kernel: gemm_reduce_scatter, config: tp4_m8192_n12288_k49152_fp16_dynamic, timer: kineto, num_gpus: 4}
+  # LLaMA-3.1-405B
+  - {kernel: gemm_reduce_scatter, config: tp1_m8192_n16384_k53248_fp16_dynamic, timer: kineto, num_gpus: 1}
+  - {kernel: gemm_reduce_scatter, config: tp4_m8192_n16384_k53248_fp16_dynamic, timer: kineto, num_gpus: 4}
+
   # ── megakernel_moe
   # Qwen3-30B-A3B full MoE: router + expert dispatch and compute. One process
   # compiles and times static, dynamic, and unfused on the same logical input.
@@ -29,11 +82,12 @@ workloads:
   - {kernel: deepgemm_fp8_fp4_mega_moe, config: t64_m64_h7168_i3072_e384_k6_g1, timer: megamoe, num_gpus: 1}
   - {kernel: deepgemm_fp8_fp4_mega_moe, config: t64_m64_h7168_i3072_e384_k6_g2, timer: megamoe, num_gpus: 2}
   - {kernel: deepgemm_fp8_fp4_mega_moe, config: t64_m64_h7168_i3072_e384_k6_g4, timer: megamoe, num_gpus: 4}
-  - {kernel: deepgemm_fp8_fp4_mega_moe, config: t64_m64_h7168_i3072_e384_k6_g6, timer: megamoe, num_gpus: 6}
+  # Deferred: 6-GPU sweep.
+  # - {kernel: deepgemm_fp8_fp4_mega_moe, config: t64_m64_h7168_i3072_e384_k6_g6, timer: megamoe, num_gpus: 6}
   - {kernel: deepgemm_fp8_fp4_mega_moe, config: t8192_m8192_h7168_i3072_e384_k6_g1, timer: megamoe, num_gpus: 1}
   - {kernel: deepgemm_fp8_fp4_mega_moe, config: t8192_m8192_h7168_i3072_e384_k6_g2, timer: megamoe, num_gpus: 2}
   - {kernel: deepgemm_fp8_fp4_mega_moe, config: t8192_m8192_h7168_i3072_e384_k6_g4, timer: megamoe, num_gpus: 4}
-  - {kernel: deepgemm_fp8_fp4_mega_moe, config: t8192_m8192_h7168_i3072_e384_k6_g6, timer: megamoe, num_gpus: 6}
+  # - {kernel: deepgemm_fp8_fp4_mega_moe, config: t8192_m8192_h7168_i3072_e384_k6_g6, timer: megamoe, num_gpus: 6}
 
   # ── deepgemm_sm100_fp4_mqa_logits
   - {kernel: deepgemm_sm100_fp4_mqa_logits, config: s2048_skv4096_h64_d128_f32_dense_cp}

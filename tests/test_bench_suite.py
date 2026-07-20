@@ -10,6 +10,8 @@ import pytest
 from tirx_kernels.bench_suite import run
 from tirx_kernels.bench_suite.baseline_view import render_markdown
 from tirx_kernels.bench_suite.ratio_diff import build_report
+from tirx_kernels.gemm_comm.allgather_gemm import CONFIGS as ALLGATHER_GEMM_CONFIGS
+from tirx_kernels.gemm_comm.gemm_reduce_scatter import CONFIGS as GEMM_RS_CONFIGS
 from tirx_kernels.megakernel.moe import BENCH_CONFIGS as MEGAKERNEL_MOE_BENCH_CONFIGS
 from tirx_kernels.megakernel.moe import _estimate_bench_launch_slots
 
@@ -53,6 +55,28 @@ def test_default_workloads_include_full_megakernel_moe_sweep() -> None:
     assert all("timer" not in w for w in megakernel_moe_workloads)
 
 
+def test_default_workloads_include_manual_gemm_comm_kineto_profiles() -> None:
+    workloads = run.load_workloads(run.DEFAULT_WORKLOADS)
+    selected = [
+        workload
+        for workload in workloads
+        if workload["kernel"] in {"allgather_gemm", "gemm_reduce_scatter"}
+    ]
+
+    configs_by_kernel = {
+        "allgather_gemm": {config["label"]: config for config in ALLGATHER_GEMM_CONFIGS},
+        "gemm_reduce_scatter": {config["label"]: config for config in GEMM_RS_CONFIGS},
+    }
+    assert len(selected) == 16
+    assert all(workload["config"] in configs_by_kernel[workload["kernel"]] for workload in selected)
+    assert all(workload["timer"] == "kineto" for workload in selected)
+    assert all(
+        workload["num_gpus"]
+        == configs_by_kernel[workload["kernel"]][workload["config"]]["world_size"]
+        for workload in selected
+    )
+
+
 def test_bench_suite_defaults_to_five_round_arithmetic_mean() -> None:
     row = {"round_samples": {"tirx": [1.0, 2.0, 3.0, 4.0, 100.0]}}
 
@@ -79,7 +103,9 @@ def test_default_workloads_do_not_override_standard_timer_budgets() -> None:
     workloads = run.load_workloads(run.DEFAULT_WORKLOADS)
 
     for workload in workloads:
-        if workload.get("timer") == "megamoe":
+        if workload.get("timer") in {"kineto", "megamoe"}:
+            assert "warmup" not in workload
+            assert "repeat" not in workload
             continue
         assert "warmup" not in workload
         assert "repeat" not in workload

@@ -3,9 +3,22 @@
 - Timestamp: `6`
 - Label:     `6d46ac95-dirty`
 - Git:       `{'tir': '2b8ac594', 'tirx-kernels': 'ca29abf7-dirty', 'tirx-bench-ci': None}`
-- Workloads: 332 ok, 0 failed
+- Workloads: 348 ok, 0 failed
 
 Grouped workloads show one row per config and one timing column per implementation. Single-TIR workloads show ref/ours against the fastest reference implementation.
+
+## allgather_gemm
+
+| config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
+|---|---|---:|---|---:|---:|---|
+| `tp1_m8192_n106496_k16384_fp16_dynamic` | tirx | 23208.0323 | cublas_nccl_cudagraph | 20919.9279 | 0.901 | cublasmp_split_p2p=21170.6322 |
+| `tp1_m8192_n24576_k4096_fp16_dynamic` | tirx | 1067.0560 | cublas_nccl_cudagraph | 1024.1600 | 0.960 | cublasmp_split_p2p=1069.9253 |
+| `tp1_m8192_n51200_k5120_fp16_dynamic` | tirx | 2976.4373 | cublas_nccl_cudagraph | 2814.2933 | 0.946 | cublasmp_split_p2p=2843.0613 |
+| `tp1_m8192_n57344_k8192_fp16_dynamic` | tirx | 6234.5093 | cublas_nccl_cudagraph | 5514.5386 | 0.885 | cublasmp_split_p2p=5614.6373 |
+| `tp4_m8192_n106496_k16384_fp16_dynamic` | tirx | 5298.3654 | cublasmp_split_p2p | 5636.5760 | 1.064 | cublas_nccl_cudagraph=5697.3734 |
+| `tp4_m8192_n24576_k4096_fp16_dynamic` | tirx | 301.6747 | cublasmp_split_p2p | 305.0827 | 1.011 | cublas_nccl_cudagraph=375.8640 |
+| `tp4_m8192_n51200_k5120_fp16_dynamic` | tirx | 706.5627 | cublasmp_split_p2p | 723.6240 | 1.024 | cublas_nccl_cudagraph=809.2107 |
+| `tp4_m8192_n57344_k8192_fp16_dynamic` | tirx | 1316.6880 | cublasmp_split_p2p | 1425.2160 | 1.082 | cublas_nccl_cudagraph=1477.8853 |
 
 ## deepgemm_fp8_fp4_mega_moe
 
@@ -345,6 +358,19 @@ Grouped workloads show one row per config and one timing column per implementati
 | `deepgemm_m4096_n576_k7168` | tir | 19.9765 | deepgemm | 19.0320 | 0.953 | — |
 | `deepgemm_m4096_n7168_k16384` | tir | 329.6422 | deepgemm | 330.9794 | 1.004 | — |
 | `deepgemm_m4096_n7168_k2048` | tir | 42.3266 | deepgemm | 41.1759 | 0.973 | — |
+
+## gemm_reduce_scatter
+
+| config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
+|---|---|---:|---|---:|---:|---|
+| `tp1_m8192_n16384_k53248_fp16_dynamic` | tirx | 10815.1573 | cublas_nccl_cudagraph | 10489.3521 | 0.970 | cublasmp_split_p2p=11427.4106 |
+| `tp1_m8192_n4096_k12288_fp16_dynamic` | tirx | 593.3013 | cublas_nccl_cudagraph | 563.6560 | 0.950 | cublasmp_split_p2p=753.8853 |
+| `tp1_m8192_n5120_k25600_fp16_dynamic` | tirx | 1526.6960 | cublas_nccl_cudagraph | 1459.0134 | 0.956 | cublasmp_split_p2p=1868.9120 |
+| `tp1_m8192_n8192_k28672_fp16_dynamic` | tirx | 2482.2586 | cublas_nccl_cudagraph | 2450.5147 | 0.987 | cublasmp_split_p2p=2930.0027 |
+| `tp4_m8192_n16384_k53248_fp16_dynamic` | tirx | 2604.8026 | cublasmp_split_p2p | 2743.7493 | 1.053 | cublas_nccl_cudagraph=2775.7653 |
+| `tp4_m8192_n4096_k12288_fp16_dynamic` | tirx | 262.0027 | cublasmp_split_p2p | 249.3147 | 0.952 | cublas_nccl_cudagraph=252.5120 |
+| `tp4_m8192_n5120_k25600_fp16_dynamic` | tirx | 478.0347 | cublasmp_split_p2p | 431.3307 | 0.902 | cublas_nccl_cudagraph=484.1093 |
+| `tp4_m8192_n8192_k28672_fp16_dynamic` | tirx | 756.1147 | cublasmp_split_p2p | 783.8987 | 1.037 | cublas_nccl_cudagraph=840.0533 |
 
 ## grouped_fp8_gemm_contiguous
 
