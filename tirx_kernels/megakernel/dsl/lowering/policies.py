@@ -51,15 +51,55 @@ class MoePolicy:
     def __init__(self, *, queue_capacity: int | None = None):
         self.queue_capacity = queue_capacity
 
+    def _lowering_env(self, spec: KernelSpec) -> MoeLoweringEnv:
+        env = MoeLoweringEnv(spec)
+        _validate_persistent_event_dependencies_acyclic(spec, self.name)
+        return env
+
     def normalize(self, spec: KernelSpec) -> NormalizedPlan:
         raise NotImplementedError
+
+
+def _validate_persistent_event_dependencies_acyclic(spec: KernelSpec, policy_name: str) -> None:
+    """Reject event cycles that can occupy every persistent worker before progress."""
+
+    tile_ids = [id(tile) for tile in spec.tiles]
+    adjacency = {tile_id: set() for tile_id in tile_ids}
+    producers: dict[int, list[int]] = {}
+    for tile in spec.tiles:
+        for event, _ in tile.notifies:
+            producers.setdefault(id(event), []).append(id(tile))
+    for consumer in spec.tiles:
+        for event, _ in consumer.waits:
+            for producer_id in producers.get(id(event), ()):
+                adjacency[producer_id].add(id(consumer))
+
+    visiting: set[int] = set()
+    visited: set[int] = set()
+
+    def visit(tile_id: int) -> None:
+        if tile_id in visiting:
+            raise ValueError(
+                f"MoE {policy_name!r} persistent queue requires logical event "
+                "dependencies to be acyclic"
+            )
+        if tile_id in visited:
+            return
+        visiting.add(tile_id)
+        for consumer_id in adjacency[tile_id]:
+            visit(consumer_id)
+        visiting.remove(tile_id)
+        visited.add(tile_id)
+
+    for tile_id in tile_ids:
+        visit(tile_id)
 
 
 class StaticPolicy(MoePolicy):
     name = "static"
 
     def normalize(self, spec: KernelSpec) -> NormalizedPlan:
-        env = MoeLoweringEnv(spec)
+        env = self._lowering_env(spec)
         events = _event_plans(env, is_dynamic=False, unfused=self.unfused)
         tiles = _normalize_tiles(
             env, is_dynamic=False, unfused=self.unfused, down_coalescing=1, events=events
@@ -129,7 +169,7 @@ class DynamicPolicy(MoePolicy):
         self.down_coalescing = down_coalescing
 
     def normalize(self, spec: KernelSpec) -> NormalizedPlan:
-        env = MoeLoweringEnv(spec)
+        env = self._lowering_env(spec)
         batch_size = env.batch_size
         expected_coalescing = 1 if batch_size < 4 else 4
         coalescing = expected_coalescing if self.down_coalescing is None else self.down_coalescing

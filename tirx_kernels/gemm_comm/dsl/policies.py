@@ -94,7 +94,8 @@ def _allgather_execution(spec: KernelSpec) -> ExecutionPlan:
             HostRegionPlan(
                 "allgather_host",
                 (HostCallStep("collective"),),
-                attrs={"tile": "allgather", "entrypoint": ag_kernel.ALLGATHER_HOST_ENTRYPOINT},
+                attrs={"entrypoint": ag_kernel.ALLGATHER_HOST_ENTRYPOINT},
+                owned_tiles=(tiles["allgather"],),
             ),
         ),
         region_dependencies=(

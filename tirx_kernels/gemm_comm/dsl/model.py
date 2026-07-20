@@ -227,7 +227,9 @@ class GemmCommPlan:
             for region in self.execution.device_regions
             for program in region.tile_programs
         ]
-        physical_tiles.extend(region.attrs.get("tile") for region in self.execution.host_regions)
+        physical_tiles.extend(
+            tile.name for region in self.execution.host_regions for tile in region.owned_tiles
+        )
         logical_tiles = [tile.name for tile in self.spec.tiles]
         if len(set(physical_tiles)) != len(physical_tiles) or set(physical_tiles) != set(
             logical_tiles
@@ -317,7 +319,7 @@ class GemmCommPlan:
                     "tiles": (
                         [program.tile.name for program in region.tile_programs]
                         if isinstance(region, DeviceRegionPlan)
-                        else [region.attrs["tile"]]
+                        else [tile.name for tile in region.owned_tiles]
                     ),
                 }
                 for region in self.execution.regions_in_dependency_order()

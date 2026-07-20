@@ -38,6 +38,7 @@ from tirx_kernels.megakernel.dsl import (
     MoeTileProgram,
     StaticPolicy,
     TopkTileImpl,
+    UnfusedPolicy,
     VarSpec,
     build_moe_graph,
     make_moe_plan,
@@ -485,14 +486,19 @@ def test_native_and_moe_validators_reject_invalid_graphs():
         spec.validate()
 
     spec = build_moe_graph(MEGAKERNEL_MOE_BENCH_CONFIG, 128)
-    _tile(spec, "gating").wait(spec.events["gate_up_done"], lambda m, n, k: (m,))
-    with pytest.raises(ValueError, match="acyclic"):
-        spec.validate()
-
-    spec = build_moe_graph(MEGAKERNEL_MOE_BENCH_CONFIG, 128)
     spec.attrs["scheduler"] = {"scope": "cta"}
     with pytest.raises(ValueError, match="scheduler field"):
         MoeLoweringEnv(spec)
+
+
+@pytest.mark.parametrize("policy_type", [StaticPolicy, UnfusedPolicy, DynamicPolicy])
+def test_moe_persistent_schedulers_reject_event_cycles(policy_type):
+    spec = build_moe_graph(MEGAKERNEL_MOE_BENCH_CONFIG, 128)
+    _tile(spec, "topk").wait(spec.events["gate_up_done"], lambda m, n, k: (0,))
+
+    assert spec.validate() is spec
+    with pytest.raises(ValueError, match="persistent queue.*acyclic"):
+        policy_type().normalize(spec)
 
 
 def test_validator_rejects_impure_callable_foreign_tensor_and_non_impl():
