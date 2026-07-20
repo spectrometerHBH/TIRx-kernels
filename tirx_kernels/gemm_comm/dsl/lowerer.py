@@ -15,7 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Validate a logical plan, then call the direct implementation-preserving builder."""
+"""Validate and normalize GemmComm graphs without regenerating tuned kernel bodies.
+
+The resulting ``ExecutionPlan`` is the validation and planning contract. The
+production module callback deliberately delegates to the direct GemmComm
+builder and may ignore the plan during module emission.
+"""
 
 from __future__ import annotations
 
@@ -57,7 +62,12 @@ class LoweredGemmComm:
 
 
 class GemmCommLowerer:
-    """Lower a logical graph without duplicating the tuned TIRx implementation."""
+    """Validate a logical graph, then invoke its implementation-preserving builder.
+
+    Policies own plan and task-coverage derivation. Kernel-body emission remains
+    owned by the direct builders; this lowerer does not interpret physical
+    steps into a second GemmComm implementation.
+    """
 
     def __init__(self, policy: GemmCommPolicy):
         self.policy = policy
@@ -83,7 +93,7 @@ class GemmCommLowerer:
 def make_allgather_dynamic_queue(
     plan: GemmCommPlan,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Materialize the existing queue ABI entirely from a normalized DSL plan."""
+    """Materialize a plan-derived queue for parity checks against the direct ABI."""
 
     if plan.workload != "allgather_gemm" or not plan.is_dynamic:
         raise ValueError("AllGather queue materialization requires its dynamic plan")

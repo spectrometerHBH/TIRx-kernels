@@ -685,7 +685,7 @@ def _build_kernel():
         sem = T.meta_var(Semaphore(cnt=1, buffer=semaphore))
         gemm_queue = T.meta_var(GEMMMPMCQueue(CAPACITY, gemm_task_types, gemm_task_idxs, gemm_head, gemm_tail, GEMM_M_CLUSTERS * GEMM_N_CLUSTERS))
         packed_buf = T.decl_buffer((1,), "uint64", buf.data, elem_offset=64)
-        packed_ptr: T.let[T.Var(name="packed_ptr", dtype=PointerType(PrimType("uint64")))] = T.reinterpret("handle", T.ptx.map_shared_rank(packed_buf.ptr_to([0]), 0)) # rank: 0
+        packed_ptr: T.let[T.Var(name="packed_ptr", ty=PointerType(PrimType("uint64")))] = T.reinterpret(PointerType(PrimType("uint64")), T.ptx.map_shared_rank(packed_buf.ptr_to([0]), 0)) # rank: 0
         packed_value = T.decl_buffer([1,], "uint64", data=packed_ptr, scope="shared")
         sch_pipe = T.meta_var(Pipeline(buf.data, 64 + 4, pipeline_depth=1, pipeline_num=1, p_single_cta=True, c_single_cta=False))
         tile_scheduler = T.meta_var(SingleDynamicTileScheduler(gemm_queue, packed_value, sch_pipe, sem))
@@ -701,7 +701,7 @@ def _build_kernel():
         mma2tma.init(NUM_CONSUMER, tid == 0)
         mma2ld.init(1, tid == 0)
         ld2mma.init(128 * NUM_CONSUMER, tid == 0)
-        ptr: T.let[T.Var(name="ptr", dtype=PointerType(PrimType("uint64")))] = T.reinterpret("handle", T.ptx.map_shared_rank(tma2mma.mbar.ptr_to([0, 0]), 0))
+        ptr: T.let[T.Var(name="ptr", ty=PointerType(PrimType("uint64")))] = T.reinterpret(PointerType(PrimType("uint64")), T.ptx.map_shared_rank(tma2mma.mbar.ptr_to([0, 0]), 0))
         tma_finished = T.decl_buffer([PIPELINE_DEPTH], "uint64", data=ptr, scope="shared")
         phase[0] = 0
         phase_tmem[0] = 0
@@ -921,7 +921,12 @@ def get_kernel(
     use_dsl: bool = True,
     **_kwargs: Any,
 ):
-    """Build from a dynamic DSL plan or call the same direct builder manually."""
+    """Validate a dynamic DSL plan, then call the implementation-preserving builder.
+
+    The production module builder intentionally ignores the ``ExecutionPlan``
+    when emitting the tuned kernel body. ``use_dsl=False`` bypasses validation
+    and planning but calls the same direct builder; it is not a second kernel.
+    """
 
     config = _check_config(M, N, K, world_size, dtype)
     _check_scheduler(scheduler)

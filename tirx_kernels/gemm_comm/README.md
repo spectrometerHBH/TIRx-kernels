@@ -54,17 +54,27 @@ host peer transfer, staging buffer, or separate reduction kernel.
 ## Megakernel DSL
 
 Both workloads have scheduler-independent `tvm.megakernel.dsl.KernelSpec`
-graphs under `tirx_kernels.gemm_comm.dsl`. The dynamic policy materializes the
-same rank-local queues as the direct kernels, then calls the same
-implementation-preserving builder. `use_dsl=False` is the manual structural
-oracle; it does not select a second kernel implementation.
+graphs under `tirx_kernels.gemm_comm.dsl`. This integration is deliberately
+implementation-preserving: the graph validates the logical programs and the
+policy produces an `ExecutionPlan`, but the production `module_builder`
+ignores that plan when emitting the module and delegates to the already tuned
+direct kernel builder from #17. The graph therefore does not generate either
+kernel body.
+
+For AllGather+GEMM, a plan-derived queue materializer is exercised only as a
+parity oracle against the direct kernel's queue ABI. For GEMM+ReduceScatter,
+the plan checks logical/physical tile and `QueuePushStep` coverage; its queue is
+still initialized by the direct implementation. `use_dsl=False` bypasses graph
+validation and planning and calls the same builder directly. It is an escape
+hatch and structural oracle, not a second kernel implementation.
 
 GemmRS lowers to one device region with a logical partial-GEMM program and a
 local multimem-ReduceScatter program. A `QueuePushStep` records that each
 physical GEMM task covers two logical GEMM tiles and publishes completed local
-RS work. It produces no host region. The tuned kernels, runtime, correctness,
-and benchmark entry points remain together in their original public files;
-the DSL does not introduce split runner modules.
+RS work. This is coverage metadata checked against the direct queue, not
+kernel-body code generation. It produces no host region. The tuned kernels,
+runtime, correctness, and benchmark entry points remain together in their
+original public files; the DSL does not introduce split runner modules.
 
 ```bash
 python -m tirx_kernels.megakernel.examples.allgather_gemm --scheduler dynamic

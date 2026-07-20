@@ -685,8 +685,10 @@ def test_mma_ss_tma_2sm_persistent(
             CAPACITY, rs_task_types, rs_task_idxs, rs_head, rs_tail, RS_M_CLUSTERS * RS_N_CLUSTERS
         )
     )
-    packed_ptr: Tx.let[Tx.Var(name="packed_ptr", dtype=PointerType(PrimType("uint64")))] = (
-        Tx.reinterpret("handle", Tx.ptx.map_shared_rank(packed_buf.ptr_to([0]), 0))
+    packed_ptr: Tx.let[Tx.Var(name="packed_ptr", ty=PointerType(PrimType("uint64")))] = (
+        Tx.reinterpret(
+            PointerType(PrimType("uint64")), Tx.ptx.map_shared_rank(packed_buf.ptr_to([0]), 0)
+        )
     )
     packed_value = Tx.decl_buffer([1], "uint64", data=packed_ptr, scope="shared")
     sch_pipe = Pipeline(
@@ -698,8 +700,8 @@ def test_mma_ss_tma_2sm_persistent(
         c_single_cta=False,
     )
     tile_scheduler = MixedDynamicTileScheduler(gemm_queue, rs_queue, packed_value, sch_pipe)
-    ptr: Tx.let[Tx.Var(name="ptr", dtype=PointerType(PrimType("uint64")))] = Tx.reinterpret(
-        "handle", Tx.ptx.map_shared_rank(smem_pipe.full.ptr_to([0]), 0)
+    ptr: Tx.let[Tx.Var(name="ptr", ty=PointerType(PrimType("uint64")))] = Tx.reinterpret(
+        PointerType(PrimType("uint64")), Tx.ptx.map_shared_rank(smem_pipe.full.ptr_to([0]), 0)
     )
     tma_finished = Tx.decl_buffer([PIPELINE_DEPTH], "uint64", data=ptr, scope="shared")
     phase = 0
@@ -1058,7 +1060,13 @@ def get_kernel(
     use_dsl: bool = True,
     **_kwargs: Any,
 ) -> tvm.IRModule:
-    """Build from a dynamic DSL plan or call the same fused builder manually."""
+    """Validate a dynamic DSL plan, then call the implementation-preserving builder.
+
+    The plan validates logical tile and queue-push coverage, while the
+    production module builder intentionally ignores the ``ExecutionPlan`` and
+    emits the tuned fused kernel directly. ``use_dsl=False`` bypasses planning
+    but calls that same builder; it is not a second kernel.
+    """
 
     config = _config(M, N, K, world_size, dtype, scheduler)
     if not use_dsl:

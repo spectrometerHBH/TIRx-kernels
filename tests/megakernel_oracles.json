@@ -3,83 +3,83 @@
   "cuda_normalization": "replace anonymous i_N/v_N loop symbols with generated_symbol, then collapse whitespace",
   "oracles": {
     "moe": {
-      "source_commit": "f25752a34e5f5e56cd89e4fd3af586f01880f1b5",
+      "source_commit": "8721e86482949ad08bbca67916245aba92a37903",
       "cases": {
         "moe_b1_static_prof0": {
-          "structural_hash": 17375017039220870605,
-          "cuda_sha256": "9bfcba0d69b5a45db11c96bfc1414862b84d4c1d653bc08a6cb1d77fd1003d0d"
+          "structural_hash": 9445072111150413875,
+          "cuda_sha256": "ec636e8f8c370d5d5dc7764345bd49c4fc11f997a45b0d73699829c1fb491925"
         },
         "moe_b1_unfused_prof0": {
-          "structural_hash": 8913099662052713736,
-          "cuda_sha256": "c98b2b89a184ac3bf00889708f8f8b45c93529a4e72237c25e1de187ba1f5283"
+          "structural_hash": 13545331904523707558,
+          "cuda_sha256": "dd4359fd13901e0b516dbd628fea39a0f49f7af74d309257aab721e9d19c55bc"
         },
         "moe_b1_dynamic_prof0": {
-          "structural_hash": 1118309990331659822,
-          "cuda_sha256": "08ac857338abab40b088f3d544442158cdd7d19c955b95e8b3fa4eb88ff61553"
+          "structural_hash": 3650514684152655871,
+          "cuda_sha256": "57966de822d850d49b866bc14c182edbebaaccf9187fb71d65c6ea2b5a88bc70"
         },
         "moe_b4_static_prof0": {
-          "structural_hash": 17615200085075230291,
-          "cuda_sha256": "6831b04efeed6e77c5818381495607322b645168121c7960e559680323b258bf"
+          "structural_hash": 8079760489810019999,
+          "cuda_sha256": "d77c58c49f85ce3186439175ef531eb52ce3b020f6c59aa557893489b15328f8"
         },
         "moe_b4_unfused_prof0": {
-          "structural_hash": 833136041602003382,
-          "cuda_sha256": "0ef7ed2b909ca5df4418cf1d63ade01289f4e105f00675b97f3dd1e3ed868224"
+          "structural_hash": 9661192626333367451,
+          "cuda_sha256": "27907b1a88df65cccefa15ff6f7b5f66124eace0132cb75ea46a54dfd042062b"
         },
         "moe_b4_dynamic_prof0": {
-          "structural_hash": 8572671933842303246,
-          "cuda_sha256": "1e12d9a8f579073c1719c752a9bf5a760d6f8936c599ea05d6ffa31fe554c471"
+          "structural_hash": 6321261349286028341,
+          "cuda_sha256": "3394b04d4e276dcbf57c2da33b1dc09e61a946458156da47b32058e7d3b2f4c3"
         },
         "moe_b4_dynamic_prof1": {
-          "structural_hash": 6808293951726445965,
-          "cuda_sha256": "d1eb0e08814f09f681f7d76e4407ec76a13d8e895632c921f5cc81a34c2a0ee4"
+          "structural_hash": 17169675149693374288,
+          "cuda_sha256": "bd7c7b68633fe25873862455d9a9a8b00e4b9646633aff6a553c8de0be294582"
         },
         "moe_b128_static_prof0": {
-          "structural_hash": 6444226058001169798,
-          "cuda_sha256": "8df72232b8afa418e037cda3626b6b3e71832734b77dbc6bc09ea84667798b2a"
+          "structural_hash": 1614602257144353166,
+          "cuda_sha256": "6235d1713ab4ac874eb6f8307989c49a2c579007d45f132f59efe160ceabe4e4"
         },
         "moe_b128_unfused_prof0": {
-          "structural_hash": 1487263949787469359,
-          "cuda_sha256": "de49d2cdac9d2dfc84c56d569979dcbaa54c0bd42a0e5df161e8a5f95ceb7595"
+          "structural_hash": 8962773087055025572,
+          "cuda_sha256": "9d0cadd2f84b3ef9513f23d43b18f8e71d84945c8d42e577fe3639ca636cefe2"
         },
         "moe_b128_dynamic_prof0": {
-          "structural_hash": 2384393727946613789,
-          "cuda_sha256": "6ff45a1d6b421a45d5f16516c20d8e41dce560636b08d067523a1bdf3b01cb51"
+          "structural_hash": 11327467849573936883,
+          "cuda_sha256": "b4f61f47aa3686c0baf2fa2e308bcc2d632a3cd96844c2b16ae78a06962a498d"
         },
         "moe_b512_static_prof0": {
-          "structural_hash": 9739951078479111214,
-          "cuda_sha256": "1108a1cbd91f19108fd25f0464ebe44c4c392ab9968b22d40abf4907b5871182"
+          "structural_hash": 18260136955509027547,
+          "cuda_sha256": "eea27008912bb06be210b8fa7fe07160c7163401304a7c0de3cadee36750a8e3"
         },
         "moe_b512_unfused_prof0": {
-          "structural_hash": 613606752441411044,
-          "cuda_sha256": "8974adeb46205a3b38521bf0870e8563bc8d1a0a3b278f67596d27e57b896e76"
+          "structural_hash": 4291110603370769719,
+          "cuda_sha256": "ff68ca843bcb3d1b6db22673ed9e9518a4f09f119978cc772e4bd90ac59d31e5"
         },
         "moe_b512_dynamic_prof0": {
-          "structural_hash": 9985596675323990710,
-          "cuda_sha256": "e4501033944876fb4363fe52ab89731feb9fd62b211494ca6f684e6a9520e392"
+          "structural_hash": 4213555129446078157,
+          "cuda_sha256": "c4af3017e3a271c6ba647d6c4a3b0b2458069ca43159071fbe971ab34bfefa66"
         },
         "moe_b2048_static_prof0": {
-          "structural_hash": 438538267467046613,
-          "cuda_sha256": "fa4b3d3bf9a2be63f5d05b37e5ca15f4dda974efad22bebf1e53348e16c1358c"
+          "structural_hash": 13041170752085936673,
+          "cuda_sha256": "fc49e6955d73717a7d7e8d3dc44fb1d2f204ac9309983b1efea8bc9086fdd59c"
         },
         "moe_b2048_unfused_prof0": {
-          "structural_hash": 4010697905830394963,
-          "cuda_sha256": "6650bd58c2423d51e464281c33c02d486807f43f1d731e4d57348a9e5da480f7"
+          "structural_hash": 7309785414219854558,
+          "cuda_sha256": "c7f2c06fa43f6a4f4d374087536d7c753232f807660aeadeb0e68d5bd8694804"
         },
         "moe_b2048_dynamic_prof0": {
-          "structural_hash": 1294152823767619338,
-          "cuda_sha256": "105541c7062631f5cbb8c8ac64be5ef9b41da5ad1e7470511f6577b88989f975"
+          "structural_hash": 13598727088304660855,
+          "cuda_sha256": "953e17fd68e3b735bc3000bb6804920f340fb8b2e29b7573c8527e2d6684ec69"
         },
         "moe_b4096_static_prof0": {
-          "structural_hash": 7324852830110931753,
-          "cuda_sha256": "4b85454100da61ad3921bf4702ff69191dad12b41fcc98502ff8427c971d4ba8"
+          "structural_hash": 6416154791414793254,
+          "cuda_sha256": "57df1a2937040efe4fe9b8a0d205b6927d97fab017283d506efd0eb463e0035f"
         },
         "moe_b4096_unfused_prof0": {
-          "structural_hash": 4500838118815992554,
-          "cuda_sha256": "5dd49fcfefe8c1ab4d14c50b4bdb405193340d46c8044840144b1d06c5ccde3e"
+          "structural_hash": 18092337224447202769,
+          "cuda_sha256": "fa0932dfd98ea3e601b92bb15517462a725b6cf17488c61b464eac1c4a79f329"
         },
         "moe_b4096_dynamic_prof0": {
-          "structural_hash": 18346705005752439803,
-          "cuda_sha256": "7e0297eddec8a5827cb2b19293d5bcb5481c76f5e7bc73dd81a934589e3201ac"
+          "structural_hash": 5035751320840910345,
+          "cuda_sha256": "2ec6d475d1be09e01fb1ffca22bbd5451ee72f63f5cf413e5e5271d83521bf2a"
         }
       }
     }

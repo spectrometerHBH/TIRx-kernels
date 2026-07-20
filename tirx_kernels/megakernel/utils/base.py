@@ -22,7 +22,7 @@ from typing import Literal
 import tvm
 from tvm.script import ir as I
 from tvm.script import tirx as T
-from tvm.tirx import PrimExpr
+from tvm.tirx import Expr
 from tvm.tirx.bench import CudaProfiler
 from tvm.tirx.expr import Var
 
@@ -155,8 +155,6 @@ class SmemManager:
         strides=None,
         scope="shared.dyn",
         align=1,
-        buffer_type="",
-        axis_separators=None,
         layout="default",
         split=1,
         method: Literal["shared", "exclusive", "persistent"] = "shared",
@@ -168,9 +166,7 @@ class SmemManager:
             beg = (beg + align - 1) // align * align
         if self.fusion_mode and method == "persistent":
             scope = "shared.persistent"
-        buf = pool_allocator.alloc(
-            shape, dtype, strides, scope, align, buffer_type, axis_separators, layout
-        )
+        buf = pool_allocator.alloc(shape, dtype, strides, scope, align, layout)
         end = pool_allocator.offset
         size = end - beg
         assert size % split == 0
@@ -415,7 +411,7 @@ class TileSchedulerBase:
     def __init__(self):
         pass
 
-    def get_idx_and_task_type(self) -> tuple[list[PrimExpr], PrimExpr]:
+    def get_idx_and_task_type(self) -> tuple[list[Expr], Expr]:
         raise NotImplementedError
 
     @T.inline
