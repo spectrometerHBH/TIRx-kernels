@@ -55,7 +55,7 @@ def test_default_workloads_include_full_megakernel_moe_sweep() -> None:
     assert all("timer" not in w for w in megakernel_moe_workloads)
 
 
-def test_default_workloads_include_manual_gemm_comm_event_profiles() -> None:
+def test_default_workloads_include_manual_gemm_comm_kineto_profiles() -> None:
     workloads = run.load_workloads(run.DEFAULT_WORKLOADS)
     selected = [
         workload
@@ -69,7 +69,7 @@ def test_default_workloads_include_manual_gemm_comm_event_profiles() -> None:
     }
     assert len(selected) == 16
     assert all(workload["config"] in configs_by_kernel[workload["kernel"]] for workload in selected)
-    assert all(workload["timer"] == "event" for workload in selected)
+    assert all(workload["timer"] == "kineto" for workload in selected)
     assert all(
         workload["num_gpus"]
         == configs_by_kernel[workload["kernel"]][workload["config"]]["world_size"]
@@ -103,7 +103,7 @@ def test_default_workloads_do_not_override_standard_timer_budgets() -> None:
     workloads = run.load_workloads(run.DEFAULT_WORKLOADS)
 
     for workload in workloads:
-        if workload.get("timer") in {"event", "megamoe"}:
+        if workload.get("timer") in {"kineto", "megamoe"}:
             assert "warmup" not in workload
             assert "repeat" not in workload
             continue

@@ -121,7 +121,11 @@ the acquired physical indices as an ordered, comma-separated
 
 MegaMoE entries use `timer: megamoe`, which invokes the dedicated DeepGEMM
 `bench_kineto` protocol. Do not set `warmup` or `repeat` for this timer because
-the protocol fixes its own 30-test schedule.
+the protocol fixes its own 30-test schedule. Both compared MegaMoE launches have
+one target CUDA kernel, so its named-kernel measurement is the same target GPU
+span used by a full-span measurement. GemmComm entries use `timer: kineto`, which
+measures the complete correlated GPU activity span across all streams after
+preparation and applies the same cold-cache setup before every sample.
 
 The suite exports an absolute `TIRX_BENCH_CACHE_DIR` under `.bench-suite/cache/`.
 Reference adapters may use it for version/GPU-qualified autotune caches, but must

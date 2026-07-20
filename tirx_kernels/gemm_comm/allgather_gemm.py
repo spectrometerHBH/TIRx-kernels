@@ -1161,7 +1161,7 @@ def _run_worker(
         result = bench(
             {"tirx": case.launch},
             references=baselines.references(),
-            timer="event",
+            timer=kwargs.get("timer", "kineto"),
             rounds=kwargs.get("rounds", 1),
             cooldown_s=kwargs.get("cooldown_s", 1.0),
             distributed=runtime.bench_context(),
@@ -1221,14 +1221,14 @@ def run_bench(
     scheduler: str = "dynamic",
     **_kwargs: Any,
 ) -> dict[str, Any]:
-    """Return full-operation event timings for TIRx and both baselines."""
+    """Return cold-cache Kineto full-span timings for TIRx and both baselines."""
 
     _check_config(M, N, K, world_size, dtype)
     _check_scheduler(scheduler)
-    if timer not in {None, "event"}:
-        raise ValueError("distributed AllGather+GEMM supports only timer='event'")
+    if timer not in {None, "kineto"}:
+        raise ValueError("distributed AllGather+GEMM supports only timer='kineto'")
     if warmup is not None or repeat is not None:
-        raise ValueError("timer='event' uses fixed iteration counts and rejects overrides")
+        raise ValueError("timer='kineto' uses fixed iteration counts and rejects overrides")
     return run_distributed(
         _get_benchmark_kernel(M, N, K, world_size, dtype, scheduler=scheduler),
         world_size=world_size,
@@ -1241,7 +1241,7 @@ def run_bench(
             "world_size": world_size,
             "dtype": dtype,
             "scheduler": scheduler,
-            "timer": "event",
+            "timer": "kineto",
             "rounds": rounds,
             "cooldown_s": cooldown_s,
         },

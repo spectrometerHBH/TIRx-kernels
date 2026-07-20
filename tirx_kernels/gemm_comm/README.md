@@ -59,15 +59,16 @@ GEMM+ReduceScatter correctness checks every rank's full partial GEMM and local
 ReduceScatter output for 20 consecutive reset/relaunch cycles, including queue
 tails, task consumption, semaphore counts, and NaN tile coverage.
 
-The headline event benchmark performs 5 warmups and 30 measured launches per
-implementation and round. Mutable state is reset before the start event, so the
-reported time covers each complete operation closure. Every sample is reduced
-by the slowest rank, round results use the sample median, and multiple rounds
-use their arithmetic mean. The cuBLAS+NCCL reference initializes both libraries
-and captures the complete GEMM-plus-collective sequence before timing; its event
-closure is one CUDA Graph replay. TIRx and cuBLASMp retain their direct launch
-closures. All headline values use the same event protocol, so ratios never mix
-timers. Kernel-only Kineto profiling is not part of the standard sweep.
+The headline benchmark uses cold-cache Kineto full spans: 5 warmups and 30
+measured launches per implementation and round, with DeepGEMM's 8 GB L2 flush,
+GPU sleep, and rank barrier before every launch. Mutable state is reset before
+the profiler scope. Each sample spans the earliest through latest correlated
+CUDA activity across all streams, is reduced by the slowest rank, and contributes
+to the round median; multiple rounds use their arithmetic mean. The cuBLAS+NCCL
+reference initializes both libraries and captures the complete GEMM-plus-
+collective sequence before timing; its measured closure is one CUDA Graph replay.
+TIRx and cuBLASMp retain their direct launch closures. All headline values use
+the same Kineto full-span protocol, so ratios never mix timers.
 
 cuBLASMp 0.10 requires nvmath-python, NCCL4Py, and a compatible recent NCCL.
 Every benchmark requires absolute paths for all four runtime dependencies so a
@@ -99,11 +100,11 @@ python -m tirx_kernels.test --kernel gemm_reduce_scatter \
   --config tp4_m8192_n5120_k25600_fp16_dynamic
 
 python -m tirx_kernels.bench --kernel allgather_gemm \
-  --config tp4_m8192_n51200_k5120_fp16_dynamic --timer event --rounds 6 --json
+  --config tp4_m8192_n51200_k5120_fp16_dynamic --timer kineto --rounds 5 --json
 python -m tirx_kernels.bench --kernel gemm_reduce_scatter \
-  --config tp4_m8192_n5120_k25600_fp16_dynamic --timer event --rounds 6 --json
+  --config tp4_m8192_n5120_k25600_fp16_dynamic --timer kineto --rounds 5 --json
 ```
 
-The distributed event protocol uses fixed iteration counts, so `--warmup` and
+The distributed Kineto protocol uses fixed iteration counts, so `--warmup` and
 `--repeat` overrides are rejected. The reported value is the arithmetic mean of
-the six round results.
+the five round results.
