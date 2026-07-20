@@ -46,7 +46,7 @@ from tirx_kernels.megakernel.dsl._expr import ConstExpr, ScalarLoadExpr, walk_ex
 from tirx_kernels.megakernel.moe import MegaKernelMOE
 from tirx_kernels.megakernel.utils.config import MEGAKERNEL_MOE_BENCH_CONFIG, JobType, KernelConfig
 from tirx_kernels.megakernel.utils.support import generate_exec_queue_moe, push_moe_tasks
-from tirx_kernels.megakernel.utils.utils import MAX_M_IDX
+from tirx_kernels.megakernel.utils.utils import MAX_M_IDX, MAX_N_IDX
 from tvm.error import DiagnosticError
 from tvm.megakernel.transform import (
     BarrierStep,
@@ -537,7 +537,8 @@ def test_moe_env_rejects_invalid_runtime_binding_and_upper_bound():
         MoeLoweringEnv(spec)
 
     spec = build_moe_graph(MEGAKERNEL_MOE_BENCH_CONFIG, 128)
-    _tile(spec, "gating").tile_num = (MAX_M_IDX + 1, 1, 4)
+    down = _tile(spec, "down")
+    down.tile_num = (down.tile_num[0], MAX_N_IDX + 1, 1)
     with pytest.raises(ValueError, match="packed tile indices"):
         MoeLowerer(StaticPolicy()).lower(spec)
 

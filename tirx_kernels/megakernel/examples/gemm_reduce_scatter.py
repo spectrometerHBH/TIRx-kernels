@@ -44,9 +44,7 @@ def build_example() -> KernelSpec:
     partial = kernel.tensor("partial", (config.M, config.N), config.dtype)
     output = kernel.tensor("output", (config.local_m, config.N), config.dtype)
     rs_ready = kernel.event(
-        "reduce_scatter_ready",
-        (config.rs_m_clusters, config.rs_n_clusters),
-        config.completion_count,
+        "reduce_scatter_ready", (config.rs_m_clusters, config.rs_n_clusters), config.world_size
     )
 
     (

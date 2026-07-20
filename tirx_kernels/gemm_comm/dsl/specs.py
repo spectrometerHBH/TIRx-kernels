@@ -115,7 +115,7 @@ def build_gemm_reduce_scatter_graph(
     rs_ready = kernel.event(
         "reduce_scatter_ready",
         (config.rs_m_clusters, config.rs_n_clusters),
-        config.completion_count,
+        config.world_size,
         attrs={"meaning": "all rank-local partials for one output tile are visible"},
     )
 
