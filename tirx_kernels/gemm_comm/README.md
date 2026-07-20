@@ -42,44 +42,16 @@ the local module, and owns its Device API streams. No Disco session or remote
 runtime object is created. Mutable queues, semaphores, workspaces, and outputs
 are reset independently on every rank before each measured launch.
 
-Both registry entries retain the direct kernel ports as their only device
-implementation. AllGather+GEMM keeps the validated dynamic queue. The fused
-persistent kernel in `gemm_reduce_scatter.py` uses a two-CTA GEMM queue feeding
-an initially empty ReduceScatter queue; the final contributor publishes each
-tile with system-scope release/acquire ordering. TP4 ReduceScatter uses NVLS
-`multimem.ld_reduce` directly from the multicast partial output, while TP1
-uses the same fused queue and a local vectorized writeback. There is no GemmRS
-host peer transfer, staging buffer, or separate reduction kernel.
-
-## Megakernel DSL
-
-Both workloads have scheduler-independent `tvm.megakernel.dsl.KernelSpec`
-graphs under `tirx_kernels.gemm_comm.dsl`. This integration is deliberately
-implementation-preserving: the graph validates the logical programs and the
-policy produces an `ExecutionPlan`, but the production `module_builder`
-ignores that plan when emitting the module and delegates to the already tuned
-direct kernel builder from #17. The graph therefore does not generate either
-kernel body.
-
-For AllGather+GEMM, a plan-derived queue materializer is exercised only as a
-parity oracle against the direct kernel's queue ABI. For GEMM+ReduceScatter,
-the plan checks logical/physical tile and `QueuePushStep` coverage; its queue is
-still initialized by the direct implementation. `use_dsl=False` bypasses graph
-validation and planning and calls the same builder directly. It is an escape
-hatch and structural oracle, not a second kernel implementation.
-
-GemmRS lowers to one device region with a logical partial-GEMM program and a
-local multimem-ReduceScatter program. A `QueuePushStep` records that each
-physical GEMM task covers two logical GEMM tiles and publishes completed local
-RS work. This is coverage metadata checked against the direct queue, not
-kernel-body code generation. It produces no host region. The tuned kernels,
-runtime, correctness, and benchmark entry points remain together in their
-original public files; the DSL does not introduce split runner modules.
-
-```bash
-python -m tirx_kernels.megakernel.examples.allgather_gemm --scheduler dynamic
-python -m tirx_kernels.megakernel.examples.gemm_reduce_scatter --scheduler dynamic
-```
+Both registry entries are direct kernel ports. This PR contains no megakernel
+DSL, scheduling policy, execution region, or MoE change. AllGather+GEMM keeps
+the already validated dynamic queue implementation. GEMM+ReduceScatter uses
+the hand-transcribed fused persistent kernel in `gemm_reduce_scatter.py`: a
+two-CTA GEMM queue feeds an initially
+empty ReduceScatter queue, and the final contributor publishes each tile with
+system-scope release/acquire ordering. TP4 ReduceScatter uses NVLS
+`multimem.ld_reduce` directly from the multicast partial output; TP1 uses the
+same fused queue and a local vectorized writeback. There is no host peer
+transfer, staging buffer, or separate reduction kernel.
 
 ## Validation and benchmarking
 

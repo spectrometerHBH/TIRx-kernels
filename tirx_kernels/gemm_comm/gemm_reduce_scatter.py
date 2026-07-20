@@ -1057,27 +1057,12 @@ def get_kernel(
     world_size: int = 4,
     dtype: str = DTYPE,
     scheduler: str = "dynamic",
-    use_dsl: bool = True,
     **_kwargs: Any,
 ) -> tvm.IRModule:
-    """Validate a dynamic DSL plan, then call the implementation-preserving builder.
-
-    The plan validates logical tile and queue-push coverage, while the
-    production module builder intentionally ignores the ``ExecutionPlan`` and
-    emits the tuned fused kernel directly. ``use_dsl=False`` bypasses planning
-    but calls that same builder; it is not a second kernel.
-    """
+    """Build the hand-transcribed fused kernel directly, without the megakernel DSL."""
 
     config = _config(M, N, K, world_size, dtype, scheduler)
-    if not use_dsl:
-        return build_kernel(config)
-
-    from .dsl import GemmCommLowerer, build_gemm_reduce_scatter_graph, policy_for_scheduler
-
-    spec = build_gemm_reduce_scatter_graph(
-        config, module_builder=lambda _execution: build_kernel(config)
-    )
-    return GemmCommLowerer(policy_for_scheduler(scheduler)).lower(spec).module
+    return build_kernel(config)
 
 
 def _get_benchmark_kernel(
