@@ -29,8 +29,6 @@ and scheduling:
 - [`MoeLowerer`](dsl/lowering/lowerer.py): interprets each program's steps in
   source order through the existing TIRX ABI.
 
-The Stage-1 planning artifact is
-[`workflow/qwen3_30b_a3b_moe_stage1.yaml`](workflow/qwen3_30b_a3b_moe_stage1.yaml).
 The hand-written `task_impl_moe_*`, `_set_events`, and queue generation path is
 retained as a numerical correctness reference and explicit fallback.
 
