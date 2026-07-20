@@ -15,115 +15,87 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Standalone TP4 AllGather+GEMM example written with the TVM megakernel DSL.
-
-Run from the tirx-kernels checkout with the paired TVM checkout on
-``PYTHONPATH``::
-
-    python -m tirx_kernels.megakernel.examples.allgather_gemm \
-        --scheduler dynamic
-
-The complete logical ``KernelSpec`` construction is visible in this file.  It
-does not call the production ``build_allgather_gemm_graph`` helper.  The
-attached concrete ``TileImpl`` classes live beside the complete kernel in
-``tirx_kernels.gemm_comm.allgather_gemm``.
-"""
+"""Standalone dynamic AllGather+GEMM graph using the TVM megakernel DSL."""
 
 from __future__ import annotations
 
 import argparse
 
 from tirx_kernels.gemm_comm import allgather_gemm as impl
-from tirx_kernels.gemm_comm.dsl import GemmCommLowerer, policy_for_scheduler
+from tirx_kernels.gemm_comm.dsl import (
+    AllGatherGemmTileImpl,
+    AllGatherTileImpl,
+    GemmCommLowerer,
+    policy_for_scheduler,
+)
 from tvm.megakernel.dsl import KernelSpec
 
 
 def build_example() -> KernelSpec:
-    """Construct and validate the complete AllGather+GEMM logical graph."""
+    """Construct the complete logical graph without calling the production helper."""
 
+    config = impl.derive_config()
     kernel = KernelSpec(
-        "allgather_gemm", attrs={"source": "SM100 TP4 AllGather and GEMM overlap pipeline"}
+        "allgather_gemm",
+        attrs={
+            "source": "SM100 AllGather and GEMM overlap pipeline",
+            "world_size": config.world_size,
+        },
     )
-    local_a = kernel.tensor("local_a", (impl.LOCAL_M, impl.K), impl.a_type)
-    local_weight = kernel.tensor("local_weight", (impl.LOCAL_N, impl.K), impl.b_type)
-    gathered_a = kernel.tensor("gathered_a", (impl.M, impl.K), impl.a_type)
-    output = kernel.tensor("output", (impl.M, impl.LOCAL_N), impl.d_type)
-    shard_ready = kernel.event(
-        "shard_ready",
-        (impl.WORLD_SIZE,),
-        1,
-        attrs={"meaning": "one source activation shard is visible on this rank"},
-    )
+    local_a = kernel.tensor("local_a", (config.local_m, config.K), config.dtype)
+    local_weight = kernel.tensor("local_weight", (config.local_n, config.K), config.dtype)
+    gathered_a = kernel.tensor("gathered_a", (config.M, config.K), config.dtype)
+    output = kernel.tensor("output", (config.M, config.local_n), config.dtype)
+    shard_ready = kernel.event("shard_ready", (config.world_size,), 1)
 
     (
         kernel.tile(
             "allgather",
-            impl=impl.AllGatherTileImpl({"local_a": local_a, "gathered_a": gathered_a}),
-            tile_num=(impl.WORLD_SIZE, 1, 1),
+            impl=AllGatherTileImpl({"local_a": local_a, "gathered_a": gathered_a}, config),
+            tile_num=(config.world_size, 1, 1),
             reads=[local_a],
             writes=[gathered_a],
-            attrs={"purpose": "publish every source activation shard to all ranks"},
-        ).notify(shard_ready, lambda m, n, k: (m,))
+        ).notify(shard_ready, lambda source, _n, _k: (source,))
     )
     (
         kernel.tile(
             "gemm",
-            impl=impl.AllGatherGemmTileImpl(
+            impl=AllGatherGemmTileImpl(
                 {
                     "local_a": local_a,
                     "local_weight": local_weight,
                     "gathered_a": gathered_a,
                     "output": output,
-                }
+                },
+                config,
+                None,
             ),
-            tile_num=(impl.GEMM_M_CLUSTERS, impl.GEMM_N_CLUSTERS, 1),
+            tile_num=(config.gemm_m_clusters, config.gemm_n_clusters, 1),
             reads=[local_a, gathered_a, local_weight],
             writes=[output],
-            attrs={"purpose": "multiply one gathered activation cluster by local weights"},
-        ).wait(shard_ready, lambda m, n, k: (m // impl.LOCAL_GEMM_M_CLUSTERS,))
+        ).wait(shard_ready, lambda m_idx, _n, _k: (m_idx // config.local_gemm_m_clusters,))
     )
     return kernel.validate()
 
 
-def describe_graph(spec: KernelSpec) -> str:
-    """Render the scheduler-independent logical graph."""
-
-    lines = [f"kernel: {spec.name}", f"logical events: {', '.join(spec.events)}", "tiles:"]
-    for tile in spec.tiles:
-        waits = ", ".join(event.name for event, _ in tile.waits) or "-"
-        notifies = ", ".join(event.name for event, _ in tile.notifies) or "-"
-        lines.append(
-            f"  - {tile.name}: {type(tile.impl).__name__} "
-            f"tile_num={tuple(tile.tile_num)} waits={waits} notifies={notifies}"
-        )
-    return "\n".join(lines)
-
-
-def describe_plan(spec: KernelSpec, scheduler: str) -> str:
-    """Normalize the graph through one physical scheduling policy."""
-
+def describe(spec: KernelSpec, scheduler: str) -> str:
     plan = GemmCommLowerer(policy_for_scheduler(scheduler)).lower(spec, plan_only=True).plan
     return "\n".join(
         [
-            f"scheduler: {plan.policy_name}",
+            f"kernel: {spec.name}",
             f"physical scheduler: {plan.physical_scheduler}",
-            f"persistent clusters: {plan.persistent_clusters}",
+            f"device regions: {len(plan.execution.device_regions)}",
+            f"host regions: {len(plan.execution.host_regions)}",
             f"tasks per rank: {plan.task_count_per_rank}",
-            f"lowerable: {str(plan.lowerable).lower()}",
         ]
     )
 
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--scheduler", choices=("static", "dynamic"))
+    parser.add_argument("--scheduler", choices=("dynamic",), default="dynamic")
     args = parser.parse_args(argv)
-
-    spec = build_example()
-    print(describe_graph(spec))
-    if args.scheduler is not None:
-        print()
-        print(describe_plan(spec, args.scheduler))
+    print(describe(build_example(), args.scheduler))
 
 
 if __name__ == "__main__":

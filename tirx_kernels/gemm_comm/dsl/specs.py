@@ -15,29 +15,47 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Scheduler-independent logical graphs for the distributed GEMM kernels."""
+"""Logical GemmComm graphs parameterized by the direct-kernel specialization."""
 
 from __future__ import annotations
+
+from collections.abc import Callable
+from typing import Any
 
 from tvm.megakernel.dsl import KernelSpec
 
 from .. import allgather_gemm as ag_kernel
 from .. import gemm_reduce_scatter as rs_kernel
+from .tile_impl import (
+    AllGatherGemmTileImpl,
+    AllGatherTileImpl,
+    MultimemReduceScatterTileImpl,
+    PartialGemmTileImpl,
+)
 
 
-def build_allgather_gemm_graph() -> KernelSpec:
-    """Describe TP4 AllGather followed by rank-local GEMM output columns."""
+def build_allgather_gemm_graph(
+    config: ag_kernel.AllGatherGemmConfig | None = None,
+    *,
+    module_builder: Callable[[Any], Any] | None = None,
+) -> KernelSpec:
+    """Build the logical AllGather publication and persistent GEMM graph."""
 
+    config = config or ag_kernel.derive_config()
     kernel = KernelSpec(
-        "allgather_gemm", attrs={"source": "SM100 TP4 AllGather and GEMM overlap pipeline"}
+        "allgather_gemm",
+        attrs={
+            "source": "SM100 AllGather and GEMM overlap pipeline",
+            "world_size": config.world_size,
+        },
     )
-    local_a = kernel.tensor("local_a", (ag_kernel.LOCAL_M, ag_kernel.K), ag_kernel.a_type)
-    local_weight = kernel.tensor("local_weight", (ag_kernel.LOCAL_N, ag_kernel.K), ag_kernel.b_type)
-    gathered_a = kernel.tensor("gathered_a", (ag_kernel.M, ag_kernel.K), ag_kernel.a_type)
-    output = kernel.tensor("output", (ag_kernel.M, ag_kernel.LOCAL_N), ag_kernel.d_type)
+    local_a = kernel.tensor("local_a", (config.local_m, config.K), config.dtype)
+    local_weight = kernel.tensor("local_weight", (config.local_n, config.K), config.dtype)
+    gathered_a = kernel.tensor("gathered_a", (config.M, config.K), config.dtype)
+    output = kernel.tensor("output", (config.M, config.local_n), config.dtype)
     shard_ready = kernel.event(
         "shard_ready",
-        (ag_kernel.WORLD_SIZE,),
+        (config.world_size,),
         1,
         attrs={"meaning": "one source activation shard is visible on this rank"},
     )
@@ -45,101 +63,87 @@ def build_allgather_gemm_graph() -> KernelSpec:
     (
         kernel.tile(
             "allgather",
-            impl=ag_kernel.AllGatherTileImpl({"local_a": local_a, "gathered_a": gathered_a}),
-            tile_num=(ag_kernel.WORLD_SIZE, 1, 1),
+            impl=AllGatherTileImpl({"local_a": local_a, "gathered_a": gathered_a}, config),
+            tile_num=(config.world_size, 1, 1),
             reads=[local_a],
             writes=[gathered_a],
-            attrs={"purpose": "publish every source activation shard to all ranks"},
-        ).notify(shard_ready, lambda m, n, k: (m,))
+            attrs={"purpose": "publish one source activation shard to every rank"},
+        ).notify(shard_ready, lambda source, _n, _k: (source,))
     )
     (
         kernel.tile(
             "gemm",
-            impl=ag_kernel.AllGatherGemmTileImpl(
+            impl=AllGatherGemmTileImpl(
                 {
                     "local_a": local_a,
                     "local_weight": local_weight,
                     "gathered_a": gathered_a,
                     "output": output,
-                }
+                },
+                config,
+                module_builder,
             ),
-            tile_num=(ag_kernel.GEMM_M_CLUSTERS, ag_kernel.GEMM_N_CLUSTERS, 1),
+            tile_num=(config.gemm_m_clusters, config.gemm_n_clusters, 1),
             reads=[local_a, gathered_a, local_weight],
             writes=[output],
-            attrs={"purpose": "multiply one gathered activation cluster by local weights"},
-        ).wait(shard_ready, lambda m, n, k: (m // ag_kernel.LOCAL_GEMM_M_CLUSTERS,))
+            attrs={"purpose": "compute one gathered activation GEMM cluster"},
+        ).wait(shard_ready, lambda m_idx, _n, _k: (m_idx // config.local_gemm_m_clusters,))
     )
-    return kernel
+    return kernel.validate()
 
 
-def build_gemm_reduce_scatter_graph() -> KernelSpec:
-    """Describe rank-local partial GEMM, peer transfer, and local reduction."""
+def build_gemm_reduce_scatter_graph(
+    config: rs_kernel.GemmRSConfig | None = None,
+    *,
+    module_builder: Callable[[Any], Any] | None = None,
+) -> KernelSpec:
+    """Build the two-program fused dynamic-multimem GemmRS graph."""
 
-    m_clusters = rs_kernel.M // (rs_kernel.BLK_M * rs_kernel.CLUSTER_M * rs_kernel.NUM_CONSUMER)
-    n_clusters = rs_kernel.N // rs_kernel.BLK_N
-    local_m_clusters = m_clusters // rs_kernel.WORLD_SIZE
+    config = config or rs_kernel.derive_config()
+    logical_gemm_m_tiles = config.gemm_m_clusters * rs_kernel.NUM_CONSUMER
     kernel = KernelSpec(
-        "gemm_reduce_scatter", attrs={"source": "SM100 TP4 GEMM and ReduceScatter overlap pipeline"}
+        "gemm_reduce_scatter",
+        attrs={
+            "source": "SM100 fused persistent dynamic-multimem GemmRS",
+            "world_size": config.world_size,
+        },
     )
-    local_a = kernel.tensor("local_a", (rs_kernel.M, rs_kernel.K), rs_kernel.a_type)
-    local_weight = kernel.tensor("local_weight", (rs_kernel.N, rs_kernel.K), rs_kernel.b_type)
-    partial = kernel.tensor("partial", (rs_kernel.M, rs_kernel.N), rs_kernel.d_type)
-    staging = kernel.tensor(
-        "staging", (rs_kernel.WORLD_SIZE, rs_kernel.LOCAL_M, rs_kernel.N), rs_kernel.d_type
-    )
-    output = kernel.tensor("output", (rs_kernel.LOCAL_M, rs_kernel.N), rs_kernel.d_type)
-    partial_ready = kernel.event(
-        "partial_shard_ready",
-        (rs_kernel.WORLD_SIZE,),
-        local_m_clusters * n_clusters,
-        attrs={"meaning": "all logical GEMM clusters for one output row shard are complete"},
-    )
-    staging_ready = kernel.event(
-        "staging_ready",
-        (rs_kernel.WORLD_SIZE,),
-        rs_kernel.WORLD_SIZE,
-        attrs={"meaning": "all source-rank partial shards reached one destination"},
+    local_a = kernel.tensor("local_a", (config.M, config.k_local), config.dtype)
+    local_weight = kernel.tensor("local_weight", (config.N, config.k_local), config.dtype)
+    partial = kernel.tensor("partial", (config.M, config.N), config.dtype)
+    output = kernel.tensor("output", (config.local_m, config.N), config.dtype)
+    rs_ready = kernel.event(
+        "reduce_scatter_ready",
+        (config.rs_m_clusters, config.rs_n_clusters),
+        config.completion_count,
+        attrs={"meaning": "all rank-local partials for one output tile are visible"},
     )
 
     (
         kernel.tile(
             "partial_gemm",
-            impl=rs_kernel.PartialGemmTileImpl(
-                {"local_a": local_a, "local_weight": local_weight, "partial": partial}
+            impl=PartialGemmTileImpl(
+                {"local_a": local_a, "local_weight": local_weight, "partial": partial},
+                config,
+                module_builder,
             ),
-            tile_num=(m_clusters, n_clusters, 1),
+            tile_num=(logical_gemm_m_tiles, config.gemm_n_clusters, 1),
             reads=[local_a, local_weight],
             writes=[partial],
-            attrs={"purpose": "compute one cluster of the rank-local partial product"},
-        ).notify(partial_ready, lambda m, n, k: (m // local_m_clusters,))
+            attrs={"purpose": "compute one logical partial-GEMM tile"},
+        ).notify(rs_ready, lambda m_idx, n_idx, _k: (m_idx % config.rs_m_clusters, n_idx))
     )
     (
         kernel.tile(
-            "transfer",
-            impl=rs_kernel.ReduceScatterTileImpl({"partial": partial, "staging": staging}),
-            tile_num=(rs_kernel.WORLD_SIZE, rs_kernel.WORLD_SIZE, 1),
+            "reduce_scatter",
+            impl=MultimemReduceScatterTileImpl({"partial": partial, "output": output}, config),
+            tile_num=(config.rs_m_clusters, config.rs_n_clusters, 1),
             reads=[partial],
-            writes=[staging],
-            attrs={"purpose": "move one source partial shard to one destination rank"},
-        )
-        .wait(partial_ready, lambda source, destination, k: (destination,))
-        .notify(staging_ready, lambda source, destination, k: (destination,))
-    )
-    (
-        kernel.tile(
-            "reduce",
-            impl=rs_kernel.ReduceSumTileImpl({"staging": staging, "output": output}),
-            tile_num=(
-                rs_kernel.WORLD_SIZE,
-                rs_kernel.LOCAL_M // rs_kernel.BLK_M_RS,
-                rs_kernel.N // rs_kernel.BLK_N_RS,
-            ),
-            reads=[staging],
             writes=[output],
-            attrs={"purpose": "sum source-rank partials for one destination output tile"},
-        ).wait(staging_ready, lambda destination, m, n: (destination,))
+            attrs={"purpose": "multimem-reduce one local output tile"},
+        ).wait(rs_ready, lambda m_idx, n_idx, _k: (m_idx, n_idx))
     )
-    return kernel
+    return kernel.validate()
 
 
 __all__ = ["build_allgather_gemm_graph", "build_gemm_reduce_scatter_graph"]

@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Static and dynamic schedule policies for distributed GEMM graphs."""
+"""Dynamic physical policy for the direct GemmComm kernels."""
 
 from __future__ import annotations
 
@@ -26,8 +26,7 @@ from tvm.megakernel.transform import (
     FetchGuardStep,
     HostCallStep,
     HostRegionPlan,
-    HostSyncStep,
-    MidBodyPortStep,
+    QueuePushStep,
     RegionDependencyPlan,
     RunStep,
     TileProgram,
@@ -40,43 +39,42 @@ from .model import GemmCommPlan, PhysicalTask, RankSchedule
 from .specs import build_allgather_gemm_graph, build_gemm_reduce_scatter_graph
 
 
-def _allgather_tasks(rank: int) -> tuple[PhysicalTask, ...]:
+def _allgather_tasks(spec: KernelSpec, rank: int) -> tuple[PhysicalTask, ...]:
+    config = spec.tiles[1].impl.config
     tasks: list[PhysicalTask] = []
-    for shard_offset in range(ag_kernel.WORLD_SIZE):
-        shard = (rank + shard_offset) % ag_kernel.WORLD_SIZE
-        begin = shard * ag_kernel.LOCAL_GEMM_M_CLUSTERS
-        end = begin + ag_kernel.LOCAL_GEMM_M_CLUSTERS
-        for n_idx in range(ag_kernel.GEMM_N_CLUSTERS):
+    offset = rank * config.local_gemm_m_clusters
+    group_count = config.gemm_m_clusters // config.group_size
+    for group in range(group_count):
+        begin = group * config.group_size
+        end = begin + config.group_size
+        for n_idx in range(config.gemm_n_clusters):
             for m_idx in range(begin, end):
-                tasks.append(PhysicalTask("gemm", m_idx, n_idx))
+                tasks.append(PhysicalTask("gemm", (offset + m_idx) % config.gemm_m_clusters, n_idx))
     return tuple(tasks)
 
 
-def _reduce_scatter_tasks(rank: int) -> tuple[PhysicalTask, ...]:
-    m_clusters = rs_kernel.M // (rs_kernel.BLK_M * rs_kernel.CLUSTER_M * rs_kernel.NUM_CONSUMER)
-    n_clusters = rs_kernel.N // rs_kernel.BLK_N
-    local_m_clusters = m_clusters // rs_kernel.WORLD_SIZE
-    tasks: list[PhysicalTask] = []
-    for shard_offset in (*range(1, rs_kernel.WORLD_SIZE), 0):
-        shard = (rank + shard_offset) % rs_kernel.WORLD_SIZE
-        begin = shard * local_m_clusters
-        end = begin + local_m_clusters
-        for n_idx in range(n_clusters):
-            for m_idx in range(begin, end):
-                tasks.append(PhysicalTask("partial_gemm", m_idx, n_idx))
-    return tuple(tasks)
-
-
-def _distribute_static(
-    rank: int, tasks: tuple[PhysicalTask, ...], persistent_clusters: int
-) -> RankSchedule:
-    queues = tuple(
-        tuple(tasks[worker::persistent_clusters]) for worker in range(persistent_clusters)
+def _gemm_rs_tasks(spec: KernelSpec) -> tuple[PhysicalTask, ...]:
+    config = spec.tiles[0].impl.config
+    return tuple(
+        PhysicalTask("partial_gemm", m_idx, n_idx)
+        for group_begin in range(0, config.gemm_n_clusters, rs_kernel.GROUP_SIZE)
+        for m_idx in range(config.gemm_m_clusters)
+        for n_idx in range(
+            group_begin, min(group_begin + rs_kernel.GROUP_SIZE, config.gemm_n_clusters)
+        )
     )
-    return RankSchedule(rank=rank, worker_queues=queues)
 
 
-def _allgather_execution(spec: KernelSpec, policy: str, scheduler: str) -> ExecutionPlan:
+def _gemm_rs_pushed_tasks(spec: KernelSpec) -> tuple[PhysicalTask, ...]:
+    config = spec.tiles[1].impl.config
+    return tuple(
+        PhysicalTask("reduce_scatter", m_idx, n_idx)
+        for m_idx in range(config.rs_m_clusters)
+        for n_idx in range(config.rs_n_clusters)
+    )
+
+
+def _allgather_execution(spec: KernelSpec) -> ExecutionPlan:
     edges = logical_edges(spec)
     if len(edges) != 1:
         raise ValueError("AllGather+GEMM requires exactly one logical edge")
@@ -89,7 +87,7 @@ def _allgather_execution(spec: KernelSpec, policy: str, scheduler: str) -> Execu
                 "gemm_device",
                 fetch_steps=(FetchGuardStep(predicate="remote_rank != rank", edges=(edge,)),),
                 tile_programs=(TileProgram(tiles["gemm"], (RunStep(),)),),
-                attrs={"scheduler": scheduler, "entrypoint": ag_kernel.GEMM_DEVICE_ENTRYPOINT},
+                attrs={"scheduler": "mpmc_queue", "entrypoint": ag_kernel.GEMM_DEVICE_ENTRYPOINT},
             ),
         ),
         host_regions=(
@@ -102,57 +100,42 @@ def _allgather_execution(spec: KernelSpec, policy: str, scheduler: str) -> Execu
         region_dependencies=(
             RegionDependencyPlan("allgather_host", "gemm_device", "launch_order"),
         ),
-        attrs={"policy": policy},
+        attrs={"policy": "dynamic"},
     ).validate()
 
 
-def _reduce_scatter_execution(spec: KernelSpec, policy: str, scheduler: str) -> ExecutionPlan:
-    by_event = {edge.event.name: edge for edge in logical_edges(spec)}
-    partial_edge = by_event["partial_shard_ready"]
-    staging_edge = by_event["staging_ready"]
+def _gemm_rs_execution(spec: KernelSpec) -> ExecutionPlan:
+    edges = logical_edges(spec)
+    if len(edges) != 1:
+        raise ValueError("GemmRS requires exactly one logical queue edge")
+    edge = edges[0]
     tiles = {tile.name: tile for tile in spec.tiles}
     return ExecutionPlan(
         kernel=spec,
         device_regions=(
             DeviceRegionPlan(
-                "partial_gemm_device",
+                "fused_gemm_rs_device",
                 tile_programs=(
                     TileProgram(
                         tiles["partial_gemm"],
                         (
-                            RunStep(),
-                            MidBodyPortStep(
-                                "after_store_before_pipeline_advance", edges=(partial_edge,)
+                            RunStep(
+                                repeat=rs_kernel.NUM_CONSUMER,
+                                index_map=lambda m, n, k, repeat: (
+                                    m * rs_kernel.NUM_CONSUMER + repeat,
+                                    n,
+                                    k,
+                                ),
                             ),
+                            QueuePushStep(edges=(edge,)),
                         ),
                     ),
+                    TileProgram(tiles["reduce_scatter"], (RunStep(),)),
                 ),
-                attrs={
-                    "scheduler": scheduler,
-                    "entrypoint": rs_kernel.PARTIAL_GEMM_DEVICE_ENTRYPOINT,
-                },
-            ),
-            DeviceRegionPlan(
-                "reduce_device",
-                tile_programs=(TileProgram(tiles["reduce"], (RunStep(),)),),
-                attrs={"entrypoint": rs_kernel.REDUCE_SUM_DEVICE_ENTRYPOINT},
+                attrs={"scheduler": "mpmc_queue", "entrypoint": rs_kernel.FUSED_DEVICE_ENTRYPOINT},
             ),
         ),
-        host_regions=(
-            HostRegionPlan(
-                "reduce_scatter_host",
-                (
-                    HostCallStep("collective"),
-                    HostSyncStep("communication_completion", edges=(staging_edge,)),
-                ),
-                attrs={"tile": "transfer", "entrypoint": rs_kernel.REDUCE_SCATTER_HOST_ENTRYPOINT},
-            ),
-        ),
-        region_dependencies=(
-            RegionDependencyPlan("partial_gemm_device", "reduce_scatter_host", "launch_order"),
-            RegionDependencyPlan("reduce_scatter_host", "reduce_device", "completion"),
-        ),
-        attrs={"policy": policy},
+        attrs={"policy": "dynamic"},
     ).validate()
 
 
@@ -163,81 +146,56 @@ class GemmCommPolicy:
         raise NotImplementedError
 
 
-class StaticPolicy(GemmCommPolicy):
-    name = "static"
-
-    def normalize(self, spec: KernelSpec) -> GemmCommPlan:
-        if spec.name == "allgather_gemm":
-            clusters = ag_kernel.SM_NUMBER // ag_kernel.M_CLUSTER
-            schedules = tuple(
-                _distribute_static(rank, _allgather_tasks(rank), clusters)
-                for rank in range(ag_kernel.WORLD_SIZE)
-            )
-            plan = GemmCommPlan(
-                execution=_allgather_execution(spec, self.name, "rank_aware_grid_stride"),
-                persistent_clusters=clusters,
-                rank_schedules=schedules,
-            )
-        elif spec.name == "gemm_reduce_scatter":
-            clusters = rs_kernel.GEMM_SMS // rs_kernel.CLUSTER_M
-            schedules = tuple(
-                _distribute_static(rank, _reduce_scatter_tasks(rank), clusters)
-                for rank in range(rs_kernel.WORLD_SIZE)
-            )
-            plan = GemmCommPlan(
-                execution=_reduce_scatter_execution(spec, self.name, "rank_aware_group_major"),
-                persistent_clusters=clusters,
-                rank_schedules=schedules,
-            )
-        else:
-            raise ValueError(f"unsupported distributed GEMM graph: {spec.name!r}")
-        return plan.validate()
-
-
 class DynamicPolicy(GemmCommPolicy):
     name = "dynamic"
 
     def normalize(self, spec: KernelSpec) -> GemmCommPlan:
         if spec.name == "allgather_gemm":
+            config = spec.tiles[1].impl.config
             schedules = tuple(
-                RankSchedule(rank=rank, shared_queue=_allgather_tasks(rank))
-                for rank in range(ag_kernel.WORLD_SIZE)
+                RankSchedule(rank=rank, shared_queue=_allgather_tasks(spec, rank))
+                for rank in range(config.world_size)
             )
             plan = GemmCommPlan(
-                execution=_allgather_execution(spec, self.name, "mpmc_queue"),
+                execution=_allgather_execution(spec),
                 persistent_clusters=ag_kernel.SM_NUMBER // ag_kernel.M_CLUSTER,
                 rank_schedules=schedules,
             )
         elif spec.name == "gemm_reduce_scatter":
+            config = spec.tiles[0].impl.config
+            initial = _gemm_rs_tasks(spec)
+            pushed = _gemm_rs_pushed_tasks(spec)
             schedules = tuple(
-                RankSchedule(rank=rank, shared_queue=_reduce_scatter_tasks(rank))
-                for rank in range(rs_kernel.WORLD_SIZE)
-            )
-            reason = (
-                "the current GEMM pipeline advances TMA, MMA, and epilogue roles independently; "
-                "a CTA-wide dynamic dequeue would serialize the inter-tile pipeline"
+                RankSchedule(rank=rank, shared_queue=initial, pushed_tasks=pushed)
+                for rank in range(config.world_size)
             )
             plan = GemmCommPlan(
-                execution=_reduce_scatter_execution(spec, self.name, "planned_mpmc_queue"),
-                persistent_clusters=rs_kernel.GEMM_SMS // rs_kernel.CLUSTER_M,
+                execution=_gemm_rs_execution(spec),
+                persistent_clusters=rs_kernel.SM_NUMBER // rs_kernel.M_CLUSTER,
                 rank_schedules=schedules,
-                lowerable=False,
-                unsupported_reason=reason,
             )
         else:
             raise ValueError(f"unsupported distributed GEMM graph: {spec.name!r}")
         return plan.validate()
 
 
+class StaticPolicy(GemmCommPolicy):
+    name = "static"
+
+    def normalize(self, spec: KernelSpec) -> GemmCommPlan:
+        del spec
+        raise ValueError("the direct GemmComm kernels support only scheduler='dynamic'")
+
+
 def policy_for_scheduler(scheduler: str) -> GemmCommPolicy:
-    if scheduler == "static":
-        return StaticPolicy()
     if scheduler == "dynamic":
         return DynamicPolicy()
+    if scheduler == "static":
+        return StaticPolicy()
     raise ValueError(f"unsupported distributed GEMM scheduler: {scheduler!r}")
 
 
-def make_plan(workload: str, scheduler: str) -> GemmCommPlan:
+def make_plan(workload: str, scheduler: str = "dynamic") -> GemmCommPlan:
     if workload == "allgather_gemm":
         spec = build_allgather_gemm_graph()
     elif workload == "gemm_reduce_scatter":

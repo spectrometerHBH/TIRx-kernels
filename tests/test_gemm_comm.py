@@ -28,9 +28,6 @@ from tirx_kernels.gemm_comm._model_shapes import (
 )
 from tirx_kernels.registry import discover_kernels
 
-ag_impl = allgather_gemm
-rs_impl = gemm_reduce_scatter
-
 
 def test_gemm_comm_registry_entries() -> None:
     kernels = discover_kernels(category="gemm_comm")

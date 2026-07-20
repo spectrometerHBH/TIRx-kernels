@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Lower logical graphs through the concrete TileImpls in each kernel module."""
+"""Validate a logical plan, then call the direct implementation-preserving builder."""
 
 from __future__ import annotations
 
@@ -57,7 +57,7 @@ class LoweredGemmComm:
 
 
 class GemmCommLowerer:
-    """Lower a pure logical graph without teaching TVM about Disco or NVSHMEM."""
+    """Lower a logical graph without duplicating the tuned TIRx implementation."""
 
     def __init__(self, policy: GemmCommPolicy):
         self.policy = policy
@@ -87,15 +87,16 @@ def make_allgather_dynamic_queue(
 
     if plan.workload != "allgather_gemm" or not plan.is_dynamic:
         raise ValueError("AllGather queue materialization requires its dynamic plan")
-    task_types = np.full((plan.world_size, ag_kernel.CAPACITY), -1, dtype=np.int32)
+    config = plan.spec.tiles[1].impl.config
+    task_types = np.full((plan.world_size, config.capacity), -1, dtype=np.int32)
     task_indices = np.zeros(
-        (plan.world_size, ag_kernel.CAPACITY, ag_kernel.TASK_IDX_LEN), dtype=np.int32
+        (plan.world_size, config.capacity, ag_kernel.TASK_IDX_LEN), dtype=np.int32
     )
     heads = np.zeros((plan.world_size, 1), dtype=np.int32)
     tails = np.zeros((plan.world_size, 1), dtype=np.int32)
     for schedule in plan.rank_schedules:
         tasks = schedule.shared_queue
-        if len(tasks) > ag_kernel.CAPACITY:
+        if len(tasks) > config.capacity:
             raise ValueError("AllGather+GEMM dynamic queue exceeds its physical capacity")
         task_types[schedule.rank, : len(tasks)] = ag_kernel.TaskType.GEMM.value
         task_indices[schedule.rank, : len(tasks)] = [(task.m, task.n) for task in tasks]

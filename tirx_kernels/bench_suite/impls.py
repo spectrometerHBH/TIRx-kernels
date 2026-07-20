@@ -5,7 +5,7 @@ from collections.abc import Mapping
 
 def is_our_impl(name: str) -> bool:
     """Whether ``name`` identifies a TIR/TIRx implementation."""
-    return name in {"tir", "tirx", "dsl", "manual"} or name.startswith(("tir_", "tirx_"))
+    return name in {"tir", "tirx"} or name.startswith(("tir_", "tirx_"))
 
 
 def our_impls(impls: Mapping[str, float]) -> list[str]:

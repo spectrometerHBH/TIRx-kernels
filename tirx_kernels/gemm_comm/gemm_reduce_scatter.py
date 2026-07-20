@@ -1057,12 +1057,21 @@ def get_kernel(
     world_size: int = 4,
     dtype: str = DTYPE,
     scheduler: str = "dynamic",
+    use_dsl: bool = True,
     **_kwargs: Any,
 ) -> tvm.IRModule:
-    """Build the hand-transcribed fused kernel directly, without the megakernel DSL."""
+    """Build from a dynamic DSL plan or call the same fused builder manually."""
 
     config = _config(M, N, K, world_size, dtype, scheduler)
-    return build_kernel(config)
+    if not use_dsl:
+        return build_kernel(config)
+
+    from .dsl import GemmCommLowerer, build_gemm_reduce_scatter_graph, policy_for_scheduler
+
+    spec = build_gemm_reduce_scatter_graph(
+        config, module_builder=lambda _execution: build_kernel(config)
+    )
+    return GemmCommLowerer(policy_for_scheduler(scheduler)).lower(spec).module
 
 
 def _get_benchmark_kernel(

@@ -15,30 +15,30 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Logical DSL and workload-specific lowering for distributed GEMM."""
+"""Logical graphs and dynamic physical plans for the direct GemmComm kernels."""
 
-from ..allgather_gemm import AllGatherGemmTileImpl, AllGatherTileImpl
-from ..gemm_reduce_scatter import PartialGemmTileImpl, ReduceScatterTileImpl, ReduceSumTileImpl
-from .host import GemmCommHostExecutor, GemmCommRuntimeBindings
 from .lowerer import GemmCommLowerer, LoweredGemmComm, make_allgather_dynamic_queue
 from .model import GemmCommPlan, PhysicalTask, RankSchedule
 from .policies import DynamicPolicy, StaticPolicy, make_plan, policy_for_scheduler
 from .specs import build_allgather_gemm_graph, build_gemm_reduce_scatter_graph
+from .tile_impl import (
+    AllGatherGemmTileImpl,
+    AllGatherTileImpl,
+    MultimemReduceScatterTileImpl,
+    PartialGemmTileImpl,
+)
 
 __all__ = [
     "AllGatherGemmTileImpl",
     "AllGatherTileImpl",
     "DynamicPolicy",
-    "GemmCommHostExecutor",
     "GemmCommLowerer",
     "GemmCommPlan",
-    "GemmCommRuntimeBindings",
     "LoweredGemmComm",
+    "MultimemReduceScatterTileImpl",
     "PartialGemmTileImpl",
     "PhysicalTask",
     "RankSchedule",
-    "ReduceScatterTileImpl",
-    "ReduceSumTileImpl",
     "StaticPolicy",
     "build_allgather_gemm_graph",
     "build_gemm_reduce_scatter_graph",

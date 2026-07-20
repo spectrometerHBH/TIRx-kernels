@@ -918,8 +918,11 @@ def get_kernel(
     world_size: int = WORLD_SIZE,
     dtype: str = "float16",
     scheduler: str = "dynamic",
+    use_dsl: bool = True,
     **_kwargs: Any,
 ):
+    """Build from a dynamic DSL plan or call the same direct builder manually."""
+
     config = _check_config(M, N, K, world_size, dtype)
     _check_scheduler(scheduler)
     requested = (config.M, config.N, config.K, config.world_size)
@@ -937,8 +940,14 @@ def get_kernel(
                 _SPECIALIZATION_WORLD_SIZE_ENV: config.world_size,
             },
         )
-        return specialized.get_kernel()
-    return _build_kernel()
+        return specialized.get_kernel(scheduler=scheduler, use_dsl=use_dsl)
+    if not use_dsl:
+        return _build_kernel()
+
+    from .dsl import GemmCommLowerer, build_allgather_gemm_graph, policy_for_scheduler
+
+    spec = build_allgather_gemm_graph(config, module_builder=lambda _execution: _build_kernel())
+    return GemmCommLowerer(policy_for_scheduler(scheduler)).lower(spec).module
 
 
 def _get_benchmark_kernel(

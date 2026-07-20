@@ -15,133 +15,82 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Standalone TP4 GEMM+ReduceScatter example using the TVM megakernel DSL.
-
-Run from the tirx-kernels checkout with the paired TVM checkout on
-``PYTHONPATH``::
-
-    python -m tirx_kernels.megakernel.examples.gemm_reduce_scatter \
-        --scheduler static
-
-The complete logical ``KernelSpec`` construction is visible in this file.  It
-does not call the production ``build_gemm_reduce_scatter_graph`` helper.
-The attached concrete ``TileImpl`` classes live beside the complete kernel in
-``tirx_kernels.gemm_comm.gemm_reduce_scatter``.
-"""
+"""Standalone fused dynamic-multimem GemmRS graph using the TVM megakernel DSL."""
 
 from __future__ import annotations
 
 import argparse
 
 from tirx_kernels.gemm_comm import gemm_reduce_scatter as impl
-from tirx_kernels.gemm_comm.dsl import GemmCommLowerer, policy_for_scheduler
+from tirx_kernels.gemm_comm.dsl import (
+    GemmCommLowerer,
+    MultimemReduceScatterTileImpl,
+    PartialGemmTileImpl,
+    policy_for_scheduler,
+)
 from tvm.megakernel.dsl import KernelSpec
 
 
 def build_example() -> KernelSpec:
-    """Construct and validate the complete GEMM+ReduceScatter logical graph."""
+    """Construct the complete logical graph without calling the production helper."""
 
-    m_clusters = impl.M // (impl.BLK_M * impl.CLUSTER_M * impl.NUM_CONSUMER)
-    n_clusters = impl.N // impl.BLK_N
-    local_m_clusters = m_clusters // impl.WORLD_SIZE
+    config = impl.derive_config()
     kernel = KernelSpec(
-        "gemm_reduce_scatter", attrs={"source": "SM100 TP4 GEMM and ReduceScatter overlap pipeline"}
+        "gemm_reduce_scatter",
+        attrs={"source": "SM100 fused dynamic-multimem GemmRS", "world_size": config.world_size},
     )
-    local_a = kernel.tensor("local_a", (impl.M, impl.K), impl.a_type)
-    local_weight = kernel.tensor("local_weight", (impl.N, impl.K), impl.b_type)
-    partial = kernel.tensor("partial", (impl.M, impl.N), impl.d_type)
-    staging = kernel.tensor("staging", (impl.WORLD_SIZE, impl.LOCAL_M, impl.N), impl.d_type)
-    output = kernel.tensor("output", (impl.LOCAL_M, impl.N), impl.d_type)
-    partial_ready = kernel.event(
-        "partial_shard_ready",
-        (impl.WORLD_SIZE,),
-        local_m_clusters * n_clusters,
-        attrs={"meaning": "all logical GEMM clusters for one output row shard are complete"},
-    )
-    staging_ready = kernel.event(
-        "staging_ready",
-        (impl.WORLD_SIZE,),
-        impl.WORLD_SIZE,
-        attrs={"meaning": "all source-rank partial shards reached one destination"},
+    local_a = kernel.tensor("local_a", (config.M, config.k_local), config.dtype)
+    local_weight = kernel.tensor("local_weight", (config.N, config.k_local), config.dtype)
+    partial = kernel.tensor("partial", (config.M, config.N), config.dtype)
+    output = kernel.tensor("output", (config.local_m, config.N), config.dtype)
+    rs_ready = kernel.event(
+        "reduce_scatter_ready",
+        (config.rs_m_clusters, config.rs_n_clusters),
+        config.completion_count,
     )
 
     (
         kernel.tile(
             "partial_gemm",
-            impl=impl.PartialGemmTileImpl(
-                {"local_a": local_a, "local_weight": local_weight, "partial": partial}
+            impl=PartialGemmTileImpl(
+                {"local_a": local_a, "local_weight": local_weight, "partial": partial}, config, None
             ),
-            tile_num=(m_clusters, n_clusters, 1),
+            tile_num=(config.gemm_m_clusters * impl.NUM_CONSUMER, config.gemm_n_clusters, 1),
             reads=[local_a, local_weight],
             writes=[partial],
-            attrs={"purpose": "compute one cluster of the rank-local partial product"},
-        ).notify(partial_ready, lambda m, n, k: (m // local_m_clusters,))
+        ).notify(rs_ready, lambda m_idx, n_idx, _k: (m_idx % config.rs_m_clusters, n_idx))
     )
     (
         kernel.tile(
-            "transfer",
-            impl=impl.ReduceScatterTileImpl({"partial": partial, "staging": staging}),
-            tile_num=(impl.WORLD_SIZE, impl.WORLD_SIZE, 1),
+            "reduce_scatter",
+            impl=MultimemReduceScatterTileImpl({"partial": partial, "output": output}, config),
+            tile_num=(config.rs_m_clusters, config.rs_n_clusters, 1),
             reads=[partial],
-            writes=[staging],
-            attrs={"purpose": "move one source partial shard to one destination rank"},
-        )
-        .wait(partial_ready, lambda source, destination, k: (destination,))
-        .notify(staging_ready, lambda source, destination, k: (destination,))
-    )
-    (
-        kernel.tile(
-            "reduce",
-            impl=impl.ReduceSumTileImpl({"staging": staging, "output": output}),
-            tile_num=(impl.WORLD_SIZE, impl.LOCAL_M // impl.BLK_M_RS, impl.N // impl.BLK_N_RS),
-            reads=[staging],
             writes=[output],
-            attrs={"purpose": "sum source-rank partials for one destination output tile"},
-        ).wait(staging_ready, lambda destination, m, n: (destination,))
+        ).wait(rs_ready, lambda m_idx, n_idx, _k: (m_idx, n_idx))
     )
     return kernel.validate()
 
 
-def describe_graph(spec: KernelSpec) -> str:
-    """Render the scheduler-independent logical graph."""
-
-    lines = [f"kernel: {spec.name}", f"logical events: {', '.join(spec.events)}", "tiles:"]
-    for tile in spec.tiles:
-        waits = ", ".join(event.name for event, _ in tile.waits) or "-"
-        notifies = ", ".join(event.name for event, _ in tile.notifies) or "-"
-        lines.append(
-            f"  - {tile.name}: {type(tile.impl).__name__} "
-            f"tile_num={tuple(tile.tile_num)} waits={waits} notifies={notifies}"
-        )
-    return "\n".join(lines)
-
-
-def describe_plan(spec: KernelSpec, scheduler: str) -> str:
-    """Normalize the graph through one physical scheduling policy."""
-
+def describe(spec: KernelSpec, scheduler: str) -> str:
     plan = GemmCommLowerer(policy_for_scheduler(scheduler)).lower(spec, plan_only=True).plan
-    lines = [
-        f"scheduler: {plan.policy_name}",
-        f"physical scheduler: {plan.physical_scheduler}",
-        f"persistent clusters: {plan.persistent_clusters}",
-        f"tasks per rank: {plan.task_count_per_rank}",
-        f"lowerable: {str(plan.lowerable).lower()}",
-    ]
-    if plan.unsupported_reason is not None:
-        lines.append(f"reason: {plan.unsupported_reason}")
-    return "\n".join(lines)
+    return "\n".join(
+        [
+            f"kernel: {spec.name}",
+            f"physical scheduler: {plan.physical_scheduler}",
+            f"device regions: {len(plan.execution.device_regions)}",
+            f"host regions: {len(plan.execution.host_regions)}",
+            f"initial tasks per rank: {plan.task_count_per_rank}",
+            f"pushed tasks per rank: {plan.pushed_task_count_per_rank}",
+        ]
+    )
 
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--scheduler", choices=("static", "dynamic"))
+    parser.add_argument("--scheduler", choices=("dynamic",), default="dynamic")
     args = parser.parse_args(argv)
-
-    spec = build_example()
-    print(describe_graph(spec))
-    if args.scheduler is not None:
-        print()
-        print(describe_plan(spec, args.scheduler))
+    print(describe(build_example(), args.scheduler))
 
 
 if __name__ == "__main__":
