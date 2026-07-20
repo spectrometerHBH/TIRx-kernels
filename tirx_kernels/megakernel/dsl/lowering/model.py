@@ -19,13 +19,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from functools import reduce
 from operator import mul
+from typing import Any
 
 import numpy as np
 
-from tirx_kernels._attrs import validate_no_nested_attr_keys
 from tirx_kernels.megakernel.utils.base import SemaphoreBase
 from tirx_kernels.megakernel.utils.config import JobType, KernelConfig
 from tirx_kernels.megakernel.utils.dynamic_scheduler import DynamicTileScheduler, MPMCQueueHost
@@ -64,6 +65,20 @@ def _shape_tuple(shape) -> tuple[int | VarSpec, ...]:
     if isinstance(shape, int | VarSpec):
         return (shape,)
     return tuple(shape)
+
+
+def _validate_logical_attrs(attrs: Mapping[str, Any], *, owner: str) -> None:
+    def visit(value: Any, path: str) -> None:
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                if key in _FORBIDDEN_SPEC_FIELDS:
+                    raise ValueError(f"{owner} contains scheduler field {path + key!r}")
+                visit(item, f"{path}{key}.")
+        elif isinstance(value, tuple | list):
+            for index, item in enumerate(value):
+                visit(item, f"{path}{index}.")
+
+    visit(attrs, "")
 
 
 class MoeLoweringEnv:
@@ -106,15 +121,11 @@ class MoeLoweringEnv:
             ScalarLoadExpr("num_tokens_post_pad", ConstExpr(0), "int32", scalar_shape) // 128
         )
 
-        validate_no_nested_attr_keys(spec.attrs, _FORBIDDEN_SPEC_FIELDS, owner="kernel attrs")
+        _validate_logical_attrs(spec.attrs, owner="kernel attrs")
         for event in spec.events.values():
-            validate_no_nested_attr_keys(
-                event.attrs, _FORBIDDEN_SPEC_FIELDS, owner=f"event {event.name!r} attrs"
-            )
+            _validate_logical_attrs(event.attrs, owner=f"event {event.name!r} attrs")
         for tile in spec.tiles:
-            validate_no_nested_attr_keys(
-                tile.attrs, _FORBIDDEN_SPEC_FIELDS, owner=f"tile {tile.name!r} attrs"
-            )
+            _validate_logical_attrs(tile.attrs, owner=f"tile {tile.name!r} attrs")
             for name in ("implementation", "job_type", "profile_event_type", "tensor_bindings"):
                 if not hasattr(tile.impl, name):
                     raise TypeError(f"tile {tile.name!r} has an incompatible MoE TileImpl")

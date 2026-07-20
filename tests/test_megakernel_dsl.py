@@ -25,7 +25,6 @@ import pytest
 
 import tirx_kernels.megakernel.dsl as megakernel_dsl
 import tvm.megakernel.dsl as tvm_dsl
-from tirx_kernels._attrs import nested_attr_keys
 from tirx_kernels.megakernel.dsl import (
     AlignTileImpl,
     CountSortTileImpl,
@@ -58,19 +57,6 @@ from tvm.megakernel.transform import (
     TileProgram,
     WaitStep,
 )
-
-_FORBIDDEN_SPEC_FIELDS = {
-    "dispatch",
-    "job_type",
-    "level",
-    "mask",
-    "queue",
-    "rank",
-    "release",
-    "runtime_init",
-    "scope",
-    "scope_id",
-}
 
 
 def _max_rows(batch_size: int) -> int:
@@ -155,13 +141,6 @@ def test_complete_six_stage_graph_is_pure_logical_native_dsl():
     assert _tile(spec, "gate_up_silu").tile_num[0] is spec.vars["routed_rows"]
     assert _tile(spec, "down").tile_num[0] is spec.vars["routed_rows"]
     assert not hasattr(spec.tensors["hidden_state"], "role")
-
-    attr_keys = nested_attr_keys(spec.attrs)
-    for event in spec.events.values():
-        attr_keys.update(nested_attr_keys(event.attrs))
-    for tile in spec.tiles:
-        attr_keys.update(nested_attr_keys(tile.attrs))
-    assert not attr_keys & _FORBIDDEN_SPEC_FIELDS
 
 
 def test_graph_has_five_logical_edges_and_callable_coordinate_maps():
