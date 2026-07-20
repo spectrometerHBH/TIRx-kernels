@@ -31,7 +31,7 @@ _EVENT_ATTRS = {
 _PACKED_INDEX_LIMITS = (MAX_M_IDX, MAX_N_IDX, MAX_K_IDX)
 _SCOPE_WIDTHS = {
     "thread": 1,
-    "warp": 32,
+    "warp": KernelConfig.WARP_SIZE,
     "warpgroup": KernelConfig.NUM_THREADS // KernelConfig.WG_NUMBER,
     "cta": KernelConfig.NUM_THREADS,
 }

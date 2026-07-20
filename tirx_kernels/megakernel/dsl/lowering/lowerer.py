@@ -235,7 +235,7 @@ class MoeLowerer:
     @T.inline
     def _emit_run_once(self, tile_impl, profile_event, m_idx, n_idx, k_idx):
         if profile_event is not None:
-            lane_id = T.lane_id([32])
+            lane_id = T.lane_id([KernelConfig.WARP_SIZE])
             if self.owner.profiler_on:
                 self.owner.profiler.start(profile_event, lane_id == 0)
             tile_impl.run(m_idx, n_idx, k_idx)

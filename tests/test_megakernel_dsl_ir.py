@@ -20,12 +20,13 @@ import hashlib
 import json
 import re
 from pathlib import Path
+from unittest import SkipTest
 
 import pytest
 import tvm_ffi
 
 import tvm
-from tirx_kernels.megakernel.moe import MegaKernelMOE
+from tirx_kernels.megakernel.moe import MegaKernelMOE, _require_cuda_sm100
 from tirx_kernels.megakernel.utils.config import MEGAKERNEL_MOE_BENCH_CONFIG
 from tirx_kernels.megakernel.utils.utils import get_source
 
@@ -62,6 +63,16 @@ def _golden_key(batch_size: int, scheduler: str, profiler_on: bool) -> str:
     return f"moe_b{batch_size}_{scheduler}_prof{int(profiler_on)}"
 
 
+@pytest.fixture(scope="module")
+def cuda_sm100():
+    """Skip CUDA source equivalence when the required compiler target is unavailable."""
+
+    try:
+        _require_cuda_sm100()
+    except SkipTest as err:
+        pytest.skip(str(err))
+
+
 @pytest.mark.parametrize("batch_size,scheduler,profiler_on", _CASES)
 def test_manual_and_dsl_are_structurally_equal(batch_size, scheduler, profiler_on):
     manual = _build_module(batch_size, scheduler, profiler_on=profiler_on, oracle=True)
@@ -73,7 +84,8 @@ def test_manual_and_dsl_are_structurally_equal(batch_size, scheduler, profiler_o
 
 
 @pytest.mark.parametrize("batch_size,scheduler,profiler_on", _CASES)
-def test_manual_and_dsl_generate_identical_cuda(batch_size, scheduler, profiler_on):
+def test_manual_and_dsl_generate_identical_cuda(batch_size, scheduler, profiler_on, cuda_sm100):
+    del cuda_sm100
     manual_source, manual_lib = get_source(
         _build_module(batch_size, scheduler, profiler_on=profiler_on, oracle=True)
     )

@@ -22,6 +22,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from tirx_kernels.megakernel.utils.config import KernelConfig
+
 from .spec import KernelSpec
 from .tile_impl import (
     AlignTileImpl,
@@ -99,13 +101,19 @@ def build_moe_graph(config: Mapping[str, Any], batch_size: int) -> KernelSpec:
         attrs={"meaning": "all split-K gating tiles are complete"},
     )
     topk_done = kernel.event(
-        "topk_done", (1,), 148, attrs={"meaning": "all persistent top-k tiles are complete"}
+        "topk_done",
+        (1,),
+        KernelConfig.SM_NUMBER,
+        attrs={"meaning": "all persistent top-k tiles are complete"},
     )
     align_done = kernel.event(
         "align_done", (1,), 1, attrs={"meaning": "token-to-expert alignment metadata is ready"}
     )
     count_sort_done = kernel.event(
-        "count_sort_done", (1,), 148, attrs={"meaning": "all count-and-sort tiles are complete"}
+        "count_sort_done",
+        (1,),
+        KernelConfig.SM_NUMBER,
+        attrs={"meaning": "all count-and-sort tiles are complete"},
     )
     gate_up_done = kernel.event(
         "gate_up_done",
@@ -131,7 +139,7 @@ def build_moe_graph(config: Mapping[str, Any], batch_size: int) -> KernelSpec:
         kernel.tile(
             "topk",
             impl=TopkTileImpl(config, batch_size, kernel.tensors),
-            tile_num=(148, 1, 1),
+            tile_num=(KernelConfig.SM_NUMBER, 1, 1),
             reads=[gating_output],
             writes=[topk_weights, topk_indices],
             attrs={
@@ -167,7 +175,7 @@ def build_moe_graph(config: Mapping[str, Any], batch_size: int) -> KernelSpec:
         kernel.tile(
             "count_sort",
             impl=CountSortTileImpl(config, batch_size, kernel.tensors),
-            tile_num=(148, 1, 1),
+            tile_num=(KernelConfig.SM_NUMBER, 1, 1),
             reads=[
                 topk_indices,
                 sorted_token_ids,

@@ -238,7 +238,7 @@ class MPMCQueue:
 
 class DynamicTileScheduler(TileSchedulerBase):
     MAX_TASKS = 32768
-    scheduler_warp = 7
+    scheduler_warp = KernelConfig.WARP_NUMBER * KernelConfig.WG_NUMBER - 1
 
     def __init__(
         self,

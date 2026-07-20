@@ -25,6 +25,7 @@ import pytest
 
 import tirx_kernels.megakernel.dsl as megakernel_dsl
 import tvm.megakernel.dsl as tvm_dsl
+from tirx_kernels._attrs import nested_attr_keys
 from tirx_kernels.megakernel.dsl import (
     AlignTileImpl,
     CountSortTileImpl,
@@ -103,18 +104,6 @@ def _replace_dispatch(plan, source_tile, dispatch):
     return _replace_program_step(plan, source_tile, plan.dispatch_step(source_tile), dispatch)
 
 
-def _collect_attr_keys(value):
-    keys = set()
-    if isinstance(value, dict):
-        for key, item in value.items():
-            keys.add(key)
-            keys.update(_collect_attr_keys(item))
-    elif isinstance(value, tuple | list):
-        for item in value:
-            keys.update(_collect_attr_keys(item))
-    return keys
-
-
 def test_public_spec_types_are_tvm_owned_and_legacy_model_is_removed():
     for name in ("VarSpec", "TensorSpec", "EventSpec", "TileSpec", "TileImpl", "KernelSpec"):
         assert getattr(megakernel_dsl, name) is getattr(tvm_dsl, name)
@@ -167,11 +156,11 @@ def test_complete_six_stage_graph_is_pure_logical_native_dsl():
     assert _tile(spec, "down").tile_num[0] is spec.vars["routed_rows"]
     assert not hasattr(spec.tensors["hidden_state"], "role")
 
-    attr_keys = _collect_attr_keys(spec.attrs)
+    attr_keys = nested_attr_keys(spec.attrs)
     for event in spec.events.values():
-        attr_keys.update(_collect_attr_keys(event.attrs))
+        attr_keys.update(nested_attr_keys(event.attrs))
     for tile in spec.tiles:
-        attr_keys.update(_collect_attr_keys(tile.attrs))
+        attr_keys.update(nested_attr_keys(tile.attrs))
     assert not attr_keys & _FORBIDDEN_SPEC_FIELDS
 
 
@@ -287,7 +276,7 @@ def test_policy_event_layout_domains_and_physical_programs(batch_size):
     )
     assert dynamic.down_coalescing == expected_q
     assert dynamic.tile("down").scheduled_upper_bounds == (max_rows, 16 // expected_q, 1)
-    assert dynamic.persistent_ctas == 148
+    assert dynamic.persistent_ctas == KernelConfig.SM_NUMBER
     assert dynamic.pre_before_wait and dynamic.post_after_run and dynamic.fifo_drain
     assert dynamic.program("align").smem_scope == "run_to_end"
     assert tuple(type(step) for step in dynamic.program("align").steps) == (
@@ -312,13 +301,13 @@ def test_policy_event_layout_domains_and_physical_programs(batch_size):
     )
     assert dynamic.protocol is not None
     assert (dynamic.protocol.pre_decrement, dynamic.protocol.post_decrement) == (1, 2**16)
-    assert dynamic.protocol.scheduler_warp == 7
+    assert dynamic.protocol.scheduler_warp == KernelConfig.WARP_NUMBER * KernelConfig.WG_NUMBER - 1
     normalized = dynamic.normalized_data()
     assert normalized["events"][-1]["runtime_init"]["value"] == runtime_init.value.to_data()
     assert normalized["tiles"][2]["steps"] == [
         type(step).__name__ for step in dynamic.program("align").steps
     ]
-    assert normalized["dispatch"][0]["enqueue_upper_bound"] == 148
+    assert normalized["dispatch"][0]["enqueue_upper_bound"] == KernelConfig.SM_NUMBER
     dynamic_down_run = next(
         step for step in dynamic.program("down").steps if isinstance(step, RunStep)
     )
@@ -457,7 +446,7 @@ def test_dynamic_seed_queue_and_dispatch_mapping(batch_size):
     assert gate_rule.count.evaluate(gate_env) == 16 // plan.down_coalescing
     assert tuple(index.evaluate(gate_env) for index in gate_rule.tile_indices) == (11, 3, 0)
     assert plan.dispatch("down").target_tile is None
-    assert plan.dispatch("down").count.evaluate(plan.env.compile_env) == 148
+    assert plan.dispatch("down").count.evaluate(plan.env.compile_env) == KernelConfig.SM_NUMBER
 
 
 def test_unfused_collapses_gate_up_coordinates_only_in_physical_plan():

@@ -19,14 +19,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass, field
 from functools import reduce
 from operator import mul
-from typing import Any
 
 import numpy as np
 
+from tirx_kernels._attrs import validate_no_nested_attr_keys
 from tirx_kernels.megakernel.utils.base import SemaphoreBase
 from tirx_kernels.megakernel.utils.config import JobType, KernelConfig
 from tirx_kernels.megakernel.utils.dynamic_scheduler import DynamicTileScheduler, MPMCQueueHost
@@ -65,20 +64,6 @@ def _shape_tuple(shape) -> tuple[int | VarSpec, ...]:
     if isinstance(shape, int | VarSpec):
         return (shape,)
     return tuple(shape)
-
-
-def _validate_logical_attrs(attrs: Mapping[str, Any], *, owner: str):
-    def visit(value, path: str):
-        if isinstance(value, Mapping):
-            for key, item in value.items():
-                if key in _FORBIDDEN_SPEC_FIELDS:
-                    raise ValueError(f"{owner} contains scheduler field {path + key!r}")
-                visit(item, f"{path}{key}.")
-        elif isinstance(value, tuple | list):
-            for index, item in enumerate(value):
-                visit(item, f"{path}{index}.")
-
-    visit(attrs, "")
 
 
 class MoeLoweringEnv:
@@ -121,11 +106,15 @@ class MoeLoweringEnv:
             ScalarLoadExpr("num_tokens_post_pad", ConstExpr(0), "int32", scalar_shape) // 128
         )
 
-        _validate_logical_attrs(spec.attrs, owner="kernel attrs")
+        validate_no_nested_attr_keys(spec.attrs, _FORBIDDEN_SPEC_FIELDS, owner="kernel attrs")
         for event in spec.events.values():
-            _validate_logical_attrs(event.attrs, owner=f"event {event.name!r} attrs")
+            validate_no_nested_attr_keys(
+                event.attrs, _FORBIDDEN_SPEC_FIELDS, owner=f"event {event.name!r} attrs"
+            )
         for tile in spec.tiles:
-            _validate_logical_attrs(tile.attrs, owner=f"tile {tile.name!r} attrs")
+            validate_no_nested_attr_keys(
+                tile.attrs, _FORBIDDEN_SPEC_FIELDS, owner=f"tile {tile.name!r} attrs"
+            )
             for name in ("implementation", "job_type", "profile_event_type", "tensor_bindings"):
                 if not hasattr(tile.impl, name):
                     raise TypeError(f"tile {tile.name!r} has an incompatible MoE TileImpl")
@@ -580,7 +569,6 @@ class NormalizedPlan:
                 self.protocol.pre_decrement != 1
                 or self.protocol.post_decrement != SemaphoreBase.base
                 or self.protocol.scheduler_warp != DynamicTileScheduler.scheduler_warp
-                or self.protocol.scheduler_warp != 7
             ):
                 raise ValueError("dynamic plan does not match the two-phase scheduler protocol")
             if (
@@ -605,7 +593,7 @@ class NormalizedPlan:
                     f"dynamic queue upper bound {self.queue_upper_bound} exceeds capacity "
                     f"{self.queue_capacity}"
                 )
-            if self.persistent_ctas != KernelConfig.SM_NUMBER or self.persistent_ctas != 148:
+            if self.persistent_ctas != KernelConfig.SM_NUMBER:
                 raise ValueError("dynamic plan violates persistent CTA saturation")
             if (
                 self.dispatch_step("gating").count_lower_bound != self.persistent_ctas

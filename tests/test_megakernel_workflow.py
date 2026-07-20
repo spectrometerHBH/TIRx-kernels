@@ -20,6 +20,7 @@ from pathlib import Path
 
 import yaml
 
+from tirx_kernels._attrs import nested_attr_keys
 from tirx_kernels.megakernel.dsl import VarSpec, build_moe_graph
 from tirx_kernels.megakernel.utils.config import MEGAKERNEL_MOE_BENCH_CONFIG
 
@@ -49,18 +50,6 @@ def _load_plan():
         return yaml.safe_load(plan_file)
 
 
-def _keys(value):
-    result = set()
-    if isinstance(value, dict):
-        for key, item in value.items():
-            result.add(key)
-            result.update(_keys(item))
-    elif isinstance(value, list):
-        for item in value:
-            result.update(_keys(item))
-    return result
-
-
 def test_stage1_yaml_matches_native_graph_stages_tensors_and_events():
     plan = _load_plan()
     spec = build_moe_graph(MEGAKERNEL_MOE_BENCH_CONFIG, 128)
@@ -70,7 +59,7 @@ def test_stage1_yaml_matches_native_graph_stages_tensors_and_events():
     assert set(plan["tensors"]) == set(spec.tensors)
     assert list(plan["events"]) == list(spec.events)
     assert "down_dispatch_done" not in yaml.safe_dump(plan)
-    assert not _keys(plan) & _FORBIDDEN_KEYS
+    assert not nested_attr_keys(plan) & _FORBIDDEN_KEYS
 
     for tile in spec.tiles:
         planned = plan["tiles"][tile.name]

@@ -242,15 +242,3 @@ def walk_expr(expr: Expr):
         yield from walk_expr(expr.rhs)
     elif isinstance(expr, ScalarLoadExpr):
         yield from walk_expr(expr.index)
-
-
-def evaluate_static(expr: Expr, env: Mapping[str, Any], *, label: str) -> int:
-    """Evaluate and type-check a host-compile-time integer expression."""
-
-    try:
-        value = expr.evaluate(env)
-    except (KeyError, TypeError, UnresolvedExpression) as err:
-        raise ValueError(f"{label} is not statically evaluable: {expr.to_data()}") from err
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{label} must evaluate to an integer; got {value!r}")
-    return value

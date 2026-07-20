@@ -19,10 +19,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from tirx_kernels._attrs import validate_no_nested_attr_keys
 from tvm.megakernel.dsl import KernelSpec
 from tvm.megakernel.transform import (
     DeviceRegionPlan,
@@ -47,20 +47,6 @@ _FORBIDDEN_LOGICAL_FIELDS = {
     "scope",
     "scope_id",
 }
-
-
-def _validate_attrs(attrs: Mapping[str, Any], *, owner: str) -> None:
-    def visit(value: Any, path: str) -> None:
-        if isinstance(value, Mapping):
-            for key, item in value.items():
-                if key in _FORBIDDEN_LOGICAL_FIELDS:
-                    raise ValueError(f"{owner} contains scheduler field {path + key!r}")
-                visit(item, f"{path}{key}.")
-        elif isinstance(value, tuple | list):
-            for index, item in enumerate(value):
-                visit(item, f"{path}{index}.")
-
-    visit(attrs, "")
 
 
 @dataclass(frozen=True, order=True)
@@ -286,11 +272,17 @@ class GemmCommPlan:
 
     def validate(self) -> GemmCommPlan:
         self.execution.validate()
-        _validate_attrs(self.spec.attrs, owner="kernel attrs")
+        validate_no_nested_attr_keys(
+            self.spec.attrs, _FORBIDDEN_LOGICAL_FIELDS, owner="kernel attrs"
+        )
         for event in self.spec.events.values():
-            _validate_attrs(event.attrs, owner=f"event {event.name!r} attrs")
+            validate_no_nested_attr_keys(
+                event.attrs, _FORBIDDEN_LOGICAL_FIELDS, owner=f"event {event.name!r} attrs"
+            )
         for tile in self.spec.tiles:
-            _validate_attrs(tile.attrs, owner=f"tile {tile.name!r} attrs")
+            validate_no_nested_attr_keys(
+                tile.attrs, _FORBIDDEN_LOGICAL_FIELDS, owner=f"tile {tile.name!r} attrs"
+            )
             if not hasattr(tile.impl, "tensor_specs") or not callable(
                 getattr(tile.impl, "run", None)
             ):

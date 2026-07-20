@@ -61,7 +61,14 @@ class MoePolicy:
 
 
 def _validate_persistent_event_dependencies_acyclic(spec: KernelSpec, policy_name: str) -> None:
-    """Reject event cycles that can occupy every persistent worker before progress."""
+    """Reject tile-level cycles that can occupy every persistent worker before progress.
+
+    This is intentionally stricter than the coordinate-projected check in TVM's
+    reference static backend.  The current MoE policies schedule complete physical
+    tile kinds and cannot represent a coordinate-disjoint cyclic phase.  A future
+    coordinate-aware policy should consume that richer schedule explicitly instead
+    of weakening this persistent-queue safety gate.
+    """
 
     tile_ids = [id(tile) for tile in spec.tiles]
     adjacency = {tile_id: set() for tile_id in tile_ids}
