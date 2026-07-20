@@ -127,7 +127,7 @@ class MegaKernelMOE(MegaKernelWrapper):
         return self._build_module(scheduler, manual_oracle=False)
 
     def _get_manual_oracle_module(self, scheduler: str):
-        """Build the private pre-migration oracle used only by equivalence tests."""
+        """Build the private pre-migration implementation used as a correctness reference."""
 
         return self._build_module(scheduler, manual_oracle=True)
 

@@ -32,7 +32,7 @@ and scheduling:
 The Stage-1 planning artifact is
 [`workflow/qwen3_30b_a3b_moe_stage1.yaml`](workflow/qwen3_30b_a3b_moe_stage1.yaml).
 The hand-written `task_impl_moe_*`, `_set_events`, and queue generation path is
-retained as the explicit `manual` fallback and A/B oracle.
+retained as a numerical correctness reference and explicit fallback.
 
 ## Runnable MoE DSL Example
 
