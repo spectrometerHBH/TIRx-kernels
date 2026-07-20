@@ -74,9 +74,6 @@ class GemmCommLowerer:
 
     def lower(self, spec: KernelSpec, *, plan_only: bool = False) -> LoweredGemmComm:
         plan = self.policy.normalize(spec)
-        if not plan.lowerable and not plan_only:
-            raise NotImplementedError(plan.unsupported_reason)
-
         module = None
         if not plan_only:
             builders = [

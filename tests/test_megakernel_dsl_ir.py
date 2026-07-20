@@ -44,9 +44,11 @@ def _build_module(
     batch_size: int, scheduler: str, *, profiler_on: bool = False, oracle: bool = False
 ):
     kernel = MegaKernelMOE(
-        config=MEGAKERNEL_MOE_BENCH_CONFIG, world_size=1, profiler_on=profiler_on
+        config=MEGAKERNEL_MOE_BENCH_CONFIG,
+        batch_size=batch_size,
+        world_size=1,
+        profiler_on=profiler_on,
     )
-    kernel._compile_batch_size = batch_size
     if oracle:
         return kernel._get_manual_oracle_module(scheduler)
     return kernel.get_module(scheduler)

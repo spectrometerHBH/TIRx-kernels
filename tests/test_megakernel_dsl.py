@@ -328,8 +328,9 @@ def test_policy_event_layout_domains_and_physical_programs(batch_size):
 
 
 def test_run_step_fields_are_authoritative_during_physical_lowering():
-    kernel = MegaKernelMOE(config=MEGAKERNEL_MOE_BENCH_CONFIG, world_size=1, profiler_on=False)
-    kernel._compile_batch_size = 4
+    kernel = MegaKernelMOE(
+        config=MEGAKERNEL_MOE_BENCH_CONFIG, batch_size=4, world_size=1, profiler_on=False
+    )
     lowerer = kernel._make_dsl_lowerer("dynamic")
     execution = lowerer.execution
     region = execution.device_regions[0]
@@ -536,18 +537,6 @@ def test_moe_env_rejects_invalid_runtime_binding_and_upper_bound():
     down.tile_num = (down.tile_num[0], MAX_N_IDX + 1, 1)
     with pytest.raises(ValueError, match="packed tile indices"):
         MoeLowerer(StaticPolicy()).lower(spec)
-
-
-def test_policy_rejects_coalescing_and_queue_capacity_regressions():
-    spec = build_moe_graph(MEGAKERNEL_MOE_BENCH_CONFIG, 512)
-    with pytest.raises(ValueError, match="coalescing"):
-        MoeLowerer(DynamicPolicy(down_coalescing=1)).lower(spec)
-    with pytest.raises(ValueError, match="exceeds capacity"):
-        MoeLowerer(DynamicPolicy(queue_capacity=512)).lower(spec)
-    with pytest.raises(ValueError, match="must remain 32768"):
-        MoeLowerer(DynamicPolicy(queue_capacity=65536)).lower(spec)
-    with pytest.raises(ValueError, match="columns"):
-        MoeLowerer(StaticPolicy(queue_capacity=1)).lower(spec)
 
 
 def test_normalized_plan_rejects_runtime_init_and_terminal_drain_regressions():

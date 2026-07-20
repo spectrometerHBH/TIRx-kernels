@@ -48,9 +48,6 @@ class MoePolicy:
     is_dynamic = False
     unfused = False
 
-    def __init__(self, *, queue_capacity: int | None = None):
-        self.queue_capacity = queue_capacity
-
     def _lowering_env(self, spec: KernelSpec) -> MoeLoweringEnv:
         env = MoeLoweringEnv(spec)
         _validate_persistent_event_dependencies_acyclic(spec, self.name)
@@ -126,10 +123,8 @@ class StaticPolicy(MoePolicy):
             if tile.tile.name != "gating":
                 central.extend(_enumerate_tile(tile))
         queue_columns = (len(central) + KernelConfig.SM_NUMBER - 1) // KernelConfig.SM_NUMBER + 1
-        capacity = (
-            StaticTileScheduler.MAX_TASKS if self.queue_capacity is None else self.queue_capacity
-        )
-        if capacity != StaticTileScheduler.MAX_TASKS or queue_columns > capacity:
+        capacity = StaticTileScheduler.MAX_TASKS
+        if queue_columns > capacity:
             raise ValueError(
                 f"static host queue requires {queue_columns} columns, capacity is {capacity}"
             )
@@ -166,27 +161,11 @@ class DynamicPolicy(MoePolicy):
     name = "dynamic"
     is_dynamic = True
 
-    def __init__(
-        self,
-        *,
-        down_coalescing: int | None = None,
-        queue_capacity: int = DynamicTileScheduler.MAX_TASKS,
-    ):
-        super().__init__(queue_capacity=queue_capacity)
-        self.down_coalescing = down_coalescing
-
     def normalize(self, spec: KernelSpec) -> NormalizedPlan:
         env = self._lowering_env(spec)
         batch_size = env.batch_size
-        expected_coalescing = 1 if batch_size < 4 else 4
-        coalescing = expected_coalescing if self.down_coalescing is None else self.down_coalescing
-        if coalescing != expected_coalescing or coalescing <= 0 or 16 % coalescing:
-            raise ValueError(
-                f"illegal dynamic down coalescing q={coalescing} for batch {batch_size}"
-            )
-        capacity = self.queue_capacity
-        if capacity is None or capacity <= 0 or capacity & (capacity - 1):
-            raise ValueError("dynamic queue capacity must be a positive power of two")
+        coalescing = 1 if batch_size < 4 else 4
+        capacity = DynamicTileScheduler.MAX_TASKS
         down_dispatch_groups = 16 // coalescing
         events = _event_plans(env, is_dynamic=True, unfused=False)
         tiles = _normalize_tiles(
@@ -209,10 +188,6 @@ class DynamicPolicy(MoePolicy):
         if queue_upper_bound > capacity:
             raise ValueError(
                 f"dynamic queue upper bound {queue_upper_bound} exceeds capacity {capacity}"
-            )
-        if capacity != DynamicTileScheduler.MAX_TASKS:
-            raise ValueError(
-                f"dynamic queue capacity must remain {DynamicTileScheduler.MAX_TASKS}; got {capacity}"
             )
         execution = ExecutionPlan(
             kernel=spec,

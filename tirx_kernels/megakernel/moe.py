@@ -91,8 +91,9 @@ class MegaKernelMOE(MegaKernelWrapper):
     MOE_M_PAD_SIZE = 128
     GATING_BLK_M = 128
 
-    def __init__(self, config, world_size, profiler_on):
+    def __init__(self, config, batch_size, world_size, profiler_on):
         super().__init__(config, 1, profiler_on)
+        self.batch_size = batch_size
         self.world_size = world_size
         self.HIDDEN_SIZE = config.get("HIDDEN_SIZE", None)
         self.INTERMEDIATE_SIZE = config.get("INTERMEDIATE_SIZE", None)
@@ -101,13 +102,11 @@ class MegaKernelMOE(MegaKernelWrapper):
         self.GATING_SPLIT_K_FACTOR = config.get("GATING_SPLIT_K_FACTOR", None)
 
     def get_normalized_plan(self, scheduler: str):
-        batch_size = getattr(self, "_compile_batch_size", 1)
-        return make_moe_plan(self.config, batch_size, scheduler)
+        return make_moe_plan(self.config, self.batch_size, scheduler)
 
     def _make_dsl_lowerer(self, scheduler: str):
-        batch_size = getattr(self, "_compile_batch_size", 1)
         lowerer = MoeLowerer(policy_for_scheduler(scheduler), owner=self)
-        lowerer.lower(build_moe_graph(self.config, batch_size))
+        lowerer.lower(build_moe_graph(self.config, self.batch_size))
         return lowerer
 
     def _build_module(self, scheduler: str, *, manual_oracle: bool):
@@ -699,7 +698,7 @@ class MegaKernelMOE(MegaKernelWrapper):
     # FIXME: change offset_factor to 0 can make performance better
     #       but it requires change on engine side
     def get_func_static(self, unfused=False):
-        compile_batch_size = getattr(self, "_compile_batch_size", 1)
+        compile_batch_size = self.batch_size
         lowering = getattr(self, "_active_lowering", "dsl")
         scheduler_name = "unfused" if unfused else "static"
         dsl_lowerer = self._make_dsl_lowerer(scheduler_name) if lowering == "dsl" else None
@@ -801,7 +800,7 @@ class MegaKernelMOE(MegaKernelWrapper):
         return main
 
     def get_func_dynamic(self):
-        compile_batch_size = getattr(self, "_compile_batch_size", 1)
+        compile_batch_size = self.batch_size
         lowering = getattr(self, "_active_lowering", "dsl")
         dsl_lowerer = self._make_dsl_lowerer("dynamic") if lowering == "dsl" else None
 
@@ -1024,10 +1023,6 @@ def _check_scheduler(scheduler: str):
         )
 
 
-def _needs_unfused_reference(scheduler: str) -> bool:
-    return scheduler in ("static", "dynamic")
-
-
 def _compile_moe_schedulers(
     schedulers: tuple[str, ...],
     batch_size: int,
@@ -1045,9 +1040,11 @@ def _compile_moe_schedulers(
         return cached
 
     mk = MegaKernelMOE(
-        config=MEGAKERNEL_MOE_BENCH_CONFIG, world_size=world_size, profiler_on=profiler_on
+        config=MEGAKERNEL_MOE_BENCH_CONFIG,
+        batch_size=batch_size,
+        world_size=world_size,
+        profiler_on=profiler_on,
     )
-    mk._compile_batch_size = batch_size
     libs = {}
     for scheduler in schedulers:
         module = (

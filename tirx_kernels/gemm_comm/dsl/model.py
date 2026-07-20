@@ -111,14 +111,6 @@ class GemmCommPlan:
         return self.policy_name == "dynamic"
 
     @property
-    def lowerable(self) -> bool:
-        return True
-
-    @property
-    def unsupported_reason(self) -> None:
-        return None
-
-    @property
     def scheduled_region(self) -> DeviceRegionPlan:
         regions = [
             region for region in self.execution.device_regions if "scheduler" in region.attrs
