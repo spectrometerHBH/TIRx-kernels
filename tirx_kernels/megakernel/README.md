@@ -14,26 +14,24 @@ the `Tile instances` section says how that logical op is split into
 
 The logical contract is the TVM-owned `tvm.megakernel.dsl.KernelSpec` returned
 by `build_moe_graph`.  Its six `TileSpec` objects directly hold concrete
-`TileImpl` adapters, while MoE-specific lowering owns physical synchronization
-and scheduling:
+`TileImpl` adapters, and every physical fact (job ids, endpoint scopes, run
+predicates, the drain event) is declared on the spec or on the adapters:
 
-- [`build_moe_graph`](dsl/examples/moe.py): records tensors, five logical events,
-  and wait/notify coordinate maps;
-- the six MoE `TileImpl` adapters: invoke existing tile-task compute only;
-- [`model.py`](dsl/lowering/model.py) and
-  [`normalize.py`](dsl/lowering/normalize.py): own the single physical
-  `ExecutionPlan`, ordered tile steps, symbolic bounds, and strict validation;
-- [`StaticPolicy`, `UnfusedPolicy`, and `DynamicPolicy`](dsl/lowering/policies.py):
-  place event, queue, runtime initialization, and dispatch state directly in
-  those physical programs;
-- [`MoeLowerer`](dsl/lowering/lowerer.py): interprets each program's steps in
-  source order;
-- [`kernel.py`](dsl/kernel.py): owns the complete TIRX function signature,
-  buffers, scheduler loop, tile lifecycle, and module emission.
+- [`build_moe_graph`](dsl/examples/moe.py): records tensors, six events (five
+  logical plus the declared `down_dispatch_done` drain), the `routed_rows`
+  runtime scalar, and wait/notify coordinate maps;
+- the six MoE [`TileImpl`](dsl/tile_impl.py) adapters: invoke existing
+  tile-task compute only, and carry scope/profiler metadata;
+- [`build_moe_kernel`](dsl/examples/moe.py): runs the spec through
+  `tvm.megakernel.transform.build_runtime_kernel`, which emits the production
+  kernel structure (static central queue, dynamic MPMC scheduler, or the
+  unfused static variant) and derives the host queue arrays.  The packed
+  queue bytes and the event-workspace layout match the production host
+  helpers exactly.
 
 The registered hand-written implementation remains unchanged in
-[`moe.py`](moe.py). It is separate from the DSL lowering; DSL runtime tests use
-it only as an external numerical reference.
+[`moe.py`](moe.py). It is separate from the DSL path; DSL runtime tests use it
+only as an external numerical and structural reference.
 
 ## Notation
 

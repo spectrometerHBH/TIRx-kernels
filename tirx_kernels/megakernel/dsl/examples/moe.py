@@ -15,15 +15,25 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""The scheduler-independent six-stage MoE kernel written with the megakernel DSL."""
+"""The six-stage MoE kernel written with the megakernel DSL.
+
+``build_moe_graph`` records the scheduler-independent logical graph: tensors,
+events, tiles, and wait/notify edges.  Every physical fact (job ids, endpoint
+scopes, run predicates, the drain event) is declared on the spec or on the
+tile implementations, so ``tvm.megakernel.transform.build_runtime_kernel``
+emits the same structure as the hand-written kernel in
+``tirx_kernels.megakernel.moe`` for both the static and dynamic schedulers
+(and the unfused static variant).
+"""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Any
 
-from tirx_kernels.megakernel.utils.config import KernelConfig
+from tirx_kernels.megakernel.utils.config import JobType, KernelConfig
 from tvm.megakernel.dsl import KernelSpec
+from tvm.megakernel.transform import LoweringOptions, RuntimeKernelBuild, build_runtime_kernel
 
 _EXPECTED_CONFIG = {
     "HIDDEN_SIZE": 2048,
@@ -32,6 +42,8 @@ _EXPECTED_CONFIG = {
     "NUM_EXPERTS_PER_TOK": 8,
     "GATING_SPLIT_K_FACTOR": 4,
 }
+
+_SCHEDULERS = ("static", "dynamic", "unfused")
 
 
 def _max_rows(batch_size: int) -> int:
@@ -52,8 +64,15 @@ def _validate_mvp_config(config: Mapping[str, Any]):
         raise ValueError(f"MoE megakernel DSL MVP only supports Qwen3-30B-A3B: {mismatch}")
 
 
-def build_moe_graph(config: Mapping[str, Any], batch_size: int) -> KernelSpec:
-    """Build the scheduler-independent six-stage MoE graph."""
+def build_moe_graph(
+    config: Mapping[str, Any], batch_size: int, *, unfused: bool = False
+) -> KernelSpec:
+    """Build the scheduler-independent six-stage MoE graph.
+
+    ``unfused`` selects the static unfused variant: the gate-up completion
+    event collapses to a single cell counted at the padded upper bound and
+    both gemm tiles address it at coordinate ``(0,)``.
+    """
 
     from ..tile_impl import (
         AlignTileImpl,
@@ -74,8 +93,8 @@ def build_moe_graph(config: Mapping[str, Any], batch_size: int) -> KernelSpec:
     kernel = KernelSpec(
         "qwen3_30b_a3b_moe", attrs={"source": "Qwen3-30B-A3B six-stage MoE pipeline"}
     )
-    routed_rows = kernel.var("routed_rows")
 
+    # Tensor registration order matches the hand-written kernel's ABI.
     hidden_state = kernel.tensor("hidden_state", (batch_size, 2048), "float16")
     kernel.tensor("residual", (batch_size, 2048), "float16")
     kernel.tensor("output", (batch_size, 2048), "float16")
@@ -91,8 +110,17 @@ def build_moe_graph(config: Mapping[str, Any], batch_size: int) -> KernelSpec:
     num_tokens_post_pad = kernel.tensor("num_tokens_post_pad", (1,), "int32")
     cumsum_buffer = kernel.tensor("cumsum_buffer", (129,), "int32")
     reordered_hidden_state = kernel.tensor("reordered_hidden_state", (max_tokens, 2048), "float16")
+    kernel.tensor("gate_up_output", (max_tokens, 1536), "float16")
     silu_mul_output = kernel.tensor("silu_mul_output", (max_tokens, 768), "float16")
     topk_reduce_output = kernel.tensor("topk_reduce_output", (batch_size, 2048), "float16")
+
+    # The routed-row count is a runtime scalar: the align tile publishes the
+    # padded token count and every downstream consumer divides by the block
+    # size.  Padded token counts are always >= 128 (one full block).
+    padded_tokens = kernel.scalar(
+        "num_tokens_post_pad", source=(num_tokens_post_pad, (0,)), range=(128, max_tokens)
+    )
+    routed_rows = padded_tokens // 128
 
     gating_done = kernel.event(
         "gating_done",
@@ -115,13 +143,32 @@ def build_moe_graph(config: Mapping[str, Any], batch_size: int) -> KernelSpec:
         KernelConfig.SM_NUMBER,
         attrs={"meaning": "all count-and-sort tiles are complete"},
     )
-    gate_up_done = kernel.event(
-        "gate_up_done",
-        (relaxed_rows,),
-        12,
-        attrs={"meaning": "all gate-up projections for one routed row are complete"},
+    if unfused:
+        gate_up_done = kernel.event(
+            "gate_up_done",
+            (1,),
+            max_rows * 12,
+            attrs={"meaning": "all gate-up projections are complete (unfused single cell)"},
+        )
+    else:
+        gate_up_done = kernel.event(
+            "gate_up_done",
+            (relaxed_rows,),
+            12,
+            attrs={"meaning": "all gate-up projections for one routed row are complete"},
+        )
+    # The terminal down tile's drain event.  Static scheduling initializes it
+    # from the host at the padded upper bound (it is never waited on there);
+    # dynamic scheduling runtime-initializes it in the align tile and pushes
+    # the END tasks from the down tile's last pre-notify.
+    kernel.event(
+        "down_dispatch_done",
+        (1,),
+        max_rows * 16,
+        attrs={"meaning": "all routed down projections are complete", "megakernel.drain": True},
     )
 
+    run_while_routed = (0, "lt", routed_rows)
     (
         kernel.tile(
             "gating",
@@ -132,6 +179,7 @@ def build_moe_graph(config: Mapping[str, Any], batch_size: int) -> KernelSpec:
             attrs={
                 "source_stage": "gating_output = hidden_state @ gate_weight.T",
                 "purpose": "compute split-K expert logits",
+                "megakernel.job_id": JobType.MOE_GATING.value,
             },
         ).notify(gating_done, lambda m, n, k: (0,))
     )
@@ -145,6 +193,7 @@ def build_moe_graph(config: Mapping[str, Any], batch_size: int) -> KernelSpec:
             attrs={
                 "source_stage": "topk_weights, topk_indices = topk(gating_output)",
                 "purpose": "select experts and routing weights",
+                "megakernel.job_id": JobType.MOE_TOPK_SOFTMAX.value,
             },
         )
         .wait(gating_done, lambda m, n, k: (0,))
@@ -166,6 +215,7 @@ def build_moe_graph(config: Mapping[str, Any], batch_size: int) -> KernelSpec:
             attrs={
                 "source_stage": "align tokens by expert",
                 "purpose": "produce padded routing metadata",
+                "megakernel.job_id": JobType.MOE_ALIGN.value,
             },
         )
         .wait(topk_done, lambda m, n, k: (0,))
@@ -187,6 +237,7 @@ def build_moe_graph(config: Mapping[str, Any], batch_size: int) -> KernelSpec:
             attrs={
                 "source_stage": "reorder hidden states by expert",
                 "purpose": "count and scatter routed tokens",
+                "megakernel.job_id": JobType.MOE_COUNT_AND_SORT.value,
             },
         )
         .wait(align_done, lambda m, n, k: (0,))
@@ -210,10 +261,12 @@ def build_moe_graph(config: Mapping[str, Any], batch_size: int) -> KernelSpec:
             attrs={
                 "source_stage": "silu(gate) * up",
                 "purpose": "compute routed gate-up projections and SiLU",
+                "megakernel.job_id": JobType.MOE_GROUP_GEMM_GATE_UP_SILU.value,
+                "megakernel.run_predicate": run_while_routed,
             },
         )
         .wait(count_sort_done, lambda m, n, k: (0,))
-        .notify(gate_up_done, lambda m, n, k: (m,))
+        .notify(gate_up_done, (lambda m, n, k: (0,)) if unfused else (lambda m, n, k: (m,)))
     )
     (
         kernel.tile(
@@ -233,7 +286,46 @@ def build_moe_graph(config: Mapping[str, Any], batch_size: int) -> KernelSpec:
             attrs={
                 "source_stage": "topk_reduce_output = down(silu_mul_output)",
                 "purpose": "compute and accumulate routed down projections",
+                "megakernel.job_id": JobType.MOE_GROUP_GEMM_DOWN.value,
+                "megakernel.run_predicate": run_while_routed,
             },
-        ).wait(gate_up_done, lambda m, n, k: (m,))
+        ).wait(gate_up_done, (lambda m, n, k: (0,)) if unfused else (lambda m, n, k: (m,)))
     )
     return kernel
+
+
+def moe_lowering_options(scheduler: str, batch_size: int) -> LoweringOptions:
+    """Lowering options that reproduce the hand-written kernel's physical ABI.
+
+    The reserved job ids match ``JobType`` so the packed queue bytes are
+    identical to the production host queues, and the profiler parameter stays
+    in the kernel signature (unused with profiling off) for call-site parity.
+    The dynamic down-tile coalescing is the production batch policy.
+    """
+
+    if scheduler not in _SCHEDULERS:
+        raise ValueError(f"unsupported MoE scheduler {scheduler!r}; expected one of {_SCHEDULERS}")
+    attrs: dict[str, Any] = {
+        "init_event_job_id": JobType.INIT_ETENSOR.value,
+        "wait_event_init_job_id": JobType.WAIT_ETENSOR_INIT.value,
+        "end_job_id": JobType.END.value,
+        "emit_profiler_param": True,
+    }
+    # The down tile's per-task run loop: the dynamic scheduler amortizes
+    # dispatch overhead by the production batch factor, static keeps 1.
+    down_task_size = (4 if batch_size >= 4 else 1) if scheduler == "dynamic" else 1
+    attrs["tile_coalescing"] = {"down": down_task_size}
+    return LoweringOptions(scheduler="dynamic" if scheduler == "dynamic" else "static", attrs=attrs)
+
+
+def build_moe_kernel(
+    config: Mapping[str, Any], batch_size: int, scheduler: str
+) -> RuntimeKernelBuild:
+    """Build one MoE kernel module and its host queues through the tvm builder."""
+
+    spec = build_moe_graph(config, batch_size, unfused=scheduler == "unfused")
+    spec.validate()
+    return build_runtime_kernel(spec, moe_lowering_options(scheduler, batch_size))
+
+
+__all__ = ["build_moe_graph", "build_moe_kernel", "moe_lowering_options"]

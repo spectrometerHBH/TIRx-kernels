@@ -14,7 +14,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""TVM-native logical DSL and MoE-specific lowering policies."""
+"""TVM-native logical DSL re-exports and the MoE tile implementations."""
 
 from tvm.megakernel.dsl import (
     CoordMapType,
@@ -22,6 +22,7 @@ from tvm.megakernel.dsl import (
     EventSpec,
     ExprLike,
     KernelSpec,
+    ScalarSpec,
     ShapeType,
     TensorSpec,
     TileImpl,
@@ -30,21 +31,6 @@ from tvm.megakernel.dsl import (
     VarSpec,
 )
 
-from .kernel import lower_moe_to_tirx
-from .lowering import (
-    DynamicDispatchStep,
-    DynamicPolicy,
-    DynamicProtocolPlan,
-    EventPlan,
-    MoeLowerer,
-    MoeLoweringEnv,
-    MoeTileProgram,
-    NormalizedPlan,
-    StaticPolicy,
-    UnfusedPolicy,
-    make_moe_plan,
-    policy_for_scheduler,
-)
 from .tile_impl import (
     AlignTileImpl,
     CountSortTileImpl,
@@ -60,29 +46,17 @@ __all__ = [
     "CountSortTileImpl",
     "DependencyType",
     "DownTileImpl",
-    "DynamicDispatchStep",
-    "DynamicPolicy",
-    "DynamicProtocolPlan",
-    "EventPlan",
     "EventSpec",
     "ExprLike",
     "GateUpSiluTileImpl",
     "GatingTileImpl",
     "KernelSpec",
-    "MoeLowerer",
-    "MoeLoweringEnv",
-    "MoeTileProgram",
-    "NormalizedPlan",
+    "ScalarSpec",
     "ShapeType",
-    "StaticPolicy",
     "TensorSpec",
     "TileImpl",
     "TileNumType",
     "TileSpec",
     "TopkTileImpl",
-    "UnfusedPolicy",
     "VarSpec",
-    "lower_moe_to_tirx",
-    "make_moe_plan",
-    "policy_for_scheduler",
 ]

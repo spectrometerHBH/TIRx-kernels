@@ -15,16 +15,16 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Runtime correctness for the standalone MoE DSL lowering."""
+"""Runtime correctness for the tvm-builder MoE DSL path (B200 GPU gate)."""
 
 from unittest import SkipTest
 
+import numpy as np
 import pytest
 import torch
 
 import tvm
-from tirx_kernels.megakernel.dsl import MoeLowerer, policy_for_scheduler
-from tirx_kernels.megakernel.dsl.examples.moe import build_moe_graph
+from tirx_kernels.megakernel.dsl.examples.moe import build_moe_kernel
 from tirx_kernels.megakernel.moe import (
     _as_cuda_tensor,
     _compile_moe_schedulers,
@@ -38,19 +38,42 @@ from tirx_kernels.megakernel.moe import (
 from tirx_kernels.megakernel.utils.config import MEGAKERNEL_MOE_BENCH_CONFIG
 from tirx_kernels.megakernel.utils.utils import get_source
 
+# Mirrors the graph-reset zero list built by _make_tir_case.
+_ZERO_NAMES = (
+    "output",
+    "topk_weights",
+    "topk_indices",
+    "sorted_token_ids",
+    "expert_ids",
+    "num_valid_tokens",
+    "num_tokens_post_pad",
+    "cumsum_buffer",
+    "reordered_hidden_state",
+    "gate_up_output",
+    "silu_mul_output",
+    "etensor_workspace",
+    "profiler_buffer",
+)
 
-def _use_plan_queue(case, plan) -> None:
+
+def _use_build_products(case, build) -> None:
+    """Feed a tvm-builder kernel and its host queues into the case harness."""
+
     dev = tvm.cuda(0)
-    if not plan.is_dynamic:
-        case["exec_queue"] = tvm.runtime.tensor(plan.make_static_queue(), dev)
+    # The tvm-built kernel declares the workspace at its exact size.
+    case["etensor_workspace"] = tvm.runtime.tensor(
+        np.zeros((build.event_workspace_size,), dtype=np.int32), dev
+    )
+    case["graph_reset"]["zero"] = [torch.from_dlpack(case[name]) for name in _ZERO_NAMES]
+    if build.scheduler == "static":
+        case["exec_queue"] = tvm.runtime.tensor(build.exec_queue, dev)
         return
 
-    queue = plan.make_dynamic_queue()
     case["graph_reset"].update(
         {
-            "queue_tasks_source": _as_cuda_tensor(queue.tasks.copy()),
-            "queue_head_source": _as_cuda_tensor(queue.head.copy()),
-            "queue_tail_source": _as_cuda_tensor(queue.tail.copy()),
+            "queue_tasks_source": _as_cuda_tensor(build.queue_tasks.copy()),
+            "queue_head_source": _as_cuda_tensor(build.queue_head.copy()),
+            "queue_tail_source": _as_cuda_tensor(build.queue_tail.copy()),
             "queue_tasks": [],
             "queue_head": [],
             "queue_tail": [],
@@ -60,9 +83,9 @@ def _use_plan_queue(case, plan) -> None:
     case["queue_head"] = []
     case["queue_tail"] = []
     for _ in range(case["launch_slots"]):
-        tasks = tvm.runtime.tensor(queue.tasks.copy(), dev)
-        head = tvm.runtime.tensor(queue.head.copy(), dev)
-        tail = tvm.runtime.tensor(queue.tail.copy(), dev)
+        tasks = tvm.runtime.tensor(build.queue_tasks.copy(), dev)
+        head = tvm.runtime.tensor(build.queue_head.copy(), dev)
+        tail = tvm.runtime.tensor(build.queue_tail.copy(), dev)
         case["queue_tasks"].append(tasks)
         case["queue_head"].append(head)
         case["queue_tail"].append(tail)
@@ -79,24 +102,22 @@ def test_megakernel_moe_dsl(batch_size, scheduler):
     except SkipTest as err:
         pytest.skip(str(err))
 
-    spec = build_moe_graph(MEGAKERNEL_MOE_BENCH_CONFIG, batch_size)
-    lowerer = MoeLowerer(policy_for_scheduler(scheduler))
-    plan = lowerer.lower(spec)
-    _, dsl_lib = get_source(lowerer.build_module())
-    dsl_kernel = lowerer.kernel
+    build = build_moe_kernel(MEGAKERNEL_MOE_BENCH_CONFIG, batch_size, scheduler)
+    _, dsl_lib = get_source(build.module)
 
     manual_kernel, manual_libs = _compile_moe_schedulers((scheduler,), batch_size, 1, False)
     _reset_prepare_data_cache()
-    data = dict(prepare_data(batch_size, dsl_kernel))
+    data = dict(prepare_data(batch_size, manual_kernel))
     dsl_case = _make_tir_case(
         batch_size=batch_size,
-        mk=dsl_kernel,
-        lib=dsl_lib,
+        mk=manual_kernel,
+        lib=manual_libs[scheduler],
         scheduler=scheduler,
         data=data,
         launch_slots=1,
     )
-    _use_plan_queue(dsl_case, plan)
+    dsl_case["kernel"] = dsl_lib["qwen3_30b_a3b_moe"]
+    _use_build_products(dsl_case, build)
     manual_case = _make_tir_case(
         batch_size=batch_size,
         mk=manual_kernel,
@@ -110,7 +131,7 @@ def test_megakernel_moe_dsl(batch_size, scheduler):
     _reset_tir_case_for_cuda_graph(manual_case)
     _validate_tir_case(
         {"tir": dsl_case, "tir_reference": manual_case, "cpu_data": data},
-        dsl_kernel,
+        manual_kernel,
         check_torch=batch_size <= 128,
     )
     torch.cuda.synchronize()
