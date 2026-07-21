@@ -691,14 +691,17 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
         k.cp_async_bulk_wait_group_read(0)
         k.wg_sync(barrier_id=10)
 
-    # Cluster-wide barrier before the TMEM teardown (canon's `cluster_sync()`
-    # right before relinquish + dealloc): both CTAs' MMA writes and epilogue
-    # TMEM reads must be done before either CTA frees the shared band — the
-    # checker requires the happens-before edge, not just drained task loops.
-    k.cluster_sync()
+    # TMEM teardown BEFORE the closing cluster_sync — canon's exact order
+    # (tirx_kernels/gemm/fp8_blockwise_gemm.py:505-506: `tmem_pool.dealloc()`
+    # then `T.cuda.cluster_sync()`): warp 0 frees the shared band once the MMA
+    # writes and epilogue TMEM reads are drained on their own streams (the
+    # tmem_full/tmem_empty mbar waits and the epilogue's tcgen05 ld drains —
+    # the checker's drain path, not a pre-dealloc barrier); the cluster_sync
+    # afterwards is canon's cluster-exit rendezvous, not a lifetime edge.
     with k.kernel_finalize(warp=0):
         k.tmem_relinquish(cta_group)
         k.tmem_dealloc(0, N_COLS_TMEM, cta_group)
+    k.cluster_sync()
 
     return k.build()
 

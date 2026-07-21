@@ -440,16 +440,15 @@ def build_flash_attention4(config: FlashAttention4Config = FlashAttention4Config
         seq_q_per_tile,
     )
 
-    # CTA-wide (cta_group=2: cluster-wide) barrier before the TMEM teardown:
-    # the last task's TMEM writes/reads (e.g. a softmax wg's tcgen05_st) do NOT
-    # all reach warp 0 through the task handshakes — the scheduler drains
-    # without another round-trip for the final iteration — so warp 0 could
-    # dealloc while another warpgroup's access is still in flight. The checker
-    # requires the happens-before edge; canon has the barrier.
-    if config.cta_group == 2:
-        k.cluster_sync()
-    else:
-        k.cta_sync()
+    # No final cta/cluster sync before the TMEM teardown — matching canon
+    # (tirx_kernels/attention/flash_attention4.py:1015-1022, which DELETED this
+    # barrier): warp 0's dealloc/relinquish needs no CTA-wide rendezvous, there
+    # is no post-exit SMEM/TMEM reuse, and canon verified the shape 50x on GPU
+    # (dropping the fully-exposed tail barrier costs ~11% of stall samples on
+    # single-task causal shapes). The checker proves every role's TMEM access
+    # is DRAINED on its own stream (tcgen05.wait::ld/st in the epilogue loops,
+    # commit->mbar waits for the MMA pipe) instead of requiring the barrier
+    # happens-before edge.
     with k.kernel_finalize(warp=0):
         k.tmem_relinquish(config.cta_group)
         k.tmem_dealloc(0, N_COLS_TMEM, config.cta_group)
