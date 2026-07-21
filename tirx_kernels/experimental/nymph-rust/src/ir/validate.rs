@@ -1642,7 +1642,7 @@ fn validate_stmt(s: &Stmt) -> R {
 
         Stmt::Fence { .. } => {}
         Stmt::CtaSync | Stmt::WarpSync | Stmt::ClusterSync => {}
-        Stmt::ClusterBarrierArrive | Stmt::ClusterBarrierWait => {}
+        Stmt::ClusterBarrierArrive { .. } | Stmt::ClusterBarrierWait => {}
         Stmt::WgSync { barrier_id } => {
             if *barrier_id < 1 || *barrier_id > 15 {
                 return bail("wg_sync barrier_id must be an integer in [1, 15]");
@@ -1883,10 +1883,10 @@ fn check_context(
             // inside a role (the whole point — idle warps skip it, active roles defer it
             // past their local setup). The checker verifies a role can't touch peer
             // state before its wait (premature peer mbarrier access errors).
-            Stmt::ClusterBarrierArrive if inside_role => {
+            Stmt::ClusterBarrierArrive { .. } if inside_role => {
                 return bail("cluster_barrier_arrive cannot be used inside role")
             }
-            Stmt::ClusterBarrierArrive if scope != Scope::Cta => {
+            Stmt::ClusterBarrierArrive { .. } if scope != Scope::Cta => {
                 return bail("cluster_barrier_arrive must be in CTA scope")
             }
             Stmt::ShuffleSync { .. } if scope == Scope::Single => {

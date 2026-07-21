@@ -151,7 +151,7 @@ pub fn stmt_kind(stmt: &Stmt) -> StmtKind {
         Stmt::NamedBarrier { .. } => StmtKind::NamedBarrier,
         Stmt::WarpSync => StmtKind::WarpSync,
         Stmt::ClusterSync => StmtKind::ClusterSync,
-        Stmt::ClusterBarrierArrive => StmtKind::ClusterBarrierArrive,
+        Stmt::ClusterBarrierArrive { .. } => StmtKind::ClusterBarrierArrive,
         Stmt::ClusterBarrierWait => StmtKind::ClusterBarrierWait,
         Stmt::SetMaxNReg { .. } => StmtKind::SetMaxNReg,
     }

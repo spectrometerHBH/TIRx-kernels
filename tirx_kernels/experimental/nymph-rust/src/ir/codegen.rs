@@ -3780,10 +3780,13 @@ fn emit_stmt(
             out.push_str(&format!("{p}T.cuda.cluster_sync()\n"));
             Ok(())
         }
-        ClusterBarrierArrive => {
+        ClusterBarrierArrive { sem } => {
             // Split cluster barrier, collective non-blocking arrival (all threads).
+            // `sem` is emitted 1:1 — canon's `.relaxed` carries no release ordering
+            // (PTX §9.7.14.3); the checker only propagates memory HB for `.release`.
             out.push_str(&format!(
-                "{p}T.ptx.barrier.cluster.arrive(sem=\"relaxed\", aligned=True)\n"
+                "{p}T.ptx.barrier.cluster.arrive(sem=\"{}\", aligned=True)\n",
+                sem.as_str()
             ));
             Ok(())
         }

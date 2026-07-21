@@ -315,6 +315,37 @@ impl GmemAtomicOrder {
     }
 }
 
+/// Memory semantics of the split cluster barrier's ARRIVE side
+/// (`barrier.cluster.arrive sem`). Canon emits `.relaxed`: the arrival only
+/// UNBLOCKS the per-role waits (control order) — per PTX §9.7.14.3 it carries
+/// NO release ordering for the cohort's prior memory accesses (canon's memory
+/// order comes from `fence.mbarrier_init` / the mbarrier pipeline instead).
+/// `.release` additionally publishes the arriving cohort's prior accesses, so
+/// the protocol checker propagates a memory happens-before edge to the waits.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ClusterBarrierSem {
+    #[default]
+    Relaxed,
+    Release,
+}
+
+impl ClusterBarrierSem {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClusterBarrierSem::Relaxed => "relaxed",
+            ClusterBarrierSem::Release => "release",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "relaxed" => Some(ClusterBarrierSem::Relaxed),
+            "release" => Some(ClusterBarrierSem::Release),
+            _ => None,
+        }
+    }
+}
+
 /// `Stmt` — one statement of the kernel body. `cta_group` fields are 1 or 2;
 /// `*_mask` are 16-bit CTA masks.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -854,8 +885,12 @@ pub enum Stmt {
     /// cluster-barrier latency from each role's local setup, and idle warps skip the
     /// wait. Modeled faithfully (unlike a codegen-synthesized split of the fused
     /// `ClusterSync`) so the protocol checker verifies every role waits before any
-    /// cross-CTA (peer mbarrier) access.
-    ClusterBarrierArrive,
+    /// cross-CTA (peer mbarrier) access. `sem` is the PTX memory semantics —
+    /// canon's `.relaxed` (the default): control order only, NO memory
+    /// happens-before (see `ClusterBarrierSem`).
+    ClusterBarrierArrive {
+        sem: ClusterBarrierSem,
+    },
     /// Split cluster barrier — WAIT side. Blocks the calling role until all threads
     /// of the cluster have executed `ClusterBarrierArrive`. Allowed inside a role
     /// (unlike `ClusterSync`).

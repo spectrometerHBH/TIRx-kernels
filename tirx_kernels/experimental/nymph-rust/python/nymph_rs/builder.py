@@ -1152,11 +1152,15 @@ class IRBuilder:
     def cluster_sync(self) -> None:
         self._append(ClusterSync())
 
-    def cluster_barrier_arrive(self) -> None:
+    def cluster_barrier_arrive(self, sem: str = "relaxed") -> None:
         """Split cluster barrier — collective non-blocking arrival (CTA scope, all
         threads). Pair with per-role ``cluster_barrier_wait``: decouples the
-        cluster-barrier latency from each role's setup; idle warps skip the wait."""
-        self._append(ClusterBarrierArrive())
+        cluster-barrier latency from each role's setup; idle warps skip the wait.
+        ``sem`` is the PTX memory semantics: canon's ``"relaxed"`` (default) only
+        unblocks the waits — it carries NO release ordering for prior accesses
+        (PTX §9.7.14.3), so the checker proves cross-CTA memory order from the
+        mbarrier pipeline instead; ``"release"`` additionally publishes them."""
+        self._append(ClusterBarrierArrive(sem=sem))
 
     def cluster_barrier_wait(self) -> None:
         """Split cluster barrier — per-role wait. Blocks until all cluster threads have

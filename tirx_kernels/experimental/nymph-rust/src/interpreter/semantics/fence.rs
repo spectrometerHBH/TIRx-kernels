@@ -29,6 +29,7 @@ fn execute_fence<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IRe
 fn fence_event_kind(kind: FenceKind) -> FenceEventKind {
     match kind {
         FenceKind::AsyncProxy => FenceEventKind::ProxyAsync,
-        FenceKind::Memory | FenceKind::View | FenceKind::MbarrierInit => FenceEventKind::Generic,
+        FenceKind::MbarrierInit => FenceEventKind::MbarrierInit,
+        FenceKind::Memory | FenceKind::View => FenceEventKind::Generic,
     }
 }

@@ -49,15 +49,21 @@ fn cluster_barrier_key(first: &ThreadId) -> String {
 /// CONTINUES — non-blocking, unlike the fused `ClusterSync` rendezvous. The matching
 /// per-role `ClusterBarrierWait`s block until the set is complete. Modeled as a
 /// one-shot collective (the prologue issues it exactly once before the role loops).
-/// The arrive emits a `ClusterBarrierArrive` trace event (a RELEASE: hardware
-/// `barrier.cluster.arrive` is `.release` by default); the checker's ordering
-/// analysis publishes the join of all arrivals once the set is complete, and each
-/// passing wait acquires it — that edge is what proves the prologue inits/alloc
-/// happen-before any role's peer-visible accesses.
+/// The arrive emits a `ClusterBarrierArrive` trace event carrying the stmt's memory
+/// `sem`: canon's `.relaxed` carries NO release ordering (PTX §9.7.14.3), so the
+/// checker's ordering analysis only publishes a memory happens-before edge for
+/// `.release`; the deadlock graph witnesses the waits against the arrival set
+/// either way (control order). The release edge is what can prove prologue
+/// inits/alloc happen-before a role's peer-visible accesses — with `.relaxed`
+/// that proof must come from the mbarrier pipeline, as in canon.
 fn execute_cluster_barrier_arrive<'a, 'k>(
     ctx: &mut CohortContext<'a, 'k>,
-    _stmt: &'k Stmt,
+    stmt: &'k Stmt,
 ) -> IResult<StepStatus> {
+    let sem = match stmt {
+        Stmt::ClusterBarrierArrive { sem } => *sem,
+        _ => unreachable!(),
+    };
     let first = ctx.cohort[0].clone();
     let expected: HashSet<ThreadId> = cluster_threads(ctx, &first).into_iter().collect();
     let arriving: HashSet<ThreadId> = ctx.cohort.iter().cloned().collect();
@@ -81,6 +87,7 @@ fn execute_cluster_barrier_arrive<'a, 'k>(
         ctx.emit(TraceEventKind::ClusterBarrierArrive {
             thread_count: expected.len(),
             count: arrived_count,
+            sem: sem.into(),
             scope: ctx.access_scope(),
         })?;
     }

@@ -651,11 +651,19 @@ fn event_to_py<'py>(py: Python<'py>, event: &TraceEvent) -> PyResult<Bound<'py, 
         TraceEventKind::ClusterBarrierArrive {
             thread_count,
             count,
+            sem,
             scope,
         } => {
             out.set_item("kind", "cluster_barrier_arrive")?;
             out.set_item("thread_count", thread_count)?;
             out.set_item("count", count)?;
+            out.set_item(
+                "sem",
+                match sem {
+                    crate::interpreter::protocol::ClusterBarrierSemEvent::Relaxed => "relaxed",
+                    crate::interpreter::protocol::ClusterBarrierSemEvent::Release => "release",
+                },
+            )?;
             out.set_item("scope", scope_to_py(py, scope)?)?;
         }
         TraceEventKind::ClusterBarrierWait { scope } => {
@@ -2732,9 +2740,12 @@ fn cluster_sync() -> PyStmt {
     PyStmt(ir::Stmt::ClusterSync)
 }
 #[pyfunction]
-#[pyo3(name = "ClusterBarrierArrive")]
-fn cluster_barrier_arrive() -> PyStmt {
-    PyStmt(ir::Stmt::ClusterBarrierArrive)
+#[pyo3(name = "ClusterBarrierArrive", signature = (sem = "relaxed"))]
+fn cluster_barrier_arrive(sem: &str) -> PyResult<PyStmt> {
+    let sem = ir::ClusterBarrierSem::parse(sem).ok_or_else(|| {
+        PyRuntimeError::new_err("cluster_barrier_arrive sem must be 'relaxed' or 'release'")
+    })?;
+    Ok(PyStmt(ir::Stmt::ClusterBarrierArrive { sem }))
 }
 #[pyfunction]
 #[pyo3(name = "ClusterBarrierWait")]

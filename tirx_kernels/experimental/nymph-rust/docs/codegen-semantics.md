@@ -136,7 +136,7 @@ parameters. An SF-classified tensor with a non-e4m3 dtype is an `Err`.
 | `Fence` | `MbarrierInit` → `fence.mbarrier_init()`; `AsyncProxy` → `fence.proxy_async(space)` with the IR `scope` lowered 1:1 — `Cta` → `"shared::cta"`, `Cluster` → `"shared::cluster"`, `Gpu` → the unqualified form (orders every address space); **all-thread at function scope, single-thread (`if tid_in_wg==0:`) in a role**. `Memory`/`View` are sim-only ordering markers — codegen `Err` | scope-based, generic; the kind and scope are read off the node |
 | `CtaSync` | `T.cuda.cta_sync()` — **only at function scope** (a partial-CTA `__syncthreads` is illegal) | scope-based |
 | `ClusterSync` | `T.cuda.cluster_sync()` | 1:1 |
-| `ClusterBarrierArrive` | `T.ptx.barrier.cluster.arrive(sem="relaxed", aligned=True)` | 1:1 |
+| `ClusterBarrierArrive` | `T.ptx.barrier.cluster.arrive(sem="<sem>", aligned=True)` | 1:1 — the IR `sem` (`relaxed` default, canon's emission / `release`) is emitted verbatim; a relaxed arrive carries no memory happens-before (PTX §9.7.14.3) |
 | `ClusterBarrierWait` | `T.ptx.barrier.cluster.wait(acquire=True, aligned=False)`; **errors** (`Err`) if reached under `Scope::Elected` | a guard, not a shape — a single-thread cluster wait deadlocks, so the codegen fails loudly instead of emitting it |
 | `WarpSync` | nothing (the elect/issue structure already orders the warp) | — |
 | `WgSync` | `T.cuda.warpgroup_sync(barrier_id)` | 1:1 |

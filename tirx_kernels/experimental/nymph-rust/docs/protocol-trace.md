@@ -85,12 +85,12 @@ lanes.
 | `TmemWait` | `async_kind`, `scope` | A TMEM async wait marker. This is not a memory access. |
 | `TmemAlloc` | `cta_ids`, `region`, `scope` | TMEM allocation metadata was installed. |
 | `TmemDealloc` | `cta_ids`, `region`, `scope` | TMEM allocation metadata was removed. |
-| `Fence` | `fence_kind`, `fence_scope`, `scope` | A generic or proxy-async fence was executed. |
+| `Fence` | `fence_kind`, `fence_scope`, `scope` | A generic / proxy-async / mbarrier-init fence was executed. |
 | `CommitGroup` | `scope` | A cp.async bulk commit group marker was executed. |
 | `WaitGroup` | `n`, `scope` | A cp.async bulk wait group marker was executed. |
 | `MbarInit` / `MbarArrive` / `MbarExpectTx` / `MbarCompleteTx` / `MbarWait` | mbar target/count/phase fields plus `scope` | Mbarrier state-machine events. |
 | `SyncArrive` / `Sync` | sync kind, count/thread count, cycle, optional bar id, `scope` | Sync arrival and completion events. |
-| `ClusterBarrierArrive` / `ClusterBarrierWait` | thread count, cumulative count, `scope` (wait: `scope` only) | Split cluster barrier: the non-blocking arrive (a release; emitted once per cluster thread cohort in the prologue) and a passing per-role wait (an acquire). |
+| `ClusterBarrierArrive` / `ClusterBarrierWait` | thread count, cumulative count, `sem`, `scope` (wait: `scope` only) | Split cluster barrier: the non-blocking arrive (emitted once per cluster thread cohort in the prologue) and a passing per-role wait (an acquire). The arrive's memory order is `sem`-gated: `release` publishes; `relaxed` publishes only when every arriving warp chain is fence-sealed (canon's prologue `fence.proxy_async` / `fence.mbarrier_init`), otherwise it carries control order only (PTX §9.7.14.3). |
 | `SchedulerNext` | scheduler id, CTA id, task id, `scope` | Dynamic scheduler handoff. |
 
 Every event carries `stmt_id` and `stmt_kind`.
