@@ -19,7 +19,7 @@
 
 from __future__ import annotations
 
-from tirx_kernels.megakernel.kernels import (
+from tirx_kernels.megakernel.tile_tasks import (
     CountAndSortExpertTokens,
     GemmTile,
     GroupGEMMTileSM100,

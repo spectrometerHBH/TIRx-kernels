@@ -25,7 +25,7 @@ import numpy as np
 import torch
 
 import tvm
-from tirx_kernels.megakernel.kernels import (
+from tirx_kernels.megakernel.tile_tasks import (
     CountAndSortExpertTokens,
     GemmTile,
     GroupGEMMSiluTile,
