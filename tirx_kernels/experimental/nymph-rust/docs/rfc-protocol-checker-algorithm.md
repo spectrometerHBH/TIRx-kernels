@@ -237,7 +237,12 @@ Cross-stream conflicting overlaps without ordering are trace gaps.
 ### `tmem_lifecycle_order`
 
 Allocation and deallocation regions must match exactly. Every TMEM memory
-access must be covered by an active allocation region using byte-box coverage.
+access must be covered by an active allocation region using byte-box coverage,
+and provably live inside one explicit generation interval: a re-allocation
+must be happens-before-after the previous generation's dealloc, and each
+access must bind to a generation (happens-before-after its alloc, before its
+dealloc intervenes) and be happens-before that generation's dealloc — or, at
+kernel teardown only, be drained on its own stream (see LIMITATIONS.md).
 
 ### `proxy_fence`
 

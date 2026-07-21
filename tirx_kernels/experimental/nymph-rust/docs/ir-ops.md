@@ -142,17 +142,28 @@ re-checks base_col/cta_group per op (it is reachable without validate);
 before this batch it dropped both fields via `..`, emitting one alloc for
 any number of IR bands. Walk 4 also rejects lifecycle ops (alloc/dealloc/
 relinquish) nested inside a `ForLoop`/`Loop`/`If`/`ForEachTask`/
-`SchedulerImpl` body — a loop-carried lifecycle is only safe under a
-path-sensitive analysis the IR does not have yet (a `for_loop(stop=2)`
-alloc passed the one-pass walk but double-allocated on iteration two).
+`SchedulerImpl` body OR inside a nested `Role` body — a loop-carried or
+subset-cohort lifecycle is only safe under a path-sensitive analysis the
+IR does not have yet (a `for_loop(stop=2)` alloc passed the one-pass walk
+but double-allocated on iteration two; a `Role(warp0){ Role(warp1){ … } }`
+alloc never executed and only the protocol check reported it missing).
 
 The protocol checker's `tmem_lifecycle_order` pass proves the lifetime
-against ALL legal interleavings, not the sampled one: every TMEM access
-must be happens-before-after a covering alloc and happens-before-before
-its dealloc (cross-stream edges must come from real synchronization —
-mbar handshakes, fused cta/cluster syncs, the split cluster barrier —
-recorded in `OrderingAnalysis`; the sampled epoch interleaving alone
-proves nothing). Missing edges fail `tmem_lifecycle_hb_missing`.
+against ALL legal interleavings, not the sampled one, over explicit
+per-band generation intervals (alloc_i, dealloc_i): a re-allocation must be
+happens-before-after the previous generation's dealloc; every TMEM access
+binds to the unique generation whose alloc is happens-before it without
+that dealloc intervening (no binding →
+`tmem_lifecycle_use_without_allocation`); and a bound access must be
+happens-before its generation's dealloc (cross-stream edges must come from
+real synchronization — mbar handshakes, fused cta/cluster syncs, a
+fence-sealed split cluster barrier — recorded in `OrderingAnalysis`; the
+sampled epoch interleaving alone proves nothing). One relaxation, scoped
+to the kernel-TEARDOWN dealloc (`KernelFinalize`): an access drained on
+its own stream (`tcgen05.wait::ld/st`, or a `tcgen05.commit` whose mbar
+is waited) counts as complete without the barrier edge — canon's
+GPU-verified teardown shape, see LIMITATIONS.md. Missing edges fail
+`tmem_lifecycle_hb_missing`.
 
 ## tcgen05.ld / tcgen05.st codegen support set
 

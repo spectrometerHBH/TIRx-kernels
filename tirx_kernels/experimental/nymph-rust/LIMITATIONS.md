@@ -20,6 +20,22 @@ Per-op detail lives in `docs/ir-ops.md`; this file is the short trust boundary.
 
 ## Modeled-differently-than-hardware
 
+- **TMEM teardown accepts drain-proven (not barrier-proven) completion**: for
+  the kernel-TEARDOWN dealloc (inside `KernelFinalize`) the lifecycle checker
+  accepts a TMEM access that is retired by the hardware completion mechanism
+  on its OWN stream — `tcgen05.wait::ld/st`, or a `tcgen05.commit` whose mbar
+  is waited anywhere in the trace — in lieu of a happens-before edge to the
+  deallocating warp. This is a deliberate relaxation: it proves each access
+  COMPLETED before kernel end, but not that it completed before the dealloc
+  executed (no rendezvous orders the two warps). Basis: canon's identical
+  teardown shape — flash_attention4 deletes the tail barrier outright
+  (tirx_kernels/attention/flash_attention4.py:1015-1022, 50x reused-module
+  GPU verify PASS) and fp8_blockwise_gemm deallocs BEFORE its closing
+  cluster_sync (tirx_kernels/gemm/fp8_blockwise_gemm.py:505-506) — both
+  GPU-validated upstream. Mid-kernel generations get NO such relaxation:
+  re-alloc requires the previous dealloc's happens-before edge, and a
+  non-teardown dealloc still requires barrier edges from every access.
+  A bare (never-drained) access fails even at teardown.
 - **cg2 multicast into a SHARED (leader) mbar**: sim dedups tx-count per unique
   cell; HW signals each destination (2x bytes). Validate now rejects this
   combination — do not re-enable without fixing the sim model.

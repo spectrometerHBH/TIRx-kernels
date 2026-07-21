@@ -144,6 +144,11 @@ struct CheckerCx<'a> {
     event_index: EventIndex<'a>,
     region_audit: TraceRegionAudit,
     ordering: OrderingAnalysis,
+    /// Stmt ids of `TmemDealloc` statements nested in a `KernelFinalize` body —
+    /// the kernel TEARDOWN dealloc. Only these accept the drain-proven (instead
+    /// of barrier-proven) completion of in-flight TMEM accesses; see
+    /// `tmem_drained_accesses` and LIMITATIONS.md.
+    teardown_dealloc_stmts: HashSet<usize>,
     gaps: Vec<TraceGap>,
     diagnostics: Vec<Diagnostic>,
     warnings: Vec<super::protocol::ProtocolWarning>,
@@ -155,6 +160,7 @@ impl<'a> CheckerCx<'a> {
             event_index: EventIndex::new(events),
             region_audit: TraceRegionAudit::new(kernel),
             ordering: OrderingAnalysis::empty(),
+            teardown_dealloc_stmts: teardown_dealloc_stmt_ids(kernel),
             gaps: Vec::new(),
             diagnostics: Vec::new(),
             warnings: Vec::new(),
@@ -1420,14 +1426,18 @@ fn tmem_lifecycle_order_local(cx: &mut CheckerCx<'_>) -> CheckResult {
     // structural pairing proofs: no overlapping live allocations, every access
     // covered by an active allocation, every dealloc matching an active one.
     // The HB layer then proves the hardware lifetime constraint (PTX
-    // §9.7.17.7.1) against ALL legal interleavings, not just the sampled one:
-    // every access must be happens-before-after a covering alloc, and every
-    // dealloc must be happens-before-after its alloc and every access of its
-    // generation. Within one stream program order supplies the edges; across
-    // streams they must come from real synchronization (mbar / barrier /
-    // semaphore edges in `OrderingAnalysis`) — an alloc in kernel_init and an
-    // access in a role on another warp have NO edge without one, however the
-    // sampled schedule happened to interleave the epochs.
+    // §9.7.17.7.1) against ALL legal interleavings, not just the sampled one,
+    // over EXPLICIT per-band generation intervals (alloc_i, dealloc_i):
+    // re-allocations must be happens-before-after the previous generation's
+    // dealloc, each access binds to the unique generation whose alloc is
+    // happens-before it without the dealloc intervening, and a bound access
+    // must be happens-before its generation's dealloc (or, at kernel teardown
+    // only, drain-proven on its own stream). Within one stream program order
+    // supplies the edges; across streams they must come from real
+    // synchronization (mbar / barrier / semaphore edges in `OrderingAnalysis`)
+    // — an alloc in kernel_init and an access in a role on another warp have
+    // NO edge without one, however the sampled schedule happened to interleave
+    // the epochs.
     let mut active: HashMap<PoolId, Vec<(usize, Region)>> = HashMap::new();
     // alloc event idx -> paired dealloc event idx (region-equality match).
     let mut paired_dealloc: HashMap<usize, usize> = HashMap::new();
@@ -1492,69 +1502,226 @@ fn tmem_lifecycle_order_local(cx: &mut CheckerCx<'_>) -> CheckResult {
         }
     }
 
-    // Access-side HB: some covering alloc must be provably ordered before the
-    // access, and the access before that alloc's dealloc (when the band is
-    // deallocated at all).
+    // === HB layer: explicit per-band GENERATION intervals ===
+    // The sampled pairing above makes (alloc_i, dealloc_i) generations explicit.
+    // Three proof obligations replace the old sampled-pairing sweep:
+    //
+    // 1. CROSS-GENERATION: a re-allocation overlapping an earlier band must be
+    //    happens-before-AFTER that generation's dealloc (PTX §9.7.17.7.1 allows
+    //    repeated allocs — validate checks the size never grows — but the
+    //    re-alloc must not alias a generation another warp may still be
+    //    freeing). The old sweep never checked this edge, so an unsynchronized
+    //    dealloc -> realloc across warps passed.
+    for bands in allocs.values() {
+        for (j, (alloc_j, region_j)) in bands.iter().enumerate() {
+            for (alloc_i, region_i) in &bands[..j] {
+                if !regions_overlap(region_i, region_j) {
+                    continue;
+                }
+                // `alloc_i` overlaps and precedes `alloc_j`, so the sampled walk
+                // already proved it inactive at `alloc_j` — it has a dealloc.
+                let Some(dealloc_i) = paired_dealloc.get(alloc_i) else {
+                    continue;
+                };
+                if !cx.ordering.happens_before(*dealloc_i, *alloc_j) {
+                    let event = &cx.event_index.events[*alloc_j];
+                    return Err(cx.fail(
+                        "tmem_lifecycle_hb_missing",
+                        "TMEM re-allocation has no happens-before edge from the \
+                         previous generation's deallocation; the freeing warp and \
+                         the re-allocating warp must synchronize (mbar / barrier), \
+                         not just sample a favorable interleaving",
+                        Some(event),
+                    ));
+                }
+            }
+        }
+    }
+    // 2. ACCESS BINDING: each access binds to the UNIQUE generation of a
+    //    covering band that is happens-before it WITHOUT that generation's
+    //    dealloc intervening — HB(alloc_i, access) && !HB(dealloc_i, access).
+    //    (An access happens-before-after the old dealloc belongs to a LATER
+    //    generation; the old generation must not claim it — the old sweep did,
+    //    and rejected the legal same-warp alloc/dealloc/alloc/access/dealloc.)
+    //    - no binding generation        -> use-without-allocation (the access is
+    //      provably inside NO allocation's lifetime);
+    //    - bound to gen i but the access is NOT HB-before dealloc_i
+    //      -> hb_missing, UNLESS dealloc_i is the kernel-TEARDOWN dealloc and the
+    //      access is DRAIN-proven on its own stream (tcgen05.wait::ld/st, or a
+    //      tcgen05.commit whose mbar is waited): the hardware completion
+    //      mechanism — not a barrier rendezvous — retires it before the band is
+    //      freed at kernel end (canon's teardown shape; the relaxation and its
+    //      GPU-verification basis are recorded in LIMITATIONS.md).
+    let drained = tmem_drained_accesses(cx.event_index.events);
     for (access_idx, region) in &accesses {
         let event = &cx.event_index.events[*access_idx];
-        let ordered = allocs.get(&region.owner).is_some_and(|bands| {
-            bands.iter().any(|(alloc_idx, band)| {
-                region_covers(band, region)
-                    && cx.ordering.happens_before(*alloc_idx, *access_idx)
-                    && paired_dealloc.get(alloc_idx).is_none_or(|dealloc_idx| {
-                        cx.ordering.happens_before(*access_idx, *dealloc_idx)
-                    })
-            })
-        });
-        if !ordered {
+        let mut bound = false;
+        let mut proven = false;
+        if let Some(bands) = allocs.get(&region.owner) {
+            for (alloc_idx, band) in bands {
+                if !region_covers(band, region)
+                    || !cx.ordering.happens_before(*alloc_idx, *access_idx)
+                {
+                    continue;
+                }
+                match paired_dealloc.get(alloc_idx) {
+                    // never deallocated: bound, nothing more to prove
+                    None => {
+                        bound = true;
+                        proven = true;
+                    }
+                    // access happens-after this dealloc -> a LATER generation's
+                    Some(dealloc_idx) if cx.ordering.happens_before(*dealloc_idx, *access_idx) => {}
+                    // bound to this generation
+                    Some(dealloc_idx) => {
+                        bound = true;
+                        if cx.ordering.happens_before(*access_idx, *dealloc_idx) {
+                            proven = true;
+                            continue;
+                        }
+                        let dealloc_event = &cx.event_index.events[*dealloc_idx];
+                        if cx.teardown_dealloc_stmts.contains(&dealloc_event.stmt_id)
+                            && drained.contains(access_idx)
+                        {
+                            proven = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !bound {
+            return Err(cx.fail(
+                "tmem_lifecycle_use_without_allocation",
+                "TMEM access is inside no allocation's lifetime: no covering \
+                 allocation is happens-before it (without its deallocation \
+                 intervening); cross-stream lifetime needs a real sync (mbar / \
+                 barrier), not just a favorable sampled interleaving",
+                Some(event),
+            ));
+        }
+        if !proven {
             return Err(cx.fail(
                 "tmem_lifecycle_hb_missing",
-                "TMEM access has no happens-before edge from a covering allocation \
-                 (and to its deallocation); cross-stream lifetime needs a real sync \
-                 (mbar / barrier), not just a favorable sampled interleaving",
+                "TMEM deallocation has no happens-before edge from an access to \
+                 its band; the accessing warp must synchronize with the \
+                 deallocating warp (and, for cta_group=2, across the CTA pair) \
+                 before the band is freed — or, at kernel teardown, drain the \
+                 access on its own stream (tcgen05.wait / commit+mbar-wait)",
                 Some(event),
             ));
         }
     }
-
-    // Dealloc-side HB: the dealloc must follow its alloc and every access of
-    // that alloc's generation (accesses HB-after the alloc that overlap the
-    // band). Rogue accesses not HB-after any covering alloc already failed
-    // above; an access HB-after this alloc but unordered w.r.t. the dealloc
-    // could still execute after it on hardware — reject.
+    // 3. GENERATION-INTERNAL: the dealloc follows its own alloc. (Checked LAST:
+    //    an unsynchronized three-role split usually ALSO strands an access, and
+    //    the access-binding diagnostic below is the more actionable one.)
     for (alloc_idx, dealloc_idx) in &paired_dealloc {
-        let dealloc_event = &cx.event_index.events[*dealloc_idx];
-        let TraceEventKind::TmemDealloc { region, .. } = &dealloc_event.payload else {
-            unreachable!()
-        };
         if !cx.ordering.happens_before(*alloc_idx, *dealloc_idx) {
+            let dealloc_event = &cx.event_index.events[*dealloc_idx];
             return Err(cx.fail(
                 "tmem_lifecycle_hb_missing",
                 "TMEM deallocation has no happens-before edge from its allocation",
                 Some(dealloc_event),
             ));
         }
-        for (access_idx, access_region) in &accesses {
-            if access_region.owner != region.owner
-                || !regions_overlap(access_region, region)
-                || !cx.ordering.happens_before(*alloc_idx, *access_idx)
-            {
-                continue;
+    }
+    Ok(())
+}
+
+/// Stmt ids of the `TmemDealloc` statements nested in a `KernelFinalize` body
+/// (the kernel teardown), numbered by the same pre-order walk `IdSpace::discover`
+/// uses, so trace events keyed by stmt id match.
+fn teardown_dealloc_stmt_ids(kernel: &Kernel) -> HashSet<usize> {
+    fn walk(body: &[Stmt], in_finalize: bool, next: &mut usize, ids: &mut HashSet<usize>) {
+        for stmt in body {
+            let id = *next;
+            *next += 1;
+            if in_finalize && matches!(stmt, Stmt::TmemDealloc { .. }) {
+                ids.insert(id);
             }
-            if !cx.ordering.happens_before(*access_idx, *dealloc_idx) {
-                let event = &cx.event_index.events[*access_idx];
-                return Err(cx.fail(
-                    "tmem_lifecycle_hb_missing",
-                    "TMEM deallocation has no happens-before edge from an access to \
-                     its band; the accessing warp must synchronize with the \
-                     deallocating warp (and, for cta_group=2, across the CTA pair) \
-                     before the band is freed",
-                    Some(event),
-                ));
+            let child_finalize = in_finalize || matches!(stmt, Stmt::KernelFinalize { .. });
+            for body in stmt.child_bodies() {
+                walk(body, child_finalize, next, ids);
             }
         }
     }
-    Ok(())
+    let mut ids = HashSet::new();
+    let mut next = 0usize;
+    walk(&kernel.body, false, &mut next, &mut ids);
+    ids
+}
+
+/// Drain-proven TMEM accesses: the async access is retired by the HARDWARE
+/// completion mechanism on its OWN stream — a `tcgen05.wait::ld/st` (same
+/// stream, matching kind), or a `tcgen05.commit` (same stream; pipe-wide for
+/// mma/cp) whose mbar cell is waited ANYWHERE in the trace (a parked wait can
+/// precede the commit in trace order, so presence — not position — is the
+/// witness, mirroring `tcgen05_async_hazard`). An access drained on its own
+/// stream is COMPLETE whenever the kernel-teardown dealloc runs, so the
+/// lifecycle proof accepts it without a cross-warp barrier edge (teardown
+/// only — see `tmem_lifecycle_order_local` and LIMITATIONS.md).
+fn tmem_drained_accesses(events: &[TraceEvent]) -> HashSet<usize> {
+    type CellKey = (u32, usize, usize, u32);
+    fn cell_key(target: &super::protocol::MbarTargetEvent) -> CellKey {
+        (
+            target.mbar_id,
+            target.cluster_id,
+            target.ctaid_in_cluster,
+            target.stage,
+        )
+    }
+    let waited: HashSet<CellKey> = events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            TraceEventKind::MbarWait { target, .. } => Some(cell_key(target)),
+            _ => None,
+        })
+        .collect();
+    let mut pending: HashMap<usize, Vec<(usize, super::protocol::TmemAsyncKind)>> = HashMap::new();
+    let mut drained = HashSet::new();
+    for (idx, event) in events.iter().enumerate() {
+        match &event.payload {
+            TraceEventKind::Read {
+                access_kind: MemoryAccessKind::Tmem(kind),
+                scope,
+                ..
+            }
+            | TraceEventKind::Write {
+                access_kind: MemoryAccessKind::Tmem(kind),
+                scope,
+                ..
+            } => {
+                pending
+                    .entry(scope.stream_id)
+                    .or_default()
+                    .push((idx, *kind));
+            }
+            TraceEventKind::TmemWait { async_kind, scope } => {
+                if let Some(list) = pending.get_mut(&scope.stream_id) {
+                    let (done, keep): (Vec<_>, Vec<_>) =
+                        list.drain(..).partition(|(_, kind)| kind == async_kind);
+                    drained.extend(done.into_iter().map(|(idx, _)| idx));
+                    *list = keep;
+                }
+            }
+            TraceEventKind::MbarArrive { target, scope, .. }
+                if event.stmt_kind == "Tcgen05Commit" && waited.contains(&cell_key(target)) =>
+            {
+                if let Some(list) = pending.get_mut(&scope.stream_id) {
+                    let (done, keep): (Vec<_>, Vec<_>) = list.drain(..).partition(|(_, kind)| {
+                        matches!(
+                            kind,
+                            super::protocol::TmemAsyncKind::Mma
+                                | super::protocol::TmemAsyncKind::Cp
+                        )
+                    });
+                    drained.extend(done.into_iter().map(|(idx, _)| idx));
+                    *list = keep;
+                }
+            }
+            _ => {}
+        }
+    }
+    drained
 }
 
 fn memory_race_check(cx: &mut CheckerCx<'_>) -> CheckResult {
@@ -5158,7 +5325,8 @@ mod tests {
         // ld / dealloc one TMEM band. The SAMPLED order (alloc -> ld -> dealloc)
         // covers the access, so the old sampled-order check passed it — but a
         // legal hardware interleaving runs the ld (or the dealloc) first. The
-        // HB-based check must reject: no sync edge, no proof.
+        // HB-based check must reject: the ld binds to NO generation (no alloc is
+        // happens-before it) -> use-without-allocation.
         let kernel = empty_kernel("tmem_lifecycle_hb", vec![]);
         let events = vec![tmem_alloc_event(0), tmem_ld(1), tmem_dealloc_event(2)];
         let report = run_offline_checkers(
@@ -5171,7 +5339,7 @@ mod tests {
             pass_status(&report, "tmem_lifecycle_order"),
             ProtocolStatus::Failed
         );
-        assert!(diagnostic_codes(&report).contains("tmem_lifecycle_hb_missing"));
+        assert!(diagnostic_codes(&report).contains("tmem_lifecycle_use_without_allocation"));
     }
 
     #[test]
@@ -5424,7 +5592,7 @@ mod tests {
     #[test]
     fn tmem_lifecycle_rejects_split_cluster_barrier_without_wait() {
         // Arrives alone do not order a role that never waits: the role's access
-        // can run before the barrier completes.
+        // can run before the barrier completes — it binds to NO generation.
         let kernel = empty_kernel("tmem_lifecycle_hb_cluster_barrier_neg", vec![]);
         let events = vec![
             tmem_alloc_event(0),
@@ -5450,7 +5618,7 @@ mod tests {
             pass_status(&report, "tmem_lifecycle_order"),
             ProtocolStatus::Failed
         );
-        assert!(diagnostic_codes(&report).contains("tmem_lifecycle_hb_missing"));
+        assert!(diagnostic_codes(&report).contains("tmem_lifecycle_use_without_allocation"));
     }
 
     // ===================== split cluster barrier sem (relaxed vs release) =====================
@@ -5661,5 +5829,282 @@ mod tests {
         // role event through the shared stmt — that would need a real barrier.
         assert!(!ordering.happens_before(1, 2));
         assert!(!ordering.happens_before(0, 2));
+    }
+
+    #[test]
+    fn tmem_lifecycle_rejects_relaxed_cluster_barrier_order() {
+        // The relaxed twin of `tmem_lifecycle_accepts_split_cluster_barrier_order`:
+        // same barrier shape, but `.relaxed` arrivals carry no memory HB, so the
+        // lifecycle proof MUST fail — canon's relaxed barrier is never what orders
+        // TMEM lifetime (the mbarrier pipeline is).
+        let kernel = empty_kernel("tmem_lifecycle_hb_cluster_barrier_relaxed", vec![]);
+        let arrive = |stream: usize, count: usize| {
+            event(
+                12,
+                TraceEventKind::ClusterBarrierArrive {
+                    thread_count: 96,
+                    count,
+                    sem: super::super::protocol::ClusterBarrierSemEvent::Relaxed,
+                    scope: scope_warps(stream, 0, 0, vec![0, 1, 2]),
+                },
+            )
+        };
+        let wait = |stream: usize, warps: Vec<usize>| {
+            event(
+                13,
+                TraceEventKind::ClusterBarrierWait {
+                    scope: scope_warps(stream, 0, 0, warps),
+                },
+            )
+        };
+        let events = vec![
+            tmem_alloc_event(0),
+            arrive(8, 96),
+            wait(9, vec![0, 1]),
+            tmem_ld(1),
+            arrive(10, 96),
+            wait(11, vec![0, 2]),
+            tmem_dealloc_event(2),
+        ];
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(
+            pass_status(&report, "tmem_lifecycle_order"),
+            ProtocolStatus::Failed
+        );
+        // relaxed arrivals give no HB(alloc, ld) — the ld binds to no generation.
+        assert!(diagnostic_codes(&report).contains("tmem_lifecycle_use_without_allocation"));
+        // ...while the control-order witness (deadlock) still passes.
+        assert_eq!(
+            pass_status(&report, "deadlock_freedom"),
+            ProtocolStatus::Passed
+        );
+    }
+
+    // ===================== TMEM generation intervals + teardown drain =====================
+
+    #[test]
+    fn tmem_lifecycle_rejects_unsynchronized_realloc() {
+        // NEGATIVE (missed-report fix): warp0 deallocs, warp1 RE-allocates the same
+        // band with NO synchronization. The sampled pairing alone accepted this;
+        // the cross-generation edge (dealloc_0 HB alloc_1) must reject it.
+        let kernel = empty_kernel("tmem_lifecycle_realloc", vec![]);
+        let events = vec![
+            tmem_alloc_event(0),
+            tmem_dealloc_event(0),
+            tmem_alloc_event(1), // re-alloc on warp1, no sync with warp0's dealloc
+            tmem_ld(1),
+            tmem_dealloc_event(1),
+        ];
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(report.status, ProtocolStatus::Failed);
+        assert_eq!(
+            pass_status(&report, "tmem_lifecycle_order"),
+            ProtocolStatus::Failed
+        );
+        assert!(diagnostic_codes(&report).contains("tmem_lifecycle_hb_missing"));
+    }
+
+    #[test]
+    fn tmem_lifecycle_accepts_same_warp_regeneration() {
+        // POSITIVE (false-positive fix): one warp's legal
+        // alloc/dealloc/alloc/access/dealloc — program order supplies every edge.
+        // The old dealloc-side sweep charged the gen-1 access to gen 0 and
+        // rejected; binding (NOT HB(dealloc_0, access)) assigns it to gen 1.
+        let kernel = empty_kernel("tmem_lifecycle_regen", vec![]);
+        let events = vec![
+            tmem_alloc_event(0),
+            tmem_dealloc_event(0),
+            tmem_alloc_event(0),
+            tmem_ld(0),
+            tmem_dealloc_event(0),
+        ];
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(report.status, ProtocolStatus::Passed);
+        assert_eq!(
+            pass_status(&report, "tmem_lifecycle_order"),
+            ProtocolStatus::Passed
+        );
+    }
+
+    /// Kernel whose ONLY stmt is a KernelFinalize wrapping a TmemDealloc — the
+    /// teardown dealloc gets stmt id 1 (pre-order walk: finalize=0, dealloc=1).
+    fn teardown_kernel() -> Kernel {
+        empty_kernel(
+            "tmem_lifecycle_teardown",
+            vec![Stmt::KernelFinalize {
+                body: vec![Stmt::TmemDealloc {
+                    base_col: 0,
+                    n_cols: 32,
+                    cta_group: 1,
+                }],
+                warp: Some(0),
+                lane: None,
+                elected: false,
+            }],
+        )
+    }
+
+    fn teardown_dealloc(stream: usize) -> TraceEvent {
+        event(
+            1, // the KernelFinalize-child stmt id — in the teardown set
+            TraceEventKind::TmemDealloc {
+                cta_ids: vec![0],
+                region: tmem_region(0, 32),
+                scope: scope(stream),
+            },
+        )
+    }
+
+    #[test]
+    fn tmem_lifecycle_accepts_teardown_dealloc_after_ld_drain() {
+        // POSITIVE (drain path): the role's tcgen05.ld is drained ON ITS OWN
+        // STREAM by tcgen05.wait::ld; the teardown dealloc (KernelFinalize) needs
+        // no barrier rendezvous with the accessing warp — canon's shape.
+        let kernel = teardown_kernel();
+        let mut events = vec![tmem_alloc_event(0)];
+        events.extend(cta_sync_events(3, vec![0, 1], 0));
+        events.push(tmem_ld(1));
+        events.push(event(
+            8,
+            TraceEventKind::TmemWait {
+                async_kind: TmemAsyncKind::Ld,
+                scope: scope(1),
+            },
+        ));
+        events.push(teardown_dealloc(0));
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(report.status, ProtocolStatus::Passed);
+        assert_eq!(
+            pass_status(&report, "tmem_lifecycle_order"),
+            ProtocolStatus::Passed
+        );
+    }
+
+    #[test]
+    fn tmem_lifecycle_accepts_teardown_dealloc_after_commit_drain() {
+        // POSITIVE (drain path, mma half): the role's tcgen05.mma is retired by
+        // its stream's tcgen05.commit whose mbar IS waited — drain-proven, so the
+        // teardown dealloc needs no barrier edge from the mma warp.
+        let kernel = teardown_kernel();
+        let target = mbar_target();
+        let mut events = vec![
+            event(
+                0,
+                TraceEventKind::MbarInit {
+                    target: target.clone(),
+                    count: 1,
+                    scope: scope(1),
+                },
+            ),
+            tmem_alloc_event(0),
+        ];
+        events.extend(cta_sync_events(3, vec![0, 1], 0));
+        events.push(event(
+            7,
+            TraceEventKind::Write {
+                region: tmem_region(0, 32),
+                proxy: MemoryProxy::Async,
+                access_kind: MemoryAccessKind::Tmem(TmemAsyncKind::Mma),
+                scope: scope(1),
+            },
+        ));
+        events.push(TraceEvent::new(
+            20,
+            "Tcgen05Commit",
+            TraceEventKind::MbarArrive {
+                target: target.clone(),
+                count: 1,
+                scope: scope(1),
+            },
+        ));
+        events.push(event(
+            21,
+            TraceEventKind::MbarWait {
+                target,
+                phase: 0,
+                scope: scope(1),
+            },
+        ));
+        events.push(teardown_dealloc(0));
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(report.status, ProtocolStatus::Passed);
+        assert_eq!(
+            pass_status(&report, "tmem_lifecycle_order"),
+            ProtocolStatus::Passed
+        );
+    }
+
+    #[test]
+    fn tmem_lifecycle_rejects_teardown_dealloc_without_drain() {
+        // NEGATIVE: same teardown shape but the ld is NEVER drained on its own
+        // stream (a bare access straight to kernel end) — the drain relaxation
+        // does not apply and there is no barrier edge either: must fail.
+        let kernel = teardown_kernel();
+        let mut events = vec![tmem_alloc_event(0)];
+        events.extend(cta_sync_events(3, vec![0, 1], 0));
+        events.push(tmem_ld(1));
+        events.push(teardown_dealloc(0));
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(report.status, ProtocolStatus::Failed);
+        assert_eq!(
+            pass_status(&report, "tmem_lifecycle_order"),
+            ProtocolStatus::Failed
+        );
+        assert!(diagnostic_codes(&report).contains("tmem_lifecycle_hb_missing"));
+    }
+
+    #[test]
+    fn tmem_lifecycle_rejects_nonteardown_dealloc_despite_drain() {
+        // NEGATIVE: drained on its own stream, but the dealloc is NOT the
+        // kernel-teardown dealloc (no KernelFinalize in this kernel) — the
+        // relaxation is scoped to teardown only, so the barrier edge is still
+        // required.
+        let kernel = empty_kernel("tmem_lifecycle_nonteardown", vec![]);
+        let mut events = vec![tmem_alloc_event(0)];
+        events.extend(cta_sync_events(3, vec![0, 1], 0));
+        events.push(tmem_ld(1));
+        events.push(event(
+            8,
+            TraceEventKind::TmemWait {
+                async_kind: TmemAsyncKind::Ld,
+                scope: scope(1),
+            },
+        ));
+        events.push(teardown_dealloc(0));
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(report.status, ProtocolStatus::Failed);
+        assert_eq!(
+            pass_status(&report, "tmem_lifecycle_order"),
+            ProtocolStatus::Failed
+        );
+        assert!(diagnostic_codes(&report).contains("tmem_lifecycle_hb_missing"));
     }
 }

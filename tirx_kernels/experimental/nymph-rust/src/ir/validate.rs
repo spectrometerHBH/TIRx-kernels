@@ -2417,20 +2417,26 @@ fn check_tmem_alloc_bands(kernel: &Kernel) -> R {
         relinquished: &mut bool,
         kernel_cta_group: u8,
         lifecycle_banned: bool,
+        inside_role: bool,
     ) -> R {
         for s in stmts {
-            // Lifecycle ops are TOP-LEVEL ONLY (a Role / KernelInit /
+            // Lifecycle ops are TOP-LEVEL ONLY (a TOP-LEVEL Role / KernelInit /
             // KernelFinalize body is fine — those execute once, mutually
             // exclusively). Inside a loop or conditional the one-pass walk
             // below is unsound: it visits the body once, so a
             // `for_loop(stop=2)` alloc + outside dealloc passed build/codegen
             // but double-allocated on the second iteration
-            // (`tmem_already_allocated`). Until a path-sensitive analysis
-            // exists, reject the placement outright.
+            // (`tmem_already_allocated`). A Role NESTED inside another Role is
+            // likewise unsound: the inner role's threads never include the
+            // outer role's, so its "lifecycle" op runs on a disjoint cohort
+            // (or never) — it passed build/codegen and only the protocol check
+            // caught the missing allocation. Until a path-sensitive analysis
+            // exists, reject both placements outright.
             let banned_here = || {
                 lifecycle_banned.then(|| {
                     "tmem lifecycle ops (alloc/dealloc/relinquish) are not allowed inside \
-                     a loop or conditional body (ForLoop/Loop/If/ForEachTask/SchedulerImpl)"
+                     a loop or conditional body (ForLoop/Loop/If/ForEachTask/SchedulerImpl) \
+                     or a nested Role body"
                 })
             };
             match s {
@@ -2524,7 +2530,9 @@ fn check_tmem_alloc_bands(kernel: &Kernel) -> R {
             // The taint propagates downward: a Role nested inside a loop still
             // re-executes with its parent, so only a fresh top-level scope
             // (Role / KernelInit / KernelFinalize at an untainted point) keeps
-            // the current value.
+            // the current value. A Role nested INSIDE another Role taints its
+            // own body too (its cohort is a strict subset of the outer role's —
+            // not a top-level, execute-once-mutually-exclusive scope).
             let child_ban = lifecycle_banned
                 || matches!(
                     s,
@@ -2533,9 +2541,22 @@ fn check_tmem_alloc_bands(kernel: &Kernel) -> R {
                         | Stmt::If { .. }
                         | Stmt::ForEachTask { .. }
                         | Stmt::SchedulerImpl { .. }
-                );
+                )
+                || (inside_role && matches!(s, Stmt::Role { .. }));
+            let child_inside_role = match s {
+                Stmt::Role { .. } => true,
+                Stmt::KernelInit { .. } | Stmt::KernelFinalize { .. } => false,
+                _ => inside_role,
+            };
             for body in s.child_bodies() {
-                walk(body, live, relinquished, kernel_cta_group, child_ban)?;
+                walk(
+                    body,
+                    live,
+                    relinquished,
+                    kernel_cta_group,
+                    child_ban,
+                    child_inside_role,
+                )?;
             }
         }
         Ok(())
@@ -2548,6 +2569,7 @@ fn check_tmem_alloc_bands(kernel: &Kernel) -> R {
         &mut live,
         &mut relinquished,
         kernel_group,
+        false,
         false,
     )
 }

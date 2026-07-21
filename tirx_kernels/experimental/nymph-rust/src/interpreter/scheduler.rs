@@ -1,10 +1,10 @@
 //! CTA-epoch scheduling + frame bookkeeping — port of `interpreter/scheduler.py`.
 //!
-//! Per CTA: ordered epochs (KernelInit, then role/loose main groups, then
-//! KernelFinalize), materialized one at a time after the prior drains (the phase
-//! boundary). Each stream owns a frame stack; loop-var writes are eager. Bodies
-//! are borrowed from the kernel (`'k`), zero-copy. `flatten/unflatten_coord` are
-//! dimension-0-fastest.
+//! Per CTA: ordered epochs in SOURCE order (KernelInit / role / loose /
+//! KernelFinalize interleaved exactly as written), materialized one at a time
+//! after the prior drains (the phase boundary). Each stream owns a frame
+//! stack; loop-var writes are eager. Bodies are borrowed from the kernel
+//! (`'k`), zero-copy. `flatten/unflatten_coord` are dimension-0-fastest.
 
 use super::threads::{canonical_thread_mask, filter_thread_mask, Coord, ThreadId, ThreadMask};
 use super::values::scalars::ScalarValues;
@@ -183,30 +183,30 @@ pub fn role_matches(
 /// One epoch = a list of (body, active_mask) stream specs.
 type EpochSpec<'k> = Vec<(&'k [Stmt], ThreadMask)>;
 
-/// Build a CTA's epochs in source order (KernelInit epochs, role/loose main
-/// groups, KernelFinalize epochs).
+/// Build a CTA's epochs in SOURCE order (KernelInit / role / loose /
+/// KernelFinalize), matching codegen's source-ordered emission. Init and
+/// finalize epochs sit at their source position — a loose stmt AFTER a
+/// `KernelFinalize` (canon's fp8 teardown: `dealloc` then `cluster_sync`) runs
+/// AFTER the finalize epoch, exactly as the generated code executes it.
+/// Consecutive main stmts of one kind (role run vs loose run) merge into one
+/// epoch; TensorDef/MBarDef are transparent (no epoch, no group break).
 pub fn cta_epoch_specs<'k>(kernel: &'k Kernel, mask: &ThreadMask) -> Vec<EpochSpec<'k>> {
     let mut epochs: Vec<EpochSpec<'k>> = Vec::new();
+    let mut cur_kind: Option<GroupKind> = None;
+    let mut cur_run: Vec<&Stmt> = Vec::new();
 
-    // KernelInit epochs
-    for stmt in &kernel.body {
-        if let Stmt::KernelInit {
-            body,
-            warp,
-            lane,
-            elected,
-        } = stmt
-        {
-            let m = filter_thread_mask(mask, |t| kernel_scope_matches(t, *warp, *lane, *elected));
-            epochs.push(vec![(body.as_slice(), m)]);
+    fn flush_main_run<'k>(
+        epochs: &mut Vec<EpochSpec<'k>>,
+        kind: &mut Option<GroupKind>,
+        run: &mut Vec<&'k Stmt>,
+        mask: &ThreadMask,
+    ) {
+        if run.is_empty() {
+            return;
         }
-    }
-
-    // main groups (role runs vs loose runs)
-    for (kind, stmts) in main_epoch_groups(&kernel.body) {
         let mut epoch: EpochSpec<'k> = Vec::new();
-        if kind == GroupKind::Role {
-            for stmt in stmts {
+        if *kind == Some(GroupKind::Role) {
+            for stmt in run.drain(..) {
                 if let Stmt::Role {
                     body,
                     warp,
@@ -232,60 +232,58 @@ pub fn cta_epoch_specs<'k>(kernel: &'k Kernel, mask: &ThreadMask) -> Vec<EpochSp
                 }
             }
         } else {
-            for stmt in stmts {
+            for stmt in run.drain(..) {
                 epoch.push((std::slice::from_ref(stmt), mask.clone()));
             }
         }
         epochs.push(epoch);
+        *kind = None;
     }
 
-    // KernelFinalize epochs
     for stmt in &kernel.body {
-        if let Stmt::KernelFinalize {
-            body,
-            warp,
-            lane,
-            elected,
-        } = stmt
-        {
-            let m = filter_thread_mask(mask, |t| kernel_scope_matches(t, *warp, *lane, *elected));
-            epochs.push(vec![(body.as_slice(), m)]);
+        match stmt {
+            Stmt::KernelInit {
+                body,
+                warp,
+                lane,
+                elected,
+            }
+            | Stmt::KernelFinalize {
+                body,
+                warp,
+                lane,
+                elected,
+            } => {
+                flush_main_run(&mut epochs, &mut cur_kind, &mut cur_run, mask);
+                let m =
+                    filter_thread_mask(mask, |t| kernel_scope_matches(t, *warp, *lane, *elected));
+                epochs.push(vec![(body.as_slice(), m)]);
+            }
+            Stmt::TensorDef { .. } | Stmt::MBarDef { .. } => {}
+            _ => {
+                let kind = if matches!(stmt, Stmt::Role { .. }) {
+                    GroupKind::Role
+                } else {
+                    GroupKind::Loose
+                };
+                if cur_kind == Some(kind) {
+                    cur_run.push(stmt);
+                } else {
+                    flush_main_run(&mut epochs, &mut cur_kind, &mut cur_run, mask);
+                    cur_kind = Some(kind);
+                    cur_run.push(stmt);
+                }
+            }
         }
     }
-
+    flush_main_run(&mut epochs, &mut cur_kind, &mut cur_run, mask);
     epochs
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Clone, Copy)]
 enum GroupKind {
     Role,
     Loose,
-}
-
-fn main_epoch_groups(body: &[Stmt]) -> Vec<(GroupKind, Vec<&Stmt>)> {
-    let mut groups: Vec<(GroupKind, Vec<&Stmt>)> = Vec::new();
-    for stmt in body {
-        match stmt {
-            Stmt::KernelInit { .. }
-            | Stmt::KernelFinalize { .. }
-            | Stmt::TensorDef { .. }
-            | Stmt::MBarDef { .. } => continue,
-            _ => {}
-        }
-        let kind = if matches!(stmt, Stmt::Role { .. }) {
-            GroupKind::Role
-        } else {
-            GroupKind::Loose
-        };
-        if let Some((last_kind, run)) = groups.last_mut() {
-            if *last_kind == kind {
-                run.push(stmt);
-                continue;
-            }
-        }
-        groups.push((kind, vec![stmt]));
-    }
-    groups
 }
 
 /// One CTA's epoch schedule.

@@ -855,6 +855,33 @@ def test_rejects_tmem_lifecycle_inside_loop_or_conditional():
     )
 
 
+def test_rejects_tmem_lifecycle_inside_nested_role():
+    # A Role nested inside another Role is NOT a top-level execute-once scope:
+    # its cohort is a strict subset of the outer role's (here warp1 inside
+    # warp0 — never executed), so the alloc slipped past build/codegen and only
+    # the protocol check reported the missing allocation. Reject at validate.
+    with pytest.raises(ValueError, match="not allowed inside a .* or a nested Role body"):
+        make([n.Role(body=(n.Role(body=(n.TmemAlloc(0, 128, cta_group=1),), warp=1),), warp=0)])
+    # ...also via the else-branch chain.
+    with pytest.raises(ValueError, match="or a nested Role body"):
+        make(
+            [
+                n.Role(
+                    body=(),
+                    else_body=(n.Role(body=(n.TmemAlloc(0, 128, cta_group=1),), warp=1),),
+                    warp=0,
+                )
+            ]
+        )
+    # POSITIVE: the same alloc directly in a TOP-LEVEL Role body is fine.
+    make(
+        [
+            n.Role(body=(n.TmemAlloc(0, 128, cta_group=1),), warp=0),
+            n.KernelFinalize(body=(n.TmemDealloc(0, 128, cta_group=1),), warp=0),
+        ]
+    )
+
+
 def test_rejects_if_branching_on_role_scope():
     cond = n.ScopeValue(kind="warp_id")
     with pytest.raises(ValueError, match="cannot branch on role scope"):
