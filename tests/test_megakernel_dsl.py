@@ -44,7 +44,7 @@ from tirx_kernels.megakernel.dsl import (
     make_moe_plan,
 )
 from tirx_kernels.megakernel.dsl._expr import ConstExpr, ScalarLoadExpr, walk_expr
-from tirx_kernels.megakernel.examples.moe import build_moe_graph
+from tirx_kernels.megakernel.dsl.examples.moe import build_moe_graph
 from tirx_kernels.megakernel.utils.config import MEGAKERNEL_MOE_BENCH_CONFIG, JobType, KernelConfig
 from tirx_kernels.megakernel.utils.support import generate_exec_queue_moe, push_moe_tasks
 from tirx_kernels.megakernel.utils.utils import MAX_M_IDX, MAX_N_IDX

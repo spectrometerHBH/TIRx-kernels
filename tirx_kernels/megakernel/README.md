@@ -17,7 +17,7 @@ by `build_moe_graph`.  Its six `TileSpec` objects directly hold concrete
 `TileImpl` adapters, while MoE-specific lowering owns physical synchronization
 and scheduling:
 
-- [`build_moe_graph`](examples/moe.py): records tensors, five logical events,
+- [`build_moe_graph`](dsl/examples/moe.py): records tensors, five logical events,
   and wait/notify coordinate maps;
 - the six MoE `TileImpl` adapters: invoke existing tile-task compute only;
 - [`model.py`](dsl/lowering/model.py) and

@@ -15,4 +15,4 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Megakernel DSL examples."""
+"""Megakernel examples written with the DSL."""

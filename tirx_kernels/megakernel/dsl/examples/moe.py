@@ -55,7 +55,7 @@ def _validate_mvp_config(config: Mapping[str, Any]):
 def build_moe_graph(config: Mapping[str, Any], batch_size: int) -> KernelSpec:
     """Build the scheduler-independent six-stage MoE graph."""
 
-    from ..dsl.tile_impl import (
+    from ..tile_impl import (
         AlignTileImpl,
         CountSortTileImpl,
         DownTileImpl,
