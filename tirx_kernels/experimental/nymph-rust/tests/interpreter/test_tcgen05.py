@@ -331,10 +331,10 @@ def _mma64_kernel(dtype, lane_align, accum, trans_a, trans_b):
         b.tcgen05_st(dst, frag, shape="32x32b", num=n)
         b.mbarrier_init(ma, count=1)
         b.mbarrier_expect_tx(ma, bytes=a_bytes)
-        b.tma_load(a_s, a_g, mbar=ma, bytes=a_bytes, coords=(0, 0), shape=a_shape)
+        b.tma_load(a_s, a_g, mbar=ma, coords=(0, 0), shape=a_shape)
         b.mbarrier_init(mb, count=1)
         b.mbarrier_expect_tx(mb, bytes=b_bytes)
-        b.tma_load(b_s, b_g, mbar=mb, bytes=b_bytes, coords=(0, 0), shape=b_shape)
+        b.tma_load(b_s, b_g, mbar=mb, coords=(0, 0), shape=b_shape)
         b.tcgen05_mma(
             dst,
             a_s,
@@ -490,7 +490,7 @@ def _tmem_operand_mma_kernel():
         b.mbarrier_init(mb, count=1)
         with b.if_(b.tid_in_wg().eq(0)):
             b.mbarrier_arrive_expect_tx(mb, bytes=n * k * 2)
-            b.tma_load(b_s, b_g, mbar=mb, bytes=n * k * 2, coords=(0, 0), shape=(n, k))
+            b.tma_load(b_s, b_g, mbar=mb, coords=(0, 0), shape=(n, k))
         b.mbarrier_wait(mb, phase=0)
         b.mbarrier_init(mc, count=1)
         b.tcgen05_mma(dst, p, b_s, m=m, n=n, k=k)

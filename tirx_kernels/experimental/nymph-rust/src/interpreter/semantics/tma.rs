@@ -335,47 +335,40 @@ fn execute_tma_load<'a, 'k>(
     ctx: &mut CohortContext<'a, 'k>,
     stmt: &'k Stmt,
 ) -> IResult<StepStatus> {
-    let (dst, src, mbar, bytes, coords, shape, gmem_shape, mbar_stage, multicast, cta_group) =
-        match stmt {
-            Stmt::TmaLoad {
-                dst,
-                src,
-                mbar,
-                bytes,
-                coords,
-                shape,
-                gmem_shape,
-                mbar_stage,
-                multicast_cta_mask,
-                cache_hint: _,
-                prefetch_tensormap: _,
-                cta_group,
-            } => (
-                dst,
-                src,
-                mbar,
-                bytes,
-                coords,
-                shape,
-                gmem_shape,
-                mbar_stage,
-                *multicast_cta_mask,
-                *cta_group,
-            ),
-            _ => unreachable!(),
-        };
-    let byte_count = ctx.eval_scalar_uniform(bytes, "tma_load bytes", "divergent_tma_operands")?;
+    let (dst, src, mbar, coords, shape, gmem_shape, mbar_stage, multicast, cta_group) = match stmt {
+        Stmt::TmaLoad {
+            dst,
+            src,
+            mbar,
+            coords,
+            shape,
+            gmem_shape,
+            mbar_stage,
+            multicast_cta_mask,
+            cache_hint: _,
+            prefetch_tensormap: _,
+            cta_group,
+        } => (
+            dst,
+            src,
+            mbar,
+            coords,
+            shape,
+            gmem_shape,
+            mbar_stage,
+            *multicast_cta_mask,
+            *cta_group,
+        ),
+        _ => unreachable!(),
+    };
+    // The transfer size is DERIVED from the tile — `numel(shape) x dtype_bytes`,
+    // exactly what TIRx derives from the box extents — so sim and codegen account
+    // the same bytes from one fact (the IR carries no separate `bytes`).
+    let byte_count = numel(shape) as i64 * dtype_bytes(src.dtype);
     if byte_count < 1 {
         return Err(InterpreterError::new(
             "tma_load_bytes",
-            "tma_load bytes must be positive",
-        ));
-    }
-    let expected = numel(shape) as i64 * dtype_bytes(src.dtype);
-    if byte_count != expected {
-        return Err(InterpreterError::new(
-            "tma_bytes_mismatch",
-            "tma_load bytes mismatch the tile",
+            "tma_load tile must have a positive byte size",
         ));
     }
     let coords_r = uniform_tuple(ctx, coords, "tma_load coords")?;

@@ -57,24 +57,8 @@ def build_bootstrap_gemm(M=256, N=128, K=64, dtype=DType.F16):
         a_m = cr * BLK_M
         b_n = cr * BLK_N
         k.mbarrier_arrive_expect_tx(smem_full, bytes=a_tb + b_tb)
-        k.tma_load(
-            a_s,
-            a_g,
-            mbar=smem_full,
-            bytes=a_tb,
-            coords=(a_m, 0),
-            shape=(BLK_M, K),
-            cta_group=CTA_GROUP,
-        )
-        k.tma_load(
-            b_s,
-            b_g,
-            mbar=smem_full,
-            bytes=b_tb,
-            coords=(b_n, 0),
-            shape=(BLK_N, K),
-            cta_group=CTA_GROUP,
-        )
+        k.tma_load(a_s, a_g, mbar=smem_full, coords=(a_m, 0), shape=(BLK_M, K), cta_group=CTA_GROUP)
+        k.tma_load(b_s, b_g, mbar=smem_full, coords=(b_n, 0), shape=(BLK_N, K), cta_group=CTA_GROUP)
     with k.role(warp=5):  # MMA (leader)
         with k.if_(cr.eq(0)):
             k.mbarrier_wait(smem_full, phase=0)

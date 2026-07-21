@@ -443,7 +443,6 @@ class IRBuilder:
         src: Tensor,
         *,
         mbar: MBar | MBarRef,
-        bytes: ScalarValue,
         coords: tuple[ScalarValue, ...],
         shape: Shape,
         gmem_shape: Shape | None = None,
@@ -458,14 +457,15 @@ class IRBuilder:
         traffic vs each CTA reading the band). ``cache_hint``: the per-load L2 eviction
         policy (e.g. ``"evict_normal"`` — canon's hint on its g2c loads); ``None`` = no
         hint. ``prefetch_tensormap`` (default True, canon's policy) prefetches the source
-        tensormap at kernel entry. All IR-carried, generic, and per-op."""
+        tensormap at kernel entry. All IR-carried, generic, and per-op. The transfer's
+        byte size is DERIVED from the tile (``numel(shape) x dtype``) — exactly what
+        TIRx derives from the box extents — so it is stated once, here as ``shape``."""
         if isinstance(dst, Tensor):
             dst = dst[...]
         stmt = TmaLoad(
             dst=dst,
             src=src,
             mbar=mbar,
-            bytes=bytes,
             coords=coords,
             shape=shape,
             gmem_shape=gmem_shape,

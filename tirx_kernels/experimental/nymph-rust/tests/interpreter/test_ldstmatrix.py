@@ -34,7 +34,7 @@ def _ldmatrix_kernel(num, trans):
         b.mbarrier_init(mbar, count=1)
     with b.role(warp=0):
         b.mbarrier_arrive_expect_tx(mbar, bytes=nbytes)
-        b.tma_load(smem, source, mbar=mbar, bytes=nbytes, coords=(0, 0), shape=(rows, 8))
+        b.tma_load(smem, source, mbar=mbar, coords=(0, 0), shape=(rows, 8))
         b.ldmatrix(frag, smem[b.lane_id() % rows, 0:8], num=num, trans=trans)
         b.reg_store(out[b.lane_id(), 0:num], frag)
     return b.build(), source, out

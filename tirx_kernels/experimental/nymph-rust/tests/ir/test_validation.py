@@ -428,7 +428,6 @@ def _tma_load(hint, **overrides):
         dst=smem([128, 64])[:, :],
         src=gmem([1024, 1024]),
         mbar=n.MBar(kind=n.MBarKind.TMA),
-        bytes=16384,
         coords=(0, 0),
         shape=[128, 64],
         cache_hint=hint,
@@ -444,14 +443,23 @@ def test_rejects_tma_load_bad_cache_hint():
     make([_tma_load("evict_first")])
 
 
-def test_rejects_tma_load_bytes_mismatch():
-    # `bytes` feeds the sim's tx accounting while TIRx derives the transfer
-    # size from the tile extents: a statically-known mismatch is rejected at
-    # validate (the interpreter re-checks the evaluated value per launch).
-    # The default tile is 128x64 f16 = 16384 bytes.
-    with pytest.raises(ValueError, match=r"tma_load bytes=8192 != dst tile bytes \(16384\)"):
-        make([_tma_load(None, bytes=8192)])
-    make([_tma_load(None, bytes=16384)])
+def test_tma_load_transfer_size_is_derived_not_stated():
+    # The transfer size is DERIVED from the tile (numel(shape) x dtype) — the IR
+    # carries no `bytes` field, so the sim's tx accounting and TIRx's box-extent
+    # derivation read one fact in one place (a mismatch is unexpressible).
+    with pytest.raises(TypeError):
+        n.TmaLoad(
+            dst=smem([128, 64])[:, :],
+            src=gmem([1024, 1024]),
+            mbar=n.MBar(kind=n.MBarKind.TMA),
+            bytes=16384,  # the field is gone — passing it is a plain TypeError
+            coords=(0, 0),
+            shape=[128, 64],
+        )
+    # A zero-extent tile would derive a 0-byte transfer — rejected at build.
+    with pytest.raises(ValueError, match="nonzero element count"):
+        make([_tma_load(None, shape=[0, 64])])
+    make([_tma_load(None)])
 
 
 def test_rejects_tma_load_group2_multicast_shared_mbar():
@@ -515,7 +523,7 @@ def test_accepts_cross_role_named_and_wg_barrier_id_reuse():
 
 
 def tma_load(dst, src, mbar):
-    return n.TmaLoad(dst=dst, src=src, mbar=mbar, bytes=16384, coords=(0, 0), shape=[128, 64])
+    return n.TmaLoad(dst=dst, src=src, mbar=mbar, coords=(0, 0), shape=[128, 64])
 
 
 def test_rejects_tma_dst_not_smem():

@@ -2160,13 +2160,12 @@ fn mbarrier_arrive_expect_tx(
     }))
 }
 #[pyfunction]
-#[pyo3(name = "TmaLoad", signature = (dst, src, mbar, bytes, coords, shape, gmem_shape = None, mbar_stage = None, multicast_cta_mask = None, cache_hint = None, prefetch_tensormap = true, cta_group = 1))]
+#[pyo3(name = "TmaLoad", signature = (dst, src, mbar, coords, shape, gmem_shape = None, mbar_stage = None, multicast_cta_mask = None, cache_hint = None, prefetch_tensormap = true, cta_group = 1))]
 #[allow(clippy::too_many_arguments)]
 fn tma_load(
     dst: Bound<'_, PyAny>,
     src: PyTensor,
     mbar: Bound<'_, PyAny>,
-    bytes: Bound<'_, PyAny>,
     coords: Bound<'_, PyAny>,
     shape: Vec<usize>,
     gmem_shape: Option<Vec<usize>>,
@@ -2180,7 +2179,6 @@ fn tma_load(
         dst: coerce_slice(&dst)?,
         src: src.0,
         mbar: coerce_mbar_ref(&mbar)?,
-        bytes: coerce_scalar(&bytes)?,
         coords: coerce_scalar_seq(&coords)?,
         shape,
         gmem_shape,

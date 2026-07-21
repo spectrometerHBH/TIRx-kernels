@@ -214,7 +214,7 @@ def test_protocol_blocked_mbar_wait_emits_completion_event():
         b.mbarrier_wait(mbar, phase=0)
     with b.role(warp=1, elected=True):
         b.scalar(initial=0, dtype=nr.ScalarDType.I32)
-        b.tma_load(smem, source, mbar=mbar, bytes=16, coords=(0,), shape=(4,))
+        b.tma_load(smem, source, mbar=mbar, coords=(0,), shape=(4,))
 
     report = nr.check_protocol(b.build(), include_events=True)
     assert report["status"] == "Passed"
@@ -237,7 +237,7 @@ def test_protocol_payload_control_bridge_is_inconclusive():
         b.mbarrier_init(mbar, count=1)
     with b.role(warp=0, elected=True):
         b.mbarrier_arrive_expect_tx(mbar, bytes=4)
-        b.tma_load(smem, source, mbar=mbar, bytes=4, coords=(0,), shape=(1,))
+        b.tma_load(smem, source, mbar=mbar, coords=(0,), shape=(1,))
         b.scalar(initial=smem[0], dtype=nr.ScalarDType.U32)
 
     report = nr.check_protocol(b.build())
@@ -255,7 +255,7 @@ def test_protocol_skipped_bulk_write_invalidates_prior_scalar_cell():
     with b.role(warp=0, elected=True):
         b.store_scalar(smem[0], 7)
         b.mbarrier_arrive_expect_tx(mbar, bytes=4)
-        b.tma_load(smem, source, mbar=mbar, bytes=4, coords=(0,), shape=(1,))
+        b.tma_load(smem, source, mbar=mbar, coords=(0,), shape=(1,))
         b.scalar(initial=smem[0], dtype=nr.ScalarDType.U32)
 
     report = nr.check_protocol(b.build())

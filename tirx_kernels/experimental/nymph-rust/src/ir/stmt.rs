@@ -508,11 +508,16 @@ pub enum Stmt {
     },
 
     // ---- TMA (bulk async GMEM<->SMEM) ----
+    // The transfer's byte size is DERIVED, never stated: the sim's mbar tx
+    // accounting computes `numel(shape) x dtype_bytes` from the tile (exactly
+    // what TIRx derives from the box extents), so the size exists in precisely
+    // one place. (It used to be a separate `bytes` field — one fact written in
+    // two places, with build/codegen blind to a mismatch until the protocol
+    // check caught it.)
     TmaLoad {
         dst: TensorSlice,
         src: Arc<Tensor>,
         mbar: MBarRef,
-        bytes: ScalarValue,
         coords: Vec<ScalarValue>,
         shape: Vec<usize>,
         gmem_shape: Option<Vec<usize>>,

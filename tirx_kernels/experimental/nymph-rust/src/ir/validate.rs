@@ -779,7 +779,6 @@ fn validate_stmt(s: &Stmt) -> R {
             dst,
             src,
             mbar,
-            bytes,
             coords,
             shape,
             gmem_shape,
@@ -794,7 +793,6 @@ fn validate_stmt(s: &Stmt) -> R {
             if mbar.mbar.kind != MBarKind::Tma {
                 return bail("tma_load mbar kind must be tma");
             }
-            validate_scalar(bytes)?;
             if let Some(v) = mbar_stage {
                 validate_scalar(v)?;
             }
@@ -808,20 +806,13 @@ fn validate_stmt(s: &Stmt) -> R {
             if dst.tensor.dtype != src.dtype {
                 return bail("tma_load dst and src dtype must match");
             }
-            // `bytes` feeds the sim's tx accounting while TIRx derives the
-            // transfer size from the tile extents: when the value is statically
-            // known it must equal the tile's byte size (shape x dtype), or sim
-            // and codegen run different transfer sizes (fail closed — the
-            // interpreter re-checks the evaluated value per launch:
-            // `tma_bytes_mismatch`). A shape-dependent (non-literal) value
-            // skips the static check and relies on that runtime re-check.
-            if let (Some(b), Some(numel)) = (static_int(bytes), tensor_numel(shape)) {
-                let expected = numel as i64 * dtype_size_bytes(src.dtype) as i64;
-                if b != expected {
-                    return bail(format!(
-                        "tma_load bytes={b} != dst tile bytes ({expected}) from shape x dtype"
-                    ));
-                }
+            // The transfer size is DERIVED from the tile (`numel(shape) x
+            // dtype`) in the sim's tx accounting — the same value TIRx derives
+            // from the box extents — so there is no separate `bytes` to check.
+            // A zero-extent tile would derive a 0-byte transfer (the old
+            // runtime `bytes >= 1` guard errored on it) — fail at build.
+            if tensor_numel(shape) == Some(0) {
+                return bail("tma_load shape must have a nonzero element count");
             }
             for c in coords {
                 validate_scalar(c)?;

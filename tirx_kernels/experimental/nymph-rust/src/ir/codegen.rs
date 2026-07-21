@@ -1221,7 +1221,6 @@ fn collect_sf_ids(k: &Kernel) -> SfIds {
             dst,
             src,
             mbar: _,
-            bytes: _,
             coords: _,
             shape: _,
             gmem_shape: _,
@@ -1274,7 +1273,6 @@ fn collect_from_stmt(s: &Stmt, map: &mut HashMap<u32, Arc<Tensor>>) {
             dst,
             src,
             mbar: _,
-            bytes: _,
             coords: _,
             shape: _,
             gmem_shape: _,
@@ -1844,7 +1842,6 @@ fn stmt_mbar_refs(s: &Stmt) -> Vec<&super::mbar::MBarRef> {
             dst: _,
             src: _,
             mbar,
-            bytes: _,
             coords: _,
             shape: _,
             gmem_shape: _,
@@ -3184,13 +3181,6 @@ fn emit_stmt(
             dst,
             src,
             mbar,
-            // The transfer size is derived from the tile extents, not the IR's
-            // `bytes` — but the field is NOT unchecked: validate rejects a
-            // statically-known mismatch with the dst tile (shape × dtype), and
-            // the interpreter re-checks the evaluated value per launch
-            // (`tma_bytes_mismatch`). The matching expect_tx carries its own
-            // byte count.
-            bytes: _,
             coords,
             shape,
             gmem_shape,
