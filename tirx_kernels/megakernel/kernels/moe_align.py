@@ -14,8 +14,6 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""MoE routing alignment and token-sorting tile tasks."""
-
 from tirx_kernels.megakernel.utils.base import SmemManager, Tile
 from tirx_kernels.megakernel.utils.config import F16_BYTES, KernelConfig
 from tirx_kernels.megakernel.utils.utils import ceildiv, next_power_of_two

@@ -30,6 +30,7 @@ from tvm.megakernel.dsl import (
     VarSpec,
 )
 
+from .kernel import lower_moe_to_tirx
 from .lowering import (
     DynamicDispatchStep,
     DynamicPolicy,
@@ -83,6 +84,7 @@ __all__ = [
     "UnfusedPolicy",
     "VarSpec",
     "build_moe_graph",
+    "lower_moe_to_tirx",
     "make_moe_plan",
     "policy_for_scheduler",
 ]

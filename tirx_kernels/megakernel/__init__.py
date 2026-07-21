@@ -18,7 +18,7 @@
 from importlib import import_module
 from typing import Any
 
-__all__ = ["dsl", "moe", "tile_tasks", "utils"]
+__all__ = ["dsl", "kernels", "moe", "utils"]
 
 
 def __getattr__(name: str) -> Any:

@@ -15,8 +15,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Tile task implementations used by the megakernel scheduler."""
-
 from .gemm import GemmTile
 from .group_gemm_sm100 import GroupGEMMSiluTile
 from .group_gemm_sm100 import GroupGEMMTile as GroupGEMMTileSM100

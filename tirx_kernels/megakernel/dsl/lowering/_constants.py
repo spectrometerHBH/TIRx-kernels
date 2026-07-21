@@ -29,9 +29,10 @@ _EVENT_ATTRS = {
     "down_dispatch_done": "evt_group_gemm_down",
 }
 _PACKED_INDEX_LIMITS = (MAX_M_IDX, MAX_N_IDX, MAX_K_IDX)
+_WARP_SIZE = 32
 _SCOPE_WIDTHS = {
     "thread": 1,
-    "warp": KernelConfig.WARP_SIZE,
+    "warp": _WARP_SIZE,
     "warpgroup": KernelConfig.NUM_THREADS // KernelConfig.WG_NUMBER,
     "cta": KernelConfig.NUM_THREADS,
 }

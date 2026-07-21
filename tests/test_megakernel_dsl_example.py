@@ -108,6 +108,7 @@ def test_example_lowers_the_same_spec_through_each_policy(scheduler):
     description = describe_plan(spec, scheduler)
 
     assert f"scheduler: {scheduler}" in description
+    assert "tirx function: main" in description
     assert "queue upper bound:" in description
 
 

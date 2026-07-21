@@ -15,8 +15,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Top-k softmax tile task for MoE routing."""
-
 import tvm
 from tirx_kernels.megakernel.utils.base import SmemManager, Tile
 from tirx_kernels.megakernel.utils.config import KernelConfig

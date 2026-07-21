@@ -272,12 +272,15 @@ def describe_graph(spec: KernelSpec, batch_size: int) -> str:
 
 
 def describe_plan(spec: KernelSpec, scheduler: str) -> str:
-    """Lower through one policy and render its private physical-plan boundary."""
+    """Lower through one policy, emit TIRX, and render the physical-plan boundary."""
 
-    plan = MoeLowerer(policy_for_scheduler(scheduler)).lower(spec)
+    lowerer = MoeLowerer(policy_for_scheduler(scheduler))
+    plan = lowerer.lower(spec)
+    module = lowerer.build_module()
     return "\n".join(
         [
             f"scheduler: {plan.policy_name}",
+            f"tirx function: {module.get_global_var('main').name_hint}",
             f"physical events ({len(plan.events)}): "
             + ", ".join(event.name for event in plan.events),
             f"dispatch rules: {len(plan.dispatch_steps)}",

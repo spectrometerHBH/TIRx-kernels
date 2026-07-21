@@ -31,7 +31,7 @@ from tvm.megakernel.transform import (
 from tvm.script import tirx as T
 
 from ..spec import KernelSpec
-from ._constants import _EVENT_ATTRS
+from ._constants import _EVENT_ATTRS, _WARP_SIZE
 from .model import DynamicDispatchStep, EventPlan, MoeTileProgram, NormalizedPlan
 from .policies import MoePolicy
 
@@ -39,10 +39,10 @@ from .policies import MoePolicy
 class MoeLowerer:
     """Lower a normalized graph into event setup, dispatch, and opaque tile calls."""
 
-    def __init__(self, policy: MoePolicy, owner=None):
+    def __init__(self, policy: MoePolicy):
         self.policy = policy
-        self.owner = owner
         self.plan: NormalizedPlan | None = None
+        self._kernel = None
 
     def lower(self, spec: KernelSpec) -> NormalizedPlan:
         self.plan = self.policy.normalize(spec)
@@ -59,15 +59,27 @@ class MoeLowerer:
             raise RuntimeError("MoeLowerer must lower a KernelSpec before code emission")
         return self.plan
 
+    @property
+    def kernel(self):
+        if self._kernel is None:
+            raise RuntimeError("MoeLowerer must build its DSL kernel before code emission")
+        return self._kernel
+
+    def build_module(self, *, profiler_on: bool = False):
+        """Emit a complete TIRX module without depending on the manual MoE kernel."""
+
+        from ..kernel import _MoeDSLKernel
+
+        self._kernel = _MoeDSLKernel(self, profiler_on)
+        return self._kernel.get_module(self._require_plan().policy_name)
+
     def register_tiles(self):
         """Register TileImpl-held tasks in the existing lifecycle order."""
 
         plan = self._require_plan()
-        if self.owner is None:
-            raise RuntimeError("tile registration requires a MegaKernelMOE owner")
-        self.owner.reset()
+        self.kernel.reset()
         for program in plan.programs:
-            self.owner._add_tile(program.tile.impl, program.tile.impl.profile_event_type)
+            self.kernel._add_tile(program.tile.impl, program.tile.impl.profile_event_type)
 
     def _bind_tensors(self, context):
         """Automatically bind constructor-held TensorSpecs to lowering buffers."""
@@ -85,24 +97,22 @@ class MoeLowerer:
             # an implementation attribute lets script naming derive stable
             # names from that Python access path, which changes CUDA despite
             # structurally identical TIR.
-            impl.profiler = T.meta_var(self.owner.profiler)
+            impl.profiler = T.meta_var(self.kernel.profiler)
 
     def init_events(self, semaphore_cls, etensor_workspace_global):
         plan = self._require_plan()
-        if self.owner is None:
-            raise RuntimeError("event lowering requires a MegaKernelMOE owner")
         for event in plan.user_events:
             initializer = None if event.init_count is None else f_init_const(event.init_count)
-            semaphore = self.owner.add_etensor(
+            semaphore = self.kernel.add_etensor(
                 semaphore_cls, etensor_workspace_global, shape=list(event.shape), f_init=initializer
             )
-            setattr(self.owner, _EVENT_ATTRS[event.name], semaphore)
-        self.owner.set_events_complete(plan.is_dynamic, semaphore_cls, etensor_workspace_global)
-        self.owner.num_etensors[plan.is_dynamic] = len(self.owner.etensor_and_f_init_pairs)
-        if self.owner.etensor_workspace_offset != plan.workspace_size:
+            setattr(self.kernel, _EVENT_ATTRS[event.name], semaphore)
+        self.kernel.set_events_complete(plan.is_dynamic, semaphore_cls, etensor_workspace_global)
+        self.kernel.num_etensors[plan.is_dynamic] = len(self.kernel.etensor_and_f_init_pairs)
+        if self.kernel.etensor_workspace_offset != plan.workspace_size:
             raise ValueError(
                 "DSL event workspace layout diverged from its normalized plan: "
-                f"{self.owner.etensor_workspace_offset} != {plan.workspace_size}"
+                f"{self.kernel.etensor_workspace_offset} != {plan.workspace_size}"
             )
 
     def _expr_env(self, program: MoeTileProgram, context, *, push_idx=None):
@@ -110,7 +120,7 @@ class MoeLowerer:
         variables = dict(plan.env.compile_env)
         if push_idx is not None:
             variables["push_idx"] = push_idx
-        scheduler = self.owner.tile_scheduler
+        scheduler = self.kernel.tile_scheduler
         return {
             "vars": variables,
             "tensors": context,
@@ -118,7 +128,7 @@ class MoeLowerer:
         }
 
     def _event(self, name: str):
-        return getattr(self.owner, _EVENT_ATTRS[name])
+        return getattr(self.kernel, _EVENT_ATTRS[name])
 
     def _emit_pre_notify(self, program: MoeTileProgram, dispatch: DynamicDispatchStep, context):
         if dispatch.rule.source_tile != program.tile.name:
@@ -155,7 +165,7 @@ class MoeLowerer:
 
             return push_fn
 
-        self.owner.tile_scheduler.pre_notify_and_push(
+        self.kernel.tile_scheduler.pre_notify_and_push(
             event,
             notify_fn,
             trigger_fn,
@@ -168,11 +178,11 @@ class MoeLowerer:
         env = self._expr_env(program, context)
         coord = tuple(index.lower(env) for index in wait.coord_map)
         if wait.mask == 0xFFFFFFFF:
-            self.owner.tile_scheduler.wait(
+            self.kernel.tile_scheduler.wait(
                 self._event(wait.event.name), *coord, wait_level=wait.level
             )
         else:
-            self.owner.tile_scheduler.wait(
+            self.kernel.tile_scheduler.wait(
                 self._event(wait.event.name), *coord, wait_level=wait.level, mask=wait.mask
             )
 
@@ -188,12 +198,12 @@ class MoeLowerer:
                 *(coord.lower(env) for coord in notify.coord_map),
             )
 
-        self.owner.tile_scheduler.notify(
+        self.kernel.tile_scheduler.notify(
             event, notify_fn, scope=notify.scope, scope_id=notify.scope_id, release=notify.release
         )
 
     def _emit_run_step(self, step: RunStep, program: MoeTileProgram, context):
-        scheduler = self.owner.tile_scheduler
+        scheduler = self.kernel.tile_scheduler
         if isinstance(step.repeat, bool) or not isinstance(step.repeat, int):
             raise TypeError("MoE run repeat must be a positive integer")
         if step.repeat <= 0:
@@ -235,12 +245,12 @@ class MoeLowerer:
     @T.inline
     def _emit_run_once(self, tile_impl, profile_event, m_idx, n_idx, k_idx):
         if profile_event is not None:
-            lane_id = T.lane_id([KernelConfig.WARP_SIZE])
-            if self.owner.profiler_on:
-                self.owner.profiler.start(profile_event, lane_id == 0)
+            lane_id = T.lane_id([_WARP_SIZE])
+            if self.kernel.profiler_on:
+                self.kernel.profiler.start(profile_event, lane_id == 0)
             tile_impl.run(m_idx, n_idx, k_idx)
-            if self.owner.profiler_on:
-                self.owner.profiler.end(profile_event, lane_id == 0)
+            if self.kernel.profiler_on:
+                self.kernel.profiler.end(profile_event, lane_id == 0)
         else:
             tile_impl.run(m_idx, n_idx, k_idx)
 
@@ -263,7 +273,7 @@ class MoeLowerer:
     @T.inline
     def _emit_tile_program(self, program, context):
         if program.tile.name == "align":
-            # Preserve the oracle's thread binding position before the first step.
+            # Bind the align thread id before emitting its first physical step.
             tid = T.thread_id([KernelConfig.NUM_THREADS])
             self._emit_program_steps(program, context, tid)
         else:
@@ -271,7 +281,7 @@ class MoeLowerer:
 
     def _emit_program_steps(self, program, context, tid):
         if program.smem_scope == "program":
-            self.owner.smem_manager.enter_tile_runtime(program.tile.impl)
+            self.kernel.smem_manager.enter_tile_runtime(program.tile.impl)
         for step in program.steps:
             if isinstance(step, DynamicDispatchStep):
                 self._emit_pre_notify(program, step, context)
@@ -279,7 +289,7 @@ class MoeLowerer:
                 self._emit_wait(program, step, context)
             elif isinstance(step, RunStep):
                 if program.smem_scope == "run_to_end":
-                    self.owner.smem_manager.enter_tile_runtime(program.tile.impl)
+                    self.kernel.smem_manager.enter_tile_runtime(program.tile.impl)
                 self._emit_run_step(step, program, context)
             elif isinstance(step, BarrierStep):
                 if step.kind != "cta":
@@ -294,7 +304,7 @@ class MoeLowerer:
             else:
                 raise ValueError(f"unsupported MoE program step {type(step).__name__}")
         if program.smem_scope in ("program", "run_to_end"):
-            self.owner.smem_manager.exit_tile_runtime()
+            self.kernel.smem_manager.exit_tile_runtime()
 
     def dispatch_loop_body(self, context):
         """Emit the task-type dispatch chain from normalized tile bindings."""
@@ -310,7 +320,7 @@ class MoeLowerer:
                 (JobType.WAIT_ETENSOR_INIT.value, "wait_event_init"),
             ]
         )
-        task_type = self.owner.tile_scheduler.task_type
+        task_type = self.kernel.tile_scheduler.task_type
         if_frames = [T.If(task_type == job_type) for job_type, _ in entries]
         then_frames = [T.Then() for _ in entries]
         else_frames = [T.Else() for _ in entries]
@@ -320,9 +330,9 @@ class MoeLowerer:
                 if isinstance(entry, MoeTileProgram):
                     self._emit_tile_program(entry, context)
                 elif entry == "init_event":
-                    self.owner.task_impl_init_etensor(plan.is_dynamic)
+                    self.kernel.task_impl_init_etensor(plan.is_dynamic)
                 else:
-                    self.owner.task_impl_wait_etensor_init_complete(plan.is_dynamic)
+                    self.kernel.task_impl_wait_etensor_init_complete(plan.is_dynamic)
             else_frames[index].__enter__()
         T.evaluate(T.cuda.trap_when_assert_failed(False))
         for index in range(len(entries) - 1, -1, -1):

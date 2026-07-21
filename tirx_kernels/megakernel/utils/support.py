@@ -23,7 +23,7 @@ import numpy as np
 import tvm_ffi
 
 import tvm
-from tirx_kernels.megakernel.tile_tasks import GroupGEMMTileSM100
+from tirx_kernels.megakernel.kernels import GroupGEMMTileSM100
 from tirx_kernels.megakernel.utils.config import JobType, KernelConfig
 from tirx_kernels.megakernel.utils.dynamic_scheduler import DynamicTileScheduler, MPMCQueueHost
 from tirx_kernels.megakernel.utils.static_scheduler import StaticTileScheduler

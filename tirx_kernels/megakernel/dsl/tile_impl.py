@@ -22,7 +22,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from tirx_kernels.megakernel.tile_tasks import (
+from tirx_kernels.megakernel.kernels import (
     CountAndSortExpertTokens,
     GemmTile,
     GroupGEMMSiluTile,

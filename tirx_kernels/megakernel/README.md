@@ -27,10 +27,13 @@ and scheduling:
   place event, queue, runtime initialization, and dispatch state directly in
   those physical programs;
 - [`MoeLowerer`](dsl/lowering/lowerer.py): interprets each program's steps in
-  source order through the existing TIRX ABI.
+  source order;
+- [`kernel.py`](dsl/kernel.py): owns the complete TIRX function signature,
+  buffers, scheduler loop, tile lifecycle, and module emission.
 
-The hand-written `task_impl_moe_*`, `_set_events`, and queue generation path is
-retained as a numerical correctness reference and explicit fallback.
+The registered hand-written implementation remains unchanged in
+[`moe.py`](moe.py). It is separate from the DSL lowering; DSL runtime tests use
+it only as an external numerical reference.
 
 ## Runnable MoE DSL Example
 
@@ -47,8 +50,9 @@ python -m tirx_kernels.megakernel.examples.moe \
   --batch-size 128 --scheduler dynamic
 ```
 
-Omit `--scheduler` to inspect only the logical DSL.  Selecting `static`,
-`unfused`, or `dynamic` additionally shows the private physical-plan boundary.
+Omit `--scheduler` to inspect only the logical DSL. Selecting `static`,
+`unfused`, or `dynamic` also emits the complete TIRX module and reports its
+physical-plan boundary.
 
 ## Notation
 

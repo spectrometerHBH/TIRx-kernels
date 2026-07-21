@@ -41,10 +41,10 @@ from tirx_kernels.megakernel.dsl import (
     UnfusedPolicy,
     VarSpec,
     build_moe_graph,
+    lower_moe_to_tirx,
     make_moe_plan,
 )
 from tirx_kernels.megakernel.dsl._expr import ConstExpr, ScalarLoadExpr, walk_expr
-from tirx_kernels.megakernel.moe import MegaKernelMOE
 from tirx_kernels.megakernel.utils.config import MEGAKERNEL_MOE_BENCH_CONFIG, JobType, KernelConfig
 from tirx_kernels.megakernel.utils.support import generate_exec_queue_moe, push_moe_tasks
 from tirx_kernels.megakernel.utils.utils import MAX_M_IDX, MAX_N_IDX
@@ -307,10 +307,9 @@ def test_policy_event_layout_domains_and_physical_programs(batch_size):
 
 
 def test_run_step_fields_are_authoritative_during_physical_lowering():
-    kernel = MegaKernelMOE(
-        config=MEGAKERNEL_MOE_BENCH_CONFIG, batch_size=4, world_size=1, profiler_on=False
-    )
-    lowerer = kernel._make_dsl_lowerer("dynamic")
+    spec = build_moe_graph(MEGAKERNEL_MOE_BENCH_CONFIG, 4)
+    lowerer = MoeLowerer(DynamicPolicy())
+    lowerer.lower(spec)
     execution = lowerer.execution
     region = execution.device_regions[0]
     programs = []
@@ -326,15 +325,22 @@ def test_run_step_fields_are_authoritative_during_physical_lowering():
         programs.append(program)
     execution = replace(execution, device_regions=(replace(region, tile_programs=tuple(programs)),))
     lowerer.plan = replace(lowerer.plan, execution=execution)
-    kernel._make_dsl_lowerer = lambda scheduler: lowerer
 
     with pytest.raises(DiagnosticError, match="invalid_mutated_predicate"):
-        kernel.get_module("dynamic")
+        lowerer.build_module()
 
     plan = make_moe_plan(MEGAKERNEL_MOE_BENCH_CONFIG, 4, "dynamic")
     with pytest.raises(ValueError, match="run_to_end"):
         _replace_plan_tile(plan, "down", smem_scope="none").validate()
     assert lowerer.execution is lowerer.plan.execution
+
+
+@pytest.mark.parametrize("scheduler", ["static", "unfused", "dynamic"])
+def test_complete_dsl_lowers_to_tirx_without_manual_kernel(scheduler):
+    spec = build_moe_graph(MEGAKERNEL_MOE_BENCH_CONFIG, 4)
+    module = lower_moe_to_tirx(spec, scheduler)
+
+    assert module.get_global_var("main") is not None
 
 
 def test_physical_wait_notify_scopes_and_dynamic_rules_are_policy_owned():
