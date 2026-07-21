@@ -44,7 +44,7 @@ from tirx_kernels.megakernel.moe import MegaKernelMOE
 from tirx_kernels.megakernel.utils.config import MEGAKERNEL_MOE_BENCH_CONFIG, JobType
 from tirx_kernels.megakernel.utils.support import generate_exec_queue_moe, push_moe_tasks
 from tvm.megakernel.transform import build_runtime_kernel
-from tvm.tirx import SeqStmt, While
+from tvm.tirx import IfThenElse, SeqStmt, While
 
 _CONFIG = MEGAKERNEL_MOE_BENCH_CONFIG
 _KERNEL_NAME = "qwen3_30b_a3b_moe"
@@ -183,7 +183,7 @@ def test_six_concrete_tile_impls_extend_tasks_and_carry_scope_metadata():
     assert scopes["align"].pre_notify_scope == ("cta", 0)
     assert scopes["gate_up_silu"].pre_notify_scope == ("warp", 0)
     assert scopes["down"].pre_notify_scope == ("warp", 0)
-    assert all(not impl.notify_release for impl in scopes.values())
+    assert all(impl.notify_release for impl in scopes.values())
     assert len({impl.job_type for impl in scopes.values()}) == 6
     # The gemm family shares one class-resource group, as in production.
     assert (
@@ -284,9 +284,9 @@ def test_builder_rejects_invalid_specs():
     with pytest.raises(ValueError, match="Qwen3-30B-A3B"):
         build_moe_graph({**_CONFIG, "HIDDEN_SIZE": 4096}, 4)
 
-    # A scalar grid without a declared run predicate cannot be static.
+    # A run predicate must guard a scalar-dependent tile axis.
     spec = build_moe_graph(_CONFIG, 4)
-    del _tile(spec, "gate_up_silu").attrs["megakernel.run_predicate"]
+    _tile(spec, "gate_up_silu").attrs["megakernel.run_predicate"] = (1, "lt", 1)
     with pytest.raises(ValueError, match="run_predicate"):
         build_runtime_kernel(spec, moe_lowering_options("static", 4))
 
@@ -301,10 +301,24 @@ def test_builder_rejects_invalid_specs():
 # Structural parity with the hand-written kernel
 # ---------------------------------------------------------------------------
 
-#: The only tolerated divergence: production declares the max-tokens-shaped
-#: tensors with the symbolic ``max_num_tokens_padded`` var while the builder
+#: Tolerated divergence: production declares the max-tokens-shaped tensors
+#: with the symbolic ``max_num_tokens_padded`` var while the builder
 #: concretizes every shape, so internal view declarations differ in shape.
 _SHAPE_ONLY_RE = re.compile(r"(\.shape\[\d+\]|\.def\.extents\[\d+\])$")
+
+#: Tolerated divergence: the DSL build publishes completions with
+#: device-scope release atomics while the zero-diff manual path keeps its
+#: plain ``atomicAdd`` (F2, intentional memory-model fix).
+_RELEASE_CALL_RE = re.compile(r"atomic_add_int32(_release)?\b")
+
+#: Tolerated divergence: the migrated ``stg_local`` store helper dropped the
+#: unused ``pe`` parameter, so tvm-side calls have two arguments against the
+#: manual three (LOW; call sites only, inside dynamic push paths).
+_STG_CALL_RE = re.compile(r"\bstg_local\b")
+
+#: The push block is nine statements: six axis definitions, the
+#: ``new_scope_id`` local and its store, and the push branch itself.
+_PUSH_BLOCK_LEN = 9
 
 
 def _unwrap_seq(body):
@@ -338,6 +352,51 @@ def _dispatch_branches(chain):
     return branches
 
 
+def _classify_pair(tvm_stmt, manual_stmt):
+    """Classify one statement pair: equal, a tolerated class, or a violation."""
+
+    path = _first_divergence_path(tvm_stmt, manual_stmt)
+    if path is None:
+        return "equal"
+    if _SHAPE_ONLY_RE.search(path):
+        return "shape"
+    # Push bodies contain both the (matching) pre-notify atomic and the
+    # store helper; the release fence only ever differs in notify bodies.
+    if any(_STG_CALL_RE.search(repr(stmt)) for stmt in (tvm_stmt, manual_stmt)):
+        return "stg_local"
+    if any(_RELEASE_CALL_RE.search(repr(stmt)) for stmt in (tvm_stmt, manual_stmt)):
+        return "release"
+    return f"VIOLATION:{path}"
+
+
+def _branch_census(tvm_branch, manual_branch):
+    """Classify every aligned statement pair of two dispatch branches."""
+
+    assert len(tvm_branch.seq) == len(manual_branch.seq), (
+        f"branch statement counts diverge: {len(tvm_branch.seq)} vs {len(manual_branch.seq)}"
+    )
+    return [
+        (index, _classify_pair(tvm_stmt, manual_stmt))
+        for index, (tvm_stmt, manual_stmt) in enumerate(zip(tvm_branch.seq, manual_branch.seq))
+    ]
+
+
+def _relocate_push_to_front(branch):
+    """Move a post-run pre-notify-and-push block back to the branch front (F1)."""
+
+    stmts = list(branch.seq)
+    push_index = next(
+        i
+        for i, stmt in enumerate(stmts)
+        if isinstance(stmt, IfThenElse) and "new_scope_id" in repr(stmt)
+    )
+    start = push_index - _PUSH_BLOCK_LEN + 1
+    block = stmts[start : push_index + 1]
+    expected = (["ScopeIdDefStmt"] * 6) + ["AllocBuffer", "BufferStore", "IfThenElse"]
+    assert [type(stmt).__name__ for stmt in block] == expected
+    return SeqStmt(block + stmts[:start] + stmts[push_index + 1 :])
+
+
 @pytest.mark.parametrize("scheduler", ["static", "unfused", "dynamic"])
 def test_structural_parity_with_manual_kernel(scheduler):
     batch_size = 4
@@ -361,17 +420,27 @@ def test_structural_parity_with_manual_kernel(scheduler):
         path = _first_divergence_path(SeqStmt(list(tvm_stmts)), SeqStmt(list(manual_stmts)))
         assert path is None, f"{label} diverges at {path}"
 
-    # Per dispatch branch: identical except at symbolic-shape positions.
+    # Per dispatch branch: identical except the pinned intentional classes.
     names = ["gating", "topk", "align", "count_sort", "gate_up_silu", "down", "init", "wait_init"]
     tvm_branches = _dispatch_branches(tvm_body.seq[tvm_loop].body.seq[0])
     manual_branches = _dispatch_branches(manual_body.seq[manual_loop].body.seq[0])
-    divergent = {}
+    dynamic = scheduler == "dynamic"
+    allowed = {"shape", "release"} | ({"stg_local"} if dynamic else set())
+    seen = set()
     for name, tvm_branch, manual_branch in zip(names, tvm_branches, manual_branches):
-        path = _first_divergence_path(tvm_branch, manual_branch)
-        if path is not None:
-            divergent[name] = path
-    for name, path in divergent.items():
-        assert _SHAPE_ONLY_RE.search(path), f"branch {name} diverges at {path}"
-    # The shape divergence lives exactly in the tiles that view the
-    # max-tokens-shaped buffers; every other branch is identical.
-    assert set(divergent) == {"align", "count_sort", "gate_up_silu", "down"}
+        if dynamic and name == "count_sort":
+            # F1: the scalar-count push fires post-run with the full-count
+            # trigger, so the push block sits after the run on the tvm side.
+            tvm_branch = _relocate_push_to_front(tvm_branch)
+        census = _branch_census(tvm_branch, manual_branch)
+        violations = [(index, kind) for index, kind in census if kind not in allowed | {"equal"}]
+        assert not violations, f"branch {name} diverges: {violations}"
+        seen.update(kind for _, kind in census if kind != "equal")
+    # The pinned classes must not only be tolerated but present (they are the
+    # contract of this comparison): shape views in the align/gemm branches,
+    # release atomics in every notify path, and the dynamic-only store-arity
+    # divergence in the push paths.
+    assert "shape" in seen
+    assert "release" in seen
+    if dynamic:
+        assert "stg_local" in seen

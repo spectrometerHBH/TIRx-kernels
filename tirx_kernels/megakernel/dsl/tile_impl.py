@@ -67,9 +67,12 @@ class _MoeTileMetadataMixin(TileImpl):
     implementation: str
     job_type: int
     profile_event: ProfileEventType
-    # The hand-written kernel notifies without a release fence (plain
-    # atomicAdd); ordering comes from scope-level syncs and acquire waits.
-    notify_release: ClassVar[bool] = False
+    # Completions are published with device-scope release atomics: the
+    # acquire-side event waits must see every write the task made.  The
+    # hand-written kernel's plain atomicAdd is a known cross-CTA publication
+    # race left as-is on the zero-diff manual path, so this is an
+    # intentional, documented divergence from it.
+    notify_release: ClassVar[bool] = True
 
     @classmethod
     @T.inline
