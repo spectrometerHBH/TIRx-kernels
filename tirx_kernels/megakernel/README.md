@@ -35,25 +35,6 @@ The registered hand-written implementation remains unchanged in
 [`moe.py`](moe.py). It is separate from the DSL lowering; DSL runtime tests use
 it only as an external numerical reference.
 
-## Runnable MoE DSL Example
-
-[`examples/moe.py`](examples/moe.py) is a standalone example containing the
-complete six-stage `KernelSpec` construction. It creates the tensors and five
-logical events, then connects six concrete `TileImpl` objects with fluent
-`read`/`write`/`wait`/`notify` calls. Scheduler fields are intentionally absent
-from the logical graph. A parity test keeps the standalone example aligned with
-the production [`build_moe_graph`](dsl/moe_spec.py) definition.
-
-```bash
-PYTHONPATH=/path/to/tvm/python:. \
-python -m tirx_kernels.megakernel.examples.moe \
-  --batch-size 128 --scheduler dynamic
-```
-
-Omit `--scheduler` to inspect only the logical DSL. Selecting `static`,
-`unfused`, or `dynamic` also emits the complete TIRX module and reports its
-physical-plan boundary.
-
 ## Notation
 
 The benchmark shape is Qwen3-30B-A3B MoE:
