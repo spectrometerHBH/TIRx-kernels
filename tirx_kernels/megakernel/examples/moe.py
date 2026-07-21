@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Scheduler-independent six-stage MoE logical specification."""
+"""The scheduler-independent six-stage MoE kernel written with the megakernel DSL."""
 
 from __future__ import annotations
 
@@ -23,16 +23,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from tirx_kernels.megakernel.utils.config import KernelConfig
-
-from .spec import KernelSpec
-from .tile_impl import (
-    AlignTileImpl,
-    CountSortTileImpl,
-    DownTileImpl,
-    GateUpSiluTileImpl,
-    GatingTileImpl,
-    TopkTileImpl,
-)
+from tvm.megakernel.dsl import KernelSpec
 
 _EXPECTED_CONFIG = {
     "HIDDEN_SIZE": 2048,
@@ -63,6 +54,15 @@ def _validate_mvp_config(config: Mapping[str, Any]):
 
 def build_moe_graph(config: Mapping[str, Any], batch_size: int) -> KernelSpec:
     """Build the scheduler-independent six-stage MoE graph."""
+
+    from ..dsl.tile_impl import (
+        AlignTileImpl,
+        CountSortTileImpl,
+        DownTileImpl,
+        GateUpSiluTileImpl,
+        GatingTileImpl,
+        TopkTileImpl,
+    )
 
     _validate_mvp_config(config)
     if not isinstance(batch_size, int) or batch_size <= 0:

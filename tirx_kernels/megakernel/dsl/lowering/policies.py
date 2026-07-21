@@ -28,7 +28,7 @@ from tirx_kernels.megakernel.utils.dynamic_scheduler import DynamicTileScheduler
 from tirx_kernels.megakernel.utils.static_scheduler import StaticTileScheduler
 from tvm.megakernel.transform import DeviceRegionPlan, ExecutionPlan
 
-from ..moe_spec import build_moe_graph
+from ...examples.moe import build_moe_graph
 from ..spec import KernelSpec
 from .model import DynamicProtocolPlan, HostTask, MoeLoweringEnv, NormalizedPlan
 from .normalize import (

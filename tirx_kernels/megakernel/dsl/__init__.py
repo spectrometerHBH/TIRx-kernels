@@ -45,7 +45,6 @@ from .lowering import (
     make_moe_plan,
     policy_for_scheduler,
 )
-from .moe_spec import build_moe_graph
 from .tile_impl import (
     AlignTileImpl,
     CountSortTileImpl,
@@ -83,7 +82,6 @@ __all__ = [
     "TopkTileImpl",
     "UnfusedPolicy",
     "VarSpec",
-    "build_moe_graph",
     "lower_moe_to_tirx",
     "make_moe_plan",
     "policy_for_scheduler",

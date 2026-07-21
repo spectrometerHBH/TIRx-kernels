@@ -23,7 +23,8 @@ import pytest
 import torch
 
 import tvm
-from tirx_kernels.megakernel.dsl import MoeLowerer, build_moe_graph, policy_for_scheduler
+from tirx_kernels.megakernel.dsl import MoeLowerer, policy_for_scheduler
+from tirx_kernels.megakernel.examples.moe import build_moe_graph
 from tirx_kernels.megakernel.moe import (
     _as_cuda_tensor,
     _compile_moe_schedulers,

@@ -43,8 +43,8 @@ from tvm.megakernel.transform import (
     WaitStep,
 )
 
+from ...examples.moe import _max_rows
 from .._expr import ConstExpr, Expr, ScalarLoadExpr, TileIndexExpr, as_expr, walk_expr
-from ..moe_spec import _max_rows
 from ..spec import DependencyType, EventSpec, KernelSpec, TileSpec, VarSpec
 
 _FORBIDDEN_SPEC_FIELDS = {
