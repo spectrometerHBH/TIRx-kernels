@@ -21,7 +21,9 @@ predicates, the drain event) is declared on the spec or on the adapters:
   logical plus the declared `down_dispatch_done` drain), the `routed_rows`
   runtime scalar, and wait/notify coordinate maps;
 - the six MoE [`TileImpl`](dsl/tile_impl.py) adapters: invoke existing
-  tile-task compute only, and carry scope/profiler metadata;
+  tile-task compute only, and carry the endpoint scope metadata
+  (`wait_level`/`wait_mask`/`notify_scope`/`pre_notify_scope`/
+  `notify_release`), profiler events, and the gemm-family `class_group`;
 - [`build_moe_kernel`](dsl/examples/moe.py): runs the spec through
   `tvm.megakernel.transform.build_runtime_kernel`, which emits the production
   kernel structure (static central queue, dynamic MPMC scheduler, or the
@@ -32,6 +34,34 @@ predicates, the drain event) is declared on the spec or on the adapters:
 The registered hand-written implementation remains unchanged in
 [`moe.py`](moe.py). It is separate from the DSL path; DSL runtime tests use it
 only as an external numerical and structural reference.
+
+## Building and running the DSL kernel
+
+```python
+from tirx_kernels.megakernel.dsl.examples.moe import build_moe_kernel
+from tirx_kernels.megakernel.utils.config import MEGAKERNEL_MOE_BENCH_CONFIG
+from tirx_kernels.megakernel.utils.utils import get_source
+
+# scheduler is "static", "dynamic", or "unfused" (a static debug variant).
+build = build_moe_kernel(MEGAKERNEL_MOE_BENCH_CONFIG, batch_size=128, scheduler="dynamic")
+_, lib = get_source(build.module)          # CUDA compile of the emitted IRModule
+kernel = lib["qwen3_30b_a3b_moe"]
+
+# Host-side products of the same build:
+#   static:  build.exec_queue          -> (sm_count, max_tasks) int32 central queue
+#   dynamic: build.queue_tasks/head/tail -> MPMC seed arrays (re-upload per launch)
+#   build.event_workspace_size         -> int32 cells to allocate and ZERO per launch
+```
+
+`moe_lowering_options(scheduler, batch_size)` holds the caller-side policy:
+reserved job ids matching `JobType` (so packed queue bytes equal the
+production host queues), the profiler-parameter ABI flag, and the dynamic
+down-tile coalescing factor (4 at batch >= 4, else 1).  Everything else is
+derived by the tvm builder from the spec: event workspace layout, job ids,
+dispatch rules, drain initialization, and the host queue contents.  Kernel
+arguments follow the hand-written kernel's order (18 tensors, event
+workspace, queue arrays, profiler buffer), so the `_make_tir_case` bench
+harness drives both sides identically.
 
 ## Notation
 

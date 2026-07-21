@@ -24,6 +24,33 @@ tile implementations, so ``tvm.megakernel.transform.build_runtime_kernel``
 emits the same structure as the hand-written kernel in
 ``tirx_kernels.megakernel.moe`` for both the static and dynamic schedulers
 (and the unfused static variant).
+
+Usage::
+
+    build = build_moe_kernel(MEGAKERNEL_MOE_BENCH_CONFIG, batch_size, "static")
+    _, lib = get_source(build.module)          # CUDA compile
+    kernel = lib["qwen3_30b_a3b_moe"]
+    exec_queue = build.exec_queue              # static central queue
+    # dynamic: build.queue_tasks/head/tail seed arrays instead
+    workspace = np.zeros((build.event_workspace_size,), dtype=np.int32)
+
+Physical-fact ownership:
+
+- spec tile attrs: ``megakernel.job_id`` (production ``JobType`` values) and
+  ``megakernel.run_predicate`` (the static routed-row guard);
+- spec event attrs: ``megakernel.drain`` on ``down_dispatch_done`` (static
+  host init, dynamic runtime init in the align tile);
+- tile impl class attributes (``dsl/tile_impl.py``): ``wait_level``,
+  ``wait_mask``, ``notify_scope``, ``pre_notify_scope``, ``notify_release``,
+  ``profile_event``, ``class_group``, ``hoisted_views``;
+- caller policy (``moe_lowering_options``): reserved job ids matching
+  ``JobType``, the profiler-parameter ABI flag, and the dynamic down-tile
+  coalescing factor.
+
+Host queues come from ``build_runtime_kernel`` itself: the static central
+task list dealt round-robin into the per-SM queue, or the dynamic MPMC seed
+arrays (event-init tasks plus the entry gating grid).  Both are byte-identical
+to the production ``generate_exec_queue_moe`` arrays for the same batch size.
 """
 
 from __future__ import annotations
@@ -321,7 +348,16 @@ def moe_lowering_options(scheduler: str, batch_size: int) -> LoweringOptions:
 def build_moe_kernel(
     config: Mapping[str, Any], batch_size: int, scheduler: str
 ) -> RuntimeKernelBuild:
-    """Build one MoE kernel module and its host queues through the tvm builder."""
+    """Build one MoE kernel module and its host queues through the tvm builder.
+
+    ``scheduler`` is ``"static"``, ``"dynamic"``, or ``"unfused"`` (a static
+    debug variant).  The returned ``RuntimeKernelBuild`` carries the IRModule
+    (kernel symbol ``qwen3_30b_a3b_moe``), the derived host queue arrays
+    (``exec_queue`` for static, ``queue_tasks``/``queue_head``/``queue_tail``
+    for dynamic), and the exact ``event_workspace_size`` to allocate and zero
+    per launch.  Re-upload the queue arrays and re-zero the workspace between
+    launches; the device mutates them.
+    """
 
     spec = build_moe_graph(config, batch_size, unfused=scheduler == "unfused")
     spec.validate()
