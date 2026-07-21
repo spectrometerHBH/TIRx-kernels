@@ -139,4 +139,4 @@ and compare — canon's `tir` there is stable, so match that setup.
 - `bench/sitecustomize.py`  — repo-local auto-imported hook: worker env repair + registration
 - `bench/nymph_workloads.yaml` — the workload list the orchestrator consumes
 - `bench/_nymph_bench_autoreg.py` — env-gated (NYMPH_BENCH_SUITE=1) registration hook
-- `bench/RESULTS.md`        — dated bench records (ground truth for past numbers)
+- `bench/RESULTS.md`        — the current bench baseline table (refresh by re-running, see its header)
