@@ -30,7 +30,6 @@ from tirx_kernels.deepgemm.mega_moe import (
     _get_block_config_for_mega_moe,
     _get_mega_moe_cuda_compile_mode,
     _get_num_bytes_per_pull,
-    _get_num_experts_per_wave_for_mega_moe,
     _make_symm_buffer_offsets,
     _run_worker,
     get_deepgemm_launch_config,
@@ -111,24 +110,6 @@ def test_pull_chunk_size_matches_deepgemm(hidden: int, expected: int) -> None:
     assert _get_num_bytes_per_pull(hidden) == expected
 
 
-def test_wave_heuristic_allows_a_partial_tail() -> None:
-    assert (
-        _get_num_experts_per_wave_for_mega_moe(
-            num_experts_per_rank=3,
-            num_tokens=577,
-            num_topk=3,
-            intermediate_hidden=3072,
-            block_m=192,
-            block_n=128,
-            num_sms=148,
-            num_ring_tokens=2304,
-            num_max_tokens_per_rank=768,
-            num_ranks=1,
-        )
-        == 2
-    )
-
-
 def test_decode_launch_uses_bk256_and_chunked_pull(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TIRX_DEEPGEMM_NUM_SMS_OVERRIDE", "148")
     launch = get_deepgemm_launch_config(
@@ -153,19 +134,18 @@ def test_decode_launch_uses_bk256_and_chunked_pull(monkeypatch: pytest.MonkeyPat
         "expected_ring_tokens",
         "expected_sf_ring_tokens",
         "expected_max_pool_tokens",
-        "expected_experts_per_wave",
         "expected_block_m",
         "expected_block_k",
     ),
     [
-        (1, 64, 147456, 2359296, 75648, 8, 16, 256),
-        (2, 64, 78336, 1253376, 41472, 8, 16, 256),
-        (4, 64, 46080, 737280, 27648, 8, 16, 256),
-        (6, 64, 38400, 614400, 26112, 8, 16, 256),
-        (1, 8192, 197760, 3164160, 124032, 8, 192, 128),
-        (2, 8192, 175104, 2801664, 138240, 4, 192, 128),
-        (4, 8192, 239616, 3833856, 221184, 3, 192, 128),
-        (6, 8192, 328704, 5259264, 316416, 2, 192, 128),
+        (1, 64, 13056, 208896, 75648, 16, 256),
+        (2, 64, 8064, 129024, 41472, 16, 256),
+        (4, 64, 6144, 98304, 27648, 16, 256),
+        (6, 64, 6144, 98304, 26112, 16, 256),
+        (1, 8192, 19968, 319488, 124032, 192, 128),
+        (2, 8192, 21888, 350208, 138240, 192, 128),
+        (4, 8192, 33792, 540672, 221184, 192, 128),
+        (6, 8192, 47616, 761856, 316416, 192, 128),
     ],
 )
 def test_bounded_ring_layout_matches_deepgemm_strict_matrix(
@@ -175,7 +155,6 @@ def test_bounded_ring_layout_matches_deepgemm_strict_matrix(
     expected_ring_tokens: int,
     expected_sf_ring_tokens: int,
     expected_max_pool_tokens: int,
-    expected_experts_per_wave: int,
     expected_block_m: int,
     expected_block_k: int,
 ) -> None:
@@ -196,14 +175,22 @@ def test_bounded_ring_layout_matches_deepgemm_strict_matrix(
     assert workspace.num_ring_blocks == expected_ring_tokens // 8
     assert workspace.num_sf_ring_tokens == expected_sf_ring_tokens
     assert workspace.num_max_pool_tokens == expected_max_pool_tokens
-    assert launch.num_experts_per_wave == expected_experts_per_wave
     assert (launch.block_m, launch.block_k) == (expected_block_m, expected_block_k)
 
     counter_bytes = workspace.num_ring_blocks * 4
+    assert workspace.l1_task_count_offset == 28
+    assert workspace.l2_task_count_offset == 32
+    assert workspace.shared_l1_task_count_offset == 36
+    assert workspace.shared_l2_task_count_offset == 40
+    assert workspace.expert_send_count_offset == 128
     assert workspace.l1_empty_count_offset == workspace.l1_full_count_offset + counter_bytes
     assert workspace.l2_full_count_offset == workspace.l1_empty_count_offset + counter_bytes
     assert workspace.l2_empty_count_offset == workspace.l2_full_count_offset + counter_bytes
-    assert workspace.src_token_topk_idx_offset == workspace.l2_empty_count_offset + counter_bytes
+    assert workspace.shared_l2_full_count_offset == workspace.l2_empty_count_offset + counter_bytes
+    assert (
+        workspace.src_token_topk_idx_offset
+        == workspace.shared_l2_full_count_offset + workspace.num_shared_l2_pool_blocks * 4
+    )
 
 
 def test_mega_moe_cuda_compile_mode_defaults_to_nvcc(monkeypatch: pytest.MonkeyPatch) -> None:

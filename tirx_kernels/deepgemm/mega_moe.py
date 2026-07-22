@@ -127,7 +127,6 @@ class DeepGemmLaunchConfig:
     num_non_epilogue_threads: int
     num_epilogue_threads: int
     num_bytes_per_pull: int
-    num_experts_per_wave: int
     num_topk: int
     hidden: int
     intermediate_hidden: int
@@ -210,8 +209,13 @@ class DeepGemmWorkspaceLayout:
     num_ring_blocks: int
     num_sf_ring_tokens: int
     num_max_pool_tokens: int
+    num_shared_l2_pool_blocks: int
     token_src_metadata_bytes: int
     barrier_offset: int
+    l1_task_count_offset: int
+    l2_task_count_offset: int
+    shared_l1_task_count_offset: int
+    shared_l2_task_count_offset: int
     expert_send_count_offset: int
     expert_recv_count_offset: int
     expert_recv_count_sum_offset: int
@@ -219,6 +223,7 @@ class DeepGemmWorkspaceLayout:
     l1_empty_count_offset: int
     l2_full_count_offset: int
     l2_empty_count_offset: int
+    shared_l2_full_count_offset: int
     src_token_topk_idx_offset: int
     token_src_metadata_offset: int
     total_bytes: int
@@ -335,60 +340,82 @@ def _get_num_sf_ring_tokens(num_ring_tokens: int) -> int:
     )
 
 
-def _get_num_wave_pool_tokens(
-    *,
-    num_ranks: int,
-    num_topk: int,
-    num_max_tokens_per_rank: int,
-    num_experts_per_wave: int,
-    block_m: int,
+def _get_num_l1_warmup_waves(
+    *, num_total_m_blocks: int, num_clusters: int, num_l1_n_clusters: int, num_l2_n_clusters: int
 ) -> int:
-    if num_max_tokens_per_rank % block_m != 0:
-        raise ValueError("MegaMoE max tokens must be aligned to the ring block size")
-    num_tokens_from_all_ranks = num_max_tokens_per_rank * num_ranks
-    if num_experts_per_wave == 1:
-        return num_tokens_from_all_ranks
-    return min(
-        num_tokens_from_all_ranks * num_experts_per_wave,
-        _align_up(
-            num_tokens_from_all_ranks * num_topk + num_experts_per_wave * (block_m - 1), block_m
-        ),
+    """Mirror of `sched::get_num_l1_warmup_waves` in
+    `deep_gemm/include/deep_gemm/scheduler/mega_moe.cuh`: minimal L1 warmup waves
+    so the interleaved L1/L2 schedule cannot deadlock on the ring buffer."""
+    num_first_l2_wave_m_blocks = _ceil_div(num_clusters, num_l2_n_clusters)
+    num_l1_warmup_clusters_for_first_l2_wave = _ceil_div(
+        num_first_l2_wave_m_blocks * num_l1_n_clusters, num_clusters
     )
+    num_interleave_cluster_diff_per_m_block = (
+        num_l1_n_clusters - num_l2_n_clusters if num_l1_n_clusters > num_l2_n_clusters else 0
+    )
+    num_warmup_waves_for_interleave_schedule = (
+        _ceil_div(
+            num_l1_n_clusters + (num_total_m_blocks - 1) * num_interleave_cluster_diff_per_m_block,
+            num_clusters,
+        )
+        + 1
+    )
+    return max(num_l1_warmup_clusters_for_first_l2_wave, num_warmup_waves_for_interleave_schedule)
 
 
-def _get_ring_limits_for_mega_moe(
-    *, num_max_tokens_per_rank: int, num_experts_per_rank: int, num_topk: int, num_ranks: int
-) -> tuple[int, int]:
-    kwargs = {
-        "num_ranks": num_ranks,
-        "num_topk": num_topk,
-        "num_max_tokens_per_rank": num_max_tokens_per_rank,
-        "block_m": _K_LCM_CANDIDATE_BLOCK_M,
-    }
-    return (
-        _get_num_wave_pool_tokens(num_experts_per_wave=1, **kwargs),
-        _get_num_wave_pool_tokens(num_experts_per_wave=num_experts_per_rank, **kwargs),
+def _get_num_max_live_pool_blocks(
+    *, num_total_m_blocks: int, num_sms: int, hidden: int, intermediate_hidden: int
+) -> int:
+    """Mirror of `sched::get_num_max_live_pool_blocks` in
+    `deep_gemm/include/deep_gemm/scheduler/mega_moe.cuh`."""
+    mega_moe_block_n = 128
+    num_ctas_per_cluster = 2
+    if (intermediate_hidden * 2) % (num_ctas_per_cluster * mega_moe_block_n) != 0:
+        raise ValueError("MegaMoE requires (intermediate_hidden * 2) % 256 == 0")
+    if hidden % (num_ctas_per_cluster * mega_moe_block_n) != 0:
+        raise ValueError("MegaMoE requires hidden % 256 == 0")
+    num_clusters = num_sms // num_ctas_per_cluster
+    num_l1_n_clusters = intermediate_hidden * 2 // (num_ctas_per_cluster * mega_moe_block_n)
+    num_l2_n_clusters = hidden // (num_ctas_per_cluster * mega_moe_block_n)
+    num_l1_clusters = num_total_m_blocks * num_l1_n_clusters
+    num_l1_waves = _ceil_div(num_l1_clusters, num_clusters)
+    num_min_l1_warmup_waves = _get_num_l1_warmup_waves(
+        num_total_m_blocks=num_total_m_blocks,
+        num_clusters=num_clusters,
+        num_l1_n_clusters=num_l1_n_clusters,
+        num_l2_n_clusters=num_l2_n_clusters,
     )
+    num_l1_warmup_waves = min(num_min_l1_warmup_waves, num_l1_waves)
+    num_l1_warmup_clusters = min(num_l1_warmup_waves * num_clusters, num_l1_clusters)
+    num_live_blocks_after_warmup = _ceil_div(num_l1_warmup_clusters, num_l1_n_clusters)
+    frontier_growth = (
+        _ceil_div(num_total_m_blocks * (num_l2_n_clusters - num_l1_n_clusters), num_l2_n_clusters)
+        if num_l2_n_clusters > num_l1_n_clusters
+        else 0
+    )
+    wave_margin = _ceil_div(num_clusters, min(num_l1_n_clusters, num_l2_n_clusters))
+    return min(num_total_m_blocks, num_live_blocks_after_warmup + frontier_growth + wave_margin)
 
 
 def _get_num_ring_tokens_for_mega_moe(config: MegaMoeConfig) -> int:
+    """Mirror of the ring sizing loop in `csrc/apis/mega.hpp`
+    `get_symm_buffer_size_for_mega_moe`: the worst-case live pool blocks over
+    all candidate block sizes bounds the ring."""
+    num_sms = _get_num_sms_for_mega_moe()
     num_max_tokens_per_rank = _get_aligned_num_max_tokens_per_rank(config)
-    num_min_ring_tokens, num_max_ring_tokens = _get_ring_limits_for_mega_moe(
-        num_max_tokens_per_rank=num_max_tokens_per_rank,
-        num_experts_per_rank=config.num_experts_per_rank,
-        num_topk=config.num_topk,
-        num_ranks=config.num_processes,
-    )
-    if num_max_tokens_per_rank >= 6144:
-        num_ring_tokens = _align_up(768 * 1024, _K_LCM_CANDIDATE_BLOCK_M)
-    else:
-        _, num_ring_tokens = _get_ring_limits_for_mega_moe(
-            num_max_tokens_per_rank=_align_up(4096, _K_LCM_CANDIDATE_BLOCK_M),
-            num_experts_per_rank=432 // 72,
-            num_topk=6,
-            num_ranks=72,
+    num_active_topk = min(config.num_topk, config.num_experts_per_rank)
+    num_max_routed_tokens = num_max_tokens_per_rank * config.num_processes * num_active_topk
+    num_ring_tokens = 0
+    for block_m in _K_CANDIDATE_BLOCK_M:
+        num_pool_blocks = _ceil_div(num_max_routed_tokens, block_m) + config.num_experts_per_rank
+        num_live_pool_blocks = _get_num_max_live_pool_blocks(
+            num_total_m_blocks=num_pool_blocks,
+            num_sms=num_sms,
+            hidden=config.hidden,
+            intermediate_hidden=config.intermediate_hidden,
         )
-    return min(max(num_ring_tokens, num_min_ring_tokens), num_max_ring_tokens)
+        num_ring_tokens = max(num_ring_tokens, num_live_pool_blocks * block_m)
+    return _align_up(num_ring_tokens, _K_LCM_CANDIDATE_BLOCK_M)
 
 
 def get_deepgemm_workspace_layout(config: MegaMoeConfig) -> DeepGemmWorkspaceLayout:
@@ -407,9 +434,18 @@ def get_deepgemm_workspace_layout(config: MegaMoeConfig) -> DeepGemmWorkspaceLay
     num_ring_tokens = _get_num_ring_tokens_for_mega_moe(config)
     num_ring_blocks = num_ring_tokens // _K_MIN_CANDIDATE_BLOCK_M
     num_sf_ring_tokens = _get_num_sf_ring_tokens(num_ring_tokens)
+    num_shared_l2_pool_blocks = _ceil_div(aligned_num_max_tokens_per_rank, _K_MIN_CANDIDATE_BLOCK_M)
 
+    # `Workspace::kNumBarrierSignalBytes` = 128: [0..15] grid sync counters,
+    # [16..19] NVLink barrier counter, [20..27] NVLink barrier signals,
+    # [28..31] L1 / [32..35] L2 / [36..39] shared-L1 / [40..43] shared-L2
+    # schedule task counters, [44..127] padding isolating the hot atomics.
     barrier_offset = 0
-    cursor = 32
+    l1_task_count_offset = 28
+    l2_task_count_offset = 32
+    shared_l1_task_count_offset = 36
+    shared_l2_task_count_offset = 40
+    cursor = 128
 
     expert_send_count_offset = cursor
     cursor += num_experts * 8
@@ -432,6 +468,9 @@ def get_deepgemm_workspace_layout(config: MegaMoeConfig) -> DeepGemmWorkspaceLay
     l2_empty_count_offset = cursor
     cursor += num_ring_blocks * 4
 
+    shared_l2_full_count_offset = cursor
+    cursor += num_shared_l2_pool_blocks * 4
+
     src_token_topk_idx_offset = cursor
     cursor += num_experts_per_rank * num_ranks * num_max_recv_tokens_per_expert * 4
 
@@ -452,8 +491,13 @@ def get_deepgemm_workspace_layout(config: MegaMoeConfig) -> DeepGemmWorkspaceLay
         num_ring_blocks=num_ring_blocks,
         num_sf_ring_tokens=num_sf_ring_tokens,
         num_max_pool_tokens=num_max_pool_tokens,
+        num_shared_l2_pool_blocks=num_shared_l2_pool_blocks,
         token_src_metadata_bytes=token_src_metadata_bytes,
         barrier_offset=barrier_offset,
+        l1_task_count_offset=l1_task_count_offset,
+        l2_task_count_offset=l2_task_count_offset,
+        shared_l1_task_count_offset=shared_l1_task_count_offset,
+        shared_l2_task_count_offset=shared_l2_task_count_offset,
         expert_send_count_offset=expert_send_count_offset,
         expert_recv_count_offset=expert_recv_count_offset,
         expert_recv_count_sum_offset=expert_recv_count_sum_offset,
@@ -461,6 +505,7 @@ def get_deepgemm_workspace_layout(config: MegaMoeConfig) -> DeepGemmWorkspaceLay
         l1_empty_count_offset=l1_empty_count_offset,
         l2_full_count_offset=l2_full_count_offset,
         l2_empty_count_offset=l2_empty_count_offset,
+        shared_l2_full_count_offset=shared_l2_full_count_offset,
         src_token_topk_idx_offset=src_token_topk_idx_offset,
         token_src_metadata_offset=token_src_metadata_offset,
         total_bytes=total_bytes,
@@ -573,7 +618,9 @@ def validate_runtime_symm_buffer_layout(
                 f"expected {expected_shape}, got {actual_shape}"
             )
 
-    actual_num_ring_tokens = int(getattr(symm_buffer, "num_ring_tokens", -1))
+    # Upstream 559d79f removed `SymmBuffer.num_ring_tokens`; the ring capacity is
+    # implied by the `l1_acts` view shape checked above.
+    actual_num_ring_tokens = int(symm_buffer.l1_acts.shape[0])
     if actual_num_ring_tokens != workspace.num_ring_tokens:
         raise ValueError(
             "DeepGEMM ring capacity mismatch: "
@@ -723,10 +770,14 @@ def build_scheduler_reference(
     dispatch_reference: DispatchReference,
     pull_reference: PullReference,
 ) -> SchedulerReference:
+    """CPU mirror of the dynamic `MegaMoEScheduler` task enumeration (upstream
+    559d79f). Which CTA pair executes a task is decided at runtime by global
+    atomic counters, but the task set itself is deterministic: L1 task indices
+    map to `(pool m block, n cluster)` in counter order, likewise for L2."""
     expert_num_tokens = dispatch_reference.expert_recv_count_sum.to(torch.int32).cpu()
     expert_pool_block_offset = pull_reference.expert_pool_block_offset.to(torch.int32).cpu()
-    num_l1_block_ns = (config.intermediate_hidden * 2) // launch.block_n
-    num_l2_block_ns = config.hidden // launch.block_n
+    num_l1_clusters = (config.intermediate_hidden * 2) // launch.block_n // 2
+    num_l2_clusters = config.hidden // launch.block_n // 2
     num_l1_block_ks = config.hidden // launch.block_k
     num_l2_block_ks = config.intermediate_hidden // launch.block_k
 
@@ -735,118 +786,46 @@ def build_scheduler_reference(
             return 0
         return int(expert_num_tokens[expert_idx].item())
 
-    def get_pool_block_offset(expert_idx: int) -> int:
-        if expert_idx >= config.num_experts_per_rank:
-            return int(expert_pool_block_offset[-1].item())
-        return int(expert_pool_block_offset[expert_idx].item())
+    num_total_m_blocks = 0
+    expert_of_pool_block: list[int] = []
+    m_block_of_pool_block: list[int] = []
+    for expert_idx in range(config.num_experts_per_rank):
+        num_m_blocks = _ceil_div(get_num_tokens(expert_idx), launch.block_m)
+        for m_block_idx in range(num_m_blocks):
+            expert_of_pool_block.append(expert_idx)
+            m_block_of_pool_block.append(m_block_idx)
+        num_total_m_blocks += num_m_blocks
 
     blocks: list[SchedulerBlockReference] = []
     num_linear1_blocks = 0
     num_linear2_blocks = 0
-
-    for block_idx_seed in range(launch.num_sms):
-        next_phase = "Linear1"
-        current_local_expert_idx = 0
-        current_num_tokens = get_num_tokens(0)
-        current_pool_block_offset = get_pool_block_offset(0)
-        block_idx = block_idx_seed
-
-        def get_wave_expert_end_idx() -> int:
-            return min(
-                _align_up(current_local_expert_idx + 1, launch.num_experts_per_wave),
-                config.num_experts_per_rank,
-            )
-
-        def get_current_num_m_blocks() -> int:
-            return (current_num_tokens + launch.block_m - 1) // launch.block_m
-
-        def advance_expert_idx() -> tuple[int, int, int]:
-            next_local_expert_idx = current_local_expert_idx + 1
-            next_pool_block_offset = current_pool_block_offset + get_current_num_m_blocks()
-            next_num_tokens = get_num_tokens(next_local_expert_idx)
-            return next_local_expert_idx, next_num_tokens, next_pool_block_offset
-
-        def set_expert_idx(expert_idx: int) -> tuple[int, int, int]:
-            return expert_idx, get_num_tokens(expert_idx), get_pool_block_offset(expert_idx)
-
-        while True:
-            if current_local_expert_idx >= config.num_experts_per_rank:
-                break
-            if next_phase == "Linear1":
-                wave_end_expert_idx = get_wave_expert_end_idx()
-                found_block = False
-                while current_local_expert_idx < wave_end_expert_idx:
-                    num_m_blocks = get_current_num_m_blocks()
-                    m_block_idx = block_idx // num_l1_block_ns
-                    if m_block_idx < num_m_blocks:
-                        n_block_idx = block_idx - m_block_idx * num_l1_block_ns
-                        valid_m = min(
-                            current_num_tokens - m_block_idx * launch.block_m, launch.block_m
-                        )
-                        blocks.append(
-                            SchedulerBlockReference(
-                                block_idx_seed=block_idx_seed,
-                                phase="Linear1",
-                                local_expert_idx=current_local_expert_idx,
-                                num_k_blocks=num_l1_block_ks,
-                                m_block_idx=m_block_idx,
-                                n_block_idx=n_block_idx,
-                                pool_block_offset=current_pool_block_offset,
-                                valid_m=max(valid_m, 0),
-                            )
-                        )
-                        num_linear1_blocks += 1
-                        block_idx += launch.num_sms
-                        found_block = True
-                        break
-                    block_idx -= num_m_blocks * num_l1_block_ns
-                    (current_local_expert_idx, current_num_tokens, current_pool_block_offset) = (
-                        advance_expert_idx()
-                    )
-                if found_block:
-                    continue
-                next_phase = "Linear2"
-                (current_local_expert_idx, current_num_tokens, current_pool_block_offset) = (
-                    set_expert_idx(
-                        _align_down(
-                            max(current_local_expert_idx - 1, 0), launch.num_experts_per_wave
-                        )
-                    )
+    for phase, num_clusters, num_k_blocks in (
+        ("Linear1", num_l1_clusters, num_l1_block_ks),
+        ("Linear2", num_l2_clusters, num_l2_block_ks),
+    ):
+        for task_idx in range(num_total_m_blocks * num_clusters):
+            pool_block_idx = task_idx // num_clusters
+            n_cluster_idx = task_idx % num_clusters
+            local_expert_idx = expert_of_pool_block[pool_block_idx]
+            m_block_idx = m_block_of_pool_block[pool_block_idx]
+            num_tokens = get_num_tokens(local_expert_idx)
+            valid_m = min(num_tokens - m_block_idx * launch.block_m, launch.block_m)
+            blocks.append(
+                SchedulerBlockReference(
+                    block_idx_seed=task_idx,
+                    phase=phase,
+                    local_expert_idx=local_expert_idx,
+                    num_k_blocks=num_k_blocks,
+                    m_block_idx=m_block_idx,
+                    n_block_idx=n_cluster_idx,
+                    pool_block_offset=pool_block_idx - m_block_idx,
+                    valid_m=max(valid_m, 0),
                 )
+            )
+            if phase == "Linear1":
+                num_linear1_blocks += 1
             else:
-                wave_end_expert_idx = get_wave_expert_end_idx()
-                found_block = False
-                while current_local_expert_idx < wave_end_expert_idx:
-                    num_m_blocks = get_current_num_m_blocks()
-                    if block_idx < num_m_blocks * num_l2_block_ns:
-                        m_block_idx = block_idx // num_l2_block_ns
-                        n_block_idx = block_idx - m_block_idx * num_l2_block_ns
-                        valid_m = min(
-                            current_num_tokens - m_block_idx * launch.block_m, launch.block_m
-                        )
-                        blocks.append(
-                            SchedulerBlockReference(
-                                block_idx_seed=block_idx_seed,
-                                phase="Linear2",
-                                local_expert_idx=current_local_expert_idx,
-                                num_k_blocks=num_l2_block_ks,
-                                m_block_idx=m_block_idx,
-                                n_block_idx=n_block_idx,
-                                pool_block_offset=current_pool_block_offset,
-                                valid_m=max(valid_m, 0),
-                            )
-                        )
-                        num_linear2_blocks += 1
-                        block_idx += launch.num_sms
-                        found_block = True
-                        break
-                    block_idx -= num_m_blocks * num_l2_block_ns
-                    (current_local_expert_idx, current_num_tokens, current_pool_block_offset) = (
-                        advance_expert_idx()
-                    )
-                if found_block:
-                    continue
-                next_phase = "Linear1"
+                num_linear2_blocks += 1
 
     return SchedulerReference(
         expert_num_tokens=expert_num_tokens.to(dispatch_reference.expert_recv_count_sum.device),
@@ -883,67 +862,6 @@ def _get_block_config_for_mega_moe(
     return cfg
 
 
-def _get_num_experts_per_wave_for_mega_moe(
-    *,
-    num_experts_per_rank: int,
-    num_tokens: int,
-    num_topk: int,
-    intermediate_hidden: int,
-    block_m: int,
-    block_n: int,
-    num_sms: int,
-    num_ring_tokens: int,
-    num_max_tokens_per_rank: int,
-    num_ranks: int,
-) -> int:
-    num_max_experts_per_wave = num_experts_per_rank
-    while (
-        num_max_experts_per_wave > 0
-        and _get_num_wave_pool_tokens(
-            num_ranks=num_ranks,
-            num_topk=num_topk,
-            num_max_tokens_per_rank=num_max_tokens_per_rank,
-            num_experts_per_wave=num_max_experts_per_wave,
-            block_m=block_m,
-        )
-        > num_ring_tokens
-    ):
-        num_max_experts_per_wave -= 1
-    if num_max_experts_per_wave <= 0:
-        raise ValueError("MegaMoE ring buffer is too small for one expert wave")
-
-    expected_tokens_per_expert = num_tokens * num_topk / num_experts_per_rank
-    imbalance_factor = 2
-    num_expected_m_blocks = max((math.ceil(expected_tokens_per_expert) + block_m - 1) // block_m, 1)
-    num_l1_n_blocks = (2 * intermediate_hidden) // block_n
-    num_expected_l1_blocks_per_expert = num_expected_m_blocks * num_l1_n_blocks
-    num_min_expected_experts_to_fill_sms = (
-        imbalance_factor * num_sms + num_expected_l1_blocks_per_expert - 1
-    ) // num_expected_l1_blocks_per_expert
-
-    if expected_tokens_per_expert < 1:
-        num_min_expected_experts_to_fill_sms = num_experts_per_rank
-    if num_min_expected_experts_to_fill_sms >= num_max_experts_per_wave:
-        return num_max_experts_per_wave
-    if num_expected_l1_blocks_per_expert >= num_sms:
-        return num_min_expected_experts_to_fill_sms
-
-    num_sweep_max_experts_per_wave = min(
-        num_max_experts_per_wave, num_min_expected_experts_to_fill_sms * 2
-    )
-    best_num_experts_per_wave = num_min_expected_experts_to_fill_sms
-    best_tail_ratio = -1.0
-    for num_experts_per_wave in range(
-        num_min_expected_experts_to_fill_sms, num_sweep_max_experts_per_wave + 1
-    ):
-        remainder = num_experts_per_rank % num_experts_per_wave
-        tail_ratio = 1.0 if remainder == 0 else remainder / num_experts_per_wave
-        if tail_ratio > best_tail_ratio:
-            best_tail_ratio = tail_ratio
-            best_num_experts_per_wave = num_experts_per_wave
-    return best_num_experts_per_wave
-
-
 def _get_num_bytes_per_pull(hidden: int) -> int:
     num_bytes_per_pull = hidden
     while num_bytes_per_pull > 4096:
@@ -973,8 +891,6 @@ def get_deepgemm_launch_config(config: MegaMoeConfig) -> DeepGemmLaunchConfig:
         raise ValueError("MegaMoE launch must satisfy DeepGEMM kNumSMs > 1")
     if num_sms % 2 != 0:
         raise ValueError("MegaMoE launch must satisfy DeepGEMM kNumSMs % 2 == 0")
-    num_max_tokens_per_rank = _get_aligned_num_max_tokens_per_rank(config)
-    num_ring_tokens = _get_num_ring_tokens_for_mega_moe(config)
     num_ctas_per_cluster_env = os.environ.get("TIRX_DEEPGEMM_NUM_CTAS_PER_CLUSTER_OVERRIDE")
     cluster_size, block_m, store_block_m, block_k, num_epilogue_wgs = (
         _get_block_config_for_mega_moe(
@@ -1002,18 +918,6 @@ def get_deepgemm_launch_config(config: MegaMoeConfig) -> DeepGemmLaunchConfig:
         num_non_epilogue_threads=128,
         num_epilogue_threads=num_epilogue_wgs * 128,
         num_bytes_per_pull=_get_num_bytes_per_pull(config.hidden),
-        num_experts_per_wave=_get_num_experts_per_wave_for_mega_moe(
-            num_experts_per_rank=config.num_experts_per_rank,
-            num_tokens=config.num_tokens,
-            num_topk=config.num_topk,
-            intermediate_hidden=config.intermediate_hidden,
-            block_m=block_m,
-            block_n=block_n,
-            num_sms=num_sms,
-            num_ring_tokens=num_ring_tokens,
-            num_max_tokens_per_rank=num_max_tokens_per_rank,
-            num_ranks=config.num_processes,
-        ),
         num_topk=config.num_topk,
         hidden=config.hidden,
         intermediate_hidden=config.intermediate_hidden,
@@ -1038,8 +942,6 @@ def get_deepgemm_launch_config(config: MegaMoeConfig) -> DeepGemmLaunchConfig:
         raise ValueError("MegaMoE launch must satisfy BLOCK_N == 128")
     if launch.block_k % launch.block_n != 0:
         raise ValueError("MegaMoE launch must satisfy BLOCK_K % BLOCK_N == 0")
-    if not 0 < launch.num_experts_per_wave <= config.num_experts_per_rank:
-        raise ValueError("MegaMoE launch has an invalid experts-per-wave count")
     if (config.intermediate_hidden * 2 // launch.block_n) % 2 != 0:
         raise ValueError("MegaMoE launch must satisfy kNumL1BlockNs % 2 == 0")
     if (config.hidden // launch.block_n) % 2 != 0:
@@ -1076,6 +978,8 @@ def get_tirx_dynamic_shared_memory_bytes(config: MegaMoeConfig) -> int:
     smem_sfb_size_per_stage = launch.block_n * (launch.block_k // 32)
     smem_amax_reduction_size = launch.store_block_m * launch.num_epilogue_warps * 4
     smem_tmem_ptr_size = 4
+    num_schedule_stages = 2
+    smem_task_info_size = num_schedule_stages * 32
     smem_per_stage = (
         smem_a_size_per_stage
         + smem_b_size_per_stage
@@ -1087,7 +991,14 @@ def get_tirx_dynamic_shared_memory_bytes(config: MegaMoeConfig) -> int:
         smem_dispatch_size
         + smem_cd_size
         + smem_amax_reduction_size
-        + (launch.num_dispatch_warps + num_epilogue_stages * 2 + launch.num_epilogue_warps * 2) * 8
+        + (
+            launch.num_dispatch_warps
+            + num_epilogue_stages * 2
+            + launch.num_epilogue_warps * 2
+            + num_schedule_stages * 2
+        )
+        * 8
+        + smem_task_info_size
         + smem_tmem_ptr_size
     )
     num_stages = (sm100_smem_capacity - smem_fixed) // smem_per_stage
@@ -1098,6 +1009,7 @@ def get_tirx_dynamic_shared_memory_bytes(config: MegaMoeConfig) -> int:
         + num_stages * 2
         + num_epilogue_stages * 2
         + launch.num_epilogue_warps * 2
+        + num_schedule_stages * 2
     )
     smem_expert_count_offset = 0
     smem_send_buffer_offset = smem_expert_count_offset + smem_expert_count_size
@@ -1108,7 +1020,8 @@ def get_tirx_dynamic_shared_memory_bytes(config: MegaMoeConfig) -> int:
     smem_sfa_offset = smem_b_offset + num_stages * smem_b_size_per_stage
     smem_sfb_offset = smem_sfa_offset + num_stages * smem_sfa_size_per_stage
     smem_amax_reduction_offset = smem_sfb_offset + num_stages * smem_sfb_size_per_stage
-    smem_barrier_offset = _align_up(smem_amax_reduction_offset + smem_amax_reduction_size, 8)
+    smem_task_info_offset = _align_up(smem_amax_reduction_offset + smem_amax_reduction_size, 16)
+    smem_barrier_offset = smem_task_info_offset + smem_task_info_size
     smem_tmem_ptr_offset = smem_barrier_offset + num_total_barriers * 8
     smem_symm_rank_bases_offset = _align_up(smem_tmem_ptr_offset + smem_tmem_ptr_size, 8)
     smem_symm_rank_bases_size = config.num_processes * 8 if config.num_processes > 1 else 0
@@ -1681,6 +1594,7 @@ def get_kernel(
     collect_stats: bool = False,
     emit_nvl_barrier_timeout_printf: bool = True,
 ):
+    from tvm.backend.cuda.op import cuda_func_call
     from tvm.backend.cuda.operator.tile_primitive.gemm_async.tcgen05 import sf_tmem_layout
     from tvm.backend.cuda.operator.tile_primitive.tma_utils import SwizzleMode, mma_shared_layout
     from tvm.script import tirx as T
@@ -1708,6 +1622,23 @@ def get_kernel(
     num_l2_block_ns = hidden // kernel_config.block_n
     num_l1_block_ks = hidden // kernel_config.block_k
     num_l2_block_ks = intermediate_hidden // kernel_config.block_k
+    # Dynamic task scheduler constants (scheduler/mega_moe.cuh, upstream 559d79f)
+    num_l1_clusters = num_l1_block_ns // 2
+    num_l2_clusters = num_l2_block_ns // 2
+    num_sched_clusters = kernel_config.num_sms // 2
+    num_schedule_stages = 2
+    num_schedule_consumer_threads = 2 * kernel_config.num_epilogue_threads
+    task_info_bytes = 32
+    sched_l1_waves_done = 0xFFFFFFFF
+    # `get_num_l1_warmup_waves`: only the interleave term depends on the runtime
+    # total-M-block count; fold the rest to compile-time constants.
+    sched_num_first_l2_wave_m_blocks = _ceil_div(num_sched_clusters, num_l2_clusters)
+    sched_l1_warmup_first_l2_wave = _ceil_div(
+        sched_num_first_l2_wave_m_blocks * num_l1_clusters, num_sched_clusters
+    )
+    sched_interleave_cluster_diff = (
+        num_l1_clusters - num_l2_clusters if num_l1_clusters > num_l2_clusters else 0
+    )
     num_ring_tokens = workspace_layout.num_ring_tokens
     if num_ring_tokens % kernel_config.block_m != 0:
         raise ValueError("MegaMoE ring capacity must be divisible by BLOCK_M")
@@ -2179,21 +2110,56 @@ def get_kernel(
             "int32",
         )
 
-    def scheduler_get_wave_expert_end_idx_expr(current_local_expert_idx):
-        current_local_expert_idx_u32 = T.cast(current_local_expert_idx + T.int32(1), "uint32")
-        wave_expert_end_idx_u32 = (
-            (current_local_expert_idx_u32 + T.uint32(kernel_config.num_experts_per_wave - 1))
-            // T.uint32(kernel_config.num_experts_per_wave)
-            * T.uint32(kernel_config.num_experts_per_wave)
-        )
-        return T.cast(T.min(wave_expert_end_idx_u32, T.uint32(num_experts_per_rank)), "int32")
+    # `ptx::st_async_cluster` (deep_gemm/include/deep_gemm/ptx/ld_st.cuh): map the
+    # destination smem + mbarrier into the peer CTA with `mapa`, then push the
+    # 32-byte TaskInfo as two `st.async...v4` transactions that complete the
+    # published-task mbarrier's tx count. No TIRx wrapper exists for
+    # `st.async.shared::cluster.mbarrier::complete_tx::bytes`; see
+    # `.porting/mega_moe/tirx_dsl_improve.md`.
+    _st_async_cluster_task_info_src = r"""
+__forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
+    void* dst, void* bar, uint32_t dst_cta_idx,
+    uint32_t v0, uint32_t v1, uint32_t v2, uint32_t v3,
+    uint32_t v4, uint32_t v5, uint32_t v6, uint32_t v7) {
+    const uint32_t bar_addr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+    const uint32_t dst_addr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+    uint32_t mapped_bar, mapped_dst;
+    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;"
+                 : "=r"(mapped_bar) : "r"(bar_addr), "r"(dst_cta_idx));
+    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;"
+                 : "=r"(mapped_dst) : "r"(dst_addr), "r"(dst_cta_idx));
+    asm volatile(
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.u32.v4 [%0], {%1, %2, %3, %4}, [%5];" ::
+        "r"(mapped_dst), "r"(v0), "r"(v1), "r"(v2), "r"(v3), "r"(mapped_bar));
+    asm volatile(
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.u32.v4 [%0], {%1, %2, %3, %4}, [%5];" ::
+        "r"(mapped_dst + 16), "r"(v4), "r"(v5), "r"(v6), "r"(v7), "r"(mapped_bar));
+}
+"""
 
-    def scheduler_get_current_num_m_blocks_expr(current_num_tokens):
-        current_num_tokens_u32 = T.cast(current_num_tokens, "uint32")
-        current_num_m_blocks_u32 = (
-            current_num_tokens_u32 + T.uint32(kernel_config.block_m - 1)
-        ) // T.uint32(kernel_config.block_m)
-        return T.cast(current_num_m_blocks_u32, "int32")
+    def st_async_cluster_task_info(dst_ptr, bar_ptr, dst_cta_idx, task_info_regs):
+        return cuda_func_call(
+            "tvm_builtin_st_async_cluster_task_info",
+            dst_ptr,
+            bar_ptr,
+            T.cast(dst_cta_idx, "uint32"),
+            task_info_regs[0],
+            task_info_regs[1],
+            task_info_regs[2],
+            task_info_regs[3],
+            task_info_regs[4],
+            task_info_regs[5],
+            task_info_regs[6],
+            task_info_regs[7],
+            source_code=_st_async_cluster_task_info_src,
+            return_type="void",
+        )
+
+    def atomic_add_u32(address, value):
+        return T.ptx.atom_scalar(address, value, space="global", op="add", ptx_type="u32")
+
+    def load_volatile_u32(address):
+        return T.ptx.ld_volatile(address, "uint32", "u32", space="global")
 
     def symm_rank_offset_arg_expr(symm_rank_offsets, mapped_rank_idx):
         if num_processes == 1:
@@ -2268,6 +2234,7 @@ def get_kernel(
         + smem_sfb_size_per_stage
         + 16
     )
+    smem_task_info_size = num_schedule_stages * task_info_bytes
     smem_fixed = (
         smem_dispatch_size
         + smem_cd_size
@@ -2276,8 +2243,10 @@ def get_kernel(
             kernel_config.num_dispatch_warps
             + num_epilogue_stages * 2
             + kernel_config.num_epilogue_warps * 2
+            + num_schedule_stages * 2
         )
         * 8
+        + smem_task_info_size
         + smem_tmem_ptr_size
     )
     num_stages = (sm100_smem_capacity - smem_fixed) // smem_per_stage
@@ -2313,6 +2282,7 @@ def get_kernel(
         + num_stages * 2
         + num_epilogue_stages * 2
         + kernel_config.num_epilogue_warps * 2
+        + num_schedule_stages * 2
     )
     dispatch_barrier_base = 0
     full_barrier_base = dispatch_barrier_base + kernel_config.num_dispatch_warps
@@ -2320,6 +2290,8 @@ def get_kernel(
     tmem_full_barrier_base = empty_barrier_base + num_stages
     tmem_empty_barrier_base = tmem_full_barrier_base + num_epilogue_stages
     combine_barrier_base = tmem_empty_barrier_base + num_epilogue_stages
+    task_info_full_barrier_base = combine_barrier_base + kernel_config.num_epilogue_warps * 2
+    task_info_empty_barrier_base = task_info_full_barrier_base + num_schedule_stages
     dispatch_sync_barrier_idx = 0
     dispatch_with_epilogue_sync_barrier_idx = 1
     epilogue_full_sync_barrier_idx = 2
@@ -2342,7 +2314,10 @@ def get_kernel(
     smem_sfa_offset = smem_b_offset + num_stages * smem_b_size_per_stage
     smem_sfb_offset = smem_sfa_offset + num_stages * smem_sfa_size_per_stage
     smem_amax_reduction_offset = smem_sfb_offset + num_stages * smem_sfb_size_per_stage
-    smem_barrier_offset = _align_up(smem_amax_reduction_offset + smem_amax_reduction_size, 8)
+    # `task_info_t task_infos[kNumScheduleStages]` (alignas(16)) sits between the
+    # amax buffer and the barriers, mirroring the SharedStorage member order.
+    smem_task_info_offset = _align_up(smem_amax_reduction_offset + smem_amax_reduction_size, 16)
+    smem_barrier_offset = smem_task_info_offset + smem_task_info_size
     smem_tmem_ptr_offset = smem_barrier_offset + num_total_barriers * 8
     smem_symm_rank_bases_offset = _align_up(smem_tmem_ptr_offset + smem_tmem_ptr_size, 8)
     smem_symm_rank_bases_size = num_processes * 8 if num_processes > 1 else 0
@@ -2618,6 +2593,26 @@ def get_kernel(
             PointerType(PrimType("uint32")),
             symm_buffer.ptr_to([workspace_layout.l2_empty_count_offset]),
         )
+        workspace_l1_task_count_data: T.let = T.reinterpret(
+            PointerType(PrimType("uint32")),
+            symm_buffer.ptr_to([workspace_layout.l1_task_count_offset]),
+        )
+        workspace_l2_task_count_data: T.let = T.reinterpret(
+            PointerType(PrimType("uint32")),
+            symm_buffer.ptr_to([workspace_layout.l2_task_count_offset]),
+        )
+        workspace_shared_l1_task_count_data: T.let = T.reinterpret(
+            PointerType(PrimType("uint32")),
+            symm_buffer.ptr_to([workspace_layout.shared_l1_task_count_offset]),
+        )
+        workspace_shared_l2_task_count_data: T.let = T.reinterpret(
+            PointerType(PrimType("uint32")),
+            symm_buffer.ptr_to([workspace_layout.shared_l2_task_count_offset]),
+        )
+        workspace_shared_l2_full_count_data: T.let = T.reinterpret(
+            PointerType(PrimType("uint32")),
+            symm_buffer.ptr_to([workspace_layout.shared_l2_full_count_offset]),
+        )
         l1_topk_weights_data: T.let = T.reinterpret(
             PointerType(PrimType("float32")),
             symm_buffer.ptr_to([symm_buffer_layout.l1_topk_weights_offset]),
@@ -2722,6 +2717,25 @@ def get_kernel(
             scope="global",
             elem_offset=0,
         )
+        workspace_l1_task_count = T.decl_buffer(
+            (1,), "uint32", data=workspace_l1_task_count_data, scope="global", elem_offset=0
+        )
+        workspace_l2_task_count = T.decl_buffer(
+            (1,), "uint32", data=workspace_l2_task_count_data, scope="global", elem_offset=0
+        )
+        workspace_shared_l1_task_count = T.decl_buffer(
+            (1,), "uint32", data=workspace_shared_l1_task_count_data, scope="global", elem_offset=0
+        )
+        workspace_shared_l2_task_count = T.decl_buffer(
+            (1,), "uint32", data=workspace_shared_l2_task_count_data, scope="global", elem_offset=0
+        )
+        workspace_shared_l2_full_count = T.decl_buffer(
+            (workspace_layout.num_shared_l2_pool_blocks,),
+            "uint32",
+            data=workspace_shared_l2_full_count_data,
+            scope="global",
+            elem_offset=0,
+        )
         l1_topk_weights = T.decl_buffer(
             (num_ring_tokens,), "float32", data=l1_topk_weights_data, scope="global", elem_offset=0
         )
@@ -2768,6 +2782,9 @@ def get_kernel(
         )
         smem_amax_reduction_data: T.let = T.reinterpret(
             PointerType(PrimType("float32")), smem.ptr_to([smem_amax_reduction_offset])
+        )
+        smem_task_info_data: T.let = T.reinterpret(
+            PointerType(PrimType("uint32")), smem.ptr_to([smem_task_info_offset])
         )
         smem_cd_data: T.let = T.reinterpret(
             PointerType(PrimType("uint8")), smem.ptr_to([smem_cd_offset])
@@ -2860,6 +2877,14 @@ def get_kernel(
             (kernel_config.num_epilogue_warps * kernel_config.store_block_m,),
             "float32",
             data=smem_amax_reduction_data,
+            scope="shared.dyn",
+            elem_offset=0,
+            align=16,
+        )
+        smem_task_infos = T.decl_buffer(
+            (num_schedule_stages, 8),
+            "uint32",
+            data=smem_task_info_data,
             scope="shared.dyn",
             elem_offset=0,
             align=16,
@@ -2964,22 +2989,22 @@ def get_kernel(
         up_accum: T.float32
         current_ring_count: T.uint32
         expected_ring_count: T.int32
-        scheduler_next_phase: T.int32
-        scheduler_current_local_expert_idx: T.int32
-        scheduler_current_num_tokens: T.int32
-        scheduler_current_pool_block_offset: T.int32
-        scheduler_block_idx: T.int32
-        scheduler_wave_end_expert_idx: T.int32
         scheduler_num_m_blocks: T.int32
-        scheduler_found_block: T.int32
         scheduler_cached_status: T.uint64
-        scheduler_block_phase: T.int32
-        scheduler_local_expert_idx: T.int32
-        scheduler_num_k_blocks_local: T.int32
-        scheduler_m_block_idx: T.int32
-        scheduler_n_block_idx: T.int32
-        scheduler_pool_block_idx: T.int32
-        scheduler_valid_m: T.int32
+        sched_stage_idx: T.int32
+        sched_phase: T.int32
+        sched_num_total_m_blocks: T.int32
+        sched_num_l1_waves: T.uint32
+        sched_task_idx: T.uint32
+        sched_task_valid: T.int32
+        sched_block_offset: T.uint32
+        sched_expert_num_m_blocks: T.uint32
+        sched_inclusive_sum: T.uint32
+        sched_lane_pool_block_offset: T.uint32
+        sched_owner_mask: T.uint32
+        sched_owner_m_block_idx: T.uint32
+        sched_owner_valid_m: T.uint32
+        sched_required_l1_tasks: T.uint32
         current_expert_idx: T.int32
         old_expert_idx: T.int32
         expert_start_idx: T.int32
@@ -3022,6 +3047,8 @@ def get_kernel(
         stored_num_tokens_per_expert = T.alloc_local((num_experts_per_lane,), "uint32")
         selected_num_tokens = T.alloc_local((1,), "int32")
         pool_block_offset_sum = T.alloc_local((1,), "int32")
+        task_info_regs = T.alloc_local((8,), "uint32")
+        sched_inclusive_vals = T.alloc_local((1,), "uint32")
         stored_rank_counts = T.alloc_local((num_ranks_per_lane,), "uint32")
         remaining_rank_counts = T.alloc_local((num_ranks_per_lane,), "uint32")
         combine_phase_local: T.int32
@@ -3187,169 +3214,210 @@ def get_kernel(
                     T.bitwise_and(scheduler_cached_status, T.uint64(0xFFFFFFFF)), "uint32"
                 )
             T.cuda.warp_sync()
-
-        @T.inline
-        def scheduler_set_expert_idx(expert_idx):
-            scheduler_current_local_expert_idx = expert_idx
-            scheduler_get_num_tokens(
-                expert_idx, lane_idx, stored_num_tokens_per_expert, selected_num_tokens
-            )
-            scheduler_current_num_tokens = selected_num_tokens[0]
+            # `num_total_m_blocks = get_num_total_pool_blocks()` plus the L1 warmup
+            # wave seed (scheduler/mega_moe.cuh `fetch_expert_recv_count`).
             scheduler_get_pool_block_offset(
-                expert_idx, lane_idx, stored_num_tokens_per_expert, pool_block_offset_sum
-            )
-            scheduler_current_pool_block_offset = pool_block_offset_sum[0]
-
-        @T.inline
-        def scheduler_advance_expert_idx():
-            scheduler_current_pool_block_offset = (
-                scheduler_current_pool_block_offset
-                + scheduler_get_current_num_m_blocks_expr(scheduler_current_num_tokens)
-            )
-            scheduler_current_local_expert_idx = scheduler_current_local_expert_idx + T.int32(1)
-            scheduler_get_num_tokens(
-                scheduler_current_local_expert_idx,
+                T.int32(num_experts_per_rank),
                 lane_idx,
                 stored_num_tokens_per_expert,
-                selected_num_tokens,
+                pool_block_offset_sum,
             )
-            scheduler_current_num_tokens = selected_num_tokens[0]
+            sched_num_total_m_blocks = pool_block_offset_sum[0]
+            sched_num_total_m_blocks_u32 = T.cast(sched_num_total_m_blocks, "uint32")
+            sched_num_total_l1_tasks = sched_num_total_m_blocks_u32 * T.uint32(num_l1_clusters)
+            sched_num_total_l1_waves = (
+                sched_num_total_l1_tasks + T.uint32(num_sched_clusters - 1)
+            ) // T.uint32(num_sched_clusters)
+            sched_warmup_interleave = (
+                T.uint32(num_l1_clusters)
+                + (sched_num_total_m_blocks_u32 - T.uint32(1))
+                * T.uint32(sched_interleave_cluster_diff)
+                + T.uint32(num_sched_clusters - 1)
+            ) // T.uint32(num_sched_clusters) + T.uint32(1)
+            sched_min_l1_warmup_waves = T.max(
+                T.uint32(sched_l1_warmup_first_l2_wave), sched_warmup_interleave
+            )
+            sched_num_l1_waves = T.min(sched_min_l1_warmup_waves, sched_num_total_l1_waves)
 
         @T.inline
-        def scheduler_init():
-            scheduler_next_phase = T.int32(1)
-            scheduler_block_idx = T.cast(sm_idx, "int32")
-            scheduler_fetch_expert_recv_count()
-            if num_experts_per_rank > 0:
-                scheduler_set_expert_idx(T.int32(0))
-            else:
-                scheduler_current_local_expert_idx = T.int32(0)
-                scheduler_current_num_tokens = T.int32(0)
-                scheduler_current_pool_block_offset = T.int32(0)
+        def sched_advance_pipeline():
+            sched_stage_idx = sched_stage_idx ^ T.int32(1)
+            if sched_stage_idx == T.int32(0):
+                sched_phase = sched_phase ^ T.int32(1)
 
         @T.inline
-        def scheduler_next_block():
-            scheduler_block_phase = T.int32(0)
-            scheduler_local_expert_idx = T.int32(0)
-            scheduler_num_k_blocks_local = T.int32(0)
-            scheduler_m_block_idx = T.int32(0)
-            scheduler_n_block_idx = T.int32(0)
-            scheduler_pool_block_idx = T.int32(0)
-            scheduler_valid_m = T.int32(0)
-            while True:
-                if T.cast(scheduler_current_local_expert_idx, "uint32") >= T.uint32(
-                    num_experts_per_rank
-                ):
-                    break
-                if scheduler_next_phase == T.int32(1):
-                    scheduler_wave_end_expert_idx = scheduler_get_wave_expert_end_idx_expr(
-                        scheduler_current_local_expert_idx
+        def consumer_get_next_task():
+            # `get_next_task`: wait for the published TaskInfo, copy it into
+            # registers (2x LDS.128 of the alignas(16) 32-byte struct), advance.
+            barrier_wait(
+                smem_barriers.ptr_to([task_info_full_barrier_base + sched_stage_idx]), sched_phase
+            )
+            lds128(smem_task_infos.ptr_to([sched_stage_idx, 0]), task_info_regs.ptr_to([0]))
+            lds128(smem_task_infos.ptr_to([sched_stage_idx, 4]), task_info_regs.ptr_to([4]))
+            sched_advance_pipeline()
+
+        @T.inline
+        def consumer_bind_task_args():
+            block_phase = T.cast(task_info_regs[0], "int32")
+            local_expert_idx = T.cast(task_info_regs[1], "int32")
+            m_block_idx = T.cast(task_info_regs[2], "int32")
+            n_cluster_idx = T.cast(task_info_regs[3], "int32")
+            pool_block_idx = T.cast(task_info_regs[4], "int32")
+            valid_m = T.cast(task_info_regs[5], "int32")
+            shape_n = T.cast(task_info_regs[6], "int32")
+            shape_k = T.cast(task_info_regs[7], "int32")
+
+        @T.inline
+        def scheduler_release_task_info():
+            # `release_task_info`: all epilogue threads (both CTAs) arrive at the
+            # leader CTA's empty barrier of the just-consumed stage.
+            T.ptx.mbarrier.arrive(
+                smem_barriers.ptr_to(
+                    [task_info_empty_barrier_base + (sched_stage_idx ^ T.int32(1))]
+                ),
+                remote=0,
+                pred=True,
+            )
+
+        @T.inline
+        def producer_create_task(task_block_phase, task_num_clusters, task_shape_n, task_shape_k):
+            # `create_task`: resolve the owning expert / m-block / valid_m of the
+            # pool block via a per-lane token-count scan + warp ballot.
+            task_info_regs[0] = T.uint32(task_block_phase)
+            task_info_regs[1] = T.uint32(0)
+            task_info_regs[2] = T.uint32(0)
+            task_info_regs[3] = sched_task_idx % T.uint32(task_num_clusters)
+            task_info_regs[4] = sched_task_idx // T.uint32(task_num_clusters)
+            task_info_regs[5] = T.uint32(0)
+            task_info_regs[6] = T.uint32(task_shape_n)
+            task_info_regs[7] = T.uint32(task_shape_k)
+            sched_block_offset = T.uint32(0)
+            for expert_lane_idx in T.unroll(0, num_experts_per_lane):
+                sched_expert_num_m_blocks = (
+                    stored_num_tokens_per_expert[expert_lane_idx]
+                    + T.uint32(kernel_config.block_m - 1)
+                ) // T.uint32(kernel_config.block_m)
+                # `math::warp_inclusive_sum`
+                sched_inclusive_vals[0] = sched_expert_num_m_blocks
+                for shuffle_offset in T.unroll(0, 5):
+                    sched_inclusive_sum = T.tvm_warp_shuffle_up(
+                        T.uint32(0xFFFFFFFF), sched_inclusive_vals[0], 1 << shuffle_offset, 32, 32
                     )
-                    scheduler_found_block = T.int32(0)
-                    while T.cast(scheduler_current_local_expert_idx, "uint32") < T.cast(
-                        scheduler_wave_end_expert_idx, "uint32"
+                    if lane_idx >= (1 << shuffle_offset):
+                        sched_inclusive_vals[0] = sched_inclusive_vals[0] + sched_inclusive_sum
+                sched_lane_pool_block_offset = (
+                    sched_block_offset + sched_inclusive_vals[0] - sched_expert_num_m_blocks
+                )
+                sched_owner_mask = ballot_sync(
+                    T.uint32(0xFFFFFFFF),
+                    (
+                        T.cast(expert_lane_idx * 32 + lane_idx, "uint32")
+                        < T.uint32(num_experts_per_rank)
+                    )
+                    & (task_info_regs[4] >= sched_lane_pool_block_offset)
+                    & (
+                        task_info_regs[4] < sched_lane_pool_block_offset + sched_expert_num_m_blocks
+                    ),
+                )
+                if sched_owner_mask != T.uint32(0):
+                    sched_owner_lane_idx = ffs_u32(sched_owner_mask) - T.int32(1)
+                    sched_owner_m_block_idx = task_info_regs[4] - sched_lane_pool_block_offset
+                    sched_owner_valid_m = T.min(
+                        stored_num_tokens_per_expert[expert_lane_idx]
+                        - sched_owner_m_block_idx * T.uint32(kernel_config.block_m),
+                        T.uint32(kernel_config.block_m),
+                    )
+                    task_info_regs[1] = T.tvm_warp_shuffle(
+                        T.uint32(0xFFFFFFFF),
+                        T.cast(expert_lane_idx * 32 + lane_idx, "uint32"),
+                        sched_owner_lane_idx,
+                        32,
+                        32,
+                    )
+                    task_info_regs[2] = T.tvm_warp_shuffle(
+                        T.uint32(0xFFFFFFFF), sched_owner_m_block_idx, sched_owner_lane_idx, 32, 32
+                    )
+                    task_info_regs[5] = T.tvm_warp_shuffle(
+                        T.uint32(0xFFFFFFFF), sched_owner_valid_m, sched_owner_lane_idx, 32, 32
+                    )
+                sched_block_offset = sched_block_offset + T.tvm_warp_shuffle(
+                    T.uint32(0xFFFFFFFF), sched_inclusive_vals[0], T.int32(31), 32, 32
+                )
+
+        @T.inline
+        def producer_get_next_task():
+            # Producer-side `get_next_task`: interleave L1/L2 task pulls from the
+            # global atomic counters with the L1 warmup-wave ordering.
+            task_info_regs[0] = T.uint32(0)
+            sched_task_valid = T.int32(0)
+            while sched_task_valid == T.int32(0):
+                if sched_num_l1_waves != T.uint32(
+                    sched_l1_waves_done
+                ) and sched_num_l1_waves != T.uint32(0):
+                    sched_num_l1_waves = sched_num_l1_waves - T.uint32(1)
+                    sched_task_idx = T.uint32(0)
+                    if T.ptx.elect_sync():
+                        sched_task_idx = atomic_add_u32(
+                            workspace_l1_task_count.ptr_to([0]), T.uint32(1)
+                        )
+                    sched_task_idx = T.tvm_warp_shuffle(
+                        T.uint32(0xFFFFFFFF), sched_task_idx, T.int32(0), 32, 32
+                    )
+                    if sched_task_idx >= T.cast(sched_num_total_m_blocks, "uint32") * T.uint32(
+                        num_l1_clusters
                     ):
-                        scheduler_num_m_blocks = scheduler_get_current_num_m_blocks_expr(
-                            scheduler_current_num_tokens
-                        )
-                        scheduler_block_idx_u32 = T.cast(scheduler_block_idx, "uint32")
-                        scheduler_m_block_idx = T.cast(
-                            scheduler_block_idx_u32 // T.uint32(num_l1_block_ns), "int32"
-                        )
-                        if T.cast(scheduler_m_block_idx, "uint32") < T.cast(
-                            scheduler_num_m_blocks, "uint32"
-                        ):
-                            scheduler_block_phase = T.int32(1)
-                            scheduler_local_expert_idx = scheduler_current_local_expert_idx
-                            scheduler_num_k_blocks_local = T.int32(num_l1_block_ks)
-                            scheduler_n_block_idx = (
-                                scheduler_block_idx
-                                - scheduler_m_block_idx * T.int32(num_l1_block_ns)
-                            )
-                            scheduler_pool_block_idx = (
-                                scheduler_current_pool_block_offset + scheduler_m_block_idx
-                            )
-                            scheduler_valid_m = T.min(
-                                scheduler_current_num_tokens
-                                - scheduler_m_block_idx * kernel_config.block_m,
-                                kernel_config.block_m,
-                            )
-                            scheduler_block_idx = scheduler_block_idx + kernel_config.num_sms
-                            scheduler_found_block = T.int32(1)
-                            break
-                        scheduler_block_idx = (
-                            scheduler_block_idx - scheduler_num_m_blocks * T.int32(num_l1_block_ns)
-                        )
-                        scheduler_advance_expert_idx()
-                    if T.cast(scheduler_found_block, "uint32") != T.uint32(0):
-                        break
-                    scheduler_next_phase = T.int32(2)
-                    if T.cast(scheduler_current_local_expert_idx, "uint32") > T.uint32(0):
-                        scheduler_current_local_expert_idx = (
-                            scheduler_current_local_expert_idx - T.int32(1)
-                        )
-                    scheduler_current_local_expert_idx_u32 = T.cast(
-                        scheduler_current_local_expert_idx, "uint32"
-                    )
-                    scheduler_wave_base_idx_u32 = (
-                        scheduler_current_local_expert_idx_u32
-                        // T.uint32(kernel_config.num_experts_per_wave)
-                        * T.uint32(kernel_config.num_experts_per_wave)
-                    )
-                    scheduler_set_expert_idx(T.cast(scheduler_wave_base_idx_u32, "int32"))
+                        sched_num_l1_waves = T.uint32(sched_l1_waves_done)
+                    else:
+                        producer_create_task(1, num_l1_clusters, intermediate_hidden * 2, hidden)
+                        sched_task_valid = T.int32(1)
                 else:
-                    scheduler_wave_end_expert_idx = scheduler_get_wave_expert_end_idx_expr(
-                        scheduler_current_local_expert_idx
+                    sched_task_idx = T.uint32(0)
+                    if T.ptx.elect_sync():
+                        sched_task_idx = atomic_add_u32(
+                            workspace_l2_task_count.ptr_to([0]), T.uint32(1)
+                        )
+                    sched_task_idx = T.tvm_warp_shuffle(
+                        T.uint32(0xFFFFFFFF), sched_task_idx, T.int32(0), 32, 32
                     )
-                    scheduler_found_block = T.int32(0)
-                    while T.cast(scheduler_current_local_expert_idx, "uint32") < T.cast(
-                        scheduler_wave_end_expert_idx, "uint32"
+                    if sched_task_idx >= T.cast(sched_num_total_m_blocks, "uint32") * T.uint32(
+                        num_l2_clusters
                     ):
-                        scheduler_num_m_blocks = scheduler_get_current_num_m_blocks_expr(
-                            scheduler_current_num_tokens
-                        )
-                        if T.cast(scheduler_block_idx, "uint32") < (
-                            T.cast(scheduler_num_m_blocks, "uint32") * T.uint32(num_l2_block_ns)
-                        ):
-                            scheduler_block_phase = T.int32(2)
-                            scheduler_local_expert_idx = scheduler_current_local_expert_idx
-                            scheduler_num_k_blocks_local = T.int32(num_l2_block_ks)
-                            scheduler_block_idx_u32 = T.cast(scheduler_block_idx, "uint32")
-                            scheduler_m_block_idx = T.cast(
-                                scheduler_block_idx_u32 // T.uint32(num_l2_block_ns), "int32"
-                            )
-                            scheduler_n_block_idx = (
-                                scheduler_block_idx
-                                - scheduler_m_block_idx * T.int32(num_l2_block_ns)
-                            )
-                            scheduler_pool_block_idx = (
-                                scheduler_current_pool_block_offset + scheduler_m_block_idx
-                            )
-                            scheduler_valid_m = T.min(
-                                scheduler_current_num_tokens
-                                - scheduler_m_block_idx * kernel_config.block_m,
-                                kernel_config.block_m,
-                            )
-                            scheduler_block_idx = scheduler_block_idx + kernel_config.num_sms
-                            scheduler_found_block = T.int32(1)
-                            break
-                        scheduler_block_idx = (
-                            scheduler_block_idx - scheduler_num_m_blocks * T.int32(num_l2_block_ns)
-                        )
-                        scheduler_advance_expert_idx()
-                    if T.cast(scheduler_found_block, "uint32") != T.uint32(0):
                         break
-                    scheduler_next_phase = T.int32(1)
+                    if sched_num_l1_waves != T.uint32(sched_l1_waves_done):
+                        sched_num_l1_waves = T.uint32(1)
+                    producer_create_task(2, num_l2_clusters, hidden, intermediate_hidden)
+                    # Wait until all required L1 tasks are fetched
+                    sched_required_l1_tasks = (task_info_regs[4] + T.uint32(1)) * T.uint32(
+                        num_l1_clusters
+                    )
+                    sched_l1_count = load_volatile_u32(workspace_l1_task_count.ptr_to([0]))
+                    while sched_l1_count < sched_required_l1_tasks:
+                        sched_l1_count = load_volatile_u32(workspace_l1_task_count.ptr_to([0]))
+                    sched_task_valid = T.int32(1)
 
         @T.inline
-        def scheduler_bind_block_args():
-            block_phase = scheduler_block_phase
-            local_expert_idx = scheduler_local_expert_idx
-            num_k_blocks = scheduler_num_k_blocks_local
-            m_block_idx = scheduler_m_block_idx
-            n_block_idx = scheduler_n_block_idx
-            pool_block_idx = scheduler_pool_block_idx
-            valid_m = scheduler_valid_m
+        def producer_publish_task():
+            # `publish_task`: lanes 0/1 arrive-and-expect-tx at each CTA's full
+            # barrier, then st.async the 32-byte TaskInfo into that CTA's smem.
+            if lane_idx < T.int32(2):
+                T.ptx.mbarrier.arrive.expect_tx(
+                    smem_barriers.ptr_to([task_info_full_barrier_base + sched_stage_idx]),
+                    task_info_bytes,
+                    sem="release",
+                    scope="cluster",
+                    remote=lane_idx,
+                    pred=True,
+                )
+                T.evaluate(
+                    st_async_cluster_task_info(
+                        smem_task_infos.ptr_to([sched_stage_idx, 0]),
+                        smem_barriers.ptr_to([task_info_full_barrier_base + sched_stage_idx]),
+                        lane_idx,
+                        task_info_regs,
+                    )
+                )
+            T.cuda.warp_sync()
+            sched_advance_pipeline()
 
         @T.inline
         def update_get_valid_m_true():
@@ -3580,6 +3648,16 @@ def get_kernel(
                         smem_barriers.ptr_to([combine_barrier_base + dispatch_expert_idx]), 1
                     )
                     dispatch_expert_idx = dispatch_expert_idx + 1
+                dispatch_expert_idx = T.int32(0)
+                while dispatch_expert_idx < num_schedule_stages:
+                    T.ptx.mbarrier.init(
+                        smem_barriers.ptr_to([task_info_full_barrier_base + dispatch_expert_idx]), 1
+                    )
+                    T.ptx.mbarrier.init(
+                        smem_barriers.ptr_to([task_info_empty_barrier_base + dispatch_expert_idx]),
+                        num_schedule_consumer_threads,
+                    )
+                    dispatch_expert_idx = dispatch_expert_idx + 1
             T.evaluate(fence_barrier_init())
         elif flat_warp_idx == kernel_config.num_dispatch_warps - 1:
             T.ptx.tcgen05.alloc(
@@ -3748,12 +3826,13 @@ def get_kernel(
             )
         if flat_warp_idx < kernel_config.num_dispatch_warps:
             pull_mbarrier_phase = T.int32(0)
-            scheduler_fetch_expert_recv_count()
             current_expert_idx = T.int32(-1)
             old_expert_idx = T.int32(-1)
             expert_start_idx = T.int32(0)
             expert_end_idx = T.int32(0)
             pull_pool_block_offset = T.int32(0)
+            # Wait token data arrival
+            scheduler_fetch_expert_recv_count()
             dispatch_token_iter = sm_idx * kernel_config.num_dispatch_warps + flat_warp_idx
             while True:
                 old_expert_idx = current_expert_idx
@@ -4007,10 +4086,22 @@ def get_kernel(
             )
             T.ptx.bar.sync(dispatch_sync_barrier_idx, kernel_config.num_dispatch_threads)
             if sm_idx == 0:
+                # SM 0: clear expert send count and schedule task counters
                 dispatch_expert_idx = thread_idx
                 while dispatch_expert_idx < num_experts:
                     workspace_expert_send_count[dispatch_expert_idx] = T.uint64(0)
                     dispatch_expert_idx = dispatch_expert_idx + kernel_config.num_dispatch_threads
+                if (flat_warp_idx == 0) & T.ptx.elect_sync() != 0:
+                    workspace_l1_task_count[0] = T.uint32(0)
+                    workspace_l2_task_count[0] = T.uint32(0)
+                    workspace_shared_l1_task_count[0] = T.uint32(0)
+                    workspace_shared_l2_task_count[0] = T.uint32(0)
+                T.cuda.warp_sync()
+                dispatch_expert_idx = thread_idx
+                while dispatch_expert_idx < workspace_layout.num_shared_l2_pool_blocks:
+                    workspace_shared_l2_full_count[dispatch_expert_idx] = T.uint32(0)
+                    dispatch_expert_idx = dispatch_expert_idx + kernel_config.num_dispatch_threads
+                T.cuda.warp_sync()
             else:
                 pull_local_expert_idx = sm_idx - 1
                 while pull_local_expert_idx < num_experts_per_rank:
@@ -4066,7 +4157,6 @@ def get_kernel(
                         )
                     pull_local_expert_idx = pull_local_expert_idx + (kernel_config.num_sms - 1)
             dispatch_nvlink_barrier_after_workspace_clean(flat_warp_idx * 32 + lane_idx)
-        scheduler_iter_idx = T.local_scalar("int32")
         current_iter_idx = T.local_scalar("int32")
         accum_stage_idx = T.local_scalar("int32")
         accum_phase = T.local_scalar("int32")
@@ -4075,6 +4165,7 @@ def get_kernel(
         num_k_blocks = T.local_scalar("int32")
         m_block_idx = T.local_scalar("int32")
         n_block_idx = T.local_scalar("int32")
+        n_cluster_idx = T.local_scalar("int32")
         get_valid_m_true = T.local_scalar("int32")
         get_valid_m_true_half = T.local_scalar("int32")
         get_valid_m_true_eighth = T.local_scalar("int32")
@@ -4082,7 +4173,6 @@ def get_kernel(
         shape_n = T.local_scalar("int32")
         shape_sfa_k = T.local_scalar("int32")
         shape_sfb_k = T.local_scalar("int32")
-        scheduler_iter_idx = 0
         current_iter_idx = 0
         accum_stage_idx = 0
         accum_phase = 0
@@ -4091,6 +4181,7 @@ def get_kernel(
         num_k_blocks = 0
         m_block_idx = 0
         n_block_idx = 0
+        n_cluster_idx = 0
         get_valid_m_true = 0
         get_valid_m_true_half = 0
         get_valid_m_true_eighth = 0
@@ -4101,31 +4192,21 @@ def get_kernel(
 
         if flat_warp_idx == kernel_config.load_a_warp_idx:
             warpgroup_reg_dealloc(num_non_epilogue_registers)
-            scheduler_init()
-            scheduler_iter_idx = 0
+            sched_stage_idx = T.int32(0)
+            sched_phase = T.int32(0)
             pipeline_stage_idx = T.int32(0)
             pipeline_phase = T.int32(0)
             while True:
-                scheduler_next_block()
-                scheduler_bind_block_args()
+                consumer_get_next_task()
+                consumer_bind_task_args()
                 if block_phase == T.int32(0):
                     break
-                scheduler_iter_idx_u32 = T.cast(scheduler_iter_idx, "uint32")
-                accum_stage_idx = T.cast(
-                    scheduler_iter_idx_u32 % T.uint32(num_epilogue_stages), "int32"
-                )
-                accum_phase = T.cast(
-                    T.bitwise_and(
-                        scheduler_iter_idx_u32 // T.uint32(num_epilogue_stages), T.uint32(1)
-                    ),
+                shape_k_u32 = T.cast(shape_k, "uint32")
+                num_k_blocks = T.cast(
+                    (shape_k_u32 + T.uint32(kernel_config.block_k - 1))
+                    // T.uint32(kernel_config.block_k),
                     "int32",
                 )
-                shape_k = T.Select(
-                    block_phase == T.int32(2), T.int32(intermediate_hidden), T.int32(hidden)
-                )
-                shape_k_u32 = T.cast(shape_k, "uint32")
-                shape_sfa_k = T.cast((shape_k_u32 + T.uint32(127)) // T.uint32(128), "int32")
-                pool_block_idx = scheduler_pool_block_idx
                 ring_block_idx = pool_block_idx % num_ring_blocks
                 if block_phase == T.int32(1):
                     expected_ring_count = kernel_config.block_m * (
@@ -4157,13 +4238,13 @@ def get_kernel(
                         smem_barriers.ptr_to([empty_barrier_base + pipeline_stage_idx]),
                         pipeline_phase ^ T.int32(1),
                     )
-                    ring_m_idx = ring_block_idx * kernel_config.block_m
+                    m_idx = ring_block_idx * kernel_config.block_m
                     k_idx = k_block_idx * kernel_config.block_k
                     sfa_m_idx = ring_block_idx * sf_block_m
                     sfa_k_idx = k_block_idx * sf_smem_outer_dim
                     if cta_idx_in_cluster != 0:
                         update_get_valid_m_true()
-                        ring_m_idx += get_valid_m_true_half
+                        m_idx += get_valid_m_true_half
                     if T.ptx.elect_sync():
                         full_barrier_ptr = smem_barriers.ptr_to(
                             [full_barrier_base + pipeline_stage_idx]
@@ -4178,7 +4259,7 @@ def get_kernel(
                                 tensor_map_l2_acts,
                                 block_phase,
                                 k_idx + tma_k_atom_idx * umma_block_k,
-                                ring_m_idx,
+                                m_idx,
                             )
                         tma_copy_2d_multicast_select(
                             smem_sfa_i32.ptr_to([pipeline_stage_idx, 0, 0]),
@@ -4197,26 +4278,27 @@ def get_kernel(
                             full_barrier_arrive_cta0(full_barrier_ptr)
                     T.cuda.warp_sync()
                     advance_pipeline()
-                scheduler_iter_idx = scheduler_iter_idx + 1
         elif flat_warp_idx == kernel_config.load_b_warp_idx:
             warpgroup_reg_dealloc(num_non_epilogue_registers)
-            scheduler_init()
-            scheduler_iter_idx = 0
+            sched_stage_idx = T.int32(0)
+            sched_phase = T.int32(0)
             pipeline_stage_idx = T.int32(0)
             pipeline_phase = T.int32(0)
             while True:
-                scheduler_next_block()
-                scheduler_bind_block_args()
+                consumer_get_next_task()
+                consumer_bind_task_args()
                 if block_phase == T.int32(0):
                     break
-                shape_k = T.Select(
-                    block_phase == T.int32(2), T.int32(intermediate_hidden), T.int32(hidden)
-                )
-                shape_n = T.Select(
-                    block_phase == T.int32(2), T.int32(hidden), T.int32(intermediate_hidden * 2)
-                )
                 shape_k_u32 = T.cast(shape_k, "uint32")
                 shape_sfb_k = T.cast((shape_k_u32 + T.uint32(127)) // T.uint32(128), "int32")
+                n_block_idx = n_cluster_idx * 2 + T.Select(
+                    cta_idx_in_cluster == 0, T.int32(0), T.int32(1)
+                )
+                num_k_blocks = T.cast(
+                    (shape_k_u32 + T.uint32(kernel_config.block_k - 1))
+                    // T.uint32(kernel_config.block_k),
+                    "int32",
+                )
                 for k_block_idx in T.serial(0, num_k_blocks):
                     barrier_wait(
                         smem_barriers.ptr_to([empty_barrier_base + pipeline_stage_idx]),
@@ -4259,7 +4341,6 @@ def get_kernel(
                             full_barrier_arrive_cta0(full_barrier_ptr)
                     T.cuda.warp_sync()
                     advance_pipeline()
-                scheduler_iter_idx = scheduler_iter_idx + 1
         elif flat_warp_idx == kernel_config.mma_issue_warp_idx:
             warpgroup_reg_dealloc(num_non_epilogue_registers)
             if cta_idx_in_cluster == 0:
@@ -4279,15 +4360,19 @@ def get_kernel(
                     + T.cast(lane_idx * (smem_b_size_per_stage // f128_bytes), "uint32"),
                     T.uint32(0),
                 )
-                scheduler_init()
+                sched_stage_idx = T.int32(0)
+                sched_phase = T.int32(0)
                 current_iter_idx = 0
                 pipeline_stage_idx = T.int32(0)
                 pipeline_phase = T.int32(0)
                 while True:
-                    scheduler_next_block()
-                    scheduler_bind_block_args()
+                    consumer_get_next_task()
+                    consumer_bind_task_args()
                     if block_phase == T.int32(0):
                         break
+                    num_k_blocks = T.cast(
+                        T.cast(shape_k, "uint32") // T.uint32(kernel_config.block_k), "int32"
+                    )
                     current_iter_idx_u32 = T.cast(current_iter_idx, "uint32")
                     accum_stage_idx = T.cast(
                         current_iter_idx_u32 % T.uint32(num_epilogue_stages), "int32"
@@ -4414,7 +4499,32 @@ def get_kernel(
                     )
         elif is_reserved_non_epilogue_warp:
             warpgroup_reg_dealloc(num_non_epilogue_registers)
-            pass
+            # Task scheduler mainloop, run by the leader CTA only
+            if cta_idx_in_cluster == 0:
+                sched_stage_idx = T.int32(0)
+                sched_phase = T.int32(0)
+                # Wait dispatch's results
+                scheduler_fetch_expert_recv_count()
+                # Generate routed tasks. Keep the original wait -> claim -> publish
+                # ordering: `get_next_task()` advances global task counters and must
+                # not run before the schedule slot is released by consumers.
+                sched_task_valid = T.int32(1)
+                while sched_task_valid != T.int32(0):
+                    barrier_wait(
+                        smem_barriers.ptr_to([task_info_empty_barrier_base + sched_stage_idx]),
+                        sched_phase ^ T.int32(1),
+                    )
+                    producer_get_next_task()
+                    if sched_task_valid != T.int32(0):
+                        producer_publish_task()
+                # Sentinel
+                barrier_wait(
+                    smem_barriers.ptr_to([task_info_empty_barrier_base + sched_stage_idx]),
+                    sched_phase ^ T.int32(1),
+                )
+                for task_reg_idx in T.unroll(0, 8):
+                    task_info_regs[task_reg_idx] = T.uint32(0)
+                producer_publish_task()
 
         elif T.cast(flat_warp_idx, "uint32") >= T.uint32(kernel_config.epilogue_warp_start_idx):
             warpgroup_reg_alloc(num_epilogue_registers)
@@ -4447,17 +4557,14 @@ def get_kernel(
                     kernel_config.num_dispatch_threads + kernel_config.num_epilogue_threads,
                 )
             )
-            scheduler_init()
+            sched_stage_idx = T.int32(0)
+            sched_phase = T.int32(0)
             current_iter_idx = 0
             while True:
-                scheduler_next_block()
-                scheduler_bind_block_args()
+                consumer_get_next_task()
+                consumer_bind_task_args()
                 if block_phase == T.int32(0):
                     break
-                # Match DeepGEMM's `ptx::exchange(..., 0)`: all lanes have the same
-                # scheduler result, but broadcasting it lets the CUDA compiler treat
-                # the valid-row early exit as warp-uniform instead of divergent.
-                valid_m = T.tvm_warp_shuffle(T.uint32(0xFFFFFFFF), valid_m, T.int32(0), 32, 32)
                 current_iter_idx_u32 = T.cast(current_iter_idx, "uint32")
                 accum_stage_idx = T.cast(
                     current_iter_idx_u32 % T.uint32(num_epilogue_stages), "int32"
@@ -4472,10 +4579,18 @@ def get_kernel(
                 barrier_wait(
                     smem_barriers.ptr_to([tmem_full_barrier_base + accum_stage_idx]), accum_phase
                 )
-                pool_block_idx = scheduler_pool_block_idx
+                # Now we can release the task
+                scheduler_release_task_info()
+                # Match DeepGEMM's `ptx::exchange(..., 0)`: all lanes have the same
+                # scheduler result, but broadcasting it lets the CUDA compiler treat
+                # the valid-row early exit as warp-uniform instead of divergent.
+                valid_m = T.tvm_warp_shuffle(T.uint32(0xFFFFFFFF), valid_m, T.int32(0), 32, 32)
                 ring_block_idx = pool_block_idx % num_ring_blocks
                 ring_m_idx = ring_block_idx * kernel_config.block_m
                 pool_m_idx = pool_block_idx * kernel_config.block_m
+                n_block_idx = n_cluster_idx * 2 + T.Select(
+                    cta_idx_in_cluster == 0, T.int32(0), T.int32(1)
+                )
                 valid_rows_in_wg = T.max(
                     T.min(valid_m - epilogue_wg_idx * wg_block_m, wg_block_m), T.int32(0)
                 )
@@ -4495,8 +4610,9 @@ def get_kernel(
                     # across store iters. When wg_block_m is not a multiple of 32 (e.g., 48 for
                     # block_m=96) the load gate `(j*atom_m) % 32 == 0` fires at a different
                     # rhythm than the s loop, so resetting per-s would leave the cache zero on
-                    # iterations between loads.
-                    stored_cached_weight = T.float32(0.0)
+                    # iterations between loads. Upstream 559d79f defaults the weight
+                    # to 1.0f (weightless shared-expert path multiplies by 1).
+                    stored_cached_weight = T.float32(1.0)
                     for s in T.serial(0, wg_block_m // kernel_config.store_block_m, unroll=True):
                         if s * kernel_config.store_block_m >= valid_rows_in_wg:
                             tmem_empty_barrier_arrive_cta0(
