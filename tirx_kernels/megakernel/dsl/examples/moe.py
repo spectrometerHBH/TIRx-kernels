@@ -21,9 +21,9 @@
 events, tiles, and wait/notify edges.  Every physical fact (job ids, endpoint
 scopes, run predicates, the drain event) is declared on the spec or on the
 tile implementations, so ``tvm.megakernel.transform.build_runtime_kernel``
-emits the same structure as the hand-written kernel in
-``tirx_kernels.megakernel.moe`` for both the static and dynamic schedulers
-(and the unfused static variant).
+emits a standalone kernel for the static and dynamic schedulers (and the
+unfused static variant).  The hand-written kernel in
+``tirx_kernels.megakernel.moe`` remains an independent numerical reference.
 
 Usage::
 

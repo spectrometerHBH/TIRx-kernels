@@ -22,7 +22,6 @@ from typing import Literal
 import numpy as np
 import tvm_ffi
 
-import tvm
 from tirx_kernels.megakernel.tile_tasks import GroupGEMMTileSM100
 from tirx_kernels.megakernel.utils.config import JobType, KernelConfig
 from tirx_kernels.megakernel.utils.dynamic_scheduler import DynamicTileScheduler, MPMCQueueHost
@@ -102,7 +101,7 @@ def generate_exec_queue_moe(
             tile_idx += 1
         for bx in range(KernelConfig.SM_NUMBER):
             exec_queue[bx, tile_idx] = pack_into_32bit(-1, -1, -1, JobType.END.value)
-        return tvm.runtime.tensor(exec_queue, device=tvm.cuda(0))
+        return exec_queue
 
     if scheduler == "dynamic":
         exec_queue = MPMCQueueHost(DynamicTileScheduler.MAX_TASKS)

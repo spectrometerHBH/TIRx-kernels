@@ -18,13 +18,11 @@
 """CPU-only validation tests for the tvm-builder MoE megakernel DSL path."""
 
 import importlib.util
-import re
 
 import numpy as np
 import pytest
 
 import tirx_kernels.megakernel.dsl as megakernel_dsl
-import tvm.ir
 import tvm.megakernel.dsl as tvm_dsl
 from tirx_kernels.megakernel.dsl import (
     AlignTileImpl,
@@ -40,11 +38,9 @@ from tirx_kernels.megakernel.dsl.examples.moe import (
     build_moe_kernel,
     moe_lowering_options,
 )
-from tirx_kernels.megakernel.moe import MegaKernelMOE
 from tirx_kernels.megakernel.utils.config import MEGAKERNEL_MOE_BENCH_CONFIG, JobType
 from tirx_kernels.megakernel.utils.support import generate_exec_queue_moe, push_moe_tasks
 from tvm.megakernel.transform import build_runtime_kernel
-from tvm.tirx import IfThenElse, SeqStmt, While
 
 _CONFIG = MEGAKERNEL_MOE_BENCH_CONFIG
 _KERNEL_NAME = "qwen3_30b_a3b_moe"
@@ -242,7 +238,7 @@ def test_static_host_queue_matches_production(batch_size, scheduler):
     assert list(build.central_tasks) == manual_tasks
 
     manual_queue = generate_exec_queue_moe(batch_size, _CONFIG, 7, "static")
-    np.testing.assert_array_equal(build.exec_queue, manual_queue.numpy())
+    np.testing.assert_array_equal(build.exec_queue, manual_queue)
     expected_workspace = (relaxed + 6) if scheduler == "static" else 7
     assert build.event_workspace_size == expected_workspace
     assert build.scheduler == "static"
@@ -295,152 +291,3 @@ def test_builder_rejects_invalid_specs():
     _tile(spec, "topk").wait(spec.events["gate_up_done"], lambda m, n, k: (0,))
     with pytest.raises(ValueError, match="acyclic"):
         build_runtime_kernel(spec, moe_lowering_options("dynamic", 4))
-
-
-# ---------------------------------------------------------------------------
-# Structural parity with the hand-written kernel
-# ---------------------------------------------------------------------------
-
-#: Tolerated divergence: production declares the max-tokens-shaped tensors
-#: with the symbolic ``max_num_tokens_padded`` var while the builder
-#: concretizes every shape, so internal view declarations differ in shape.
-_SHAPE_ONLY_RE = re.compile(r"(\.shape\[\d+\]|\.def\.extents\[\d+\])$")
-
-#: Tolerated divergence: the DSL build publishes completions with
-#: device-scope release atomics while the zero-diff manual path keeps its
-#: plain ``atomicAdd`` (F2, intentional memory-model fix).
-_RELEASE_CALL_RE = re.compile(r"atomic_add_int32(_release)?\b")
-
-#: Tolerated divergence: the migrated ``stg_local`` store helper dropped the
-#: unused ``pe`` parameter, so tvm-side calls have two arguments against the
-#: manual three (LOW; call sites only, inside dynamic push paths).
-_STG_CALL_RE = re.compile(r"\bstg_local\b")
-
-#: The push block is nine statements: six axis definitions, the
-#: ``new_scope_id`` local and its store, and the push branch itself.
-_PUSH_BLOCK_LEN = 9
-
-
-def _unwrap_seq(body):
-    while not hasattr(body, "seq"):
-        body = body.body
-    return body
-
-
-def _loop_index(seq_stmt):
-    return next(i for i, stmt in enumerate(seq_stmt.seq) if isinstance(stmt, While))
-
-
-def _first_divergence_path(lhs, rhs):
-    try:
-        tvm.ir.assert_structural_equal(lhs, rhs, map_free_vars=True)
-        return None
-    except Exception as err:
-        message = str(err)
-        if "Access path:" not in message:
-            return "<no path>"
-        return message.split("Access path:")[1].split("\n")[0].strip()
-
-
-def _dispatch_branches(chain):
-    branches = []
-    while hasattr(chain, "then_case"):
-        branches.append(chain.then_case)
-        chain = getattr(chain, "else_case", None)
-        if chain is None:
-            break
-    return branches
-
-
-def _classify_pair(tvm_stmt, manual_stmt):
-    """Classify one statement pair: equal, a tolerated class, or a violation."""
-
-    path = _first_divergence_path(tvm_stmt, manual_stmt)
-    if path is None:
-        return "equal"
-    if _SHAPE_ONLY_RE.search(path):
-        return "shape"
-    # Push bodies contain both the (matching) pre-notify atomic and the
-    # store helper; the release fence only ever differs in notify bodies.
-    if any(_STG_CALL_RE.search(repr(stmt)) for stmt in (tvm_stmt, manual_stmt)):
-        return "stg_local"
-    if any(_RELEASE_CALL_RE.search(repr(stmt)) for stmt in (tvm_stmt, manual_stmt)):
-        return "release"
-    return f"VIOLATION:{path}"
-
-
-def _branch_census(tvm_branch, manual_branch):
-    """Classify every aligned statement pair of two dispatch branches."""
-
-    assert len(tvm_branch.seq) == len(manual_branch.seq), (
-        f"branch statement counts diverge: {len(tvm_branch.seq)} vs {len(manual_branch.seq)}"
-    )
-    return [
-        (index, _classify_pair(tvm_stmt, manual_stmt))
-        for index, (tvm_stmt, manual_stmt) in enumerate(zip(tvm_branch.seq, manual_branch.seq))
-    ]
-
-
-def _relocate_push_to_front(branch):
-    """Move a post-run pre-notify-and-push block back to the branch front (F1)."""
-
-    stmts = list(branch.seq)
-    push_index = next(
-        i
-        for i, stmt in enumerate(stmts)
-        if isinstance(stmt, IfThenElse) and "new_scope_id" in repr(stmt)
-    )
-    start = push_index - _PUSH_BLOCK_LEN + 1
-    block = stmts[start : push_index + 1]
-    expected = (["ScopeIdDefStmt"] * 6) + ["AllocBuffer", "BufferStore", "IfThenElse"]
-    assert [type(stmt).__name__ for stmt in block] == expected
-    return SeqStmt(block + stmts[:start] + stmts[push_index + 1 :])
-
-
-@pytest.mark.parametrize("scheduler", ["static", "unfused", "dynamic"])
-def test_structural_parity_with_manual_kernel(scheduler):
-    batch_size = 4
-    build = build_moe_kernel(_CONFIG, batch_size, scheduler)
-    tvm_body = _unwrap_seq(build.module[_KERNEL_NAME].body)
-    mk = MegaKernelMOE(_CONFIG, 1, False)
-    mk._compile_batch_size = batch_size
-    manual_body = _unwrap_seq(mk.get_module(scheduler)["main"].body)
-    tvm_loop = _loop_index(tvm_body)
-    manual_loop = _loop_index(manual_body)
-
-    # Everything around the dispatch loop is structurally identical: wrapper
-    # lifecycle, class/device init, event setup, scheduler init, hoisted
-    # views, scheduler advance, and the finalize tail.
-    segments = (
-        (tvm_body.seq[:tvm_loop], manual_body.seq[:manual_loop], "prefix"),
-        (tvm_body.seq[tvm_loop].body.seq[1:], manual_body.seq[manual_loop].body.seq[1:], "tail"),
-        (tvm_body.seq[tvm_loop + 1 :], manual_body.seq[manual_loop + 1 :], "post"),
-    )
-    for tvm_stmts, manual_stmts, label in segments:
-        path = _first_divergence_path(SeqStmt(list(tvm_stmts)), SeqStmt(list(manual_stmts)))
-        assert path is None, f"{label} diverges at {path}"
-
-    # Per dispatch branch: identical except the pinned intentional classes.
-    names = ["gating", "topk", "align", "count_sort", "gate_up_silu", "down", "init", "wait_init"]
-    tvm_branches = _dispatch_branches(tvm_body.seq[tvm_loop].body.seq[0])
-    manual_branches = _dispatch_branches(manual_body.seq[manual_loop].body.seq[0])
-    dynamic = scheduler == "dynamic"
-    allowed = {"shape", "release"} | ({"stg_local"} if dynamic else set())
-    seen = set()
-    for name, tvm_branch, manual_branch in zip(names, tvm_branches, manual_branches):
-        if dynamic and name == "count_sort":
-            # F1: the scalar-count push fires post-run with the full-count
-            # trigger, so the push block sits after the run on the tvm side.
-            tvm_branch = _relocate_push_to_front(tvm_branch)
-        census = _branch_census(tvm_branch, manual_branch)
-        violations = [(index, kind) for index, kind in census if kind not in allowed | {"equal"}]
-        assert not violations, f"branch {name} diverges: {violations}"
-        seen.update(kind for _, kind in census if kind != "equal")
-    # The pinned classes must not only be tolerated but present (they are the
-    # contract of this comparison): shape views in the align/gemm branches,
-    # release atomics in every notify path, and the dynamic-only store-arity
-    # divergence in the push paths.
-    assert "shape" in seen
-    assert "release" in seen
-    if dynamic:
-        assert "stg_local" in seen

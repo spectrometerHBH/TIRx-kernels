@@ -33,7 +33,7 @@ predicates, the drain event) is declared on the spec or on the adapters:
 
 The registered hand-written implementation remains unchanged in
 [`moe.py`](moe.py). It is separate from the DSL path; DSL runtime tests use it
-only as an external numerical and structural reference.
+only as an external numerical reference.
 
 ## Building and running the DSL kernel
 
