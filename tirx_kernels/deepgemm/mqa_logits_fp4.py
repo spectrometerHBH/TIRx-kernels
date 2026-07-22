@@ -499,13 +499,22 @@ def get_kernel(**kwargs: Any):
             full="tma",
             empty="mbar",
             init_full=1,
-            init_empty=num_math_threads + 32,
+            init_empty=num_math_threads + 1,
         )
         kv_pipe = Pipeline(
             pool, num_kv_stages, full="tma", empty="tcgen05", init_full=1, init_empty=1
         )
         tmem_pipe = Pipeline(
             pool, num_tmem_stages, full="tcgen05", empty="mbar", init_full=1, init_empty=128
+        )
+        # SF-transpose handoff: the dedicated transpose warp (warp 11) publishes the
+        # post-transpose SF smem per stage; the MMA warp's elected lane consumes it.
+        # full: 32 arrivals (the whole transpose warp); empty: 1 (the elected lane).
+        sfq_ready = Pipeline(
+            pool, num_q_stages, full="mbar", empty="mbar", init_full=32, init_empty=1
+        )
+        sfkv_ready = Pipeline(
+            pool, num_kv_stages, full="mbar", empty="mbar", init_full=32, init_empty=1
         )
         tmem_ptr_in_smem = pool.alloc((1,), "uint32", align=4)
         pool.commit()
@@ -717,39 +726,35 @@ def get_kernel(**kwargs: Any):
                 allocated_addr=tmem_start_col_of_sfq,
                 layout=sf_tmem_q_mma_layout,
             )
-            q_stage_idx: T.uint32 = T.uint32(0)
-            q_phase: T.uint32 = T.uint32(0)
-            kv_stage_idx: T.uint32 = T.uint32(0)
-            kv_phase: T.uint32 = T.uint32(0)
-            tmem_stage_idx: T.uint32 = T.uint32(0)
-            tmem_phase: T.uint32 = T.uint32(0)
-            q_idx: T.uint32 = sm_idx
-            while q_idx < num_q_blocks:
-                load_schedule(q_idx)
-                kv_start: T.uint32 = schedule_result[0]
-                num_kv_blocks: T.uint32 = schedule_result[1]
-                q_pipe.full.wait(q_stage_idx, q_phase)
-                emit_sf_transpose(smem_sf_q, lane_idx, q_stage_idx, 0)
-                T.cuda.warp_sync()
-                T.ptx.fence.proxy_async("shared::cta")
-                if T.ptx.elect_sync():
+            # The ENTIRE MMA-warp loop lives in one elect scope (same as the fp8
+            # kernel): ring cursors and schedule math are elect-lane locals on the
+            # uniform datapath. The SF transpose moved to the dedicated transpose
+            # warp (warp 11); this warp only waits for the ready barriers.
+            if T.ptx.elect_sync():
+                q_stage_idx: T.uint32 = T.uint32(0)
+                q_phase: T.uint32 = T.uint32(0)
+                kv_stage_idx: T.uint32 = T.uint32(0)
+                kv_phase: T.uint32 = T.uint32(0)
+                tmem_stage_idx: T.uint32 = T.uint32(0)
+                tmem_phase: T.uint32 = T.uint32(0)
+                q_idx: T.uint32 = sm_idx
+                while q_idx < num_q_blocks:
+                    load_schedule(q_idx)
+                    num_kv_blocks: T.uint32 = schedule_result[1]
+                    q_pipe.full.wait(q_stage_idx, q_phase)
+                    sfq_ready.full.wait(q_stage_idx, q_phase)
+                    T.ptx.fence.proxy_async("shared::cta")
                     Tx.copy_async(sfq_tmem, smem_sf_q_cp[T.cast(q_stage_idx, "int32")], cta_group=1)
-                T.cuda.warp_sync()
-                kv_idx: T.uint32 = T.uint32(0)
-                while kv_idx < num_kv_blocks:
-                    kv_pipe.full.wait(kv_stage_idx, kv_phase)
-                    # Transpose per 128-uint32 chunk with a fence PER chunk (interleaved
-                    # transpose/fence), matching the hand-rolled deposit's schedule.
-                    emit_sf_transpose(smem_sf_kv, lane_idx, kv_stage_idx, 0)
-                    T.ptx.fence.proxy_async("shared::cta")
-                    emit_sf_transpose(smem_sf_kv, lane_idx, kv_stage_idx, num_utccp_aligned_elems)
-                    T.ptx.fence.proxy_async("shared::cta")
-                    # cp + MMA share ONE elect scope: drops a redundant elect.sync per
-                    # kv-iter and lets the cp overlap the MMA setup.
-                    if T.ptx.elect_sync():
+                    sfq_ready.empty.arrive(q_stage_idx)
+                    kv_idx: T.uint32 = T.uint32(0)
+                    while kv_idx < num_kv_blocks:
+                        kv_pipe.full.wait(kv_stage_idx, kv_phase)
+                        sfkv_ready.full.wait(kv_stage_idx, kv_phase)
+                        T.ptx.fence.proxy_async("shared::cta")
                         Tx.copy_async(
                             sfkv_tmem, smem_sf_kv_cp[T.cast(kv_stage_idx, "int32")], cta_group=1
                         )
+                        sfkv_ready.empty.arrive(kv_stage_idx)
                         for math_wg_i in T.unroll(0, num_math_warpgroups):
                             tmem_addr: T.uint32 = tmem_stage_idx * T.uint32(umma_n)
                             # int32 column base: a uint32 base would promote the slice
@@ -788,21 +793,62 @@ def get_kernel(**kwargs: Any):
                             if tmem_stage_idx >= T.uint32(num_tmem_stages):
                                 tmem_stage_idx = tmem_stage_idx - T.uint32(num_tmem_stages)
                                 tmem_phase = tmem_phase ^ T.uint32(1)
-                    if T.ptx.elect_sync():
                         kv_pipe.empty.arrive(kv_stage_idx, cta_group=1)
+                        kv_idx = kv_idx + T.uint32(1)
+                        kv_stage_idx = kv_stage_idx + T.uint32(1)
+                        if kv_stage_idx >= T.uint32(num_kv_stages):
+                            kv_stage_idx = kv_stage_idx - T.uint32(num_kv_stages)
+                            kv_phase = kv_phase ^ T.uint32(1)
+                    q_pipe.empty.arrive(q_stage_idx)
+                    q_idx = q_idx + T.uint32(config.num_sms)
+                    q_stage_idx = q_stage_idx + T.uint32(1)
+                    if q_stage_idx >= T.uint32(num_q_stages):
+                        q_stage_idx = q_stage_idx - T.uint32(num_q_stages)
+                        q_phase = q_phase ^ T.uint32(1)
+            T.cuda.warp_sync()
+        elif warp_idx == spec_warp_start + 3:
+            # Dedicated SF-transpose warp (idle in DeepGEMM): transposes sf_q per q
+            # block and sf_kv per kv block into the UTCCP-ready layout, publishing
+            # each stage through the ready barriers so the MMA warp's issue loop
+            # stays lean. kv/q stage lifecycles are still governed by kv_pipe/q_pipe,
+            # so a transposed stage is never rewritten before its cp+MMA completes.
+            T.ptx.setmaxnreg(False, 56)
+            q_stage_idx: T.uint32 = T.uint32(0)
+            q_phase: T.uint32 = T.uint32(0)
+            kv_stage_idx: T.uint32 = T.uint32(0)
+            kv_phase: T.uint32 = T.uint32(0)
+            q_idx: T.uint32 = sm_idx
+            while q_idx < num_q_blocks:
+                load_schedule(q_idx)
+                num_kv_blocks: T.uint32 = schedule_result[1]
+                q_pipe.full.wait(q_stage_idx, q_phase)
+                sfq_ready.empty.wait(q_stage_idx, q_phase ^ T.uint32(1))
+                emit_sf_transpose(smem_sf_q, lane_idx, q_stage_idx, 0)
+                T.cuda.warp_sync()
+                T.ptx.fence.proxy_async("shared::cta")
+                sfq_ready.full.arrive(q_stage_idx)
+                kv_idx: T.uint32 = T.uint32(0)
+                while kv_idx < num_kv_blocks:
+                    kv_pipe.full.wait(kv_stage_idx, kv_phase)
+                    sfkv_ready.empty.wait(kv_stage_idx, kv_phase ^ T.uint32(1))
+                    # Transpose per 128-uint32 chunk with a fence PER chunk
+                    # (interleaved transpose/fence), matching the hand-rolled deposit.
+                    emit_sf_transpose(smem_sf_kv, lane_idx, kv_stage_idx, 0)
+                    T.ptx.fence.proxy_async("shared::cta")
+                    emit_sf_transpose(smem_sf_kv, lane_idx, kv_stage_idx, num_utccp_aligned_elems)
+                    T.cuda.warp_sync()
+                    T.ptx.fence.proxy_async("shared::cta")
+                    sfkv_ready.full.arrive(kv_stage_idx)
                     kv_idx = kv_idx + T.uint32(1)
                     kv_stage_idx = kv_stage_idx + T.uint32(1)
                     if kv_stage_idx >= T.uint32(num_kv_stages):
                         kv_stage_idx = kv_stage_idx - T.uint32(num_kv_stages)
                         kv_phase = kv_phase ^ T.uint32(1)
-                q_pipe.empty.arrive(q_stage_idx)
                 q_idx = q_idx + T.uint32(config.num_sms)
                 q_stage_idx = q_stage_idx + T.uint32(1)
                 if q_stage_idx >= T.uint32(num_q_stages):
                     q_stage_idx = q_stage_idx - T.uint32(num_q_stages)
                     q_phase = q_phase ^ T.uint32(1)
-        elif warp_idx == spec_warp_start + 3:
-            T.ptx.setmaxnreg(False, 56)
         elif warp_idx < spec_warp_start:
             T.ptx.setmaxnreg(True, 224)
             accum = T.alloc_local((num_heads,), "float32")
@@ -830,7 +876,7 @@ def get_kernel(**kwargs: Any):
                                 q_inner_i * num_heads
                             )
                             # REGION E: TMEM->register read as one tcgen05.ld.32x32b.x64
-                            # (unlike fp8's 2x x32 split); accum stays flat for the wrelu reduce.
+                            # (the 2x x32 split loses for THIS kernel, unlike fp8's).
                             accum_2d = accum.view(128, num_heads, layout=wg_local_layout(num_heads))
                             Tx.warpgroup.copy_async(
                                 accum_2d, tmem[:, tmem_addr : tmem_addr + num_heads]
