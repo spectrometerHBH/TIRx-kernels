@@ -52,7 +52,6 @@ COMBINE_LAUNCH_TAGS = (
     "blockIdx.z",
     "threadIdx.x",
     "tirx.use_programtic_dependent_launch",
-    "tirx.max_dynamic_shared_memory",
 )
 NULLABLE_MAIN_BUFFER_PARAMS = (
     "topk_length_h",
@@ -2798,7 +2797,6 @@ def _sparse_decode_head64_combine_kernel(
     num_splits = T.match_buffer(num_splits_h, (b + 1,), "int32", scope="global")
     attn_sink = T.match_buffer(attn_sink_h, (h_q,), "float32", scope="global")
     T.device_entry()
-    T.attr({"tirx.max_dynamic_shared_memory": 8 * (max_splits + 1) * 4})
     # combine.cu:18-43.  Keep one warp per head, eight heads per CTA, the
     # early no-split return, and the MAX_SPLITS bucket selected by the host.
     batch_s_q_idx_expr, _, h_block_idx_expr = T.cta_id([b * s_q, 1, (h_q + 7) // 8])
@@ -2842,8 +2840,8 @@ def _sparse_decode_head64_combine_kernel(
     )
     g_lse = T.decl_buffer((8,), "float32", data=lse.data, scope="global", elem_offset=g_lse_offset)
 
-    # combine.cu:56,195-210.  This is static shared storage.  The CUDA host
-    # raises the function ceiling above while launch-time dynamic bytes stay 0.
+    # combine.cu:56.  This is static shared storage; launch-time dynamic bytes
+    # stay zero.
     lse_scales = T.alloc_buffer((8, max_splits), "float32", scope="shared")
 
     # combine.cu:58-69.  The PDL consumer wait remains after both early
