@@ -1092,6 +1092,7 @@ BASELINE_IMPL_BY_KERNEL = {
     "sparse_flashmla_prefill_head64_phase1": "flashmla",
     "sparse_flashmla_prefill_head128_phase1": "flashmla",
     "sparse_flashmla_prefill_head128_small_topk_phase1": "flashmla",
+    "sparse_flashmla_decode_head64": "flashmla",
 }
 
 
