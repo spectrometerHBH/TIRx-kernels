@@ -16,6 +16,27 @@ export TVM_LIBRARY_PATH="${TVM_PATH}/build/lib"
 
 Entry point: `python -m tirx_kernels.bench_suite` (same flags as `run.py`).
 
+### Default-sweep prerequisites
+
+Every row benches our kernel **and all of its reference impls**; a reference
+that fails to build is recorded as a baseline error and **fails the workload**
+(which fail-fasts the whole sweep). The default `workloads.yaml` therefore has
+two hard host requirements beyond torch/DeepGEMM:
+
+- **SGLang** checkout on `PYTHONPATH` (plus its CUTLASS DSL): the fp8 paged MQA
+  rows bench the `sglang_cutedsl` reference unconditionally.
+- **NVSHMEM**: required by the `allgather_gemm` / `gemm_reduce_scatter`
+  (GemmComm) rows.
+
+`--filter` is include-only and cannot exclude rows. On a host without NVSHMEM,
+run a trimmed workload list:
+
+```bash
+grep -vE "allgather_gemm|gemm_reduce_scatter" \
+  tirx_kernels/bench_suite/workloads.yaml > /tmp/workloads_no_comm.yaml
+python -m tirx_kernels.bench_suite --workloads /tmp/workloads_no_comm.yaml
+```
+
 Import gate (kernels referenced in `workloads.yaml` only):
 
 ```bash
@@ -24,10 +45,11 @@ python -m tirx_kernels.bench_suite --check-imports
 
 ### SGLang FP8 paged MQA exploration
 
-The optional SGLang CuTeDSL reference is imported lazily; the normal TIRx and
-DeepGEMM paths do not require SGLang. To run the 80-shape SM100 comparison against
-SGLang's current production picker, expose a matching SGLang checkout and install
-the CUTLASS DSL version required by that checkout:
+The `sglang_cutedsl` reference is required wherever it appears — the fp8 paged
+MQA rows of the default sweep as well as this exploration sweep (see
+"Default-sweep prerequisites" above). To run the 80-shape SM100 comparison
+against SGLang's current production picker, expose a matching SGLang checkout
+and install the CUTLASS DSL version required by that checkout:
 
 ```bash
 export SGLANG_PATH=/path/to/sglang
@@ -160,7 +182,8 @@ remain in the run JSON for variance and outlier inspection.
 | Path | Description |
 |------|-------------|
 | `.bench-suite/runs/<id>.json` | Aggregated run results (times in microseconds) |
-| `.bench-suite/reports/<id>/bench.md` | Main diff report |
+| `.bench-suite/reports/<id>/summary.md` | Run overview: label, git provenance, ok/fail counts, per-row table |
+| `.bench-suite/reports/<id>/bench.md` | Main diff report (ratio Δ vs pinned baseline) |
 | `.bench-suite/logs/*__a<N>.log` | Benchmark subprocess stdout for each attempt |
 
 ## Exit codes
