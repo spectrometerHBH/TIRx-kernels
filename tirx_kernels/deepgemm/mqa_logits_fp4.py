@@ -437,9 +437,15 @@ def get_kernel(**kwargs: Any):
         q_gmem = T.match_buffer(q_gmem_h, (seq_len * num_heads, head_dim // 2), "uint8")
         sf_q_gmem = T.match_buffer(sf_q_gmem_h, (seq_len, num_heads), "uint32")
         kv_gmem = T.match_buffer(kv_gmem_h, (seq_len_kv, head_dim // 2), "uint8")
-        sf_kv_gmem = T.match_buffer(sf_kv_gmem_h, (seq_len_kv,), "uint32")
+        # 2D (1, seq_len_kv) view so copy_async(tma) builds a 2D descriptor
+        # (UTMALDG.2D) like upstream's make_tma_2d_desc for sf_kv.
+        sf_kv_gmem = T.match_buffer(sf_kv_gmem_h, (1, seq_len_kv), "uint32")
         weights_gmem = T.match_buffer(weights_gmem_h, (seq_len, num_heads), "float32")
         T.device_entry()
+        if config.logits_dtype == "float32":
+            # __launch_bounds__(kNumThreads, 1): without .minnctapersm ptxas ignores
+            # the setmaxnreg 56/224 budget (C7508); bf16 runs faster without it.
+            T.attr({"tirx.launch_bounds_min_blocks_per_sm": 1})
         # TIRX_TRANSCRIBE_START sm100_fp4_mqa_logits
         aligned_sl: T.int32 = (
             (T.cast(seq_len, "int32") + T.int32(block_q - 1)) // T.int32(block_q) * T.int32(block_q)
@@ -648,8 +654,8 @@ def get_kernel(**kwargs: Any):
                             prefetch_tensormap=True,
                         )
                         Tx.copy_async(
-                            smem_sf_kv[kv_stage_idx, 0:block_kv],
-                            sf_kv_gmem[kv_row0 : kv_row0 + block_kv],
+                            smem_sf_kv[kv_stage_idx : kv_stage_idx + 1, 0:block_kv],
+                            sf_kv_gmem[0:1, kv_row0 : kv_row0 + block_kv],
                             dispatch="tma",
                             mbar=kv_pipe.full.ptr_to([kv_stage_idx]),
                             cta_group=1,
@@ -738,8 +744,8 @@ def get_kernel(**kwargs: Any):
                 kv_idx: T.uint32 = T.uint32(0)
                 while kv_idx < num_kv_blocks:
                     kv_pipe.full.wait(kv_stage_idx, kv_phase)
-                    # Transpose per 128-uint32 chunk with a fence PER chunk (interleaved
-                    # transpose/fence), matching the hand-rolled deposit's schedule.
+                    # Fence PER 128-uint32 chunk like the hand-rolled deposit; upstream's
+                    # single post-transpose fence measurably hurt bf16_compressed.
                     emit_sf_transpose(smem_sf_kv, lane_idx, kv_stage_idx, 0)
                     T.ptx.fence.proxy_async("shared::cta")
                     emit_sf_transpose(smem_sf_kv, lane_idx, kv_stage_idx, num_utccp_aligned_elems)
@@ -807,6 +813,9 @@ def get_kernel(**kwargs: Any):
             T.ptx.setmaxnreg(True, 224)
             accum = T.alloc_local((num_heads,), "float32")
             cached_weights = T.alloc_local((block_q, num_heads), "float32")
+            # f32-dense store offsets, hoisted and chained (+block_kv per split) to keep
+            # nvrtc's u64 IMAD.WIDE out of the hot loop; bf16-dense keeps per-iter form.
+            token_store_off = T.alloc_local((block_q,), "uint64")
             q_stage_idx: T.uint32 = T.uint32(0)
             q_phase: T.uint32 = T.uint32(0)
             tmem_stage_idx: T.uint32 = T.cast(warpgroup_idx, "uint32")
@@ -819,6 +828,13 @@ def get_kernel(**kwargs: Any):
                 q_pipe.full.wait(q_stage_idx, q_phase)
                 if num_kv_blocks > T.uint32(0):
                     Tx.warpgroup.copy(cached_weights, smem_weights[q_stage_idx])
+                    if not config.compressed_logits and config.logits_dtype == "float32":
+                        for tb_i in T.unroll(0, block_q):
+                            token_store_off[tb_i] = T.cast(
+                                q_idx * T.uint32(block_q) + T.uint32(tb_i), "uint64"
+                            ) * T.cast(logits_stride, "uint64") + T.cast(
+                                kv_start + T.cast(thread_idx, "uint32"), "uint64"
+                            )
                     kv_idx: T.uint32 = T.uint32(0)
                     while kv_idx < num_kv_blocks:
                         kv_offset: T.uint32 = (
@@ -847,12 +863,10 @@ def get_kernel(**kwargs: Any):
                                 return_type="float32",
                             )
                             result = T.cast(result_f32, logits_tir_dtype)
-                            # Per-token logits base offset (an IMAD.WIDE per store): a
-                            # per-q-block u64 offset array would spill at 224 regs.
-                            q_offset: T.uint64 = T.cast(
-                                q_idx * T.uint32(block_q) + T.uint32(q_inner_i), "uint64"
-                            ) * T.cast(logits_stride, "uint64")
                             if config.compressed_logits:
+                                q_offset: T.uint64 = T.cast(
+                                    q_idx * T.uint32(block_q) + T.uint32(q_inner_i), "uint64"
+                                ) * T.cast(logits_stride, "uint64")
                                 row_k_start: T.uint32 = seq_k_start[q_inner_i]
                                 row_k_end: T.uint32 = seq_k_end[q_inner_i]
                                 # Range-guarded store: if-converts to a predicated @P STG
@@ -864,8 +878,17 @@ def get_kernel(**kwargs: Any):
                                         - T.cast(row_k_start, "uint64"),
                                         result,
                                     )
+                            elif config.logits_dtype == "float32":
+                                store_logits(token_store_off[q_inner_i], result)
                             else:
-                                store_logits(q_offset + T.cast(kv_offset, "uint64"), result)
+                                # bf16-dense: per-iter offset; see token_store_off note.
+                                q_offset_bf16: T.uint64 = T.cast(
+                                    q_idx * T.uint32(block_q) + T.uint32(q_inner_i), "uint64"
+                                ) * T.cast(logits_stride, "uint64")
+                                store_logits(q_offset_bf16 + T.cast(kv_offset, "uint64"), result)
+                        if not config.compressed_logits and config.logits_dtype == "float32":
+                            for tb_i in T.unroll(0, block_q):
+                                token_store_off[tb_i] = token_store_off[tb_i] + T.uint64(block_kv)
                         kv_idx = kv_idx + T.uint32(1)
                         tmem_stage_idx = tmem_stage_idx + T.uint32(num_math_warpgroups)
                         if tmem_stage_idx >= T.uint32(num_tmem_stages):
@@ -995,7 +1018,7 @@ def _run_tirx_invocation(data: dict[str, Any], invocation: dict[str, Any]) -> to
     )
     kv_gmem = kv_fp4.contiguous().view(torch.uint8)
     sf_q_gmem = sf_q.contiguous().view(torch.uint32)
-    sf_kv_gmem = sf_kv.contiguous().view(torch.uint32)
+    sf_kv_gmem = sf_kv.contiguous().view(torch.uint32).view(1, -1)
     _prepare_global_barrier(executable)
     executable.mod(
         config.seq_len,
