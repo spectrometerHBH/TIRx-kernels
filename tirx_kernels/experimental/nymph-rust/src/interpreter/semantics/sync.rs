@@ -1,4 +1,5 @@
-//! Cooperative rendezvous — CtaSync / WgSync / WarpSync / ClusterSync.
+//! Cooperative rendezvous — CtaSync / WgSync / NamedBarrier / WarpSync /
+//! ClusterSync.
 //!
 //! Per-warp streams arrive independently; the record in
 //! `state.values.cooperative` accumulates STREAM-granular arrival counts and
@@ -23,15 +24,24 @@ use crate::ir::Stmt;
 pub fn register(reg: &mut StmtExecutorRegistry) {
     reg.register(StmtKind::CtaSync, execute_sync);
     reg.register(StmtKind::WgSync, execute_sync);
+    reg.register(StmtKind::NamedBarrier, execute_sync);
     reg.register(StmtKind::WarpSync, execute_sync);
     reg.register(StmtKind::ClusterSync, execute_sync);
 }
+
+/// Named barriers rendezvous ACROSS statements: warpgroup A's `named_barrier(1)`
+/// and warpgroup B's `named_barrier(1)` are ONE hardware barrier. Their
+/// `SyncKey` therefore uses this sentinel in place of the statement id, and the
+/// barrier_id rides in the domain — every same-(cta, barrier_id) statement
+/// shares one `SyncRecord`.
+const NAMED_BARRIER_STMT_SENTINEL: usize = usize::MAX;
 
 fn sync_kind(stmt: &Stmt) -> &'static str {
     match stmt {
         Stmt::ClusterSync => "cluster",
         Stmt::CtaSync => "cta",
         Stmt::WgSync { .. } => "warpgroup",
+        Stmt::NamedBarrier { .. } => "named",
         Stmt::WarpSync => "warp",
         _ => unreachable!(),
     }
@@ -40,6 +50,7 @@ fn sync_kind(stmt: &Stmt) -> &'static str {
 fn sync_bar_id(stmt: &Stmt) -> Option<u32> {
     match stmt {
         Stmt::WgSync { barrier_id } => Some(*barrier_id as u32),
+        Stmt::NamedBarrier { barrier_id, .. } => Some(*barrier_id),
         _ => None,
     }
 }
@@ -50,6 +61,7 @@ fn sync_domain(stmt: &Stmt, first: &ThreadId) -> (usize, usize) {
         Stmt::ClusterSync => (first.cluster_id, 0),
         Stmt::CtaSync => (first.cta_id, 0),
         Stmt::WgSync { .. } => (first.cta_id, first.warpgroup_id()),
+        Stmt::NamedBarrier { barrier_id, .. } => (first.cta_id, *barrier_id as usize),
         Stmt::WarpSync => (first.cta_id, first.warp_id),
         _ => unreachable!(),
     }
@@ -61,6 +73,9 @@ fn in_scope(stmt: &Stmt, first: &ThreadId, t: &ThreadId) -> bool {
         Stmt::ClusterSync => t.cluster_id == first.cluster_id,
         Stmt::CtaSync => t.cta_id == first.cta_id,
         Stmt::WgSync { .. } => t.cta_id == first.cta_id && t.warpgroup_id() == first.warpgroup_id(),
+        // Count-based: any warp of the CTA may participate; completion is
+        // gated on num_warps*32 arrivals, not a fixed structural scope.
+        Stmt::NamedBarrier { .. } => t.cta_id == first.cta_id,
         Stmt::WarpSync => t.cta_id == first.cta_id && t.warp_id == first.warp_id,
         _ => unreachable!(),
     }
@@ -95,6 +110,10 @@ fn sync_scope(ctx: &CohortContext, stmt: &Stmt, first: &ThreadId) -> (usize, Vec
         }
         Stmt::CtaSync => (cta_threads, vec![first.cta_id]),
         Stmt::WgSync { .. } => (4 * warp_threads, vec![first.cta_id]),
+        // The statement's count operand: `bar.sync barrier_id, num_warps*32`.
+        Stmt::NamedBarrier { num_warps, .. } => {
+            (*num_warps as usize * warp_threads, vec![first.cta_id])
+        }
         Stmt::WarpSync => {
             // The barrier spans exactly the arriving cohort's warps (one warp
             // under per-warp streams); a sub-warp cohort can never fill it —
@@ -133,7 +152,12 @@ fn check_cluster_peer_liveness(ctx: &CohortContext, rec: &SyncRecord) -> IResult
 }
 
 fn execute_sync<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
-    let stmt_id = ctx.stmt_id(stmt);
+    let named = matches!(stmt, Stmt::NamedBarrier { .. });
+    let stmt_id = if named {
+        NAMED_BARRIER_STMT_SENTINEL
+    } else {
+        ctx.stmt_id(stmt)
+    };
     let first = ctx.cohort[0].clone();
     let key = SyncKey {
         stmt_id,
@@ -152,6 +176,15 @@ fn execute_sync<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IRes
                 return Ok(StepStatus::block(WakeCondition::Polled));
             }
             if rec.passed_streams.contains(&stream_id) {
+                if named {
+                    // This stream finished the CURRENT generation and reached
+                    // its next use of the same (cta, barrier_id) while
+                    // stragglers still poll their passage. Hardware bar.sync
+                    // counts such an arrival toward the NEXT generation:
+                    // defer until the record re-arms (the stragglers pass on
+                    // their own polls, so this cannot deadlock).
+                    return Ok(StepStatus::block(WakeCondition::Polled));
+                }
                 return Err(InterpreterError::new(
                     "cooperative_sync_reentry",
                     "thread re-entered a completed sync",
@@ -202,8 +235,23 @@ fn execute_sync<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IRes
         if rec.expected_count == 0 {
             rec.expected_count = expected_count;
             rec.expected_ctas = expected_ctas;
+        } else if named && rec.expected_count != expected_count {
+            // The record persists across generations, so every statement that
+            // names this (cta, barrier_id) must agree on the count — two
+            // different counts would rendezvous against different targets on
+            // the SAME hardware barrier.
+            return Err(InterpreterError::new(
+                "named_barrier_count_mismatch",
+                "named_barrier num_warps differs across uses of one barrier_id",
+            ));
         }
         if rec.complete() {
+            if named {
+                // Current generation fully arrived but not fully passed; this
+                // fresh arrival belongs to the NEXT generation — defer it
+                // until the record re-arms (see the fast-path twin above).
+                return Ok(StepStatus::block(WakeCondition::Polled));
+            }
             // Everyone the scope expects has arrived, yet a new stream shows
             // up — the arrival set would exceed the scope.
             return Err(InterpreterError::new(
@@ -212,6 +260,14 @@ fn execute_sync<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IRes
             ));
         }
         if rec.arrived_count + n > rec.expected_count {
+            if named {
+                // More threads inside one generation than `num_warps * 32` —
+                // the arrival set genuinely overflows the count operand.
+                return Err(InterpreterError::new(
+                    "named_barrier_overflow",
+                    "named barrier arrivals exceed num_warps*32",
+                ));
+            }
             return Err(InterpreterError::new(
                 "cooperative_sync_mismatch",
                 "sync arrival set exceeds scope",

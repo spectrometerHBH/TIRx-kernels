@@ -2079,6 +2079,7 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
                                     coords=(ktok, head_kv, half_base_v + j * DV_RNCOL),
                                     shape=(TILE_N, DV_RNCOL),
                                     gmem_shape=(TILE_N, 1, DV_RNCOL),
+                                    allow_nondet_reduce=True,
                                 )
                             _chunk_drain(j, NEPI_V)
                         for j in range(NEPI_K):
@@ -2090,6 +2091,7 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
                                     coords=(ktok, head_kv, half_base + j * DK_RNCOL),
                                     shape=(TILE_N, DK_RNCOL),
                                     gmem_shape=(TILE_N, 1, DK_RNCOL),
+                                    allow_nondet_reduce=True,
                                 )
                             _chunk_drain(j, NEPI_K)
                         with k.if_(tid.eq(0)):
@@ -2174,6 +2176,7 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
                                 coords=(ktok, head_kv, half_base_v + j * DV_RNCOL),
                                 shape=(TILE_N, DV_RNCOL),
                                 gmem_shape=(TILE_N, 1, DV_RNCOL),
+                                allow_nondet_reduce=True,
                             )
                         else:
                             k.tma_store(
@@ -2195,6 +2198,7 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
                                 coords=(ktok, head_kv, half_base + j * DK_RNCOL),
                                 shape=(TILE_N, DK_RNCOL),
                                 gmem_shape=(TILE_N, 1, DK_RNCOL),
+                                allow_nondet_reduce=True,
                             )
                         else:
                             k.tma_store(
@@ -2374,6 +2378,7 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
                                     coords=(cl_qtok, head, cbase),
                                     shape=(TM_H, RDQ_NCOL),
                                     gmem_shape=(TM_H, 1, RDQ_NCOL),
+                                    allow_nondet_reduce=True,
                                 )
                                 k.cp_async_bulk_commit_group()
                                 k.cp_async_bulk_wait_group_read(RDQ_NSLOT - 1)
@@ -2471,6 +2476,7 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
                                 coords=(qtok, head, cbase),
                                 shape=(TILE_M, RDQ_NCOL),
                                 gmem_shape=(TILE_M, 1, RDQ_NCOL),
+                                allow_nondet_reduce=True,
                             )
                             k.cp_async_bulk_commit_group()
                             k.cp_async_bulk_wait_group_read(RDQ_NSLOT - 1)

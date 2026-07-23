@@ -34,6 +34,25 @@ pub enum DType {
     F32,
 }
 
+impl DType {
+    /// Integer (or bool) dtype — an integer reduce-add is exact/associative,
+    /// a float one is order-dependent (validate gates the latter).
+    pub fn is_integer(self) -> bool {
+        matches!(
+            self,
+            DType::Bool
+                | DType::I8
+                | DType::U8
+                | DType::I16
+                | DType::U16
+                | DType::I32
+                | DType::U32
+                | DType::I64
+                | DType::U64
+        )
+    }
+}
+
 /// `Swizzle` — SMEM swizzle width.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Swizzle {

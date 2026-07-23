@@ -356,6 +356,32 @@ impl ValueArray1 {
         }
         Ok(())
     }
+
+    /// Elementwise `dst[dst_start..+len] += src[src_start..+len]` — the value
+    /// side of a TMA reduce-add run. f32 only (validate restricts `reduce_add`
+    /// to f32 destinations).
+    pub fn add_run_from(
+        &mut self,
+        dst_start: usize,
+        src: &ValueArray1,
+        src_start: usize,
+        len: usize,
+    ) -> IResult<()> {
+        match (self, src) {
+            (Self::F32(dst), Self::F32(src)) => {
+                let d = dst.as_slice_mut().expect("contiguous data");
+                let s = src.as_slice().expect("contiguous values");
+                for i in 0..len {
+                    d[dst_start + i] += s[src_start + i];
+                }
+                Ok(())
+            }
+            _ => Err(InterpreterError::new(
+                "tensor_value",
+                "tma reduce-add supports only f32 operands",
+            )),
+        }
+    }
 }
 
 impl ValueArray2 {

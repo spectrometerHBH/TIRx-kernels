@@ -13,6 +13,7 @@ pub mod mbarrier;
 pub mod metadata;
 pub mod reg;
 pub mod scalar;
+pub mod semaphore;
 pub mod sync;
 pub mod tcgen05;
 pub mod tma;
@@ -30,6 +31,7 @@ pub fn default_executor_registry() -> StmtExecutorRegistry {
     tmem::register(&mut registry);
     mbarrier::register(&mut registry);
     tma::register(&mut registry);
+    semaphore::register(&mut registry);
     tcgen05::register(&mut registry);
     ldstmatrix::register(&mut registry);
     warpmma::register(&mut registry);

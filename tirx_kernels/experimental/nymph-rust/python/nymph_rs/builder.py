@@ -12,6 +12,7 @@ from .nymph_rs import (
     ClusterShape,
     ClusterSync,
     CpAsyncBulkCommitGroup,
+    CpAsyncBulkS2Cluster,
     CpAsyncBulkWaitGroupRead,
     CtaSync,
     DType,
@@ -20,6 +21,8 @@ from .nymph_rs import (
     FenceScope,
     ForEachTask,
     ForLoop,
+    GmemAtomicAdd,
+    GmemWaitEq,
     If,
     Kernel,
     LaunchShape,
@@ -36,6 +39,7 @@ from .nymph_rs import (
     MBarrierInit,
     MBarrierWait,
     MemorySpace,
+    NamedBarrier,
     RegAdd,
     RegBitwise,
     RegCausalMask,
@@ -329,6 +333,89 @@ class IRBuilder:
             src = src[...]
         stmt = TmaStore(dst=dst, src=src, coords=coords, shape=shape, gmem_shape=gmem_shape)
         self._append(stmt)
+
+    def tma_reduce_add(
+        self,
+        dst: Tensor,
+        src: Tensor | TensorSlice,
+        *,
+        coords: tuple[ScalarValue, ...],
+        shape: Shape,
+        gmem_shape: Shape | None = None,
+        allow_nondet_reduce: bool = False,
+    ) -> None:
+        """TMA reduce-add (``cp.reduce.async.bulk...add.f32``): atomically accumulate
+        ``dst += src`` (SMEM->GMEM, f32). Same bulk-async path as ``tma_store`` (commit
+        with ``cp_async_bulk_commit_group`` / wait with ``cp_async_bulk_wait_group_read``);
+        value-mode accumulates instead of overwriting. dst must be an f32 GMEM tensor.
+
+        A float reduction is not associative: cross-CTA reduce-adds into one location
+        are race-free (hardware-atomic, commutative) but ORDER-DEPENDENT — the result is
+        not bit-reproducible. The protocol checker can only warn
+        (``nondeterministic_reduction``) about that, so the IR makes the non-determinism
+        opt-in: validate REJECTS a float reduce-add unless ``allow_nondet_reduce=True``
+        is passed (the checker's warning still fires with the flag set)."""
+        if isinstance(src, Tensor):
+            src = src[...]
+        stmt = TmaStore(
+            dst=dst,
+            src=src,
+            coords=coords,
+            shape=shape,
+            gmem_shape=gmem_shape,
+            reduce_add=True,
+            allow_nondet_reduce=allow_nondet_reduce,
+        )
+        self._append(stmt)
+
+    def cp_async_bulk_s2cluster(
+        self,
+        dst: Tensor | TensorSlice,
+        src: Tensor | TensorSlice,
+        *,
+        mbar: MBar | MBarRef,
+        bytes: ScalarValue,
+    ) -> None:
+        """`cp.async.bulk.shared::cluster` — async bulk copy of this CTA's SMEM `src`
+        into a PEER CTA's SMEM `dst` (the peer instance), signalling the peer's `mbar`
+        (pass `mbar_ref(m, remote_coord=peer)`) on completion. The dS cross-CTA
+        exchange in the 2-CTA backward. The peer CTA = the mbar's target."""
+        if isinstance(dst, Tensor):
+            dst = dst[...]
+        if isinstance(src, Tensor):
+            src = src[...]
+        self._append(CpAsyncBulkS2Cluster(dst=dst, src=src, mbar=mbar, bytes=bytes))
+
+    def gmem_atomic_add(
+        self,
+        sem: Tensor | TensorSlice,
+        *,
+        coords: tuple[ScalarValue, ...],
+        value: ScalarValue,
+        order: Literal["release", "relaxed"] = "release",
+    ) -> None:
+        """GMEM semaphore atomic-add ("signal") — ``red.<order>.gpu.global.add.s32``:
+        ``sem[coords] += value``. A value-keyed RELEASE: it is a SYNC op (NOT a data
+        access on the semaphore tensor), publishing this stream's clock as the release
+        clock for the post-increment counter value, so a later ``gmem_wait_eq`` on that
+        exact value joins it (acquire). ``order='release'`` carries the release fence
+        ordering prior writes (incl. a drained reduce-add) before the publish. ``sem``
+        must be an i32 GMEM tensor. Single-thread issue: elect one thread."""
+        if isinstance(sem, Tensor):
+            sem = sem[...]
+        self._append(GmemAtomicAdd(sem=sem, coords=coords, value=value, order=order))
+
+    def gmem_wait_eq(
+        self, sem: Tensor | TensorSlice, *, coords: tuple[ScalarValue, ...], value: ScalarValue
+    ) -> None:
+        """GMEM semaphore spin-wait ("wait") — ``ld.global.acquire.gpu`` poll until
+        ``sem[coords] == value``. A value-keyed ACQUIRE: blocks this stream until the
+        counter equals ``value`` (never reaching it -> deadlock), and joins the release
+        clock published by the ``gmem_atomic_add`` that produced THIS exact value. A
+        SYNC op (no data access on the semaphore tensor). ``sem`` must be i32 GMEM."""
+        if isinstance(sem, Tensor):
+            sem = sem[...]
+        self._append(GmemWaitEq(sem=sem, coords=coords, value=value))
 
     def cp_async_bulk_commit_group(self) -> None:
         self._append(CpAsyncBulkCommitGroup())
@@ -807,7 +894,11 @@ class IRBuilder:
         key_start: ScalarValue,
         group_size: int,
         mask_value: RegOperand = -float("inf"),
+        swap_qk: bool = False,
     ) -> None:
+        """``swap_qk``: fragment orientation. False = forward ``[q-row, kv-col]``;
+        True = backward ``[kv-row, q-col]`` (the fa-bwd fragment is transposed —
+        k = key_start + row, q = query_start + col/group_size). Both mask k > q."""
         if isinstance(dst, Tensor):
             dst = dst[...]
         if isinstance(src, Tensor):
@@ -822,6 +913,7 @@ class IRBuilder:
                 key_start=key_start,
                 group_size=group_size,
                 mask_value=mask_value,
+                swap_qk=swap_qk,
             )
         )
 
@@ -863,6 +955,13 @@ class IRBuilder:
 
     def wg_sync(self, *, barrier_id: int) -> None:
         self._append(WgSync(barrier_id=barrier_id))
+
+    def named_barrier(self, *, barrier_id: int, num_warps: int) -> None:
+        """Named barrier across `num_warps` warps spanning warpgroups —
+        `bar.sync barrier_id, num_warps*32` (flashattn NamedBarrierBwdSm100).
+        Distinct statements that call this with the same barrier_id rendezvous
+        on ONE hardware barrier (count-based completion)."""
+        self._append(NamedBarrier(barrier_id=barrier_id, num_warps=num_warps))
 
     def warp_sync(self) -> None:
         self._append(WarpSync())

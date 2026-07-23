@@ -6,7 +6,7 @@
 use crate::interpreter::diagnostics::{Diagnostic, Severity};
 use crate::interpreter::protocol::{
     AccessScope, BoxN, ExecutionMode, MbarTargetEvent, PoolId, ProtocolPassSummary,
-    ProtocolWarning, Region, TraceEvent, TraceEventKind,
+    ProtocolWarning, Region, SemKey, TraceEvent, TraceEventKind,
 };
 use crate::interpreter::threads::ThreadId;
 use crate::interpreter::values::arrays::ValueArray1;
@@ -646,6 +646,24 @@ fn event_to_py<'py>(py: Python<'py>, event: &TraceEvent) -> PyResult<Bound<'py, 
             out.set_item("bar_id", bar_id)?;
             out.set_item("scope", scope_to_py(py, scope)?)?;
         }
+        TraceEventKind::SemRelease {
+            key,
+            new_value,
+            order,
+            scope,
+        } => {
+            out.set_item("kind", "sem_release")?;
+            out.set_item("key", sem_key_to_py(py, key)?)?;
+            out.set_item("new_value", new_value)?;
+            out.set_item("order", order.as_str())?;
+            out.set_item("scope", scope_to_py(py, scope)?)?;
+        }
+        TraceEventKind::SemAcquire { key, value, scope } => {
+            out.set_item("kind", "sem_acquire")?;
+            out.set_item("key", sem_key_to_py(py, key)?)?;
+            out.set_item("value", value)?;
+            out.set_item("scope", scope_to_py(py, scope)?)?;
+        }
         TraceEventKind::TmemAlloc {
             cta_ids,
             region,
@@ -715,6 +733,13 @@ fn mbar_target_to_py<'py>(
     out.set_item("cluster_id", target.cluster_id)?;
     out.set_item("ctaid_in_cluster", target.ctaid_in_cluster)?;
     out.set_item("stage", target.stage)?;
+    Ok(out)
+}
+
+fn sem_key_to_py<'py>(py: Python<'py>, key: &SemKey) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py);
+    out.set_item("tensor_id", key.tensor_id)?;
+    out.set_item("flat_coord", key.flat_coord)?;
     Ok(out)
 }
 
@@ -1979,13 +2004,15 @@ fn tma_load(
     }))
 }
 #[pyfunction]
-#[pyo3(name = "TmaStore", signature = (dst, src, coords, shape, gmem_shape = None))]
+#[pyo3(name = "TmaStore", signature = (dst, src, coords, shape, gmem_shape = None, reduce_add = false, allow_nondet_reduce = false))]
 fn tma_store(
     dst: PyTensor,
     src: Bound<'_, PyAny>,
     coords: Bound<'_, PyAny>,
     shape: Vec<usize>,
     gmem_shape: Option<Vec<usize>>,
+    reduce_add: bool,
+    allow_nondet_reduce: bool,
 ) -> PyResult<PyStmt> {
     Ok(PyStmt(ir::Stmt::TmaStore {
         dst: dst.0,
@@ -1993,6 +2020,54 @@ fn tma_store(
         coords: coerce_scalar_seq(&coords)?,
         shape,
         gmem_shape,
+        reduce_add,
+        allow_nondet_reduce,
+    }))
+}
+#[pyfunction]
+#[pyo3(name = "CpAsyncBulkS2Cluster", signature = (dst, src, mbar, bytes))]
+fn cp_async_bulk_s2cluster(
+    dst: Bound<'_, PyAny>,
+    src: Bound<'_, PyAny>,
+    mbar: Bound<'_, PyAny>,
+    bytes: Bound<'_, PyAny>,
+) -> PyResult<PyStmt> {
+    Ok(PyStmt(ir::Stmt::CpAsyncBulkS2Cluster {
+        dst: coerce_slice(&dst)?,
+        src: coerce_slice(&src)?,
+        mbar: coerce_mbar_ref(&mbar)?,
+        bytes: coerce_scalar(&bytes)?,
+    }))
+}
+#[pyfunction]
+#[pyo3(name = "GmemAtomicAdd", signature = (sem, coords, value, order))]
+fn gmem_atomic_add(
+    sem: Bound<'_, PyAny>,
+    coords: Bound<'_, PyAny>,
+    value: Bound<'_, PyAny>,
+    order: &str,
+) -> PyResult<PyStmt> {
+    let order = ir::GmemAtomicOrder::parse(order).ok_or_else(|| {
+        PyRuntimeError::new_err("gmem_atomic_add order must be 'release' or 'relaxed'")
+    })?;
+    Ok(PyStmt(ir::Stmt::GmemAtomicAdd {
+        sem: coerce_slice(&sem)?,
+        coords: coerce_scalar_seq(&coords)?,
+        value: coerce_scalar(&value)?,
+        order,
+    }))
+}
+#[pyfunction]
+#[pyo3(name = "GmemWaitEq", signature = (sem, coords, value))]
+fn gmem_wait_eq(
+    sem: Bound<'_, PyAny>,
+    coords: Bound<'_, PyAny>,
+    value: Bound<'_, PyAny>,
+) -> PyResult<PyStmt> {
+    Ok(PyStmt(ir::Stmt::GmemWaitEq {
+        sem: coerce_slice(&sem)?,
+        coords: coerce_scalar_seq(&coords)?,
+        value: coerce_scalar(&value)?,
     }))
 }
 #[pyfunction]
@@ -2357,7 +2432,8 @@ fn reg_softmax_rescale(
 }
 
 #[pyfunction]
-#[pyo3(name = "RegCausalMask", signature = (dst, src, query_start, key_start, group_size, mask_value = None))]
+#[pyo3(name = "RegCausalMask", signature = (dst, src, query_start, key_start, group_size, mask_value = None, swap_qk = false))]
+#[allow(clippy::too_many_arguments)]
 fn reg_causal_mask(
     dst: Bound<'_, PyAny>,
     src: Bound<'_, PyAny>,
@@ -2365,6 +2441,7 @@ fn reg_causal_mask(
     key_start: Bound<'_, PyAny>,
     group_size: u32,
     mask_value: Option<Bound<'_, PyAny>>,
+    swap_qk: bool,
 ) -> PyResult<PyStmt> {
     Ok(PyStmt(ir::Stmt::RegCausalMask {
         dst: coerce_slice(&dst)?,
@@ -2376,6 +2453,7 @@ fn reg_causal_mask(
             Some(v) => coerce_reg_operand(&v)?,
             None => ir::RegOperand::Literal(ir::RegLiteral::f32(f32::NEG_INFINITY)),
         },
+        swap_qk,
     }))
 }
 
@@ -2437,6 +2515,14 @@ fn cta_sync() -> PyStmt {
 #[pyo3(name = "WgSync")]
 fn wg_sync(barrier_id: u32) -> PyStmt {
     PyStmt(ir::Stmt::WgSync { barrier_id })
+}
+#[pyfunction]
+#[pyo3(name = "NamedBarrier")]
+fn named_barrier(barrier_id: u32, num_warps: u32) -> PyStmt {
+    PyStmt(ir::Stmt::NamedBarrier {
+        barrier_id,
+        num_warps,
+    })
 }
 #[pyfunction]
 #[pyo3(name = "WarpSync")]
@@ -2597,6 +2683,9 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(mbarrier_arrive_expect_tx, m)?,
         wrap_pyfunction!(tma_load, m)?,
         wrap_pyfunction!(tma_store, m)?,
+        wrap_pyfunction!(cp_async_bulk_s2cluster, m)?,
+        wrap_pyfunction!(gmem_atomic_add, m)?,
+        wrap_pyfunction!(gmem_wait_eq, m)?,
         wrap_pyfunction!(cp_async_bulk_commit_group, m)?,
         wrap_pyfunction!(cp_async_bulk_wait_group_read, m)?,
         wrap_pyfunction!(tcgen05_mma, m)?,
@@ -2629,6 +2718,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(fence, m)?,
         wrap_pyfunction!(cta_sync, m)?,
         wrap_pyfunction!(wg_sync, m)?,
+        wrap_pyfunction!(named_barrier, m)?,
         wrap_pyfunction!(warp_sync, m)?,
         wrap_pyfunction!(cluster_sync, m)?,
     ] {

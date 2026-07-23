@@ -247,6 +247,32 @@ impl LdStShape {
     }
 }
 
+/// Memory order of a `gmem_atomic_add` (`red.<order>.gpu.global.add.s32`).
+/// `Release` orders all prior writes before the publish (the semaphore
+/// "signal"); `Relaxed` is a bare RMW with no happens-before edge.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GmemAtomicOrder {
+    Release,
+    Relaxed,
+}
+
+impl GmemAtomicOrder {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GmemAtomicOrder::Release => "release",
+            GmemAtomicOrder::Relaxed => "relaxed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "release" => Some(GmemAtomicOrder::Release),
+            "relaxed" => Some(GmemAtomicOrder::Relaxed),
+            _ => None,
+        }
+    }
+}
+
 /// PTX ldmatrix/stmatrix matrix shape.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MatrixShape {
@@ -408,6 +434,57 @@ pub enum Stmt {
         coords: Vec<ScalarValue>,
         shape: Vec<usize>,
         gmem_shape: Option<Vec<usize>>,
+        /// True for `cp.reduce.async.bulk...add.f32` (TMA reduce-add): value-mode
+        /// accumulates `dst += src` instead of overwriting. Trace/protocol treat it
+        /// like a store (a GMEM-output bulk async write) whose accesses carry the
+        /// `TmaReduce` marker.
+        reduce_add: bool,
+        /// Explicit opt-in for a NON-INTEGER (today: f32) `reduce_add`. A float
+        /// reduction is not associative, so cross-CTA reduce-adds to one location are
+        /// race-free (hardware-atomic, commutative) but ORDER-DEPENDENT — the result is
+        /// not bit-reproducible. The protocol checker can only WARN
+        /// (`nondeterministic_reduction`), and warnings are easy to miss, so validate
+        /// REJECTS a float reduce-add unless the kernel author sets this flag. With the
+        /// flag set, the checker keeps its warning.
+        allow_nondet_reduce: bool,
+    },
+    /// `cp.async.bulk.shared::cluster.shared::cta` — async bulk copy from this CTA's
+    /// SMEM (`src`) to a PEER CTA's SMEM (`dst`, the peer instance), signalling the
+    /// peer's `mbar` (via its `remote_coord`) on completion. The peer CTA is the
+    /// mbar's target. Trace/protocol model it as a local-SMEM async-proxy READ +
+    /// a peer-CTA-SMEM async-proxy WRITE (attributed to the peer's SMEM pool, so the
+    /// race checker matches it against the peer's read) + a `complete_tx` on the
+    /// PEER's mbar (so the cross-CTA happens-before closes through the peer's wait).
+    CpAsyncBulkS2Cluster {
+        dst: TensorSlice,
+        src: TensorSlice,
+        mbar: MBarRef,
+        bytes: ScalarValue,
+    },
+    /// `red.<order>.gpu.global.add.s32` — a GMEM semaphore atomic-add ("signal").
+    /// VALUE: serialized RMW of the i32 semaphore cell `sem[coords]` (`+= value`).
+    /// TRACE/protocol: a SYNC op (NOT a data access — no Read/Write on the
+    /// semaphore tensor); it publishes this stream's clock as the RELEASE clock for
+    /// the semaphore slot at its POST-increment value (value-keyed), so a later
+    /// `wait_eq` on that exact value joins it (acquire). `order=release` carries the
+    /// release fence ordering all prior writes (incl. drained reduce-adds) before
+    /// the publish.
+    GmemAtomicAdd {
+        sem: TensorSlice,
+        coords: Vec<ScalarValue>,
+        value: ScalarValue,
+        order: GmemAtomicOrder,
+    },
+    /// `ld.global.acquire.gpu` spin-loop until `sem[coords] == value` ("wait").
+    /// VALUE: BLOCK this stream (polled re-check) until the i32 cell equals `value`;
+    /// never reaching it -> the runner's deadlock detection fires. TRACE/protocol: a
+    /// SYNC op (no Read/Write) that ACQUIRES — joins the release clock published by
+    /// the `atomic_add` that PRODUCED this exact `value` (value-keyed, mirroring the
+    /// mbar phase-keyed pattern with the counter-value in place of parity).
+    GmemWaitEq {
+        sem: TensorSlice,
+        coords: Vec<ScalarValue>,
+        value: ScalarValue,
     },
     CpAsyncBulkCommitGroup,
     CpAsyncBulkWaitGroupRead {
@@ -592,6 +669,11 @@ pub enum Stmt {
         key_start: ScalarValue,
         group_size: u32,
         mask_value: RegOperand,
+        /// Fragment orientation. False = forward `[q-row, kv-col]` (q = query_start +
+        /// row/group_size, k = key_start + col). True = backward `[kv-row, q-col]` (the
+        /// fa-bwd fragment is transposed): k = key_start + row, q = query_start +
+        /// col/group_size — group_size lands on the q (col) axis. Both mask when k > q.
+        swap_qk: bool,
     },
     RegCombineIntFracEx2 {
         dst: TensorSlice,
@@ -620,6 +702,16 @@ pub enum Stmt {
     CtaSync,
     WgSync {
         barrier_id: u32,
+    },
+    /// Named barrier across `num_warps` warps that may span warpgroups —
+    /// `bar.sync barrier_id, num_warps*32` (flashattn `NamedBarrierBwdSm100`).
+    /// Unlike WgSync (per-warpgroup), DIFFERENT NamedBarrier statements with the
+    /// same `barrier_id` rendezvous on ONE hardware barrier: the rendezvous
+    /// identity is (CTA, barrier_id), not the statement, and completion is
+    /// count-based (`num_warps * 32` arrived threads).
+    NamedBarrier {
+        barrier_id: u32,
+        num_warps: u32,
     },
     WarpSync,
     ClusterSync,

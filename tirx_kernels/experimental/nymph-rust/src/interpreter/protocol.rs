@@ -107,6 +107,34 @@ impl PoolId {
     }
 }
 
+/// Identity of a GMEM semaphore cell: the i32 tensor + the flat cell coordinate.
+/// SHARED across all CTAs that target it (NOT per-CTA), so a release from one CTA
+/// is visible to a wait on another. Mirrors a `(pool, coords)` mbar key, but the
+/// release/acquire is keyed on the counter VALUE (see `SemRelease`/`SemAcquire`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SemKey {
+    pub tensor_id: u32,
+    pub flat_coord: usize,
+}
+
+/// Memory order carried on a `SemRelease` event (mirrors `ir::GmemAtomicOrder`,
+/// kept local to the trace layer so the protocol module needn't depend on the IR
+/// enum's identity). Only `Release` publishes a happens-before edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GmemAtomicOrderEvent {
+    Release,
+    Relaxed,
+}
+
+impl GmemAtomicOrderEvent {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GmemAtomicOrderEvent::Release => "release",
+            GmemAtomicOrderEvent::Relaxed => "relaxed",
+        }
+    }
+}
+
 /// N-dimensional half-open physical byte box.
 ///
 /// SMEM, GMEM, and REG use rank-1 byte ranges. TMEM uses rank-2 boxes in
@@ -310,6 +338,12 @@ impl MemoryProxy {
     }
 }
 
+/// Commutative reduction operator carried by an atomic-reduce access (see `TmaReduce`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReduceOp {
+    Add,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TensorAccessKind {
     Generic,
@@ -319,6 +353,18 @@ pub enum TensorAccessKind {
     Tcgen05Cp,
     LdMatrix,
     StMatrix,
+    /// Atomic commutative reduction (`cp.reduce.async.bulk.<op>`) into GMEM. The marker
+    /// ITSELF asserts hardware atomicity AT GLOBAL SCOPE — it is emitted ONLY from a
+    /// genuinely-atomic reduce instruction, never from a software accumulate (those stay
+    /// `TmaStore`). `exact` = the op is associative-exact for the element dtype (true for
+    /// integer add, false for float add — float add is not associative, so the reduced value
+    /// is order-dependent). The checker uses BOTH facts: atomicity makes two same-op reduces
+    /// to one location race-free without ordering; `exact=false` makes the result
+    /// order-dependent (non-deterministic), which it surfaces as a warning, not a race.
+    TmaReduce {
+        op: ReduceOp,
+        exact: bool,
+    },
 }
 
 impl TensorAccessKind {
@@ -331,6 +377,15 @@ impl TensorAccessKind {
             TensorAccessKind::Tcgen05Cp => "tcgen05_cp",
             TensorAccessKind::LdMatrix => "ldmatrix",
             TensorAccessKind::StMatrix => "stmatrix",
+            TensorAccessKind::TmaReduce { .. } => "tma_reduce",
+        }
+    }
+
+    /// The `(op, exact)` of an atomic commutative reduce, or `None` for any non-reduce access.
+    pub fn reduce(self) -> Option<(ReduceOp, bool)> {
+        match self {
+            TensorAccessKind::TmaReduce { op, exact } => Some((op, exact)),
+            _ => None,
         }
     }
 }
@@ -495,6 +550,25 @@ pub enum TraceEventKind {
         thread_count: usize,
         cycle: u64,
         bar_id: Option<u32>,
+        scope: AccessScope,
+    },
+    /// GMEM semaphore atomic-add ("signal") — a SYNC op, NOT a data access. Carries
+    /// the semaphore cell key and the POST-increment counter value; in
+    /// `OrderingAnalysis` it publishes this stream's clock as the RELEASE clock for
+    /// `(key, new_value)` (value-keyed), iff `order == Release`.
+    SemRelease {
+        key: SemKey,
+        new_value: i64,
+        order: GmemAtomicOrderEvent,
+        scope: AccessScope,
+    },
+    /// GMEM semaphore spin-wait ("wait") — a SYNC op, NOT a data access. Carries the
+    /// awaited counter value; in `OrderingAnalysis` it ACQUIRES — joins the release
+    /// clock published for `(key, value)` (the SPECIFIC observed value, not the
+    /// cell's latest release) into this stream's clock.
+    SemAcquire {
+        key: SemKey,
+        value: i64,
         scope: AccessScope,
     },
     TmemAlloc {

@@ -8,7 +8,7 @@
 //! fire when you call `validate()` rather than at each `__post_init__`.
 
 use super::*;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// An IR validation error (mirrors Python's `ValueError`/`TypeError` messages).
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -676,11 +676,25 @@ fn validate_stmt(s: &Stmt) -> R {
             coords,
             shape,
             gmem_shape,
+            reduce_add,
+            allow_nondet_reduce,
         } => {
             validate_slice(src, "tma_store src")?;
             validate_tensor(dst)?;
             if dst.space != MemorySpace::Gmem {
                 return bail("tma_store dst must be GMEM");
+            }
+            if *reduce_add && dst.dtype != DType::F32 {
+                return bail("tma_reduce_add dst must be f32");
+            }
+            // Float reduce-add is order-dependent (float add is not associative): the
+            // checker can only WARN `nondeterministic_reduction`, so the IR makes the
+            // non-determinism opt-in instead — reject unless the author declared it.
+            if *reduce_add && !dst.dtype.is_integer() && !allow_nondet_reduce {
+                return bail(
+                    "tma_reduce_add on a non-integer dst is order-dependent; \
+                     pass allow_nondet_reduce=true to opt in",
+                );
             }
             if src.tensor.space != MemorySpace::Smem {
                 return bail("tma_store src must be SMEM");
@@ -699,6 +713,62 @@ fn validate_stmt(s: &Stmt) -> R {
             }
             validate_tma_gmem_shape(gmem_shape, &dst.shape, shape, "tma_store")?;
             check_slice_covers(src, shape, "tma_store src slice")?;
+        }
+        Stmt::CpAsyncBulkS2Cluster {
+            dst,
+            src,
+            mbar,
+            bytes,
+        } => {
+            validate_slice(src, "cp_async_bulk_s2cluster src")?;
+            validate_slice(dst, "cp_async_bulk_s2cluster dst")?;
+            validate_scalar(bytes)?;
+            if src.tensor.space != MemorySpace::Smem || dst.tensor.space != MemorySpace::Smem {
+                return bail("cp_async_bulk_s2cluster src and dst must both be SMEM");
+            }
+            if dst.tensor.dtype != src.tensor.dtype {
+                return bail("cp_async_bulk_s2cluster src and dst dtype must match");
+            }
+            // The copy targets a PEER CTA's SMEM and signals that peer's mbar —
+            // without a remote_coord the mbar resolves to the issuing CTA
+            // itself, which is not the cross-CTA exchange this op models.
+            if mbar.remote_coord.is_none() {
+                return bail("cp_async_bulk_s2cluster mbar must target a peer CTA (remote_coord)");
+            }
+        }
+        Stmt::GmemAtomicAdd {
+            sem, coords, value, ..
+        } => {
+            validate_slice(sem, "gmem_atomic_add sem")?;
+            validate_scalar(value)?;
+            if sem.tensor.space != MemorySpace::Gmem {
+                return bail("gmem_atomic_add sem must be GMEM");
+            }
+            if sem.tensor.dtype != DType::I32 {
+                return bail("gmem_atomic_add sem must be an i32 semaphore");
+            }
+            if coords.len() != sem.tensor.shape.len() {
+                return bail("gmem_atomic_add coords rank must match the semaphore tensor rank");
+            }
+            for c in coords {
+                validate_scalar(c)?;
+            }
+        }
+        Stmt::GmemWaitEq { sem, coords, value } => {
+            validate_slice(sem, "gmem_wait_eq sem")?;
+            validate_scalar(value)?;
+            if sem.tensor.space != MemorySpace::Gmem {
+                return bail("gmem_wait_eq sem must be GMEM");
+            }
+            if sem.tensor.dtype != DType::I32 {
+                return bail("gmem_wait_eq sem must be an i32 semaphore");
+            }
+            if coords.len() != sem.tensor.shape.len() {
+                return bail("gmem_wait_eq coords rank must match the semaphore tensor rank");
+            }
+            for c in coords {
+                validate_scalar(c)?;
+            }
         }
         Stmt::CpAsyncBulkCommitGroup => {}
         Stmt::CpAsyncBulkWaitGroupRead { n } => {
@@ -1273,6 +1343,7 @@ fn validate_stmt(s: &Stmt) -> R {
             key_start,
             group_size,
             mask_value,
+            swap_qk: _,
         } => {
             if !is_float_reg_dtype(dst.tensor.dtype) {
                 return bail("reg_causal_mask dst dtype must be f16, bf16, or f32");
@@ -1326,6 +1397,19 @@ fn validate_stmt(s: &Stmt) -> R {
         Stmt::WgSync { barrier_id } => {
             if *barrier_id < 1 || *barrier_id > 15 {
                 return bail("wg_sync barrier_id must be an integer in [1, 15]");
+            }
+        }
+        Stmt::NamedBarrier {
+            barrier_id,
+            num_warps,
+        } => {
+            if *barrier_id < 1 || *barrier_id > 15 {
+                return bail("named_barrier barrier_id must be an integer in [1, 15]");
+            }
+            // The thread count is `num_warps * 32` by construction — carrying the
+            // WARP count in the IR is what keeps it a positive multiple of 32.
+            if *num_warps < 1 {
+                return bail("named_barrier num_warps must be >= 1");
             }
         }
     }
@@ -1469,6 +1553,24 @@ fn define_var(var: Var, defined: &mut HashSet<Var>) -> R {
 /// exceptions are ops with NO runtime backstop (`SetMaxNReg` is sim metadata;
 /// a multi-warp `SchedNext` silently work-steals instead of failing): those
 /// require a statically-resolvable branch.
+/// Per-`barrier_id` static participant warp sets of the two hardware-barrier
+/// classes (wg_sync vs named_barrier). The 16 hardware named barriers are ONE
+/// resource shared by both classes: a warp whose arrivals count toward a
+/// wg_sync(id) AND a named_barrier(id) folds two different rendezvous into one
+/// hardware barrier. The old rule was role-scoped ("one role may not use the
+/// same barrier_id for both classes"); roles no longer exist, so the per-warp
+/// re-derivation keys on the statically-known WARP SETS instead: the warps
+/// reaching wg_sync(id) must be disjoint from the warps reaching
+/// named_barrier(id). Disjoint reuse (one warpgroup's private wg_sync(1) next
+/// to a named_barrier(1) among OTHER warpgroups) stays legal, as on hardware.
+/// Unknown filters skip, like the other static shape rules.
+#[derive(Default)]
+struct BarrierClassUse {
+    wg_sync_warps: HashMap<u32, BTreeSet<u32>>,
+    named_warps: HashMap<u32, BTreeSet<u32>>,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn check_context(
     body: &[Stmt],
     filter: &ThreadFilter,
@@ -1476,6 +1578,7 @@ fn check_context(
     num_warps: u32,
     in_scheduler_impl: bool,
     scheduler_loop_depth: usize,
+    barriers: &mut BarrierClassUse,
 ) -> R {
     for stmt in body {
         match stmt {
@@ -1493,10 +1596,43 @@ fn check_context(
                     }
                 }
             }
-            Stmt::WgSync { .. } => {
+            Stmt::WgSync { barrier_id } => {
                 if let Some(set) = filter.known() {
                     if set.is_exactly_one_full_warpgroup().is_none() {
                         return bail("wg_sync must cover exactly one full warpgroup");
+                    }
+                    let warps = barriers.wg_sync_warps.entry(*barrier_id).or_default();
+                    warps.extend(set.warps_touched());
+                    if let Some(named) = barriers.named_warps.get(barrier_id) {
+                        if warps.intersection(named).next().is_some() {
+                            return bail(
+                                "wg_sync barrier_id cannot alias a named_barrier reachable \
+                                 by the same warp (the 16 hardware barriers are one resource)",
+                            );
+                        }
+                    }
+                }
+            }
+            Stmt::NamedBarrier { barrier_id, .. } => {
+                if let Some(set) = filter.known() {
+                    // A statically sub-warp participant can never fill a
+                    // count-based bar.sync — the hardware hang.
+                    let touched = set.warps_touched();
+                    if touched.is_empty() || !touched.iter().all(|&w| set.is_full_warp(w)) {
+                        return bail(
+                            "named_barrier must cover whole warps (a sub-warp participant \
+                             deadlocks)",
+                        );
+                    }
+                    let warps = barriers.named_warps.entry(*barrier_id).or_default();
+                    warps.extend(touched);
+                    if let Some(wg) = barriers.wg_sync_warps.get(barrier_id) {
+                        if warps.intersection(wg).next().is_some() {
+                            return bail(
+                                "named_barrier barrier_id cannot alias a wg_sync reachable \
+                                 by the same warp (the 16 hardware barriers are one resource)",
+                            );
+                        }
                     }
                 }
             }
@@ -1592,6 +1728,7 @@ fn check_context(
                     num_warps,
                     in_scheduler_impl,
                     scheduler_loop_depth,
+                    barriers,
                 )?;
             }
             Stmt::ForEachTask { var, body, .. } => {
@@ -1603,10 +1740,11 @@ fn check_context(
                     num_warps,
                     in_scheduler_impl,
                     scheduler_loop_depth,
+                    barriers,
                 )?;
             }
             Stmt::SchedulerImpl { body, .. } => {
-                check_context(body, filter, defined, num_warps, true, 0)?;
+                check_context(body, filter, defined, num_warps, true, 0, barriers)?;
             }
             Stmt::SchedNext { var, .. } => {
                 if !in_scheduler_impl {
@@ -1638,6 +1776,7 @@ fn check_context(
                     num_warps,
                     in_scheduler_impl,
                     scheduler_loop_depth + 1,
+                    barriers,
                 )?;
             }
             Stmt::BreakIf { cond } => {
@@ -1663,6 +1802,7 @@ fn check_context(
                     num_warps,
                     in_scheduler_impl,
                     scheduler_loop_depth,
+                    barriers,
                 )?;
             }
             _ => {}
@@ -1905,6 +2045,7 @@ impl Kernel {
             self.num_warps,
             false,
             0,
+            &mut BarrierClassUse::default(),
         )?;
         check_cta_group_consistency(&self.body)?;
         Ok(())
