@@ -108,12 +108,14 @@ fn cta_eq(ctaid: i64) -> ScalarValue {
     )
 }
 
+/// Single-thread init block (warp 0, lane 0) — mbarrier.init is per-thread,
+/// so unguarded multi-thread inits are double-init errors by design.
 fn kernel_init(body: Vec<Stmt>) -> Stmt {
     Stmt::KernelInit {
         body,
         warp: Some(0),
         lane: None,
-        elected: false,
+        elected: true,
     }
 }
 
@@ -229,11 +231,17 @@ fn tmem_cta_group2_collective_success_populates_peer_scratchpads() {
         name: "tmem_cta_group2_success".into(),
         args: vec![],
         body: vec![
-            kernel_init(vec![Stmt::TmemAlloc {
-                tensor: paired.clone(),
-                n_cols: 128,
-                cta_group: 2,
-            }]),
+            // tmem alloc/dealloc are warp-collective: full warp 0, not elected.
+            Stmt::KernelInit {
+                body: vec![Stmt::TmemAlloc {
+                    tensor: paired.clone(),
+                    n_cols: 128,
+                    cta_group: 2,
+                }],
+                warp: Some(0),
+                lane: None,
+                elected: false,
+            },
             kernel_finalize(vec![Stmt::TmemDealloc {
                 tensor: paired,
                 n_cols: 128,
@@ -438,6 +446,22 @@ fn mbarrier_wait_success_and_blocked_frontier_are_rust_internal() {
                 count: 1,
                 stage: None,
             }]),
+            // The issuing thread posts expect-tx in ITS program order before
+            // the TMA (canon's shape — a cross-warp expect_tx would race the
+            // TMA completion on hardware and the checker now says so). The
+            // consumer warp's parked wait is still woken by the producer
+            // stream's completion write.
+            Stmt::Role {
+                body: vec![Stmt::MBarrierWait {
+                    mbar: mbar_ref(&mbar),
+                    stage: None,
+                    phase: Some(ScalarValue::Int(0)),
+                }],
+                warp: Some(0),
+                warpgroup: None,
+                elected: true,
+                maxnreg: None,
+            },
             Stmt::Role {
                 body: vec![
                     Stmt::MBarrierArriveExpectTx {
@@ -445,30 +469,19 @@ fn mbarrier_wait_success_and_blocked_frontier_are_rust_internal() {
                         bytes: 16,
                         stage: None,
                     },
-                    Stmt::MBarrierWait {
+                    Stmt::TmaLoad {
+                        dst: full_slice(smem),
+                        src: source.clone(),
                         mbar: mbar_ref(&mbar),
-                        stage: None,
-                        phase: Some(ScalarValue::Int(0)),
+                        bytes: ScalarValue::Int(16),
+                        coords: vec![ScalarValue::Int(0)],
+                        shape: vec![4],
+                        gmem_shape: None,
+                        mbar_stage: None,
+                        multicast_cta_mask: None,
+                        cta_group: 1,
                     },
                 ],
-                warp: Some(0),
-                warpgroup: None,
-                elected: true,
-                maxnreg: None,
-            },
-            Stmt::Role {
-                body: vec![Stmt::TmaLoad {
-                    dst: full_slice(smem),
-                    src: source.clone(),
-                    mbar: mbar_ref(&mbar),
-                    bytes: ScalarValue::Int(16),
-                    coords: vec![ScalarValue::Int(0)],
-                    shape: vec![4],
-                    gmem_shape: None,
-                    mbar_stage: None,
-                    multicast_cta_mask: None,
-                    cta_group: 1,
-                }],
                 warp: Some(1),
                 warpgroup: None,
                 elected: true,
@@ -648,12 +661,14 @@ fn cluster_sync_cleanup_is_rust_internal() {
     let result = run_trace_kernel(&kernel, HashMap::new());
     assert!(result.completed, "failed: {:?}", result.failure_reason);
     assert_eq!(trace_status(&result), ProtocolStatus::Passed);
+    // 2 cluster_syncs x 8 per-warp streams (2 CTAs x 4 warps): every arriving
+    // warp stream logs its own Sync passage.
     assert_eq!(
         trace_events(&result)
             .iter()
             .filter(|event| matches!(&event.payload, TraceEventKind::Sync { .. }))
             .count(),
-        4
+        16
     );
 }
 
@@ -761,11 +776,14 @@ fn tma_and_reg_runtime_failures_expose_no_partial_values() {
         launch_shape: vec![1],
         cluster_shape: vec![1],
     };
+    // A 32-thread cohort reaching tma_store now trips the PTX single-thread
+    // issue gate before operand checks (divergent coords are unconstructible
+    // from a single thread).
     let divergent_result = run_value_kernel(&divergent, HashMap::new());
     assert!(!divergent_result.completed);
     assert_eq!(
         divergent_result.failure_reason.as_deref(),
-        Some("divergent_tma_operands")
+        Some("tma_store_mask")
     );
     assert!(divergent_result.payload.is_none());
 

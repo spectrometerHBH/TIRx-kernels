@@ -60,6 +60,7 @@ fn execute_wait<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IRes
 }
 
 fn execute_commit<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
+    ctx.check_single_thread_issue("tcgen05_commit_mask", "tcgen05_commit")?;
     let (mbar, stage, cta_group, multicast) = match stmt {
         Stmt::Tcgen05Commit {
             mbar,
@@ -770,10 +771,7 @@ fn execute_mma<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResu
             ),
             _ => unreachable!(),
         };
-    ctx.check_full_warp_cohort(
-        "tcgen05_mma_mask",
-        "tcgen05_mma must be issued by one or more full warps",
-    )?;
+    ctx.check_single_thread_issue("tcgen05_mma_mask", "tcgen05_mma")?;
 
     // The accumulator CTA(s): cta_group=2's even CTA computes the whole pair; odd is a no-op.
     let cta_ids: Vec<usize> = if cta_group == 2 {
@@ -1037,6 +1035,7 @@ fn read_scale_rows(
 /// toward other streams is observed through `tcgen05_commit` (the trace records
 /// an async `Tmem(Cp)` write window drained by the commit).
 fn execute_cp<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
+    ctx.check_single_thread_issue("tcgen05_cp_mask", "tcgen05_cp")?;
     let (dst, src, cta_group) = match stmt {
         Stmt::Tcgen05Cp {
             dst,

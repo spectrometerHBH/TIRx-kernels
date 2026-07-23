@@ -17,7 +17,9 @@ def test_tma_and_reg_runtime_failures_expose_runtime_codes():
     smem = smem_tensor(b, shape=(4,), byte_offset=0)
     with b.role(warp=0):
         b.tma_store(out, smem, coords=(b.lane_id(),), shape=(4,))
-    with expect_runtime_error("divergent_tma_operands"):
+    # Divergent TMA operands need >1 executing thread, which the single-thread
+    # issue gate now rejects first: the reachable code is tma_store_mask.
+    with expect_runtime_error("tma_store_mask"):
         run(b.build())
 
     b = builder("reg_load_oob_source")
@@ -81,7 +83,8 @@ def test_tcgen05_commit_runtime_failures_are_closed():
 
     b = builder("tcgen05_commit_overflow")
     overflow = b.mbar(kind=nr.MBarKind.TCGEN05)
-    with b.kernel_init(warp=0):
+    # mbarrier.init is per-thread now: issue it from a single elected thread.
+    with b.kernel_init(warp=0, elected=True):
         b.mbarrier_init(overflow, count=1)
     with b.role(warp=0, elected=True):
         b.mbarrier_expect_tx(overflow, bytes=1)
@@ -90,22 +93,32 @@ def test_tcgen05_commit_runtime_failures_are_closed():
     with expect_runtime_error("mbarrier_arrive_overflow"):
         run(b.build())
 
+    # No epochs anymore, so "CTA 0 exits before CTA 1 commits" must be built
+    # explicitly: CTA 0's LAST statement remote-arrives CTA 1's `go` barrier and
+    # then CTA 0 runs off the end of its program; CTA 1 waits `go` and burns a
+    # few filler statements so CTA 0's streams retire before the commit issues.
     b = builder("tcgen05_commit_peer_exited", launch_shape=(2,), cluster_shape=(2,))
     peer_exited = b.mbar(kind=nr.MBarKind.TCGEN05)
-    with b.kernel_init(warp=0):
+    go = b.mbar(kind=nr.MBarKind.THREAD)
+    with b.kernel_init(warp=0, elected=True):
         b.mbarrier_init(peer_exited, count=1)
+        with b.if_(b.ctaid_in_cluster().eq(1)):
+            b.mbarrier_init(go, count=1)
+    b.cluster_sync()  # publish `go` before CTA 0's remote arrive
     with b.kernel_finalize(warp=0, elected=True):
         with b.if_(b.ctaid_in_cluster().eq(0)):
-            b.fence()
-    with b.kernel_finalize(warp=0, elected=True):
+            b.mbarrier_arrive(b.mbar_ref(go, remote_coord=1))
         with b.if_(b.ctaid_in_cluster().eq(1)):
+            b.mbarrier_wait(go, phase=0)
+            b.scalar(initial=0, dtype=nr.ScalarDType.I32)
+            b.scalar(initial=0, dtype=nr.ScalarDType.I32)
             b.tcgen05_commit(peer_exited, cta_group=2)
     with expect_runtime_error("tcgen05_peer_exited"):
         run(b.build())
 
     b = builder("tcgen05_commit_mask_oob", launch_shape=(2,), cluster_shape=(2,))
     mask_oob = b.mbar(kind=nr.MBarKind.TCGEN05)
-    with b.kernel_init(warp=0):
+    with b.kernel_init(warp=0, elected=True):
         b.mbarrier_init(mask_oob, count=1)
     with b.role(warp=0, elected=True):
         b.tcgen05_commit(mask_oob, multicast_cta_mask=0b100)

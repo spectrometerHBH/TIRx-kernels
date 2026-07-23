@@ -1,9 +1,12 @@
-//! CTA-epoch scheduling + frame bookkeeping — port of `interpreter/scheduler.py`.
+//! Per-warp stream scheduling + frame bookkeeping.
 //!
-//! Per CTA: ordered epochs (KernelInit, then role/loose main groups, then
-//! KernelFinalize), materialized one at a time after the prior drains (the phase
-//! boundary). Each stream owns a frame stack; loop-var writes are eager. Bodies
-//! are borrowed from the kernel (`'k`), zero-copy. `flatten/unflatten_coord` are
+//! One stream per (cta, warp), each running the WHOLE kernel body top to
+//! bottom — the warp is the hardware's own lockstep unit, everything above it
+//! is concurrency. There are no epochs and no implicit barriers: cross-warp
+//! and cross-CTA ordering comes only from explicit sync ops (mbarrier waits
+//! park and wake event-driven; collective syncs rendezvous in shared state).
+//! Each stream owns a frame stack; loop-var writes are eager. Bodies are
+//! borrowed from the kernel (`'k`), zero-copy. `flatten/unflatten_coord` are
 //! dimension-0-fastest.
 
 use super::threads::{canonical_thread_mask, filter_thread_mask, Coord, ThreadId, ThreadMask};
@@ -180,216 +183,66 @@ pub fn role_matches(
     thread.warp_id == 0 && thread.lane_id == 0
 }
 
-/// One epoch = a list of (body, active_mask) stream specs.
-type EpochSpec<'k> = Vec<(&'k [Stmt], ThreadMask)>;
-
-/// Build a CTA's epochs in source order (KernelInit epochs, role/loose main
-/// groups, KernelFinalize epochs).
-pub fn cta_epoch_specs<'k>(kernel: &'k Kernel, mask: &ThreadMask) -> Vec<EpochSpec<'k>> {
-    let mut epochs: Vec<EpochSpec<'k>> = Vec::new();
-
-    // KernelInit epochs
-    for stmt in &kernel.body {
-        if let Stmt::KernelInit {
-            body,
-            warp,
-            lane,
-            elected,
-        } = stmt
-        {
-            let m = filter_thread_mask(mask, |t| kernel_scope_matches(t, *warp, *lane, *elected));
-            epochs.push(vec![(body.as_slice(), m)]);
-        }
-    }
-
-    // main groups (role runs vs loose runs)
-    for (kind, stmts) in main_epoch_groups(&kernel.body) {
-        let mut epoch: EpochSpec<'k> = Vec::new();
-        if kind == GroupKind::Role {
-            for stmt in stmts {
-                if let Stmt::Role {
-                    body,
-                    warp,
-                    warpgroup,
-                    elected,
-                    ..
-                } = stmt
-                {
-                    let m =
-                        filter_thread_mask(mask, |t| role_matches(t, *warp, *warpgroup, *elected));
-                    epoch.push((body.as_slice(), m));
-                }
-            }
-        } else {
-            for stmt in stmts {
-                epoch.push((std::slice::from_ref(stmt), mask.clone()));
-            }
-        }
-        epochs.push(epoch);
-    }
-
-    // KernelFinalize epochs
-    for stmt in &kernel.body {
-        if let Stmt::KernelFinalize {
-            body,
-            warp,
-            lane,
-            elected,
-        } = stmt
-        {
-            let m = filter_thread_mask(mask, |t| kernel_scope_matches(t, *warp, *lane, *elected));
-            epochs.push(vec![(body.as_slice(), m)]);
-        }
-    }
-
-    epochs
-}
-
-#[derive(PartialEq, Eq)]
-enum GroupKind {
-    Role,
-    Loose,
-}
-
-fn main_epoch_groups(body: &[Stmt]) -> Vec<(GroupKind, Vec<&Stmt>)> {
-    let mut groups: Vec<(GroupKind, Vec<&Stmt>)> = Vec::new();
-    for stmt in body {
-        match stmt {
-            Stmt::KernelInit { .. }
-            | Stmt::KernelFinalize { .. }
-            | Stmt::TensorDef { .. }
-            | Stmt::MBarDef { .. } => continue,
-            _ => {}
-        }
-        let kind = if matches!(stmt, Stmt::Role { .. }) {
-            GroupKind::Role
-        } else {
-            GroupKind::Loose
-        };
-        if let Some((last_kind, run)) = groups.last_mut() {
-            if *last_kind == kind {
-                run.push(stmt);
-                continue;
-            }
-        }
-        groups.push((kind, vec![stmt]));
-    }
-    groups
-}
-
-/// One CTA's epoch schedule.
-pub struct CtaSchedule<'k> {
-    pub epoch_specs: Vec<EpochSpec<'k>>,
-    pub epoch_index: usize,
-    pub stream_ids: Vec<usize>, // indices into SchedulerState.streams that are live
-    pub completed: bool,
+/// One CTA's streams: one per warp, all materialized eagerly at launch.
+pub struct CtaSchedule {
+    pub stream_ids: Vec<usize>, // indices into SchedulerState.streams
 }
 
 pub struct SchedulerState<'k> {
     pub cta_thread_masks: Vec<ThreadMask>,
     pub streams: Vec<ExecutionStream<'k>>,
-    pub schedules: Vec<CtaSchedule<'k>>,
-    pub next_stream_id: usize,
+    pub schedules: Vec<CtaSchedule>,
 }
 
 impl<'k> SchedulerState<'k> {
+    /// Per-warp streams: every (cta, warp) runs the WHOLE kernel body from
+    /// the start, exactly like hardware. There are no phases and no implicit
+    /// barriers — all cross-warp ordering comes from explicit sync ops.
     pub fn from_kernel(kernel: &'k Kernel) -> SchedulerState<'k> {
         let cta_thread_masks = expand_threads_by_cta(kernel);
-        let schedules = cta_thread_masks
-            .iter()
-            .map(|mask| CtaSchedule {
-                epoch_specs: cta_epoch_specs(kernel, mask),
-                epoch_index: 0,
-                stream_ids: Vec::new(),
-                completed: false,
-            })
-            .collect();
-        SchedulerState {
-            cta_thread_masks,
-            streams: Vec::new(),
-            schedules,
-            next_stream_id: 0,
-        }
-    }
-
-    fn remaining_nonempty_epoch(schedule: &CtaSchedule<'k>) -> Option<usize> {
-        for (i, epoch) in schedule
-            .epoch_specs
-            .iter()
-            .enumerate()
-            .skip(schedule.epoch_index)
-        {
-            if epoch.iter().any(|(b, m)| !b.is_empty() && !m.is_empty()) {
-                return Some(i);
-            }
-        }
-        None
-    }
-
-    /// Materialize the next epoch's streams once the current epoch drains.
-    pub fn ensure_cta_epoch_streams(&mut self, sched_idx: usize) {
-        loop {
-            let schedule = &self.schedules[sched_idx];
-            let live = schedule
-                .stream_ids
-                .iter()
-                .any(|&sid| !self.streams[sid].completed);
-            if !schedule.stream_ids.is_empty() && live {
-                return; // still running
-            }
-            let schedule = &mut self.schedules[sched_idx];
-            schedule.stream_ids.clear();
-            if schedule.epoch_index >= schedule.epoch_specs.len() {
-                schedule.completed = true;
-                return;
-            }
-            let epoch_index = schedule.epoch_index;
-            schedule.epoch_index += 1;
-            // collect specs (clone the small (slice, mask) pairs)
-            let specs: Vec<(&'k [Stmt], ThreadMask)> = schedule.epoch_specs[epoch_index].clone();
-            let mut made_any = false;
-            for (body, active_mask) in specs {
-                if body.is_empty() || active_mask.is_empty() {
+        let num_warps = kernel.num_warps as usize;
+        let mut streams = Vec::with_capacity(cta_thread_masks.len() * num_warps);
+        let mut schedules = Vec::with_capacity(cta_thread_masks.len());
+        for mask in &cta_thread_masks {
+            let mut stream_ids = Vec::with_capacity(num_warps);
+            for warp in 0..num_warps {
+                let warp_mask = filter_thread_mask(mask, |t| t.warp_id == warp);
+                if warp_mask.is_empty() {
                     continue;
                 }
-                let sid = self.next_stream_id;
-                self.next_stream_id += 1;
-                let stream = make_stream(sid, body, active_mask);
-                self.streams.push(stream);
-                self.schedules[sched_idx].stream_ids.push(sid);
-                made_any = true;
+                let sid = streams.len();
+                streams.push(make_stream(sid, kernel.body.as_slice(), warp_mask));
+                stream_ids.push(sid);
             }
-            if made_any {
-                return;
-            }
-            // else loop to skip a fully-empty epoch
+            schedules.push(CtaSchedule { stream_ids });
+        }
+        SchedulerState {
+            cta_thread_masks,
+            streams,
+            schedules,
         }
     }
 
+    /// With eager materialization a CTA is Active until its last warp stream
+    /// completes, then Exited. (`NotStarted` no longer occurs: every stream
+    /// exists from round 0.)
     pub fn cta_activity_status(&self, cta_id: usize) -> CtaActivityStatus {
         if cta_id >= self.schedules.len() {
             return CtaActivityStatus::Missing;
         }
-        let schedule = &self.schedules[cta_id];
-        if schedule.completed {
-            return CtaActivityStatus::Exited;
-        }
-        let has_incomplete = schedule
+        let any_live = self.schedules[cta_id]
             .stream_ids
             .iter()
             .any(|&sid| !self.streams[sid].completed);
-        if !schedule.stream_ids.is_empty() && has_incomplete {
-            return CtaActivityStatus::Active;
-        }
-        if Self::remaining_nonempty_epoch(schedule).is_some() {
-            CtaActivityStatus::NotStarted
+        if any_live {
+            CtaActivityStatus::Active
         } else {
             CtaActivityStatus::Exited
         }
     }
 
     pub fn all_completed(&self) -> bool {
-        self.schedules.iter().all(|s| s.completed)
+        self.streams.iter().all(|s| s.completed)
     }
 }
 

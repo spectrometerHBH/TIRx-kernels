@@ -33,8 +33,12 @@ def _ldmatrix_kernel(num, trans):
     with b.kernel_init(warp=0, elected=True):
         b.mbarrier_init(mbar, count=1)
     with b.role(warp=0):
-        b.mbarrier_arrive_expect_tx(mbar, bytes=nbytes)
-        b.tma_load(smem, source, mbar=mbar, bytes=nbytes, coords=(0, 0), shape=(rows, 8))
+        # arrive_expect_tx is per-thread and tma_load is single-thread issue:
+        # one elected producer thread; the warp waits before reading SMEM.
+        with b.if_elected():
+            b.mbarrier_arrive_expect_tx(mbar, bytes=nbytes)
+            b.tma_load(smem, source, mbar=mbar, bytes=nbytes, coords=(0, 0), shape=(rows, 8))
+        b.mbarrier_wait(mbar, phase=0)
         b.ldmatrix(frag, smem[b.lane_id() % rows, 0:8], num=num, trans=trans)
         b.reg_store(out[b.lane_id(), 0:num], frag)
     return b.build(), source, out
@@ -69,7 +73,11 @@ def _stmatrix_kernel(num, trans):
     with b.role(warp=0):
         b.reg_load(frag, source[b.lane_id(), 0:num])
         b.stmatrix(smem[b.lane_id() % rows, 0:8], frag, num=num, trans=trans)
-        b.tma_store(out, smem, coords=(0, 0), shape=(rows, 8))
+        # Generic-proxy SMEM writes -> async-proxy bulk read, issued by a
+        # single thread (tma_store is a single-thread instruction).
+        b.fence(kind=nr.FenceKind.ASYNC_PROXY, scope=nr.FenceScope.CTA)
+        with b.if_elected():
+            b.tma_store(out, smem, coords=(0, 0), shape=(rows, 8))
     return b.build(), source, out
 
 
@@ -106,7 +114,11 @@ def _stmatrix_b16_kernel(num, trans):
     with b.role(warp=0):
         b.reg_load(frag, source[b.lane_id(), 0 : 2 * num])
         b.stmatrix(smem[b.lane_id() % rows, 0:8], frag, num=num, trans=trans)
-        b.tma_store(out, smem, coords=(0, 0), shape=(rows, 8))
+        # Generic-proxy SMEM writes -> async-proxy bulk read, issued by a
+        # single thread (tma_store is a single-thread instruction).
+        b.fence(kind=nr.FenceKind.ASYNC_PROXY, scope=nr.FenceScope.CTA)
+        with b.if_elected():
+            b.tma_store(out, smem, coords=(0, 0), shape=(rows, 8))
     return b.build(), source, out
 
 

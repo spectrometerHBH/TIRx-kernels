@@ -54,13 +54,16 @@ def test_protocol_trace_scheduler_scalar_bridge_passes():
     def phase_of(var):
         return (var // 2) % 2
 
-    with b.kernel_init(warp=0):
+    # mbarrier init/arrive are per-thread now: prime from one elected thread,
+    # and publish the initialized cells to the consumer warp with a cta_sync.
+    with b.kernel_init(warp=0, elected=True):
         b.mbarrier_init(full, count=1, stage=0)
         b.mbarrier_init(full, count=1, stage=1)
         b.mbarrier_init(empty, count=1, stage=0)
         b.mbarrier_init(empty, count=1, stage=1)
         b.mbarrier_arrive(empty, stage=0)
         b.mbarrier_arrive(empty, stage=1)
+    b.cta_sync()
 
     with b.role(warp=0, elected=True):
         sched_iter = b.scalar(initial=0, dtype=nr.ScalarDType.I32)
@@ -126,9 +129,12 @@ def test_protocol_deadlock_freedom_accepts_mixed_supported_blockers():
     b = builder("protocol_deadlock_mixed_supported")
     mbar = b.mbar(kind=nr.MBarKind.THREAD)
 
-    with b.kernel_init(warp=0):
+    # mbarrier init/arrive are per-thread now: keep the whole mbar handshake on
+    # one elected thread (count=1 must see exactly one arrival); the loose
+    # cta_sync stays as the third supported blocker kind.
+    with b.kernel_init(warp=0, elected=True):
         b.mbarrier_init(mbar, count=1)
-    with b.role():
+    with b.role(warp=0, elected=True):
         b.mbarrier_arrive(mbar)
         b.mbarrier_wait(mbar, phase=0)
         b.cp_async_bulk_commit_group()
@@ -187,7 +193,8 @@ def test_protocol_wait_group_read_zero_drains_retained_async_source():
 def test_protocol_deadlock_returns_failed_report():
     b = builder("protocol_deadlock")
     mbar = b.mbar(kind=nr.MBarKind.TMA)
-    with b.kernel_init(warp=0):
+    # mbarrier.init is per-thread now: issue it from a single elected thread.
+    with b.kernel_init(warp=0, elected=True):
         b.mbarrier_init(mbar, count=1)
     with b.role(warp=0, elected=True):
         b.mbarrier_expect_tx(mbar, bytes=8)
@@ -207,13 +214,18 @@ def test_protocol_blocked_mbar_wait_emits_completion_event():
     smem = smem_tensor(b, shape=(4,), byte_offset=0)
     mbar = b.mbar(kind=nr.MBarKind.TMA)
 
-    with b.kernel_init(warp=0):
+    # New model: the ISSUING thread (warp 1) arms expect_tx right before its own
+    # tma_load; warp 0 only waits. cta_sync publishes the per-thread init. The
+    # wait still blocks until the load's tx completes, which is what the
+    # completion-before-wait event ordering below pins.
+    with b.kernel_init(warp=0, elected=True):
         b.mbarrier_init(mbar, count=1)
+    b.cta_sync()
     with b.role(warp=0, elected=True):
-        b.mbarrier_arrive_expect_tx(mbar, bytes=16)
         b.mbarrier_wait(mbar, phase=0)
     with b.role(warp=1, elected=True):
         b.scalar(initial=0, dtype=nr.ScalarDType.I32)
+        b.mbarrier_arrive_expect_tx(mbar, bytes=16)
         b.tma_load(smem, source, mbar=mbar, bytes=16, coords=(0,), shape=(4,))
 
     report = nr.check_protocol(b.build(), include_events=True)
@@ -233,7 +245,8 @@ def test_protocol_payload_control_bridge_is_inconclusive():
     source = gmem_arg(b, shape=(1,))
     smem = smem_tensor(b, shape=(1,), byte_offset=0)
     mbar = b.mbar(kind=nr.MBarKind.TMA)
-    with b.kernel_init(warp=0):
+    # mbarrier.init is per-thread now: issue it from a single elected thread.
+    with b.kernel_init(warp=0, elected=True):
         b.mbarrier_init(mbar, count=1)
     with b.role(warp=0, elected=True):
         b.mbarrier_arrive_expect_tx(mbar, bytes=4)
@@ -250,7 +263,8 @@ def test_protocol_skipped_bulk_write_invalidates_prior_scalar_cell():
     source = gmem_arg(b, shape=(1,))
     smem = smem_tensor(b, shape=(1,), byte_offset=0)
     mbar = b.mbar(kind=nr.MBarKind.TMA)
-    with b.kernel_init(warp=0):
+    # mbarrier.init is per-thread now: issue it from a single elected thread.
+    with b.kernel_init(warp=0, elected=True):
         b.mbarrier_init(mbar, count=1)
     with b.role(warp=0, elected=True):
         b.store_scalar(smem[0], 7)
@@ -297,7 +311,9 @@ def test_protocol_tmem_mma_layout_f_emits_union_boxes():
 
     with b.kernel_init(warp=0):
         b.tmem_alloc(dst, n_cols=32)
-    with b.role(warpgroup=0):
+    # tcgen05_mma is a single-thread issue instruction now; issue it from warp
+    # 0's elected lane so alloc -> mma -> dealloc stay ordered on one stream.
+    with b.role(warp=0, elected=True):
         b.tcgen05_mma(dst, a_s, b_s, m=m, n=n, k=k, accum=False, cta_group=1)
     with b.kernel_finalize(warp=0):
         b.tmem_dealloc(dst, n_cols=32)
@@ -375,15 +391,19 @@ def test_protocol_trace_emits_proxy_fence_group_and_sync_metadata():
     source = smem_tensor(b, shape=(128,), byte_offset=0)
     out = gmem_arg(b, shape=(128,))
 
+    # New model: all 128 threads write, the wg_sync publishes the writes to the
+    # elected issuing thread, and the single-thread tail (fences, group ops,
+    # tma_store) runs after it — tma_store is a single-thread issue instruction.
     with b.role(warpgroup=0):
         b.store_scalar(source[b.tid_in_wg()], b.tid_in_wg())
-        b.fence(kind=nr.FenceKind.ASYNC_PROXY, scope=nr.FenceScope.CTA)
-        b.fence(kind=nr.FenceKind.ASYNC_PROXY, scope=nr.FenceScope.CLUSTER)
-        b.fence(kind=nr.FenceKind.MEMORY, scope=nr.FenceScope.GPU)
-        b.cp_async_bulk_commit_group()
-        b.cp_async_bulk_wait_group_read()
-        b.tma_store(out, source, coords=(0,), shape=(128,))
         b.wg_sync(barrier_id=7)
+        with b.if_(b.tid_in_wg().eq(0)):
+            b.fence(kind=nr.FenceKind.ASYNC_PROXY, scope=nr.FenceScope.CTA)
+            b.fence(kind=nr.FenceKind.ASYNC_PROXY, scope=nr.FenceScope.CLUSTER)
+            b.fence(kind=nr.FenceKind.MEMORY, scope=nr.FenceScope.GPU)
+            b.cp_async_bulk_commit_group()
+            b.cp_async_bulk_wait_group_read()
+            b.tma_store(out, source, coords=(0,), shape=(128,))
 
     report = nr.check_protocol(b.build(), include_events=True)
     assert report["status"] == "Passed"
@@ -399,18 +419,23 @@ def test_protocol_trace_emits_proxy_fence_group_and_sync_metadata():
     assert _events(report, "commit_group")
     assert _events(report, "wait_group")[0]["n"] == 0
 
-    sync_arrive = _events(report, "sync_arrive")[0]
-    assert sync_arrive["sync_kind"] == "warpgroup"
-    assert sync_arrive["bar_id"] == 7
-    assert sync_arrive["thread_count"] == 128
-    assert sync_arrive["count"] == 128
-    assert sync_arrive["cycle"] == 0
+    # Each of the 4 per-warp streams logs its own SyncArrive passage with a
+    # cumulative count (32, 64, 96, 128); blocked streams may re-log count=128
+    # at wake-up, so assert the cumulative ladder as a subset.
+    sync_arrives = _events(report, "sync_arrive")
+    assert all(a["sync_kind"] == "warpgroup" for a in sync_arrives)
+    assert all(a["bar_id"] == 7 for a in sync_arrives)
+    assert all(a["thread_count"] == 128 for a in sync_arrives)
+    assert all(a["cycle"] == 0 for a in sync_arrives)
+    assert {a["count"] for a in sync_arrives} >= {32, 64, 96, 128}
 
-    sync = _events(report, "sync")[0]
-    assert sync["sync_kind"] == "warpgroup"
-    assert sync["bar_id"] == 7
-    assert sync["thread_count"] == 128
-    assert sync["cycle"] == sync_arrive["cycle"]
+    # one Sync completion per warp stream: 1 wg_sync x 4 warp streams
+    syncs = _events(report, "sync")
+    assert len(syncs) == 4
+    assert all(s["sync_kind"] == "warpgroup" for s in syncs)
+    assert all(s["bar_id"] == 7 for s in syncs)
+    assert all(s["thread_count"] == 128 for s in syncs)
+    assert all(s["cycle"] == 0 for s in syncs)
 
     assert any(
         event["proxy"] == "async"

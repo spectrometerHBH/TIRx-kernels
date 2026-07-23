@@ -98,6 +98,7 @@ fn execute_tma_load<'a, 'k>(
     ctx: &mut CohortContext<'a, 'k>,
     stmt: &'k Stmt,
 ) -> IResult<StepStatus> {
+    ctx.check_single_thread_issue("tma_load_mask", "tma_load")?;
     let (dst, src, mbar, bytes, coords, shape, gmem_shape, mbar_stage, multicast, cta_group) =
         match stmt {
             Stmt::TmaLoad {
@@ -366,6 +367,7 @@ fn execute_tma_store<'a, 'k>(
     ctx: &mut CohortContext<'a, 'k>,
     stmt: &'k Stmt,
 ) -> IResult<StepStatus> {
+    ctx.check_single_thread_issue("tma_store_mask", "tma_store")?;
     let (dst, src, coords, shape, gmem_shape) = match stmt {
         Stmt::TmaStore {
             dst,

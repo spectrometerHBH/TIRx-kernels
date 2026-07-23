@@ -341,7 +341,13 @@ def test_reg_cond_rescale_direct_matches_slow_dynamic_slot():
     scales[91] = 1.5
     outputs = run(b.build(), {src_g: src, scale_g: scales})
     np.testing.assert_array_equal(output(outputs, direct_g), output(outputs, slow_g))
-    np.testing.assert_array_equal(output(outputs, direct_g), src * scales)
+    # Per-warp streams: the "warpgroup" any(scale < threshold) is evaluated
+    # over each executing warp cohort. Warp 0 (rows 0-31) contains
+    # scales[19] = 0.25 < 1.0 and rescales; row 91's warp (rows 64-95) has no
+    # scale below threshold, so its 1.5 scale is not applied.
+    expected = src.copy()
+    expected[0:32] = src[0:32] * scales[0:32]
+    np.testing.assert_array_equal(output(outputs, direct_g), expected)
 
 
 def test_reg_causal_mask_uses_thread_row_and_element_index():

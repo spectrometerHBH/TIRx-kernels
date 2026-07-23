@@ -271,6 +271,22 @@ impl<'a, 'k> CohortContext<'a, 'k> {
     pub fn stmt_id(&self, stmt: &Stmt) -> usize {
         self.ids.stmt_id(stmt)
     }
+    /// PTX single-thread issue instructions (tcgen05.mma/cp/commit, TMA bulk
+    /// copies): exactly one executing thread, or the op would issue N times.
+    pub fn check_single_thread_issue(&self, code: &str, op: &str) -> IResult<()> {
+        if self.cohort.len() != 1 {
+            return Err(InterpreterError::new(
+                code,
+                format!(
+                    "{op} is a single-thread instruction ({} threads executing); \
+                     wrap it in an elected branch",
+                    self.cohort.len()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn check_full_warp_cohort(
         &self,
         code: impl Into<String>,

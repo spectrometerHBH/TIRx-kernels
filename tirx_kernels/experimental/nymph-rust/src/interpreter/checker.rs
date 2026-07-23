@@ -2059,6 +2059,42 @@ impl MbarKey {
     }
 }
 
+/// One cooperative-barrier generation for happens-before purposes: the
+/// statement identity plus the runtime rendezvous domain (cluster syncs
+/// rendezvous per cluster, cta syncs per CTA, wg_syncs per (CTA, warpgroup),
+/// warp syncs per (CTA, warp)) plus that statement's cycle counter.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SyncHbKey {
+    stmt_id: usize,
+    bar_id: Option<u32>,
+    domain: (usize, usize),
+    cycle: u64,
+}
+
+impl SyncHbKey {
+    fn new(
+        stmt_id: usize,
+        sync_kind: &str,
+        bar_id: Option<u32>,
+        cycle: u64,
+        scope: &super::protocol::AccessScope,
+    ) -> Self {
+        let first_warp = scope.warp_ids.first().copied().unwrap_or(0);
+        let domain = match sync_kind {
+            "cluster" => (scope.cluster_id, 0),
+            "warpgroup" => (scope.cta_id, first_warp / 4),
+            "warp" => (scope.cta_id, first_warp),
+            _ => (scope.cta_id, 0),
+        };
+        Self {
+            stmt_id,
+            bar_id,
+            domain,
+            cycle,
+        }
+    }
+}
+
 struct MbarCycle {
     expected_arrivals: i64,
     pending_arrivals: i64,
@@ -2736,6 +2772,15 @@ impl OrderingAnalysis {
         let mut stream_clocks = vec![Clock::new(); stream_count];
         let mut mbars: HashMap<MbarKey, MbarCycle> = HashMap::new();
         let mut last_release_clocks: HashMap<MbarKey, Clock> = HashMap::new();
+        // Cooperative barrier (cta_sync / wg_sync / warp_sync / cluster_sync)
+        // happens-before. Per-warp streams rendezvous in shared state and each
+        // emits SyncArrive at arrival and Sync at passage. A barrier means
+        // every arrival happens-before every passage: arrivals of a
+        // generation join into `sync_arrivals`; the completing arrival
+        // (count == thread_count) freezes that join as the generation's
+        // release clock; every Sync passage acquires it.
+        let mut sync_arrivals: HashMap<SyncHbKey, Clock> = HashMap::new();
+        let mut sync_releases: HashMap<SyncHbKey, Clock> = HashMap::new();
         for (idx, event) in events.iter().enumerate() {
             let Some(scope) = event_scope(&event.payload) else {
                 continue;
@@ -2749,6 +2794,17 @@ impl OrderingAnalysis {
                         if let Some(release_clock) = last_release_clocks.get(&key) {
                             join_clock(&mut stream_clocks[stream_id], release_clock);
                         }
+                    }
+                }
+                TraceEventKind::Sync {
+                    sync_kind,
+                    cycle,
+                    bar_id,
+                    ..
+                } => {
+                    let key = SyncHbKey::new(event.stmt_id, sync_kind, *bar_id, *cycle, scope);
+                    if let Some(release_clock) = sync_releases.get(&key) {
+                        join_clock(&mut stream_clocks[stream_id], release_clock);
                     }
                 }
                 _ => {}
@@ -2790,6 +2846,29 @@ impl OrderingAnalysis {
                                 release_clock(&event_clocks, cycle.drain_release_events()),
                             );
                         }
+                    }
+                }
+                TraceEventKind::SyncArrive {
+                    sync_kind,
+                    thread_count,
+                    count,
+                    cycle,
+                    bar_id,
+                    ..
+                } => {
+                    // Blocked streams re-poll and re-emit their arrival every
+                    // round (including once more at passage, still with
+                    // count == thread_count) — so the release ACCUMULATES:
+                    // each echo joins only that stream's own program order,
+                    // never foreign edges, and the frozen generation join is
+                    // never clobbered.
+                    let key = SyncHbKey::new(event.stmt_id, sync_kind, *bar_id, *cycle, scope);
+                    let acc = sync_arrivals.entry(key.clone()).or_default();
+                    join_clock(acc, &event_clocks[idx]);
+                    if *count == *thread_count {
+                        let acc = sync_arrivals.remove(&key).unwrap_or_default();
+                        let release = sync_releases.entry(key).or_default();
+                        join_clock(release, &acc);
                     }
                 }
                 _ => {}

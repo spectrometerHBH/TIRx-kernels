@@ -234,9 +234,6 @@ impl<'k> Interpreter<'k> {
 
         loop {
             let t_mgmt = prof_now();
-            for i in 0..scheduler.schedules.len() {
-                scheduler.ensure_cta_epoch_streams(i);
-            }
             if scheduler.all_completed() {
                 prof_end("P:round_mgmt", t_mgmt);
                 return completed_result(state, kernel, &options, diagnostics, rounds, executed);

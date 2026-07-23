@@ -80,13 +80,18 @@ def test_clc_shaped_scheduler_broadcast_consumer_pipeline_completes():
     def phase_of(var):
         return (var // 2) % 2
 
-    with b.kernel_init(warp=0):
+    # mbarrier.init/arrive are per-thread: a single thread initializes and
+    # pre-arms the cells.
+    with b.kernel_init(warp=0, elected=True):
         b.mbarrier_init(full, count=1, stage=0)
         b.mbarrier_init(full, count=1, stage=1)
         b.mbarrier_init(empty, count=1, stage=0)
         b.mbarrier_init(empty, count=1, stage=1)
         b.mbarrier_arrive(empty, stage=0)
         b.mbarrier_arrive(empty, stage=1)
+    # Publish the cells to the consumer warp's stream before it waits (no
+    # implicit barrier between kernel_init and roles in the per-warp model).
+    b.cta_sync()
 
     with b.role(warp=0, elected=True):
         sched_iter = b.scalar(initial=0, dtype=nr.ScalarDType.I32)

@@ -1,7 +1,14 @@
-//! mbarrier executors — port of `semantics/mbarrier.py`. Wait is the one blocking
-//! op; it parks on `WakeCondition::Mbar` and is advanced (never re-run) when a
-//! later cell write flips the parity. Arrive/expect-tx writes list the touched
-//! cell key in `wakes` so the runner re-checks that key's parked waiters.
+//! mbarrier executors. Wait is the one blocking op; it parks on
+//! `WakeCondition::Mbar` and is advanced (never re-run) when a later cell
+//! write flips the parity. Arrive/expect-tx writes list the touched cell key
+//! in `wakes` so the runner re-checks that key's parked waiters.
+//!
+//! init/arrive/expect-tx are PER-THREAD instructions (PTX): every executing
+//! thread applies its operand once, so a full-warp arrive(1) is 32 arrivals
+//! and an unguarded init is a double-init error — exactly the hardware
+//! behavior. The cell address (mbar + stage) must still be cohort-uniform.
+//! The trace carries ONE event per statement with the summed count/bytes, so
+//! arrival accounting downstream is unchanged.
 
 use super::super::cohort::CohortContext;
 use super::super::diagnostics::{IResult, InterpreterError};
@@ -102,6 +109,15 @@ fn execute_mbarrier_init<'a, 'k>(
             scope: ctx.access_scope(),
         })?;
     }
+    // Per-thread instruction: a second executing thread re-initializes the
+    // live cell — the same UB an unguarded init has on hardware.
+    if ctx.cohort.len() > 1 {
+        return Err(InterpreterError::new(
+            "mbarrier_already_initialized",
+            "mbarrier.init is per-thread: every executing thread initializes the cell \
+             (wrap it in a single-thread branch)",
+        ));
+    }
     Ok(StepStatus::advance())
 }
 
@@ -114,19 +130,34 @@ fn execute_mbarrier_arrive<'a, 'k>(
         _ => unreachable!(),
     };
     let target = uniform_mbar_target(ctx, mbar, stage.as_ref())?;
-    let count = ctx.eval_scalar_uniform(
-        count,
-        "mbarrier arrive count",
-        "divergent_mbarrier_operands",
-    )?;
-    let cell = initialized_mbar_cell(ctx, target.key())?;
-    let updated = arrive_mbarrier_cell(cell, count)?;
+    // Per-thread instruction: every executing thread arrives with its own
+    // count. Fold sequentially so a phase can complete and re-arm mid-cohort
+    // (hardware rollover); the trace carries one event with the summed count.
+    let uniform_count = if scalar_eval::scalar_is_cohort_uniform(count) {
+        Some(scalar_eval::eval_scalar_at(
+            count,
+            &ctx.cohort[0],
+            &ctx.state.values.scalars,
+        )?)
+    } else {
+        None
+    };
+    let mut cell = initialized_mbar_cell(ctx, target.key())?;
+    let mut total = 0i64;
+    for i in 0..ctx.cohort.len() {
+        let c = match uniform_count {
+            Some(c) => c,
+            None => scalar_eval::eval_scalar_at(count, &ctx.cohort[i], &ctx.state.values.scalars)?,
+        };
+        cell = arrive_mbarrier_cell(cell, c)?;
+        total += c;
+    }
     let key = target.key();
-    ctx.state.values.mbars.cells.insert(key, updated);
+    ctx.state.values.mbars.cells.insert(key, cell);
     if ctx.trace_mode() {
         ctx.emit(TraceEventKind::MbarArrive {
             target: target.into(),
-            count,
+            count: total,
             scope: ctx.access_scope(),
         })?;
     }
@@ -143,13 +174,15 @@ fn execute_mbarrier_expect_tx<'a, 'k>(
     };
     let target = uniform_mbar_target(ctx, mbar, stage.as_ref())?;
     let cell = initialized_mbar_cell(ctx, target.key())?;
-    let updated = expect_tx_cell(cell, bytes as i64);
+    // Per-thread instruction: every executing thread adds its byte count.
+    let total = bytes as i64 * ctx.cohort.len() as i64;
+    let updated = expect_tx_cell(cell, total);
     let key = target.key();
     ctx.state.values.mbars.cells.insert(key, updated);
     if ctx.trace_mode() {
         ctx.emit(TraceEventKind::MbarExpectTx {
             target: target.into(),
-            bytes: bytes as i64,
+            bytes: total,
             scope: ctx.access_scope(),
         })?;
     }
@@ -165,26 +198,25 @@ fn execute_mbarrier_arrive_expect_tx<'a, 'k>(
         _ => unreachable!(),
     };
     let target = uniform_mbar_target(ctx, mbar, stage.as_ref())?;
-    let cell = initialized_mbar_cell(ctx, target.key())?;
-    if cell.pending_arrivals < 1 {
-        return Err(InterpreterError::new(
-            "mbarrier_arrive_overflow",
-            "mbarrier arrive exceeds pending arrivals",
-        ));
+    let mut cell = initialized_mbar_cell(ctx, target.key())?;
+    // Per-thread instruction: each executing thread expects its bytes and
+    // arrives once (sequential fold — see execute_mbarrier_arrive).
+    let n = ctx.cohort.len();
+    for _ in 0..n {
+        cell = arrive_mbarrier_cell(expect_tx_cell(cell, bytes as i64), 1)?;
     }
-    let updated = arrive_mbarrier_cell(expect_tx_cell(cell, bytes as i64), 1)?;
     let key = target.key();
-    ctx.state.values.mbars.cells.insert(key, updated);
+    ctx.state.values.mbars.cells.insert(key, cell);
     if ctx.trace_mode() {
         let scope = ctx.access_scope();
         ctx.emit(TraceEventKind::MbarExpectTx {
             target: target.into(),
-            bytes: bytes as i64,
+            bytes: bytes as i64 * n as i64,
             scope: scope.clone(),
         })?;
         ctx.emit(TraceEventKind::MbarArrive {
             target: target.into(),
-            count: 1,
+            count: n as i64,
             scope,
         })?;
     }
