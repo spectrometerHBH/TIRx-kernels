@@ -25,6 +25,12 @@ The 5 GEMMs (acc in TMEM f32; tcgen05.mma.cta_group::1.kind::f16):
   dQ = dS·K    (A=dS,      B=K)               -> tmem_dQ  (reduce-add to global dQaccum)
 """
 
+# NOTE: this kernel was already unbuildable on dev before the per-warp
+# migration (builder API skew from the tree sync: named_barrier builder API).
+# Dispatch syntax is migrated mechanically; the per-warp ordering audit
+# (single-thread issue election, publish syncs, mbar-count re-derivation)
+# is pending the kernel's repair against the current builder.
+
 from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
@@ -766,7 +772,7 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
 
     cta_in_cluster = k.ctaid_in_cluster() if use_2cta else 0
 
-    with k.kernel_init(warp=0):
+    with k.if_warp(0):
         k.tmem_alloc(tmem_base, n_cols=N_COLS_TMEM, cta_group=cg)
         for nm, spec in bar_spec.items():
             stg = spec[2] if len(spec) > 2 else 1
@@ -1072,7 +1078,7 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
             gemm(*args, accum=True, **kwargs)  # subsequent executed blocks -> accumulate
 
     # ============== load warp (13): TMA Q/K/V/dO + bulk LSE/dPsum ==============
-    with k.role(warp=LOAD_WARP):
+    with k.if_warp(LOAD_WARP):
         with k.for_each_task(sched) as task:
             batch, head, nb = task_geom(task)
             # GQA: K/V are shared across the G q-heads of a group -> load from the kv-head
@@ -1304,7 +1310,7 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
     # mma_m = the M (kv) extent of S/dP/dV/dK: cluster-wide (256) under 2-CTA, else TILE_N.
     mma_m = cg * TILE_N
 
-    with k.role(warp=MMA_WARP):
+    with k.if_warp(MMA_WARP):
         with k.for_each_task(sched) as task:
             batch, head, nb = task_geom(task)
             vg = varlen_geom(batch) if varlen else None  # VARLEN: per-seq runtime geometry
@@ -2243,7 +2249,7 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
 
         return dk_dv_tail
 
-    with k.role(warpgroup=1):  # compute wg1: warps 4-7, q-cols 0..63 / dK/dV hdim-cols [0, hdim/2)
+    with k.if_warpgroup(1):  # compute wg1: warps 4-7, q-cols 0..63 / dK/dV hdim-cols [0, hdim/2)
         tid = k.tid_in_wg()  # 0..127 = kv-row of S/P/dP/dS [TILE_N, TILE_M]
         rt = reg(DType.F32, (1,))
         fragK = reg(DType.F32, (hdim_half,))
@@ -2257,8 +2263,8 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
             tail = make_dk_dv_tail(0, tid, task, rt, fragK, fragV, rkb, cscale_s, mmin_, vg_, nb_)
             compute_softmax_ds(0, tid, task, per_mb_tail=tail)
 
-    with k.role(
-        warpgroup=2
+    with k.if_warpgroup(
+        2
     ):  # compute wg2: warps 8-11, q-cols 64..127 / dK/dV hdim-cols [hdim/2, hdim)
         tid = k.tid_in_wg()
         rt = reg(DType.F32, (1,))
@@ -2282,7 +2288,7 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
     # reduce, value-identical) but match flashattn's 2× reduce-add instruction count.
     RDQ_STAGES = hdim // RDQ_NCOL  # = 2 for hd64 (RDQ_NCOL is module-level)
     assert hdim % RDQ_NCOL == 0
-    with k.role(warpgroup=0):
+    with k.if_warpgroup(0):
         tid = k.tid_in_wg()
         fragdQ = reg(DType.F32, (hdim,))
         rzero = reg(DType.F32, (1,))
@@ -2499,7 +2505,7 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
     # release the leader MMA's dQ GEMM. Runs on BOTH CTAs: each CTA's relay arrives the
     # leader's (cluster coord 0) dS_cluster_leader (count 2 -> both arrivals release the dQ
     # GEMM). empty (15): reg donor, idle.
-    with k.role(warp=RELAY_WARP):
+    with k.if_warp(RELAY_WARP):
         with k.for_each_task(sched) as task:
             if use_2cta:
                 # VARLEN: the relay's dS_cluster_full wait + dS_cluster_leader arrive must stay
@@ -2523,10 +2529,10 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
                         # never lands (deadlock).
                         k.mbarrier_wait(bars["dS_cluster_full"], phase=mb % 2)
                         k.mbarrier_arrive(k.mbar_ref(bars["dS_cluster_leader"], remote_coord=0))
-    with k.role(warp=EMPTY_WARP):
+    with k.if_warp(EMPTY_WARP):
         with k.for_each_task(sched) as task:
             pass
 
-    with k.kernel_finalize(warp=0):
+    with k.if_warp(0):
         k.tmem_dealloc(tmem_base, n_cols=N_COLS_TMEM, cta_group=cg)
     return k.build()

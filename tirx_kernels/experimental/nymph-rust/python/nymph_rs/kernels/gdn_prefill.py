@@ -30,6 +30,12 @@ the 7 GEMMs and the gating/inverse/epilogue glue (see ``docs/kernels/gdn_prefill
 and the project memory for the full op map). State S[K,V] carried in TMEM.
 """
 
+# NOTE: this kernel was already unbuildable on dev before the per-warp
+# migration (builder API skew from the tree sync: reg_unary op set).
+# Dispatch syntax is migrated mechanically; the per-warp ordering audit
+# (single-thread issue election, publish syncs, mbar-count re-derivation)
+# is pending the kernel's repair against the current builder.
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -430,7 +436,7 @@ def build_gdn_prefill(config: GdnPrefillConfig = GdnPrefillConfig()) -> Kernel:
 
     sched = k.scheduler(k.task_space(grid=(num_work,), fields=("work",)))
 
-    with k.kernel_init(warp=0):
+    with k.if_warp(0):
         k.tmem_alloc(tmem_base, n_cols=N_COLS_TMEM)
         for nm, spec in bar_spec.items():
             stg = spec[2] if len(spec) > 2 else 1
@@ -468,7 +474,7 @@ def build_gdn_prefill(config: GdnPrefillConfig = GdnPrefillConfig()) -> Kernel:
         bars,
     )
 
-    with k.kernel_finalize(warp=0):
+    with k.if_warp(0):
         k.tmem_dealloc(tmem_base, n_cols=N_COLS_TMEM)
     return k.build()
 
@@ -585,7 +591,7 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
         k.wg_sync(barrier_id=10)
 
     # ============== TMA-load warp (9): cp.async.bulk.tensor (UTMALDG) ==============
-    with k.role(warp=TMA_WARP):
+    with k.if_warp(TMA_WARP):
         gc = k.scalar(initial=0)  # cumulative chunk index, carried across the persistent
         with k.for_each_task(
             sched
@@ -629,7 +635,7 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                 k.scalar_store(gc, gc + 1)  # advance the pipeline state
 
     # ============== gate/beta warp (10): load gate/beta + cumsum -> gate_ready ==============
-    with k.role(warp=GATE_WARP):
+    with k.if_warp(GATE_WARP):
         lane = k.lane_id()
         gc = k.scalar(initial=0)  # cumulative chunk index (pipeline state across tiles)
         with k.for_each_task(sched) as task:
@@ -708,7 +714,7 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                 k.scalar_store(gc, gc + 1)  # advance pipeline state
 
     # ============== MMA warp (8): issues all 7 GEMMs (UTCHMMA) ==============
-    with k.role(warp=MMA_WARP):
+    with k.if_warp(MMA_WARP):
         # gc = every-chunk pipeline state; gc_pos = the GEMM3/4 pipeline (used only on
         # chunk>0 — S_prev exists), advancing on its own cadence (= flashinfer's separate
         # per-pipeline PipelineState). Both carried across the persistent tile loop.
@@ -782,7 +788,7 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                     k.scalar_store(gc_pos, gc_pos + 1)
 
     # ============== compute group 0 (warps 0-3): kk_epi, qk_epi, WY inverse ==============
-    with k.role(warpgroup=0):
+    with k.if_warpgroup(0):
         tid = k.tid_in_wg()
         lane = tid % 32
         warp = tid // 32
@@ -914,7 +920,7 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                 k.scalar_store(gc, gc + 1)  # advance pipeline state
 
     # ============== compute group 1 (warps 4-7): new_v, qkv, kv_update ==============
-    with k.role(warpgroup=1):
+    with k.if_warpgroup(1):
         tid = k.tid_in_wg()
         lane = tid % 32
         warp = tid // 32
@@ -1052,7 +1058,7 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
 
     # ============== epilogue warp (11): output store (UTMASTG) ==============
     if not config.varlen:
-        with k.role(warp=EPI_WARP, elected=True):
+        with k.if_warp(EPI_WARP), k.if_elected():
             gc = k.scalar(initial=0)  # cumulative chunk index (pipeline state across tiles)
             with k.for_each_task(sched) as task:
                 seq, eh, q_head, k_head, v_head, tok_base, NCH, slen = task_geom(task)
@@ -1074,7 +1080,7 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
         # varlen: the partial last chunk's OOB rows must NOT be stored (they'd overrun
         # into the next packed sequence). Full-warp scalar store, predicated to valid
         # rows (global pos < seqlen_b); boundary-tile checklist guidance.
-        with k.role(warp=EPI_WARP):
+        with k.if_warp(EPI_WARP):
             gc = k.scalar(initial=0)
             with k.for_each_task(sched) as task:
                 seq, eh, q_head, k_head, v_head, tok_base, NCH, slen = task_geom(task)
