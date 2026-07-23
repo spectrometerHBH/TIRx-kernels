@@ -25,11 +25,18 @@ The 5 GEMMs (acc in TMEM f32; tcgen05.mma.cta_group::1.kind::f16):
   dQ = dS·K    (A=dS,      B=K)               -> tmem_dQ  (reduce-add to global dQaccum)
 """
 
-# NOTE: this kernel was already unbuildable on dev before the per-warp
-# migration (builder API skew from the tree sync: named_barrier builder API).
-# Dispatch syntax is migrated mechanically; the per-warp ordering audit
-# (single-thread issue election, publish syncs, mbar-count re-derivation)
-# is pending the kernel's repair against the current builder.
+# PER-WARP EXECUTION MODEL: fully audited (not just the mechanical dispatch
+# migration). The audit applied the fp16_bf16_gemm/fa4 playbook:
+#   - prologue: warp-0 tmem_alloc (warp-collective) + if_elected mbarrier inits,
+#     published by a top-level cta_sync (cluster_sync under 2-CTA — peers read
+#     each other's mbars);
+#   - load/mma/relay are single-thread streams (if_elected): tma_load /
+#     tcgen05_mma / tcgen05_commit are single-thread issue, and their mbarrier
+#     arrives count exactly 1 per signal;
+#   - compute/reduce warpgroup streams keep warp-collective tcgen05_ld/st and
+#     arrive per-thread — every mbar they signal counts one arrival per thread
+#     (see bar_spec's count derivation);
+#   - teardown: top-level sync (cluster-wide under 2-CTA) before the dealloc.
 
 from __future__ import annotations
 
@@ -641,7 +648,15 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
     # The single-stage cross-role barriers (s_ready/dp_ready/p_ready/ds_ready/dq_done) fire once
     # per mb; consumers wait phase=mb%2 (producer flips parity each mb). dv_done/dk_done fire
     # only on the LAST mb (dV/dK accumulate) -> single-stage, phase=0.
-    # spec = (kind, arrive_count[, stages])
+    # spec = (kind, arrive_count[, stages]).
+    # PER-WARP EXECUTION MODEL — mbarrier.arrive is PER-THREAD, so every count
+    # below is derived from "arrivals per phase" under per-thread semantics:
+    #   - TMA/TCGEN05 kinds are armed by the engine (tx bytes / commit): count=1.
+    #   - single-thread streams (the elected mma/load/relay threads) contribute
+    #     exactly one arrival per signal: count=1 (or 2 for one-per-CTA pairs).
+    #   - warpgroup streams let EVERY thread arrive after its own row's work
+    #     (fa4 pattern): count = #arriving threads (128 per wg, 256 for both).
+    WG_T = 128  # threads per warpgroup
     bar_spec = {
         "tk": (MBarKind.TMA, 1),
         "tv": (MBarKind.TMA, 1),
@@ -651,24 +666,26 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
         "tdps": (MBarKind.TMA, 1, NSTAGE),
         "s_ready": (MBarKind.TCGEN05, 1),  # mma S -> compute
         "dp_ready": (MBarKind.TCGEN05, 1),  # mma dP -> compute
-        "p_ready": (MBarKind.THREAD, 2),  # compute P -> mma (dV)   (BOTH compute wgs arrive)
-        "ds_ready": (MBarKind.THREAD, 2),  # compute dS -> mma (dK/dQ) (BOTH compute wgs arrive)
+        # compute P -> mma (dV) / compute dS -> mma (dK/dQ): every thread of
+        # BOTH compute warpgroups arrives once after its own row's r2t store.
+        "p_ready": (MBarKind.THREAD, 2 * WG_T),
+        "ds_ready": (MBarKind.THREAD, 2 * WG_T),
         "dv_done": (MBarKind.TCGEN05, 1),
         "dk_done": (MBarKind.TCGEN05, 1),
         "dq_done": (MBarKind.TCGEN05, 1),  # mma dQ -> reduce
-        "dq_free": (
-            MBarKind.THREAD,
-            1,
-        ),  # reduce -> mma: tdQ[mb] read done, mma may write tdP[mb+1]
+        # reduce -> mma: tdQ[mb] read done, mma may overwrite. Every reduce-wg
+        # thread arrives after its own row's t2r drained (count = 128).
+        "dq_free": (MBarKind.THREAD, WG_T),
         # NEW-3/F5: operand EMPTY barriers (per-stage) — the consumer arrives after its LAST
         # read of a stage; the load warp WAITS *_free[st] before reloading that stage. This
         # guards the load->consume WAR that makes n_mb>2 (stage reuse at mb and mb+2) correct.
-        # q_free/do_free: consumer = mma (single arrival). lse_free/dps_free: consumer = BOTH
-        # compute warpgroups (2 arrivals). Mirror of GDN k_free (gdn_prefill.py).
+        # q_free/do_free: consumer = the mma stream's single elected thread (one arrival).
+        # lse_free/dps_free: every thread of BOTH compute warpgroups arrives after its own
+        # sLSE/sdPsum reads (count = 256). Mirror of GDN k_free (gdn_prefill.py).
         "q_free": (MBarKind.THREAD, 1, NSTAGE),  # mma (last read = dK) -> load
         "do_free": (MBarKind.THREAD, 1, NSTAGE),  # mma (last read = dV) -> load
-        "lse_free": (MBarKind.THREAD, 2, NSTAGE),  # both compute wgs (P loop done) -> load
-        "dps_free": (MBarKind.THREAD, 2, NSTAGE),  # both compute wgs (dS loop done) -> load
+        "lse_free": (MBarKind.THREAD, 2 * WG_T, NSTAGE),  # both compute wgs -> load
+        "dps_free": (MBarKind.THREAD, 2 * WG_T, NSTAGE),  # both compute wgs -> load
     }
     if use_2cta:
         # Transposed-operand TMA barriers (NSTAGE stages — single-stage 2-CTA operands, so the
@@ -689,7 +706,8 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
         #   lands here (complete_tx of stage_copy_bytes); waited by the relay warp.
         # dS_cluster_leader (THREAD, count 2): relay (both CTAs) -> leader MMA; gates dQ.
         bar_spec["dS_cluster_full"] = (MBarKind.TMA, 1)
-        bar_spec["dS_cluster_leader"] = (MBarKind.THREAD, 2)  # both CTAs' relays arrive
+        # both CTAs' relay streams arrive (each a single elected thread): count=2.
+        bar_spec["dS_cluster_leader"] = (MBarKind.THREAD, 2)
         # dS_free (multi-Q-tile WAR): sdS_full is SINGLE-buffer — gdQ(mb-1) (the leader's cluster
         # dQ MMA) reads it as the A-operand, then compute(mb) overwrites it. flashattn's
         # pipeline_dS.consumer_release (the dQ MMA, flash_bwd_sm100.py:2541) releases the dS empty
@@ -704,20 +722,22 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
             # tS(mb) into registers BEFORE gdQ(mb-1) clobbers it. s_cons = "compute consumed S(mb)"
             # (arrived by both compute wgs right after the S t2r); the leader's gdQ(mb-1) waits
             # s_cons[mb] (local + peer — the cluster MMA writes both CTAs' tdQ over both CTAs' tS).
-            # count=2 = both compute wgs arrive. (hd192 is n_mb=1; 1-CTA has no S/dQ overlap.)
-            bar_spec["s_cons"] = (MBarKind.THREAD, 2)
+            # count = 2*WG_T: every thread of both compute wgs arrives after its own row's t2r.
+            # (hd192 is n_mb=1; 1-CTA has no S/dQ overlap.)
+            bar_spec["s_cons"] = (MBarKind.THREAD, 2 * WG_T)
         if is_hd192:
             # hd192 ONLY: S/dP overlap TMEM cols [384,448) (dedicated layout). The compute
             # warpgroups signal "S fully read into rmem" so the dP MMA may overwrite those
             # cols — flashattn's hd192 `pipeline_S_P.consumer_release` right after the S t2r
-            # (flash_bwd_sm100.py:3060-3065). count=2 = both compute wgs arrive.
-            bar_spec["s_free"] = (MBarKind.THREAD, 2)
+            # (flash_bwd_sm100.py:3060-3065). count = 2*WG_T: per-thread arrives, both wgs.
+            bar_spec["s_free"] = (MBarKind.THREAD, 2 * WG_T)
             # hd192 ONLY: sdS_xchg aliases sdQ (above). The reduce warp arrives after its
             # reduce-add drained sdQ (flash_bwd_sm100.py:3670); the exporting compute wg waits
-            # before overwriting the region with the NEXT block's dS export (3258-3262). count=1
-            # = the single reduce warpgroup arrives. Single-stage, phase keyed on _eph(mb) like
+            # before overwriting the region with the NEXT block's dS export (3258-3262).
+            # count = WG_T: every reduce-wg thread arrives (per-thread) behind the wg_sync
+            # that published thread-0's drain. Single-stage, phase keyed on _eph(mb) like
             # dq_free (the compute wg waits the PREVIOUS block's phase, cross-mb WAR).
-            bar_spec["dQaccum_empty"] = (MBarKind.THREAD, 1)
+            bar_spec["dQaccum_empty"] = (MBarKind.THREAD, WG_T)
     bars = {
         nm: k.mbar(kind=spec[0], stages=(spec[2] if len(spec) > 2 else 1))
         for nm, spec in bar_spec.items()
@@ -773,11 +793,24 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
     cta_in_cluster = k.ctaid_in_cluster() if use_2cta else 0
 
     with k.if_warp(0):
+        # tmem_alloc is warp-collective (full warp 0); mbarrier.init is
+        # per-thread, so exactly one elected thread runs every init (a
+        # warp-wide init would double-init each cell 32x).
         k.tmem_alloc(tmem_base, n_cols=N_COLS_TMEM, cta_group=cg)
-        for nm, spec in bar_spec.items():
-            stg = spec[2] if len(spec) > 2 else 1
-            for s in range(stg):
-                k.mbarrier_init(bars[nm], count=spec[1], stage=s)
+        with k.if_elected():
+            for nm, spec in bar_spec.items():
+                stg = spec[2] if len(spec) > 2 else 1
+                for s in range(stg):
+                    k.mbarrier_init(bars[nm], count=spec[1], stage=s)
+    # Publish the prologue (TMEM alloc + mbarrier cells) to every stream before
+    # any wait/arrive touches them — there is no implicit barrier between
+    # top-level statements. 2-CTA peers read each other's mbars (peer_bars /
+    # peer_free / the s2cluster's remote dS_cluster_full), so the publish must
+    # be cluster-wide there.
+    if use_2cta:
+        k.cluster_sync()
+    else:
+        k.cta_sync()
 
     def task_geom(task):
         # 1-CTA: `work` indexes (nb, head, batch) directly. 2-CTA: `work` indexes a
@@ -1078,7 +1111,10 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
             gemm(*args, accum=True, **kwargs)  # subsequent executed blocks -> accumulate
 
     # ============== load warp (13): TMA Q/K/V/dO + bulk LSE/dPsum ==============
-    with k.if_warp(LOAD_WARP):
+    # Single-thread TMA producer stream: mbarrier_arrive_expect_tx is per-thread
+    # (one arm per load) and tma_load is single-thread issue, so exactly one
+    # elected thread drives the whole pipeline (fa4 _emit_tma_load_role pattern).
+    with k.if_warp(LOAD_WARP), k.if_elected():
         with k.for_each_task(sched) as task:
             batch, head, nb = task_geom(task)
             # GQA: K/V are shared across the G q-heads of a group -> load from the kv-head
@@ -1310,7 +1346,10 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
     # mma_m = the M (kv) extent of S/dP/dV/dK: cluster-wide (256) under 2-CTA, else TILE_N.
     mma_m = cg * TILE_N
 
-    with k.if_warp(MMA_WARP):
+    # Single-thread MMA issuer stream: tcgen05_mma/tcgen05_commit are
+    # single-thread instructions and the *_free release arrives are per-thread
+    # (count=1 each), so one elected thread issues the whole GEMM pipeline.
+    with k.if_warp(MMA_WARP), k.if_elected():
         with k.for_each_task(sched) as task:
             batch, head, nb = task_geom(task)
             vg = varlen_geom(batch) if varlen else None  # VARLEN: per-seq runtime geometry
@@ -1756,14 +1795,16 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
                     # hd192: S fully read into rmem (wait_ld drained the t2r). Signal s_free so the
                     # dP MMA may overwrite S's overlapping cols [384,448) — flashattn issues this
                     # release RIGHT HERE (after the S t2r, before computing P; flash_bwd_sm100.py:
-                    # 3060-3065), much earlier than the general path's "after P write". Both compute
-                    # wgs arrive (count=2); the dP MMA (gdP) waits s_free.
+                    # 3060-3065), much earlier than the general path's "after P write". Every thread
+                    # of both compute wgs arrives after its own row's t2r (count=2*WG_T);
+                    # the dP MMA (gdP) waits s_free.
                     k.fence(kind=af, scope=FenceScope.CTA)
                     k.mbarrier_arrive(bars["s_free"])
                 elif use_2cta and n_mb > 1:
                     # general 2-CTA multi-Q-tile: S fully read into rmem (wait_ld drained the t2r).
                     # Signal s_cons so the leader's gdQ(mb-1) may overwrite tS(mb)'s S/dQ-overlap cols
-                    # ([64,128); tmem_dQ=64 over tmem_S=0). Both compute wgs arrive (count=2). The fence
+                    # ([64,128); tmem_dQ=64 over tmem_S=0). Every thread of both compute wgs arrives
+                    # after its own row's t2r (count=2*WG_T). The fence
                     # orders the t2r read before the arrive so the WAR has a happens-before witness.
                     k.fence(kind=af, scope=FenceScope.CTA)
                     k.mbarrier_arrive(bars["s_cons"])
@@ -1839,8 +1880,8 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
                     k.reg_fma(rt, _sl(fragS, (c,), (1,)), cscale, rnlse)
                     k.reg_unary(_sl(rP, (c,), (1,)), rt, op="exp2")
                     k.reg_cvt(_sl(fragP, (c,), (1,)), _sl(rP, (c,), (1,)))
-                # NEW-3/F5: this wg has read all its sLSE[st] cols -> free the stage (count=2,
-                # both wgs arrive; the load warp reloads sLSE[st] only after both wgs are done).
+                # NEW-3/F5: per-thread arrive after THIS thread's sLSE[st] reads (count=2*WG_T:
+                # all threads of both wgs; the load warp reloads sLSE[st] only after all are done).
                 k.mbarrier_arrive(bars["lse_free"], stage=st)
                 # (a0) S is fully read into registers (fence drains the t2r) — rendezvous BEFORE
                 # any wg writes P into tmem: P@S overlap means one wg writing P[col_base//2] would
@@ -1871,7 +1912,7 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
                     k.reg_sub(rt2, _sl(fragdP, (c,), (2,)), rdps2)  # (dP − dPsum) packed
                     k.reg_mul(rt2, _sl(rP, (c,), (2,)), rt2)  # P·(…) packed
                     k.reg_cvt(_sl(fragdS, (c,), (2,)), rt2)
-                # NEW-3/F5: this wg has read all its sdPsum[st] cols -> free the stage (count=2).
+                # NEW-3/F5: per-thread arrive after THIS thread's sdPsum[st] reads (count=2*WG_T).
                 k.mbarrier_arrive(bars["dps_free"], stage=st)
                 k.tcgen05_st(tdS, _sl(fragdS, (0,), (NCOL // 2,)), num=NCOL // 2, row=0, col=cbc)
                 k.tcgen05_wait_st()
@@ -2406,8 +2447,9 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
                                 )
                         if is_hd192:
                             # hd192: sdQ fully drained — free the aliased region for the next block's dS
-                            # export (flash_bwd_sm100.py:3670). Warp-uniform arrive (the wg_sync makes
-                            # thread-0's drain visible to the cohort first).
+                            # export (flash_bwd_sm100.py:3670). Per-thread arrive from every reduce-wg
+                            # thread (count=WG_T), each behind the wg_sync that published thread-0's
+                            # drain to the cohort.
                             k.wg_sync(barrier_id=1)
                             k.mbarrier_arrive(bars["dQaccum_empty"])
                         continue
@@ -2507,11 +2549,11 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
 
     # relay (14): idle in 1-CTA. 2-CTA — ACTIVE (map §1, source relay() @1630-1672): per
     # m-iter it waits dS_cluster_full (the peer's s2cluster dS half landed in OUR sdS_full)
-    # then elect_one -> mbarrier_arrive(dS_cluster_leader on the LEADER, remote_coord=0) to
-    # release the leader MMA's dQ GEMM. Runs on BOTH CTAs: each CTA's relay arrives the
-    # leader's (cluster coord 0) dS_cluster_leader (count 2 -> both arrivals release the dQ
-    # GEMM). empty (15): reg donor, idle.
-    with k.if_warp(RELAY_WARP):
+    # then arrives dS_cluster_leader on the LEADER (remote_coord=0) to release the leader
+    # MMA's dQ GEMM. Single-thread stream (mbarrier wait/arrive are per-thread): one elected
+    # thread per CTA's relay warp, so both CTAs contribute exactly one arrival each
+    # (dS_cluster_leader count=2). empty (15): reg donor, idle.
+    with k.if_warp(RELAY_WARP), k.if_elected():
         with k.for_each_task(sched) as task:
             if use_2cta:
                 # VARLEN: the relay's dS_cluster_full wait + dS_cluster_leader arrive must stay
@@ -2528,17 +2570,22 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
                 for mb in range(n_mb):
                     with _skip(mb, _mmin, _vg, _nb, cluster=True):
                         # wait our half landed (peer's s2cluster -> dS_cluster_full), then release
-                        # the leader's dQ GEMM. The arrive is WARP-UNIFORM (one per relay warp = one
-                        # per CTA; both CTAs' relays target the LEADER's barrier via remote_coord=0
-                        # -> count 2). NB: mbarrier_arrive must NOT be tid-guarded — barrier ops are
-                        # warp-cohort-uniform; a tid==0 guard makes the cohort diverge and the arrive
-                        # never lands (deadlock).
+                        # the leader's dQ GEMM. The relay stream is the single elected thread, so
+                        # this arrive is exactly ONE per CTA; both CTAs' relays target the LEADER's
+                        # barrier via remote_coord=0 -> count 2.
                         k.mbarrier_wait(bars["dS_cluster_full"], phase=mb % 2)
                         k.mbarrier_arrive(k.mbar_ref(bars["dS_cluster_leader"], remote_coord=0))
     with k.if_warp(EMPTY_WARP):
         with k.for_each_task(sched) as task:
             pass
 
+    # Teardown: every stream's pipeline work happens-before the dealloc
+    # (cluster-wide under 2-CTA — peer mbars/TMEM are still live until both
+    # CTAs drain).
+    if use_2cta:
+        k.cluster_sync()
+    else:
+        k.cta_sync()
     with k.if_warp(0):
         k.tmem_dealloc(tmem_base, n_cols=N_COLS_TMEM, cta_group=cg)
     return k.build()
