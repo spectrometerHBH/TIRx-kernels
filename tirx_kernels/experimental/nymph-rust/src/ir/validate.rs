@@ -8,7 +8,7 @@
 //! fire when you call `validate()` rather than at each `__post_init__`.
 
 use super::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 /// An IR validation error (mirrors Python's `ValueError`/`TypeError` messages).
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -30,14 +30,6 @@ fn bail(msg: impl Into<String>) -> R {
     Err(err(msg))
 }
 
-/// Execution scope tracked by the context walk.
-#[derive(Clone, Copy, PartialEq)]
-enum Scope {
-    Cta,
-    Warpgroup,
-    Warp,
-    Single,
-}
 
 // ---------------------------------------------------------------------------
 // small leaf helpers (mirror the `_check_*` functions)
@@ -1351,25 +1343,60 @@ fn define_var(var: Var, defined: &mut HashSet<Var>) -> R {
     Ok(())
 }
 
-fn nested_scope_init(warp: Option<u32>, lane: Option<u32>, elected: bool) -> Scope {
-    if elected || lane.is_some() {
-        Scope::Single
-    } else if warp.is_some() {
-        Scope::Warp
-    } else {
-        Scope::Cta
-    }
+/// The threads a `KernelInit`/`KernelFinalize` mask selects (mirrors the
+/// scheduler's `kernel_scope_matches`). Interim until the variants are
+/// deleted — role dispatch is becoming plain `If`.
+fn init_thread_set(
+    warp: Option<u32>,
+    lane: Option<u32>,
+    elected: bool,
+    num_warps: u32,
+) -> ThreadSet {
+    ThreadSet::from_fn(num_warps, |w, l| {
+        if let Some(sel) = warp {
+            if w != sel {
+                return false;
+            }
+        }
+        if let Some(sel) = lane {
+            return l == sel && (warp.is_some() || w == 0);
+        }
+        if elected {
+            return l == 0 && (warp.is_some() || w == 0);
+        }
+        true
+    })
 }
-fn nested_scope_role(warp: Option<u32>, warpgroup: Option<u32>, elected: bool) -> Scope {
-    if elected {
-        Scope::Single
-    } else if warpgroup.is_some() {
-        Scope::Warpgroup
-    } else if warp.is_some() {
-        Scope::Warp
-    } else {
-        Scope::Cta
-    }
+
+/// The threads a `Role` mask selects (mirrors the scheduler's `role_matches`).
+fn role_thread_set(
+    warp: Option<u32>,
+    warpgroup: Option<u32>,
+    elected: bool,
+    num_warps: u32,
+) -> ThreadSet {
+    ThreadSet::from_fn(num_warps, |w, l| {
+        if let Some(sel) = warp {
+            if w != sel {
+                return false;
+            }
+        }
+        if let Some(sel) = warpgroup {
+            if w / 4 != sel {
+                return false;
+            }
+        }
+        if !elected {
+            return true;
+        }
+        if warp.is_some() {
+            return l == 0;
+        }
+        if warpgroup.is_some() {
+            return w % 4 == 0 && l == 0;
+        }
+        w == 0 && l == 0
+    })
 }
 
 fn check_role_geometry(
@@ -1393,45 +1420,73 @@ fn check_role_geometry(
     Ok(())
 }
 
-/// Walks 1 (var-defs) + 2 (scope rules), threading the defined-set, current scope,
-/// and per-role wg_sync barrier ownership. `role_token` identifies the enclosing
-/// role-like body (a counter); `next_token` hands out fresh ones.
-#[allow(clippy::too_many_arguments)]
+/// Walks 1 (var-defs) + 2 (thread-shape rules), threading the defined-set and
+/// the static thread filter of the enclosing branch chain.
+///
+/// Shape rules fire only when the filter is `Known` — a branch on a runtime
+/// value makes the reachable thread set indeterminate, and the runtime
+/// semantics (rendezvous accounting, issue gates) own the check there. The
+/// exceptions are ops with NO runtime backstop (`SetMaxNReg` is sim metadata;
+/// a multi-warp `SchedNext` silently work-steals instead of failing): those
+/// require a statically-resolvable branch.
 fn check_context(
     body: &[Stmt],
-    scope: Scope,
-    role_token: Option<u32>,
-    barriers: &mut HashMap<u32, u32>,
+    filter: &ThreadFilter,
     defined: &mut HashSet<Var>,
     num_warps: u32,
-    next_token: &mut u32,
     in_scheduler_impl: bool,
     scheduler_loop_depth: usize,
-    inside_role: bool,
 ) -> R {
     for stmt in body {
         match stmt {
-            Stmt::CtaSync if inside_role => return bail("cta_sync cannot be used inside role"),
-            Stmt::CtaSync if scope != Scope::Cta => return bail("cta_sync must be in CTA scope"),
-            Stmt::ClusterSync if scope != Scope::Cta => {
-                return bail("cluster_sync must be in CTA scope")
-            }
-            Stmt::WgSync { barrier_id } => {
-                if scope != Scope::Warpgroup {
-                    return bail("wg_sync must be in warpgroup scope");
+            Stmt::CtaSync | Stmt::ClusterSync => {
+                if let Some(set) = filter.known() {
+                    if !set.is_full_cta() {
+                        let name = if matches!(stmt, Stmt::CtaSync) {
+                            "cta_sync"
+                        } else {
+                            "cluster_sync"
+                        };
+                        return bail(format!(
+                            "{name} must be reachable by every thread of the CTA"
+                        ));
+                    }
                 }
-                let token = role_token.ok_or_else(|| err("wg_sync must be in a role"))?;
-                let owner = *barriers.entry(*barrier_id).or_insert(token);
-                if owner != token {
-                    return bail("wg_sync barrier_id cannot be shared across roles");
+            }
+            Stmt::WgSync { .. } => {
+                if let Some(set) = filter.known() {
+                    if set.is_exactly_one_full_warpgroup().is_none() {
+                        return bail("wg_sync must cover exactly one full warpgroup");
+                    }
                 }
             }
-            Stmt::WarpSync if scope == Scope::Single => {
-                return bail("warp_sync cannot be in single-thread scope");
+            Stmt::WarpSync => {
+                if let Some(set) = filter.known() {
+                    let touched = set.warps_touched();
+                    if touched.is_empty() || !touched.iter().all(|&w| set.is_full_warp(w)) {
+                        return bail(
+                            "warp_sync must cover whole warps (a sub-warp barrier deadlocks)",
+                        );
+                    }
+                }
             }
-            Stmt::TmemAlloc { .. } | Stmt::TmemDealloc { .. } if scope != Scope::Warp => {
-                return bail("tmem alloc/dealloc must be in warp scope");
+            Stmt::TmemAlloc { .. } | Stmt::TmemDealloc { .. } => {
+                if let Some(set) = filter.known() {
+                    if set.is_exactly_one_full_warp().is_none() {
+                        return bail("tmem alloc/dealloc must be issued by exactly one full warp");
+                    }
+                }
             }
+            Stmt::SetMaxNReg { .. } => match filter.known() {
+                None => {
+                    return bail("setmaxnreg requires a statically-resolvable thread branch");
+                }
+                Some(set) => {
+                    if !set.is_union_of_full_warpgroups() {
+                        return bail("setmaxnreg must cover whole warpgroup(s)");
+                    }
+                }
+            },
             _ => {}
         }
         match stmt {
@@ -1492,67 +1547,57 @@ fn check_context(
                 define_var(*var, defined)?;
                 check_context(
                     body,
-                    scope,
-                    role_token,
-                    barriers,
+                    filter,
                     defined,
                     num_warps,
-                    next_token,
                     in_scheduler_impl,
                     scheduler_loop_depth,
-                    inside_role,
                 )?;
             }
             Stmt::ForEachTask { var, body, .. } => {
                 define_var(*var, defined)?;
                 check_context(
                     body,
-                    scope,
-                    role_token,
-                    barriers,
+                    filter,
                     defined,
                     num_warps,
-                    next_token,
                     in_scheduler_impl,
                     scheduler_loop_depth,
-                    inside_role,
                 )?;
             }
             Stmt::SchedulerImpl { body, .. } => {
-                check_context(
-                    body,
-                    scope,
-                    role_token,
-                    barriers,
-                    defined,
-                    num_warps,
-                    next_token,
-                    true,
-                    0,
-                    inside_role,
-                )?;
+                check_context(body, filter, defined, num_warps, true, 0)?;
             }
             Stmt::SchedNext { var, .. } => {
                 if !in_scheduler_impl {
                     return bail("sched_next must be inside scheduler_impl");
                 }
+                // A sched_next reachable by more than one warp hands each warp
+                // a DIFFERENT task (shared cursor) with no diagnostic — the
+                // sim cannot catch it, so the branch must be statically known.
+                match filter.known() {
+                    None => {
+                        return bail("sched_next requires a statically-resolvable thread branch");
+                    }
+                    Some(set) => {
+                        if set.warps_touched().len() > 1 {
+                            return bail(
+                                "sched_next must be confined to a single warp (each warp \
+                                 advancing the shared cursor takes a different task)",
+                            );
+                        }
+                    }
+                }
                 define_var(*var, defined)?;
             }
             Stmt::Loop { body } => {
-                if !in_scheduler_impl && scope == Scope::Cta {
-                    return bail("loop must be inside scheduler_impl or role scope");
-                }
                 check_context(
                     body,
-                    scope,
-                    role_token,
-                    barriers,
+                    filter,
                     defined,
                     num_warps,
-                    next_token,
                     in_scheduler_impl,
                     scheduler_loop_depth + 1,
-                    inside_role,
                 )?;
             }
             Stmt::BreakIf { cond } => {
@@ -1568,43 +1613,22 @@ fn check_context(
                 warp,
                 lane,
                 elected,
-            } => {
-                check_role_geometry(*warp, None, num_warps, false)?;
-                let token = *next_token;
-                *next_token += 1;
-                check_context(
-                    body,
-                    nested_scope_init(*warp, *lane, *elected),
-                    Some(token),
-                    barriers,
-                    defined,
-                    num_warps,
-                    next_token,
-                    in_scheduler_impl,
-                    scheduler_loop_depth,
-                    false,
-                )?;
             }
-            Stmt::KernelFinalize {
+            | Stmt::KernelFinalize {
                 body,
                 warp,
                 lane,
                 elected,
             } => {
                 check_role_geometry(*warp, None, num_warps, false)?;
-                let token = *next_token;
-                *next_token += 1;
+                let inner = narrow(filter, &init_thread_set(*warp, *lane, *elected, num_warps));
                 check_context(
                     body,
-                    nested_scope_init(*warp, *lane, *elected),
-                    Some(token),
-                    barriers,
+                    &inner,
                     defined,
                     num_warps,
-                    next_token,
                     in_scheduler_impl,
                     scheduler_loop_depth,
-                    false,
                 )?;
             }
             Stmt::Role {
@@ -1615,42 +1639,50 @@ fn check_context(
                 ..
             } => {
                 check_role_geometry(*warp, *warpgroup, num_warps, true)?;
-                let token = *next_token;
-                *next_token += 1;
+                let inner = narrow(
+                    filter,
+                    &role_thread_set(*warp, *warpgroup, *elected, num_warps),
+                );
                 check_context(
                     body,
-                    nested_scope_role(*warp, *warpgroup, *elected),
-                    Some(token),
-                    barriers,
+                    &inner,
                     defined,
                     num_warps,
-                    next_token,
                     in_scheduler_impl,
                     scheduler_loop_depth,
-                    true,
                 )?;
             }
             Stmt::If { cond, then_body } => {
                 let mut vars = Vec::new();
                 collect_vars(cond, &mut vars);
                 require_defined(&vars, defined, "if condition")?;
+                let inner = match static_thread_filter(cond, num_warps) {
+                    ThreadFilter::Known(set) => narrow(filter, &set),
+                    ThreadFilter::Unknown => ThreadFilter::Unknown,
+                };
                 check_context(
                     then_body,
-                    scope,
-                    role_token,
-                    barriers,
+                    &inner,
                     defined,
                     num_warps,
-                    next_token,
                     in_scheduler_impl,
                     scheduler_loop_depth,
-                    inside_role,
                 )?;
             }
             _ => {}
         }
     }
     Ok(())
+}
+
+/// Intersect the enclosing filter with a statically-known branch set. An
+/// Unknown enclosing filter stays Unknown: the true set is SOME subset of the
+/// branch set, which is not enough for the exact-shape rules above.
+fn narrow(outer: &ThreadFilter, branch: &ThreadSet) -> ThreadFilter {
+    match outer {
+        ThreadFilter::Known(set) => ThreadFilter::Known(set.intersect(branch)),
+        ThreadFilter::Unknown => ThreadFilter::Unknown,
+    }
 }
 
 /// Walk 3: `_check_tcgen05_cta_group_consistency`.
@@ -1863,19 +1895,13 @@ impl Kernel {
         }
         check_smem_pool_bounds(self)?;
         let mut defined = HashSet::new();
-        let mut barriers = HashMap::new();
-        let mut next_token = 0u32;
         check_context(
             &self.body,
-            Scope::Cta,
-            None,
-            &mut barriers,
+            &ThreadFilter::Known(ThreadSet::full(self.num_warps)),
             &mut defined,
             self.num_warps,
-            &mut next_token,
             false,
             0,
-            false,
         )?;
         check_cta_group_consistency(&self.body)?;
         Ok(())

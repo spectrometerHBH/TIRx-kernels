@@ -2,9 +2,14 @@ from helpers import builder, cta_eq, expect_runtime_error, run
 
 
 def test_sync_partial_arrival_and_cluster_peer_exit_fail_closed():
+    # The sub-warp predicate goes through a runtime scalar so the static
+    # thread-filter rule stands down (statically sub-warp warp_sync is
+    # rejected at validation — covered in test_validation) and the RUNTIME
+    # deadlock path stays exercised.
     b = builder("partial_warp_sync")
     with b.role(warp=0):
-        with b.if_(b.lane_id() < 16):
+        half = b.scalar(initial=16)
+        with b.if_(b.lane_id() < half):
             b.warp_sync()
 
     with expect_runtime_error("deadlock"):

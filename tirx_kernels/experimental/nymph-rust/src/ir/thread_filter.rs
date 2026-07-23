@@ -38,6 +38,17 @@ impl ThreadSet {
         }
     }
 
+    /// Build a set from a per-(warp, lane) predicate.
+    pub fn from_fn(num_warps: u32, f: impl Fn(u32, u32) -> bool) -> ThreadSet {
+        let mut bits = vec![false; (num_warps * 32) as usize];
+        for warp in 0..num_warps {
+            for lane in 0..32 {
+                bits[(warp * 32 + lane) as usize] = f(warp, lane);
+            }
+        }
+        ThreadSet { num_warps, bits }
+    }
+
     pub fn num_warps(&self) -> u32 {
         self.num_warps
     }

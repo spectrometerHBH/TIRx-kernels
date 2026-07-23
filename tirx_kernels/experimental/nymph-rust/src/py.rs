@@ -1733,9 +1733,10 @@ impl PyStmt {
             | ir::Stmt::Loop { body }
             | ir::Stmt::Role { body, .. }
             | ir::Stmt::KernelInit { body, .. }
-            | ir::Stmt::KernelFinalize { body, .. } => {
-                Ok(body.iter().map(|s| PyStmt(s.clone())).collect())
-            }
+            | ir::Stmt::KernelFinalize { body, .. }
+            | ir::Stmt::If {
+                then_body: body, ..
+            } => Ok(body.iter().map(|s| PyStmt(s.clone())).collect()),
             _ => Err(PyAttributeError::new_err("body")),
         }
     }

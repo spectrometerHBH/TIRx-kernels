@@ -271,19 +271,51 @@ def test_rejects_wg_sync_bad_barrier_id():
         make([n.WgSync(barrier_id=99)])
 
 
-def test_rejects_cta_sync_in_warp_scope():
-    with pytest.raises(ValueError, match="cta_sync must be in CTA scope"):
+def test_rejects_cta_sync_in_partial_branch():
+    # cta_sync reached by only warp 0 can never complete on hardware.
+    with pytest.raises(ValueError, match="every thread of the CTA"):
         make([n.KernelInit(body=(n.CtaSync(),), warp=0)])
+    with pytest.raises(ValueError, match="every thread of the CTA"):
+        make([n.Role(body=(n.CtaSync(),), warpgroup=0)], num_warps=8)
 
 
-def test_rejects_cta_sync_inside_role():
-    with pytest.raises(ValueError, match="cta_sync cannot be used inside role"):
-        make([n.Role(body=(n.CtaSync(),))])
+def test_accepts_cta_sync_in_full_cta_branch():
+    # A bare full-CTA branch (old: banned "inside role") is exactly the shape
+    # the per-warp model wants: reachability, not nesting, is what matters.
+    make([n.Role(body=(n.CtaSync(),))])
 
 
-def test_rejects_tmem_alloc_outside_warp_scope():
-    with pytest.raises(ValueError, match="must be in warp scope"):
-        make([n.TmemAlloc(tmem([128, 256]), n_cols=64)])  # at CTA scope
+def test_rejects_tmem_alloc_outside_single_warp():
+    with pytest.raises(ValueError, match="exactly one full warp"):
+        make([n.TmemAlloc(tmem([128, 256]), n_cols=64)])  # full-CTA branch
+
+
+def test_rejects_wg_sync_not_covering_full_warpgroup():
+    cond = n.ScopeValue(kind="warp_id").eq(0)
+    with pytest.raises(ValueError, match="exactly one full warpgroup"):
+        make([n.If(cond=cond, then_body=(n.WgSync(barrier_id=1),))], num_warps=8)
+
+
+def test_accepts_wg_sync_in_full_warpgroup_branch():
+    cond = n.ScopeValue(kind="warpgroup_id").eq(1)
+    make([n.If(cond=cond, then_body=(n.WgSync(barrier_id=1),))], num_warps=8)
+
+
+def test_rejects_warp_sync_in_subwarp_branch():
+    cond = n.ScopeValue(kind="lane_id").eq(0)
+    with pytest.raises(ValueError, match="whole warps"):
+        make([n.If(cond=cond, then_body=(n.WarpSync(),))])
+
+
+def test_dynamic_branch_skips_static_sync_rules():
+    # A runtime-valued predicate makes the thread set indeterminate; the
+    # static shape rules stand down (runtime rendezvous owns the check).
+    v = n.Var(binding=n.VarBinding.SCALAR, dtype=n.ScalarDType.U32)
+    body = (
+        n.ScalarDef(var=v, initial=0),
+        n.If(cond=n.ScopeValue(kind="warp_id").eq(v), then_body=(n.WgSync(barrier_id=1),)),
+    )
+    make(body, num_warps=8)
 
 
 # ---- tcgen05 ld/st ---------------------------------------------------------
@@ -387,6 +419,12 @@ def test_setmaxnreg_requires_positive_multiple_of_8():
         make([n.SetMaxNReg(nreg=100)])
     with pytest.raises(ValueError, match="positive multiple of 8"):
         make([n.SetMaxNReg(nreg=0)])
+
+
+def test_setmaxnreg_requires_whole_warpgroups():
+    cond = n.ScopeValue(kind="warp_id").eq(0)
+    with pytest.raises(ValueError, match="whole warpgroup"):
+        make([n.If(cond=cond, then_body=(n.SetMaxNReg(nreg=232),))], num_warps=8)
 
 
 def test_rejects_loop_nonpositive_step():

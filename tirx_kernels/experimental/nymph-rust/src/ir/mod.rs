@@ -184,8 +184,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_cta_sync_in_warp_scope() {
-        // cta_sync inside a warp-scope init block -> scope walk fails.
+    fn rejects_cta_sync_in_partial_branch() {
+        // cta_sync reachable by only warp 0 can never complete on hardware.
         let body = vec![Stmt::KernelInit {
             body: vec![Stmt::CtaSync],
             warp: Some(0),
@@ -194,14 +194,15 @@ mod tests {
         }];
         let e = kernel(body, 4).validate().unwrap_err();
         assert!(
-            e.message.contains("cta_sync must be in CTA scope"),
+            e.message.contains("every thread of the CTA"),
             "{}",
             e.message
         );
     }
 
     #[test]
-    fn rejects_cta_sync_inside_role() {
+    fn accepts_cta_sync_in_full_cta_branch() {
+        // A bare full-CTA branch: reachability, not nesting, is what matters.
         let body = vec![Stmt::Role {
             body: vec![Stmt::CtaSync],
             warp: None,
@@ -209,11 +210,6 @@ mod tests {
             elected: false,
             maxnreg: None,
         }];
-        let e = kernel(body, 4).validate().unwrap_err();
-        assert!(
-            e.message.contains("cta_sync cannot be used inside role"),
-            "{}",
-            e.message
-        );
+        kernel(body, 4).validate().unwrap();
     }
 }
