@@ -53,14 +53,17 @@ COMBINE_LAUNCH_TAGS = (
     "threadIdx.x",
     "tirx.use_programtic_dependent_launch",
 )
-NULLABLE_MAIN_BUFFER_PARAMS = (
+MAIN_OPTIONAL_BUFFER_PARAMS = (
     "topk_length_h",
     "attn_sink_h",
     "extra_kv_h",
     "extra_indices_h",
     "extra_topk_length_h",
 )
-NULLABLE_COMBINE_BUFFER_PARAMS = ("attn_sink_h",)
+COMBINE_OPTIONAL_BUFFER_PARAMS = ("attn_sink_h",)
+MainPresenceMask = tuple[bool, bool, bool, bool, bool]
+MAIN_OPTIONAL_ARG_INDICES = (3, 4, 11, 12, 13)
+COMBINE_OPTIONAL_ARG_INDICES = (5,)
 _TMA_PREFETCH_SEQUENCE = "flashmla_q_sw128,flashmla_o,flashmla_q_sw64"
 
 _mma_config = partial(tcgen05_config, cta_group=1)
@@ -1364,17 +1367,17 @@ def _make_sparse_decode_head64_kernel(model_type: ModelType):
         q_h: T.handle,
         kv_h: T.handle,
         indices_h: T.handle,
-        topk_length_h: T.handle,
-        attn_sink_h: T.handle,
+        topk_length_h: T.Optional(T.handle),
+        attn_sink_h: T.Optional(T.handle),
         lse_h: T.handle,
         out_h: T.handle,
         lse_accum_h: T.handle,
         o_accum_h: T.handle,
         tile_scheduler_metadata_h: T.handle,
         num_splits_h: T.handle,
-        extra_kv_h: T.handle,
-        extra_indices_h: T.handle,
-        extra_topk_length_h: T.handle,
+        extra_kv_h: T.Optional(T.handle),
+        extra_indices_h: T.Optional(T.handle),
+        extra_topk_length_h: T.Optional(T.handle),
         tensor_map_kv_nope: T.TensorMap(),
         tensor_map_kv_rope: T.TensorMap(),
         tensor_map_extra_kv_nope: T.TensorMap(),
@@ -1411,10 +1414,10 @@ def _make_sparse_decode_head64_kernel(model_type: ModelType):
         extra_page_block_size: T.int32,
         num_sm_parts: T.int32,
     ):
-        # params.h:71-99.  Optional tensors stay nullable runtime handles, and
-        # every source stride remains a runtime kernel operand.  The views are
-        # descriptor/addressing views over the caller's storage, not packed
-        # substitutes.
+        # params.h:71-99.  Optional tensor presence is specialized before FFI,
+        # while every source stride remains a runtime kernel operand.  The
+        # views are descriptor/addressing views over the caller's storage, not
+        # packed substitutes.
         q = T.match_buffer(
             q_h,
             ((b - 1) * stride_q_b + (s_q - 1) * stride_q_s_q + (B_H - 1) * stride_q_h_q + d_qk,),
@@ -1428,8 +1431,10 @@ def _make_sparse_decode_head64_kernel(model_type: ModelType):
             "int32",
             scope="global",
         )
-        topk_length = T.match_buffer(topk_length_h, (b,), "int32", scope="global")
-        attn_sink = T.match_buffer(attn_sink_h, (B_H,), "float32", scope="global")
+        if topk_length_h is not None:
+            topk_length = T.match_buffer(topk_length_h, (b,), "int32", scope="global")
+        if attn_sink_h is not None:
+            attn_sink = T.match_buffer(attn_sink_h, (B_H,), "float32", scope="global")
         lse = T.match_buffer(
             lse_h,
             ((b - 1) * stride_lse_b + (s_q - 1) * stride_lse_s_q + B_H,),
@@ -1467,16 +1472,23 @@ def _make_sparse_decode_head64_kernel(model_type: ModelType):
             tile_scheduler_metadata_h, (num_sm_parts, 8), "int32", scope="global"
         )
         num_splits = T.match_buffer(num_splits_h, (b + 1,), "int32", scope="global")
-        extra_kv = T.match_buffer(
-            extra_kv_h, (extra_num_blocks * stride_extra_kv_block,), "uint8", scope="global"
-        )
-        extra_indices = T.match_buffer(
-            extra_indices_h,
-            ((b - 1) * stride_extra_indices_b + (s_q - 1) * stride_extra_indices_s_q + extra_topk,),
-            "int32",
-            scope="global",
-        )
-        extra_topk_length = T.match_buffer(extra_topk_length_h, (b,), "int32", scope="global")
+        if extra_kv_h is not None:
+            extra_kv = T.match_buffer(
+                extra_kv_h, (extra_num_blocks * stride_extra_kv_block,), "uint8", scope="global"
+            )
+        if extra_indices_h is not None:
+            extra_indices = T.match_buffer(
+                extra_indices_h,
+                (
+                    (b - 1) * stride_extra_indices_b
+                    + (s_q - 1) * stride_extra_indices_s_q
+                    + extra_topk,
+                ),
+                "int32",
+                scope="global",
+            )
+        if extra_topk_length_h is not None:
+            extra_topk_length = T.match_buffer(extra_topk_length_h, (b,), "int32", scope="global")
 
         T.device_entry()
         T.attr(
@@ -1651,7 +1663,7 @@ def _make_sparse_decode_head64_kernel(model_type: ModelType):
             o_smem_win = o_smem.rearrange("h (a b c) -> (b h) (a c)", a=2, b=2, c=128)
             scale_pair: T.let = T.cuda.make_float2(sm_scale_div_log2, sm_scale_div_log2)
             attn_sink_log2: T.float32 = T.float32(-float("inf"))
-            if not T.isnullptr(attn_sink_h):
+            if attn_sink_h is not None:
                 attn_sink_log2 = (
                     T.cuda.ldg(attn_sink.ptr_to([idx_in_warpgroup % B_H]), "float32") * LOG_2_E
                 )
@@ -1675,13 +1687,13 @@ def _make_sparse_decode_head64_kernel(model_type: ModelType):
             if sched_begin_req < b:
                 for batch_idx in T.serial(sched_begin_req, sched_end_req + 1, unroll=False):
                     topk_len: T.int32 = topk
-                    if not T.isnullptr(topk_length_h):
+                    if topk_length_h is not None:
                         topk_len = T.cuda.ldg(topk_length.ptr_to([batch_idx]), "int32")
                     orig_topk_padded: T.let = T.max(
                         ((topk_len + B_TOPK - 1) // B_TOPK) * B_TOPK, B_TOPK
                     )
                     extra_topk_len: T.int32 = extra_topk
-                    if not T.isnullptr(extra_topk_length_h):
+                    if extra_topk_length_h is not None:
                         extra_topk_len = T.cuda.ldg(extra_topk_length.ptr_to([batch_idx]), "int32")
                     total_topk_padded: T.let = (
                         orig_topk_padded + ((extra_topk_len + B_TOPK - 1) // B_TOPK) * B_TOPK
@@ -2027,12 +2039,17 @@ def _make_sparse_decode_head64_kernel(model_type: ModelType):
                             [d_nope if model_is_v32 else page_block_size * (d_nope + 2 * 64)]
                         ),
                     )
-                    extra_k_scales_ptr_u64 = T.reinterpret(
-                        "uint64",
-                        extra_kv.ptr_to(
-                            [d_nope if model_is_v32 else extra_page_block_size * (d_nope + 2 * 64)]
-                        ),
-                    )
+                    if extra_kv_h is not None:
+                        extra_k_scales_ptr_u64 = T.reinterpret(
+                            "uint64",
+                            extra_kv.ptr_to(
+                                [
+                                    d_nope
+                                    if model_is_v32
+                                    else extra_page_block_size * (d_nope + 2 * 64)
+                                ]
+                            ),
+                        )
                 # kernel.cuh:77-118, expanded once for all WG1 threads.  Non-elected
                 # lanes still execute the empty role and participate in the 384-way
                 # per-batch named barrier, matching the CUDA else branch at 744.
@@ -2052,13 +2069,13 @@ def _make_sparse_decode_head64_kernel(model_type: ModelType):
                 if sched_begin_req < b:
                     for batch_idx in T.serial(sched_begin_req, sched_end_req + 1, unroll=False):
                         topk_len: T.int32 = topk
-                        if not T.isnullptr(topk_length_h):
+                        if topk_length_h is not None:
                             topk_len = T.cuda.ldg(topk_length.ptr_to([batch_idx]), "int32")
                         orig_topk_padded: T.let = T.max(
                             ((topk_len + B_TOPK - 1) // B_TOPK) * B_TOPK, B_TOPK
                         )
                         extra_topk_len: T.int32 = extra_topk
-                        if not T.isnullptr(extra_topk_length_h):
+                        if extra_topk_length_h is not None:
                             extra_topk_len = T.cuda.ldg(
                                 extra_topk_length.ptr_to([batch_idx]), "int32"
                             )
@@ -2542,10 +2559,11 @@ def _make_sparse_decode_head64_kernel(model_type: ModelType):
                                 start_block, T.min(num_orig_blocks, end_block), unroll=False
                             ):
                                 process_index_block(block_idx, False)
-                            for block_idx in T.serial(
-                                T.max(start_block, num_orig_blocks), end_block, unroll=False
-                            ):
-                                process_index_block(block_idx, True)
+                            if extra_kv_h is not None and extra_indices_h is not None:
+                                for block_idx in T.serial(
+                                    T.max(start_block, num_orig_blocks), end_block, unroll=False
+                                ):
+                                    process_index_block(block_idx, True)
 
                         T.ptx.barrier.sync(BAR_EVERYONE_SYNC, NUM_THREADS)
                         batch_bar_phase = batch_bar_phase ^ 1
@@ -2621,13 +2639,13 @@ def _make_sparse_decode_head64_kernel(model_type: ModelType):
             if sched_begin_req < b:
                 for batch_idx in T.serial(sched_begin_req, sched_end_req + 1, unroll=False):
                     topk_len: T.int32 = topk
-                    if not T.isnullptr(topk_length_h):
+                    if topk_length_h is not None:
                         topk_len = T.cuda.ldg(topk_length.ptr_to([batch_idx]), "int32")
                     orig_topk_padded: T.let = T.max(
                         ((topk_len + B_TOPK - 1) // B_TOPK) * B_TOPK, B_TOPK
                     )
                     extra_topk_len: T.int32 = extra_topk
-                    if not T.isnullptr(extra_topk_length_h):
+                    if extra_topk_length_h is not None:
                         extra_topk_len = T.cuda.ldg(extra_topk_length.ptr_to([batch_idx]), "int32")
                     total_topk_padded: T.let = (
                         orig_topk_padded + ((extra_topk_len + B_TOPK - 1) // B_TOPK) * B_TOPK
@@ -2767,7 +2785,7 @@ def _sparse_decode_head64_combine_kernel(
     lse_accum_h: T.handle,
     o_accum_h: T.handle,
     num_splits_h: T.handle,
-    attn_sink_h: T.handle,
+    attn_sink_h: T.Optional(T.handle),
     stride_lse_b: T.int32,
     stride_lse_s_q: T.int32,
     stride_o_b: T.int32,
@@ -2795,7 +2813,8 @@ def _sparse_decode_head64_combine_kernel(
         o_accum_h, ((b + num_sm_parts) * s_q * h_q * d_v,), "float32", scope="global"
     )
     num_splits = T.match_buffer(num_splits_h, (b + 1,), "int32", scope="global")
-    attn_sink = T.match_buffer(attn_sink_h, (h_q,), "float32", scope="global")
+    if attn_sink_h is not None:
+        attn_sink = T.match_buffer(attn_sink_h, (h_q,), "float32", scope="global")
     T.device_entry()
     # combine.cu:18-43.  Keep one warp per head, eight heads per CTA, the
     # early no-split return, and the MAX_SPLITS bucket selected by the host.
@@ -2898,7 +2917,7 @@ def _sparse_decode_head64_combine_kernel(
     if lane_idx == 0:
         g_lse[warp_idx] = global_lse / T.float32(LOG_2_E)
 
-    if not T.isnullptr(attn_sink_h):
+    if attn_sink_h is not None:
         sink: T.let = T.cuda.ldg(attn_sink.ptr_to([head_idx]), "float32")
         if global_lse != T.float32(float("inf")):
             global_lse = global_lse + T.log2(1.0 + T.ptx.exp2(sink * LOG_2_E - global_lse))
@@ -3005,19 +3024,52 @@ def _kernel_shape_params(
     }
 
 
-@lru_cache(maxsize=10)
-def _specialized_decode_kernels(model_type: ModelType, max_splits: int):
-    main = (
+def _main_presence_mask(cfg: SparseFlashMLADecodeHead64Config) -> MainPresenceMask:
+    have_extra_kv = cfg.extra_topk != 0
+    return (
+        cfg.have_topk_length,
+        cfg.have_attn_sink,
+        have_extra_kv,
+        have_extra_kv,
+        cfg.have_extra_topk_length,
+    )
+
+
+def _absent_specialization_kwargs(
+    optional_names: tuple[str, ...], presence: tuple[bool, ...]
+) -> dict[str, None]:
+    return {
+        name: None
+        for name, is_present in zip(optional_names, presence, strict=True)
+        if not is_present
+    }
+
+
+@lru_cache(maxsize=64)
+def _specialized_main_kernel(model_type: ModelType, presence: MainPresenceMask):
+    specialization = _absent_specialization_kwargs(MAIN_OPTIONAL_BUFFER_PARAMS, presence)
+    return (
         _make_sparse_decode_head64_kernel(model_type)
-        .specialize()
+        .specialize(**specialization)
         .with_attr("tirx.kernel_launch_params", list(LAUNCH_TAGS))
-        .with_attr("tirx.nullable_buffer_params", list(NULLABLE_MAIN_BUFFER_PARAMS))
     )
-    combine = _sparse_decode_head64_combine_kernel.specialize(max_splits=max_splits).with_attr(
-        "tirx.kernel_launch_params", list(COMBINE_LAUNCH_TAGS)
+
+
+@lru_cache(maxsize=10)
+def _specialized_combine_kernel(max_splits: int, have_attn_sink: bool):
+    specialization = _absent_specialization_kwargs(
+        COMBINE_OPTIONAL_BUFFER_PARAMS, (have_attn_sink,)
     )
-    combine = combine.with_attr("tirx.nullable_buffer_params", list(NULLABLE_COMBINE_BUFFER_PARAMS))
-    return main, combine
+    return _sparse_decode_head64_combine_kernel.specialize(
+        max_splits=max_splits, **specialization
+    ).with_attr("tirx.kernel_launch_params", list(COMBINE_LAUNCH_TAGS))
+
+
+def _specialized_decode_kernels(model_type: ModelType, max_splits: int, presence: MainPresenceMask):
+    return (
+        _specialized_main_kernel(model_type, presence),
+        _specialized_combine_kernel(max_splits, presence[1]),
+    )
 
 
 def get_kernel(**kwargs: Any):
@@ -3026,7 +3078,11 @@ def get_kernel(**kwargs: Any):
         raise SkipTest("CUDA is required for sparse FlashMLA decode")
     device = kwargs.get("device", "cuda")
     shape = _kernel_shape_params(cfg, device)
-    return list(_specialized_decode_kernels(cfg.normalized_model_type, shape["max_splits"]))
+    return list(
+        _specialized_decode_kernels(
+            cfg.normalized_model_type, shape["max_splits"], _main_presence_mask(cfg)
+        )
+    )
 
 
 def prepare_data(**kwargs: Any) -> dict[str, Any]:
@@ -3229,6 +3285,17 @@ def _flat_storage_alias(
     )
 
 
+def _present_runtime_args(
+    args: tuple[Any, ...], optional_indices: tuple[int, ...], presence: tuple[bool, ...]
+) -> tuple[Any, ...]:
+    absent_indices = {
+        index
+        for index, is_present in zip(optional_indices, presence, strict=True)
+        if not is_present
+    }
+    return tuple(arg for index, arg in enumerate(args) if index not in absent_indices)
+
+
 def _tirx_main_args(case: dict[str, Any], start_head_idx: int) -> tuple[Any, ...]:
     cfg: SparseFlashMLADecodeHead64Config = case["config"]
     if start_head_idx % B_H or start_head_idx + B_H > cfg.h_q:
@@ -3268,7 +3335,7 @@ def _tirx_main_args(case: dict[str, Any], start_head_idx: int) -> tuple[Any, ...
         + (cfg.s_q - 1) * case["stride_extra_indices_s_q"]
         + cfg.extra_topk
     )
-    return (
+    args = (
         _flat_storage_alias(
             case["q"], element_offset=start_head_idx * case["stride_q_h_q"], extent=q_extent
         ),
@@ -3333,11 +3400,13 @@ def _tirx_main_args(case: dict[str, Any], start_head_idx: int) -> tuple[Any, ...
         case["shape"]["extra_page_block_size"],
         case["shape"]["num_sm_parts"],
     )
+    presence = _main_presence_mask(cfg)
+    return _present_runtime_args(args, MAIN_OPTIONAL_ARG_INDICES, presence)
 
 
 def _tirx_combine_args(case: dict[str, Any]) -> tuple[Any, ...]:
     cfg: SparseFlashMLADecodeHead64Config = case["config"]
-    return (
+    args = (
         case["lse"].reshape(-1),
         case["out"].reshape(-1),
         case["lse_accum"].reshape(-1),
@@ -3360,21 +3429,33 @@ def _tirx_combine_args(case: dict[str, Any]) -> tuple[Any, ...]:
         cfg.d_v,
         case["shape"]["num_sm_parts"],
     )
+    presence = (cfg.have_attn_sink,)
+    return _present_runtime_args(args, COMBINE_OPTIONAL_ARG_INDICES, presence)
+
+
+@lru_cache(maxsize=64)
+def _compile_main_kernel_cached(model_type: ModelType, presence: MainPresenceMask):
+    from tirx_kernels.runner import compile_kernel
+
+    return compile_kernel(_specialized_main_kernel(model_type, presence))
 
 
 @lru_cache(maxsize=10)
-def _compile_decode_kernels_cached(model_type: ModelType, max_splits: int):
+def _compile_combine_kernel_cached(max_splits: int, have_attn_sink: bool):
     from tirx_kernels.runner import compile_kernel
 
-    main, combine = _specialized_decode_kernels(model_type, max_splits)
-    return compile_kernel(main), compile_kernel(combine)
+    return compile_kernel(_specialized_combine_kernel(max_splits, have_attn_sink))
 
 
 def _compile_decode_kernels(**kwargs: Any):
     cfg = _cfg(**kwargs)
     device = kwargs.get("device", "cuda")
     shape = _kernel_shape_params(cfg, device)
-    return _compile_decode_kernels_cached(cfg.normalized_model_type, shape["max_splits"])
+    presence = _main_presence_mask(cfg)
+    return (
+        _compile_main_kernel_cached(cfg.normalized_model_type, presence),
+        _compile_combine_kernel_cached(shape["max_splits"], presence[1]),
+    )
 
 
 def _launch_tirx(case: dict[str, Any], executables: tuple[Any, Any]) -> None:
