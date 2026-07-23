@@ -6,7 +6,7 @@ heuristic. The port keeps:
 
 - the verbatim DeepGEMM config heuristic (block sizes, SMEM pipeline depth,
   cluster layout) including the TMEM column-budget constraint;
-- the role split: one TMA-load warp, one scale-factor permute warp, one MMA
+- the warp split: one TMA-load warp, one scale-factor permute warp, one MMA
   warp (issuing from the cluster leader only), and one epilogue warpgroup;
 - the pipeline protocol: ``smem_pipe`` (full = TMA arrive-expect-tx, empty =
   tcgen05_commit multicast to both CTAs), ``trans_done`` (both CTAs' permute
@@ -431,20 +431,31 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
             col = within // TILE_GROUPS_ROW_SIZE
         return (col, row) if swap_ab else (row, col)
 
-    with k.kernel_init(warp=0):
+    with k.if_warp(0):
+        # tmem_alloc is warp-collective (full warp 0); mbarrier.init is
+        # per-thread, so exactly one elected thread runs the inits.
         k.tmem_alloc(tmem_base, n_cols=N_COLS_TMEM, cta_group=cta_group)
-        for s in range(smem_depth):
-            k.mbarrier_init(smem_full, count=1, stage=s)
-            k.mbarrier_init(smem_empty, count=1, stage=s)
-            # One arrival per CTA's permute warp.
-            k.mbarrier_init(trans_done, count=cta_group, stage=s)
-        for s in range(TMEM_DEPTH):
-            k.mbarrier_init(tmem_full, count=1, stage=s)
-            # One arrival per CTA's epilogue warpgroup.
-            k.mbarrier_init(tmem_empty, count=cta_group, stage=s)
+        with k.if_elected():
+            for s in range(smem_depth):
+                k.mbarrier_init(smem_full, count=1, stage=s)
+                k.mbarrier_init(smem_empty, count=1, stage=s)
+                # One arrival per CTA: each CTA's permute warp arrives from a
+                # single elected thread.
+                k.mbarrier_init(trans_done, count=cta_group, stage=s)
+            for s in range(TMEM_DEPTH):
+                k.mbarrier_init(tmem_full, count=1, stage=s)
+                # One arrival per CTA: each CTA's epilogue leader thread.
+                k.mbarrier_init(tmem_empty, count=cta_group, stage=s)
+    # Publish the prologue (TMEM alloc + mbarrier cells) to every stream before
+    # any wait/arrive touches them. There is no implicit barrier between
+    # top-level statements — this sync IS the prologue ordering, and it must be
+    # cluster-wide: the peer CTA arrives at the LEADER's trans_done/tmem_empty.
+    k.cluster_sync()
 
     # ---- TMA producer (TIRx wg0/warp0) ----
-    with k.role(warp=0):
+    # Single thread drives the whole TMA pipeline (waits, per-thread
+    # arrive_expect_tx, single-thread tma_load issues).
+    with k.if_warp(0), k.if_elected():
         with k.for_each_task(task_scheduler) as task:
             local_iter = (task.task_id - task_start) // task_step
             work_idx = task.task_id * cta_group + cta_rank
@@ -505,12 +516,15 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
                     )
 
     # ---- scale-factor permute (TIRx wg0/warp2) ----
-    with k.role(warp=2):
+    # Whole-warp scope: the permute reg ops are warp-collective. Once-per-warp
+    # ops (the padding zeroing, the trans_done arrive) narrow to one elected
+    # thread; warp-stream program order covers store -> arrive without a sync.
+    with k.if_warp(2):
         # The TMA writes only the first DG_BLOCK rows of each (128-aligned) scale
         # buffer; the tcgen05.cp copies the whole aligned buffer. Zero the padding
         # once (single lane) so the cp never reads uninitialized SMEM (on silicon
         # those bytes are don't-care garbage feeding unused MMA rows).
-        with k.if_(k.lane_id().eq(0)):
+        with k.if_elected():
             for s in range(smem_depth):
                 for i in range(dg_block_m, blk_sfa):
                     k.store_scalar(TensorSlice(tensor=sfa_smem, offsets=(s, i), shape=(1, 1)), 0)
@@ -543,10 +557,16 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
                     k.reg_load(sfb_perm_frag, sfb_slice)
                     k.reg_store(sfb_slice, sfb_perm_frag)
                     k.fence(kind=FenceKind.ASYNC_PROXY, scope=FenceScope.CTA)
-                k.mbarrier_arrive(trans_done_leader, stage=stage)
+                # mbarrier.arrive is per-thread: exactly one thread per CTA's
+                # permute warp arrives at the leader, matching trans_done's
+                # count = cta_group.
+                with k.if_elected():
+                    k.mbarrier_arrive(trans_done_leader, stage=stage)
 
     # ---- MMA (TIRx wg0/warp1, cluster leader only) ----
-    with k.role(warp=1):
+    # Single thread: tcgen05_cp/tcgen05_mma/tcgen05_commit require a
+    # single-thread cohort; the waits are fine from one thread too.
+    with k.if_warp(1), k.if_elected():
         with k.for_each_task(task_scheduler) as task:
             local_iter = (task.task_id - task_start) // task_step
             with k.if_(cta_rank.eq(0)):
@@ -614,7 +634,12 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
                 )
 
     # ---- epilogue (TIRx wg1) ----
-    with k.role(warpgroup=1):
+    # Full-warpgroup scope for the warp-collective accumulator drains; every
+    # once-per-execution op (bulk-group wait, tmem_empty arrive, tma_store,
+    # commit_group) narrows to the leader thread, with the cross-warp program
+    # order the old whole-role stream provided implicitly made explicit as
+    # wg_syncs (barrier_id=10, the warpgroup's one named barrier).
+    with k.if_warpgroup(1):
         with k.for_each_task(task_scheduler) as task:
             local_iter = (task.task_id - task_start) // task_step
             work_idx = task.task_id * cta_group + cta_rank
@@ -623,10 +648,15 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
             k.mbarrier_wait(tmem_full, stage=tmem_idx, phase=(local_iter // TMEM_DEPTH) % 2)
             for ot in range(store_tiles):
                 store_iter = local_iter * store_tiles + ot
-                # Pace the D_smem stage ring against in-flight TMA stores.
+                # Pace the D_smem stage ring against in-flight TMA stores. The
+                # bulk-async group lives on the leader thread's stream (it
+                # issued the commit), so only the leader may wait it; the
+                # wg_sync after publishes the drain to the other three warps
+                # before anyone overwrites the stage.
                 with k.if_(store_iter >= TMEM_DEPTH):
-                    k.cp_async_bulk_wait_group_read(TMEM_DEPTH - 1)
-                    k.wg_sync(barrier_id=10)
+                    with k.if_(k.tid_in_wg().eq(0)):
+                        k.cp_async_bulk_wait_group_read(TMEM_DEPTH - 1)
+                k.wg_sync(barrier_id=10)
                 d_stage = store_iter % TMEM_DEPTH  # runtime: the EPI count may be odd
                 if swap_ab:
                     # The accumulator holds C^T (rows = this CTA's n tile, cols =
@@ -687,36 +717,49 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
                             ),
                             out_frag,
                         )
-                if ot == store_tiles - 1:
-                    # The accumulator stage is drained; let the leader's MMA reuse it.
-                    k.mbarrier_arrive(tmem_empty_leader, stage=tmem_idx)
-                k.fence(kind=FenceKind.ASYNC_PROXY, scope=FenceScope.CTA)
+                # All four warps' accumulator drains and d_smem writes must
+                # land before the single-thread tail (accum release + bulk
+                # store).
                 k.wg_sync(barrier_id=10)
-                if swap_ab:
-                    k.tma_store(
-                        d_gmem,
-                        TensorSlice(
-                            tensor=d_smem, offsets=(d_stage, 0, 0), shape=(1, epi_tile, dg_block_n)
-                        ),
-                        coords=(m_idx * dg_block_m + ot * epi_tile, n_idx * dg_block_n),
-                        shape=(1, epi_tile, dg_block_n),
-                        gmem_shape=(epi_tile, dg_block_n),
-                    )
-                else:
-                    k.tma_store(
-                        d_gmem,
-                        TensorSlice(
-                            tensor=d_smem, offsets=(d_stage, 0, 0), shape=(1, blk_m, epi_tile)
-                        ),
-                        coords=(m_idx * dg_block_m, n_idx * dg_block_n + ot * epi_tile),
-                        shape=(1, blk_m, epi_tile),
-                        gmem_shape=(blk_m, epi_tile),
-                    )
-                k.cp_async_bulk_commit_group()
-        k.cp_async_bulk_wait_group_read(0)
+                with k.if_(k.tid_in_wg().eq(0)):
+                    if ot == store_tiles - 1:
+                        # The accumulator stage is fully drained (the wg_sync
+                        # above proves all warps' loads retired); one arrive
+                        # per CTA's epilogue keeps tmem_empty's count at
+                        # cta_group.
+                        k.mbarrier_arrive(tmem_empty_leader, stage=tmem_idx)
+                    k.fence(kind=FenceKind.ASYNC_PROXY, scope=FenceScope.CTA)
+                    if swap_ab:
+                        k.tma_store(
+                            d_gmem,
+                            TensorSlice(
+                                tensor=d_smem,
+                                offsets=(d_stage, 0, 0),
+                                shape=(1, epi_tile, dg_block_n),
+                            ),
+                            coords=(m_idx * dg_block_m + ot * epi_tile, n_idx * dg_block_n),
+                            shape=(1, epi_tile, dg_block_n),
+                            gmem_shape=(epi_tile, dg_block_n),
+                        )
+                    else:
+                        k.tma_store(
+                            d_gmem,
+                            TensorSlice(
+                                tensor=d_smem, offsets=(d_stage, 0, 0), shape=(1, blk_m, epi_tile)
+                            ),
+                            coords=(m_idx * dg_block_m, n_idx * dg_block_n + ot * epi_tile),
+                            shape=(1, blk_m, epi_tile),
+                            gmem_shape=(blk_m, epi_tile),
+                        )
+                    k.cp_async_bulk_commit_group()
+        # Tail drain: only the committing stream may wait its bulk groups.
+        with k.if_(k.tid_in_wg().eq(0)):
+            k.cp_async_bulk_wait_group_read(0)
         k.wg_sync(barrier_id=10)
 
-    with k.kernel_finalize(warp=0):
+    # Teardown: every stream's pipeline work happens-before the dealloc.
+    k.cluster_sync()
+    with k.if_warp(0):
         k.tmem_dealloc(tmem_base, n_cols=N_COLS_TMEM, cta_group=cta_group)
 
     return k.build()
