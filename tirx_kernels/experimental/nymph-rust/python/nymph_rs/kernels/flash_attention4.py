@@ -1,11 +1,12 @@
 """FlashAttention4-shaped protocol kernel expressed in Nymph IR.
 
-The kernel keeps the tirx-kernels FA4 role shape: one custom scheduler role
-broadcasts task metadata through a two-stage SMEM mailbox, and six consumer
-roles drain each task (TMA load, MMA, two softmax warpgroups, correction
-epilogue, TMA store). The mailbox mbarrier count is derived from that role
-composition below so adding a consumer cannot silently leave task_empty with an
-obsolete arrival count.
+The kernel keeps the tirx-kernels FA4 stream shape under the per-warp
+execution model: one custom scheduler stream (warp 15, lane 0) broadcasts task
+metadata through a two-stage SMEM mailbox, and six consumer streams drain each
+task (TMA load, MMA, two softmax warpgroups, correction epilogue, TMA store).
+mbarrier.arrive is per-thread, so the mailbox mbarrier count is derived from
+the consumer composition below as one arrival per mailbox-reading thread —
+adding a consumer cannot silently leave task_empty with an obsolete count.
 """
 
 from __future__ import annotations
@@ -56,14 +57,20 @@ F16_BYTES = 2
 F32_BYTES = 4
 I32_BYTES = 4
 TASK_BROADCAST_STAGES = 2
+WARPGROUP_THREADS = 128
+# (role, streams, mailbox-reading threads per stream). mbarrier.arrive is
+# per-thread under the per-warp execution model: single-thread streams
+# contribute one task_empty arrival per slot; warpgroup streams let every
+# thread arrive after its own mailbox read, so the scheduler cannot overwrite
+# a slot a lagging warp of the group is still reading.
 TASK_CONSUMER_ROLES = (
-    ("tma_load", 1),
-    ("mma", 1),
-    ("softmax", SMEM_PIPE_DEPTH_Q),
-    ("correction_epilogue", 1),
-    ("tma_store", 1),
+    ("tma_load", 1, 1),
+    ("mma", 1, 1),
+    ("softmax", SMEM_PIPE_DEPTH_Q, WARPGROUP_THREADS),
+    ("correction_epilogue", 1, WARPGROUP_THREADS),
+    ("tma_store", 1, 1),
 )
-TASK_CONSUMER_COUNT = sum(count for _, count in TASK_CONSUMER_ROLES)
+TASK_CONSUMER_COUNT = sum(streams * threads for _, streams, threads in TASK_CONSUMER_ROLES)
 TASK_BROADCAST_FIELDS_DEF = (
     "task_id",
     "task_iter",
@@ -133,7 +140,7 @@ def _assert_task_broadcast_contract() -> None:
         raise AssertionError("task broadcast field ids must be dense and match field count")
     if TASK_BROADCAST_FIELDS != len(TASK_BROADCAST_FIELDS_DEF):
         raise AssertionError("task broadcast field count must match field definitions")
-    if TASK_CONSUMER_COUNT != sum(count for _, count in TASK_CONSUMER_ROLES):
+    if TASK_CONSUMER_COUNT != sum(streams * threads for _, streams, threads in TASK_CONSUMER_ROLES):
         raise AssertionError("task_empty arrive count must match task consumer role composition")
 
 
@@ -286,32 +293,50 @@ def build_flash_attention4(config: FlashAttention4Config = FlashAttention4Config
     )
     scheduler = k.scheduler(task_space, policy="custom")
 
-    with k.kernel_init(warp=0):
+    with k.if_warp(0):
+        # tmem_alloc is warp-collective (exactly one full warp); mbarrier.init
+        # is per-thread, so a single elected thread runs every init.
         k.tmem_alloc(tmem_base, n_cols=N_COLS_TMEM, cta_group=config.cta_group)
-        for mbar in [*q_full, *q_empty]:
-            _init_stages(k, mbar, stages=1, count=1)
-        _init_stages(k, k_full, stages=SMEM_PIPE_DEPTH_KV, count=1)
-        _init_stages(k, k_empty, stages=SMEM_PIPE_DEPTH_KV, count=1)
-        _init_stages(k, v_full, stages=SMEM_PIPE_DEPTH_KV, count=1)
-        _init_stages(k, v_empty, stages=SMEM_PIPE_DEPTH_KV, count=1)
-        for mbar in [
-            s_ready,
-            p_first_ready,
-            p_second_ready,
-            softmax_corr,
-            softmax_corr_empty,
-            row_sum_ready,
-            o_ready,
-            corr_epi_full,
-            corr_epi_empty,
-            task_full,
-        ]:
-            _init_stages(k, mbar, stages=2, count=1)
-        _init_stages(k, task_empty, stages=TASK_BROADCAST_STAGES, count=TASK_CONSUMER_COUNT)
-        _init_stages(k, p_o_rescale, stages=2, count=2)
+        with k.if_elected():
+            # count=1 barriers: armed by the TMA engine (tx bytes), a tcgen05
+            # commit, or a single-thread stream's lone arrive.
+            for mbar in [*q_full, *q_empty]:
+                _init_stages(k, mbar, stages=1, count=1)
+            _init_stages(k, k_full, stages=SMEM_PIPE_DEPTH_KV, count=1)
+            _init_stages(k, k_empty, stages=SMEM_PIPE_DEPTH_KV, count=1)
+            _init_stages(k, v_full, stages=SMEM_PIPE_DEPTH_KV, count=1)
+            _init_stages(k, v_empty, stages=SMEM_PIPE_DEPTH_KV, count=1)
+            for mbar in [s_ready, o_ready, corr_epi_empty, task_full]:
+                _init_stages(k, mbar, stages=2, count=1)
+            # Warpgroup-published barriers: the producing warpgroup's threads
+            # each arrive once after their own per-row work (tcgen05_st rows /
+            # s_scale lanes / o_smem rows), so a completed phase proves all
+            # 128 rows landed without any wg_sync on the producer side.
+            for mbar in [
+                p_first_ready,
+                p_second_ready,
+                softmax_corr,
+                softmax_corr_empty,
+                row_sum_ready,
+                corr_epi_full,
+            ]:
+                _init_stages(k, mbar, stages=2, count=WARPGROUP_THREADS)
+            # p_o_rescale gates each PV MMA on BOTH the softmax warpgroup's
+            # P-store and the correction warpgroup's O-rescale: 128 + 128.
+            _init_stages(k, p_o_rescale, stages=2, count=2 * WARPGROUP_THREADS)
+            _init_stages(k, task_empty, stages=TASK_BROADCAST_STAGES, count=TASK_CONSUMER_COUNT)
 
+    # No implicit barrier between top-level statements: this fence + sync IS
+    # the publish of the TMEM alloc and mbarrier cells to every stream.
     k.fence(kind=FenceKind.ASYNC_PROXY, scope=FenceScope.CTA)
     k.cta_sync()
+
+    # Warpgroup 3 hosts the four single-warp streams (MMA / TMA load / TMA
+    # store / scheduler); one warpgroup-wide setmaxnreg replaces the old
+    # per-role maxnreg=48 annotations (set_maxnreg must statically cover a
+    # whole warpgroup, which the single-warp branches below cannot).
+    with k.if_warpgroup(3):
+        k.set_maxnreg(48)
 
     _emit_scheduler_role(
         k,
@@ -447,7 +472,9 @@ def build_flash_attention4(config: FlashAttention4Config = FlashAttention4Config
         seq_q_per_tile,
     )
 
-    with k.kernel_finalize(warp=0):
+    # Teardown: every stream's pipeline work happens-before the dealloc.
+    k.cta_sync()
+    with k.if_warp(0):
         k.tmem_dealloc(tmem_base, n_cols=N_COLS_TMEM, cta_group=config.cta_group)
 
     return k.build()
@@ -464,7 +491,10 @@ def _emit_scheduler_role(
     num_kv_blocks: int,
     seq_q_per_tile: int,
 ) -> None:
-    with k.role(warp=15, elected=True):
+    # Single-thread scheduler stream: sched_next must sit in a statically
+    # single-warp branch, and the mailbox stores + task_full arrive are
+    # per-thread, so exactly one thread runs the whole loop.
+    with k.if_warp(15), k.if_elected():
         sched_iter = k.scalar(initial=0, dtype=ScalarDType.I32)
         pipe_base = k.scalar(initial=0, dtype=ScalarDType.I32)
         kv_stage0_base = k.scalar(initial=0, dtype=ScalarDType.I32)
@@ -526,7 +556,12 @@ def _emit_scheduler_role(
 def _persistent_task_loop(
     k: IRBuilder, task_smem: Tensor, task_full: MBar, task_empty: MBar
 ) -> Iterator[tuple[object, object, object, tuple[object, object, object], object, object, object]]:
-    """Consume scheduler mailbox entries until the sentinel task id is seen."""
+    """Consume scheduler mailbox entries until the sentinel task id is seen.
+
+    Every executing thread reads the slot and arrives task_empty once
+    (per-thread arrive), so TASK_CONSUMER_ROLES must account one arrival per
+    mailbox-reading thread of every consumer stream.
+    """
     consumer_iter = k.scalar(initial=0, dtype=ScalarDType.I32)
     with k.loop():
         stage = _task_broadcast_stage(consumer_iter)
@@ -631,93 +666,88 @@ def _emit_tma_load_role(
     kv_tile_bytes: int,
     seq_q_per_tile: int,
 ) -> None:
-    with k.role(warpgroup=3, maxnreg=48):
-        with k.role(warp=13):
-            with _persistent_task_loop(k, task_smem, task_full, task_empty) as (
-                _task_id,
-                local_iter,
-                _pipe_base,
-                kv_stage_bases,
-                m_block_idx,
-                head_idx,
-                batch_idx,
-            ):
-                n_block_count = _n_block_count(config, m_block_idx, num_kv_blocks, seq_q_per_tile)
-                m_start = m_block_idx * seq_q_per_tile * SMEM_PIPE_DEPTH_Q
-                q_head = head_idx * (config.num_qo_heads // config.num_kv_heads)
-                gqa_ratio = config.num_qo_heads // config.num_kv_heads
-                q_empty_phase = (local_iter + 1) % 2
+    # Single-thread TMA producer stream (lane 0 of warp 13): mbarrier waits
+    # are fine from one thread, arrive_expect_tx is per-thread (one arm per
+    # load), and tma_load requires a single-thread cohort — the old nested
+    # elected roles collapse into the stream itself.
+    with k.if_warp(13), k.if_elected():
+        with _persistent_task_loop(k, task_smem, task_full, task_empty) as (
+            _task_id,
+            local_iter,
+            _pipe_base,
+            kv_stage_bases,
+            m_block_idx,
+            head_idx,
+            batch_idx,
+        ):
+            n_block_count = _n_block_count(config, m_block_idx, num_kv_blocks, seq_q_per_tile)
+            m_start = m_block_idx * seq_q_per_tile * SMEM_PIPE_DEPTH_Q
+            q_head = head_idx * (config.num_qo_heads // config.num_kv_heads)
+            gqa_ratio = config.num_qo_heads // config.num_kv_heads
+            q_empty_phase = (local_iter + 1) % 2
 
-                def load_q(i_q: int) -> None:
-                    k.mbarrier_wait(q_empty[i_q], phase=q_empty_phase)
-                    with k.role(warp=13, elected=True):
-                        k.mbarrier_arrive_expect_tx(q_full[i_q], bytes=q_tile_bytes)
-                        k.tma_load(
-                            q_smem[i_q],
-                            q_gmem,
-                            mbar=q_full[i_q],
-                            bytes=q_tile_bytes,
-                            coords=(batch_idx, m_start + i_q * seq_q_per_tile, q_head, 0),
-                            shape=(BLK_M, HEAD_DIM),
-                            gmem_shape=(1, seq_q_per_tile, gqa_ratio, HEAD_DIM),
-                            cta_group=config.cta_group,
-                        )
+            def load_q(i_q: int) -> None:
+                k.mbarrier_wait(q_empty[i_q], phase=q_empty_phase)
+                k.mbarrier_arrive_expect_tx(q_full[i_q], bytes=q_tile_bytes)
+                k.tma_load(
+                    q_smem[i_q],
+                    q_gmem,
+                    mbar=q_full[i_q],
+                    bytes=q_tile_bytes,
+                    coords=(batch_idx, m_start + i_q * seq_q_per_tile, q_head, 0),
+                    shape=(BLK_M, HEAD_DIM),
+                    gmem_shape=(1, seq_q_per_tile, gqa_ratio, HEAD_DIM),
+                    cta_group=config.cta_group,
+                )
 
-                def load_k(kv_idx: int) -> None:
-                    kv_block_idx = _scheduled_kv_block_idx(
-                        config, kv_idx, n_block_count, num_kv_blocks
-                    )
-                    stage = kv_idx % SMEM_PIPE_DEPTH_KV
-                    use = _kv_stage_use(kv_stage_bases[stage], kv_idx)
-                    full_phase = use % 2
-                    empty_phase = (use + 1) % 2
-                    k.mbarrier_wait(v_empty, stage=stage, phase=empty_phase)
-                    with k.role(warp=13, elected=True):
-                        k.mbarrier_arrive_expect_tx(k_full, stage=stage, bytes=kv_tile_bytes)
-                        k.tma_load(
-                            k_smem[stage],
-                            k_gmem,
-                            mbar=k_full,
-                            mbar_stage=stage,
-                            bytes=kv_tile_bytes,
-                            coords=(batch_idx, kv_block_idx * BLK_N, head_idx, 0),
-                            shape=(BLK_N, HEAD_DIM),
-                            gmem_shape=(1, BLK_N, 1, HEAD_DIM),
-                            cta_group=config.cta_group,
-                        )
+            def load_k(kv_idx: int) -> None:
+                kv_block_idx = _scheduled_kv_block_idx(config, kv_idx, n_block_count, num_kv_blocks)
+                stage = kv_idx % SMEM_PIPE_DEPTH_KV
+                use = _kv_stage_use(kv_stage_bases[stage], kv_idx)
+                empty_phase = (use + 1) % 2
+                k.mbarrier_wait(v_empty, stage=stage, phase=empty_phase)
+                k.mbarrier_arrive_expect_tx(k_full, stage=stage, bytes=kv_tile_bytes)
+                k.tma_load(
+                    k_smem[stage],
+                    k_gmem,
+                    mbar=k_full,
+                    mbar_stage=stage,
+                    bytes=kv_tile_bytes,
+                    coords=(batch_idx, kv_block_idx * BLK_N, head_idx, 0),
+                    shape=(BLK_N, HEAD_DIM),
+                    gmem_shape=(1, BLK_N, 1, HEAD_DIM),
+                    cta_group=config.cta_group,
+                )
 
-                def load_v(kv_idx: int) -> None:
-                    kv_block_idx = _scheduled_kv_block_idx(
-                        config, kv_idx, n_block_count, num_kv_blocks
-                    )
-                    stage = kv_idx % SMEM_PIPE_DEPTH_KV
-                    use = _kv_stage_use(kv_stage_bases[stage], kv_idx)
-                    full_phase = use % 2
-                    k.mbarrier_wait(k_empty, stage=stage, phase=full_phase)
-                    with k.role(warp=13, elected=True):
-                        k.mbarrier_arrive_expect_tx(v_full, stage=stage, bytes=kv_tile_bytes)
-                        k.tma_load(
-                            v_smem[stage],
-                            v_gmem,
-                            mbar=v_full,
-                            mbar_stage=stage,
-                            bytes=kv_tile_bytes,
-                            coords=(batch_idx, kv_block_idx * BLK_N, head_idx, 0),
-                            shape=(BLK_N, HEAD_DIM),
-                            gmem_shape=(1, BLK_N, 1, HEAD_DIM),
-                            cta_group=config.cta_group,
-                        )
+            def load_v(kv_idx: int) -> None:
+                kv_block_idx = _scheduled_kv_block_idx(config, kv_idx, n_block_count, num_kv_blocks)
+                stage = kv_idx % SMEM_PIPE_DEPTH_KV
+                use = _kv_stage_use(kv_stage_bases[stage], kv_idx)
+                full_phase = use % 2
+                k.mbarrier_wait(k_empty, stage=stage, phase=full_phase)
+                k.mbarrier_arrive_expect_tx(v_full, stage=stage, bytes=kv_tile_bytes)
+                k.tma_load(
+                    v_smem[stage],
+                    v_gmem,
+                    mbar=v_full,
+                    mbar_stage=stage,
+                    bytes=kv_tile_bytes,
+                    coords=(batch_idx, kv_block_idx * BLK_N, head_idx, 0),
+                    shape=(BLK_N, HEAD_DIM),
+                    gmem_shape=(1, BLK_N, 1, HEAD_DIM),
+                    cta_group=config.cta_group,
+                )
 
-                load_q(0)
-                with _kv_in_bounds(k, 0, n_block_count):
-                    load_k(0)
-                load_q(1)
-                with _kv_in_bounds(k, 0, n_block_count):
-                    load_v(0)
-                for kv_idx in range(1, num_kv_blocks):
-                    with _kv_in_bounds(k, kv_idx, n_block_count):
-                        load_k(kv_idx)
-                        load_v(kv_idx)
+            load_q(0)
+            with _kv_in_bounds(k, 0, n_block_count):
+                load_k(0)
+            load_q(1)
+            with _kv_in_bounds(k, 0, n_block_count):
+                load_v(0)
+            for kv_idx in range(1, num_kv_blocks):
+                with _kv_in_bounds(k, kv_idx, n_block_count):
+                    load_k(kv_idx)
+                    load_v(kv_idx)
 
 
 def _emit_mma_role(
@@ -747,80 +777,81 @@ def _emit_mma_role(
     num_kv_blocks: int,
     seq_q_per_tile: int,
 ) -> None:
-    with k.role(warpgroup=3, maxnreg=48):
-        with k.role(warp=12):
-            with _persistent_task_loop(k, task_smem, task_full, task_empty) as (
-                _task_id,
-                local_iter,
-                pipe_base,
-                kv_stage_bases,
-                m_block_idx,
-                _head_idx,
-                _batch_idx,
-            ):
-                n_block_count = _n_block_count(config, m_block_idx, num_kv_blocks, seq_q_per_tile)
-                q_phase = local_iter % 2
-                stage = 0
-                full_phase = _kv_stage_use(kv_stage_bases[stage], 0) % 2
-                with _kv_in_bounds(k, 0, n_block_count):
-                    k.mbarrier_wait(k_full, stage=stage, phase=full_phase)
+    # Single-thread MMA issuer stream (lane 0 of warp 12): tcgen05_mma and
+    # tcgen05_commit require a single-thread cohort, and the k/v/q release
+    # arrives are per-thread (each buffer's empty barrier counts exactly one
+    # arrival per k-tile).
+    with k.if_warp(12), k.if_elected():
+        with _persistent_task_loop(k, task_smem, task_full, task_empty) as (
+            _task_id,
+            local_iter,
+            pipe_base,
+            kv_stage_bases,
+            m_block_idx,
+            _head_idx,
+            _batch_idx,
+        ):
+            n_block_count = _n_block_count(config, m_block_idx, num_kv_blocks, seq_q_per_tile)
+            q_phase = local_iter % 2
+            stage = 0
+            full_phase = _kv_stage_use(kv_stage_bases[stage], 0) % 2
+            with _kv_in_bounds(k, 0, n_block_count):
+                k.mbarrier_wait(k_full, stage=stage, phase=full_phase)
+                for i_q in range(SMEM_PIPE_DEPTH_Q):
+                    k.mbarrier_wait(q_full[i_q], phase=q_phase)
+                    _emit_qk_mma(k, config, s_tmem[i_q], q_smem[i_q], k_smem[stage])
+                    k.tcgen05_commit(s_ready, stage=i_q, cta_group=config.cta_group)
+                k.mbarrier_arrive(k_empty, stage=stage)
+            for kv_idx in range(num_kv_blocks):
+                with _kv_in_bounds(k, kv_idx, n_block_count):
+                    stage_v = kv_idx % SMEM_PIPE_DEPTH_KV
+                    full_phase_v = _kv_stage_use(kv_stage_bases[stage_v], kv_idx) % 2
+                    pipe_phase = _pipe_phase(pipe_base, kv_idx)
+                    next_kv_idx = kv_idx + 1
+                    has_next_k = next_kv_idx < num_kv_blocks
+                    if has_next_k:
+                        stage_k = next_kv_idx % SMEM_PIPE_DEPTH_KV
+                        full_phase_k = _kv_stage_use(kv_stage_bases[stage_k], next_kv_idx) % 2
                     for i_q in range(SMEM_PIPE_DEPTH_Q):
-                        k.mbarrier_wait(q_full[i_q], phase=q_phase)
-                        _emit_qk_mma(k, config, s_tmem[i_q], q_smem[i_q], k_smem[stage])
-                        k.tcgen05_commit(s_ready, stage=i_q, cta_group=config.cta_group)
-                    k.mbarrier_arrive(k_empty, stage=stage)
-                for kv_idx in range(num_kv_blocks):
-                    with _kv_in_bounds(k, kv_idx, n_block_count):
-                        stage_v = kv_idx % SMEM_PIPE_DEPTH_KV
-                        full_phase_v = _kv_stage_use(kv_stage_bases[stage_v], kv_idx) % 2
-                        pipe_phase = _pipe_phase(pipe_base, kv_idx)
-                        next_kv_idx = kv_idx + 1
-                        has_next_k = next_kv_idx < num_kv_blocks
-                        if has_next_k:
-                            stage_k = next_kv_idx % SMEM_PIPE_DEPTH_KV
-                            full_phase_k = _kv_stage_use(kv_stage_bases[stage_k], next_kv_idx) % 2
-                        for i_q in range(SMEM_PIPE_DEPTH_Q):
-                            if i_q == 0:
-                                k.mbarrier_wait(v_full, stage=stage_v, phase=full_phase_v)
-                            k.mbarrier_wait(p_o_rescale, stage=i_q, phase=pipe_phase)
-                            k.mbarrier_wait(p_first_ready, stage=i_q, phase=pipe_phase)
-                            for k_group in range(PV_SPLIT_GROUPS):
-                                _emit_pv_mma(
-                                    k,
-                                    config,
-                                    o_tmem[i_q],
-                                    p_tmem[i_q],
-                                    v_smem[stage_v],
-                                    k_group,
-                                    kv_idx,
-                                )
-                            k.mbarrier_wait(p_second_ready, stage=i_q, phase=pipe_phase)
-                            for k_group in range(PV_SPLIT_GROUPS, BLK_N // MMA_K):
-                                _emit_pv_mma(
-                                    k,
-                                    config,
-                                    o_tmem[i_q],
-                                    p_tmem[i_q],
-                                    v_smem[stage_v],
-                                    k_group,
-                                    kv_idx,
-                                )
-                            k.tcgen05_commit(o_ready, stage=i_q, cta_group=config.cta_group)
-                            if has_next_k:
-                                with _kv_in_bounds(k, next_kv_idx, n_block_count):
-                                    if i_q == 0:
-                                        k.mbarrier_wait(k_full, stage=stage_k, phase=full_phase_k)
-                                    k.mbarrier_wait(q_full[i_q], phase=q_phase)
-                                    _emit_qk_mma(
-                                        k, config, s_tmem[i_q], q_smem[i_q], k_smem[stage_k]
-                                    )
-                                    k.tcgen05_commit(s_ready, stage=i_q, cta_group=config.cta_group)
-                        k.mbarrier_arrive(v_empty, stage=stage_v)
+                        if i_q == 0:
+                            k.mbarrier_wait(v_full, stage=stage_v, phase=full_phase_v)
+                        k.mbarrier_wait(p_o_rescale, stage=i_q, phase=pipe_phase)
+                        k.mbarrier_wait(p_first_ready, stage=i_q, phase=pipe_phase)
+                        for k_group in range(PV_SPLIT_GROUPS):
+                            _emit_pv_mma(
+                                k,
+                                config,
+                                o_tmem[i_q],
+                                p_tmem[i_q],
+                                v_smem[stage_v],
+                                k_group,
+                                kv_idx,
+                            )
+                        k.mbarrier_wait(p_second_ready, stage=i_q, phase=pipe_phase)
+                        for k_group in range(PV_SPLIT_GROUPS, BLK_N // MMA_K):
+                            _emit_pv_mma(
+                                k,
+                                config,
+                                o_tmem[i_q],
+                                p_tmem[i_q],
+                                v_smem[stage_v],
+                                k_group,
+                                kv_idx,
+                            )
+                        k.tcgen05_commit(o_ready, stage=i_q, cta_group=config.cta_group)
                         if has_next_k:
                             with _kv_in_bounds(k, next_kv_idx, n_block_count):
-                                k.mbarrier_arrive(k_empty, stage=stage_k)
-                for i_q in range(SMEM_PIPE_DEPTH_Q):
-                    k.mbarrier_arrive(q_empty[i_q])
+                                if i_q == 0:
+                                    k.mbarrier_wait(k_full, stage=stage_k, phase=full_phase_k)
+                                k.mbarrier_wait(q_full[i_q], phase=q_phase)
+                                _emit_qk_mma(k, config, s_tmem[i_q], q_smem[i_q], k_smem[stage_k])
+                                k.tcgen05_commit(s_ready, stage=i_q, cta_group=config.cta_group)
+                    k.mbarrier_arrive(v_empty, stage=stage_v)
+                    if has_next_k:
+                        with _kv_in_bounds(k, next_kv_idx, n_block_count):
+                            k.mbarrier_arrive(k_empty, stage=stage_k)
+            for i_q in range(SMEM_PIPE_DEPTH_Q):
+                k.mbarrier_arrive(q_empty[i_q])
 
 
 def _emit_pv_mma(
@@ -898,8 +929,15 @@ def _emit_softmax_roles(
     seq_q_per_tile: int,
 ) -> None:
     scale_log2 = math.log2(math.e) / math.sqrt(config.head_dim)
+    # Softmax warpgroup streams: the body stays warpgroup-wide (tcgen05_ld/st
+    # spread the 128 rows across the group's 128 threads; reg ops are
+    # warp-collective). Every mbarrier_arrive below is per-thread — each
+    # thread signals after ITS row's tcgen05_st / s_scale store — so the
+    # barriers are initialized with count=WARPGROUP_THREADS and a completed
+    # phase proves all 128 rows landed without a producer-side wg_sync.
     for i_q in range(SMEM_PIPE_DEPTH_Q):
-        with k.role(warpgroup=i_q, maxnreg=200):
+        with k.if_warpgroup(i_q):
+            k.set_maxnreg(200)
             with _persistent_task_loop(k, task_smem, task_full, task_empty) as (
                 _task_id,
                 _local_iter,
@@ -1033,7 +1071,11 @@ def _emit_correction_epilogue_role(
     num_kv_blocks: int,
     seq_q_per_tile: int,
 ) -> None:
-    with k.role(warpgroup=2, maxnreg=64):
+    # Correction warpgroup stream: same per-thread arrive discipline as the
+    # softmax warpgroups — p_o_rescale / softmax_corr_empty / corr_epi_full
+    # each collect 128 arrivals, one per thread after its own row work.
+    with k.if_warpgroup(2):
+        k.set_maxnreg(64)
         with _persistent_task_loop(k, task_smem, task_full, task_empty) as (
             _task_id,
             local_iter,
@@ -1106,34 +1148,37 @@ def _emit_tma_store_role(
     num_q_blocks: int,
     seq_q_per_tile: int,
 ) -> None:
-    with k.role(warpgroup=3, maxnreg=48):
-        with k.role(warp=14):
-            with _persistent_task_loop(k, task_smem, task_full, task_empty) as (
-                _task_id,
-                local_iter,
-                _pipe_base,
-                _kv_stage_bases,
-                m_block_idx,
-                head_idx,
-                batch_idx,
-            ):
-                m_start = m_block_idx * seq_q_per_tile * SMEM_PIPE_DEPTH_Q
-                gqa_ratio = config.num_qo_heads // config.num_kv_heads
-                q_head = head_idx * gqa_ratio
-                for i_q in range(TMEM_PIPE_DEPTH):
-                    k.mbarrier_wait(corr_epi_full, stage=i_q, phase=local_iter % 2)
-                    with k.role(warp=14, elected=True):
-                        k.tma_store(
-                            o_gmem,
-                            o_smem[i_q],
-                            coords=(batch_idx, m_start + i_q * seq_q_per_tile, q_head, 0),
-                            shape=(BLK_M, HEAD_DIM),
-                            gmem_shape=(1, seq_q_per_tile, gqa_ratio, HEAD_DIM),
-                        )
-                    k.cp_async_bulk_commit_group()
-                for i_q in range(TMEM_PIPE_DEPTH):
-                    k.cp_async_bulk_wait_group_read(1 - i_q)
-                    k.mbarrier_arrive(corr_epi_empty, stage=i_q)
+    # Single-thread TMA store stream (lane 0 of warp 14). cp_async_bulk
+    # groups are per-stream: the commit and the wait_group_read must run on
+    # the SAME stream that issued the tma_store, so all three live in this
+    # one-thread branch; the correction warpgroup observes the drain through
+    # the corr_epi_empty mbarrier, not through the group.
+    with k.if_warp(14), k.if_elected():
+        with _persistent_task_loop(k, task_smem, task_full, task_empty) as (
+            _task_id,
+            local_iter,
+            _pipe_base,
+            _kv_stage_bases,
+            m_block_idx,
+            head_idx,
+            batch_idx,
+        ):
+            m_start = m_block_idx * seq_q_per_tile * SMEM_PIPE_DEPTH_Q
+            gqa_ratio = config.num_qo_heads // config.num_kv_heads
+            q_head = head_idx * gqa_ratio
+            for i_q in range(TMEM_PIPE_DEPTH):
+                k.mbarrier_wait(corr_epi_full, stage=i_q, phase=local_iter % 2)
+                k.tma_store(
+                    o_gmem,
+                    o_smem[i_q],
+                    coords=(batch_idx, m_start + i_q * seq_q_per_tile, q_head, 0),
+                    shape=(BLK_M, HEAD_DIM),
+                    gmem_shape=(1, seq_q_per_tile, gqa_ratio, HEAD_DIM),
+                )
+                k.cp_async_bulk_commit_group()
+            for i_q in range(TMEM_PIPE_DEPTH):
+                k.cp_async_bulk_wait_group_read(1 - i_q)
+                k.mbarrier_arrive(corr_epi_empty, stage=i_q)
 
 
 def _emit_exp2_emulation(
