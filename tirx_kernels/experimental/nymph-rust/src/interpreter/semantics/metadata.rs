@@ -9,6 +9,9 @@ use crate::ir::Stmt;
 pub fn register(reg: &mut StmtExecutorRegistry) {
     reg.register(StmtKind::TensorDef, execute_metadata);
     reg.register(StmtKind::MBarDef, execute_metadata);
+    // setmaxnreg: register-pressure directive for codegen; the simulator does
+    // not model register file occupancy, so it is discovery metadata here.
+    reg.register(StmtKind::SetMaxNReg, execute_metadata);
 }
 
 fn execute_metadata<'a, 'k>(

@@ -64,6 +64,7 @@ from .nymph_rs import (
     Scheduler,
     SchedulerImpl,
     ScopeValue,
+    SetMaxNReg,
     Shape,
     StMatrix,
     Stmt,
@@ -426,6 +427,49 @@ class IRBuilder:
         else:
             self._body_stack.pop()
             self._append(If(cond=cond, then_body=tuple(body)))
+
+    # -- thread-dispatch sugar -----------------------------------------------
+    # Canonical `if_` shapes over thread coordinates. These are ordinary Ifs
+    # (masked per-thread execution, exactly the hardware model); the canonical
+    # predicate forms are what `static_thread_filter` resolves for validation.
+
+    @contextmanager
+    def if_warp(self, warp: int) -> Iterator[None]:
+        """Threads of one warp: `warp_id() == warp`."""
+        with self.if_(self.warp_id().eq(warp)):
+            yield
+
+    @contextmanager
+    def if_warpgroup(self, warpgroup: int) -> Iterator[None]:
+        """Threads of one warpgroup: `warpgroup_id() == warpgroup`."""
+        with self.if_(self.warpgroup_id().eq(warpgroup)):
+            yield
+
+    @contextmanager
+    def if_lane(self, lane: int) -> Iterator[None]:
+        """One lane of every warp in context: `lane_id() == lane`."""
+        with self.if_(self.lane_id().eq(lane)):
+            yield
+
+    @contextmanager
+    def if_elected(self) -> Iterator[None]:
+        """Lane 0 of EVERY warp in context (`lane_id() == 0`).
+
+        NOTE: this is per-warp election, not the old `role(elected=True)`
+        semantics. For one thread per warpgroup use
+        `if_(tid_in_wg().eq(0))`; for one thread per CTA nest it under
+        `if_warp(w)`.
+        """
+        with self.if_(self.lane_id().eq(0)):
+            yield
+
+    def set_maxnreg(self, nreg: int) -> None:
+        """`setmaxnreg` directive for the enclosing warpgroup(s); sim metadata.
+
+        Validation requires the enclosing branch to statically cover whole
+        warpgroups and `nreg` to be a positive multiple of 8.
+        """
+        self._append(SetMaxNReg(nreg=nreg))
 
     def tcgen05_mma(
         self,

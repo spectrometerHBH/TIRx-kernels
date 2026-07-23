@@ -1930,6 +1930,11 @@ fn if_stmt(cond: Bound<'_, PyAny>, then_body: Option<Bound<'_, PyAny>>) -> PyRes
     }))
 }
 #[pyfunction]
+#[pyo3(name = "SetMaxNReg", signature = (nreg))]
+fn set_max_nreg(nreg: u32) -> PyResult<PyStmt> {
+    Ok(PyStmt(ir::Stmt::SetMaxNReg { nreg }))
+}
+#[pyfunction]
 #[pyo3(name = "MBarrierInit", signature = (mbar, *, count, stage = None))]
 fn mbarrier_init(
     mbar: Bound<'_, PyAny>,
@@ -2603,6 +2608,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(loop_stmt, m)?,
         wrap_pyfunction!(break_if, m)?,
         wrap_pyfunction!(if_stmt, m)?,
+        wrap_pyfunction!(set_max_nreg, m)?,
         wrap_pyfunction!(mbarrier_init, m)?,
         wrap_pyfunction!(mbarrier_arrive, m)?,
         wrap_pyfunction!(mbarrier_wait, m)?,

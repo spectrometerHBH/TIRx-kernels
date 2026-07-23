@@ -621,18 +621,14 @@ fn validate_stmt(s: &Stmt) -> R {
             }
         }
         Stmt::Loop { .. } => {}
-        Stmt::BreakIf { cond } => {
-            validate_scalar(cond)?;
-            if uses_role_scope(cond) {
-                return bail(
-                    "break_if condition cannot branch on role scope values; use role scope",
-                );
-            }
-        }
-        Stmt::If { cond, .. } => {
-            validate_scalar(cond)?;
-            if uses_role_scope(cond) {
-                return bail("if condition cannot branch on role scope values; use role scope");
+        // If/BreakIf conditions may branch on any scope value — warp/lane
+        // dispatch via `If` IS the execution model (per-warp streams with
+        // masked lanes), so warp_id/lane_id predicates are the normal case.
+        Stmt::BreakIf { cond } => validate_scalar(cond)?,
+        Stmt::If { cond, .. } => validate_scalar(cond)?,
+        Stmt::SetMaxNReg { nreg } => {
+            if *nreg == 0 || *nreg % 8 != 0 {
+                return bail("setmaxnreg nreg must be a positive multiple of 8");
             }
         }
 
@@ -1320,15 +1316,6 @@ fn validate_task_space(space: &TaskSpace) -> R {
 
 fn validate_scheduler(scheduler: &Scheduler) -> R {
     validate_task_space(&scheduler.space)
-}
-
-/// `_uses_scope_value` for the role-scope kinds (warp_id / warpgroup_id).
-fn uses_role_scope(v: &ScalarValue) -> bool {
-    match v {
-        ScalarValue::Scope(k) => matches!(k, ScopeValueKind::WarpId | ScopeValueKind::WarpgroupId),
-        ScalarValue::Expr(e) => e.args.iter().any(uses_role_scope),
-        _ => false,
-    }
 }
 
 // ---------------------------------------------------------------------------

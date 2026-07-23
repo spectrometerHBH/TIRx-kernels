@@ -46,6 +46,71 @@ pub struct ScalarExpr {
     pub args: Vec<ScalarValue>,
 }
 
+/// Python floor division (rounds toward -inf).
+fn floor_div(a: i64, b: i64) -> i64 {
+    let q = a / b;
+    let r = a % b;
+    if r != 0 && ((r < 0) != (b < 0)) {
+        q - 1
+    } else {
+        q
+    }
+}
+/// Python modulo (sign follows divisor).
+fn floor_mod(a: i64, b: i64) -> i64 {
+    let m = a % b;
+    if m != 0 && ((m < 0) != (b < 0)) {
+        m + b
+    } else {
+        m
+    }
+}
+
+/// Pure `ScalarOp` application on i64 operands: floor div/mod (Python
+/// semantics, sign follows divisor), bitwise And/Or/Xor, logical Not,
+/// comparison results as 0/1. The single source of the scalar ALU — shared by
+/// the interpreter's evaluator and the static thread filter. Division or
+/// modulo by zero is the only failure.
+pub fn apply_scalar_op(op: ScalarOp, args: &[i64]) -> Result<i64, &'static str> {
+    Ok(match op {
+        ScalarOp::Add => args[0].wrapping_add(args[1]),
+        ScalarOp::Sub => args[0].wrapping_sub(args[1]),
+        ScalarOp::Mul => args[0].wrapping_mul(args[1]),
+        ScalarOp::Xor => args[0] ^ args[1],
+        ScalarOp::And => args[0] & args[1],
+        ScalarOp::Or => args[0] | args[1],
+        ScalarOp::Eq => (args[0] == args[1]) as i64,
+        ScalarOp::Ne => (args[0] != args[1]) as i64,
+        ScalarOp::Lt => (args[0] < args[1]) as i64,
+        ScalarOp::Le => (args[0] <= args[1]) as i64,
+        ScalarOp::Gt => (args[0] > args[1]) as i64,
+        ScalarOp::Ge => (args[0] >= args[1]) as i64,
+        ScalarOp::FloorDiv => {
+            if args[1] == 0 {
+                return Err("division by zero");
+            }
+            floor_div(args[0], args[1])
+        }
+        ScalarOp::Mod => {
+            if args[1] == 0 {
+                return Err("modulo by zero");
+            }
+            floor_mod(args[0], args[1])
+        }
+        ScalarOp::Neg => -args[0],
+        ScalarOp::Not => (args[0] == 0) as i64,
+        ScalarOp::Select => {
+            if args[0] != 0 {
+                args[1]
+            } else {
+                args[2]
+            }
+        }
+        ScalarOp::Min => args[0].min(args[1]),
+        ScalarOp::Max => args[0].max(args[1]),
+    })
+}
+
 /// `ScalarValue = int | Var | ScalarExpr | ScopeValue` — the Python union type,
 /// expressed as a Rust enum (Python dispatched on isinstance; Rust matches).
 /// `Expr` is boxed because the type is recursive (an expr contains scalar values).

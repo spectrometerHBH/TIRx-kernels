@@ -374,10 +374,19 @@ def test_rejects_inconsistent_cta_group():
         make([n.Role(body=body, warp=0)])
 
 
-def test_rejects_if_branching_on_role_scope():
-    cond = n.ScopeValue(kind="warp_id")
-    with pytest.raises(ValueError, match="cannot branch on role scope"):
-        make([n.If(cond=cond, then_body=())])
+def test_if_may_branch_on_warp_and_lane_scope():
+    # Warp/lane dispatch via If IS the execution model: predicates over
+    # warp_id/warpgroup_id/lane_id are the normal case, not an error.
+    cond = n.ScopeValue(kind="warp_id").eq(0)
+    make([n.If(cond=cond, then_body=())])
+
+
+def test_setmaxnreg_requires_positive_multiple_of_8():
+    make([n.If(cond=n.ScopeValue(kind="warpgroup_id").eq(0), then_body=(n.SetMaxNReg(nreg=232),))])
+    with pytest.raises(ValueError, match="positive multiple of 8"):
+        make([n.SetMaxNReg(nreg=100)])
+    with pytest.raises(ValueError, match="positive multiple of 8"):
+        make([n.SetMaxNReg(nreg=0)])
 
 
 def test_rejects_loop_nonpositive_step():

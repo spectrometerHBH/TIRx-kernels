@@ -370,6 +370,13 @@ pub enum Stmt {
         cond: ScalarValue,
         then_body: Vec<Stmt>,
     },
+    /// `setmaxnreg` register reallocation for the enclosing warpgroup(s).
+    /// Simulation metadata only (register pressure is not modeled); carried in
+    /// the IR so codegen can emit the PTX directive. Validation requires the
+    /// enclosing branch to statically cover whole warpgroups.
+    SetMaxNReg {
+        nreg: u32,
+    },
 
     // ---- mbarrier ----
     MBarrierInit {

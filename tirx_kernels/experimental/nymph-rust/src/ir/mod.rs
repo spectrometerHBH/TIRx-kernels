@@ -15,6 +15,7 @@ pub mod scalar;
 pub mod scheduler;
 pub mod stmt;
 pub mod tensor;
+pub mod thread_filter;
 pub mod validate;
 
 // Re-export everything so callers can write `nymph::ir::Tensor` etc.
@@ -25,6 +26,7 @@ pub use scalar::*;
 pub use scheduler::*;
 pub use stmt::*;
 pub use tensor::*;
+pub use thread_filter::*;
 pub use validate::*;
 
 #[cfg(test)]
