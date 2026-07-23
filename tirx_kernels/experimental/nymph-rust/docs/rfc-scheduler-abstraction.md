@@ -1,9 +1,16 @@
 # RFC: First-Class Tile Scheduler Abstraction
 
-**Status:** Draft.
+**Status:** Superseded — kept as a historical record.
 **Scope:** Nymph IR, the value simulator (`nymph-rust`), and the bounded
 synchronization checker. Codegen is out of nymph's scope but the design must be
 codegen-compatible (§8).
+
+> **Superseded.** The role-stream execution model this RFC is written against
+> was replaced by per-warp streams: one stream per `(cta, warp)`, every stream
+> running the whole kernel body, and thread dispatch via `If` predicates
+> (`if_warp(n)` instead of the deleted `role(warp=n)`). The builder examples
+> below use the old `k.role(...)` surface and no longer build. See
+> `interpreter.md` for the current execution model.
 
 ## 1. Problem
 

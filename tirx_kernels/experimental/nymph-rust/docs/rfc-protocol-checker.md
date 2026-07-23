@@ -8,8 +8,8 @@ IR syntax and codegen are out of scope.
 
 The current interpreter already has the hard parts a protocol checker needs:
 
-- CTA/thread expansion and deterministic stream scheduling;
-- nested role/control-flow execution;
+- CTA/thread expansion and deterministic per-warp stream scheduling;
+- nested control-flow and thread-dispatch execution;
 - precise mbarrier wake and deadlock detection;
 - CTA-local ownership for SMEM/TMEM and cross-CTA cluster state;
 - fail-closed runtime diagnostics.
@@ -245,7 +245,7 @@ raw trace timing does not retain one `TraceEvent` per protocol action.
 
 | Op family | Value mode | Trace mode |
 | --- | --- | --- |
-| Control, roles, loops, scheduler frames | Push/advance frames and scalar vars. | Same. Control flow must be real in both modes. |
+| Control, thread dispatch, loops, scheduler frames | Push/advance frames and scalar vars. | Same. Control flow must be real in both modes. |
 | Scalar ops | Compute scalar env values; tensor scalar initial loads read the cell. | Same — scalars drive control/addressing. `store_scalar` runs in trace too and marks its target scalar cell valid (§8). A tensor scalar load from invalid skipped-payload data makes the report inconclusive. |
 | Mbarrier | Mutate phase cells and wake waiters. | Same phase-cell mutation, plus mbar events. This is protocol state, not numeric value state. |
 | Sync | Mutate cooperative rendezvous state. | Same, plus sync events. |
@@ -382,8 +382,12 @@ events.
 
 Event-based HB/region data-race analysis is implemented by
 `ordering_analysis` and `memory_race_check`: overlapping SMEM/TMEM accesses
-with at least one write must be HB ordered. Output formula injectivity remains
-out of scope for the current checker.
+with at least one write must be HB ordered. HB edges come from per-stream
+program order, mbar phase-keyed release/acquire, and cooperative-barrier
+generations (`cta_sync`/`wg_sync`/`warp_sync`/`cluster_sync`). Warps of one
+CTA are separate streams, so cross-warp access pairs inside a CTA carry no
+implicit ordering and are race-checked like any other pair. Output formula
+injectivity remains out of scope for the current checker.
 
 Payload-dependent control is represented separately from protocol failure. If trace hits
 `trace_control_from_skipped_payload`, the report is `Inconclusive`, not `Failed`. The

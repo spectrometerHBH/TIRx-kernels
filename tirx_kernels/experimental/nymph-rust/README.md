@@ -7,16 +7,19 @@ statement semantics are implemented in Rust.
 
 Nymph IR is a small concurrent language for describing GPU kernel protocols.
 Each source statement is a semantic execution unit. The interpreter expands a
-bounded launch into concrete CTAs and threads, groups active thread masks into
-CTA-local execution streams, and advances those streams under a deterministic
-scheduler.
+bounded launch into concrete CTAs and threads, materializes one execution
+stream per `(cta, warp)`, and advances every stream through the whole kernel
+body under a deterministic scheduler. The warp is the hardware's lockstep unit
+(32 lanes step together under masked execution); everything above the warp is
+concurrency, ordered only by explicit synchronization.
 
 ## Documentation
 
 - [IR](docs/ir.md) - the Rust IR data model, validation policy, and extension
   rules.
-- [Interpreter Architecture](docs/interpreter.md) - scheduling, roles,
-  blocking, value state, and the direct-mutation execution model.
+- [Interpreter Architecture](docs/interpreter.md) - per-warp streams,
+  scheduling, thread dispatch, blocking, value state, and the direct-mutation
+  execution model.
 - [Interpreter Semantics](docs/interpreter-semantics.md) - reviewed semantics
   by statement family and the current proof boundary.
 - [Hardware Verification](docs/hardware-verification.md) - B200 validation for
@@ -33,7 +36,7 @@ runtime values and GMEM outputs.
 
 This deterministic execution is useful for regression tests and value
 validation, but it is not itself a proof of protocol safety. A protocol checker
-must prove a stronger property: within a bounded configuration, all legal role
+must prove a stronger property: within a bounded configuration, all legal warp
 and CTA interleavings are deterministic over observable memory and outputs, and
 all modeled waits can make progress. Explicit synchronization in the IR must be
 sufficient to make the program confluent.

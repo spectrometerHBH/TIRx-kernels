@@ -23,9 +23,12 @@ Full checker passes run only after trace execution returns `Passed`.
 
 ## 2. Execution Model
 
-- A role/stream executes its dynamic operations in order.
+- A stream is one warp (`(cta, warp)`) and executes its dynamic operations in
+  order.
 - Each modeled op is atomic at checker granularity.
-- Different roles/streams may interleave arbitrarily.
+- Different streams may interleave arbitrarily. Warps of one CTA are separate
+  streams: cross-warp pairs carry no implicit ordering, and there is no
+  same-stream exemption above the warp.
 - Barriers, waits, syncs, fences, commits, and async drains constrain legal
   interleavings.
 - Event vector order is canonical trace order, not cross-stream
@@ -148,7 +151,12 @@ The checker is a pass pipeline over `Kernel IR + TraceEvents`:
 - `trace_schema_audit`: validates common event fields and non-region schema.
 - `trace_region_audit`: validates `Region` owner/rank/bounds/empty-box rules.
 - `barrier_cycle_audit`: audits mbarrier and sync counters/cycles.
-- `ordering_analysis`: builds schedule-independent happens-before edges.
+- `ordering_analysis`: builds schedule-independent happens-before edges from
+  per-stream program order, mbar phase-keyed release/acquire, and cooperative
+  barriers. A cooperative-barrier generation is keyed by
+  `(statement, rendezvous domain, cycle)`: all arrivals of one generation join
+  into a release clock frozen by the completing arrival, and every passage of
+  that generation acquires it.
 - `deadlock_freedom`: proves modeled blocking operations have no wait cycle.
 - `async_group_lifetime`: checks cp.async/TMA source windows.
 - `tmem_async_hazard`: checks overlapping TMEM async windows.
