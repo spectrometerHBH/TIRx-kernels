@@ -10,7 +10,7 @@ def test_for_each_task_cluster_grid_stride_drives_value_flow():
     reg = reg_tensor(b)
     sched = b.scheduler(b.task_space(grid=(4,), fields=("task",)))
 
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         with b.for_each_task(sched) as task:
             b.reg_load(reg[0], source[task.task_id])
             b.reg_store(out[task.task_id], reg[0])
@@ -28,11 +28,11 @@ def test_for_each_task_grid_stride_shares_canonical_stream_across_roles():
     reg1 = reg_tensor(b)
     sched = b.scheduler(b.task_space(grid=(4,), fields=("task",)))
 
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         with b.for_each_task(sched) as task:
             b.reg_load(reg0[0], source[task.task_id])
             b.reg_store(out0[task.task_id], reg0[0])
-    with b.role(warp=1, elected=True):
+    with b.if_warp(1), b.if_elected():
         with b.for_each_task(sched) as task:
             b.reg_load(reg1[0], source[task.task_id])
             b.reg_store(out1[task.task_id], reg1[0])
@@ -50,7 +50,7 @@ def test_sched_next_loop_break_runs_canonical_dynamic_scheduler():
     sched = b.scheduler(b.task_space(grid=(4,), fields=("task",)), policy="custom")
 
     with b.scheduler_impl(sched):
-        with b.role(warp=0, elected=True):
+        with b.if_warp(0), b.if_elected():
             with b.loop():
                 task = b.sched_next(sched)
                 b.break_if(task.task_id < 0)
@@ -82,7 +82,7 @@ def test_clc_shaped_scheduler_broadcast_consumer_pipeline_completes():
 
     # mbarrier.init/arrive are per-thread: a single thread initializes and
     # pre-arms the cells.
-    with b.kernel_init(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.mbarrier_init(full, count=1, stage=0)
         b.mbarrier_init(full, count=1, stage=1)
         b.mbarrier_init(empty, count=1, stage=0)
@@ -93,7 +93,7 @@ def test_clc_shaped_scheduler_broadcast_consumer_pipeline_completes():
     # implicit barrier between kernel_init and roles in the per-warp model).
     b.cta_sync()
 
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         sched_iter = b.scalar(initial=0, dtype=nr.ScalarDType.I32)
         with b.scheduler_impl(sched):
             with b.loop():
@@ -104,7 +104,7 @@ def test_clc_shaped_scheduler_broadcast_consumer_pipeline_completes():
                 b.scalar_store(sched_iter, add_one(sched_iter))
                 b.break_if(task.task_id < 0)
 
-    with b.role(warp=1, elected=True):
+    with b.if_warp(1), b.if_elected():
         consumer_iter = b.scalar(initial=0, dtype=nr.ScalarDType.I32)
         with b.loop():
             b.mbarrier_wait(full, stage=stage_of(consumer_iter), phase=phase_of(consumer_iter))

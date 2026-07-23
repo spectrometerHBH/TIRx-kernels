@@ -22,8 +22,6 @@ from .nymph_rs import (
     ForLoop,
     If,
     Kernel,
-    KernelFinalize,
-    KernelInit,
     LaunchShape,
     Layout,
     LdMatrix,
@@ -55,7 +53,6 @@ from .nymph_rs import (
     RegStore,
     RegSub,
     RegUnary,
-    Role,
     ScalarDef,
     ScalarDType,
     ScalarStore,
@@ -833,64 +830,6 @@ class IRBuilder:
 
     def cluster_sync(self) -> None:
         self._append(ClusterSync())
-
-    @contextmanager
-    def role(
-        self,
-        *,
-        warp: int | None = None,
-        warpgroup: int | None = None,
-        elected: bool = False,
-        maxnreg: int | None = None,
-    ) -> Iterator[None]:
-        body: list[Stmt] = []
-        self._body_stack.append(body)
-        try:
-            yield
-        except Exception:
-            self._body_stack.pop()
-            raise
-        else:
-            self._body_stack.pop()
-            self._append(
-                Role(
-                    body=tuple(body),
-                    warp=warp,
-                    warpgroup=warpgroup,
-                    elected=elected,
-                    maxnreg=maxnreg,
-                )
-            )
-
-    @contextmanager
-    def kernel_init(
-        self, *, warp: int | None = None, lane: int | None = None, elected: bool = False
-    ) -> Iterator[None]:
-        body: list[Stmt] = []
-        self._body_stack.append(body)
-        try:
-            yield
-        except Exception:
-            self._body_stack.pop()
-            raise
-        else:
-            self._body_stack.pop()
-            self._append(KernelInit(body=tuple(body), warp=warp, lane=lane, elected=elected))
-
-    @contextmanager
-    def kernel_finalize(
-        self, *, warp: int | None = None, lane: int | None = None, elected: bool = False
-    ) -> Iterator[None]:
-        body: list[Stmt] = []
-        self._body_stack.append(body)
-        try:
-            yield
-        except Exception:
-            self._body_stack.pop()
-            raise
-        else:
-            self._body_stack.pop()
-            self._append(KernelFinalize(body=tuple(body), warp=warp, lane=lane, elected=elected))
 
     def _append(self, stmt: Stmt) -> None:
         self._body_stack[-1].append(stmt)

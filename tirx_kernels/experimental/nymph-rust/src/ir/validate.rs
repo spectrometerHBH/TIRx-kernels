@@ -30,7 +30,6 @@ fn bail(msg: impl Into<String>) -> R {
     Err(err(msg))
 }
 
-
 // ---------------------------------------------------------------------------
 // small leaf helpers (mirror the `_check_*` functions)
 // ---------------------------------------------------------------------------
@@ -93,14 +92,6 @@ fn check_cta_group(value: u8, label: &str) -> R {
 fn check_uint16(value: Option<u16>, _label: &str) -> R {
     // Stored as u16, so range is already guaranteed; nothing to check.
     let _ = value;
-    Ok(())
-}
-fn check_lane(value: Option<u32>, label: &str) -> R {
-    if let Some(v) = value {
-        if v >= 32 {
-            return bail(format!("{label} must be in [0, 32)"));
-        }
-    }
     Ok(())
 }
 fn check_tmem_cols(value: u32, label: &str) -> R {
@@ -550,28 +541,6 @@ fn validate_stmt(s: &Stmt) -> R {
             }
         }
 
-        Stmt::KernelInit { lane, .. } | Stmt::KernelFinalize { lane, .. } => {
-            check_lane(*lane, "kernel_init/finalize lane")?;
-        }
-        Stmt::Role {
-            warp,
-            warpgroup,
-            elected,
-            maxnreg,
-            ..
-        } => {
-            if warp.is_some() && warpgroup.is_some() {
-                return bail("role cannot set both warp and warpgroup");
-            }
-            if let Some(m) = maxnreg {
-                if warpgroup.is_none() || *elected {
-                    return bail("role maxnreg requires a non-elected warpgroup role");
-                }
-                if *m < 1 || m % 8 != 0 {
-                    return bail("role maxnreg must be a positive multiple of 8");
-                }
-            }
-        }
         Stmt::ForLoop {
             var,
             start,
@@ -1343,83 +1312,6 @@ fn define_var(var: Var, defined: &mut HashSet<Var>) -> R {
     Ok(())
 }
 
-/// The threads a `KernelInit`/`KernelFinalize` mask selects (mirrors the
-/// scheduler's `kernel_scope_matches`). Interim until the variants are
-/// deleted — role dispatch is becoming plain `If`.
-fn init_thread_set(
-    warp: Option<u32>,
-    lane: Option<u32>,
-    elected: bool,
-    num_warps: u32,
-) -> ThreadSet {
-    ThreadSet::from_fn(num_warps, |w, l| {
-        if let Some(sel) = warp {
-            if w != sel {
-                return false;
-            }
-        }
-        if let Some(sel) = lane {
-            return l == sel && (warp.is_some() || w == 0);
-        }
-        if elected {
-            return l == 0 && (warp.is_some() || w == 0);
-        }
-        true
-    })
-}
-
-/// The threads a `Role` mask selects (mirrors the scheduler's `role_matches`).
-fn role_thread_set(
-    warp: Option<u32>,
-    warpgroup: Option<u32>,
-    elected: bool,
-    num_warps: u32,
-) -> ThreadSet {
-    ThreadSet::from_fn(num_warps, |w, l| {
-        if let Some(sel) = warp {
-            if w != sel {
-                return false;
-            }
-        }
-        if let Some(sel) = warpgroup {
-            if w / 4 != sel {
-                return false;
-            }
-        }
-        if !elected {
-            return true;
-        }
-        if warp.is_some() {
-            return l == 0;
-        }
-        if warpgroup.is_some() {
-            return w % 4 == 0 && l == 0;
-        }
-        w == 0 && l == 0
-    })
-}
-
-fn check_role_geometry(
-    warp: Option<u32>,
-    warpgroup: Option<u32>,
-    num_warps: u32,
-    is_role: bool,
-) -> R {
-    if let Some(w) = warp {
-        if w >= num_warps {
-            return bail("role/kernel scope warp must be in [0, kernel num_warps)");
-        }
-    }
-    if is_role {
-        if let Some(wg) = warpgroup {
-            if wg >= num_warps / 4 {
-                return bail("role warpgroup must be in [0, kernel num_warps / 4)");
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Walks 1 (var-defs) + 2 (thread-shape rules), threading the defined-set and
 /// the static thread filter of the enclosing branch chain.
 ///
@@ -1607,50 +1499,6 @@ fn check_context(
                 let mut vars = Vec::new();
                 collect_vars(cond, &mut vars);
                 require_defined(&vars, defined, "break_if condition")?;
-            }
-            Stmt::KernelInit {
-                body,
-                warp,
-                lane,
-                elected,
-            }
-            | Stmt::KernelFinalize {
-                body,
-                warp,
-                lane,
-                elected,
-            } => {
-                check_role_geometry(*warp, None, num_warps, false)?;
-                let inner = narrow(filter, &init_thread_set(*warp, *lane, *elected, num_warps));
-                check_context(
-                    body,
-                    &inner,
-                    defined,
-                    num_warps,
-                    in_scheduler_impl,
-                    scheduler_loop_depth,
-                )?;
-            }
-            Stmt::Role {
-                body,
-                warp,
-                warpgroup,
-                elected,
-                ..
-            } => {
-                check_role_geometry(*warp, *warpgroup, num_warps, true)?;
-                let inner = narrow(
-                    filter,
-                    &role_thread_set(*warp, *warpgroup, *elected, num_warps),
-                );
-                check_context(
-                    body,
-                    &inner,
-                    defined,
-                    num_warps,
-                    in_scheduler_impl,
-                    scheduler_loop_depth,
-                )?;
             }
             Stmt::If { cond, then_body } => {
                 let mut vars = Vec::new();

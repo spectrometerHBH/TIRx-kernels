@@ -31,7 +31,7 @@ def test_reg_float_and_cvt_value_semantics_round_destination_dtypes():
     f16_tmp = reg_tensor(b, dtype=nr.DType.F16, shape=(4,))
     bf16_tmp = reg_tensor(b, dtype=nr.DType.BF16, shape=(4,))
 
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.reg_load(lhs, lhs_g)
         b.reg_load(rhs, rhs_g)
         b.reg_load(acc, acc_g)
@@ -83,7 +83,7 @@ def test_reg_integer_alu_value_semantics():
     u_rhs = reg_tensor(b, shape=(4,))
     u_tmp = reg_tensor(b, shape=(4,))
 
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.reg_load(i_lhs, i_lhs_g)
         b.reg_load(i_rhs, i_rhs_g)
         for op, out_t in [
@@ -146,7 +146,7 @@ def test_reg_extended_float_ops_literals_broadcast_reduce_and_unary():
     shifted = reg_tensor(b, dtype=nr.DType.F32, shape=(4,))
     expv = reg_tensor(b, dtype=nr.DType.F32, shape=(4,))
 
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.reg_load(vec, src_g)
         b.reg_reduce(scalar, vec, op="sum")
         b.reg_reduce(max_scalar, vec, op="max")
@@ -180,7 +180,7 @@ def test_reg_bitwise_shift_and_combine_int_frac_ex2_value_semantics():
     frac = reg_tensor(b, dtype=nr.DType.F32, shape=(2,))
     combined = reg_tensor(b, dtype=nr.DType.F32, shape=(2,))
 
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.reg_load(lhs, lhs_g)
         b.reg_load(rhs, rhs_g)
         b.reg_bitwise(tmp, lhs, rhs, op="and")
@@ -222,7 +222,7 @@ def test_reg_softmax_rescale_keeps_small_row_max_increase():
     row_max = reg_tensor(b, dtype=nr.DType.F32, shape=(1,))
     row_scale = reg_tensor(b, dtype=nr.DType.F32, shape=(1,))
 
-    with b.role(warp=0):
+    with b.if_warp(0):
         b.reg_load(old, old_g[b.tid_in_wg()])
         b.reg_load(new, new_g[b.tid_in_wg()])
         b.reg_softmax_rescale(row_max, row_scale, old, new, 1.0, threshold=8.0)
@@ -257,7 +257,7 @@ def test_reg_softmax_rescale_accepts_register_threshold():
     row_max = reg_tensor(b, dtype=nr.DType.F32, shape=(1,))
     row_scale = reg_tensor(b, dtype=nr.DType.F32, shape=(1,))
 
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.reg_load(old, old_g[0])
         b.reg_load(new, new_g[0])
         b.reg_load(threshold, threshold_g[0])
@@ -277,7 +277,7 @@ def test_reg_min_caps_safe_reciprocal_for_fa4_epilogue():
     row_sum = reg_tensor(b, dtype=nr.DType.F32, shape=(4,))
     inv = reg_tensor(b, dtype=nr.DType.F32, shape=(4,))
 
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.reg_load(row_sum, row_sum_g)
         b.reg_unary(inv, row_sum, op="rcp")
         b.reg_min(inv, 1.0, inv)
@@ -296,7 +296,7 @@ def test_reg_cond_rescale_uses_warpgroup_any_scope():
     scale = reg_tensor(b, dtype=nr.DType.F32, shape=(1,))
     out = reg_tensor(b, dtype=nr.DType.F32, shape=(1,))
 
-    with b.role(warpgroup=0):
+    with b.if_warpgroup(0):
         b.reg_load(src, src_g[0])
         b.reg_load(scale, scale_g[b.tid_in_wg()])
         b.reg_cond_rescale(out, src, scale, threshold=1.0, scope="warpgroup")
@@ -324,7 +324,7 @@ def test_reg_cond_rescale_direct_matches_slow_dynamic_slot():
     out_slow = reg_tensor(b, dtype=nr.DType.F32, shape=(2,))
     slot = b.tid_in_wg() % 2
 
-    with b.role(warpgroup=0):
+    with b.if_warpgroup(0):
         b.reg_load(src_direct, src_g[b.tid_in_wg()])
         b.reg_load(scale_direct, scale_g[b.tid_in_wg()])
         b.reg_cond_rescale(out_direct, src_direct, scale_direct, threshold=1.0, scope="warpgroup")
@@ -357,7 +357,7 @@ def test_reg_causal_mask_uses_thread_row_and_element_index():
     src = reg_tensor(b, dtype=nr.DType.F32, shape=(4,))
     out = reg_tensor(b, dtype=nr.DType.F32, shape=(4,))
 
-    with b.role(warpgroup=1):
+    with b.if_warpgroup(1):
         b.reg_load(src, src_g[b.tid_in_wg(), 0:4])
         b.reg_causal_mask(out, src, query_start=10, key_start=8, group_size=4, mask_value=-99.0)
         b.reg_store(out_g[b.tid_in_wg(), 0:4], out)
@@ -384,7 +384,7 @@ def test_reg_causal_mask_direct_matches_slow_dynamic_slot():
     out_slow = reg_tensor(b, dtype=nr.DType.F32, shape=(2, 4))
     slot = b.tid_in_wg() % 2
 
-    with b.role(warpgroup=1):
+    with b.if_warpgroup(1):
         b.reg_load(src_direct, src_g[b.tid_in_wg(), 0:4])
         b.reg_causal_mask(
             out_direct, src_direct, query_start=10, key_start=8, group_size=4, mask_value=-99.0
@@ -415,7 +415,7 @@ def test_reg_smem_is_owned_per_cta():
     first = reg_tensor(b)
     second = reg_tensor(b)
 
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.reg_load(first[0], cta_values[b.cta_id()])
         b.reg_store(cta_smem[0], first[0])
         b.reg_load(second[0], cta_smem[0])
@@ -431,7 +431,7 @@ def test_reg_overlap_failure_is_fail_closed():
     overlap_out = gmem_arg(b, shape=(1,))
     overlap_reg = reg_tensor(b)
 
-    with b.role(warp=0):
+    with b.if_warp(0):
         b.reg_load(overlap_reg[0], overlap_src[b.lane_id()])
         b.reg_store(overlap_out[0], overlap_reg[0])
 
@@ -457,7 +457,7 @@ def test_reg_trace_region_uses_register_rows_for_warp_uniform_slice():
     b = builder("reg_region_warp_uniform", num_warps=4)
     reg = reg_tensor(b, shape=(1,))
 
-    with b.role(warp=0):
+    with b.if_warp(0):
         b.reg_fill(reg[0], 1)
 
     report = nr.check_protocol(b.build(), include_events=True)
@@ -472,7 +472,7 @@ def test_reg_trace_region_keeps_lane_id_diagonal_exact():
     b = builder("reg_region_lane_diagonal", num_warps=4)
     reg = reg_tensor(b, shape=(32,))
 
-    with b.role(warp=0):
+    with b.if_warp(0):
         b.reg_fill(reg[b.lane_id()], 1)
 
     report = nr.check_protocol(b.build(), include_events=True)
@@ -489,7 +489,7 @@ def test_reg_trace_region_elected_thread_covers_tensor_slice():
     b = builder("reg_region_elected_slice", num_warps=4)
     reg = reg_tensor(b, shape=(4,))
 
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.reg_fill(reg, 1)
 
     report = nr.check_protocol(b.build(), include_events=True)

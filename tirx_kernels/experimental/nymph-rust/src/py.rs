@@ -1731,9 +1731,6 @@ impl PyStmt {
             | ir::Stmt::ForEachTask { body, .. }
             | ir::Stmt::SchedulerImpl { body, .. }
             | ir::Stmt::Loop { body }
-            | ir::Stmt::Role { body, .. }
-            | ir::Stmt::KernelInit { body, .. }
-            | ir::Stmt::KernelFinalize { body, .. }
             | ir::Stmt::If {
                 then_body: body, ..
             } => Ok(body.iter().map(|s| PyStmt(s.clone())).collect()),
@@ -1814,53 +1811,6 @@ fn store_scalar(dst: Bound<'_, PyAny>, value: Bound<'_, PyAny>) -> PyResult<PySt
 #[pyo3(name = "MBarDef")]
 fn mbar_def(mbar: PyMBar) -> PyStmt {
     PyStmt(ir::Stmt::MBarDef { mbar: mbar.0 })
-}
-#[pyfunction]
-#[pyo3(name = "KernelInit", signature = (body = None, warp = None, lane = None, elected = false))]
-fn kernel_init(
-    body: Option<Bound<'_, PyAny>>,
-    warp: Option<u32>,
-    lane: Option<u32>,
-    elected: bool,
-) -> PyResult<PyStmt> {
-    Ok(PyStmt(ir::Stmt::KernelInit {
-        body: opt_body(body)?,
-        warp,
-        lane,
-        elected,
-    }))
-}
-#[pyfunction]
-#[pyo3(name = "KernelFinalize", signature = (body = None, warp = None, lane = None, elected = false))]
-fn kernel_finalize(
-    body: Option<Bound<'_, PyAny>>,
-    warp: Option<u32>,
-    lane: Option<u32>,
-    elected: bool,
-) -> PyResult<PyStmt> {
-    Ok(PyStmt(ir::Stmt::KernelFinalize {
-        body: opt_body(body)?,
-        warp,
-        lane,
-        elected,
-    }))
-}
-#[pyfunction]
-#[pyo3(name = "Role", signature = (body = None, warp = None, warpgroup = None, elected = false, maxnreg = None))]
-fn role(
-    body: Option<Bound<'_, PyAny>>,
-    warp: Option<u32>,
-    warpgroup: Option<u32>,
-    elected: bool,
-    maxnreg: Option<u32>,
-) -> PyResult<PyStmt> {
-    Ok(PyStmt(ir::Stmt::Role {
-        body: opt_body(body)?,
-        warp,
-        warpgroup,
-        elected,
-        maxnreg,
-    }))
 }
 #[pyfunction]
 #[pyo3(name = "ForLoop", signature = (var, start = None, stop = None, step = None, body = None))]
@@ -2599,9 +2549,6 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(scalar_store, m)?,
         wrap_pyfunction!(store_scalar, m)?,
         wrap_pyfunction!(mbar_def, m)?,
-        wrap_pyfunction!(kernel_init, m)?,
-        wrap_pyfunction!(kernel_finalize, m)?,
-        wrap_pyfunction!(role, m)?,
         wrap_pyfunction!(for_loop, m)?,
         wrap_pyfunction!(for_each_task, m)?,
         wrap_pyfunction!(scheduler_impl, m)?,

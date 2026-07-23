@@ -7,17 +7,11 @@ use super::super::diagnostics::{IResult, InterpreterError};
 use super::super::outcomes::StepStatus;
 use super::super::protocol::TraceEventKind;
 use super::super::registry::{StmtExecutorRegistry, StmtKind};
-use super::super::scheduler::{
-    break_dynamic_loop, kernel_scope_matches, push_dynamic_loop, push_frame, push_loop,
-    role_matches,
-};
-use super::super::threads::{canonical_thread_mask, filter_thread_mask};
+use super::super::scheduler::{break_dynamic_loop, push_dynamic_loop, push_frame, push_loop};
+use super::super::threads::canonical_thread_mask;
 use crate::ir::{SchedulerPolicy, Stmt};
 
 pub fn register(reg: &mut StmtExecutorRegistry) {
-    reg.register(StmtKind::KernelInit, execute_kernel_scope);
-    reg.register(StmtKind::KernelFinalize, execute_kernel_scope);
-    reg.register(StmtKind::Role, execute_role);
     reg.register(StmtKind::ForLoop, execute_loop);
     reg.register(StmtKind::ForEachTask, execute_for_each_task);
     reg.register(StmtKind::SchedulerImpl, execute_scheduler_impl);
@@ -25,52 +19,6 @@ pub fn register(reg: &mut StmtExecutorRegistry) {
     reg.register(StmtKind::Loop, execute_dynamic_loop);
     reg.register(StmtKind::BreakIf, execute_break_if);
     reg.register(StmtKind::If, execute_if);
-}
-
-fn execute_kernel_scope<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
-    stmt: &'k Stmt,
-) -> IResult<StepStatus> {
-    let (body, warp, lane, elected) = match stmt {
-        Stmt::KernelInit {
-            body,
-            warp,
-            lane,
-            elected,
-        }
-        | Stmt::KernelFinalize {
-            body,
-            warp,
-            lane,
-            elected,
-        } => (body, *warp, *lane, *elected),
-        _ => unreachable!(),
-    };
-    let child = filter_thread_mask(&ctx.cohort, |t| {
-        kernel_scope_matches(t, warp, lane, elected)
-    });
-    if !child.is_empty() && !body.is_empty() {
-        push_frame(ctx.stream, body.as_slice(), child);
-    }
-    Ok(StepStatus::advance_continue())
-}
-
-fn execute_role<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
-    let (body, warp, warpgroup, elected) = match stmt {
-        Stmt::Role {
-            body,
-            warp,
-            warpgroup,
-            elected,
-            ..
-        } => (body, *warp, *warpgroup, *elected),
-        _ => unreachable!(),
-    };
-    let child = filter_thread_mask(&ctx.cohort, |t| role_matches(t, warp, warpgroup, elected));
-    if !child.is_empty() && !body.is_empty() {
-        push_frame(ctx.stream, body.as_slice(), child);
-    }
-    Ok(StepStatus::advance_continue())
 }
 
 fn execute_scheduler_impl<'a, 'k>(

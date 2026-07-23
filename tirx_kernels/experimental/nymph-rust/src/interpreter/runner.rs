@@ -89,8 +89,7 @@ fn kind_name(k: super::registry::StmtKind) -> &'static str {
         }
         CtaSync | WgSync | WarpSync | ClusterSync => "exec:Sync",
         TmemAlloc | TmemDealloc => "exec:Tmem",
-        ForLoop | ForEachTask | SchedulerImpl | SchedNext | Loop | BreakIf | If | Role
-        | KernelInit | KernelFinalize => "exec:Control",
+        ForLoop | ForEachTask | SchedulerImpl | SchedNext | Loop | BreakIf | If => "exec:Control",
         _ => "exec:other",
     }
 }

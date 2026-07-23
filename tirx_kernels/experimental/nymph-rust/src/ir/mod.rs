@@ -186,11 +186,16 @@ mod tests {
     #[test]
     fn rejects_cta_sync_in_partial_branch() {
         // cta_sync reachable by only warp 0 can never complete on hardware.
-        let body = vec![Stmt::KernelInit {
-            body: vec![Stmt::CtaSync],
-            warp: Some(0),
-            lane: None,
-            elected: false,
+        let warp0 = ScalarValue::expr(
+            ScalarOp::Eq,
+            vec![
+                ScalarValue::Scope(ScopeValueKind::WarpId),
+                ScalarValue::Int(0),
+            ],
+        );
+        let body = vec![Stmt::If {
+            cond: warp0,
+            then_body: vec![Stmt::CtaSync],
         }];
         let e = kernel(body, 4).validate().unwrap_err();
         assert!(
@@ -202,13 +207,10 @@ mod tests {
 
     #[test]
     fn accepts_cta_sync_in_full_cta_branch() {
-        // A bare full-CTA branch: reachability, not nesting, is what matters.
-        let body = vec![Stmt::Role {
-            body: vec![Stmt::CtaSync],
-            warp: None,
-            warpgroup: None,
-            elected: false,
-            maxnreg: None,
+        // A statically-true branch: reachability, not nesting, is what matters.
+        let body = vec![Stmt::If {
+            cond: ScalarValue::Int(1),
+            then_body: vec![Stmt::CtaSync],
         }];
         kernel(body, 4).validate().unwrap();
     }

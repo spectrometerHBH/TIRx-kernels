@@ -321,25 +321,6 @@ pub enum Stmt {
     },
 
     // ---- structural / control flow (bodies recurse) ----
-    KernelInit {
-        body: Vec<Stmt>,
-        warp: Option<u32>,
-        lane: Option<u32>,
-        elected: bool,
-    },
-    KernelFinalize {
-        body: Vec<Stmt>,
-        warp: Option<u32>,
-        lane: Option<u32>,
-        elected: bool,
-    },
-    Role {
-        body: Vec<Stmt>,
-        warp: Option<u32>,
-        warpgroup: Option<u32>,
-        elected: bool,
-        maxnreg: Option<u32>,
-    },
     ForLoop {
         var: Var,
         start: ScalarValue,
@@ -618,10 +599,7 @@ impl Stmt {
     /// mirrors Python `Stmt.child_bodies`, used by generic structural walks.
     pub fn child_bodies(&self) -> Vec<&[Stmt]> {
         match self {
-            Stmt::KernelInit { body, .. }
-            | Stmt::KernelFinalize { body, .. }
-            | Stmt::Role { body, .. }
-            | Stmt::ForLoop { body, .. }
+            Stmt::ForLoop { body, .. }
             | Stmt::ForEachTask { body, .. }
             | Stmt::SchedulerImpl { body, .. }
             | Stmt::Loop { body } => vec![body],

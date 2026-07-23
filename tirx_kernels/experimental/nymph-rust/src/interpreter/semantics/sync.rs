@@ -60,9 +60,7 @@ fn in_scope(stmt: &Stmt, first: &ThreadId, t: &ThreadId) -> bool {
     match stmt {
         Stmt::ClusterSync => t.cluster_id == first.cluster_id,
         Stmt::CtaSync => t.cta_id == first.cta_id,
-        Stmt::WgSync { .. } => {
-            t.cta_id == first.cta_id && t.warpgroup_id() == first.warpgroup_id()
-        }
+        Stmt::WgSync { .. } => t.cta_id == first.cta_id && t.warpgroup_id() == first.warpgroup_id(),
         Stmt::WarpSync => t.cta_id == first.cta_id && t.warp_id == first.warp_id,
         _ => unreachable!(),
     }

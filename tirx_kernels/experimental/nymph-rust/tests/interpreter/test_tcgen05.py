@@ -124,13 +124,23 @@ def _tcgen05_role_failure_kernel(op, *, row=0, col=0, elected=False):
     b = builder("tcgen05_datapath_failure")
     src = tmem_tensor(b, dtype=nr.DType.F32, shape=(128, 128), col_start=0)
     dst = reg_tensor(b, dtype=nr.DType.F32, shape=(1,))
-    with b.kernel_init(warp=0):
+    with b.if_warp(0):
         b.tmem_alloc(src, n_cols=64)
-    with b.role(warp=0, elected=elected):
+
+    def emit():
         if op == "ld":
             b.tcgen05_ld(dst, src, row=row, col=col)
         else:
             b.tcgen05_st(src, dst, row=row, col=col)
+
+    if elected:
+        # A single-lane cohort: ld/st are warp-collective, so this is the
+        # partial-warp shape the mask check rejects.
+        with b.if_warp(0), b.if_elected():
+            emit()
+    else:
+        with b.if_warp(0):
+            emit()
     return b.build()
 
 
@@ -161,10 +171,10 @@ def _tcgen05_datapath_kernel(shape, num, mode):
     out_reg = reg_tensor(b, shape=(reg_size,))
     chunk_reg = reg_tensor(b, shape=(128,))
 
-    with b.kernel_init(warp=0):
+    with b.if_warp(0):
         b.tmem_alloc(tmem, n_cols=256)
 
-    with b.role(warpgroup=0):
+    with b.if_warpgroup(0):
         for col in [0, 128]:
             b.reg_load(seed_reg, _reg_row_cols(b, seed_g, col, 128))
             b.tcgen05_st(tmem, seed_reg, shape="32x32b", num=128, row=0, col=col)
@@ -179,7 +189,7 @@ def _tcgen05_datapath_kernel(shape, num, mode):
             b.tcgen05_ld(out_reg, tmem, shape=shape, num=num, row=0, col=0)
             b.reg_store(_reg_row_cols(b, out, 0, reg_size), out_reg)
 
-    with b.kernel_finalize(warp=0):
+    with b.if_warp(0):
         b.tmem_dealloc(tmem, n_cols=256)
 
     return b.build(), seed_g, source_g, out
@@ -246,7 +256,7 @@ def _mma64_kernel(dtype, lane_align, accum, trans_a, trans_b):
     mb = b.mbar(kind=nr.MBarKind.TMA)
     mc = b.mbar(kind=nr.MBarKind.TCGEN05)
 
-    with b.kernel_init(warp=0):
+    with b.if_warp(0):
         b.tmem_alloc(dst, n_cols=32)
         # mbarrier.init is per-thread: exactly one thread initializes each cell.
         with b.if_elected():
@@ -257,7 +267,7 @@ def _mma64_kernel(dtype, lane_align, accum, trans_a, trans_b):
     # between kernel_init and roles in the per-warp model).
     b.cta_sync()
 
-    with b.role(warpgroup=0):
+    with b.if_warpgroup(0):
         b.reg_load(frag, zero_g[b.tid_in_wg(), 0:n])
         b.tcgen05_st(dst, frag, shape="32x32b", num=n, row=0, col=0)
         b.tcgen05_wait_st()
@@ -288,7 +298,7 @@ def _mma64_kernel(dtype, lane_align, accum, trans_a, trans_b):
 
     # Every warp's loads retire before the dealloc.
     b.cta_sync()
-    with b.kernel_finalize(warp=0):
+    with b.if_warp(0):
         b.tmem_dealloc(dst, n_cols=32)
 
     return b.build(), a_g, b_g, zero_g, out
@@ -351,11 +361,11 @@ def _build_mma_failure(
     a = smem_tensor(b, dtype=nr.DType.F16, shape=a_shape, byte_offset=0)
     b_s = smem_tensor(b, dtype=nr.DType.F16, shape=(16, 16), byte_offset=4096)
     if allocate:
-        with b.kernel_init(warp=0):
+        with b.if_warp(0):
             b.tmem_alloc(dst, n_cols=32)
     # tcgen05_mma is a single-thread instruction now; issue it from an elected
     # thread so each pinned validation code is reached (not tcgen05_mma_mask).
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.tcgen05_mma(dst if dst_slice is None else dst_slice(dst), a, b_s, m=128, n=16, k=16)
     return b.build()
 
@@ -391,7 +401,7 @@ def _tmem_operand_mma_kernel():
     mb = b.mbar(kind=nr.MBarKind.TMA)
     mc = b.mbar(kind=nr.MBarKind.TCGEN05)
 
-    with b.kernel_init(warp=0):
+    with b.if_warp(0):
         b.tmem_alloc(p, n_cols=32)
         b.tmem_alloc(dst, n_cols=32)
         # mbarrier.init is per-thread: one thread initializes each cell.
@@ -400,7 +410,7 @@ def _tmem_operand_mma_kernel():
             b.mbarrier_init(mc, count=1)
     # Publish allocs + mbar cells to every warp stream.
     b.cta_sync()
-    with b.role(warpgroup=0):
+    with b.if_warpgroup(0):
         b.reg_fill(out_frag, 0.0)
         b.tcgen05_st(dst, out_frag, shape="32x32b", num=n, row=0, col=0)
         b.tcgen05_wait_st()
@@ -424,7 +434,7 @@ def _tmem_operand_mma_kernel():
         b.reg_store(out[b.tid_in_wg(), 0:n], out_frag)
     # Every warp's loads retire before the deallocs.
     b.cta_sync()
-    with b.kernel_finalize(warp=0):
+    with b.if_warp(0):
         b.tmem_dealloc(dst, n_cols=32)
         b.tmem_dealloc(p, n_cols=32)
 
@@ -466,16 +476,16 @@ def _f16_tmem_store_kernel():
     tmem = tmem_tensor(b, dtype=nr.DType.F16, shape=(128, 32), col_start=0)
     frag = reg_tensor(b, dtype=nr.DType.F16, shape=(2,))
     loaded = reg_tensor(b, dtype=nr.DType.F16, shape=(2,))
-    with b.kernel_init(warp=0):
+    with b.if_warp(0):
         b.tmem_alloc(tmem, n_cols=32)
-    with b.role(warp=0):
+    with b.if_warp(0):
         b.reg_fill(frag[0], 1.0)
         b.reg_fill(frag[1], 2.0)
         b.tcgen05_st(tmem, frag[0:1], shape="32x32b", num=1, row=0, col=0)
         b.tcgen05_wait_st()
         b.tcgen05_ld(loaded[0:1], tmem, shape="32x32b", num=1, row=0, col=0)
         b.reg_store(out[b.tid_in_wg(), 0:2], loaded)
-    with b.kernel_finalize(warp=0):
+    with b.if_warp(0):
         b.tmem_dealloc(tmem, n_cols=32)
     return b.build(), out
 
@@ -543,7 +553,7 @@ def _mma_cg2_peer_smem_kernel(synced):
     )
     ready = b.mbar(kind=nr.MBarKind.THREAD)
     ready_leader = b.mbar_ref(ready, remote_coord=0)  # absolute coord: the leader's cell
-    with b.kernel_init(warp=0):
+    with b.if_warp(0):
         b.tmem_alloc(accum, n_cols=32, cta_group=2)
         # mbarrier.init is per-thread: one thread initializes the cell.
         with b.if_elected():
@@ -551,7 +561,7 @@ def _mma_cg2_peer_smem_kernel(synced):
     # Publish each CTA's alloc + mbar cell cluster-wide (the peer arrives the
     # leader's cell remotely).
     b.cluster_sync()
-    with b.role(warp=0):
+    with b.if_warp(0):
         cta = b.ctaid_in_cluster()
         with b.if_(b.lane_id().eq(0)):
             for r in range(2):
@@ -572,7 +582,7 @@ def _mma_cg2_peer_smem_kernel(synced):
     # Keeps the peer CTA resident for the cluster-collective MMA/dealloc and
     # orders all pipeline work before the dealloc.
     b.cluster_sync()
-    with b.kernel_finalize(warp=0):
+    with b.if_warp(0):
         b.tmem_dealloc(accum, n_cols=32, cta_group=2)
     return b.build()
 
@@ -612,12 +622,12 @@ def _mma_operand_overwrite_kernel(drain):
         layout=nr.TmemLayout(nr.TmemLayoutKind.LANE_128, col_start=0),
     )
     done = b.mbar(kind=nr.MBarKind.TCGEN05)
-    with b.kernel_init(warp=0):
+    with b.if_warp(0):
         b.tmem_alloc(acc, n_cols=32, cta_group=1)
         # mbarrier.init is per-thread: one thread initializes the cell.
         with b.if_elected():
             b.mbarrier_init(done, count=1)
-    with b.role(warp=0):
+    with b.if_warp(0):
         with b.if_(b.lane_id().eq(0)):
             b.store_scalar(nr.TensorSlice(tensor=a, offsets=(0, 0), shape=(1, 1)), 0)
             b.store_scalar(nr.TensorSlice(tensor=bb, offsets=(0, 0), shape=(1, 1)), 0)
@@ -633,7 +643,7 @@ def _mma_operand_overwrite_kernel(drain):
             b.mbarrier_wait(done, phase=0)
         with b.if_(b.lane_id().eq(0)):
             b.store_scalar(nr.TensorSlice(tensor=a, offsets=(0, 0), shape=(1, 1)), 1)
-    with b.kernel_finalize(warp=0):
+    with b.if_warp(0):
         b.tmem_dealloc(acc, n_cols=32, cta_group=1)
     return b.build()
 
@@ -667,14 +677,14 @@ def _mma_acc_read_release_kernel(commit_release):
     )
     frag = reg_tensor(b, dtype=nr.DType.F32, shape=(16,))
     done = b.mbar(kind=nr.MBarKind.TCGEN05 if commit_release else nr.MBarKind.THREAD)
-    with b.kernel_init(warp=0):
+    with b.if_warp(0):
         b.tmem_alloc(acc, n_cols=32, cta_group=1)
         # mbarrier.init is per-thread: one thread initializes the cell.
         with b.if_elected():
             b.mbarrier_init(done, count=1)
     # Publish the alloc + mbar cell to warp 4's stream before it waits.
     b.cta_sync()
-    with b.role(warp=0):
+    with b.if_warp(0):
         with b.if_(b.lane_id().eq(0)):
             b.store_scalar(nr.TensorSlice(tensor=a, offsets=(0, 0), shape=(1, 1)), 0)
             b.store_scalar(nr.TensorSlice(tensor=bb, offsets=(0, 0), shape=(1, 1)), 0)
@@ -687,13 +697,13 @@ def _mma_acc_read_release_kernel(commit_release):
                 b.tcgen05_commit(done, cta_group=1)
             else:
                 b.mbarrier_arrive(done)
-    with b.role(warp=4):
+    with b.if_warp(4):
         b.mbarrier_wait(done, phase=0)
         b.tcgen05_ld(frag, acc, num=16, row=0, col=0)
         b.tcgen05_wait_ld()
     # Warp 4's accumulator read retires before the dealloc.
     b.cta_sync()
-    with b.kernel_finalize(warp=0):
+    with b.if_warp(0):
         b.tmem_dealloc(acc, n_cols=32, cta_group=1)
     return b.build()
 

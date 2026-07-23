@@ -248,22 +248,7 @@ def test_rejects_tmem_alloc_bad_ncols():
         make([n.TmemAlloc(tmem([128, 256]), n_cols=33)])
 
 
-# ---- role / scope ----------------------------------------------------------
-
-
-def test_rejects_role_both_warp_and_warpgroup():
-    with pytest.raises(ValueError, match="cannot set both"):
-        make([n.Role(body=(), warp=0, warpgroup=0)])
-
-
-def test_rejects_role_maxnreg_without_warpgroup():
-    with pytest.raises(ValueError, match="maxnreg requires"):
-        make([n.Role(body=(), warp=0, maxnreg=64)])
-
-
-def test_rejects_role_warp_out_of_range():
-    with pytest.raises(ValueError, match=r"warp must be in \[0, kernel num_warps\)"):
-        make([n.Role(body=(), warp=10)])
+# ---- thread-shape rules ----------------------------------------------------
 
 
 def test_rejects_wg_sync_bad_barrier_id():
@@ -274,15 +259,18 @@ def test_rejects_wg_sync_bad_barrier_id():
 def test_rejects_cta_sync_in_partial_branch():
     # cta_sync reached by only warp 0 can never complete on hardware.
     with pytest.raises(ValueError, match="every thread of the CTA"):
-        make([n.KernelInit(body=(n.CtaSync(),), warp=0)])
+        make([n.If(cond=n.ScopeValue(kind="warp_id").eq(0), then_body=(n.CtaSync(),))])
     with pytest.raises(ValueError, match="every thread of the CTA"):
-        make([n.Role(body=(n.CtaSync(),), warpgroup=0)], num_warps=8)
+        make(
+            [n.If(cond=n.ScopeValue(kind="warpgroup_id").eq(0), then_body=(n.CtaSync(),))],
+            num_warps=8,
+        )
 
 
 def test_accepts_cta_sync_in_full_cta_branch():
     # A bare full-CTA branch (old: banned "inside role") is exactly the shape
     # the per-warp model wants: reachability, not nesting, is what matters.
-    make([n.Role(body=(n.CtaSync(),))])
+    make([n.If(cond=1, then_body=(n.CtaSync(),))])
 
 
 def test_rejects_tmem_alloc_outside_single_warp():
@@ -326,12 +314,12 @@ def test_accepts_non_32x32b_tcgen05_ld_st_atom():
     frag = reg([4], dtype=n.DType.U32)
     make(
         [
-            n.Role(
-                body=(
+            n.If(
+                cond=n.ScopeValue(kind="warpgroup_id").eq(0),
+                then_body=(
                     n.Tcgen05Ld(dst=frag[:], src=tm, shape="16x128b", num=2),
                     n.Tcgen05St(dst=tm, src=frag[:], shape="16x128b", num=2),
                 ),
-                warpgroup=0,
             )
         ],
         launch=(1,),
@@ -343,7 +331,9 @@ def test_rejects_invalid_tcgen05_ld_st_atom_num():
     tm = tmem([128, 32], dtype=n.DType.U32)
     frag = reg([128], dtype=n.DType.U32)
     with pytest.raises(ValueError, match="shape/num"):
-        make([n.Role(body=(n.Tcgen05Ld(dst=frag[:], src=tm, shape="16x128b", num=128),))])
+        make(
+            [n.If(cond=1, then_body=(n.Tcgen05Ld(dst=frag[:], src=tm, shape="16x128b", num=128),))]
+        )
 
 
 # ---- ldmatrix / stmatrix ---------------------------------------------------
@@ -354,12 +344,12 @@ def test_accepts_ldstmatrix_m8n8_b16_atoms():
     frag = reg([4], dtype=n.DType.U32)
     make(
         [
-            n.Role(
-                body=(
+            n.If(
+                cond=n.ScopeValue(kind="warp_id").eq(0),
+                then_body=(
                     n.LdMatrix(dst=frag[0:4], src=sm[0, 0:8], num=4, trans=True),
                     n.StMatrix(dst=sm[0, 0:8], src=frag[0:4], num=4, trans=True),
                 ),
-                warp=0,
             )
         ],
         launch=(1,),
@@ -371,11 +361,32 @@ def test_rejects_ldstmatrix_bad_spaces_shapes_and_dtype():
     sm = smem([8, 8], dtype=n.DType.U16)
     frag = reg([4], dtype=n.DType.U32)
     with pytest.raises(ValueError, match="dst must be REG"):
-        make([n.Role(body=(n.LdMatrix(dst=sm[0, 0:4], src=sm[0, 0:8], num=1),), warp=0)])
+        make(
+            [
+                n.If(
+                    cond=n.ScopeValue(kind="warp_id").eq(0),
+                    then_body=(n.LdMatrix(dst=sm[0, 0:4], src=sm[0, 0:8], num=1),),
+                )
+            ]
+        )
     with pytest.raises(ValueError, match="src slice must contain one row"):
-        make([n.Role(body=(n.LdMatrix(dst=frag[0:1], src=sm[0, 0:4], num=1),), warp=0)])
+        make(
+            [
+                n.If(
+                    cond=n.ScopeValue(kind="warp_id").eq(0),
+                    then_body=(n.LdMatrix(dst=frag[0:1], src=sm[0, 0:4], num=1),),
+                )
+            ]
+        )
     with pytest.raises(ValueError, match="src dtype must be i32/u32 words or a b16 fragment"):
-        make([n.Role(body=(n.StMatrix(dst=sm[0, 0:8], src=reg([1], dtype=n.DType.F32)[:]),))])
+        make(
+            [
+                n.If(
+                    cond=1,
+                    then_body=(n.StMatrix(dst=sm[0, 0:8], src=reg([1], dtype=n.DType.F32)[:]),),
+                )
+            ]
+        )
 
 
 # ---- var definedness -------------------------------------------------------
@@ -403,7 +414,7 @@ def test_rejects_inconsistent_cta_group():
         n.TmemAlloc(tmem([128, 256]), n_cols=64, cta_group=2),
     )
     with pytest.raises(ValueError, match="cta_group must be consistent"):
-        make([n.Role(body=body, warp=0)])
+        make([n.If(cond=n.ScopeValue(kind="warp_id").eq(0), then_body=body)])
 
 
 def test_if_may_branch_on_warp_and_lane_scope():

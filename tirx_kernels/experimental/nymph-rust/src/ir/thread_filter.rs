@@ -186,9 +186,9 @@ fn eval_tri(value: &ScalarValue, warp: i64, lane: i64) -> Tri {
             ScopeValueKind::LaneId => Tri::Known(lane),
             ScopeValueKind::WarpId => Tri::Known(warp),
             ScopeValueKind::WarpgroupId => Tri::Known(warp / 4),
-            ScopeValueKind::CtaidInCluster | ScopeValueKind::CtaId | ScopeValueKind::NvshmemMyPe => {
-                Tri::Unknown
-            }
+            ScopeValueKind::CtaidInCluster
+            | ScopeValueKind::CtaId
+            | ScopeValueKind::NvshmemMyPe => Tri::Unknown,
         },
         ScalarValue::Expr(e) => {
             let args: Vec<Tri> = e.args.iter().map(|a| eval_tri(a, warp, lane)).collect();

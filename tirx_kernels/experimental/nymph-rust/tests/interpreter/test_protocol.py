@@ -56,7 +56,7 @@ def test_protocol_trace_scheduler_scalar_bridge_passes():
 
     # mbarrier init/arrive are per-thread now: prime from one elected thread,
     # and publish the initialized cells to the consumer warp with a cta_sync.
-    with b.kernel_init(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.mbarrier_init(full, count=1, stage=0)
         b.mbarrier_init(full, count=1, stage=1)
         b.mbarrier_init(empty, count=1, stage=0)
@@ -65,7 +65,7 @@ def test_protocol_trace_scheduler_scalar_bridge_passes():
         b.mbarrier_arrive(empty, stage=1)
     b.cta_sync()
 
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         sched_iter = b.scalar(initial=0, dtype=nr.ScalarDType.I32)
         with b.scheduler_impl(sched):
             with b.loop():
@@ -76,7 +76,7 @@ def test_protocol_trace_scheduler_scalar_bridge_passes():
                 b.scalar_store(sched_iter, sched_iter + 1)
                 b.break_if(task.task_id < 0)
 
-    with b.role(warp=1, elected=True):
+    with b.if_warp(1), b.if_elected():
         consumer_iter = b.scalar(initial=0, dtype=nr.ScalarDType.I32)
         with b.loop():
             b.mbarrier_wait(full, stage=stage_of(consumer_iter), phase=phase_of(consumer_iter))
@@ -96,7 +96,7 @@ def test_protocol_trace_scheduler_scalar_bridge_passes():
 
 def test_protocol_default_omits_events_but_reports_pass_summary():
     b = builder("protocol_default_omits_events")
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.scalar(initial=0, dtype=nr.ScalarDType.I32)
 
     report = nr.check_protocol(b.build())
@@ -116,7 +116,7 @@ def test_protocol_deadlock_freedom_accepts_cta_sync():
 
 def test_protocol_deadlock_freedom_rejects_wait_group_without_commit():
     b = builder("protocol_deadlock_wait_group_missing_commit")
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.cp_async_bulk_wait_group_read()
 
     report = nr.check_protocol(b.build())
@@ -132,9 +132,9 @@ def test_protocol_deadlock_freedom_accepts_mixed_supported_blockers():
     # mbarrier init/arrive are per-thread now: keep the whole mbar handshake on
     # one elected thread (count=1 must see exactly one arrival); the loose
     # cta_sync stays as the third supported blocker kind.
-    with b.kernel_init(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.mbarrier_init(mbar, count=1)
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.mbarrier_arrive(mbar)
         b.mbarrier_wait(mbar, phase=0)
         b.cp_async_bulk_commit_group()
@@ -151,7 +151,7 @@ def test_protocol_wait_group_read_n_retains_latest_async_source():
     source = smem_tensor(b, shape=(1,), byte_offset=0)
     out = gmem_arg(b, shape=(1,))
 
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.store_scalar(source[0], 1)
         b.fence(kind=nr.FenceKind.ASYNC_PROXY, scope=nr.FenceScope.CTA)
         b.tma_store(out, source, coords=(0,), shape=(1,))
@@ -173,7 +173,7 @@ def test_protocol_wait_group_read_zero_drains_retained_async_source():
     source = smem_tensor(b, shape=(1,), byte_offset=0)
     out = gmem_arg(b, shape=(1,))
 
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.store_scalar(source[0], 1)
         b.fence(kind=nr.FenceKind.ASYNC_PROXY, scope=nr.FenceScope.CTA)
         b.tma_store(out, source, coords=(0,), shape=(1,))
@@ -194,9 +194,9 @@ def test_protocol_deadlock_returns_failed_report():
     b = builder("protocol_deadlock")
     mbar = b.mbar(kind=nr.MBarKind.TMA)
     # mbarrier.init is per-thread now: issue it from a single elected thread.
-    with b.kernel_init(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.mbarrier_init(mbar, count=1)
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.mbarrier_expect_tx(mbar, bytes=8)
         b.mbarrier_arrive(mbar)
         b.mbarrier_wait(mbar)
@@ -218,12 +218,12 @@ def test_protocol_blocked_mbar_wait_emits_completion_event():
     # tma_load; warp 0 only waits. cta_sync publishes the per-thread init. The
     # wait still blocks until the load's tx completes, which is what the
     # completion-before-wait event ordering below pins.
-    with b.kernel_init(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.mbarrier_init(mbar, count=1)
     b.cta_sync()
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.mbarrier_wait(mbar, phase=0)
-    with b.role(warp=1, elected=True):
+    with b.if_warp(1), b.if_elected():
         b.scalar(initial=0, dtype=nr.ScalarDType.I32)
         b.mbarrier_arrive_expect_tx(mbar, bytes=16)
         b.tma_load(smem, source, mbar=mbar, bytes=16, coords=(0,), shape=(4,))
@@ -246,9 +246,9 @@ def test_protocol_payload_control_bridge_is_inconclusive():
     smem = smem_tensor(b, shape=(1,), byte_offset=0)
     mbar = b.mbar(kind=nr.MBarKind.TMA)
     # mbarrier.init is per-thread now: issue it from a single elected thread.
-    with b.kernel_init(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.mbarrier_init(mbar, count=1)
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.mbarrier_arrive_expect_tx(mbar, bytes=4)
         b.tma_load(smem, source, mbar=mbar, bytes=4, coords=(0,), shape=(1,))
         b.scalar(initial=smem[0], dtype=nr.ScalarDType.U32)
@@ -264,9 +264,9 @@ def test_protocol_skipped_bulk_write_invalidates_prior_scalar_cell():
     smem = smem_tensor(b, shape=(1,), byte_offset=0)
     mbar = b.mbar(kind=nr.MBarKind.TMA)
     # mbarrier.init is per-thread now: issue it from a single elected thread.
-    with b.kernel_init(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.mbarrier_init(mbar, count=1)
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.store_scalar(smem[0], 7)
         b.mbarrier_arrive_expect_tx(mbar, bytes=4)
         b.tma_load(smem, source, mbar=mbar, bytes=4, coords=(0,), shape=(1,))
@@ -309,13 +309,13 @@ def test_protocol_tmem_mma_layout_f_emits_union_boxes():
     b_s = smem_tensor(b, dtype=nr.DType.F16, shape=(n, k), byte_offset=a_bytes)
     dst = tmem_tensor(b, dtype=nr.DType.F32, shape=(m, n), col_start=0, lane_align=0)
 
-    with b.kernel_init(warp=0):
+    with b.if_warp(0):
         b.tmem_alloc(dst, n_cols=32)
     # tcgen05_mma is a single-thread issue instruction now; issue it from warp
     # 0's elected lane so alloc -> mma -> dealloc stay ordered on one stream.
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.tcgen05_mma(dst, a_s, b_s, m=m, n=n, k=k, accum=False, cta_group=1)
-    with b.kernel_finalize(warp=0):
+    with b.if_warp(0):
         b.tmem_dealloc(dst, n_cols=32)
 
     report = nr.check_protocol(b.build(), include_events=True)
@@ -343,12 +343,12 @@ def test_protocol_tmem_async_overlap_fails_before_wait():
     tmem = tmem_tensor(b, dtype=nr.DType.F32, shape=(128, 32), col_start=0)
     reg = reg_tensor(b, dtype=nr.DType.F32, shape=(1,))
 
-    with b.kernel_init(warp=0):
+    with b.if_warp(0):
         b.tmem_alloc(tmem, n_cols=32)
-    with b.role(warp=0):
+    with b.if_warp(0):
         b.tcgen05_st(tmem, reg, shape="32x32b", num=1, row=0, col=0)
         b.tcgen05_st(tmem, reg, shape="32x32b", num=1, row=0, col=0)
-    with b.kernel_finalize(warp=0):
+    with b.if_warp(0):
         b.tmem_dealloc(tmem, n_cols=32)
 
     report = nr.check_protocol(b.build())
@@ -361,7 +361,7 @@ def test_protocol_proxy_fence_missing_fails():
     source = smem_tensor(b, shape=(1,), byte_offset=0)
     out = gmem_arg(b, shape=(1,))
 
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.store_scalar(source[0], 1)
         b.tma_store(out, source, coords=(0,), shape=(1,))
 
@@ -376,7 +376,7 @@ def test_protocol_proxy_fence_present_passes():
     source = smem_tensor(b, shape=(1,), byte_offset=0)
     out = gmem_arg(b, shape=(1,))
 
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.store_scalar(source[0], 1)
         b.fence(kind=nr.FenceKind.ASYNC_PROXY, scope=nr.FenceScope.CTA)
         b.tma_store(out, source, coords=(0,), shape=(1,))
@@ -394,7 +394,7 @@ def test_protocol_trace_emits_proxy_fence_group_and_sync_metadata():
     # New model: all 128 threads write, the wg_sync publishes the writes to the
     # elected issuing thread, and the single-thread tail (fences, group ops,
     # tma_store) runs after it — tma_store is a single-thread issue instruction.
-    with b.role(warpgroup=0):
+    with b.if_warpgroup(0):
         b.store_scalar(source[b.tid_in_wg()], b.tid_in_wg())
         b.wg_sync(barrier_id=7)
         with b.if_(b.tid_in_wg().eq(0)):
@@ -451,7 +451,7 @@ def test_oob_tensor_slice_caught_in_value_and_trace():
     source = gmem_arg(b, shape=(2,))
     out = gmem_arg(b, shape=(1,))
     reg = reg_tensor(b, shape=(1,))
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         idx = b.scalar(initial=3, dtype=nr.ScalarDType.I32)
         b.reg_load(reg[0], source[idx])
         b.reg_store(out[0], reg[0])

@@ -135,54 +135,6 @@ pub fn expand_threads_by_cta(kernel: &Kernel) -> Vec<ThreadMask> {
     masks
 }
 
-pub fn kernel_scope_matches(
-    thread: &ThreadId,
-    warp: Option<u32>,
-    lane: Option<u32>,
-    elected: bool,
-) -> bool {
-    if let Some(w) = warp {
-        if thread.warp_id != w as usize {
-            return false;
-        }
-    }
-    if let Some(l) = lane {
-        return thread.lane_id == l as usize && (warp.is_some() || thread.warp_id == 0);
-    }
-    if elected {
-        return thread.lane_id == 0 && (warp.is_some() || thread.warp_id == 0);
-    }
-    true
-}
-
-pub fn role_matches(
-    thread: &ThreadId,
-    warp: Option<u32>,
-    warpgroup: Option<u32>,
-    elected: bool,
-) -> bool {
-    if let Some(w) = warp {
-        if thread.warp_id != w as usize {
-            return false;
-        }
-    }
-    if let Some(wg) = warpgroup {
-        if thread.warpgroup_id() != wg as usize {
-            return false;
-        }
-    }
-    if !elected {
-        return true;
-    }
-    if warp.is_some() {
-        return thread.lane_id == 0;
-    }
-    if warpgroup.is_some() {
-        return thread.warp_id % 4 == 0 && thread.lane_id == 0;
-    }
-    thread.warp_id == 0 && thread.lane_id == 0
-}
-
 /// One CTA's streams: one per warp, all materialized eagerly at launch.
 pub struct CtaSchedule {
     pub stream_ids: Vec<usize>, // indices into SchedulerState.streams
