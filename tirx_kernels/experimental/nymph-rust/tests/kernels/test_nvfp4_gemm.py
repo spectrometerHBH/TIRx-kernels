@@ -6,7 +6,6 @@ a power-of-two alpha. Every product and partial sum is then exact in f32 and
 both sides round bf16 identically, so the interpreter must match the numpy
 reference with ZERO mismatches.
 
-Protocol (trace + check_protocol) coverage lands with the ordering-audit phase.
 """
 
 from __future__ import annotations
@@ -87,6 +86,17 @@ def test_nvfp4_gemm_builds_and_validates(cfg):
         NvFp4GemmConfig(m=cfg["m"], n=cfg["n"], k=cfg["k"], launch_shape=(2,))
     )
     kernel.validate()
+
+
+@pytest.mark.parametrize(
+    "cfg", NVFP4_CONFIGS_SUPPORTED, ids=[c["label"] for c in NVFP4_CONFIGS_SUPPORTED]
+)
+def test_nvfp4_gemm_protocol_all_supported_shapes(cfg):
+    # Every supported shape protocol-checks, not just the default config.
+    kernel = build_nvfp4_gemm(
+        NvFp4GemmConfig(m=cfg["m"], n=cfg["n"], k=cfg["k"], launch_shape=(2,))
+    )
+    assert nr.check_protocol(kernel)["status"] == "Passed"
 
 
 # Shapes x alphas: 1 / 2 / 4 k-tiles, 1 / 2 N bands, 1 / 2 M pairs, and a
