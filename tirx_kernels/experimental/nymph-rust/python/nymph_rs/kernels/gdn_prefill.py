@@ -30,9 +30,11 @@ the 7 GEMMs and the gating/inverse/epilogue glue (see ``docs/kernels/gdn_prefill
 and the project memory for the full op map). State S[K,V] carried in TMEM.
 """
 
-# NOTE: dispatch syntax is migrated mechanically; the per-warp ordering audit
-# (single-thread issue election, publish syncs, mbar-count re-derivation) is
-# pending — build + validate pass, check_protocol does not yet.
+# Per-warp execution model audit (mirrors the fp16/fa4 pattern): mbarrier.init
+# and every once-per-execution issue (tma_load / tcgen05_mma / tcgen05_commit)
+# run from a single elected thread; mbarrier.arrive is per-thread, so the
+# warpgroup/warp-wide arrive sites scale their barrier counts to the cohort
+# size (each thread signs off its own rows/reads — see bar_spec).
 
 from __future__ import annotations
 
@@ -390,14 +392,20 @@ def build_gdn_prefill(config: GdnPrefillConfig = GdnPrefillConfig()) -> Kernel:
     sttile2 = reg(iod, (2,))  # second tile (vnew gated/ungated emit two stmatrix tiles)
     sinp_reg = reg(iod, (128,))  # state_inp bf16 staging fragment (128 halves = 64 cells)
 
-    CG0_T = 1  # mbarrier_arrive is one arrival per producer cohort (NOT per-thread)
-    CG1_T = 1
-    GATE_T = 1
+    # mbarrier.arrive is PER-THREAD: each producer thread arrives once after its
+    # own rows/reads land, so a completed phase proves the whole cohort finished
+    # without a producer-side sync (the fa4 audit pattern). Counts = cohort size.
+    CG0_T = 128  # CG0 arrives are warpgroup-wide (warps 0-3)
+    CG1_T = 128  # CG1 arrives are warpgroup-wide (warps 4-7)
+    GATE_T = 32  # gate warp arrives warp-wide (each lane signs off its gcs/beta lanes)
     # (barrier name -> (kind, arrival count)) for the 12-warp producer/consumer pipeline.
     KSTAGES = 2  # K is double-buffered (flashinfer smem_k_stages=2): prefetch next chunk
     bar_spec = {
         "tk": (MBarKind.TMA, 1, KSTAGES),  # K full (2 stages)
-        "k_free": (MBarKind.THREAD, 1, KSTAGES),  # K empty (MMA frees stage after GEMM7)
+        # K empty: armed by the MMA PIPELINE (tcgen05_commit after GEMM7) — a
+        # thread arrive right after the issue would release the stage while the
+        # engine may still be reading it (the fp16 gemm operand-release rule).
+        "k_free": (MBarKind.TCGEN05, 1, KSTAGES),
         "tq": (MBarKind.TMA, 1),
         "tv": (MBarKind.TMA, 1),
         "tg": (MBarKind.TMA, 1),
@@ -425,7 +433,9 @@ def build_gdn_prefill(config: GdnPrefillConfig = GdnPrefillConfig()) -> Kernel:
         "f_qs": (MBarKind.THREAD, CG1_T),
         "f_nv": (MBarKind.THREAD, CG1_T),
         "f_oi": (MBarKind.THREAD, CG1_T),
-        "chunk_free": (MBarKind.THREAD, CG1_T + 1),  # CG1 + epilogue (both free chunk-c buffers)
+        # CG1 (128 per-thread arrives) + epilogue (1 elected/lane-0 arrive) both
+        # free the chunk-c buffers.
+        "chunk_free": (MBarKind.THREAD, CG1_T + 1),
     }
     bars = {
         nm: k.mbar(kind=spec[0], stages=(spec[2] if len(spec) > 2 else 1))
@@ -435,11 +445,17 @@ def build_gdn_prefill(config: GdnPrefillConfig = GdnPrefillConfig()) -> Kernel:
     sched = k.scheduler(k.task_space(grid=(num_work,), fields=("work",)))
 
     with k.if_warp(0):
+        # tmem_alloc is warp-collective (full warp 0); mbarrier.init is
+        # per-thread, so exactly one elected thread runs every init.
         k.tmem_alloc(tmem_base, n_cols=N_COLS_TMEM)
-        for nm, spec in bar_spec.items():
-            stg = spec[2] if len(spec) > 2 else 1
-            for s in range(stg):
-                k.mbarrier_init(bars[nm], count=spec[1], stage=s)
+        with k.if_elected():
+            for nm, spec in bar_spec.items():
+                stg = spec[2] if len(spec) > 2 else 1
+                for s in range(stg):
+                    k.mbarrier_init(bars[nm], count=spec[1], stage=s)
+    # No implicit barrier between top-level statements: this sync IS the
+    # publish of the TMEM alloc + mbarrier cells to every stream.
+    k.cta_sync()
 
     _emit(
         k,
@@ -472,6 +488,8 @@ def build_gdn_prefill(config: GdnPrefillConfig = GdnPrefillConfig()) -> Kernel:
         bars,
     )
 
+    # Teardown: every stream's pipeline work happens-before the dealloc.
+    k.cta_sync()
     with k.if_warp(0):
         k.tmem_dealloc(tmem_base, n_cols=N_COLS_TMEM)
     return k.build()
@@ -589,7 +607,9 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
         k.wg_sync(barrier_id=10)
 
     # ============== TMA-load warp (9): cp.async.bulk.tensor (UTMALDG) ==============
-    with k.if_warp(TMA_WARP):
+    # Single-thread TMA producer stream: arrive_expect_tx is per-thread (one arm
+    # per load) and tma_load requires a single-thread cohort.
+    with k.if_warp(TMA_WARP), k.if_elected():
         gc = k.scalar(initial=0)  # cumulative chunk index, carried across the persistent
         with k.for_each_task(
             sched
@@ -642,26 +662,29 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                 gtok = tok_base + c * BT
                 with k.if_(gc > 0):
                     k.mbarrier_wait(bars["chunk_free"], phase=ph(gc - 1))
-                k.mbarrier_arrive_expect_tx(bars["tg"], bytes=BT * 4)
-                k.tma_load(
-                    gcs_s,
-                    gate_g,
-                    mbar=bars["tg"],
-                    bytes=BT * 4,
-                    coords=(gtok, eh),
-                    shape=(BT,),
-                    gmem_shape=(BT, 1),
-                )
-                k.mbarrier_arrive_expect_tx(bars["tb"], bytes=BT * 4)
-                k.tma_load(
-                    beta_s,
-                    beta_g,
-                    mbar=bars["tb"],
-                    bytes=BT * 4,
-                    coords=(gtok, eh),
-                    shape=(BT,),
-                    gmem_shape=(BT, 1),
-                )
+                # TMA issue is single-thread: arrive_expect_tx is per-thread (one
+                # arm per load) and tma_load needs a single-thread cohort.
+                with k.if_elected():
+                    k.mbarrier_arrive_expect_tx(bars["tg"], bytes=BT * 4)
+                    k.tma_load(
+                        gcs_s,
+                        gate_g,
+                        mbar=bars["tg"],
+                        bytes=BT * 4,
+                        coords=(gtok, eh),
+                        shape=(BT,),
+                        gmem_shape=(BT, 1),
+                    )
+                    k.mbarrier_arrive_expect_tx(bars["tb"], bytes=BT * 4)
+                    k.tma_load(
+                        beta_s,
+                        beta_g,
+                        mbar=bars["tb"],
+                        bytes=BT * 4,
+                        coords=(gtok, eh),
+                        shape=(BT,),
+                        gmem_shape=(BT, 1),
+                    )
                 k.mbarrier_wait(bars["tg"], phase=ph(gc))
                 if (
                     config.varlen
@@ -712,7 +735,9 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                 k.scalar_store(gc, gc + 1)  # advance pipeline state
 
     # ============== MMA warp (8): issues all 7 GEMMs (UTCHMMA) ==============
-    with k.if_warp(MMA_WARP):
+    # Single-thread MMA issuer stream: tcgen05_mma/tcgen05_commit require a
+    # single-thread cohort; the k_free arrive is one arrival (count=1).
+    with k.if_warp(MMA_WARP), k.if_elected():
         # gc = every-chunk pipeline state; gc_pos = the GEMM3/4 pipeline (used only on
         # chunk>0 — S_prev exists), advancing on its own cadence (= flashinfer's separate
         # per-pipeline PipelineState). Both carried across the persistent tile loop.
@@ -779,8 +804,10 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                     trans_a=True,
                     a_row0=ks_row,
                 )  # GEMM7 dS
-                # GEMM7 was the last K[c] consumer → free this K stage for chunk gc+2.
-                k.mbarrier_arrive(bars["k_free"], stage=gc % 2)
+                # GEMM7 was the last K[c] consumer → free this K stage for chunk
+                # gc+2. tcgen05_commit (not a thread arrive): the stage may only
+                # be released once the engine's reads of it actually completed.
+                k.tcgen05_commit(bars["k_free"], stage=gc % 2)
                 k.scalar_store(gc, gc + 1)
                 with k.if_(c > 0):
                     k.scalar_store(gc_pos, gc_pos + 1)
