@@ -2006,7 +2006,7 @@ fn cp_async_bulk_wait_group_read(n: u8) -> PyStmt {
     PyStmt(ir::Stmt::CpAsyncBulkWaitGroupRead { n })
 }
 #[pyfunction]
-#[pyo3(name = "Tcgen05Mma", signature = (dst, a, b, m, n, k = 16, accum = false, trans_a = false, trans_b = false, cta_group = 1, sfa = None, sfb = None, sf_byte = 0))]
+#[pyo3(name = "Tcgen05Mma", signature = (dst, a, b, m, n, k = 16, accum = false, trans_a = false, trans_b = false, cta_group = 1, sfa = None, sfb = None, sf_byte = 0, sf_e4m3 = false, sf_block = 0, a_fp4 = false, b_fp4 = false))]
 #[allow(clippy::too_many_arguments)]
 fn tcgen05_mma(
     dst: Bound<'_, PyAny>,
@@ -2022,6 +2022,10 @@ fn tcgen05_mma(
     sfa: Option<Bound<'_, PyAny>>,
     sfb: Option<Bound<'_, PyAny>>,
     sf_byte: u8,
+    sf_e4m3: bool,
+    sf_block: u32,
+    a_fp4: bool,
+    b_fp4: bool,
 ) -> PyResult<PyStmt> {
     Ok(PyStmt(ir::Stmt::Tcgen05Mma {
         dst: coerce_slice(&dst)?,
@@ -2037,6 +2041,10 @@ fn tcgen05_mma(
         sfa: sfa.map(|v| coerce_slice(&v)).transpose()?,
         sfb: sfb.map(|v| coerce_slice(&v)).transpose()?,
         sf_byte,
+        sf_e4m3,
+        sf_block,
+        a_fp4,
+        b_fp4,
     }))
 }
 #[pyfunction]
@@ -2161,6 +2169,31 @@ fn stmatrix(
         num,
         trans,
         dtype,
+    }))
+}
+
+#[pyfunction]
+#[pyo3(name = "WarpMma", signature = (d, a, b, c, m = 16, n = 8, k = 16, ab_dtype = None))]
+#[allow(clippy::too_many_arguments)]
+fn warp_mma(
+    d: Bound<'_, PyAny>,
+    a: Bound<'_, PyAny>,
+    b: Bound<'_, PyAny>,
+    c: Bound<'_, PyAny>,
+    m: u32,
+    n: u32,
+    k: u32,
+    ab_dtype: Option<PyDType>,
+) -> PyResult<PyStmt> {
+    Ok(PyStmt(ir::Stmt::WarpMma {
+        d: coerce_slice(&d)?,
+        a: coerce_slice(&a)?,
+        b: coerce_slice(&b)?,
+        c: coerce_slice(&c)?,
+        m,
+        n,
+        k,
+        ab_dtype: ab_dtype.map_or(ir::DType::Bf16, Into::into),
     }))
 }
 
@@ -2575,6 +2608,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(tcgen05_wait_st, m)?,
         wrap_pyfunction!(ldmatrix, m)?,
         wrap_pyfunction!(stmatrix, m)?,
+        wrap_pyfunction!(warp_mma, m)?,
         wrap_pyfunction!(reg_fill, m)?,
         wrap_pyfunction!(reg_unary, m)?,
         wrap_pyfunction!(reg_add, m)?,

@@ -112,6 +112,50 @@ pub fn round_e4m3_scalar(x: f32) -> f32 {
     decode_e4m3(encode_e4m3(x))
 }
 
+/// Decode one float4 e2m1 nibble to f32: 1 sign + 2 exp (bias 1) + 1 mantissa,
+/// no inf / NaN. The 8 magnitudes {0, .5, 1, 1.5, 2, 3, 4, 6} are all exact in
+/// f32 (subnormal m=1 -> .5; normals 2^(e-1)*(1+m/2)). Operands arrive packed
+/// 2 nibbles per byte: element 2i is the low nibble, 2i+1 the high nibble.
+#[inline]
+pub fn decode_e2m1(nibble: u8) -> f32 {
+    const MAG: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+    let v = MAG[(nibble & 0x7) as usize];
+    if nibble & 0x8 != 0 {
+        -v
+    } else {
+        v
+    }
+}
+
+/// RNE encode of an f32 to a float4 e2m1 nibble, saturating to ±6. Test-only:
+/// the value simulator never encodes fp4 (operands arrive pre-packed), but the
+/// round-trip test needs it to exercise the decode table.
+#[cfg(test)]
+fn encode_e2m1(x: f32) -> u8 {
+    const MAG: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+    let sign: u8 = if x.is_sign_negative() { 0x8 } else { 0 };
+    let a = x.abs();
+    if a >= MAG[7] {
+        return sign | 7;
+    }
+    let mut lo = 0usize;
+    while lo + 1 < 8 && MAG[lo + 1] <= a {
+        lo += 1;
+    }
+    let below = a - MAG[lo];
+    let above = MAG[lo + 1] - a;
+    let idx = if below < above {
+        lo
+    } else if below > above {
+        lo + 1
+    } else if lo % 2 == 0 {
+        lo // ties to the even nibble
+    } else {
+        lo + 1
+    };
+    sign | idx as u8
+}
+
 pub fn is_int_dtype(d: DType) -> bool {
     matches!(
         d,
@@ -344,5 +388,43 @@ mod tests {
         // RNE tie: 19 sits halfway between 18 and 20 -> even mantissa (20).
         assert_eq!(decode_e4m3(encode_e4m3(19.0)), 20.0);
         assert_eq!(encode_e4m3(f32::NAN), 0x7F);
+    }
+
+    #[test]
+    fn e2m1_decode_table_is_the_canonical_eight_magnitudes() {
+        // The OCP / nvfp4 e2m1 table: nibble s|ee|m -> value.
+        let expect: [f32; 16] = [
+            0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, // positive
+            -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0, // negative
+        ];
+        for (n, &want) in expect.iter().enumerate() {
+            assert_eq!(decode_e2m1(n as u8), want, "nibble {n:#x}");
+        }
+    }
+
+    #[test]
+    fn e2m1_encode_round_trips_and_rounds_to_nearest_even() {
+        // every encoding decodes-encodes back to itself (ignoring -0/+0)
+        for n in 0u8..16 {
+            let v = decode_e2m1(n);
+            let back = encode_e2m1(v);
+            assert_eq!(decode_e2m1(back).to_bits(), v.to_bits(), "nibble {n:#x}");
+        }
+        // saturation to ±6
+        assert_eq!(decode_e2m1(encode_e2m1(1000.0)), 6.0);
+        assert_eq!(decode_e2m1(encode_e2m1(-1000.0)), -6.0);
+        // RNE ties: 0.25 between 0 and 0.5 -> even nibble 0 (0.0);
+        //           2.5 between 2 and 3 -> even nibble 4 (2.0);
+        //           3.5 between 3 and 4 -> even nibble 6 (4.0);
+        //           5.0 between 4 and 6 -> even nibble 6 (4.0)
+        assert_eq!(decode_e2m1(encode_e2m1(0.25)), 0.0);
+        assert_eq!(decode_e2m1(encode_e2m1(2.5)), 2.0);
+        assert_eq!(decode_e2m1(encode_e2m1(3.5)), 4.0);
+        assert_eq!(decode_e2m1(encode_e2m1(5.0)), 4.0);
+        // exact grid points unchanged
+        for v in [0.5f32, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0] {
+            assert_eq!(decode_e2m1(encode_e2m1(v)), v);
+            assert_eq!(decode_e2m1(encode_e2m1(-v)), -v);
+        }
     }
 }

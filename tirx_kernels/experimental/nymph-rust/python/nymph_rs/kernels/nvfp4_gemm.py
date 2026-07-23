@@ -34,11 +34,6 @@ as the epilogue rescale; on silicon it is a runtime ``(1,)`` buffer, here a
 power-of-two value-model constant (the value test fixes the global scales).
 """
 
-# NOTE: already unbuildable on dev before the per-warp migration (the tree
-# sync brought tcgen05_mma sf kwargs the dev builder lacks). The dispatch
-# structure below IS fully migrated and ordering-audited; it becomes
-# verifiable once the builder regains the block-scaled MMA surface.
-
 from __future__ import annotations
 
 from dataclasses import dataclass

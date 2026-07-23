@@ -122,6 +122,143 @@ def test_rejects_mma_bad_k():
         make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=256, k=8)])
 
 
+# ---- tcgen05_mma block-scaled (f8 UE8M0 + nvfp4 e4m3) ----------------------
+
+
+def mma_f8_operands():
+    """A valid block-scaled f8 (UE8M0) MMA operand set: cg1, m=128, n=32, k=32."""
+    dst = tmem([128, 32])[:, :]
+    a = smem([128, 32], dtype=n.DType.F8E4M3)[:, :]
+    b = smem([32, 32], dtype=n.DType.F8E4M3)[:, :]
+    sfa = tmem([128, 1], dtype=n.DType.U32)[:, :]
+    sfb = tmem([128, 1], dtype=n.DType.U32)[:, :]
+    return dst, a, b, sfa, sfb
+
+
+def mma_fp4_operands():
+    """A valid NVFP4 MMA operand set: cg2, m=256, n=256, k=64 (32 packed bytes)."""
+    dst = tmem([128, 256])[:, :]
+    a = smem([128, 32], dtype=n.DType.U8)[:, :]
+    b = smem([128, 32], dtype=n.DType.U8)[:, :]
+    sfa = tmem([128, 1], dtype=n.DType.U32)[:, :]
+    sfb = tmem([128, 2], dtype=n.DType.U32)[:, :]
+    return dst, a, b, sfa, sfb
+
+
+def fp4_kwargs(**overrides):
+    kw = dict(m=256, n=256, k=64, cta_group=2, sf_e4m3=True, sf_block=16, a_fp4=True, b_fp4=True)
+    kw.update(overrides)
+    return kw
+
+
+def test_accepts_block_scaled_f8_and_nvfp4_mma():
+    dst, a, b, sfa, sfb = mma_f8_operands()
+    make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=32, k=32, sfa=sfa, sfb=sfb)])
+    dst, a, b, sfa, sfb = mma_fp4_operands()
+    make([n.Tcgen05Mma(dst=dst, a=a, b=b, sfa=sfa, sfb=sfb, **fp4_kwargs())])
+
+
+def test_rejects_mma_fp4_k():
+    dst, a, b, sfa, sfb = mma_fp4_operands()
+    with pytest.raises(ValueError, match=r"fp4 \(mxf4\) k must be 64, 128, or 256"):
+        make([n.Tcgen05Mma(dst=dst, a=a, b=b, sfa=sfa, sfb=sfb, **fp4_kwargs(k=32))])
+
+
+def test_rejects_mma_fp4_nblocks_beyond_packed_cell():
+    # k=128 spans 8 blocks of 16 — more e4m3 bytes than one packed-u32 cell holds.
+    dst, a, b, sfa, sfb = mma_fp4_operands()
+    a = smem([128, 64], dtype=n.DType.U8)[:, :]
+    b = smem([128, 64], dtype=n.DType.U8)[:, :]
+    with pytest.raises(ValueError, match="at most 4 blocks per packed-u32 scale cell"):
+        make([n.Tcgen05Mma(dst=dst, a=a, b=b, sfa=sfa, sfb=sfb, **fp4_kwargs(k=128))])
+
+
+def test_rejects_mma_m64_cg1_scale_mode():
+    dst = tmem([64, 32])[:, :]
+    a = smem([64, 32], dtype=n.DType.F8E4M3)[:, :]
+    b = smem([32, 32], dtype=n.DType.F8E4M3)[:, :]
+    sfa = tmem([128, 1], dtype=n.DType.U32)[:, :]
+    sfb = tmem([128, 1], dtype=n.DType.U32)[:, :]
+    with pytest.raises(ValueError, match="m=64 cta_group=1 does not support block-scaled"):
+        make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=64, n=32, k=32, sfa=sfa, sfb=sfb)])
+
+
+def test_rejects_mma_fp4_transposed():
+    dst, a, b, sfa, sfb = mma_fp4_operands()
+    with pytest.raises(ValueError, match="does not support trans_a/trans_b"):
+        make([n.Tcgen05Mma(dst=dst, a=a, b=b, sfa=sfa, sfb=sfb, **fp4_kwargs(trans_b=True))])
+
+
+def test_rejects_mma_fp4_shape():
+    dst, _, b, sfa, sfb = mma_fp4_operands()
+    dst = tmem([64, 32])[:, :]
+    a = smem([64, 32], dtype=n.DType.U8)[:, :]
+    b = smem([32, 32], dtype=n.DType.U8)[:, :]
+    with pytest.raises(ValueError, match="fp4 requires"):
+        make(
+            [
+                n.Tcgen05Mma(
+                    dst=dst, a=a, b=b, sfa=sfa, sfb=sfb, **fp4_kwargs(m=64, n=32, cta_group=1)
+                )
+            ]
+        )
+
+
+def test_rejects_mma_sf_e4m3_without_fp4_operands():
+    dst, a, b, sfa, sfb = mma_f8_operands()
+    with pytest.raises(ValueError, match=r"sf_e4m3 \(NVFP4\) requires fp4 operands"):
+        make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=32, k=32, sfa=sfa, sfb=sfb, sf_e4m3=True)])
+
+
+def test_rejects_mma_sf_e4m3_nonzero_sf_byte():
+    dst, a, b, sfa, sfb = mma_fp4_operands()
+    with pytest.raises(ValueError, match="sf_byte must be 0 for sf_e4m3"):
+        make([n.Tcgen05Mma(dst=dst, a=a, b=b, sfa=sfa, sfb=sfb, sf_byte=1, **fp4_kwargs())])
+
+
+# ---- mma_sync (WarpMma) ----------------------------------------------------
+
+
+def warp_mma_operands():
+    """A valid m16n8k16 mma.sync fragment set: A/B u32 packed words, C/D f32."""
+    d = reg([4])[:]
+    a = reg([4], dtype=n.DType.U32)[:]
+    b = reg([2], dtype=n.DType.U32)[:]
+    c = reg([4])[:]
+    return d, a, b, c
+
+
+def test_accepts_warp_mma_fragments():
+    d, a, b, c = warp_mma_operands()
+    make([n.WarpMma(d=d, a=a, b=b, c=c, m=16, n=8, k=16, ab_dtype=n.DType.BF16)])
+
+
+def test_rejects_warp_mma_shape():
+    d, a, b, c = warp_mma_operands()
+    with pytest.raises(ValueError, match="supports only m16n8k8 / m16n8k16"):
+        make([n.WarpMma(d=d, a=a, b=b, c=c, m=16, n=16, k=16)])
+
+
+def test_rejects_warp_mma_ab_dtype():
+    d, a, b, c = warp_mma_operands()
+    with pytest.raises(ValueError, match="ab_dtype must be bf16 or f16"):
+        make([n.WarpMma(d=d, a=a, b=b, c=c, m=16, n=8, k=16, ab_dtype=n.DType.F32)])
+
+
+def test_rejects_warp_mma_non_reg_operand():
+    d, a, b, c = warp_mma_operands()
+    a = smem([4], dtype=n.DType.U32)[:]
+    with pytest.raises(ValueError, match="mma_sync a must be REG"):
+        make([n.WarpMma(d=d, a=a, b=b, c=c, m=16, n=8, k=16)])
+
+
+def test_rejects_warp_mma_fragment_length():
+    d, a, b, c = warp_mma_operands()
+    a = reg([2], dtype=n.DType.U32)[:]  # want m*k/64 = 4 words
+    with pytest.raises(ValueError, match="fragment must hold 4 elements per lane"):
+        make([n.WarpMma(d=d, a=a, b=b, c=c, m=16, n=8, k=16)])
+
+
 # ---- tma ------------------------------------------------------------------
 
 

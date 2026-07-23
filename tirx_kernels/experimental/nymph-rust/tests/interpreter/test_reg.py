@@ -140,11 +140,13 @@ def test_reg_extended_float_ops_literals_broadcast_reduce_and_unary():
     sum_out = gmem_arg(b, dtype=nr.DType.F32, shape=(1,))
     max_out = gmem_arg(b, dtype=nr.DType.F32, shape=(1,))
     exp_out = gmem_arg(b, dtype=nr.DType.F32, shape=(4,))
+    log_out = gmem_arg(b, dtype=nr.DType.F32, shape=(4,))
     vec = reg_tensor(b, dtype=nr.DType.F32, shape=(4,))
     scalar = reg_tensor(b, dtype=nr.DType.F32, shape=(1,))
     max_scalar = reg_tensor(b, dtype=nr.DType.F32, shape=(1,))
     shifted = reg_tensor(b, dtype=nr.DType.F32, shape=(4,))
     expv = reg_tensor(b, dtype=nr.DType.F32, shape=(4,))
+    logv = reg_tensor(b, dtype=nr.DType.F32, shape=(4,))
 
     with b.if_warp(0), b.if_elected():
         b.reg_load(vec, src_g)
@@ -156,12 +158,16 @@ def test_reg_extended_float_ops_literals_broadcast_reduce_and_unary():
         b.reg_store(shifted_out, shifted)
         b.reg_unary(expv, vec, op="exp2")
         b.reg_store(exp_out, expv)
+        # log2 inverts exp2 exactly on power-of-two values.
+        b.reg_unary(logv, expv, op="log2")
+        b.reg_store(log_out, logv)
 
     outputs = run(b.build(), {src_g: f32([1.0, 2.0, 3.0, 4.0])})
     assert_output_eq(outputs, sum_out, [10.0], dtype=np.float32)
     assert_output_eq(outputs, max_out, [4.0], dtype=np.float32)
     assert_output_eq(outputs, shifted_out, [11.0, 12.0, 13.0, 14.0], dtype=np.float32)
     assert_output_eq(outputs, exp_out, [2.0, 4.0, 8.0, 16.0], dtype=np.float32)
+    assert_output_eq(outputs, log_out, [1.0, 2.0, 3.0, 4.0], dtype=np.float32)
 
 
 def test_reg_bitwise_shift_and_combine_int_frac_ex2_value_semantics():

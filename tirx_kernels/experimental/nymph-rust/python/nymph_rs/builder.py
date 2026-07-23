@@ -83,6 +83,7 @@ from .nymph_rs import (
     TmemDealloc,
     Var,
     VarBinding,
+    WarpMma,
     WarpSync,
     WgSync,
 )
@@ -92,7 +93,7 @@ MatrixShape = Literal["m8n8"]
 MatrixDType = Literal["b16"]
 SchedulerPolicy = Literal["grid_stride", "clc", "atomic_steal", "custom"]
 RegOperand = Tensor | TensorSlice | int | float
-RegUnaryOp = Literal["exp2", "rcp", "neg"]
+RegUnaryOp = Literal["exp2", "log2", "rcp", "neg"]
 RegReduceOp = Literal["max", "sum"]
 RegCondScope = Literal["warp", "warpgroup"]
 
@@ -484,11 +485,22 @@ class IRBuilder:
         sfa: Tensor | TensorSlice | None = None,
         sfb: Tensor | TensorSlice | None = None,
         sf_byte: int = 0,
+        sf_e4m3: bool = False,
+        sf_block: int = 0,
+        a_fp4: bool = False,
+        b_fp4: bool = False,
     ) -> None:
-        """``sfa``/``sfb`` make this a block-scaled MMA (``kind::mxf8f6f4``): each is a
-        (128, cols) u32 TMEM slice of packed UE8M0 scale bytes; operand row r is
-        dequantized by 2^(byte - 127), where ``sf_byte`` picks the packed byte for
-        this MMA's k-slice."""
+        """``sfa``/``sfb`` make this a block-scaled MMA: each is a (128, cols) u32
+        TMEM slice of packed scale bytes. Two scale modes share the field set:
+
+        * fp8 (``kind::mxf8f6f4`` + UE8M0, default): one scale per operand row;
+          ``sf_byte`` picks the packed byte for this MMA's k-slice, dequant
+          2^(byte - 127).
+        * nvfp4 (``kind::mxf4`` + e4m3, ``sf_e4m3=True, sf_block=16``): one scale
+          per 16 contiguous k-elements; this MMA's k spans k/16 blocks whose
+          scales are bytes 0..k/16 of the cell, each decoded as e4m3.
+          ``a_fp4``/``b_fp4`` mark the operands as packed e2m1 (2 per u8 byte,
+          the SMEM tile's inner extent is k/2 bytes)."""
         if isinstance(dst, Tensor):
             dst = dst[...]
         if isinstance(a, Tensor):
@@ -513,6 +525,10 @@ class IRBuilder:
             sfa=sfa,
             sfb=sfb,
             sf_byte=sf_byte,
+            sf_e4m3=sf_e4m3,
+            sf_block=sf_block,
+            a_fp4=a_fp4,
+            b_fp4=b_fp4,
         )
         self._append(stmt)
 
@@ -611,6 +627,29 @@ class IRBuilder:
         if isinstance(src, Tensor):
             src = src[...]
         self._append(StMatrix(dst=dst, src=src, shape=shape, num=num, trans=trans, dtype=dtype))
+
+    def mma_sync(
+        self,
+        d: Tensor | TensorSlice,
+        a: Tensor | TensorSlice,
+        b: Tensor | TensorSlice,
+        c: Tensor | TensorSlice,
+        *,
+        m: int = 16,
+        n: int = 8,
+        k: int = 16,
+        ab_dtype: DType = DType.BF16,
+    ) -> None:
+        """Warp-level SM80 tensor-core MMA: D = A·Bᵀ + C
+        (``mma.sync.aligned.m{m}n{n}k{k}.row.col.f32.{abt}.{abt}.f32``). A/B are
+        packed-16bit reg fragments of ``ab_dtype`` (bf16 or f16 — the PTX operand
+        type); C/D are f32 reg fragments — all in the standard mma warp fragment
+        layout (the layout ldmatrix produces)."""
+        d = d[...] if isinstance(d, Tensor) else d
+        a = a[...] if isinstance(a, Tensor) else a
+        b = b[...] if isinstance(b, Tensor) else b
+        c = c[...] if isinstance(c, Tensor) else c
+        self._append(WarpMma(d=d, a=a, b=b, c=c, m=m, n=n, k=k, ab_dtype=ab_dtype))
 
     def reg_fill(self, dst: Tensor | TensorSlice, value: RegOperand) -> None:
         if isinstance(dst, Tensor):

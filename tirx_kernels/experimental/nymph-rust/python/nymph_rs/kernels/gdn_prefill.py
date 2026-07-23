@@ -30,11 +30,9 @@ the 7 GEMMs and the gating/inverse/epilogue glue (see ``docs/kernels/gdn_prefill
 and the project memory for the full op map). State S[K,V] carried in TMEM.
 """
 
-# NOTE: this kernel was already unbuildable on dev before the per-warp
-# migration (builder API skew from the tree sync: reg_unary op set).
-# Dispatch syntax is migrated mechanically; the per-warp ordering audit
-# (single-thread issue election, publish syncs, mbar-count re-derivation)
-# is pending the kernel's repair against the current builder.
+# NOTE: dispatch syntax is migrated mechanically; the per-warp ordering audit
+# (single-thread issue election, publish syncs, mbar-count re-derivation) is
+# pending — build + validate pass, check_protocol does not yet.
 
 from __future__ import annotations
 

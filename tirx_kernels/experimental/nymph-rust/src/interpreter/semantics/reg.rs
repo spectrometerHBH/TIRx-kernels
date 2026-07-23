@@ -668,6 +668,7 @@ fn execute_reg_unary<'a, 'k>(
         let src_v = read_reg_operand(ctx, src, shape, dtype)?.to_f32_compute();
         let out = match op {
             RegUnaryOp::Exp2 => src_v.mapv(|v| v.exp2()),
+            RegUnaryOp::Log2 => src_v.mapv(|v| v.log2()),
             RegUnaryOp::Rcp => src_v.mapv(|v| 1.0 / v),
             RegUnaryOp::Neg => src_v.mapv(|v| -v),
         };

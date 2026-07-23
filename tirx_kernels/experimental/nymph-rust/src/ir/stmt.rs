@@ -5,7 +5,7 @@
 //! Body-bearing control nodes hold `Vec<Stmt>` (a recursive enum; `Vec` heap-
 //! allocates so the type has a finite size).
 
-use super::dtype::{FenceKind, FenceScope};
+use super::dtype::{DType, FenceKind, FenceScope};
 use super::mbar::{MBar, MBarRef};
 use super::scalar::{ScalarInitial, ScalarValue, Var};
 use super::scheduler::Scheduler;
@@ -90,6 +90,7 @@ impl From<TensorSlice> for RegOperand {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RegUnaryOp {
     Exp2,
+    Log2,
     Rcp,
     Neg,
 }
@@ -98,6 +99,7 @@ impl RegUnaryOp {
     pub fn as_str(self) -> &'static str {
         match self {
             RegUnaryOp::Exp2 => "exp2",
+            RegUnaryOp::Log2 => "log2",
             RegUnaryOp::Rcp => "rcp",
             RegUnaryOp::Neg => "neg",
         }
@@ -106,6 +108,7 @@ impl RegUnaryOp {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "exp2" => Some(RegUnaryOp::Exp2),
+            "log2" => Some(RegUnaryOp::Log2),
             "rcp" => Some(RegUnaryOp::Rcp),
             "neg" => Some(RegUnaryOp::Neg),
             _ => None,
@@ -423,13 +426,28 @@ pub enum Stmt {
         trans_a: bool,
         trans_b: bool,
         cta_group: u8,
-        /// Block-scaled MMA (`kind::mxf8f6f4` + UE8M0 scale vectors): per-row scale
-        /// factors for A and B held in TMEM as packed u32 cells (4 biased-exponent
-        /// bytes each). `sf_byte` selects which packed byte applies to this MMA's
-        /// k-slice; the operand row r dequantizes by 2^(byte - 127).
+        /// Block-scaled MMA scale vectors for A and B, held in TMEM as packed
+        /// u32 cells (4 scale bytes each).
+        ///
+        /// Two scale modes share this field set:
+        /// * fp8 block-128 (`kind::mxf8f6f4` + UE8M0): one scale per operand row,
+        ///   constant over the whole k-slice. `sf_e4m3=false`, `sf_block=0`
+        ///   (per-row); `sf_byte` selects which of the 4 packed bytes applies,
+        ///   dequant `2^(byte-127)`.
+        /// * nvfp4 block-16 (`kind::mxf4` + e4m3): one scale per 16 contiguous
+        ///   k-elements. `sf_e4m3=true`, `sf_block=16`; this MMA's k spans
+        ///   `k/16` blocks whose scales are bytes `0..k/16` of the cell, each
+        ///   decoded as e4m3.
         sfa: Option<TensorSlice>,
         sfb: Option<TensorSlice>,
         sf_byte: u8,
+        /// scale decode: e4m3 (nvfp4) when true, UE8M0 biased exponent (fp8) when false.
+        sf_e4m3: bool,
+        /// scale block width in operand elements; 0 = one scale per row (fp8).
+        sf_block: u32,
+        /// operands are packed fp4 (e2m1, 2 per u8 byte); materialize by unpacking.
+        a_fp4: bool,
+        b_fp4: bool,
     },
     /// `tcgen05.cp` — bulk SMEM -> TMEM copy of packed u32 scale-factor cells.
     /// With `cta_group=2` one leader issue drives both CTAs' datapaths: each CTA
@@ -483,6 +501,19 @@ pub enum Stmt {
         num: u32,
         trans: bool,
         dtype: MatrixDType,
+    },
+    /// Warp-level SM80 tensor-core MMA (`mma.sync.aligned.m{M}n{N}k{K}.row.col`).
+    /// D = A·Bᵀ + C, with A (M×K) / B (N×K) bf16/f16 reg fragments and C/D (M×N)
+    /// f32 reg accumulators, all in the standard mma warp fragment layout.
+    WarpMma {
+        d: TensorSlice,
+        a: TensorSlice,
+        b: TensorSlice,
+        c: TensorSlice,
+        m: u32,
+        n: u32,
+        k: u32,
+        ab_dtype: DType, // A/B operand type — the PTX .bf16 / .f16 (C/D are f32)
     },
 
     // ---- register ALU ----
