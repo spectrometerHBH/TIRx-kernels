@@ -180,6 +180,7 @@ def _kernel(
     TILE_GROUPS_ROW_SIZE: T.constexpr = 16,
     SCHED_CLUSTER_SIZE: T.constexpr = 1,
     SCHED_SERPENTINE: T.constexpr = False,
+    TMA_L2_PROMOTION: T.constexpr = "L2::256B",
 ):
     CTA_GROUP = T.meta_var(LOGICAL_M_CLUSTER * LOGICAL_N_CLUSTER)
     CTA_MASK = T.meta_var((1 << CTA_GROUP) - 1)
@@ -315,6 +316,7 @@ def _kernel(
                         "mbar": smem_pipe.full.ptr_to([stage]),
                         "cta_group": 1,
                         "cache_hint": "evict_normal",
+                        "tensormap_l2_promotion": TMA_L2_PROMOTION,
                         "prefetch_tensormap": True,
                     }
                 )
@@ -324,6 +326,7 @@ def _kernel(
                         "mbar": smem_pipe.full.ptr_to([stage]),
                         "cta_group": 1,
                         "cache_hint": "evict_last",
+                        "tensormap_l2_promotion": TMA_L2_PROMOTION,
                         "prefetch_tensormap": True,
                     }
                 )
@@ -542,6 +545,7 @@ def _kernel(
                                 ],
                                 D_smem[stage, :, d_atom_n : d_atom_n + D_TMA_TILE_N],
                                 dispatch="tma_auto",
+                                tensormap_l2_promotion=TMA_L2_PROMOTION,
                                 prefetch_tensormap=True,
                             )
                         T.ptx.cp_async.bulk.commit_group()
@@ -597,6 +601,9 @@ def grouped_fp8_gemm_contiguous(num_groups: int, M: int, N: int, K: int):
         TILE_GROUPS_ROW_SIZE=tile_groups_row_size,
         SCHED_CLUSTER_SIZE=2 if cluster_schedule else 1,
         SCHED_SERPENTINE=cluster_schedule,
+        TMA_L2_PROMOTION=(
+            "L2::128B" if K in (2048, 7168) or (num_groups == 8 and K == 4096) else "L2::256B"
+        ),
     )
 
 
