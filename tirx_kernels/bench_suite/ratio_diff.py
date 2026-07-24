@@ -15,10 +15,8 @@ moving ratio is a real perf signal. Rows where the reference impl
 itself drifted > 20% are flagged ⚠ — workload's environment was
 unstable, so the ratio Δ is less trustworthy.
 
-The report lists comparable workloads sorted by ratio Δ from most-improved
-to most-regressed (positive → negative). DeepGEMM FP4/FP8 paged MQA logits
-workloads are kept in a dedicated section so their reference-sensitive ratios
-do not interrupt the main regression table.
+The report lists comparable workloads in one table sorted by ratio Δ from
+most-improved to most-regressed (positive → negative).
 Baseline workloads that were attempted this run but produced no comparable
 measurement (failed, interfered, or missing an impl) are listed in a separate
 "Not comparable in current run" section so lost coverage is never silent.
@@ -47,9 +45,6 @@ HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent.parent
 DEFAULT_LATEST_RUN = REPO_ROOT / ".bench-suite" / "latest.json"
 DEFAULT_BASELINE = HERE / "baseline.json"
-PAGED_MQA_LOGITS_KERNELS = frozenset(
-    {"deepgemm_sm100_fp4_paged_mqa_logits", "deepgemm_sm100_fp8_paged_mqa_logits"}
-)
 
 
 def _refs_only(impls: dict[str, float]) -> dict[str, float]:
@@ -173,20 +168,15 @@ def build_report(
 
     # Positive ratio Δ first (improvements), negative last (regressions).
     rows.sort(key=lambda r: -r[8])
-    paged_mqa_rows = [row for row in rows if row[0] in PAGED_MQA_LOGITS_KERNELS]
-    main_rows = [row for row in rows if row[0] not in PAGED_MQA_LOGITS_KERNELS]
 
     out = io.StringIO()
 
     def w(line: str = "") -> None:
         out.write(line + "\n")
 
-    def write_ratio_table(table_rows: list[tuple], *, heading: str | None = None) -> None:
+    def write_ratio_table(table_rows: list[tuple]) -> None:
         if not table_rows:
             return
-        if heading is not None:
-            w(heading)
-            w()
         w(
             "| kernel | config | ours impl | ref | ours (µs) | ref (µs) | ratio | saved | "
             "ratio Δ | ours Δ | ref Δ |"
@@ -209,7 +199,7 @@ def build_report(
     w(f"- Current run: `{current_label}`")
     w(
         "- Columns: ref/ours ratio (higher = ours faster), ratio Δ vs baseline ratio, "
-        "ours/ref Δ vs pinned baseline abs µs. Sorted by ratio Δ within each section."
+        "ours/ref Δ vs pinned baseline abs µs. Sorted by ratio Δ."
     )
     w(
         f"- Summary: {len(rows)} comparable implementation/reference measurements; "
@@ -223,10 +213,7 @@ def build_report(
     )
     w()
 
-    write_ratio_table(main_rows)
-    write_ratio_table(
-        paged_mqa_rows, heading=f"## DeepGEMM paged MQA logits — FP4/FP8 ({len(paged_mqa_rows)})"
-    )
+    write_ratio_table(rows)
 
     if not_comparable:
         w(f"## Not comparable in current run ({len(not_comparable)})")

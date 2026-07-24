@@ -154,7 +154,7 @@ def test_ratio_report_keeps_grouped_tir_schedulers_out_of_references() -> None:
     assert "| megakernel_moe | moe_a3b_bs1_all | tir_unfused | sglang_full |" in report
 
 
-def test_ratio_report_separates_fp4_fp8_paged_mqa_logits() -> None:
+def test_ratio_report_keeps_fp4_fp8_paged_mqa_logits_in_main_table() -> None:
     kernels = [
         "ordinary_kernel",
         "deepgemm_sm100_fp4_paged_mqa_logits",
@@ -166,10 +166,15 @@ def test_ratio_report_separates_fp4_fp8_paged_mqa_logits() -> None:
                 "kernel": kernel,
                 "label": f"{kernel}_config",
                 "status": "ok",
-                "impls": {"tirx": 10.0, "deepgemm": 12.0},
+                "impls": {"tirx": 10.0, "deepgemm": 10.0},
             }
             for kernel in kernels
         ]
+    }
+    current_refs = {
+        "ordinary_kernel": 11.0,
+        "deepgemm_sm100_fp4_paged_mqa_logits": 10.0,
+        "deepgemm_sm100_fp8_paged_mqa_logits": 9.0,
     }
     current = {
         "results": [
@@ -177,7 +182,7 @@ def test_ratio_report_separates_fp4_fp8_paged_mqa_logits() -> None:
                 "kernel": kernel,
                 "label": f"{kernel}_config",
                 "status": "ok",
-                "impls": {"tirx": 10.0, "deepgemm": 12.0},
+                "impls": {"tirx": 10.0, "deepgemm": current_refs[kernel]},
             }
             for kernel in kernels
         ]
@@ -185,13 +190,15 @@ def test_ratio_report_separates_fp4_fp8_paged_mqa_logits() -> None:
 
     report, regressions = build_report(baseline, current)
 
-    assert regressions == 0
-    main, paged_mqa = report.split("## DeepGEMM paged MQA logits — FP4/FP8 (2)")
-    assert "| ordinary_kernel | ordinary_kernel_config |" in main
-    assert "deepgemm_sm100_fp4_paged_mqa_logits" not in main
-    assert "deepgemm_sm100_fp8_paged_mqa_logits" not in main
-    assert "| deepgemm_sm100_fp4_paged_mqa_logits |" in paged_mqa
-    assert "| deepgemm_sm100_fp8_paged_mqa_logits |" in paged_mqa
+    assert regressions == 1
+    assert "## DeepGEMM paged MQA logits" not in report
+    assert report.count("| kernel | config | ours impl | ref |") == 1
+    assert report.index("| ordinary_kernel | ordinary_kernel_config |") < report.index(
+        "| deepgemm_sm100_fp4_paged_mqa_logits |"
+    )
+    assert report.index("| deepgemm_sm100_fp4_paged_mqa_logits |") < report.index(
+        "| deepgemm_sm100_fp8_paged_mqa_logits |"
+    )
 
 
 def test_baseline_view_renders_grouped_implementations_in_one_row() -> None:
