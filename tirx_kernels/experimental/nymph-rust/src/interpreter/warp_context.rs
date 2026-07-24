@@ -301,6 +301,32 @@ impl<'a, 'k> WarpContext<'a, 'k> {
         Ok(())
     }
 
+    /// tcgen05.mma/cp/commit issue granularity (PTX): single-thread-ISSUE, but a
+    /// full warp is also a valid issuer (the instruction elects lane 0 itself).
+    /// tcgen05.mma is single-thread-ISSUE (unlike warp-collective mma.sync): a
+    /// full warp OR a single elected lane (canon's `if elect_sync(): gemm`) is a
+    /// valid issuer; a ragged partial mask is a real divergence bug. The B200
+    /// tensor pipe REQUIRES the elected single-lane form — per-op elect guards
+    /// that reconverge the warp between consecutive tcgen05 issues stall the
+    /// async stream (a GPU deadlock).
+    pub fn check_tcgen05_issuer(&self, code: &str, op: &str) -> IResult<()> {
+        if self.lanes.is_empty() {
+            return Err(InterpreterError::new(
+                code,
+                format!("{op} must be issued by a full warp or a single elected lane"),
+            ));
+        }
+        // Single elected lane (lane 0 of the warp) is a valid tcgen05 issuer.
+        if self.lanes.iter().all(|t| t.lane_id == 0) {
+            return Ok(());
+        }
+        // Otherwise require full warps (the non-elected form): same rule as mma.sync.
+        self.check_full_warp(
+            code,
+            format!("{op} must be issued by a full warp or a single elected lane"),
+        )
+    }
+
     pub fn check_full_warp(
         &self,
         code: impl Into<String>,

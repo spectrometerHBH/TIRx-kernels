@@ -16,6 +16,7 @@ pub fn register(reg: &mut StmtExecutorRegistry) {
     reg.register(StmtKind::ForEachTask, execute_for_each_task);
     reg.register(StmtKind::SchedulerImpl, execute_scheduler_impl);
     reg.register(StmtKind::SchedNext, execute_sched_next);
+    reg.register(StmtKind::ClcQueryCancel, execute_clc_query_cancel);
     reg.register(StmtKind::Loop, execute_dynamic_loop);
     reg.register(StmtKind::BreakIf, execute_break_if);
     reg.register(StmtKind::If, execute_if);
@@ -43,6 +44,9 @@ fn execute_loop<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResul
             stop,
             step,
             body,
+            // Emission directive only (T.serial vs pinned-rolled) — the value
+            // and protocol models run the loop the same either way.
+            unroll: _,
         } => (var, start, stop, step, body),
         _ => unreachable!(),
     };
@@ -203,6 +207,36 @@ fn execute_sched_next<'a, 'k>(
             scope: ctx.access_scope(),
         })?;
     }
+    Ok(StepStatus::advance())
+}
+
+/// `clusterlaunchcontrol.query_cancel` — read the per-cluster handle slot the
+/// paired `ClcTryCancel` filled: the cancelled cluster's first ctaid (`task *
+/// cta_group`), or -1 when drained. Pure slot read + scalar bind; no trace
+/// event — the task id was already emitted by the `ClcTryCancel` itself.
+fn execute_clc_query_cancel<'a, 'k>(
+    ctx: &mut WarpContext<'a, 'k>,
+    stmt: &'k Stmt,
+) -> IResult<StepStatus> {
+    let (scheduler, var) = match stmt {
+        Stmt::ClcQueryCancel { scheduler, var, .. } => (scheduler, var),
+        _ => unreachable!(),
+    };
+    let value = ctx
+        .state
+        .clc_handle_values
+        .get(&(scheduler.id, ctx.stream.cluster_id))
+        .copied()
+        .ok_or_else(|| {
+            InterpreterError::new(
+                "clc_query_before_try",
+                "clc_query_cancel ran before clc_try_cancel filled the handle",
+            )
+        })?;
+    ctx.state
+        .values
+        .scalars
+        .write_mask(&ctx.lanes, var.id.0, value);
     Ok(StepStatus::advance())
 }
 

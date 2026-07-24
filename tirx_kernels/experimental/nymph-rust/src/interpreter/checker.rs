@@ -2480,9 +2480,7 @@ fn record_reg_operand(tensors: &mut HashMap<u32, TensorInfo>, operand: &crate::i
 fn walk_tensors(body: &[Stmt], tensors: &mut HashMap<u32, TensorInfo>) {
     for stmt in body {
         match stmt {
-            Stmt::TensorDef { tensor }
-            | Stmt::TmemAlloc { tensor, .. }
-            | Stmt::TmemDealloc { tensor, .. } => record_tensor(tensors, tensor),
+            Stmt::TensorDef { tensor } => record_tensor(tensors, tensor),
             Stmt::StoreScalar { dst, .. } => record_slice(tensors, dst),
             Stmt::TmaLoad { dst, src, .. } => {
                 record_slice(tensors, dst);
@@ -2502,17 +2500,25 @@ fn walk_tensors(body: &[Stmt], tensors: &mut HashMap<u32, TensorInfo>) {
             Stmt::GmemAtomicAdd { sem, .. } | Stmt::GmemWaitEq { sem, .. } => {
                 record_slice(tensors, sem);
             }
-            Stmt::Tcgen05Mma { dst, a, b, .. } => {
-                record_slice(tensors, dst);
-                record_slice(tensors, a);
-                record_slice(tensors, b);
+            Stmt::Tcgen05Mma { a, b, .. } => {
+                // TMEM operands (dst/sfa/sfb, and a/b in TmemOperand form) carry
+                // no tensor — the checker's TMEM windows key on physical boxes.
+                for op in [a, b] {
+                    if let crate::ir::MmaOperand::Slice(s) = op {
+                        record_slice(tensors, s);
+                    }
+                }
             }
-            Stmt::Tcgen05Ld { dst, src, .. } => {
-                record_slice(tensors, dst);
-                record_tensor(tensors, src);
+            Stmt::Tcgen05Cp { src, .. } => {
+                record_slice(tensors, src);
             }
-            Stmt::Tcgen05St { dst, src, .. } => {
-                record_tensor(tensors, dst);
+            Stmt::ClcTryCancel { handle, .. } | Stmt::ClcQueryCancel { handle, .. } => {
+                record_tensor(tensors, handle);
+            }
+            Stmt::Tcgen05Ld { dst, .. } => {
+                record_slice(tensors, dst);
+            }
+            Stmt::Tcgen05St { src, .. } => {
                 record_slice(tensors, src);
             }
             Stmt::LdMatrix { dst, src, .. }
@@ -3335,6 +3341,8 @@ fn event_kind_name(payload: &TraceEventKind) -> &'static str {
         TraceEventKind::SemAcquire { .. } => "sem_acquire",
         TraceEventKind::TmemAlloc { .. } => "tmem_alloc",
         TraceEventKind::TmemDealloc { .. } => "tmem_dealloc",
+        TraceEventKind::ClusterBarrierArrive { .. } => "cluster_barrier_arrive",
+        TraceEventKind::ClusterBarrierWait { .. } => "cluster_barrier_wait",
         TraceEventKind::SchedulerNext { .. } => "scheduler_next",
     }
 }
@@ -3358,6 +3366,8 @@ fn event_scope(payload: &TraceEventKind) -> Option<&super::protocol::AccessScope
         | TraceEventKind::SemAcquire { scope, .. }
         | TraceEventKind::TmemAlloc { scope, .. }
         | TraceEventKind::TmemDealloc { scope, .. }
+        | TraceEventKind::ClusterBarrierArrive { scope, .. }
+        | TraceEventKind::ClusterBarrierWait { scope, .. }
         | TraceEventKind::SchedulerNext { scope, .. } => Some(scope),
     }
 }

@@ -9,7 +9,7 @@ use super::dtype::{DType, FenceKind, FenceScope};
 use super::mbar::{MBar, MBarRef};
 use super::scalar::{ScalarInitial, ScalarValue, Var};
 use super::scheduler::Scheduler;
-use super::tensor::{Tensor, TensorSlice};
+use super::tensor::{MmaOperand, Tensor, TensorSlice, TmemOperand};
 use std::sync::Arc;
 
 /// RegCvt rounding mode (Python `Literal["rn"]` — only RN exists).
@@ -315,6 +315,37 @@ impl MatrixDType {
     }
 }
 
+/// Memory semantics of the split cluster barrier's ARRIVE side
+/// (`barrier.cluster.arrive sem`). Canon emits `.relaxed`: the arrival only
+/// UNBLOCKS the per-role waits (control order) — per PTX §9.7.14.3 it carries
+/// NO release ordering for the cohort's prior memory accesses (canon's memory
+/// order comes from `fence.mbarrier_init` / the mbarrier pipeline instead).
+/// `.release` additionally publishes the arriving cohort's prior accesses, so
+/// the protocol checker propagates a memory happens-before edge to the waits.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ClusterBarrierSem {
+    #[default]
+    Relaxed,
+    Release,
+}
+
+impl ClusterBarrierSem {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClusterBarrierSem::Relaxed => "relaxed",
+            ClusterBarrierSem::Release => "release",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "relaxed" => Some(ClusterBarrierSem::Relaxed),
+            "release" => Some(ClusterBarrierSem::Release),
+            _ => None,
+        }
+    }
+}
+
 /// `Stmt` — one statement of the kernel body. `cta_group` fields are 1 or 2;
 /// `*_mask` are 16-bit CTA masks.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -323,14 +354,27 @@ pub enum Stmt {
     TensorDef {
         tensor: Arc<Tensor>,
     },
+    /// `tcgen05.alloc` — allocate the TMEM column band `[base_col, base_col +
+    /// n_cols)`. TMEM is not a tensor: the allocation only declares the column
+    /// interval; every TMEM instruction addresses cells by absolute physical
+    /// (lane, col) via `TmemOperand`.
     TmemAlloc {
-        tensor: Arc<Tensor>,
+        base_col: u32,
         n_cols: u32,
         cta_group: u8,
     },
+    /// `tcgen05.dealloc` — release the column band `[base_col, base_col +
+    /// n_cols)` (must match a live allocation).
     TmemDealloc {
-        tensor: Arc<Tensor>,
+        base_col: u32,
         n_cols: u32,
+        cta_group: u8,
+    },
+    /// `tcgen05.relinquish_alloc_permit` — give up the right to issue further
+    /// `tcgen05.alloc`s. Explicit in the IR (codegen translates 1:1); it used
+    /// to be emitted implicitly with the dealloc, which was not a faithful
+    /// translation.
+    TmemRelinquish {
         cta_group: u8,
     },
     ScalarDef {
@@ -340,6 +384,26 @@ pub enum Stmt {
     ScalarStore {
         var: Var,
         value: ScalarValue,
+    },
+    /// Single-assignment `let` binding (canon's `name: T.let = expr` — an immutable
+    /// SSA `T.Bind`, NOT a `local_scalar` cell). Every execution of the statement
+    /// binds `var` once; validate REJECTS any `ScalarStore` to it. Codegen emits the
+    /// `T.let` form so ptxas sees a pure SSA dataflow (mutable locals defeat its
+    /// uniform-register analysis — the R2UR problem; see docs/perf-methodology.md).
+    ScalarLet {
+        var: Var,
+        value: ScalarValue,
+    },
+    /// Warp shuffle/broadcast that DEFINES a scalar: `var` gets the value of `src`
+    /// evaluated on lane `src_lane` of each warp, broadcast to all lanes (a faithful
+    /// `__shfl_sync`). First-class so the value-sim verifies it — broadcasting a value
+    /// that ISN'T warp-uniform changes it, which surfaces as a value mismatch. Used to
+    /// promote warp-uniform SMEM reads (the scheduler mailbox) to a form the CUDA
+    /// compiler proves uniform → the index/address chain lowers to the uniform datapath.
+    ShuffleSync {
+        var: Var,
+        src: ScalarValue,
+        src_lane: ScalarValue,
     },
     StoreScalar {
         dst: TensorSlice,
@@ -356,6 +420,15 @@ pub enum Stmt {
         stop: ScalarValue,
         step: ScalarValue,
         body: Vec<Stmt>,
+        /// False pins the loop ROLLED (canon's `T.serial(N, unroll=False)` —
+        /// the CUDA source then carries `#pragma unroll 1`, the `disable_unroll`
+        /// annotation). Without it ptxas re-unrolls a merged loop whose body is
+        /// a run of tcgen05 MMAs, re-inflating the whole-function static size
+        /// that decides the uniform-placement threshold (docs/perf-methodology.md
+        /// §5). True (the default) is the plain serial loop. Validate requires
+        /// literal start=0/step=1 when false (the emitted form expresses no
+        /// other range).
+        unroll: bool,
     },
     ForEachTask {
         scheduler: Arc<Scheduler>,
@@ -369,6 +442,33 @@ pub enum Stmt {
     SchedNext {
         scheduler: Arc<Scheduler>,
         var: Var,
+    },
+    /// CLC (Cluster Launch Control) async work-steal issue: hardware
+    /// `clusterlaunchcontrol.try_cancel` writes a 16B response into `handle` and
+    /// completes-tx `mbar` (multicast to both cluster CTAs). Written out EXPLICITLY
+    /// in the kernel's `policy="custom"` scheduler — codegen translates it 1:1 and
+    /// never synthesizes it. In sim it (1) runs the canonical round-robin oracle —
+    /// the trusted seam, §7 of the scheduler RFC — and stores the resulting work id
+    /// into a per-cluster handle slot, and (2) completes-tx the signalled mbar (like
+    /// a TMA landing) so the handshake the checker validates is real. The paired
+    /// `ClcQueryCancel` reads the slot, so the scheduler and every worker that query
+    /// the same handle observe the same id.
+    ClcTryCancel {
+        scheduler: Arc<Scheduler>,
+        handle: Arc<Tensor>,
+        mbar: MBarRef,
+        stage: Option<ScalarValue>,
+        cta_group: u8,
+    },
+    /// CLC decode of the response `handle`: DEFINES `var` by reading the per-cluster
+    /// handle slot the paired `ClcTryCancel` filled — the cancelled cluster's first
+    /// `ctaid.x` (= task * cta_group), or `0xFFFFFFFF` (→ -1 as int32) when drained.
+    /// Codegen translates 1:1 to `T.ptx.clc_query_cancel`; `scheduler` is sim-only
+    /// metadata (keys the slot read).
+    ClcQueryCancel {
+        scheduler: Arc<Scheduler>,
+        var: Var,
+        handle: Arc<Tensor>,
     },
     Loop {
         body: Vec<Stmt>,
@@ -416,11 +516,16 @@ pub enum Stmt {
     },
 
     // ---- TMA (bulk async GMEM<->SMEM) ----
+    // The transfer's byte size is DERIVED, never stated: the sim's mbar tx
+    // accounting computes `numel(shape) x dtype_bytes` from the tile (exactly
+    // what TIRx derives from the box extents), so the size exists in precisely
+    // one place. (It used to be a separate `bytes` field — one fact written in
+    // two places, with build/codegen blind to a mismatch until the protocol
+    // check caught it.)
     TmaLoad {
         dst: TensorSlice,
         src: Arc<Tensor>,
         mbar: MBarRef,
-        bytes: ScalarValue,
         coords: Vec<ScalarValue>,
         shape: Vec<usize>,
         gmem_shape: Option<Vec<usize>>,
@@ -493,30 +598,40 @@ pub enum Stmt {
 
     // ---- tcgen05 (tensor core + TMEM) ----
     Tcgen05Mma {
-        dst: TensorSlice,
-        a: TensorSlice,
-        b: TensorSlice,
+        /// Accumulator destination: absolute physical TMEM address (lane, col)
+        /// + f32 cell interpretation. The accumulator's (rows, n) footprint is
+        /// implied by `m`/`n`/`cta_group`/`lane_align`; `row` must be 0 (the
+        /// full-datapath layouts are lane-anchored).
+        dst: TmemOperand,
+        a: MmaOperand,
+        b: MmaOperand,
         m: u32,
         n: u32,
         k: u32,
-        accum: bool,
+        /// Overwrite (0) vs accumulate (nonzero) the accumulator. A RUNTIME scalar so
+        /// a merged k-tile loop can carry canon's `accum` cell: 0 on the first k-tile
+        /// (overwrite), 1 after — one static MMA site instead of a peeled first tile
+        /// plus a rolled rest (the peel doubles the static MMA code, which on fp16 1024
+        /// tips ptxas's whole-function uniform placement — docs/perf-methodology.md §5).
+        /// Literal 0/1 fold to the old compile-time behavior everywhere else.
+        accum: ScalarValue,
         trans_a: bool,
         trans_b: bool,
         cta_group: u8,
-        /// Block-scaled MMA scale vectors for A and B, held in TMEM as packed
-        /// u32 cells (4 scale bytes each).
+        /// Block-scaled MMA scale vectors for A and B, held in TMEM as packed u32
+        /// cells (4 scale bytes each) or raw e4m3 bytes (nvfp4), addressed by
+        /// absolute physical (lane, col).
         ///
         /// Two scale modes share this field set:
-        /// * fp8 block-128 (`kind::mxf8f6f4` + UE8M0): one scale per operand row,
-        ///   constant over the whole k-slice. `sf_e4m3=false`, `sf_block=0`
-        ///   (per-row); `sf_byte` selects which of the 4 packed bytes applies,
-        ///   dequant `2^(byte-127)`.
-        /// * nvfp4 block-16 (`kind::mxf4` + e4m3): one scale per 16 contiguous
-        ///   k-elements. `sf_e4m3=true`, `sf_block=16`; this MMA's k spans
+        /// * fp8 block-128 (UE8M0): one scale per operand row, constant over the
+        ///   whole k-slice. `sf_e4m3=false`, `sf_block=0` (per-row); `sf_byte`
+        ///   selects which of the 4 packed bytes applies, dequant `2^(byte-127)`.
+        /// * nvfp4 block-16 (e4m3): one scale per 16 contiguous k-elements.
+        ///   `sf_e4m3=true`, `sf_block=16`; this MMA's k spans
         ///   `k/16` blocks whose scales are bytes `0..k/16` of the cell, each
         ///   decoded as e4m3.
-        sfa: Option<TensorSlice>,
-        sfb: Option<TensorSlice>,
+        sfa: Option<TmemOperand>,
+        sfb: Option<TmemOperand>,
         sf_byte: u8,
         /// scale decode: e4m3 (nvfp4) when true, UE8M0 biased exponent (fp8) when false.
         sf_e4m3: bool,
@@ -525,15 +640,22 @@ pub enum Stmt {
         /// operands are packed fp4 (e2m1, 2 per u8 byte); materialize by unpacking.
         a_fp4: bool,
         b_fp4: bool,
+        /// d-tmem accumulator lane field (0 or 16): only the cta_group=1 m=64
+        /// (Layout F) accumulator uses 16 to place its second 64-row half at
+        /// lane 16+. A property of THIS MMA's accumulator write — hardware
+        /// D-lane placement, not a layout.
+        lane_align: u8,
     },
-    /// `tcgen05.cp` — bulk SMEM -> TMEM copy of packed u32 scale-factor cells.
-    /// With `cta_group=2` one leader issue drives both CTAs' datapaths: each CTA
-    /// copies from its own SMEM into its own TMEM. Retirement is observed via
-    /// `tcgen05_commit`, like the MMA; in the value model the copy is applied at
-    /// issue (the tcgen05 engine executes its ops in issue order, so a same-stream
-    /// MMA reading the destination never observes a stale value).
+    /// `tcgen05.cp` — bulk SMEM -> TMEM copy of packed u32 scale-factor cells
+    /// (or raw e4m3 scale bytes for nvfp4). `dst` is the absolute physical TMEM
+    /// base (lane 0, col); `src` stays an SMEM tile. With `cta_group=2` one
+    /// leader issue drives both CTAs' datapaths: each CTA copies from its own
+    /// SMEM into its own TMEM. Retirement is observed via `tcgen05_commit`,
+    /// like the MMA; in the value model the copy is applied at issue (the
+    /// tcgen05 engine executes its ops in issue order, so a same-stream MMA
+    /// reading the destination never observes a stale value).
     Tcgen05Cp {
-        dst: TensorSlice,
+        dst: TmemOperand,
         src: TensorSlice,
         cta_group: u8,
     },
@@ -543,22 +665,22 @@ pub enum Stmt {
         cta_group: u8,
         multicast_cta_mask: Option<u16>,
     },
+    /// `tcgen05.ld` — TMEM -> REG datapath read. `src` is the absolute physical
+    /// TMEM base address (lane, col) + cell dtype; `dst` the REG fragment.
     Tcgen05Ld {
         dst: TensorSlice,
-        src: Arc<Tensor>,
+        src: TmemOperand,
         shape: LdStShape,
         num: u32,
-        row: ScalarValue,
-        col: ScalarValue,
     },
     Tcgen05WaitLd,
+    /// `tcgen05.st` — REG -> TMEM datapath write. `dst` is the absolute physical
+    /// TMEM base address (lane, col) + cell dtype; `src` the REG fragment.
     Tcgen05St {
-        dst: Arc<Tensor>,
+        dst: TmemOperand,
         src: TensorSlice,
         shape: LdStShape,
         num: u32,
-        row: ScalarValue,
-        col: ScalarValue,
     },
     Tcgen05WaitSt,
 
@@ -715,6 +837,22 @@ pub enum Stmt {
     },
     WarpSync,
     ClusterSync,
+    /// Split cluster barrier — ARRIVE side. A non-blocking collective arrival
+    /// (`barrier.cluster.arrive`, aligned) issued once at CTA scope after the
+    /// prologue init. Paired with per-role `ClusterBarrierWait`s: decouples the
+    /// cluster-barrier latency from each role's local setup, and idle warps skip the
+    /// wait. Modeled faithfully (unlike a codegen-synthesized split of the fused
+    /// `ClusterSync`) so the protocol checker verifies every role waits before any
+    /// cross-CTA (peer mbarrier) access. `sem` is the PTX memory semantics —
+    /// canon's `.relaxed` (the default): control order only, NO memory
+    /// happens-before (see `ClusterBarrierSem`).
+    ClusterBarrierArrive {
+        sem: ClusterBarrierSem,
+    },
+    /// Split cluster barrier — WAIT side. Blocks the calling warp until all threads
+    /// of the cluster have executed `ClusterBarrierArrive`. Allowed inside a warp
+    /// branch (unlike `ClusterSync`).
+    ClusterBarrierWait,
 }
 
 impl Stmt {

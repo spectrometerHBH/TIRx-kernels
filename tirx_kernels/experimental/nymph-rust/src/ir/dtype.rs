@@ -62,17 +62,6 @@ pub enum Swizzle {
     B128,
 }
 
-/// `TmemLayoutKind` — logical row->lane mapping for a TMEM tensor.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum TmemLayoutKind {
-    Lane128,
-    Lane64Upper,
-    Lane64Lower,
-    ScaleVec1x,
-    ScaleVec2x,
-    ScaleVec4x,
-}
-
 /// `MBarKind` — what kind of work an mbarrier tracks.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum MBarKind {
@@ -87,6 +76,10 @@ pub enum FenceKind {
     Memory,
     AsyncProxy,
     View,
+    /// `fence.mbarrier_init` — the prologue init-epoch seal that publishes all
+    /// `mbarrier.init`s before any arrive/wait. Modeled as a fence; codegen emits
+    /// `T.ptx.fence.mbarrier_init()`.
+    MbarrierInit,
 }
 
 /// `FenceScope` — the memory hierarchy level a fence orders. `Cta`/`Cluster` are the

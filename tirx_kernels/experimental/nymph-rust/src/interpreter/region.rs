@@ -9,8 +9,8 @@ use super::protocol::{BoxN, PoolId, Region, RegionBoxes};
 use super::slice_indexing::{shared_flat_indices, ResolvedSlice};
 use super::values::indexing::numel;
 use super::values::smem::dtype_size_bytes;
-use super::values::tmem::{tmem_layout_for, TMEM_COLS, TMEM_ROWS};
-use crate::ir::{MemorySpace, Tensor, TmemLayoutKind};
+use super::values::tmem::{TMEM_COLS, TMEM_ROWS};
+use crate::ir::{MemorySpace, Tensor};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -233,13 +233,9 @@ pub fn lane_attributed_boxes(
         return None;
     }
     match tensor.space {
-        MemorySpace::Tmem => {
-            let mut out = Vec::with_capacity(offsets.len());
-            for (row, &lane) in offsets.iter().zip(lanes) {
-                out.push((lane, tmem_logical_box(tensor, row, shape).ok()?));
-            }
-            Some(out)
-        }
+        // TMEM is not a tensor: TMEM accesses are physical (lane, lane_byte)
+        // boxes built by the tcgen05 executors, not lane-attributed slices.
+        MemorySpace::Tmem => None,
         MemorySpace::Smem => {
             let base = tensor.byte_offset?;
             let elem_size = dtype_size_bytes(tensor.dtype);
@@ -319,7 +315,13 @@ pub fn tensor_region_from_offsets(
     }
     let owner = pool_for_tensor(tensor, cta_id);
     match tensor.space {
-        MemorySpace::Tmem => tmem_logical_region(tensor, owner, offsets, shape),
+        // TMEM is not a tensor: no IR op references a TMEM tensor slice
+        // anymore (all TMEM addressing is a physical TmemOperand), so this
+        // projection has no meaning — fail closed instead of guessing a layout.
+        MemorySpace::Tmem => Err(InterpreterError::new(
+            "trace_region_tmem_tensor",
+            "TMEM is not a tensor: no (offset, shape) projection exists",
+        )),
         MemorySpace::Reg => {
             let register_rows: Vec<usize> = (0..offsets.len()).collect();
             reg_tensor_logical_region(tensor, owner, &register_rows, offsets, shape)
@@ -976,114 +978,6 @@ fn reg_tensor_logical_box(
     Ok(BoxN::new(ranges))
 }
 
-fn tmem_logical_region(
-    tensor: &Arc<Tensor>,
-    owner: PoolId,
-    offsets: &[Vec<i64>],
-    shape: &[usize],
-) -> IResult<Region> {
-    let PoolId::Tmem { cta_id } = owner else {
-        unreachable!("TMEM tensor must project to TMEM owner")
-    };
-    let offsets = unique_offsets(offsets);
-    let mut boxes = Vec::with_capacity(offsets.len());
-    for offset in &offsets {
-        boxes.push(tmem_logical_box(tensor, offset, shape)?);
-    }
-    non_empty_region(
-        PoolId::Tmem { cta_id },
-        RegionBoxes::Boxes(coalesced_tmem_byte_boxes(boxes)),
-        tensor.id,
-    )
-}
-
-fn tmem_logical_box(tensor: &Tensor, offset: &[i64], shape: &[usize]) -> IResult<BoxN> {
-    if tensor.shape.len() != 2 || offset.len() != 2 || shape.len() != 2 {
-        return Err(InterpreterError::new(
-            "tmem_value",
-            "TMEM access must be rank-2",
-        ));
-    }
-    let row0 = usize::try_from(offset[0]).map_err(|_| {
-        InterpreterError::new("trace_region_oob", "TMEM logical offset is negative")
-    })?;
-    let col0 = usize::try_from(offset[1]).map_err(|_| {
-        InterpreterError::new("trace_region_oob", "TMEM logical offset is negative")
-    })?;
-    let (rows, cols) = (shape[0], shape[1]);
-    if rows == 0 || cols == 0 {
-        return Err(InterpreterError::new(
-            "trace_region_empty_box",
-            "TMEM trace box has an empty dimension",
-        ));
-    }
-    if row0 + rows > tensor.shape[0] || col0 + cols > tensor.shape[1] {
-        return Err(InterpreterError::new(
-            "trace_region_oob",
-            "TMEM slice is out of bounds",
-        ));
-    }
-    let layout = tmem_layout_for(tensor)?;
-    let lane_start = match layout.kind {
-        TmemLayoutKind::Lane128 => row0,
-        TmemLayoutKind::Lane64Upper => {
-            if row0 + rows > 64 {
-                return Err(InterpreterError::new(
-                    "invalid_tmem_row",
-                    "TMEM row out of range",
-                ));
-            }
-            row0
-        }
-        TmemLayoutKind::Lane64Lower => {
-            if row0 + rows > 64 {
-                return Err(InterpreterError::new(
-                    "invalid_tmem_row",
-                    "TMEM row out of range",
-                ));
-            }
-            row0 + 64
-        }
-        _ => {
-            return Err(InterpreterError::new(
-                "unsupported_tmem_layout",
-                "scale-vector TMEM layouts are unsupported for trace access",
-            ))
-        }
-    };
-    let elem_size = dtype_size_bytes(tensor.dtype);
-    if !matches!(elem_size, 2 | 4) {
-        return Err(InterpreterError::new(
-            "unsupported_tmem_dtype",
-            "TMEM trace access supports 16-bit or 32-bit element widths",
-        ));
-    }
-    let byte_start = layout
-        .col_start
-        .checked_mul(TMEM_CELL_BYTES)
-        .and_then(|base| base.checked_add(col0.checked_mul(elem_size)?))
-        .ok_or_else(|| {
-            InterpreterError::new("trace_region_overflow", "TMEM byte offset overflows")
-        })?;
-    let byte_end = byte_start
-        .checked_add(cols.checked_mul(elem_size).ok_or_else(|| {
-            InterpreterError::new("trace_region_overflow", "TMEM byte range overflows")
-        })?)
-        .ok_or_else(|| {
-            InterpreterError::new("trace_region_overflow", "TMEM byte range overflows")
-        })?;
-    if lane_start + rows > TMEM_ROWS || byte_end > TMEM_LANE_BYTES {
-        return Err(InterpreterError::new(
-            "trace_region_oob",
-            "TMEM trace box is outside the scratchpad",
-        ));
-    }
-    Ok(BoxN::new(vec![
-        (lane_start, lane_start + rows),
-        (byte_start, byte_end),
-    ]))
-}
-
 fn offsets_array(offsets: &[Vec<i64>]) -> IResult<ndarray::Array2<i64>> {
     let rank = offsets.first().map(|o| o.len()).unwrap_or(0);
     if rank == 0 || offsets.iter().any(|o| o.len() != rank) {
@@ -1206,21 +1100,6 @@ fn ranges_touch_or_overlap(left: (usize, usize), right: (usize, usize)) -> bool 
     left.0 <= right.1 && right.0 <= left.1
 }
 
-fn coalesced_tmem_byte_boxes(mut boxes: Vec<BoxN>) -> Vec<BoxN> {
-    boxes.sort_by_key(|b| (b.ranges[0].0, b.ranges[0].1, b.ranges[1].0, b.ranges[1].1));
-    let mut row_merged: Vec<BoxN> = Vec::new();
-    for b in boxes {
-        if let Some(last) = row_merged.last_mut() {
-            if last.ranges[0] == b.ranges[0] && b.ranges[1].0 <= last.ranges[1].1 {
-                last.ranges[1].1 = last.ranges[1].1.max(b.ranges[1].1);
-                continue;
-            }
-        }
-        row_merged.push(b);
-    }
-    coalesced_tmem_boxes(row_merged)
-}
-
 fn tmem_box(lane_start: usize, n_lanes: usize, col_start: usize, n_cols: usize) -> BoxN {
     BoxN::new(vec![
         (lane_start, lane_start + n_lanes),
@@ -1244,7 +1123,7 @@ fn non_empty_region(owner: PoolId, boxes: RegionBoxes, tensor_id: u32) -> IResul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{DType, Layout, SmemSwizzleLayout, Swizzle, TmemLayout};
+    use crate::ir::{DType, Layout, SmemSwizzleLayout, Swizzle};
 
     #[test]
     fn lane_attribution_reproduces_each_lane_footprint() {
@@ -1389,40 +1268,17 @@ mod tests {
     }
 
     #[test]
-    fn f16_tmem_halves_use_lane_byte_precision() {
-        let half = Arc::new(Tensor {
-            id: 10,
-            space: MemorySpace::Tmem,
-            dtype: DType::F16,
-            shape: vec![1, 2],
-            layout: Some(Layout::Tmem(TmemLayout {
-                kind: TmemLayoutKind::Lane128,
-                col_start: 0,
-                lane_align: 0,
-            })),
-            byte_offset: None,
-        });
-        let whole = Arc::new(Tensor {
-            id: 11,
-            space: MemorySpace::Tmem,
-            dtype: DType::F32,
-            shape: vec![1, 1],
-            layout: Some(Layout::Tmem(TmemLayout {
-                kind: TmemLayoutKind::Lane128,
-                col_start: 0,
-                lane_align: 0,
-            })),
-            byte_offset: None,
-        });
-        let lo = tensor_region_from_uniform(&half, 0, &[0, 0], &[1, 1]).unwrap();
-        let hi = tensor_region_from_uniform(&half, 0, &[0, 1], &[1, 1]).unwrap();
-        let f32_cell = tensor_region_from_uniform(&whole, 0, &[0, 0], &[1, 1]).unwrap();
-
-        assert_eq!(lo.boxes.to_boxes()[0].ranges, vec![(0, 1), (0, 2)]);
-        assert_eq!(hi.boxes.to_boxes()[0].ranges, vec![(0, 1), (2, 4)]);
-        assert!(!regions_overlap(&lo, &hi));
-        assert!(regions_overlap(&lo, &f32_cell));
-        assert!(regions_overlap(&hi, &f32_cell));
+    fn tmem_operand_boxes_use_lane_byte_physical_coords() {
+        // A TMEM operand's region is a direct physical box: lane range as-is,
+        // column cells scaled by 4 bytes — no logical->physical layout layer.
+        let cell = tmem_region_from_rects(0, 0, [(0, 1, 0, 1)]).unwrap();
+        let pair = tmem_region_from_rects(0, 0, [(0, 1, 1, 1)]).unwrap();
+        assert_eq!(cell.boxes.to_boxes()[0].ranges, vec![(0, 1), (0, 4)]);
+        assert_eq!(pair.boxes.to_boxes()[0].ranges, vec![(0, 1), (4, 8)]);
+        assert!(!regions_overlap(&cell, &pair));
+        // Same cell touched through another lane box still overlaps.
+        let wide = tmem_region_from_rects(0, 0, [(0, 2, 0, 1)]).unwrap();
+        assert!(regions_overlap(&cell, &wide));
     }
 
     #[test]
