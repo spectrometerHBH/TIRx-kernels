@@ -1520,8 +1520,17 @@ struct TmemAccess {
     event_idx: usize,
     region: Region,
     async_kind: TmemAsyncKind,
-    /// The `tcgen05.wait` that retired it, when the trace records one.
-    drain_idx: Option<usize>,
+    /// Completion observations, FIRST per waiting stream: the
+    /// `tcgen05.wait::ld/st` that retired a load/store, or an mbar wait
+    /// whose cell a covering `tcgen05.commit` handed the access to (a commit
+    /// tracks EVERY async op the warp issued before it, so every later
+    /// commit covers the access again and any one of those cells' waits is
+    /// a valid observation). Only the first witness per stream is kept: a
+    /// stream's events are program-ordered, so its earliest witness is the
+    /// easiest for any happens-before query to cover — keeping more from
+    /// the same stream cannot change the answer, and a long mainloop would
+    /// otherwise pile one witness per tile onto every access.
+    drains: Vec<(usize, usize)>,
 }
 
 /// One `alloc .. dealloc` interval of a TMEM band.
@@ -1565,6 +1574,13 @@ fn tmem_lifecycle_order_local(cx: &mut CheckerCx<'_>) -> CheckResult {
     // cells proves completion.
     let mut undrained_async: HashMap<usize, Vec<usize>> = HashMap::new();
     let mut committed: HashMap<MbarKey, Vec<usize>> = HashMap::new();
+    // Per (cell, committing stream): how many of the stream's pending
+    // accesses were already handed to the cell. `undrained_async` is
+    // append-only, so re-extending from the watermark hands each access to
+    // each cell at most once — without it a commit per tile re-copies the
+    // whole pending set into the cell and the structure grows quadratically
+    // in the tile count.
+    let mut handed: HashMap<(MbarKey, usize), usize> = HashMap::new();
     for (event_idx, event) in cx.event_index.events.iter().enumerate() {
         match &event.payload {
             TraceEventKind::TmemAlloc { region, .. } => {
@@ -1612,7 +1628,7 @@ fn tmem_lifecycle_order_local(cx: &mut CheckerCx<'_>) -> CheckResult {
                     event_idx,
                     region: region.clone(),
                     async_kind: *async_kind,
-                    drain_idx: None,
+                    drains: Vec::new(),
                 });
             }
             // `tcgen05.wait::ld/st` retires the EXECUTING thread's own loads
@@ -1622,7 +1638,10 @@ fn tmem_lifecycle_order_local(cx: &mut CheckerCx<'_>) -> CheckResult {
                 if let Some(pending) = undrained.get_mut(&scope.stream_id) {
                     pending.retain(|a| {
                         if accesses[*a].async_kind == *async_kind {
-                            accesses[*a].drain_idx = Some(event_idx);
+                            let drains = &mut accesses[*a].drains;
+                            if !drains.iter().any(|(s, _)| *s == scope.stream_id) {
+                                drains.push((scope.stream_id, event_idx));
+                            }
                             false
                         } else {
                             true
@@ -1638,22 +1657,38 @@ fn tmem_lifecycle_order_local(cx: &mut CheckerCx<'_>) -> CheckResult {
                 if event.stmt_kind == "Tcgen05Commit" =>
             {
                 if let Some(pending) = undrained_async.get(&scope.stream_id) {
-                    committed
-                        .entry(MbarKey::from_target(target))
-                        .or_default()
-                        .extend(pending.iter().copied());
+                    let key = MbarKey::from_target(target);
+                    let watermark = handed.entry((key.clone(), scope.stream_id)).or_insert(0);
+                    if *watermark < pending.len() {
+                        committed
+                            .entry(key)
+                            .or_default()
+                            .extend(pending[*watermark..].iter().copied());
+                        *watermark = pending.len();
+                    }
                 }
             }
-            TraceEventKind::MbarWait { target, .. } => {
-                if let Some(tracked) = committed.remove(&MbarKey::from_target(target)) {
+            TraceEventKind::MbarWait { target, scope, .. } => {
+                let key = MbarKey::from_target(target);
+                if let Some(tracked) = committed.remove(&key) {
                     for a in &tracked {
-                        if accesses[*a].drain_idx.is_none() {
-                            accesses[*a].drain_idx = Some(event_idx);
+                        let drains = &mut accesses[*a].drains;
+                        if !drains.iter().any(|(s, _)| *s == scope.stream_id) {
+                            drains.push((scope.stream_id, event_idx));
                         }
                     }
-                    for pending in undrained_async.values_mut() {
-                        pending.retain(|a| accesses[*a].drain_idx.is_none());
-                    }
+                    // The wait consumed this generation of the cell: later
+                    // commits start a new one, and every prior async access is
+                    // handed to it again (a commit covers EVERY async op the
+                    // warp issued before it) — reset the watermarks so the
+                    // next wait is an equally valid observation of them. The
+                    // accesses also stay in `undrained_async` (never purged):
+                    // the first wait's stream may simply never synchronize
+                    // with the band's freeing warp (a pacing wait on a
+                    // commit-multicast SMEM-ring cell is not the observer the
+                    // teardown orders against; the epilogue's tmem_full wait
+                    // is).
+                    handed.retain(|(cell, _), _| *cell != key);
                 }
             }
             TraceEventKind::TmemDealloc { region, .. } => {
@@ -1719,32 +1754,39 @@ fn tmem_lifecycle_order_local(cx: &mut CheckerCx<'_>) -> CheckResult {
         if let Some(dealloc_idx) = generation.dealloc_idx {
             // Ordering the ISSUE before the free is not enough for an async
             // access: a barrier orders instruction streams, it does not drain
-            // an engine. The free must be ordered after the COMPLETION
+            // an engine. The free must be ordered after a COMPLETION
             // OBSERVATION — `tcgen05.wait::ld/st` for a load or store, the
-            // wait on the mbarrier a `tcgen05.commit` handed the work to for
-            // an mma or cp.
-            let must_precede = access.drain_idx.unwrap_or(*access_idx);
-            if !cx.ordering().happens_before(must_precede, dealloc_idx) {
-                let event = cx.event_index.events.get(dealloc_idx);
-                let message = if access.drain_idx.is_some() {
-                    "TMEM deallocation has no happens-before edge from the drain that retires \
-                     an access of that generation; a barrier orders the issue, it does not \
-                     complete the access"
-                } else {
+            // wait on an mbarrier a `tcgen05.commit` handed the work to for
+            // an mma or cp. Any covering commit's cell yields a valid
+            // observation (the commit tracks every prior async op of the
+            // warp), so the free needs a happens-before edge from ONE
+            // recorded drain, not from a particular one.
+            let observed_before_free = access
+                .drains
+                .iter()
+                .any(|(_, d)| cx.ordering().happens_before(*d, dealloc_idx));
+            if !observed_before_free {
+                if access.drains.is_empty()
+                    && cx.ordering().happens_before(*access_idx, dealloc_idx)
+                {
+                    return Err(cx.fail(
+                        "tmem_lifecycle_use_not_drained",
+                        "TMEM access is never observed to complete — a `tcgen05.wait` of its \
+                         kind for a load or store, an awaited `tcgen05.commit` for an mma or \
+                         cp — so it is not known to have landed before the band is freed",
+                        cx.event_index.events.get(*access_idx),
+                    ));
+                }
+                let message = if access.drains.is_empty() {
                     "TMEM deallocation has no happens-before edge from an access of that \
                      generation; every accessing warp must be ordered before the free"
+                } else {
+                    "TMEM deallocation has no happens-before edge from any drain that retires \
+                     an access of that generation; a barrier orders the issue, it does not \
+                     complete the access"
                 };
+                let event = cx.event_index.events.get(dealloc_idx);
                 return Err(cx.fail("tmem_lifecycle_hb_missing", message, event));
-            }
-            if access.drain_idx.is_none() {
-                let event = cx.event_index.events.get(*access_idx);
-                return Err(cx.fail(
-                    "tmem_lifecycle_use_not_drained",
-                    "TMEM access is never observed to complete — a `tcgen05.wait` of its kind \
-                     for a load or store, an awaited `tcgen05.commit` for an mma or cp — so it \
-                     is not known to have landed before the band is freed",
-                    event,
-                ));
             }
         }
     }
@@ -6480,6 +6522,144 @@ mod tests {
             },
         ));
         events.push(tmem_dealloc_event(0));
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(report.status, ProtocolStatus::Failed);
+        assert_eq!(
+            pass_status(&report, "tmem_lifecycle_order"),
+            ProtocolStatus::Failed
+        );
+        assert!(diagnostic_codes(&report).contains("tmem_lifecycle_hb_missing"));
+    }
+
+    /// A `tcgen05.cp` + two commits: the first cell's wait is a pacing wait on
+    /// a warp that never synchronizes with the freeing warp; the second
+    /// commit covers the cp again (a commit tracks EVERY prior async op of
+    /// the warp) and the epilogue-side wait on ITS cell is the ordered
+    /// observation the free needs. mbar ids: 0 = pacing cell, 1 = epilogue
+    /// cell.
+    fn two_commit_cp_events(second_commit: bool) -> Vec<TraceEvent> {
+        let cell_a = super::super::protocol::MbarTargetEvent {
+            mbar_id: 0,
+            ..mbar_target()
+        };
+        let cell_b = super::super::protocol::MbarTargetEvent {
+            mbar_id: 1,
+            ..mbar_target()
+        };
+        let mut events = vec![
+            event(
+                0,
+                TraceEventKind::MbarInit {
+                    target: cell_a.clone(),
+                    count: 1,
+                    scope: scope(0),
+                },
+            ),
+            event(
+                0,
+                TraceEventKind::MbarInit {
+                    target: cell_b.clone(),
+                    count: 1,
+                    scope: scope(0),
+                },
+            ),
+            tmem_alloc_event(0),
+            event(
+                7,
+                TraceEventKind::Write {
+                    region: tmem_region(0, 32),
+                    proxy: MemoryProxy::Async,
+                    access_kind: MemoryAccessKind::Tmem(TmemAsyncKind::Cp),
+                    scope: scope(0),
+                },
+            ),
+            TraceEvent::new(
+                20,
+                "Tcgen05Commit",
+                TraceEventKind::MbarArrive {
+                    target: cell_a,
+                    count: 1,
+                    scope: scope(0),
+                },
+            ),
+            // The pacing wait: a valid observation of the cp's completion,
+            // but stream 1 has no edge to the freeing warp below.
+            event(
+                21,
+                TraceEventKind::MbarWait {
+                    target: super::super::protocol::MbarTargetEvent {
+                        mbar_id: 0,
+                        ..mbar_target()
+                    },
+                    phase: 0,
+                    scope: scope(1),
+                },
+            ),
+        ];
+        if second_commit {
+            events.push(TraceEvent::new(
+                22,
+                "Tcgen05Commit",
+                TraceEventKind::MbarArrive {
+                    target: cell_b,
+                    count: 1,
+                    scope: scope(0),
+                },
+            ));
+            // The epilogue-side wait on the second commit's cell — ordered
+            // with the free by program order on stream 2.
+            events.push(event(
+                23,
+                TraceEventKind::MbarWait {
+                    target: super::super::protocol::MbarTargetEvent {
+                        mbar_id: 1,
+                        ..mbar_target()
+                    },
+                    phase: 0,
+                    scope: scope(2),
+                },
+            ));
+        }
+        events.push(tmem_dealloc_event(2));
+        events
+    }
+
+    #[test]
+    fn tmem_lifecycle_accepts_dealloc_when_any_covering_drain_is_ordered() {
+        // POSITIVE (canon's SMEM-ring pacing shape): the cp's completion is
+        // observed by BOTH a pacing wait (unordered with the free) and the
+        // epilogue-side wait on a LATER covering commit's cell (ordered by
+        // program order). One ordered observation suffices.
+        let kernel = empty_kernel("tmem_lifecycle_covering_commit", vec![]);
+        let events = two_commit_cp_events(true);
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(
+            report.status,
+            ProtocolStatus::Passed,
+            "{:?}",
+            report.diagnostics
+        );
+        assert_eq!(
+            pass_status(&report, "tmem_lifecycle_order"),
+            ProtocolStatus::Passed
+        );
+    }
+
+    #[test]
+    fn tmem_lifecycle_rejects_dealloc_when_no_covering_drain_is_ordered() {
+        // NEGATIVE twin: only the unordered pacing wait observed the cp — no
+        // later commit re-covers it into an ordered cell, so the free has no
+        // ordered observation and must fail.
+        let kernel = empty_kernel("tmem_lifecycle_no_covering_commit", vec![]);
+        let events = two_commit_cp_events(false);
         let report = run_offline_checkers(
             &kernel,
             ProtocolReport::new(ProtocolStatus::Passed),
