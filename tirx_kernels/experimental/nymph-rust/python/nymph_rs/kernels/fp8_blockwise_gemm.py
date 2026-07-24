@@ -561,6 +561,11 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
                     k.reg_load(sfb_perm_frag, sfb_slice)
                     k.reg_store(sfb_slice, sfb_perm_frag)
                     k.fence(kind=FenceKind.ASYNC_PROXY, scope=FenceScope.CTA)
+                    # Each lane permuted its own column chunk, but only the
+                    # elected lane arrives below: on sm_70+ lanes reconverge
+                    # only at an explicit sync, so converge the warp before
+                    # its stores are published to the MMA warp.
+                    k.warp_sync()
                 # mbarrier.arrive is per-thread: exactly one thread per CTA's
                 # permute warp arrives at the leader, matching trans_done's
                 # count = cta_group.

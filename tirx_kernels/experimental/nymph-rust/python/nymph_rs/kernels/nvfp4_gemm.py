@@ -350,8 +350,8 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                     mbar_stage=stage,
                 )
 
-    # ---- scale-factor permute (wg0/warp2; the reg permute is warp-collective,
-    # the trans_done arrive is one thread — warp program order covers the rest) ----
+    # ---- scale-factor permute (wg0/warp2; per-lane in-place permute, then a
+    # warp_sync converges the warp before the one-thread trans_done arrive) ----
     with k.if_warp(2):
         with k.for_each_task(task_scheduler) as task:
             local_iter = (task.task_id - task_start) // task_step
@@ -381,6 +381,11 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                 k.reg_load(sfb_perm_frag, sfb_slice)
                 k.reg_store(sfb_slice, sfb_perm_frag)
                 k.fence(kind=FenceKind.ASYNC_PROXY, scope=FenceScope.CTA)
+                # Each lane permuted its own column band, but only the elected
+                # lane arrives below: on sm_70+ lanes reconverge only at an
+                # explicit sync, so converge the warp before its stores are
+                # published to the MMA warp.
+                k.warp_sync()
                 # One arrive per CTA's permute warp (trans_done count = 2).
                 with k.if_elected():
                     k.mbarrier_arrive(trans_done_leader, stage=stage)
