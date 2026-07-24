@@ -179,20 +179,19 @@ def _publish_kernel(*, write: str, warp_sync: bool, arrive: str = "elected"):
     return b.build()
 
 
-def _publish_details(report):
-    return next(d for d in report["diagnostics"] if d["code"] == "cross_lane_publish_without_sync")[
-        "details"
-    ]
+def _race_details(report):
+    return next(d for d in report["diagnostics"] if d["code"] == "memory_data_race")["details"]
 
 
 def test_divergent_write_published_by_elected_arrive_fails():
-    # Lanes 16..31 store, lane 0 arrives: nothing converged the warp, so the
-    # waiter can observe the mbar before the divergent bytes land.
+    # Lanes 16..31 store, lane 0 arrives: the arrive's release carries only
+    # lane 0's program order, so the waiter's read of the divergent bytes is
+    # unordered against the writes — judged at the consuming access.
     report = nr.check_protocol(_publish_kernel(write="half", warp_sync=False))
     assert report["status"] == "Failed"
-    assert "cross_lane_publish_without_sync" in _codes(report), report["diagnostics"]
-    detail = _publish_details(report)
-    assert detail["write_stmt_id"] != detail["publish_stmt_id"]
+    assert "memory_data_race" in _codes(report), report["diagnostics"]
+    detail = _race_details(report)
+    assert detail["left_stmt_id"] != detail["right_stmt_id"]
     assert detail["owner"].startswith("smem"), detail
 
 
@@ -204,11 +203,12 @@ def test_warp_sync_before_the_elected_arrive_passes():
 
 def test_full_warp_divergent_write_published_by_elected_arrive_fails():
     # All 32 lanes store their own cell, only lane 0 arrives: the other 31
-    # writers are unordered against the arrive — the same hazard as the
-    # half-warp variant (a full-warp cohort does not converge by itself).
+    # writers' dimensions are absent from the published clock — the same
+    # hazard as the half-warp variant (a full mask does not converge by
+    # itself).
     report = nr.check_protocol(_publish_kernel(write="full", warp_sync=False))
     assert report["status"] == "Failed"
-    assert "cross_lane_publish_without_sync" in _codes(report), report["diagnostics"]
+    assert "memory_data_race" in _codes(report), report["diagnostics"]
 
 
 def test_full_warp_arrive_publishes_every_lanes_own_store():
@@ -234,10 +234,11 @@ def test_collective_write_published_by_elected_arrive_passes():
     assert report["status"] == "Passed", report["diagnostics"]
 
 
-def test_within_warp_pipeline_arrive_is_not_a_publish():
-    # The mbar is only ever waited by the ARRIVING warp itself: a within-warp
-    # pipeline handshake, not a cross-warp publish — the per-lane ordering of
-    # that warp is the race walk's problem, not the publish pass's.
+def test_unconsumed_divergent_write_with_elected_arrive_passes():
+    # The mbar is only ever waited by the ARRIVING warp itself, and nobody
+    # reads the divergent bytes: with no conflicting access pair there is
+    # nothing to order — visibility is judged where data is consumed, never
+    # at the release itself.
     b = builder("cross_lane_publish_within_warp", smem_size_bytes=LANES * 4)
     smem = smem_tensor(b, dtype=nr.DType.U32, shape=(LANES,), byte_offset=0)
     reg = reg_tensor(b, dtype=nr.DType.U32, shape=(1,))
