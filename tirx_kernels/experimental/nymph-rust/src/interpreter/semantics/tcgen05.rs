@@ -68,9 +68,9 @@ fn execute_wait<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResul
 }
 
 fn execute_commit<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
-    // Same issue-granularity rule as the MMA/cp: a full warp or a single
-    // elected lane — a ragged partial cohort is a real divergence bug.
-    ctx.check_tcgen05_issuer("tcgen05_commit_mask", "tcgen05_commit")?;
+    // Single-thread issue, exactly like the MMA/cp it drains (PTX; canon emits
+    // it under `elect_sync`).
+    ctx.check_single_thread_issue("tcgen05_commit_mask", "tcgen05_commit")?;
     let (mbar, stage, cta_group, multicast) = match stmt {
         Stmt::Tcgen05Commit {
             mbar,
@@ -823,11 +823,14 @@ fn execute_mma<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult
         ),
         _ => unreachable!(),
     };
-    // tcgen05.mma is single-thread-ISSUE (unlike warp-collective mma.sync): a full warp OR
-    // a single elected lane (canon's `if elect_sync(): gemm`) is a valid issuer. The B200
-    // tensor pipe REQUIRES the elected single-lane form — per-op elect guards that reconverge
-    // the warp between consecutive tcgen05 issues stall the async stream (a GPU deadlock).
-    ctx.check_tcgen05_issuer("tcgen05_mma_mask", "tcgen05_mma")?;
+    // tcgen05.mma is single-thread-ISSUE (unlike warp-collective mma.sync): 32
+    // executing lanes would initiate the MMA 32 times (the accumulator adds 32
+    // times — a wrong value, not just a perf bug). Hardware has no "the
+    // instruction elects lane 0" semantics, so canon issues it under
+    // `if elect_sync():`; the B200 tensor pipe requires exactly that form —
+    // per-op elect guards that reconverge the warp between consecutive tcgen05
+    // issues stall the async stream (a GPU deadlock).
+    ctx.check_single_thread_issue("tcgen05_mma_mask", "tcgen05_mma")?;
 
     // The accumulator CTA(s): cta_group=2's even CTA computes the whole pair; odd is a no-op.
     let cta_ids: Vec<usize> = if cta_group == 2 {
@@ -1231,9 +1234,8 @@ fn read_scale_blocks(
 /// observed through `tcgen05_commit` (the trace records an async `Tmem(Cp)`
 /// write window drained by the commit).
 fn execute_cp<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
-    // Same issue-granularity rule as the MMA: a full warp or a single elected
-    // lane — a ragged partial cohort is a real divergence bug.
-    ctx.check_tcgen05_issuer("tcgen05_cp_mask", "tcgen05_cp")?;
+    // Single-thread issue, like the MMA (PTX; canon emits it under `elect_sync`).
+    ctx.check_single_thread_issue("tcgen05_cp_mask", "tcgen05_cp")?;
     let (dst, src, cta_group) = match stmt {
         Stmt::Tcgen05Cp {
             dst,
