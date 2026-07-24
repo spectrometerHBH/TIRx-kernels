@@ -1209,11 +1209,11 @@ fn tcgen05_async_hazard(cx: &mut CheckerCx<'_>) -> CheckResult {
     // per-STREAM pending load (two CTAs execute the SAME kernel stmt)
     let mut tma_pending: HashMap<usize, (usize, Vec<Region>, Vec<CellKey>)> = HashMap::new();
     let mut tma_open: HashMap<CellKey, Vec<(usize, Region)>> = HashMap::new();
-    // A PARKED mbar wait emits its event at first execution — often BEFORE
-    // the completing tx in trace order — so wait-position bookkeeping is
-    // unreliable. The rule tracks only loads whose mbar cell is never waited
-    // ANYWHERE in the trace: the fake-release core (a consumer "synchronized"
-    // by something other than the load's own barrier).
+    // The rule tracks loads whose mbar cell is never waited ANYWHERE in the
+    // trace: the fake-release core (a consumer "synchronized" by something
+    // other than the load's own barrier). Presence, not position, is what
+    // this window needs — a load whose barrier nobody ever waits was never
+    // delivered, whenever the waits happen to sit.
     let mut waited_cells: HashSet<CellKey> = HashSet::new();
     for event in cx.event_index.events.iter() {
         if let TraceEventKind::MbarWait { target, .. } = &event.payload {
