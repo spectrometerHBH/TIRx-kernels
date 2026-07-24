@@ -172,7 +172,8 @@ The checker is a pass pipeline over `Kernel IR + TraceEvents`:
 - `deadlock_freedom`: proves modeled blocking operations have no wait cycle.
 - `async_group_lifetime`: checks cp.async/TMA source windows.
 - `tmem_async_hazard`: checks overlapping TMEM async windows.
-- `tmem_lifecycle_order`: checks TMEM alloc/use/dealloc coverage.
+- `tmem_lifecycle_order`: proves TMEM band lifetimes (alloc -> use -> free
+  ordering, and the free waits for the access to be observed complete).
 - `memory_race_check`: checks SMEM/TMEM data-race freedom.
 - `cluster_peer_consistency`, `scheduler_handoff_consistency`,
   `trace_gap_audit`.
@@ -269,8 +270,22 @@ Cross-stream conflicting overlaps without ordering are trace gaps.
 
 ### `tmem_lifecycle_order`
 
-Allocation and deallocation regions must match exactly. Every TMEM memory
-access must be covered by an active allocation region using byte-box coverage.
+Two halves. The RESOURCE ALGEBRA: allocation and deallocation regions must
+match exactly, and a band may not be allocated over a live one. The LIFETIME,
+which is pure happens-before:
+
+- an access belongs to the generation whose band covers it, that it is ordered
+  after, and whose free it is not already past — a binding the clock decides,
+  not the trace walk (which only enumerates generations, and cannot answer
+  lifetime questions since it saw one schedule);
+- a re-allocation of an overlapping band must be ordered after the previous
+  generation's free;
+- the free must be ordered after every access of that generation is observed to
+  have COMPLETED. Ordering the issue is not enough: a barrier orders
+  instruction streams, it does not drain an engine. The observation point is
+  `tcgen05.wait::ld/st` for a load or store, and for an mma or cp the wait on a
+  barrier some `tcgen05.commit` handed the work to (a commit tracks every async
+  op the warp issued before it, so waiting any such barrier suffices).
 
 ### cross-proxy publication (inside `memory_race_check`)
 

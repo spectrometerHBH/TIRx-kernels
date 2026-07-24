@@ -164,6 +164,16 @@ not.
 Acquires join into the ACQUIRING lanes only: a masked wait delivers the
 release to its lanes alone until a convergence point spreads it.
 
+**Completion observation** (visibility rule 5): an engine access is ordered
+by its completion object, not by its issue. A barrier that orders two
+instruction streams says nothing about whether the engine has drained, so
+anything that depends on an async access having LANDED — most sharply, freeing
+the TMEM band it touches — must be ordered after the observation point:
+`tcgen05.wait::ld/st` for a load or store, and for an mma or cp the wait on a
+barrier some `tcgen05.commit` handed the work to. A commit tracks every async
+op the warp issued before it, so a later commit covers the same work again and
+waiting any one of those barriers suffices.
+
 **Modeled WEAK** (over-report direction, by the ledger discipline):
 
 - `elect` — no IR op; `if_elected` lowers to a plain `If`. Hardware

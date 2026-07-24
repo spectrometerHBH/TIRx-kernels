@@ -207,7 +207,11 @@ struct CheckerCx<'a> {
     kernel: &'a Kernel,
     event_index: EventIndex<'a>,
     region_audit: TraceRegionAudit,
-    ordering: OrderingAnalysis,
+    /// Built by `ordering_analysis`, read by the passes that need
+    /// happens-before. `None` until then, so a pass that runs before it says
+    /// so instead of quietly reading an empty clock — under which nothing is
+    /// ordered and every conflicting pair looks like a race.
+    ordering: Option<OrderingAnalysis>,
     gaps: Vec<TraceGap>,
     diagnostics: Vec<Diagnostic>,
     warnings: Vec<super::protocol::ProtocolWarning>,
@@ -219,11 +223,17 @@ impl<'a> CheckerCx<'a> {
             kernel,
             event_index: EventIndex::new(events),
             region_audit: TraceRegionAudit::new(kernel),
-            ordering: OrderingAnalysis::empty(),
+            ordering: None,
             gaps: Vec::new(),
             diagnostics: Vec::new(),
             warnings: Vec::new(),
         }
+    }
+
+    fn ordering(&self) -> &OrderingAnalysis {
+        self.ordering
+            .as_ref()
+            .expect("ordering_analysis must run before the passes that read the clock")
     }
 
     fn fail(
@@ -631,7 +641,7 @@ fn barrier_cycle_audit(cx: &mut CheckerCx<'_>) -> CheckResult {
 }
 
 fn ordering_analysis_pass(cx: &mut CheckerCx<'_>) -> CheckResult {
-    cx.ordering = OrderingAnalysis::new(cx.event_index.events);
+    cx.ordering = Some(OrderingAnalysis::new(cx.event_index.events));
     Ok(())
 }
 
@@ -1058,12 +1068,12 @@ fn check_cross_stream_async_windows(
                 }
                 // instances [0, drained) are proven drained before the access
                 let drained = group.closes.partition_point(|close| {
-                    close.is_some_and(|close| cx.ordering.happens_before(close, access.event_idx))
+                    close.is_some_and(|close| cx.ordering().happens_before(close, access.event_idx))
                 });
                 // instances [issued_after, n) are proven issued after it
-                let issued_after = group
-                    .starts
-                    .partition_point(|&start| !cx.ordering.happens_before(access.event_idx, start));
+                let issued_after = group.starts.partition_point(|&start| {
+                    !cx.ordering().happens_before(access.event_idx, start)
+                });
                 if issued_after <= drained {
                     continue; // every instance is on one safe side
                 }
@@ -1637,7 +1647,7 @@ fn tmem_lifecycle_order_local(cx: &mut CheckerCx<'_>) -> CheckResult {
             }
             let ordered = earlier
                 .dealloc_idx
-                .is_some_and(|d| cx.ordering.happens_before(d, later.alloc_idx));
+                .is_some_and(|d| cx.ordering().happens_before(d, later.alloc_idx));
             if !ordered {
                 let event = cx.event_index.events.get(later.alloc_idx);
                 return Err(cx.fail(
@@ -1659,10 +1669,10 @@ fn tmem_lifecycle_order_local(cx: &mut CheckerCx<'_>) -> CheckResult {
         let generation = generations.iter().find(|g| {
             g.region.owner == region.owner
                 && region_covers(&g.region, region)
-                && cx.ordering.happens_before(g.alloc_idx, *access_idx)
+                && cx.ordering().happens_before(g.alloc_idx, *access_idx)
                 && !g
                     .dealloc_idx
-                    .is_some_and(|d| cx.ordering.happens_before(d, *access_idx))
+                    .is_some_and(|d| cx.ordering().happens_before(d, *access_idx))
         });
         let Some(generation) = generation else {
             let event = cx.event_index.events.get(*access_idx);
@@ -1681,7 +1691,7 @@ fn tmem_lifecycle_order_local(cx: &mut CheckerCx<'_>) -> CheckResult {
             // wait on the mbarrier a `tcgen05.commit` handed the work to for
             // an mma or cp.
             let must_precede = access.drain_idx.unwrap_or(*access_idx);
-            if !cx.ordering.happens_before(must_precede, dealloc_idx) {
+            if !cx.ordering().happens_before(must_precede, dealloc_idx) {
                 let event = cx.event_index.events.get(dealloc_idx);
                 let message = if access.drain_idx.is_some() {
                     "TMEM deallocation has no happens-before edge from the drain that retires \
@@ -1774,9 +1784,9 @@ fn ordered_conflict(
     // ordered pair whose bytes were never published is still a bug (and an
     // unordered one is a bug even if they were).
     if current.crosses_into_engine(prior) {
-        let write_ordinal = cx.ordering.event_ordinal(prior.event_idx);
+        let write_ordinal = cx.ordering().event_ordinal(prior.event_idx);
         let unpublished = |pl: u8| {
-            !cx.ordering
+            !cx.ordering()
                 .engine_sees(prior.stream_id, pl, write_ordinal, current.event_idx)
         };
         let offender = match prior.region.lane_boxes.as_deref() {
@@ -1820,21 +1830,21 @@ fn lane_slices_ordered(
     // case for converged same-stream pairs and release-chained cross-stream
     // pairs. Only when it fails does the pair need slice-level resolution.
     if cx
-        .ordering
+        .ordering()
         .happens_before(prior.event_idx, current.event_idx)
         || (!same_stream
             && cx
-                .ordering
+                .ordering()
                 .happens_before(current.event_idx, prior.event_idx))
     {
         return Ok(());
     }
     let pair_ordered = |pl: u8, cl: u8| -> bool {
-        cx.ordering
+        cx.ordering()
             .ordered_lane(prior.event_idx, pl, current.event_idx, cl)
             || (!same_stream
                 && cx
-                    .ordering
+                    .ordering()
                     .ordered_lane(current.event_idx, cl, prior.event_idx, pl))
     };
     let mask_lanes = |mask: u32| (0..32u8).filter(move |l| mask & (1u32 << l) != 0);
@@ -1926,7 +1936,7 @@ fn prune_ordered(
         return true;
     }
     if cx
-        .ordering
+        .ordering()
         .happens_before(prior.event_idx, current.event_idx)
     {
         return true;
@@ -3559,10 +3569,6 @@ struct OrderingAnalysis {
 }
 
 impl OrderingAnalysis {
-    fn empty() -> Self {
-        Self { meta: Vec::new() }
-    }
-
     fn new(events: &[TraceEvent]) -> Self {
         let stream_count = events
             .iter()
