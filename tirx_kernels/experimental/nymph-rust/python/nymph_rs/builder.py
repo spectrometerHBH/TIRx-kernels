@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Literal
+from typing import Literal, NamedTuple
 
 from .nymph_rs import (
     _SCALAR_GMEM_DTYPES,
     BreakIf,
+    ClcQueryCancel,
+    ClcTryCancel,
+    ClusterBarrierArrive,
+    ClusterBarrierWait,
     ClusterShape,
     ClusterSync,
     CpAsyncBulkCommitGroup,
@@ -59,6 +63,7 @@ from .nymph_rs import (
     RegUnary,
     ScalarDef,
     ScalarDType,
+    ScalarLet,
     ScalarStore,
     ScalarValue,
     SchedNext,
@@ -67,6 +72,7 @@ from .nymph_rs import (
     ScopeValue,
     SetMaxNReg,
     Shape,
+    ShuffleSync,
     StMatrix,
     Stmt,
     StoreScalar,
@@ -85,6 +91,8 @@ from .nymph_rs import (
     TmaStore,
     TmemAlloc,
     TmemDealloc,
+    TmemOperand,
+    TmemRelinquish,
     Var,
     VarBinding,
     WarpMma,
@@ -104,6 +112,64 @@ RegCondScope = Literal["warp", "warpgroup"]
 # Single source of the GMEM-scalar tensor-dtype -> ScalarDType mapping lives in
 # ir.py (`_SCALAR_GMEM_DTYPES`); the builder reuses it for the default scalar
 # dtype of a `ScalarDef(initial=TensorSlice)`.
+
+_PACKED_HALF_DTYPES = (DType.F16, DType.BF16)
+
+
+class TmemBand(NamedTuple):
+    """A pure-Python TMEM column-band descriptor (NOT in the IR): one region of the
+    shared 128-lane x 512-column TMEM, addressed by its absolute physical base lane
+    + 32-bit-cell column plus the dtype its cells are (un)packed as. This replaces
+    the old TMEM `Tensor`+`TmemLayout` — the IR carries flat `TmemOperand`s, so the
+    band only exists to keep a kernel's column plan named and traceable. `lane0` is
+    the band's base lane: 0 for the full-datapath lane-anchored layouts, 64 for a
+    lower-half 64-row layout (lane = row + 64)."""
+
+    col0: int
+    dtype: DType
+    lane0: int = 0
+
+    def at(self, row: ScalarValue = 0, col: ScalarValue = 0) -> TmemOperand:
+        """The operand at absolute physical (lane0 + row, col0 + col) — `col` in
+        32-bit cells (the tcgen05.ld/st/cp and MMA-dst addressing unit)."""
+        return TmemOperand(self.lane0 + row, self.col0 + col, self.dtype)
+
+    def elem(self, row: ScalarValue = 0, col: ScalarValue = 0) -> TmemOperand:
+        """The operand at logical ELEMENT (row, col) of the band — f16/bf16 pack
+        two elements per 32-bit cell (low half first), f32/i32/u32 one per cell.
+        This is the old TMEM-tensor slice-offset unit (MMA A/B operands)."""
+        return self.at(row, col // 2 if self.dtype in _PACKED_HALF_DTYPES else col)
+
+
+class SfTmemBand(NamedTuple):
+    """A block scale-factor TMEM band (pure Python, NOT in the IR): `rows` logical
+    scaled rows (may exceed 128 — e.g. the 256-row SFB) of `nblocks` scale blocks
+    each, folded onto the physical 128 lanes at base column `col0`. The folding is
+    canon's sf_tmem_layout / the interpreter's SF rule: logical (row, block) sits
+    at physical ``lane = row % 128``, ``col = col0 + (row // 128) * nblocks +
+    block``. nvfp4 uses dtype=f8e4m3 (one raw scale byte per cell); fp8 blockwise
+    uses dtype=u32 with nblocks=1 (one packed 4-byte scale cell per row, so the
+    rule degenerates to ``col = col0 + row // 128``)."""
+
+    col0: int
+    rows: int
+    nblocks: int
+    dtype: DType = DType.F8E4M3
+
+    @property
+    def n_cols(self) -> int:
+        """The folded physical column span: ceil(rows / 128) super-blocks of
+        `nblocks` columns each."""
+        return ((self.rows + 127) // 128) * self.nblocks
+
+    def cell(self, row: int, block: int) -> tuple[int, int]:
+        """The folded physical (lane, col) of logical (row, block)."""
+        return (row % 128, self.col0 + (row // 128) * self.nblocks + block)
+
+    def at(self, col: ScalarValue = 0) -> TmemOperand:
+        """The MMA sfa/sfb / tcgen05.cp operand: lane-anchored at row 0, at the
+        band's physical base column (+ `col` cells, e.g. a per-stage offset)."""
+        return TmemOperand(0, self.col0 + col, self.dtype)
 
 
 class TaskToken:
@@ -142,12 +208,14 @@ class IRBuilder:
         smem_size_bytes: int = 0,
         launch_shape: LaunchShape = (1,),
         cluster_shape: ClusterShape = (1,),
+        smem_pool: bool = False,
     ):
         self.name = name
         self.num_warps = num_warps
         self.smem_size_bytes = smem_size_bytes
         self.launch_shape = launch_shape
         self.cluster_shape = cluster_shape
+        self.smem_pool = smem_pool
         self._args: list[Tensor] = []
         self._body: list[Stmt] = []
         self._body_stack: list[list[Stmt]] = [self._body]
@@ -161,6 +229,7 @@ class IRBuilder:
             smem_size_bytes=self.smem_size_bytes,
             launch_shape=self.launch_shape,
             cluster_shape=self.cluster_shape,
+            smem_pool=self.smem_pool,
         )
 
     @property
@@ -200,11 +269,27 @@ class IRBuilder:
         self._append(TensorDef(tensor))
         return tensor
 
-    def tmem_alloc(self, tensor: Tensor, *, n_cols: int, cta_group: Literal[1, 2] = 1) -> None:
-        self._append(TmemAlloc(tensor=tensor, n_cols=n_cols, cta_group=cta_group))
+    def tmem_alloc(self, base_col: int, n_cols: int, cta_group: Literal[1, 2] = 1) -> None:
+        """Allocate the TMEM column band [base_col, base_col + n_cols). The IR's
+        lifecycle is deliberately narrower than raw PTX (validate enforces it,
+        because codegen lowers the band as ONE base-0 view): a single live
+        base-0 band per kernel (the next alloc needs a matching dealloc first),
+        every lifecycle op carries the kernel-level cta_group, no alloc after
+        `tmem_relinquish` (PTX §9.7.17.7.1), and lifecycle ops are top-level
+        only — never inside a loop/conditional body."""
+        self._append(TmemAlloc(base_col=base_col, n_cols=n_cols, cta_group=cta_group))
 
-    def tmem_dealloc(self, tensor: Tensor, *, n_cols: int, cta_group: Literal[1, 2] = 1) -> None:
-        self._append(TmemDealloc(tensor=tensor, n_cols=n_cols, cta_group=cta_group))
+    def tmem_dealloc(self, base_col: int, n_cols: int, cta_group: Literal[1, 2] = 1) -> None:
+        """Free the live band [base_col, base_col + n_cols) (must exactly match an
+        alloc). Pair with a preceding `tmem_relinquish` — the CTA's alloc permit is
+        released explicitly, not implied by the dealloc."""
+        self._append(TmemDealloc(base_col=base_col, n_cols=n_cols, cta_group=cta_group))
+
+    def tmem_relinquish(self, cta_group: Literal[1, 2] = 1) -> None:
+        """`tcgen05.relinquish_alloc_permit` — explicit (the old codegen emitted it
+        implicitly at the dealloc; it now rides its own IR statement, written right
+        before the dealloc to reproduce the same output sequence)."""
+        self._append(TmemRelinquish(cta_group=cta_group))
 
     def scalar(
         self, *, initial: ScalarValue | TensorSlice = 0, dtype: ScalarDType | None = None
@@ -221,6 +306,31 @@ class IRBuilder:
 
     def scalar_store(self, var: Var, value: ScalarValue) -> None:
         self._append(ScalarStore(var=var, value=value))
+
+    def let(self, value: ScalarValue, *, dtype: ScalarDType = ScalarDType.I32) -> Var:
+        """Single-assignment ``let`` binding (canon's ``name: T.let = expr``): an
+        immutable SSA value, NOT a mutable local-scalar cell. Called inside a task
+        loop body it re-binds once per iteration — canon's ``while``-loop ``T.let``
+        form. The SSA dataflow is what lets ptxas keep the value (and the index
+        chain derived from it) on the uniform datapath; a mutable scalar forces
+        vector regs + R2UR moves at every uniform-sink use. ``scalar_store`` to a
+        let-bound var is rejected by validate (single assignment)."""
+        var = Var(binding=VarBinding.SCALAR, dtype=dtype)
+        self._append(ScalarLet(var=var, value=value))
+        return var
+
+    def shuffle_sync(
+        self, src: ScalarValue, src_lane: ScalarValue = 0, *, dtype: ScalarDType = ScalarDType.I32
+    ) -> Var:
+        """Warp broadcast that DEFINES a scalar: every lane gets the value of ``src``
+        on lane ``src_lane`` (a faithful ``__shfl_sync``). For a warp-uniform ``src``
+        it is value-preserving and makes the result compiler-provably uniform (so the
+        derived index/address math lowers to the uniform datapath). The value model
+        runs the broadcast, so broadcasting a non-uniform value is caught as a
+        mismatch."""
+        var = Var(binding=VarBinding.SCALAR, dtype=dtype)
+        self._append(ShuffleSync(var=var, src=src, src_lane=src_lane))
+        return var
 
     def store_scalar(self, dst: Tensor | TensorSlice, value: ScalarValue) -> None:
         if isinstance(dst, Tensor):
@@ -248,8 +358,23 @@ class IRBuilder:
     def nvshmem_my_pe(self) -> ScopeValue:
         return ScopeValue(kind="nvshmem_my_pe")
 
-    def mbar(self, *, kind: MBarKind, stages: int = 1, arrive_count: int | None = None) -> MBar:
-        mbar = MBar(kind=kind, stages=stages, arrive_count=arrive_count)
+    def mbar(
+        self,
+        *,
+        kind: MBarKind,
+        stages: int = 1,
+        arrive_count: int | None = None,
+        leader_routed: bool = False,
+    ) -> MBar:
+        """``leader_routed=True`` marks a cluster TMA-completion barrier: BOTH
+        CTAs' TMA loads signal the LEADER CTA's (CTA-0) copy of this barrier
+        (the canonical cta_group=2 pattern — the legal substitute for a peer
+        ``try_wait``, and the prerequisite for multicast loads, whose per-
+        destination tx counts must accumulate on the single leader barrier).
+        Validate requires a peer reference and TMA-load/expect_tx-only use."""
+        mbar = MBar(
+            kind=kind, stages=stages, arrive_count=arrive_count, leader_routed=leader_routed
+        )
         self._append(MBarDef(mbar))
         return mbar
 
@@ -296,7 +421,6 @@ class IRBuilder:
         src: Tensor,
         *,
         mbar: MBar | MBarRef,
-        bytes: ScalarValue,
         coords: tuple[ScalarValue, ...],
         shape: Shape,
         gmem_shape: Shape | None = None,
@@ -304,13 +428,16 @@ class IRBuilder:
         multicast_cta_mask: int | None = None,
         cta_group: int = 1,
     ) -> None:
+        """TMA bulk async GMEM->SMEM copy. The transfer's byte size is DERIVED,
+        never stated: the sim's mbar tx accounting computes
+        ``numel(shape) x dtype_bytes`` from the tile (exactly what TIRx derives
+        from the box extents), so the size exists in precisely one place."""
         if isinstance(dst, Tensor):
             dst = dst[...]
         stmt = TmaLoad(
             dst=dst,
             src=src,
             mbar=mbar,
-            bytes=bytes,
             coords=coords,
             shape=shape,
             gmem_shape=gmem_shape,
@@ -425,8 +552,18 @@ class IRBuilder:
 
     @contextmanager
     def for_loop(
-        self, *, stop: ScalarValue, start: ScalarValue = 0, step: ScalarValue = 1
+        self,
+        *,
+        stop: ScalarValue,
+        start: ScalarValue = 0,
+        step: ScalarValue = 1,
+        unroll: bool = True,
     ) -> Iterator[Var]:
+        """``unroll=False`` pins the loop ROLLED (canon's ``T.serial(N,
+        unroll=False)`` — the CUDA source carries ``#pragma unroll 1``).
+        Without it ptxas re-unrolls a merged tcgen05-MMA loop, re-inflating the
+        whole-function static size that decides the uniform-register placement
+        threshold. Validate requires literal start=0/step=1 when false."""
         var = Var()
         body: list[Stmt] = []
         self._body_stack.append(body)
@@ -437,7 +574,9 @@ class IRBuilder:
             raise
         else:
             self._body_stack.pop()
-            self._append(ForLoop(var=var, start=start, stop=stop, step=step, body=tuple(body)))
+            self._append(
+                ForLoop(var=var, start=start, stop=stop, step=step, body=tuple(body), unroll=unroll)
+            )
 
     def task_space(self, *, grid: tuple[int, ...], fields: tuple[str, ...]) -> TaskSpace:
         return TaskSpace(grid=grid, fields=fields)
@@ -483,6 +622,36 @@ class IRBuilder:
         var = Var(binding=VarBinding.TASK)
         self._append(SchedNext(scheduler=scheduler, var=var))
         return TaskToken(var, scheduler.space, has_valid=True)
+
+    def clc_try_cancel(
+        self,
+        scheduler: Scheduler,
+        handle: Tensor,
+        mbar: MBar | MBarRef,
+        *,
+        stage: ScalarValue | None = None,
+        cta_group: Literal[1, 2] = 2,
+    ) -> None:
+        """CLC (Cluster Launch Control) async work-steal issue:
+        ``clusterlaunchcontrol.try_cancel`` writes a 16B response into ``handle``
+        and completes-tx ``mbar`` (multicast to both cluster CTAs). Single-issue
+        (one elected thread). The paired ``clc_query_cancel`` reads the result,
+        so the scheduler and every worker that query the same handle observe the
+        same id."""
+        self._append(
+            ClcTryCancel(
+                scheduler=scheduler, handle=handle, mbar=mbar, stage=stage, cta_group=cta_group
+            )
+        )
+
+    def clc_query_cancel(self, scheduler: Scheduler, handle: Tensor) -> Var:
+        """CLC decode of the response ``handle``: DEFINES the scalar (the
+        cancelled cluster's first ``ctaid.x`` — task * cta_group — or
+        ``0xFFFFFFFF`` → -1 as int32 when drained). Unguarded: every thread of
+        the branch reads the same handle and gets the same value."""
+        var = Var(binding=VarBinding.SCALAR, dtype=ScalarDType.I32)
+        self._append(ClcQueryCancel(scheduler=scheduler, var=var, handle=handle))
+        return var
 
     @contextmanager
     def loop(self) -> Iterator[None]:
@@ -556,46 +725,43 @@ class IRBuilder:
 
     def tcgen05_mma(
         self,
-        dst: Tensor | TensorSlice,
-        a: Tensor | TensorSlice,
-        b: Tensor | TensorSlice,
+        dst: TmemOperand,
+        a: Tensor | TensorSlice | TmemOperand,
+        b: Tensor | TensorSlice | TmemOperand,
         *,
         m: int,
         n: int,
         k: int = 16,
-        accum: bool = False,
+        accum: ScalarValue = 0,
         trans_a: bool = False,
         trans_b: bool = False,
         cta_group: Literal[1, 2] = 1,
-        sfa: Tensor | TensorSlice | None = None,
-        sfb: Tensor | TensorSlice | None = None,
+        sfa: TmemOperand | None = None,
+        sfb: TmemOperand | None = None,
         sf_byte: int = 0,
         sf_e4m3: bool = False,
         sf_block: int = 0,
         a_fp4: bool = False,
         b_fp4: bool = False,
+        lane_align: int = 0,
     ) -> None:
-        """``sfa``/``sfb`` make this a block-scaled MMA: each is a (128, cols) u32
-        TMEM slice of packed scale bytes. Two scale modes share the field set:
-
-        * fp8 (``kind::mxf8f6f4`` + UE8M0, default): one scale per operand row;
-          ``sf_byte`` picks the packed byte for this MMA's k-slice, dequant
-          2^(byte - 127).
-        * nvfp4 (``kind::mxf4`` + e4m3, ``sf_e4m3=True, sf_block=16``): one scale
-          per 16 contiguous k-elements; this MMA's k spans k/16 blocks whose
-          scales are bytes 0..k/16 of the cell, each decoded as e4m3.
-          ``a_fp4``/``b_fp4`` mark the operands as packed e2m1 (2 per u8 byte,
-          the SMEM tile's inner extent is k/2 bytes)."""
-        if isinstance(dst, Tensor):
-            dst = dst[...]
+        """``dst``/``sfa``/``sfb`` are absolute physical TMEM operands
+        (``TmemOperand`` or a ``(row, col, dtype)`` tuple); ``a``/``b`` are SMEM
+        tiles or TMEM operands. A dense f16/bf16 MMA carries k = the full
+        k-tile (validate reads it as an ordered run of k/16 atomic MMAs, exactly
+        canon's one-issue full-K ``gemm_async``). ``accum`` is a RUNTIME scalar
+        (0 = overwrite, nonzero = accumulate) so a merged k-tile loop can carry
+        canon's accum cell; a Python bool/int literal folds to the compile-time
+        form. ``sfa``/``sfb`` make this a block-scaled MMA: nvfp4 (e4m3 decode,
+        ``sf_e4m3=True, sf_block=16``) holds one scale byte per 16 contiguous
+        k-elements; fp8 (UE8M0, default) one scale per operand row with
+        ``sf_byte`` selecting the packed byte."""
         if isinstance(a, Tensor):
             a = a[...]
         if isinstance(b, Tensor):
             b = b[...]
-        if isinstance(sfa, Tensor):
-            sfa = sfa[...]
-        if isinstance(sfb, Tensor):
-            sfb = sfb[...]
+        if isinstance(accum, bool):
+            accum = int(accum)
         stmt = Tcgen05Mma(
             dst=dst,
             a=a,
@@ -614,18 +780,18 @@ class IRBuilder:
             sf_block=sf_block,
             a_fp4=a_fp4,
             b_fp4=b_fp4,
+            lane_align=lane_align,
         )
         self._append(stmt)
 
     def tcgen05_cp(
-        self, dst: Tensor | TensorSlice, src: Tensor | TensorSlice, *, cta_group: Literal[1, 2] = 1
+        self, dst: TmemOperand, src: Tensor | TensorSlice, *, cta_group: Literal[1, 2] = 1
     ) -> None:
-        """``tcgen05.cp`` — bulk-copy packed u32 scale cells from SMEM into TMEM.
-        With ``cta_group=2`` the leader's single issue drives both CTAs: each CTA
-        copies from its own SMEM into its own TMEM (row r -> lane r % 128,
-        col base + r // 128)."""
-        if isinstance(dst, Tensor):
-            dst = dst[...]
+        """``tcgen05.cp`` — bulk-copy packed u32 scale cells (or raw e4m3 scale
+        bytes for nvfp4) from SMEM into TMEM at the absolute physical base
+        ``dst``. With ``cta_group=2`` the leader's single issue drives both
+        CTAs: each CTA copies from its own SMEM into its own TMEM (row r ->
+        lane r % 128, col base + r // 128)."""
         if isinstance(src, Tensor):
             src = src[...]
         self._append(Tcgen05Cp(dst=dst, src=src, cta_group=cta_group))
@@ -646,17 +812,17 @@ class IRBuilder:
     def tcgen05_ld(
         self,
         dst: Tensor | TensorSlice,
-        src: Tensor,
+        src: TmemOperand,
         *,
         shape: Tcgen05LdStShape = "32x32b",
         num: Literal[1, 2, 4, 8, 16, 32, 64, 128] = 1,
-        row: ScalarValue = 0,
-        col: ScalarValue = 0,
     ) -> None:
-        # ``src`` is the TMEM tensor handle; the taddr corner is the (row, col) operands.
+        """``tcgen05.ld`` — TMEM -> REG datapath read. ``src`` is the absolute
+        physical TMEM base address (``TmemOperand(row, col, dtype)``); ``dst``
+        the REG fragment."""
         if isinstance(dst, Tensor):
             dst = dst[...]
-        stmt = Tcgen05Ld(dst=dst, src=src, shape=shape, num=num, row=row, col=col)
+        stmt = Tcgen05Ld(dst=dst, src=src, shape=shape, num=num)
         self._append(stmt)
 
     def tcgen05_wait_ld(self) -> None:
@@ -664,18 +830,17 @@ class IRBuilder:
 
     def tcgen05_st(
         self,
-        dst: Tensor,
+        dst: TmemOperand,
         src: Tensor | TensorSlice,
         *,
         shape: Tcgen05LdStShape = "32x32b",
         num: Literal[1, 2, 4, 8, 16, 32, 64, 128] = 1,
-        row: ScalarValue = 0,
-        col: ScalarValue = 0,
     ) -> None:
-        # ``dst`` is the TMEM tensor handle; the taddr corner is the (row, col) operands.
+        """``tcgen05.st`` — REG -> TMEM datapath write at the absolute physical
+        base ``dst``; ``src`` the REG fragment."""
         if isinstance(src, Tensor):
             src = src[...]
-        stmt = Tcgen05St(dst=dst, src=src, shape=shape, num=num, row=row, col=col)
+        stmt = Tcgen05St(dst=dst, src=src, shape=shape, num=num)
         self._append(stmt)
 
     def tcgen05_wait_st(self) -> None:
@@ -966,6 +1131,22 @@ class IRBuilder:
 
     def cluster_sync(self) -> None:
         self._append(ClusterSync())
+
+    def cluster_barrier_arrive(self, sem: Literal["relaxed", "release"] = "relaxed") -> None:
+        """Split cluster barrier — ARRIVE side. A non-blocking collective arrival
+        (``barrier.cluster.arrive``, aligned) issued once at CTA scope after the
+        prologue init, paired with per-branch ``cluster_barrier_wait``s. Canon's
+        ``.relaxed`` (the default) unblocks the waits with NO memory happens-
+        before (the memory order comes from ``fence.mbarrier_init`` / the mbar
+        pipeline); ``.release`` additionally publishes the cohort's prior
+        accesses."""
+        self._append(ClusterBarrierArrive(sem=sem))
+
+    def cluster_barrier_wait(self) -> None:
+        """Split cluster barrier — WAIT side. WARP-COLLECTIVE: all threads of the
+        branch's warp(group) must execute it (an elected-lane wait deadlocks on
+        hardware). Blocks until every CTA of the cluster has arrived."""
+        self._append(ClusterBarrierWait())
 
     def _append(self, stmt: Stmt) -> None:
         self._body_stack[-1].append(stmt)
