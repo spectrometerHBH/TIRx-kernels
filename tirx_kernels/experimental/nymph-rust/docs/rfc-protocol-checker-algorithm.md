@@ -23,9 +23,19 @@ Full checker passes run only after trace execution returns `Passed`.
 
 ## 2. Execution Model
 
-- A role/stream executes its dynamic operations in order.
+- A stream is one warp (`(cta, warp)`) and executes its dynamic operations in
+  order.
 - Each modeled op is atomic at checker granularity.
-- Different roles/streams may interleave arbitrarily.
+- Different streams may interleave arbitrarily. Warps of one CTA are separate
+  streams, so cross-warp pairs are ordered only by explicit synchronization.
+- Within one stream, program order orders each LANE against itself. A pair of
+  accesses by DIFFERENT lanes of the warp is ordered by a warp-level sync
+  between them: a passed cooperative barrier (`warp_sync`, `wg_sync`,
+  `cta_sync`, a named barrier, `cluster_sync`) or a warp-collective
+  instruction (`ldmatrix`, `stmatrix`, `tcgen05.ld`, `tcgen05.st`, warp MMA),
+  which every lane converges on. An access performed by an async engine
+  (`proxy = async`) is ordered by its own drain rule, checked by the async
+  passes.
 - Barriers, waits, syncs, fences, commits, and async drains constrain legal
   interleavings.
 - Event vector order is canonical trace order, not cross-stream
@@ -47,6 +57,11 @@ Region {
     owner: PoolId,
     boxes: Vec<BoxN>,
     tensor_id: u32,
+    // Per-lane attribution of `boxes`, before they are merged across the
+    // warp's lanes. Carried for lane-divergent SMEM/TMEM accesses and for
+    // single-lane masks; `None` means every executing lane touches the
+    // whole region.
+    lane_boxes: Option<Vec<(u8, BoxN)>>,
 }
 
 BoxN {
@@ -82,7 +97,7 @@ TraceEventKind::Write {
 non-memory event.
 
 `AccessScope` includes `stream_id`, `cluster_id`, global `cta_id`,
-`ctaid_in_cluster`, `cohort_size`, and `warp_ids`. `MbarTargetEvent` includes
+`ctaid_in_cluster`, `lane_count`, and `warp_id`. `MbarTargetEvent` includes
 `mbar_id`, `cluster_id`, `ctaid_in_cluster`, and `stage`. Resource keys for
 mbarrier, sync, deadlock, and cluster-scope fences must use cluster identity
 where applicable.
@@ -148,13 +163,18 @@ The checker is a pass pipeline over `Kernel IR + TraceEvents`:
 - `trace_schema_audit`: validates common event fields and non-region schema.
 - `trace_region_audit`: validates `Region` owner/rank/bounds/empty-box rules.
 - `barrier_cycle_audit`: audits mbarrier and sync counters/cycles.
-- `ordering_analysis`: builds schedule-independent happens-before edges.
+- `ordering_analysis`: builds schedule-independent happens-before edges from
+  per-stream program order, mbar phase-keyed release/acquire, and cooperative
+  barriers. A cooperative-barrier generation is keyed by
+  `(statement, rendezvous domain, cycle)`: all arrivals of one generation join
+  into a release clock frozen by the completing arrival, and every passage of
+  that generation acquires it.
 - `deadlock_freedom`: proves modeled blocking operations have no wait cycle.
 - `async_group_lifetime`: checks cp.async/TMA source windows.
 - `tmem_async_hazard`: checks overlapping TMEM async windows.
-- `tmem_lifecycle_order`: checks TMEM alloc/use/dealloc coverage.
+- `tmem_lifecycle_order`: proves TMEM band lifetimes (alloc -> use -> free
+  ordering, and the free waits for the access to be observed complete).
 - `memory_race_check`: checks SMEM/TMEM data-race freedom.
-- `proxy_fence`: checks generic/async SMEM proxy transitions.
 - `cluster_peer_consistency`, `scheduler_handoff_consistency`,
   `trace_gap_audit`.
 
@@ -175,7 +195,7 @@ region_covers(a, b):
   and every box in b is covered by some box in a
 ```
 
-`async_group_lifetime`, `proxy_fence`, `tmem_async_hazard`, and
+`async_group_lifetime`, `tmem_async_hazard`, and
 `tmem_lifecycle_order` all use these helpers. Barrier and deadlock passes do not
 inspect regions.
 
@@ -190,6 +210,17 @@ A.mode == Write || B.mode == Write
 !happens_before(B.event_idx, A.event_idx)
 ```
 
+A conflicting pair on ONE stream is a race between two lanes of that warp
+unless an intra-warp ordering fact covers it:
+
+```text
+A.stmt_kind is warp-collective || B.stmt_kind is warp-collective
+|| A.proxy == async || B.proxy == async
+|| a cooperative-barrier passage or warp-collective event of that stream
+   lies strictly between A and B
+|| every overlapping (A.lane_boxes, B.lane_boxes) pair shares one lane
+```
+
 The pass keeps per-owner read and write frontiers. Reads query only the write
 frontier, may prune older covered reads ordered before the current read, and
 then join the read frontier. Writes query both frontiers, then join the write
@@ -199,7 +230,10 @@ writes or drive global spatial partitioning.
 
 The pass does not prove prior-write completeness, read-from identity, or write
 consumption. A read without a prior write is not an error by itself, and an
-unread write is not an error by itself. Failures use `memory_data_race`.
+unread write is not an error by itself. Failures use `memory_data_race`,
+across streams and between lanes of one warp alike — the happens-before
+clock is per (warp, lane), so both are the same missing edge (the diagnostic
+names the lane pair when the conflict is lane-attributed).
 
 ## 8. Pass Notes
 
@@ -236,13 +270,32 @@ Cross-stream conflicting overlaps without ordering are trace gaps.
 
 ### `tmem_lifecycle_order`
 
-Allocation and deallocation regions must match exactly. Every TMEM memory
-access must be covered by an active allocation region using byte-box coverage.
+Two halves. The RESOURCE ALGEBRA: allocation and deallocation regions must
+match exactly, and a band may not be allocated over a live one. The LIFETIME,
+which is pure happens-before:
 
-### `proxy_fence`
+- an access belongs to the generation whose band covers it, that it is ordered
+  after, and whose free it is not already past — a binding the clock decides,
+  not the trace walk (which only enumerates generations, and cannot answer
+  lifetime questions since it saw one schedule);
+- a re-allocation of an overlapping band must be ordered after the previous
+  generation's free;
+- the free must be ordered after every access of that generation is observed to
+  have COMPLETED. Ordering the issue is not enough: a barrier orders
+  instruction streams, it does not drain an engine. The observation point is
+  `tcgen05.wait::ld/st` for a load or store, and for an mma or cp the wait on a
+  barrier some `tcgen05.commit` handed the work to (a commit tracks every async
+  op the warp issued before it, so waiting any such barrier suffices).
 
-An async-proxy SMEM read that overlaps a prior generic-proxy SMEM write in the
-same stream requires an intervening covering `fence.proxy.async`.
+### cross-proxy publication (inside `memory_race_check`)
+
+An engine access that overlaps a generic-proxy SMEM write carries a SECOND
+obligation beyond the ordering one: the write must have been published across
+the proxy boundary. `fence.proxy.async` releases the fencing thread's view
+into the async-proxy engines at the fence's address scope, and the engine
+access acquires the view published for the address space it touches, so both
+obligations are decided against the same clocks. A pair that is ordered but
+unpublished reports `proxy_fence_missing`.
 
 ## 9. Test Matrix
 
@@ -261,5 +314,5 @@ Required coverage includes:
 - TMA and contiguous MMA footprints remain single boxes when physically
   contiguous;
 - `async_group_lifetime`, `tmem_async_hazard`, `tmem_lifecycle_order`,
-  `proxy_fence`, and `memory_race_check` use unified overlap helpers;
+  and `memory_race_check` use unified overlap helpers;
 - value-mode behavior is unchanged.

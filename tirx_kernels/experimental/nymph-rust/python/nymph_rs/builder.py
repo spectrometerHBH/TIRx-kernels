@@ -12,6 +12,7 @@ from .nymph_rs import (
     ClusterShape,
     ClusterSync,
     CpAsyncBulkCommitGroup,
+    CpAsyncBulkS2Cluster,
     CpAsyncBulkWaitGroupRead,
     CtaSync,
     DType,
@@ -20,10 +21,10 @@ from .nymph_rs import (
     FenceScope,
     ForEachTask,
     ForLoop,
+    GmemAtomicAdd,
+    GmemWaitEq,
     If,
     Kernel,
-    KernelFinalize,
-    KernelInit,
     LaunchShape,
     Layout,
     LdMatrix,
@@ -38,6 +39,7 @@ from .nymph_rs import (
     MBarrierInit,
     MBarrierWait,
     MemorySpace,
+    NamedBarrier,
     RegAdd,
     RegBitwise,
     RegCausalMask,
@@ -55,7 +57,6 @@ from .nymph_rs import (
     RegStore,
     RegSub,
     RegUnary,
-    Role,
     ScalarDef,
     ScalarDType,
     ScalarStore,
@@ -64,6 +65,7 @@ from .nymph_rs import (
     Scheduler,
     SchedulerImpl,
     ScopeValue,
+    SetMaxNReg,
     Shape,
     StMatrix,
     Stmt,
@@ -85,6 +87,7 @@ from .nymph_rs import (
     TmemDealloc,
     Var,
     VarBinding,
+    WarpMma,
     WarpSync,
     WgSync,
 )
@@ -94,7 +97,7 @@ MatrixShape = Literal["m8n8"]
 MatrixDType = Literal["b16"]
 SchedulerPolicy = Literal["grid_stride", "clc", "atomic_steal", "custom"]
 RegOperand = Tensor | TensorSlice | int | float
-RegUnaryOp = Literal["exp2", "rcp", "neg"]
+RegUnaryOp = Literal["exp2", "log2", "rcp", "neg"]
 RegReduceOp = Literal["max", "sum"]
 RegCondScope = Literal["warp", "warpgroup"]
 
@@ -331,6 +334,89 @@ class IRBuilder:
         stmt = TmaStore(dst=dst, src=src, coords=coords, shape=shape, gmem_shape=gmem_shape)
         self._append(stmt)
 
+    def tma_reduce_add(
+        self,
+        dst: Tensor,
+        src: Tensor | TensorSlice,
+        *,
+        coords: tuple[ScalarValue, ...],
+        shape: Shape,
+        gmem_shape: Shape | None = None,
+        allow_nondet_reduce: bool = False,
+    ) -> None:
+        """TMA reduce-add (``cp.reduce.async.bulk...add.f32``): atomically accumulate
+        ``dst += src`` (SMEM->GMEM, f32). Same bulk-async path as ``tma_store`` (commit
+        with ``cp_async_bulk_commit_group`` / wait with ``cp_async_bulk_wait_group_read``);
+        value-mode accumulates instead of overwriting. dst must be an f32 GMEM tensor.
+
+        A float reduction is not associative: cross-CTA reduce-adds into one location
+        are race-free (hardware-atomic, commutative) but ORDER-DEPENDENT — the result is
+        not bit-reproducible. The protocol checker can only warn
+        (``nondeterministic_reduction``) about that, so the IR makes the non-determinism
+        opt-in: validate REJECTS a float reduce-add unless ``allow_nondet_reduce=True``
+        is passed (the checker's warning still fires with the flag set)."""
+        if isinstance(src, Tensor):
+            src = src[...]
+        stmt = TmaStore(
+            dst=dst,
+            src=src,
+            coords=coords,
+            shape=shape,
+            gmem_shape=gmem_shape,
+            reduce_add=True,
+            allow_nondet_reduce=allow_nondet_reduce,
+        )
+        self._append(stmt)
+
+    def cp_async_bulk_s2cluster(
+        self,
+        dst: Tensor | TensorSlice,
+        src: Tensor | TensorSlice,
+        *,
+        mbar: MBar | MBarRef,
+        bytes: ScalarValue,
+    ) -> None:
+        """`cp.async.bulk.shared::cluster` — async bulk copy of this CTA's SMEM `src`
+        into a PEER CTA's SMEM `dst` (the peer instance), signalling the peer's `mbar`
+        (pass `mbar_ref(m, remote_coord=peer)`) on completion. The dS cross-CTA
+        exchange in the 2-CTA backward. The peer CTA = the mbar's target."""
+        if isinstance(dst, Tensor):
+            dst = dst[...]
+        if isinstance(src, Tensor):
+            src = src[...]
+        self._append(CpAsyncBulkS2Cluster(dst=dst, src=src, mbar=mbar, bytes=bytes))
+
+    def gmem_atomic_add(
+        self,
+        sem: Tensor | TensorSlice,
+        *,
+        coords: tuple[ScalarValue, ...],
+        value: ScalarValue,
+        order: Literal["release", "relaxed"] = "release",
+    ) -> None:
+        """GMEM semaphore atomic-add ("signal") — ``red.<order>.gpu.global.add.s32``:
+        ``sem[coords] += value``. A value-keyed RELEASE: it is a SYNC op (NOT a data
+        access on the semaphore tensor), publishing this stream's clock as the release
+        clock for the post-increment counter value, so a later ``gmem_wait_eq`` on that
+        exact value joins it (acquire). ``order='release'`` carries the release fence
+        ordering prior writes (incl. a drained reduce-add) before the publish. ``sem``
+        must be an i32 GMEM tensor. Single-thread issue: elect one thread."""
+        if isinstance(sem, Tensor):
+            sem = sem[...]
+        self._append(GmemAtomicAdd(sem=sem, coords=coords, value=value, order=order))
+
+    def gmem_wait_eq(
+        self, sem: Tensor | TensorSlice, *, coords: tuple[ScalarValue, ...], value: ScalarValue
+    ) -> None:
+        """GMEM semaphore spin-wait ("wait") — ``ld.global.acquire.gpu`` poll until
+        ``sem[coords] == value``. A value-keyed ACQUIRE: blocks this stream until the
+        counter equals ``value`` (never reaching it -> deadlock), and joins the release
+        clock published by the ``gmem_atomic_add`` that produced THIS exact value. A
+        SYNC op (no data access on the semaphore tensor). ``sem`` must be i32 GMEM."""
+        if isinstance(sem, Tensor):
+            sem = sem[...]
+        self._append(GmemWaitEq(sem=sem, coords=coords, value=value))
+
     def cp_async_bulk_commit_group(self) -> None:
         self._append(CpAsyncBulkCommitGroup())
 
@@ -427,6 +513,47 @@ class IRBuilder:
             self._body_stack.pop()
             self._append(If(cond=cond, then_body=tuple(body)))
 
+    # -- thread-dispatch sugar -----------------------------------------------
+    # Canonical `if_` shapes over thread coordinates. These are ordinary Ifs
+    # (masked per-thread execution, exactly the hardware model); the canonical
+    # predicate forms are what `static_thread_filter` resolves for validation.
+
+    @contextmanager
+    def if_warp(self, warp: int) -> Iterator[None]:
+        """Threads of one warp: `warp_id() == warp`."""
+        with self.if_(self.warp_id().eq(warp)):
+            yield
+
+    @contextmanager
+    def if_warpgroup(self, warpgroup: int) -> Iterator[None]:
+        """Threads of one warpgroup: `warpgroup_id() == warpgroup`."""
+        with self.if_(self.warpgroup_id().eq(warpgroup)):
+            yield
+
+    @contextmanager
+    def if_lane(self, lane: int) -> Iterator[None]:
+        """One lane of every warp in context: `lane_id() == lane`."""
+        with self.if_(self.lane_id().eq(lane)):
+            yield
+
+    @contextmanager
+    def if_elected(self) -> Iterator[None]:
+        """Lane 0 of EVERY warp in context (`lane_id() == 0`).
+
+        For one thread per warpgroup use `if_(tid_in_wg().eq(0))`; for one
+        thread per CTA nest this under `if_warp(w)`.
+        """
+        with self.if_(self.lane_id().eq(0)):
+            yield
+
+    def set_maxnreg(self, nreg: int) -> None:
+        """`setmaxnreg` directive for the enclosing warpgroup(s); sim metadata.
+
+        Validation requires the enclosing branch to statically cover whole
+        warpgroups and `nreg` to be a positive multiple of 8.
+        """
+        self._append(SetMaxNReg(nreg=nreg))
+
     def tcgen05_mma(
         self,
         dst: Tensor | TensorSlice,
@@ -443,11 +570,22 @@ class IRBuilder:
         sfa: Tensor | TensorSlice | None = None,
         sfb: Tensor | TensorSlice | None = None,
         sf_byte: int = 0,
+        sf_e4m3: bool = False,
+        sf_block: int = 0,
+        a_fp4: bool = False,
+        b_fp4: bool = False,
     ) -> None:
-        """``sfa``/``sfb`` make this a block-scaled MMA (``kind::mxf8f6f4``): each is a
-        (128, cols) u32 TMEM slice of packed UE8M0 scale bytes; operand row r is
-        dequantized by 2^(byte - 127), where ``sf_byte`` picks the packed byte for
-        this MMA's k-slice."""
+        """``sfa``/``sfb`` make this a block-scaled MMA: each is a (128, cols) u32
+        TMEM slice of packed scale bytes. Two scale modes share the field set:
+
+        * fp8 (``kind::mxf8f6f4`` + UE8M0, default): one scale per operand row;
+          ``sf_byte`` picks the packed byte for this MMA's k-slice, dequant
+          2^(byte - 127).
+        * nvfp4 (``kind::mxf4`` + e4m3, ``sf_e4m3=True, sf_block=16``): one scale
+          per 16 contiguous k-elements; this MMA's k spans k/16 blocks whose
+          scales are bytes 0..k/16 of the cell, each decoded as e4m3.
+          ``a_fp4``/``b_fp4`` mark the operands as packed e2m1 (2 per u8 byte,
+          the SMEM tile's inner extent is k/2 bytes)."""
         if isinstance(dst, Tensor):
             dst = dst[...]
         if isinstance(a, Tensor):
@@ -472,6 +610,10 @@ class IRBuilder:
             sfa=sfa,
             sfb=sfb,
             sf_byte=sf_byte,
+            sf_e4m3=sf_e4m3,
+            sf_block=sf_block,
+            a_fp4=a_fp4,
+            b_fp4=b_fp4,
         )
         self._append(stmt)
 
@@ -570,6 +712,29 @@ class IRBuilder:
         if isinstance(src, Tensor):
             src = src[...]
         self._append(StMatrix(dst=dst, src=src, shape=shape, num=num, trans=trans, dtype=dtype))
+
+    def mma_sync(
+        self,
+        d: Tensor | TensorSlice,
+        a: Tensor | TensorSlice,
+        b: Tensor | TensorSlice,
+        c: Tensor | TensorSlice,
+        *,
+        m: int = 16,
+        n: int = 8,
+        k: int = 16,
+        ab_dtype: DType = DType.BF16,
+    ) -> None:
+        """Warp-level SM80 tensor-core MMA: D = A·Bᵀ + C
+        (``mma.sync.aligned.m{m}n{n}k{k}.row.col.f32.{abt}.{abt}.f32``). A/B are
+        packed-16bit reg fragments of ``ab_dtype`` (bf16 or f16 — the PTX operand
+        type); C/D are f32 reg fragments — all in the standard mma warp fragment
+        layout (the layout ldmatrix produces)."""
+        d = d[...] if isinstance(d, Tensor) else d
+        a = a[...] if isinstance(a, Tensor) else a
+        b = b[...] if isinstance(b, Tensor) else b
+        c = c[...] if isinstance(c, Tensor) else c
+        self._append(WarpMma(d=d, a=a, b=b, c=c, m=m, n=n, k=k, ab_dtype=ab_dtype))
 
     def reg_fill(self, dst: Tensor | TensorSlice, value: RegOperand) -> None:
         if isinstance(dst, Tensor):
@@ -671,7 +836,7 @@ class IRBuilder:
         scale: RegOperand,
         *,
         threshold: RegOperand = 1.0,
-        scope: RegCondScope = "warpgroup",
+        scope: RegCondScope = "warp",
     ) -> None:
         if isinstance(dst, Tensor):
             dst = dst[...]
@@ -727,7 +892,11 @@ class IRBuilder:
         key_start: ScalarValue,
         group_size: int,
         mask_value: RegOperand = -float("inf"),
+        swap_qk: bool = False,
     ) -> None:
+        """``swap_qk``: fragment orientation. False = forward ``[q-row, kv-col]``;
+        True = backward ``[kv-row, q-col]`` (the fa-bwd fragment is transposed —
+        k = key_start + row, q = query_start + col/group_size). Both mask k > q."""
         if isinstance(dst, Tensor):
             dst = dst[...]
         if isinstance(src, Tensor):
@@ -742,6 +911,7 @@ class IRBuilder:
                 key_start=key_start,
                 group_size=group_size,
                 mask_value=mask_value,
+                swap_qk=swap_qk,
             )
         )
 
@@ -784,69 +954,18 @@ class IRBuilder:
     def wg_sync(self, *, barrier_id: int) -> None:
         self._append(WgSync(barrier_id=barrier_id))
 
+    def named_barrier(self, *, barrier_id: int, num_warps: int) -> None:
+        """Named barrier across `num_warps` warps spanning warpgroups —
+        `bar.sync barrier_id, num_warps*32` (flashattn NamedBarrierBwdSm100).
+        Distinct statements that call this with the same barrier_id rendezvous
+        on ONE hardware barrier (count-based completion)."""
+        self._append(NamedBarrier(barrier_id=barrier_id, num_warps=num_warps))
+
     def warp_sync(self) -> None:
         self._append(WarpSync())
 
     def cluster_sync(self) -> None:
         self._append(ClusterSync())
-
-    @contextmanager
-    def role(
-        self,
-        *,
-        warp: int | None = None,
-        warpgroup: int | None = None,
-        elected: bool = False,
-        maxnreg: int | None = None,
-    ) -> Iterator[None]:
-        body: list[Stmt] = []
-        self._body_stack.append(body)
-        try:
-            yield
-        except Exception:
-            self._body_stack.pop()
-            raise
-        else:
-            self._body_stack.pop()
-            self._append(
-                Role(
-                    body=tuple(body),
-                    warp=warp,
-                    warpgroup=warpgroup,
-                    elected=elected,
-                    maxnreg=maxnreg,
-                )
-            )
-
-    @contextmanager
-    def kernel_init(
-        self, *, warp: int | None = None, lane: int | None = None, elected: bool = False
-    ) -> Iterator[None]:
-        body: list[Stmt] = []
-        self._body_stack.append(body)
-        try:
-            yield
-        except Exception:
-            self._body_stack.pop()
-            raise
-        else:
-            self._body_stack.pop()
-            self._append(KernelInit(body=tuple(body), warp=warp, lane=lane, elected=elected))
-
-    @contextmanager
-    def kernel_finalize(
-        self, *, warp: int | None = None, lane: int | None = None, elected: bool = False
-    ) -> Iterator[None]:
-        body: list[Stmt] = []
-        self._body_stack.append(body)
-        try:
-            yield
-        except Exception:
-            self._body_stack.pop()
-            raise
-        else:
-            self._body_stack.pop()
-            self._append(KernelFinalize(body=tuple(body), warp=warp, lane=lane, elected=elected))
 
     def _append(self, stmt: Stmt) -> None:
         self._body_stack[-1].append(stmt)

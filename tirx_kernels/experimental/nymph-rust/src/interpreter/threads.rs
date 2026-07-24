@@ -1,8 +1,8 @@
-//! Thread identity & cohort masks — port of `interpreter/threads.py`.
+//! Thread identity & lane masks.
 //!
 //! ThreadId is `Copy` (no heap): coords are a fixed-size `Coord` (rank <= 3), so
-//! cloning a cohort and hashing the scalar-env key are allocation-free — this is
-//! on the hottest path (every statement clones its cohort).
+//! cloning a lane mask and hashing the scalar-env key are allocation-free — this is
+//! on the hottest path (every statement clones its lane mask).
 
 /// A small fixed-capacity coordinate (launch/cluster rank is 1..=3).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -52,7 +52,7 @@ impl ThreadId {
     }
 }
 
-/// An ordered, deduped cohort of threads (canonical order = sorted by (warp, lane)).
+/// An ordered, deduped set of threads (canonical order = sorted by (warp, lane)).
 pub type ThreadMask = Vec<ThreadId>;
 
 /// Dedupe then sort by (warp_id, lane_id). `mask[0]` is the canonical first thread.

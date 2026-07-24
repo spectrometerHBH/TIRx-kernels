@@ -1,10 +1,10 @@
 //! cp.async.bulk group counter — port of `semantics/cp_async.py`. Never blocks.
 
-use super::super::cohort::CohortContext;
 use super::super::diagnostics::{IResult, InterpreterError};
 use super::super::outcomes::StepStatus;
 use super::super::protocol::TraceEventKind;
 use super::super::registry::{StmtExecutorRegistry, StmtKind};
+use super::super::warp_context::WarpContext;
 use crate::ir::Stmt;
 
 pub fn register(reg: &mut StmtExecutorRegistry) {
@@ -13,7 +13,7 @@ pub fn register(reg: &mut StmtExecutorRegistry) {
 }
 
 fn execute_commit_group<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
+    ctx: &mut WarpContext<'a, 'k>,
     _stmt: &'k Stmt,
 ) -> IResult<StepStatus> {
     let sid = ctx.stream.stream_id;
@@ -34,7 +34,7 @@ fn execute_commit_group<'a, 'k>(
 }
 
 fn execute_wait_group_read<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
+    ctx: &mut WarpContext<'a, 'k>,
     stmt: &'k Stmt,
 ) -> IResult<StepStatus> {
     let n = match stmt {

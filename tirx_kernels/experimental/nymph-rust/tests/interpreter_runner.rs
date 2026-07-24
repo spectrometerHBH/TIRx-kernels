@@ -108,22 +108,45 @@ fn cta_eq(ctaid: i64) -> ScalarValue {
     )
 }
 
-fn kernel_init(body: Vec<Stmt>) -> Stmt {
-    Stmt::KernelInit {
-        body,
-        warp: Some(0),
-        lane: None,
-        elected: false,
-    }
+fn eq_scope(kind: ScopeValueKind, v: i64) -> ScalarValue {
+    ScalarValue::expr(
+        ScalarOp::Eq,
+        vec![ScalarValue::Scope(kind), ScalarValue::Int(v)],
+    )
 }
 
-fn kernel_finalize(body: Vec<Stmt>) -> Stmt {
-    Stmt::KernelFinalize {
+fn if_stmt(cond: ScalarValue, then_body: Vec<Stmt>) -> Stmt {
+    Stmt::If { cond, then_body }
+}
+
+/// One thread (warp `w`, lane 0) — the issue-thread shape.
+fn single_thread_of_warp(w: i64, body: Vec<Stmt>) -> Stmt {
+    if_stmt(
+        ScalarValue::expr(
+            ScalarOp::And,
+            vec![
+                eq_scope(ScopeValueKind::WarpId, w),
+                eq_scope(ScopeValueKind::LaneId, 0),
+            ],
+        ),
         body,
-        warp: Some(0),
-        lane: None,
-        elected: false,
-    }
+    )
+}
+
+/// All 32 threads of warp `w`.
+fn warp_stmts(w: i64, body: Vec<Stmt>) -> Stmt {
+    if_stmt(eq_scope(ScopeValueKind::WarpId, w), body)
+}
+
+/// Single-thread init block (warp 0, lane 0) — mbarrier.init is per-thread,
+/// so unguarded multi-thread inits are double-init errors by design.
+fn kernel_init(body: Vec<Stmt>) -> Stmt {
+    single_thread_of_warp(0, body)
+}
+
+/// Full warp 0 (tmem dealloc is warp-collective).
+fn kernel_finalize(body: Vec<Stmt>) -> Stmt {
+    warp_stmts(0, body)
 }
 
 fn run_value_kernel(kernel: &Kernel, inputs: HashMap<u32, ValueArray1>) -> RunResult {
@@ -188,16 +211,13 @@ fn has_mbar_arrive_for_cta(result: &RunResult, ctaid_in_cluster: usize) -> bool 
 
 #[test]
 fn failed_runs_do_not_expose_partial_values() {
-    let body = vec![Stmt::Role {
-        body: vec![Stmt::ScalarDef {
+    let body = vec![if_stmt(
+        ScalarValue::Int(1),
+        vec![Stmt::ScalarDef {
             var: var(0, VarBinding::Scalar),
             initial: ScalarInitial::Value(ScalarValue::Int(0)),
         }],
-        warp: None,
-        warpgroup: None,
-        elected: false,
-        maxnreg: None,
-    }];
+    )];
     let kernel = Kernel {
         name: "t".into(),
         args: vec![],
@@ -229,11 +249,15 @@ fn tmem_cta_group2_collective_success_populates_peer_scratchpads() {
         name: "tmem_cta_group2_success".into(),
         args: vec![],
         body: vec![
-            kernel_init(vec![Stmt::TmemAlloc {
-                tensor: paired.clone(),
-                n_cols: 128,
-                cta_group: 2,
-            }]),
+            // tmem alloc/dealloc are warp-collective: full warp 0.
+            warp_stmts(
+                0,
+                vec![Stmt::TmemAlloc {
+                    tensor: paired.clone(),
+                    n_cols: 128,
+                    cta_group: 2,
+                }],
+            ),
             kernel_finalize(vec![Stmt::TmemDealloc {
                 tensor: paired,
                 n_cols: 128,
@@ -301,8 +325,9 @@ fn tma_roundtrip_mbar_cell_parity_is_rust_internal() {
                 count: 1,
                 stage: None,
             }]),
-            Stmt::Role {
-                body: vec![
+            single_thread_of_warp(
+                0,
+                vec![
                     Stmt::MBarrierArriveExpectTx {
                         mbar: mbar_ref(&mbar),
                         bytes: 16,
@@ -331,13 +356,11 @@ fn tma_roundtrip_mbar_cell_parity_is_rust_internal() {
                         coords: vec![ScalarValue::Int(2)],
                         shape: vec![4],
                         gmem_shape: None,
+                        reduce_add: false,
+                        allow_nondet_reduce: false,
                     },
                 ],
-                warp: Some(0),
-                warpgroup: None,
-                elected: true,
-                maxnreg: None,
-            },
+            ),
         ],
         num_warps: 4,
         smem_size_bytes: 16,
@@ -374,8 +397,9 @@ fn tma_multicast_group2_mbar_targets_are_deduplicated() {
                 count: 1,
                 stage: None,
             }]),
-            Stmt::Role {
-                body: vec![
+            single_thread_of_warp(
+                0,
+                vec![
                     Stmt::If {
                         cond: cta_eq(0),
                         then_body: vec![Stmt::MBarrierArriveExpectTx {
@@ -400,11 +424,7 @@ fn tma_multicast_group2_mbar_targets_are_deduplicated() {
                         }],
                     },
                 ],
-                warp: Some(0),
-                warpgroup: None,
-                elected: true,
-                maxnreg: None,
-            },
+            ),
         ],
         num_warps: 4,
         smem_size_bytes: 16,
@@ -438,42 +458,41 @@ fn mbarrier_wait_success_and_blocked_frontier_are_rust_internal() {
                 count: 1,
                 stage: None,
             }]),
-            Stmt::Role {
-                body: vec![
+            // The issuing thread posts expect-tx in ITS program order before
+            // the TMA (canon's shape — a cross-warp expect_tx would race the
+            // TMA completion on hardware and the checker now says so). The
+            // consumer warp's parked wait is still woken by the producer
+            // stream's completion write.
+            single_thread_of_warp(
+                0,
+                vec![Stmt::MBarrierWait {
+                    mbar: mbar_ref(&mbar),
+                    stage: None,
+                    phase: Some(ScalarValue::Int(0)),
+                }],
+            ),
+            single_thread_of_warp(
+                1,
+                vec![
                     Stmt::MBarrierArriveExpectTx {
                         mbar: mbar_ref(&mbar),
                         bytes: 16,
                         stage: None,
                     },
-                    Stmt::MBarrierWait {
+                    Stmt::TmaLoad {
+                        dst: full_slice(smem),
+                        src: source.clone(),
                         mbar: mbar_ref(&mbar),
-                        stage: None,
-                        phase: Some(ScalarValue::Int(0)),
+                        bytes: ScalarValue::Int(16),
+                        coords: vec![ScalarValue::Int(0)],
+                        shape: vec![4],
+                        gmem_shape: None,
+                        mbar_stage: None,
+                        multicast_cta_mask: None,
+                        cta_group: 1,
                     },
                 ],
-                warp: Some(0),
-                warpgroup: None,
-                elected: true,
-                maxnreg: None,
-            },
-            Stmt::Role {
-                body: vec![Stmt::TmaLoad {
-                    dst: full_slice(smem),
-                    src: source.clone(),
-                    mbar: mbar_ref(&mbar),
-                    bytes: ScalarValue::Int(16),
-                    coords: vec![ScalarValue::Int(0)],
-                    shape: vec![4],
-                    gmem_shape: None,
-                    mbar_stage: None,
-                    multicast_cta_mask: None,
-                    cta_group: 1,
-                }],
-                warp: Some(1),
-                warpgroup: None,
-                elected: true,
-                maxnreg: None,
-            },
+            ),
         ],
         num_warps: 4,
         smem_size_bytes: 16,
@@ -503,8 +522,9 @@ fn mbarrier_wait_success_and_blocked_frontier_are_rust_internal() {
                 count: 1,
                 stage: None,
             }]),
-            Stmt::Role {
-                body: vec![
+            single_thread_of_warp(
+                0,
+                vec![
                     Stmt::MBarrierExpectTx {
                         mbar: mbar_ref(&expect_tx),
                         bytes: 8,
@@ -521,11 +541,7 @@ fn mbarrier_wait_success_and_blocked_frontier_are_rust_internal() {
                         phase: None,
                     },
                 ],
-                warp: Some(0),
-                warpgroup: None,
-                elected: true,
-                maxnreg: None,
-            },
+            ),
         ],
         num_warps: 4,
         smem_size_bytes: 0,
@@ -556,8 +572,9 @@ fn mbarrier_wait_success_and_blocked_frontier_are_rust_internal() {
                 count: 1,
                 stage: None,
             }]),
-            Stmt::Role {
-                body: vec![
+            single_thread_of_warp(
+                0,
+                vec![
                     Stmt::If {
                         cond: cta_eq(0),
                         then_body: vec![Stmt::MBarrierArrive {
@@ -578,11 +595,7 @@ fn mbarrier_wait_success_and_blocked_frontier_are_rust_internal() {
                         }],
                     },
                 ],
-                warp: Some(0),
-                warpgroup: None,
-                elected: true,
-                maxnreg: None,
-            },
+            ),
         ],
         num_warps: 4,
         smem_size_bytes: 0,
@@ -610,19 +623,16 @@ fn scalar_tensor_initial_loads_per_thread_gmem() {
     let kernel = Kernel {
         name: "scalar_tensor_initial".into(),
         args: vec![source.clone()],
-        body: vec![Stmt::Role {
-            body: vec![Stmt::ScalarDef {
+        body: vec![warp_stmts(
+            0,
+            vec![Stmt::ScalarDef {
                 var: scalar,
                 initial: ScalarInitial::Tensor(element_slice(
                     source.clone(),
                     ScalarValue::Scope(ScopeValueKind::LaneId),
                 )),
             }],
-            warp: Some(0),
-            warpgroup: None,
-            elected: false,
-            maxnreg: None,
-        }],
+        )],
         num_warps: 4,
         smem_size_bytes: 0,
         launch_shape: vec![1],
@@ -648,12 +658,14 @@ fn cluster_sync_cleanup_is_rust_internal() {
     let result = run_trace_kernel(&kernel, HashMap::new());
     assert!(result.completed, "failed: {:?}", result.failure_reason);
     assert_eq!(trace_status(&result), ProtocolStatus::Passed);
+    // 2 cluster_syncs x 8 per-warp streams (2 CTAs x 4 warps): every arriving
+    // warp stream logs its own Sync passage.
     assert_eq!(
         trace_events(&result)
             .iter()
             .filter(|event| matches!(&event.payload, TraceEventKind::Sync { .. }))
             .count(),
-        4
+        16
     );
 }
 
@@ -665,8 +677,9 @@ fn fence_cp_async_trace_limit_fail_closed() {
     let kernel = Kernel {
         name: "fence_cp_async_noop".into(),
         args: vec![source.clone(), out.clone()],
-        body: vec![Stmt::Role {
-            body: vec![
+        body: vec![single_thread_of_warp(
+            0,
+            vec![
                 Stmt::CpAsyncBulkCommitGroup,
                 Stmt::CpAsyncBulkCommitGroup,
                 Stmt::CpAsyncBulkWaitGroupRead { n: 0 },
@@ -683,11 +696,7 @@ fn fence_cp_async_trace_limit_fail_closed() {
                     src: full_slice(reg),
                 },
             ],
-            warp: None,
-            warpgroup: Some(0),
-            elected: true,
-            maxnreg: None,
-        }],
+        )],
         num_warps: 4,
         smem_size_bytes: 0,
         launch_shape: vec![1],
@@ -714,19 +723,18 @@ fn tma_and_reg_runtime_failures_expose_no_partial_values() {
     let missing_source = Kernel {
         name: "tma_store_missing_source".into(),
         args: vec![],
-        body: vec![Stmt::Role {
-            body: vec![Stmt::TmaStore {
+        body: vec![single_thread_of_warp(
+            0,
+            vec![Stmt::TmaStore {
                 dst: out.clone(),
                 src: full_slice(smem.clone()),
                 coords: vec![ScalarValue::Int(0)],
                 shape: vec![4],
                 gmem_shape: None,
+                reduce_add: false,
+                allow_nondet_reduce: false,
             }],
-            warp: Some(0),
-            warpgroup: None,
-            elected: true,
-            maxnreg: None,
-        }],
+        )],
         num_warps: 4,
         smem_size_bytes: 16,
         launch_shape: vec![1],
@@ -743,29 +751,31 @@ fn tma_and_reg_runtime_failures_expose_no_partial_values() {
     let divergent = Kernel {
         name: "tma_store_divergent_coords".into(),
         args: vec![],
-        body: vec![Stmt::Role {
-            body: vec![Stmt::TmaStore {
+        body: vec![warp_stmts(
+            0,
+            vec![Stmt::TmaStore {
                 dst: out.clone(),
                 src: full_slice(smem.clone()),
                 coords: vec![ScalarValue::Scope(ScopeValueKind::LaneId)],
                 shape: vec![4],
                 gmem_shape: None,
+                reduce_add: false,
+                allow_nondet_reduce: false,
             }],
-            warp: Some(0),
-            warpgroup: None,
-            elected: false,
-            maxnreg: None,
-        }],
+        )],
         num_warps: 4,
         smem_size_bytes: 16,
         launch_shape: vec![1],
         cluster_shape: vec![1],
     };
+    // A 32-lane mask reaching tma_store now trips the PTX single-thread
+    // issue gate before operand checks (divergent coords are unconstructible
+    // from a single thread).
     let divergent_result = run_value_kernel(&divergent, HashMap::new());
     assert!(!divergent_result.completed);
     assert_eq!(
         divergent_result.failure_reason.as_deref(),
-        Some("divergent_tma_operands")
+        Some("tma_store_mask")
     );
     assert!(divergent_result.payload.is_none());
 
@@ -774,16 +784,13 @@ fn tma_and_reg_runtime_failures_expose_no_partial_values() {
     let reg_oob = Kernel {
         name: "reg_load_oob_source".into(),
         args: vec![short.clone()],
-        body: vec![Stmt::Role {
-            body: vec![Stmt::RegLoad {
+        body: vec![warp_stmts(
+            0,
+            vec![Stmt::RegLoad {
                 dst: element_slice(reg.clone(), ScalarValue::Int(0)),
                 src: element_slice(short.clone(), ScalarValue::Scope(ScopeValueKind::LaneId)),
             }],
-            warp: Some(0),
-            warpgroup: None,
-            elected: false,
-            maxnreg: None,
-        }],
+        )],
         num_warps: 4,
         smem_size_bytes: 0,
         launch_shape: vec![1],
@@ -801,16 +808,13 @@ fn tma_and_reg_runtime_failures_expose_no_partial_values() {
     let reg_missing_store = Kernel {
         name: "reg_store_missing_source".into(),
         args: vec![out.clone()],
-        body: vec![Stmt::Role {
-            body: vec![Stmt::RegStore {
+        body: vec![single_thread_of_warp(
+            0,
+            vec![Stmt::RegStore {
                 dst: element_slice(out, ScalarValue::Int(0)),
                 src: element_slice(reg, ScalarValue::Int(0)),
             }],
-            warp: Some(0),
-            warpgroup: None,
-            elected: true,
-            maxnreg: None,
-        }],
+        )],
         num_warps: 4,
         smem_size_bytes: 0,
         launch_shape: vec![1],
@@ -843,8 +847,9 @@ fn tcgen05_commit_success_paths_update_rust_internal_mbar_cells() {
                 count: 1,
                 stage: None,
             }]),
-            Stmt::Role {
-                body: vec![Stmt::If {
+            single_thread_of_warp(
+                0,
+                vec![Stmt::If {
                     cond: cta_eq(0),
                     then_body: vec![Stmt::Tcgen05Commit {
                         mbar: mbar_ref(&mbar),
@@ -853,11 +858,7 @@ fn tcgen05_commit_success_paths_update_rust_internal_mbar_cells() {
                         multicast_cta_mask: None,
                     }],
                 }],
-                warp: Some(0),
-                warpgroup: None,
-                elected: true,
-                maxnreg: None,
-            },
+            ),
         ],
         num_warps: 4,
         smem_size_bytes: 0,
@@ -888,8 +889,9 @@ fn tcgen05_commit_success_paths_update_rust_internal_mbar_cells() {
                 count: 1,
                 stage: None,
             }]),
-            Stmt::Role {
-                body: vec![Stmt::If {
+            single_thread_of_warp(
+                0,
+                vec![Stmt::If {
                     cond: cta_eq(0),
                     then_body: vec![Stmt::Tcgen05Commit {
                         mbar: MBarRef {
@@ -901,11 +903,7 @@ fn tcgen05_commit_success_paths_update_rust_internal_mbar_cells() {
                         multicast_cta_mask: Some(0b10),
                     }],
                 }],
-                warp: Some(0),
-                warpgroup: None,
-                elected: true,
-                maxnreg: None,
-            },
+            ),
         ],
         num_warps: 4,
         smem_size_bytes: 0,

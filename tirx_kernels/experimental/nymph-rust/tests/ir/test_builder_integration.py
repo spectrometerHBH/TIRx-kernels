@@ -59,15 +59,18 @@ def test_builder_scheduler_impl_loop_sched_next_builds():
     task_smem = b.tensor(
         space=nymph_rs.MemorySpace.SMEM, dtype=nymph_rs.DType.I32, shape=(1,), byte_offset=0
     )
-    with b.scheduler_impl(sched):
-        with b.loop():
-            task = b.sched_next(sched)
-            valid = task.valid
-            b.store_scalar(task_smem[0], task.task_id)
-            b.break_if(~valid)
+    # sched_next must sit in a statically single-warp branch (a wider branch
+    # would hand each warp a different task from the shared cursor).
+    with b.if_warp(0):
+        with b.scheduler_impl(sched):
+            with b.loop():
+                task = b.sched_next(sched)
+                valid = task.valid
+                b.store_scalar(task_smem[0], task.task_id)
+                b.break_if(~valid)
 
     assert valid.op == nymph_rs.ScalarOp.GE
     k = b.build()
-    impl = k.body[1]
+    impl = k.body[1].body[0]
     assert impl.scheduler.id == sched.id
     assert len(impl.body[0].body) == 3

@@ -31,7 +31,7 @@ def test_reg_float_and_cvt_value_semantics_round_destination_dtypes():
     f16_tmp = reg_tensor(b, dtype=nr.DType.F16, shape=(4,))
     bf16_tmp = reg_tensor(b, dtype=nr.DType.BF16, shape=(4,))
 
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.reg_load(lhs, lhs_g)
         b.reg_load(rhs, rhs_g)
         b.reg_load(acc, acc_g)
@@ -83,7 +83,7 @@ def test_reg_integer_alu_value_semantics():
     u_rhs = reg_tensor(b, shape=(4,))
     u_tmp = reg_tensor(b, shape=(4,))
 
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.reg_load(i_lhs, i_lhs_g)
         b.reg_load(i_rhs, i_rhs_g)
         for op, out_t in [
@@ -140,13 +140,15 @@ def test_reg_extended_float_ops_literals_broadcast_reduce_and_unary():
     sum_out = gmem_arg(b, dtype=nr.DType.F32, shape=(1,))
     max_out = gmem_arg(b, dtype=nr.DType.F32, shape=(1,))
     exp_out = gmem_arg(b, dtype=nr.DType.F32, shape=(4,))
+    log_out = gmem_arg(b, dtype=nr.DType.F32, shape=(4,))
     vec = reg_tensor(b, dtype=nr.DType.F32, shape=(4,))
     scalar = reg_tensor(b, dtype=nr.DType.F32, shape=(1,))
     max_scalar = reg_tensor(b, dtype=nr.DType.F32, shape=(1,))
     shifted = reg_tensor(b, dtype=nr.DType.F32, shape=(4,))
     expv = reg_tensor(b, dtype=nr.DType.F32, shape=(4,))
+    logv = reg_tensor(b, dtype=nr.DType.F32, shape=(4,))
 
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.reg_load(vec, src_g)
         b.reg_reduce(scalar, vec, op="sum")
         b.reg_reduce(max_scalar, vec, op="max")
@@ -156,12 +158,16 @@ def test_reg_extended_float_ops_literals_broadcast_reduce_and_unary():
         b.reg_store(shifted_out, shifted)
         b.reg_unary(expv, vec, op="exp2")
         b.reg_store(exp_out, expv)
+        # log2 inverts exp2 exactly on power-of-two values.
+        b.reg_unary(logv, expv, op="log2")
+        b.reg_store(log_out, logv)
 
     outputs = run(b.build(), {src_g: f32([1.0, 2.0, 3.0, 4.0])})
     assert_output_eq(outputs, sum_out, [10.0], dtype=np.float32)
     assert_output_eq(outputs, max_out, [4.0], dtype=np.float32)
     assert_output_eq(outputs, shifted_out, [11.0, 12.0, 13.0, 14.0], dtype=np.float32)
     assert_output_eq(outputs, exp_out, [2.0, 4.0, 8.0, 16.0], dtype=np.float32)
+    assert_output_eq(outputs, log_out, [1.0, 2.0, 3.0, 4.0], dtype=np.float32)
 
 
 def test_reg_bitwise_shift_and_combine_int_frac_ex2_value_semantics():
@@ -180,7 +186,7 @@ def test_reg_bitwise_shift_and_combine_int_frac_ex2_value_semantics():
     frac = reg_tensor(b, dtype=nr.DType.F32, shape=(2,))
     combined = reg_tensor(b, dtype=nr.DType.F32, shape=(2,))
 
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.reg_load(lhs, lhs_g)
         b.reg_load(rhs, rhs_g)
         b.reg_bitwise(tmp, lhs, rhs, op="and")
@@ -222,7 +228,7 @@ def test_reg_softmax_rescale_keeps_small_row_max_increase():
     row_max = reg_tensor(b, dtype=nr.DType.F32, shape=(1,))
     row_scale = reg_tensor(b, dtype=nr.DType.F32, shape=(1,))
 
-    with b.role(warp=0):
+    with b.if_warp(0):
         b.reg_load(old, old_g[b.tid_in_wg()])
         b.reg_load(new, new_g[b.tid_in_wg()])
         b.reg_softmax_rescale(row_max, row_scale, old, new, 1.0, threshold=8.0)
@@ -257,7 +263,7 @@ def test_reg_softmax_rescale_accepts_register_threshold():
     row_max = reg_tensor(b, dtype=nr.DType.F32, shape=(1,))
     row_scale = reg_tensor(b, dtype=nr.DType.F32, shape=(1,))
 
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.reg_load(old, old_g[0])
         b.reg_load(new, new_g[0])
         b.reg_load(threshold, threshold_g[0])
@@ -277,7 +283,7 @@ def test_reg_min_caps_safe_reciprocal_for_fa4_epilogue():
     row_sum = reg_tensor(b, dtype=nr.DType.F32, shape=(4,))
     inv = reg_tensor(b, dtype=nr.DType.F32, shape=(4,))
 
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.reg_load(row_sum, row_sum_g)
         b.reg_unary(inv, row_sum, op="rcp")
         b.reg_min(inv, 1.0, inv)
@@ -287,8 +293,8 @@ def test_reg_min_caps_safe_reciprocal_for_fa4_epilogue():
     np.testing.assert_array_equal(output(outputs, out_g), f32([1.0, 1.0, 1.0, 0.5]))
 
 
-def test_reg_cond_rescale_uses_warpgroup_any_scope():
-    b = builder("reg_cond_rescale_wg", num_warps=4)
+def test_reg_cond_rescale_uses_warp_any_scope():
+    b = builder("reg_cond_rescale_warp", num_warps=4)
     src_g = gmem_arg(b, dtype=nr.DType.F32, shape=(1,))
     scale_g = gmem_arg(b, dtype=nr.DType.F32, shape=(128,))
     out_g = gmem_arg(b, dtype=nr.DType.F32, shape=(128,))
@@ -296,12 +302,15 @@ def test_reg_cond_rescale_uses_warpgroup_any_scope():
     scale = reg_tensor(b, dtype=nr.DType.F32, shape=(1,))
     out = reg_tensor(b, dtype=nr.DType.F32, shape=(1,))
 
-    with b.role(warpgroup=0):
+    with b.if_warpgroup(0):
         b.reg_load(src, src_g[0])
         b.reg_load(scale, scale_g[b.tid_in_wg()])
-        b.reg_cond_rescale(out, src, scale, threshold=1.0, scope="warpgroup")
+        b.reg_cond_rescale(out, src, scale, threshold=1.0, scope="warp")
         b.reg_store(out_g[b.tid_in_wg()], out)
 
+    # Both below-threshold and above-threshold scales sit in warp 0, so warp 0
+    # rescales its whole 32 rows; warps 1-3 see only scale == 1.0 (an exact
+    # float identity), so the result is 2.0 * scales regardless of scope.
     scales = np.ones(128, dtype=np.float32)
     scales[7] = 0.5
     scales[9] = 1.5
@@ -324,10 +333,10 @@ def test_reg_cond_rescale_direct_matches_slow_dynamic_slot():
     out_slow = reg_tensor(b, dtype=nr.DType.F32, shape=(2,))
     slot = b.tid_in_wg() % 2
 
-    with b.role(warpgroup=0):
+    with b.if_warpgroup(0):
         b.reg_load(src_direct, src_g[b.tid_in_wg()])
         b.reg_load(scale_direct, scale_g[b.tid_in_wg()])
-        b.reg_cond_rescale(out_direct, src_direct, scale_direct, threshold=1.0, scope="warpgroup")
+        b.reg_cond_rescale(out_direct, src_direct, scale_direct, threshold=1.0, scope="warp")
         b.reg_store(direct_g[b.tid_in_wg()], out_direct)
 
         b.reg_load(src_slow[slot], src_g[b.tid_in_wg()])
@@ -341,7 +350,13 @@ def test_reg_cond_rescale_direct_matches_slow_dynamic_slot():
     scales[91] = 1.5
     outputs = run(b.build(), {src_g: src, scale_g: scales})
     np.testing.assert_array_equal(output(outputs, direct_g), output(outputs, slow_g))
-    np.testing.assert_array_equal(output(outputs, direct_g), src * scales)
+    # Per-warp streams: the "warpgroup" any(scale < threshold) is evaluated
+    # over each executing warp's lanes. Warp 0 (rows 0-31) contains
+    # scales[19] = 0.25 < 1.0 and rescales; row 91's warp (rows 64-95) has no
+    # scale below threshold, so its 1.5 scale is not applied.
+    expected = src.copy()
+    expected[0:32] = src[0:32] * scales[0:32]
+    np.testing.assert_array_equal(output(outputs, direct_g), expected)
 
 
 def test_reg_causal_mask_uses_thread_row_and_element_index():
@@ -351,7 +366,7 @@ def test_reg_causal_mask_uses_thread_row_and_element_index():
     src = reg_tensor(b, dtype=nr.DType.F32, shape=(4,))
     out = reg_tensor(b, dtype=nr.DType.F32, shape=(4,))
 
-    with b.role(warpgroup=1):
+    with b.if_warpgroup(1):
         b.reg_load(src, src_g[b.tid_in_wg(), 0:4])
         b.reg_causal_mask(out, src, query_start=10, key_start=8, group_size=4, mask_value=-99.0)
         b.reg_store(out_g[b.tid_in_wg(), 0:4], out)
@@ -378,7 +393,7 @@ def test_reg_causal_mask_direct_matches_slow_dynamic_slot():
     out_slow = reg_tensor(b, dtype=nr.DType.F32, shape=(2, 4))
     slot = b.tid_in_wg() % 2
 
-    with b.role(warpgroup=1):
+    with b.if_warpgroup(1):
         b.reg_load(src_direct, src_g[b.tid_in_wg(), 0:4])
         b.reg_causal_mask(
             out_direct, src_direct, query_start=10, key_start=8, group_size=4, mask_value=-99.0
@@ -409,7 +424,7 @@ def test_reg_smem_is_owned_per_cta():
     first = reg_tensor(b)
     second = reg_tensor(b)
 
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.reg_load(first[0], cta_values[b.cta_id()])
         b.reg_store(cta_smem[0], first[0])
         b.reg_load(second[0], cta_smem[0])
@@ -425,7 +440,7 @@ def test_reg_overlap_failure_is_fail_closed():
     overlap_out = gmem_arg(b, shape=(1,))
     overlap_reg = reg_tensor(b)
 
-    with b.role(warp=0):
+    with b.if_warp(0):
         b.reg_load(overlap_reg[0], overlap_src[b.lane_id()])
         b.reg_store(overlap_out[0], overlap_reg[0])
 
@@ -451,7 +466,7 @@ def test_reg_trace_region_uses_register_rows_for_warp_uniform_slice():
     b = builder("reg_region_warp_uniform", num_warps=4)
     reg = reg_tensor(b, shape=(1,))
 
-    with b.role(warp=0):
+    with b.if_warp(0):
         b.reg_fill(reg[0], 1)
 
     report = nr.check_protocol(b.build(), include_events=True)
@@ -466,7 +481,7 @@ def test_reg_trace_region_keeps_lane_id_diagonal_exact():
     b = builder("reg_region_lane_diagonal", num_warps=4)
     reg = reg_tensor(b, shape=(32,))
 
-    with b.role(warp=0):
+    with b.if_warp(0):
         b.reg_fill(reg[b.lane_id()], 1)
 
     report = nr.check_protocol(b.build(), include_events=True)
@@ -483,7 +498,7 @@ def test_reg_trace_region_elected_thread_covers_tensor_slice():
     b = builder("reg_region_elected_slice", num_warps=4)
     reg = reg_tensor(b, shape=(4,))
 
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.reg_fill(reg, 1)
 
     report = nr.check_protocol(b.build(), include_events=True)

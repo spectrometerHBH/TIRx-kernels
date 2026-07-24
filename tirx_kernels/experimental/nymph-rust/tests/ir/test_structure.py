@@ -76,10 +76,10 @@ def test_kernel_body_preserves_statements_in_order():
 
 
 def test_nested_body_roundtrips():
-    # a role wrapping a body — confirm the nesting is preserved.
+    # an If wrapping a body — confirm the nesting is preserved.
     inner = n.CtaSync()
-    role = n.Role(body=(inner,), warp=0)
-    assert len(role.body) == 1
+    branch = n.If(cond=n.ScopeValue(kind="warp_id").eq(0), then_body=(inner,))
+    assert len(branch.body) == 1
 
 
 def test_scheduler_abstraction_roundtrips_fields():

@@ -90,7 +90,10 @@ def _copy_kernel(dtype):
     reg = n.Tensor(space=n.MemorySpace.REG, dtype=dtype, shape=[1])
     tid = n.ScopeValue(kind="tid_in_wg")
     body = (
-        n.Role(body=(n.RegLoad(dst=reg[:], src=inp[tid]), n.RegStore(dst=out[tid], src=reg[:]))),
+        n.If(
+            cond=1,
+            then_body=(n.RegLoad(dst=reg[:], src=inp[tid]), n.RegStore(dst=out[tid], src=reg[:])),
+        ),
     )
     return (
         n.Kernel(
@@ -157,7 +160,7 @@ def test_interpret_returns_native_output_dtype(dtype, expected_dtype):
 def test_interpret_accepts_nonfloat_gmem_scalar_initial(dtype, scalar_dtype, values):
     gmem = n.Tensor(space=n.MemorySpace.GMEM, dtype=dtype, shape=[1])
     scalar = n.Var(binding=n.VarBinding.SCALAR, dtype=scalar_dtype)
-    body = (n.Role(body=(n.ScalarDef(var=scalar, initial=gmem[0]),)),)
+    body = (n.If(cond=1, then_body=(n.ScalarDef(var=scalar, initial=gmem[0]),)),)
     kernel = n.Kernel(
         name="scalar_init",
         args=(gmem,),

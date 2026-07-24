@@ -24,7 +24,9 @@ def test_tma_load_rejects_non_multicast_mbar_target_mismatch():
         dst = smem_tensor(b, dtype=nr.DType.F32, shape=(1,), byte_offset=0)
         src = gmem_arg(b, dtype=nr.DType.F32, shape=(1,))
         mbar = b.mbar(kind=nr.MBarKind.TMA)
-        with b.role():
+        # tma_load is a single-thread issue instruction now: elect one thread,
+        # so the mbar-target check (not the issue-mask gate) is what fires.
+        with b.if_warp(0), b.if_elected():
             b.tma_load(
                 dst,
                 src,
@@ -48,10 +50,11 @@ def test_tma_load_store_value_mode_roundtrips_and_preserves_gmem_cells():
     reg = reg_tensor(b, shape=(8,))
     mbar = b.mbar(kind=nr.MBarKind.TMA)
 
-    with b.kernel_init(warp=0):
+    # mbarrier.init is per-thread now: issue it from a single elected thread.
+    with b.if_warp(0), b.if_elected():
         b.mbarrier_init(mbar, count=1)
 
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.mbarrier_arrive_expect_tx(mbar, bytes=16)
         b.tma_load(smem, source, mbar=mbar, bytes=16, coords=(0,), shape=(4,))
         b.tma_store(out, smem, coords=(2,), shape=(4,))
@@ -71,10 +74,11 @@ def test_tma_value_mode_uses_explicit_full_rank_gmem_shape():
     reg = reg_tensor(b, shape=(1, 2, 2, 4))
     mbar = b.mbar(kind=nr.MBarKind.TMA)
 
-    with b.kernel_init(warp=0):
+    # mbarrier.init is per-thread now: issue it from a single elected thread.
+    with b.if_warp(0), b.if_elected():
         b.mbarrier_init(mbar, count=1)
 
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.mbarrier_arrive_expect_tx(mbar, bytes=64)
         b.tma_load(
             smem,
@@ -108,13 +112,16 @@ def test_tma_multicast_writes_each_cta_smem():
     mbar = b.mbar(kind=nr.MBarKind.TMA)
     even_mbar = b.mbar_ref(mbar, remote_coord=0)
 
-    with b.kernel_init(warp=0):
+    # mbarrier.init is per-thread now: issue it from a single elected thread.
+    with b.if_warp(0), b.if_elected():
         b.mbarrier_init(mbar, count=1)
 
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
+        # The issuing thread arms expect_tx immediately before its own tma_load;
+        # then BOTH CTAs gate their reads on the load's mbarrier (CTA 1 waits
+        # it remotely).
         with b.if_(cta_eq(b, 0)):
             b.mbarrier_arrive_expect_tx(mbar, bytes=16)
-        with b.if_(cta_eq(b, 0)):
             b.tma_load(
                 smem,
                 source,
@@ -125,8 +132,9 @@ def test_tma_multicast_writes_each_cta_smem():
                 multicast_cta_mask=0b11,
                 cta_group=2,
             )
+        b.mbarrier_wait(even_mbar, phase=0)
 
-    with b.kernel_finalize(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.reg_load(reg[0], smem[0])
         b.reg_store(out[b.ctaid_in_cluster()], reg[0])
 
@@ -154,9 +162,11 @@ def test_tma_load_gmem_region_is_per_row_rectangle():
     source = gmem_arg(b, dtype=nr.DType.U8, shape=(4, 16))
     smem = smem_tensor(b, dtype=nr.DType.U8, shape=(2, 4), byte_offset=0)
     mbar = b.mbar(kind=nr.MBarKind.TMA)
-    with b.kernel_init(warp=0):
+    # init/arrive_expect_tx are per-thread and tma_load is single-thread issue:
+    # run the whole sequence on one elected thread.
+    with b.if_warp(0), b.if_elected():
         b.mbarrier_init(mbar, count=1)
-    with b.role(warp=0):
+    with b.if_warp(0), b.if_elected():
         b.mbarrier_arrive_expect_tx(mbar, bytes=8)
         b.tma_load(smem, source, mbar=mbar, bytes=8, coords=(1, 3), shape=(2, 4))
         b.mbarrier_wait(mbar, phase=0)
@@ -174,9 +184,11 @@ def test_tma_load_gmem_region_clamps_partial_tile():
     source = gmem_arg(b, dtype=nr.DType.U8, shape=(4, 16))
     smem = smem_tensor(b, dtype=nr.DType.U8, shape=(2, 8), byte_offset=0)
     mbar = b.mbar(kind=nr.MBarKind.TMA)
-    with b.kernel_init(warp=0):
+    # init/arrive_expect_tx are per-thread and tma_load is single-thread issue:
+    # run the whole sequence on one elected thread.
+    with b.if_warp(0), b.if_elected():
         b.mbarrier_init(mbar, count=1)
-    with b.role(warp=0):
+    with b.if_warp(0), b.if_elected():
         b.mbarrier_arrive_expect_tx(mbar, bytes=16)
         b.tma_load(smem, source, mbar=mbar, bytes=16, coords=(3, 12), shape=(2, 8))
         b.mbarrier_wait(mbar, phase=0)
@@ -191,7 +203,9 @@ def test_tma_store_gmem_region_is_per_row_rectangle_clamped():
     b = builder("tma_store_region_rect", smem_size_bytes=64)
     dest = gmem_arg(b, dtype=nr.DType.U8, shape=(4, 16))
     smem = smem_tensor(b, dtype=nr.DType.U8, shape=(2, 8), byte_offset=0)
-    with b.role(warp=0):
+    # tma_store is single-thread issue now: run the fill + fence + store on one
+    # elected thread (the inner lane-0 guard is then trivially true).
+    with b.if_warp(0), b.if_elected():
         with b.if_(b.lane_id().eq(0)):
             for r in range(2):
                 for c in range(8):
@@ -214,17 +228,20 @@ def _tma_load_fake_release_kernel(wait_tma):
     frag = reg_tensor(b, dtype=nr.DType.F32, shape=(4,))
     tma_mbar = b.mbar(kind=nr.MBarKind.TMA)
     ready = b.mbar(kind=nr.MBarKind.THREAD)
-    with b.kernel_init(warp=0):
+    # Per-thread init on one elected thread; the cta_sync publishes the
+    # initialized cells to warp 4.
+    with b.if_warp(0), b.if_elected():
         b.mbarrier_init(tma_mbar, count=1)
         b.mbarrier_init(ready, count=1)
-    with b.role(warp=0):
+    b.cta_sync()
+    with b.if_warp(0):
         with b.if_(b.lane_id().eq(0)):
             b.mbarrier_arrive_expect_tx(tma_mbar, bytes=64)
             b.tma_load(smem, source, mbar=tma_mbar, bytes=64, coords=(0, 0), shape=(4, 4))
             if wait_tma:
                 b.mbarrier_wait(tma_mbar, phase=0)
             b.mbarrier_arrive(ready)
-    with b.role(warp=4):
+    with b.if_warp(4):
         b.mbarrier_wait(ready, phase=0)
         b.reg_load(frag, smem[b.lane_id() % 4, 0:4])
     return b.build()
@@ -246,7 +263,8 @@ def _tma_store_source_reuse_kernel(drain):
     b = builder("tma_store_reuse" + ("_drain" if drain else ""), smem_size_bytes=16)
     dest = gmem_arg(b, dtype=nr.DType.F32, shape=(2, 4))
     smem = smem_tensor(b, dtype=nr.DType.F32, shape=(1, 4), byte_offset=0)
-    with b.role(warp=0):
+    # tma_store is single-thread issue now: run the whole sequence elected.
+    with b.if_warp(0), b.if_elected():
         with b.if_(b.lane_id().eq(0)):
             for c in range(4):
                 b.store_scalar(nr.TensorSlice(tensor=smem, offsets=(0, c), shape=(1, 1)), 0)

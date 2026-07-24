@@ -2,22 +2,16 @@
 //! `advance_continue` (structural; no trace entry) and mutate the frame stack,
 //! except the empty-body loop terminal write.
 
-use super::super::cohort::CohortContext;
 use super::super::diagnostics::{IResult, InterpreterError};
 use super::super::outcomes::StepStatus;
 use super::super::protocol::TraceEventKind;
 use super::super::registry::{StmtExecutorRegistry, StmtKind};
-use super::super::scheduler::{
-    break_dynamic_loop, kernel_scope_matches, push_dynamic_loop, push_frame, push_loop,
-    role_matches,
-};
-use super::super::threads::{canonical_thread_mask, filter_thread_mask};
+use super::super::scheduler::{break_dynamic_loop, push_dynamic_loop, push_frame, push_loop};
+use super::super::threads::canonical_thread_mask;
+use super::super::warp_context::WarpContext;
 use crate::ir::{SchedulerPolicy, Stmt};
 
 pub fn register(reg: &mut StmtExecutorRegistry) {
-    reg.register(StmtKind::KernelInit, execute_kernel_scope);
-    reg.register(StmtKind::KernelFinalize, execute_kernel_scope);
-    reg.register(StmtKind::Role, execute_role);
     reg.register(StmtKind::ForLoop, execute_loop);
     reg.register(StmtKind::ForEachTask, execute_for_each_task);
     reg.register(StmtKind::SchedulerImpl, execute_scheduler_impl);
@@ -27,54 +21,8 @@ pub fn register(reg: &mut StmtExecutorRegistry) {
     reg.register(StmtKind::If, execute_if);
 }
 
-fn execute_kernel_scope<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
-    stmt: &'k Stmt,
-) -> IResult<StepStatus> {
-    let (body, warp, lane, elected) = match stmt {
-        Stmt::KernelInit {
-            body,
-            warp,
-            lane,
-            elected,
-        }
-        | Stmt::KernelFinalize {
-            body,
-            warp,
-            lane,
-            elected,
-        } => (body, *warp, *lane, *elected),
-        _ => unreachable!(),
-    };
-    let child = filter_thread_mask(&ctx.cohort, |t| {
-        kernel_scope_matches(t, warp, lane, elected)
-    });
-    if !child.is_empty() && !body.is_empty() {
-        push_frame(ctx.stream, body.as_slice(), child);
-    }
-    Ok(StepStatus::advance_continue())
-}
-
-fn execute_role<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
-    let (body, warp, warpgroup, elected) = match stmt {
-        Stmt::Role {
-            body,
-            warp,
-            warpgroup,
-            elected,
-            ..
-        } => (body, *warp, *warpgroup, *elected),
-        _ => unreachable!(),
-    };
-    let child = filter_thread_mask(&ctx.cohort, |t| role_matches(t, warp, warpgroup, elected));
-    if !child.is_empty() && !body.is_empty() {
-        push_frame(ctx.stream, body.as_slice(), child);
-    }
-    Ok(StepStatus::advance_continue())
-}
-
 fn execute_scheduler_impl<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
+    ctx: &mut WarpContext<'a, 'k>,
     stmt: &'k Stmt,
 ) -> IResult<StepStatus> {
     let body = match stmt {
@@ -82,12 +30,12 @@ fn execute_scheduler_impl<'a, 'k>(
         _ => unreachable!(),
     };
     if !body.is_empty() {
-        push_frame(ctx.stream, body.as_slice(), ctx.cohort.clone());
+        push_frame(ctx.stream, body.as_slice(), ctx.lanes.clone());
     }
     Ok(StepStatus::advance_continue())
 }
 
-fn execute_loop<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
+fn execute_loop<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
     let (var, start_v, stop_v, step_v, body) = match stmt {
         Stmt::ForLoop {
             var,
@@ -114,7 +62,7 @@ fn execute_loop<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IRes
 }
 
 fn execute_for_each_task<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
+    ctx: &mut WarpContext<'a, 'k>,
     stmt: &'k Stmt,
 ) -> IResult<StepStatus> {
     let (scheduler, var, body) = match stmt {
@@ -157,7 +105,7 @@ fn execute_for_each_task<'a, 'k>(
 }
 
 fn execute_counted_loop<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
+    ctx: &mut WarpContext<'a, 'k>,
     var_id: u32,
     start: i64,
     stop: i64,
@@ -183,7 +131,7 @@ fn execute_counted_loop<'a, 'k>(
             stop,
             step,
             body,
-            ctx.cohort.clone(),
+            ctx.lanes.clone(),
         );
         Ok(StepStatus::advance_continue())
     } else {
@@ -192,13 +140,13 @@ fn execute_counted_loop<'a, 'k>(
         ctx.state
             .values
             .scalars
-            .write_mask(&ctx.cohort, var_id, last);
+            .write_mask(&ctx.lanes, var_id, last);
         Ok(StepStatus::advance())
     }
 }
 
 fn execute_sched_next<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
+    ctx: &mut WarpContext<'a, 'k>,
     stmt: &'k Stmt,
 ) -> IResult<StepStatus> {
     let (scheduler, var) = match stmt {
@@ -246,7 +194,7 @@ fn execute_sched_next<'a, 'k>(
     ctx.state
         .values
         .scalars
-        .write_mask(&ctx.cohort, var.id.0, value);
+        .write_mask(&ctx.lanes, var.id.0, value);
     if ctx.trace_mode() {
         ctx.emit(TraceEventKind::SchedulerNext {
             scheduler_id: scheduler.id,
@@ -259,7 +207,7 @@ fn execute_sched_next<'a, 'k>(
 }
 
 fn execute_dynamic_loop<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
+    ctx: &mut WarpContext<'a, 'k>,
     stmt: &'k Stmt,
 ) -> IResult<StepStatus> {
     let body = match stmt {
@@ -267,15 +215,12 @@ fn execute_dynamic_loop<'a, 'k>(
         _ => unreachable!(),
     };
     if !body.is_empty() {
-        push_dynamic_loop(ctx.stream, body.as_slice(), ctx.cohort.clone());
+        push_dynamic_loop(ctx.stream, body.as_slice(), ctx.lanes.clone());
     }
     Ok(StepStatus::advance_continue())
 }
 
-fn execute_break_if<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
-    stmt: &'k Stmt,
-) -> IResult<StepStatus> {
+fn execute_break_if<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
     let cond = match stmt {
         Stmt::BreakIf { cond } => cond,
         _ => unreachable!(),
@@ -290,21 +235,21 @@ fn execute_break_if<'a, 'k>(
     Ok(StepStatus::advance_continue())
 }
 
-fn execute_if<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
+fn execute_if<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
     let (cond, then_body) = match stmt {
         Stmt::If { cond, then_body } => (cond, then_body),
         _ => unreachable!(),
     };
     let conditions = ctx.eval_scalar_vec(cond)?;
     let true_threads: Vec<_> = ctx
-        .cohort
+        .lanes
         .iter()
         .zip(conditions.iter())
         .filter(|(_, &c)| c != 0)
         .map(|(t, _)| t.clone())
         .collect();
-    let true_mask = if true_threads.len() == ctx.cohort.len() {
-        ctx.cohort.clone()
+    let true_mask = if true_threads.len() == ctx.lanes.len() {
+        ctx.lanes.clone()
     } else {
         canonical_thread_mask(true_threads)
     };

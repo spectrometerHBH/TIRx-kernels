@@ -15,6 +15,7 @@ pub mod scalar;
 pub mod scheduler;
 pub mod stmt;
 pub mod tensor;
+pub mod thread_filter;
 pub mod validate;
 
 // Re-export everything so callers can write `nymph::ir::Tensor` etc.
@@ -25,6 +26,7 @@ pub use scalar::*;
 pub use scheduler::*;
 pub use stmt::*;
 pub use tensor::*;
+pub use thread_filter::*;
 pub use validate::*;
 
 #[cfg(test)]
@@ -182,36 +184,34 @@ mod tests {
     }
 
     #[test]
-    fn rejects_cta_sync_in_warp_scope() {
-        // cta_sync inside a warp-scope init block -> scope walk fails.
-        let body = vec![Stmt::KernelInit {
-            body: vec![Stmt::CtaSync],
-            warp: Some(0),
-            lane: None,
-            elected: false,
+    fn rejects_cta_sync_in_partial_branch() {
+        // cta_sync reachable by only warp 0 can never complete on hardware.
+        let warp0 = ScalarValue::expr(
+            ScalarOp::Eq,
+            vec![
+                ScalarValue::Scope(ScopeValueKind::WarpId),
+                ScalarValue::Int(0),
+            ],
+        );
+        let body = vec![Stmt::If {
+            cond: warp0,
+            then_body: vec![Stmt::CtaSync],
         }];
         let e = kernel(body, 4).validate().unwrap_err();
         assert!(
-            e.message.contains("cta_sync must be in CTA scope"),
+            e.message.contains("every thread of the CTA"),
             "{}",
             e.message
         );
     }
 
     #[test]
-    fn rejects_cta_sync_inside_role() {
-        let body = vec![Stmt::Role {
-            body: vec![Stmt::CtaSync],
-            warp: None,
-            warpgroup: None,
-            elected: false,
-            maxnreg: None,
+    fn accepts_cta_sync_in_full_cta_branch() {
+        // A statically-true branch: reachability, not nesting, is what matters.
+        let body = vec![Stmt::If {
+            cond: ScalarValue::Int(1),
+            then_body: vec![Stmt::CtaSync],
         }];
-        let e = kernel(body, 4).validate().unwrap_err();
-        assert!(
-            e.message.contains("cta_sync cannot be used inside role"),
-            "{}",
-            e.message
-        );
+        kernel(body, 4).validate().unwrap();
     }
 }

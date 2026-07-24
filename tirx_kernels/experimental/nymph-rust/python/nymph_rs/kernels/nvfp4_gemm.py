@@ -271,18 +271,24 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
         n_idx = within // TILE_GROUPS_ROW_SIZE
         return m_idx, n_idx
 
-    with k.kernel_init(warp=0):
+    with k.if_warp(0):
+        # tmem_alloc is warp-collective (full warp 0); mbarrier.init is
+        # per-thread, so one elected thread runs the inits.
         k.tmem_alloc(tmem_base, n_cols=N_COLS_TMEM, cta_group=cta_group)
-        for s in range(SMEM_DEPTH):
-            k.mbarrier_init(smem_full, count=1, stage=s)
-            k.mbarrier_init(smem_empty, count=1, stage=s)
-            k.mbarrier_init(trans_done, count=cta_group, stage=s)
-        for s in range(ACC_DEPTH):
-            k.mbarrier_init(tmem_full, count=1, stage=s)
-            k.mbarrier_init(tmem_empty, count=cta_group, stage=s)
+        with k.if_elected():
+            for s in range(SMEM_DEPTH):
+                k.mbarrier_init(smem_full, count=1, stage=s)
+                k.mbarrier_init(smem_empty, count=1, stage=s)
+                k.mbarrier_init(trans_done, count=cta_group, stage=s)
+            for s in range(ACC_DEPTH):
+                k.mbarrier_init(tmem_full, count=1, stage=s)
+                k.mbarrier_init(tmem_empty, count=cta_group, stage=s)
+    # Publish the prologue cluster-wide (the pair signals each other's
+    # leader-routed mbars) before any wait/arrive touches the cells.
+    k.cluster_sync()
 
-    # ---- TMA producer (wg0/warp0) ----
-    with k.role(warp=0):
+    # ---- TMA producer (wg0/warp0, one issuing thread) ----
+    with k.if_warp(0), k.if_elected():
         with k.for_each_task(task_scheduler) as task:
             local_iter = (task.task_id - task_start) // task_step
             work_idx = task.task_id * cta_group + cta_rank
@@ -344,8 +350,9 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                     mbar_stage=stage,
                 )
 
-    # ---- scale-factor permute (wg0/warp2) ----
-    with k.role(warp=2):
+    # ---- scale-factor permute (wg0/warp2; per-lane in-place permute, then a
+    # warp_sync converges the warp before the one-thread trans_done arrive) ----
+    with k.if_warp(2):
         with k.for_each_task(task_scheduler) as task:
             local_iter = (task.task_id - task_start) // task_step
             for t in range(k_tiles):
@@ -374,10 +381,17 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                 k.reg_load(sfb_perm_frag, sfb_slice)
                 k.reg_store(sfb_slice, sfb_perm_frag)
                 k.fence(kind=FenceKind.ASYNC_PROXY, scope=FenceScope.CTA)
-                k.mbarrier_arrive(trans_done_leader, stage=stage)
+                # Each lane permuted its own column band, but only the elected
+                # lane arrives below: on sm_70+ lanes reconverge only at an
+                # explicit sync, so converge the warp before its stores are
+                # published to the MMA warp.
+                k.warp_sync()
+                # One arrive per CTA's permute warp (trans_done count = 2).
+                with k.if_elected():
+                    k.mbarrier_arrive(trans_done_leader, stage=stage)
 
-    # ---- MMA (wg0/warp1, cluster leader only) ----
-    with k.role(warp=1):
+    # ---- MMA (wg0/warp1, cluster leader only, one issuing thread) ----
+    with k.if_warp(1), k.if_elected():
         with k.for_each_task(task_scheduler) as task:
             local_iter = (task.task_id - task_start) // task_step
             with k.if_(cta_rank.eq(0)):
@@ -453,7 +467,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                 )
 
     # ---- epilogue (wg1) ----
-    with k.role(warpgroup=1):
+    with k.if_warpgroup(1):
         with k.for_each_task(task_scheduler) as task:
             local_iter = (task.task_id - task_start) // task_step
             work_idx = task.task_id * cta_group + cta_rank
@@ -464,8 +478,13 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
             k.mbarrier_wait(tmem_full, stage=tmem_idx, phase=(local_iter // ACC_DEPTH) % 2)
             for ot in range(store_tiles):
                 store_iter = local_iter * store_tiles + ot
+                # The D ring's oldest bulk store still reads d_smem until its
+                # group drains. The group lives on the leader thread's stream
+                # (it issues the commits below); the wg_sync publishes the
+                # drain to the other warps before anyone overwrites the stage.
                 with k.if_(store_iter >= D_DEPTH):
-                    k.cp_async_bulk_wait_group_read(D_DEPTH - 1)
+                    with k.if_(k.tid_in_wg().eq(0)):
+                        k.cp_async_bulk_wait_group_read(D_DEPTH - 1)
                     k.wg_sync(barrier_id=10)
                 d_stage = store_iter % D_DEPTH
                 for ki in range(EPI_TILE // TMEM_LD_SIZE):
@@ -483,22 +502,32 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                         ),
                         out_frag,
                     )
-                if ot == store_tiles - 1:
-                    k.mbarrier_arrive(tmem_empty_leader, stage=tmem_idx)
-                k.fence(kind=FenceKind.ASYNC_PROXY, scope=FenceScope.CTA)
+                # All four warps' accumulator loads and d_smem writes must land
+                # before the single-thread tail (tmem release + bulk store).
                 k.wg_sync(barrier_id=10)
-                k.tma_store(
-                    d_gmem,
-                    TensorSlice(tensor=d_smem, offsets=(d_stage, 0, 0), shape=(1, blk_m, EPI_TILE)),
-                    coords=(d_m, d_n + ot * EPI_TILE),
-                    shape=(1, blk_m, EPI_TILE),
-                    gmem_shape=(blk_m, EPI_TILE),
-                )
-                k.cp_async_bulk_commit_group()
-        k.cp_async_bulk_wait_group_read(0)
+                with k.if_(k.tid_in_wg().eq(0)):
+                    if ot == store_tiles - 1:
+                        # One arrive per CTA's epilogue (tmem_empty count = 2);
+                        # the wg_sync above proves every warp's loads retired.
+                        k.mbarrier_arrive(tmem_empty_leader, stage=tmem_idx)
+                    k.fence(kind=FenceKind.ASYNC_PROXY, scope=FenceScope.CTA)
+                    k.tma_store(
+                        d_gmem,
+                        TensorSlice(
+                            tensor=d_smem, offsets=(d_stage, 0, 0), shape=(1, blk_m, EPI_TILE)
+                        ),
+                        coords=(d_m, d_n + ot * EPI_TILE),
+                        shape=(1, blk_m, EPI_TILE),
+                        gmem_shape=(blk_m, EPI_TILE),
+                    )
+                    k.cp_async_bulk_commit_group()
+        with k.if_(k.tid_in_wg().eq(0)):
+            k.cp_async_bulk_wait_group_read(0)
         k.wg_sync(barrier_id=10)
 
-    with k.kernel_finalize(warp=0):
+    # Teardown: every warp's pipeline work happens-before the pair dealloc.
+    k.cluster_sync()
+    with k.if_warp(0):
         k.tmem_dealloc(tmem_base, n_cols=N_COLS_TMEM, cta_group=cta_group)
 
     return k.build()

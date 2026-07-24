@@ -8,7 +8,7 @@
 //! fire when you call `validate()` rather than at each `__post_init__`.
 
 use super::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// An IR validation error (mirrors Python's `ValueError`/`TypeError` messages).
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -28,15 +28,6 @@ fn err(msg: impl Into<String>) -> IrError {
 }
 fn bail(msg: impl Into<String>) -> R {
     Err(err(msg))
-}
-
-/// Execution scope tracked by the context walk.
-#[derive(Clone, Copy, PartialEq)]
-enum Scope {
-    Cta,
-    Warpgroup,
-    Warp,
-    Single,
 }
 
 // ---------------------------------------------------------------------------
@@ -101,14 +92,6 @@ fn check_cta_group(value: u8, label: &str) -> R {
 fn check_uint16(value: Option<u16>, _label: &str) -> R {
     // Stored as u16, so range is already guaranteed; nothing to check.
     let _ = value;
-    Ok(())
-}
-fn check_lane(value: Option<u32>, label: &str) -> R {
-    if let Some(v) = value {
-        if v >= 32 {
-            return bail(format!("{label} must be in [0, 32)"));
-        }
-    }
     Ok(())
 }
 fn check_tmem_cols(value: u32, label: &str) -> R {
@@ -182,12 +165,17 @@ fn smem_extent_bytes(tensor: &Tensor) -> Result<usize, IrError> {
 }
 
 /// `_check_tcgen05_mma_shape`.
-fn check_mma_shape(m: u32, n: u32, k: u32, cta_group: u8) -> R {
+fn check_mma_shape(m: u32, n: u32, k: u32, cta_group: u8, block_scaled_f8: bool) -> R {
     check_positive(m, "tcgen05_mma m")?;
     check_positive(n, "tcgen05_mma n")?;
     check_positive(k, "tcgen05_mma k")?;
-    if k != 16 && k != 32 {
-        return bail("tcgen05_mma k must be 16 (dense f16/bf16) or 32 (block-scaled f8)");
+    // The k rule itself is per operand KIND and lives at the Tcgen05Mma arm
+    // (which sees the dtypes and fp4 flags): dense f16/bf16 is k=16, the
+    // block-scaled f8 instruction is k=32, fp4 (mxf4) is k in {64, 128, 256}.
+    if !matches!(k, 16 | 32 | 64 | 128 | 256) {
+        return bail(
+            "tcgen05_mma k must be 16 (dense f16/bf16), 32 (block-scaled f8), or 64/128/256 (fp4)",
+        );
     }
     match cta_group {
         1 => {
@@ -200,8 +188,8 @@ fn check_mma_shape(m: u32, n: u32, k: u32, cta_group: u8) -> R {
         2 => {
             // The block-scaled f8 instruction (k=32) steps N by 16 (DeepGEMM's
             // swap_ab grid uses N = block_m in 16-element steps, e.g. 240);
-            // the dense f16/bf16 shape keeps the 32-step rule.
-            let granularity = if k == 32 { 16 } else { 32 };
+            // the dense f16/bf16 and nvfp4 (k=64) shapes keep the 32-step rule.
+            let granularity = if block_scaled_f8 && k == 32 { 16 } else { 32 };
             if (m != 128 && m != 256) || n > 256 || n % granularity != 0 {
                 return bail("tcgen05_mma matrix shape is invalid for cta_group=2");
             }
@@ -558,28 +546,6 @@ fn validate_stmt(s: &Stmt) -> R {
             }
         }
 
-        Stmt::KernelInit { lane, .. } | Stmt::KernelFinalize { lane, .. } => {
-            check_lane(*lane, "kernel_init/finalize lane")?;
-        }
-        Stmt::Role {
-            warp,
-            warpgroup,
-            elected,
-            maxnreg,
-            ..
-        } => {
-            if warp.is_some() && warpgroup.is_some() {
-                return bail("role cannot set both warp and warpgroup");
-            }
-            if let Some(m) = maxnreg {
-                if warpgroup.is_none() || *elected {
-                    return bail("role maxnreg requires a non-elected warpgroup role");
-                }
-                if *m < 1 || m % 8 != 0 {
-                    return bail("role maxnreg must be a positive multiple of 8");
-                }
-            }
-        }
         Stmt::ForLoop {
             var,
             start,
@@ -621,18 +587,14 @@ fn validate_stmt(s: &Stmt) -> R {
             }
         }
         Stmt::Loop { .. } => {}
-        Stmt::BreakIf { cond } => {
-            validate_scalar(cond)?;
-            if uses_role_scope(cond) {
-                return bail(
-                    "break_if condition cannot branch on role scope values; use role scope",
-                );
-            }
-        }
-        Stmt::If { cond, .. } => {
-            validate_scalar(cond)?;
-            if uses_role_scope(cond) {
-                return bail("if condition cannot branch on role scope values; use role scope");
+        // If/BreakIf conditions may branch on any scope value — warp/lane
+        // dispatch via `If` IS the execution model (per-warp streams with
+        // masked lanes), so warp_id/lane_id predicates are the normal case.
+        Stmt::BreakIf { cond } => validate_scalar(cond)?,
+        Stmt::If { cond, .. } => validate_scalar(cond)?,
+        Stmt::SetMaxNReg { nreg } => {
+            if *nreg == 0 || *nreg % 8 != 0 {
+                return bail("setmaxnreg nreg must be a positive multiple of 8");
             }
         }
 
@@ -714,11 +676,25 @@ fn validate_stmt(s: &Stmt) -> R {
             coords,
             shape,
             gmem_shape,
+            reduce_add,
+            allow_nondet_reduce,
         } => {
             validate_slice(src, "tma_store src")?;
             validate_tensor(dst)?;
             if dst.space != MemorySpace::Gmem {
                 return bail("tma_store dst must be GMEM");
+            }
+            if *reduce_add && dst.dtype != DType::F32 {
+                return bail("tma_reduce_add dst must be f32");
+            }
+            // Float reduce-add is order-dependent (float add is not associative): the
+            // checker can only WARN `nondeterministic_reduction`, so the IR makes the
+            // non-determinism opt-in instead — reject unless the author declared it.
+            if *reduce_add && !dst.dtype.is_integer() && !allow_nondet_reduce {
+                return bail(
+                    "tma_reduce_add on a non-integer dst is order-dependent; \
+                     pass allow_nondet_reduce=true to opt in",
+                );
             }
             if src.tensor.space != MemorySpace::Smem {
                 return bail("tma_store src must be SMEM");
@@ -737,6 +713,62 @@ fn validate_stmt(s: &Stmt) -> R {
             }
             validate_tma_gmem_shape(gmem_shape, &dst.shape, shape, "tma_store")?;
             check_slice_covers(src, shape, "tma_store src slice")?;
+        }
+        Stmt::CpAsyncBulkS2Cluster {
+            dst,
+            src,
+            mbar,
+            bytes,
+        } => {
+            validate_slice(src, "cp_async_bulk_s2cluster src")?;
+            validate_slice(dst, "cp_async_bulk_s2cluster dst")?;
+            validate_scalar(bytes)?;
+            if src.tensor.space != MemorySpace::Smem || dst.tensor.space != MemorySpace::Smem {
+                return bail("cp_async_bulk_s2cluster src and dst must both be SMEM");
+            }
+            if dst.tensor.dtype != src.tensor.dtype {
+                return bail("cp_async_bulk_s2cluster src and dst dtype must match");
+            }
+            // The copy targets a PEER CTA's SMEM and signals that peer's mbar —
+            // without a remote_coord the mbar resolves to the issuing CTA
+            // itself, which is not the cross-CTA exchange this op models.
+            if mbar.remote_coord.is_none() {
+                return bail("cp_async_bulk_s2cluster mbar must target a peer CTA (remote_coord)");
+            }
+        }
+        Stmt::GmemAtomicAdd {
+            sem, coords, value, ..
+        } => {
+            validate_slice(sem, "gmem_atomic_add sem")?;
+            validate_scalar(value)?;
+            if sem.tensor.space != MemorySpace::Gmem {
+                return bail("gmem_atomic_add sem must be GMEM");
+            }
+            if sem.tensor.dtype != DType::I32 {
+                return bail("gmem_atomic_add sem must be an i32 semaphore");
+            }
+            if coords.len() != sem.tensor.shape.len() {
+                return bail("gmem_atomic_add coords rank must match the semaphore tensor rank");
+            }
+            for c in coords {
+                validate_scalar(c)?;
+            }
+        }
+        Stmt::GmemWaitEq { sem, coords, value } => {
+            validate_slice(sem, "gmem_wait_eq sem")?;
+            validate_scalar(value)?;
+            if sem.tensor.space != MemorySpace::Gmem {
+                return bail("gmem_wait_eq sem must be GMEM");
+            }
+            if sem.tensor.dtype != DType::I32 {
+                return bail("gmem_wait_eq sem must be an i32 semaphore");
+            }
+            if coords.len() != sem.tensor.shape.len() {
+                return bail("gmem_wait_eq coords rank must match the semaphore tensor rank");
+            }
+            for c in coords {
+                validate_scalar(c)?;
+            }
         }
         Stmt::CpAsyncBulkCommitGroup => {}
         Stmt::CpAsyncBulkWaitGroupRead { n } => {
@@ -758,13 +790,23 @@ fn validate_stmt(s: &Stmt) -> R {
             sfa,
             sfb,
             sf_byte,
+            sf_e4m3,
+            sf_block,
+            a_fp4,
+            b_fp4,
             ..
         } => {
             validate_slice(dst, "tcgen05_mma dst")?;
             validate_slice(a, "tcgen05_mma a")?;
             validate_slice(b, "tcgen05_mma b")?;
             check_cta_group(*cta_group, "tcgen05_mma cta_group")?;
-            check_mma_shape(*m, *n, *k, *cta_group)?;
+            check_mma_shape(
+                *m,
+                *n,
+                *k,
+                *cta_group,
+                (sfa.is_some() || sfb.is_some()) && !*a_fp4,
+            )?;
             if dst.tensor.space != MemorySpace::Tmem {
                 return bail("tcgen05_mma dst must be TMEM");
             }
@@ -773,18 +815,45 @@ fn validate_stmt(s: &Stmt) -> R {
             {
                 return bail("tcgen05_mma operands must be SMEM or TMEM");
             }
-            if !matches!(a.tensor.dtype, DType::F16 | DType::Bf16 | DType::F8E4M3)
-                || !matches!(b.tensor.dtype, DType::F16 | DType::Bf16 | DType::F8E4M3)
-            {
-                return bail("tcgen05_mma operand dtype must be f16, bf16, or f8e4m3");
-            }
-            if a.tensor.dtype != b.tensor.dtype {
-                return bail("tcgen05_mma a and b operand dtype must match");
-            }
-            if (*k == 32) != (a.tensor.dtype == DType::F8E4M3) {
-                return bail(
-                    "tcgen05_mma k=32 is the f8e4m3 instruction shape (k=16 for f16/bf16)",
-                );
+            if *a_fp4 || *b_fp4 {
+                // NVFP4 (mxf4): operands are e2m1 fp4 packed 2-per-u8; both must be fp4.
+                if !*a_fp4 || !*b_fp4 {
+                    return bail("tcgen05_mma a_fp4 and b_fp4 must be set together");
+                }
+                if a.tensor.dtype != DType::U8 || b.tensor.dtype != DType::U8 {
+                    return bail("tcgen05_mma fp4 operands must be u8 (2 packed e2m1 per byte)");
+                }
+                // The fp4 value model is the in-place SMEM datapath: PTX Table 54's
+                // mxf4* shapes have no transposed form and exist only as
+                // (cta_group=1, M=128) or (cta_group=2, M=256).
+                if a.tensor.space != MemorySpace::Smem || b.tensor.space != MemorySpace::Smem {
+                    return bail("tcgen05_mma fp4 operands must be SMEM");
+                }
+                if *trans_a || *trans_b {
+                    return bail("tcgen05_mma fp4 (mxf4) does not support trans_a/trans_b");
+                }
+                if !((*cta_group == 1 && *m == 128) || (*cta_group == 2 && *m == 256)) {
+                    return bail(
+                        "tcgen05_mma fp4 requires (cta_group=1, m=128) or (cta_group=2, m=256)",
+                    );
+                }
+                if !matches!(*k, 64 | 128 | 256) {
+                    return bail("tcgen05_mma fp4 (mxf4) k must be 64, 128, or 256");
+                }
+            } else {
+                if !matches!(a.tensor.dtype, DType::F16 | DType::Bf16 | DType::F8E4M3)
+                    || !matches!(b.tensor.dtype, DType::F16 | DType::Bf16 | DType::F8E4M3)
+                {
+                    return bail("tcgen05_mma operand dtype must be f16, bf16, or f8e4m3");
+                }
+                if a.tensor.dtype != b.tensor.dtype {
+                    return bail("tcgen05_mma a and b operand dtype must match");
+                }
+                if (*k == 32) != (a.tensor.dtype == DType::F8E4M3) {
+                    return bail(
+                        "tcgen05_mma k=32 is the f8e4m3 instruction shape (k=16 for f16/bf16)",
+                    );
+                }
             }
             if dst.tensor.dtype != DType::F32 {
                 return bail("tcgen05_mma dst dtype must be f32");
@@ -793,15 +862,27 @@ fn validate_stmt(s: &Stmt) -> R {
             let a_rows = if *cta_group == 1 { *m } else { m / 2 };
             let b_rows = if *cta_group == 1 { *n } else { n / 2 };
             check_slice_covers(dst, &[dst_rows as usize, *n as usize], "tcgen05_mma dst")?;
-            let a_shape = if *trans_a {
-                [*k as usize, a_rows as usize]
+            // fp4 operands are packed 2-per-byte, so the K (contraction) extent in
+            // the SMEM tile is k/2 bytes, not k elements.
+            let a_kdim = if *a_fp4 {
+                (*k / 2) as usize
             } else {
-                [a_rows as usize, *k as usize]
+                *k as usize
+            };
+            let b_kdim = if *b_fp4 {
+                (*k / 2) as usize
+            } else {
+                *k as usize
+            };
+            let a_shape = if *trans_a {
+                [a_kdim, a_rows as usize]
+            } else {
+                [a_rows as usize, a_kdim]
             };
             let b_shape = if *trans_b {
-                [*k as usize, b_rows as usize]
+                [b_kdim, b_rows as usize]
             } else {
-                [b_rows as usize, *k as usize]
+                [b_rows as usize, b_kdim]
             };
             check_slice_covers_trailing(a, &a_shape, "tcgen05_mma a")?;
             check_slice_covers_trailing(b, &b_shape, "tcgen05_mma b")?;
@@ -810,13 +891,53 @@ fn validate_stmt(s: &Stmt) -> R {
                     if a.tensor.dtype == DType::F8E4M3 {
                         return bail("tcgen05_mma f8e4m3 operands require sfa/sfb scale vectors");
                     }
+                    if *sf_e4m3 || *sf_block != 0 {
+                        return bail("tcgen05_mma sf_e4m3/sf_block require sfa/sfb scale vectors");
+                    }
                 }
                 (Some(sfa), Some(sfb)) => {
-                    if a.tensor.dtype != DType::F8E4M3 {
+                    // PTX: the block-scaled kinds (mxf8f6f4/mxf4) with cta_group::1
+                    // exist only at M=128 — an m=64 cg1 MMA has no scale mode.
+                    if *cta_group == 1 && *m == 64 {
+                        return bail(
+                            "tcgen05_mma m=64 cta_group=1 does not support block-scaled \
+                             (sfa/sfb) modes",
+                        );
+                    }
+                    // UE8M0 path requires f8e4m3 operands; NVFP4 (sf_e4m3) uses fp4 operands.
+                    if !*sf_e4m3 && a.tensor.dtype != DType::F8E4M3 {
                         return bail("tcgen05_mma sfa/sfb require f8e4m3 operands");
+                    }
+                    if *sf_e4m3 && !*a_fp4 {
+                        return bail("tcgen05_mma sf_e4m3 (NVFP4) requires fp4 operands");
                     }
                     if *sf_byte >= 4 {
                         return bail("tcgen05_mma sf_byte must be in 0..4");
+                    }
+                    // The NVFP4 e4m3 decode reads scale bytes 0..k/16 of each cell —
+                    // sf_byte exists only in the packed-UE8M0 (fp8) layout.
+                    if *sf_e4m3 && *sf_byte != 0 {
+                        return bail("tcgen05_mma sf_byte must be 0 for sf_e4m3 (NVFP4) scales");
+                    }
+                    // The two supported scale modes fix sf_block: nvfp4 block-16
+                    // (sf_e4m3) or fp8 per-row (sf_block=0). Anything else would be
+                    // silently mis-divided by the k/sf_block block math downstream.
+                    match (*sf_e4m3, *sf_block) {
+                        (true, 16) => {
+                            // The packed-u32 scale cell holds 4 e4m3 bytes; this MMA
+                            // reads bytes 0..k/16, so k/16 must fit in one cell.
+                            if *k % 16 != 0 || *k / 16 > 4 {
+                                return bail(
+                                    "tcgen05_mma nvfp4 k must be a multiple of sf_block=16 \
+                                     with at most 4 blocks per packed-u32 scale cell",
+                                );
+                            }
+                        }
+                        (true, _) => return bail("tcgen05_mma sf_e4m3 requires sf_block=16"),
+                        (false, 0) => {}
+                        (false, _) => {
+                            return bail("tcgen05_mma UE8M0 (fp8) mode requires sf_block=0")
+                        }
                     }
                     for (sf, rows, label) in [
                         (sfa, a_rows as usize, "tcgen05_mma sfa"),
@@ -828,7 +949,7 @@ fn validate_stmt(s: &Stmt) -> R {
                         }
                         if sf.tensor.dtype != DType::U32 {
                             return bail(format!(
-                                "{label} dtype must be u32 (4 packed UE8M0 bytes)"
+                                "{label} dtype must be u32 (4 packed UE8M0/e4m3 scale bytes)"
                             ));
                         }
                         let Some(shape) = static_slice_shape(sf) else {
@@ -1043,6 +1164,60 @@ fn validate_stmt(s: &Stmt) -> R {
                 }
             }
         }
+        Stmt::WarpMma {
+            d,
+            a,
+            b,
+            c,
+            m,
+            n,
+            k,
+            ab_dtype,
+        } => {
+            for (sl, lbl) in [(d, "d"), (a, "a"), (b, "b"), (c, "c")] {
+                validate_slice(sl, &format!("mma_sync {lbl}"))?;
+                if sl.tensor.space != MemorySpace::Reg {
+                    return bail(format!("mma_sync {lbl} must be REG"));
+                }
+            }
+            // m16n8k{8,16}: A/B are u32 packed-16bit fragments, C/D are f32.
+            if !(*m == 16 && *n == 8 && (*k == 8 || *k == 16)) {
+                return bail("mma_sync supports only m16n8k8 / m16n8k16");
+            }
+            if !matches!(*ab_dtype, DType::Bf16 | DType::F16) {
+                return bail("mma_sync ab_dtype must be bf16 or f16");
+            }
+            // A/B are u32 packed-bf16 words OR a bf16/f16 fragment (2 elems = 1 word).
+            for (sl, lbl) in [(a, "A"), (b, "B")] {
+                if !is_b32_reg_dtype(sl.tensor.dtype) && !is_b16_dtype(sl.tensor.dtype) {
+                    return bail(format!(
+                        "mma_sync {lbl} must be u32/i32 words or a bf16/f16 fragment"
+                    ));
+                }
+            }
+            if c.tensor.dtype != DType::F32 || d.tensor.dtype != DType::F32 {
+                return bail("mma_sync C/D must be f32 register fragments");
+            }
+            let (la, lb, lcd) = (
+                (*m * *k / 64) as usize,
+                (*n * *k / 64) as usize,
+                (*m * *n / 32) as usize,
+            );
+            for (sl, words, lbl) in [(a, la, "A"), (b, lb, "B"), (c, lcd, "C"), (d, lcd, "D")] {
+                let want = if is_b16_dtype(sl.tensor.dtype) {
+                    2 * words
+                } else {
+                    words
+                };
+                if let Some(got) = static_shape_numel(&sl.shape) {
+                    if got != want {
+                        return bail(format!(
+                            "mma_sync {lbl} fragment must hold {want} elements per lane"
+                        ));
+                    }
+                }
+            }
+        }
 
         Stmt::RegFill { dst, value } => check_reg_alu(dst, &[("value", value)], "reg_fill")?,
         Stmt::RegUnary { dst, src, .. } => {
@@ -1101,10 +1276,19 @@ fn validate_stmt(s: &Stmt) -> R {
             src,
             scale,
             threshold,
-            ..
+            scope,
         } => {
             if !is_float_reg_dtype(dst.tensor.dtype) {
                 return bail("reg_cond_rescale dst dtype must be f16, bf16, or f32");
+            }
+            // A register reduction sees only the executing warp's rows, so its
+            // group predicate spans one warp. A warpgroup group would need the
+            // four warps' registers together, which one warp's execution cannot
+            // provide.
+            if matches!(scope, RegCondScope::Warpgroup) {
+                return bail(
+                    "reg_cond_rescale scope must be warp (a register reduction spans one warp)",
+                );
             }
             check_reg_alu(
                 dst,
@@ -1168,6 +1352,7 @@ fn validate_stmt(s: &Stmt) -> R {
             key_start,
             group_size,
             mask_value,
+            swap_qk: _,
         } => {
             if !is_float_reg_dtype(dst.tensor.dtype) {
                 return bail("reg_causal_mask dst dtype must be f16, bf16, or f32");
@@ -1221,6 +1406,19 @@ fn validate_stmt(s: &Stmt) -> R {
         Stmt::WgSync { barrier_id } => {
             if *barrier_id < 1 || *barrier_id > 15 {
                 return bail("wg_sync barrier_id must be an integer in [1, 15]");
+            }
+        }
+        Stmt::NamedBarrier {
+            barrier_id,
+            num_warps,
+        } => {
+            if *barrier_id < 1 || *barrier_id > 15 {
+                return bail("named_barrier barrier_id must be an integer in [1, 15]");
+            }
+            // The thread count is `num_warps * 32` by construction — carrying the
+            // WARP count in the IR is what keeps it a positive multiple of 32.
+            if *num_warps < 1 {
+                return bail("named_barrier num_warps must be >= 1");
             }
         }
     }
@@ -1322,15 +1520,6 @@ fn validate_scheduler(scheduler: &Scheduler) -> R {
     validate_task_space(&scheduler.space)
 }
 
-/// `_uses_scope_value` for the role-scope kinds (warp_id / warpgroup_id).
-fn uses_role_scope(v: &ScalarValue) -> bool {
-    match v {
-        ScalarValue::Scope(k) => matches!(k, ScopeValueKind::WarpId | ScopeValueKind::WarpgroupId),
-        ScalarValue::Expr(e) => e.args.iter().any(uses_role_scope),
-        _ => false,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // the three kernel-level walks (Python's `Kernel.__post_init__`)
 // ---------------------------------------------------------------------------
@@ -1364,87 +1553,137 @@ fn define_var(var: Var, defined: &mut HashSet<Var>) -> R {
     Ok(())
 }
 
-fn nested_scope_init(warp: Option<u32>, lane: Option<u32>, elected: bool) -> Scope {
-    if elected || lane.is_some() {
-        Scope::Single
-    } else if warp.is_some() {
-        Scope::Warp
-    } else {
-        Scope::Cta
-    }
-}
-fn nested_scope_role(warp: Option<u32>, warpgroup: Option<u32>, elected: bool) -> Scope {
-    if elected {
-        Scope::Single
-    } else if warpgroup.is_some() {
-        Scope::Warpgroup
-    } else if warp.is_some() {
-        Scope::Warp
-    } else {
-        Scope::Cta
-    }
-}
-
-fn check_role_geometry(
-    warp: Option<u32>,
-    warpgroup: Option<u32>,
-    num_warps: u32,
-    is_role: bool,
-) -> R {
-    if let Some(w) = warp {
-        if w >= num_warps {
-            return bail("role/kernel scope warp must be in [0, kernel num_warps)");
-        }
-    }
-    if is_role {
-        if let Some(wg) = warpgroup {
-            if wg >= num_warps / 4 {
-                return bail("role warpgroup must be in [0, kernel num_warps / 4)");
-            }
-        }
-    }
-    Ok(())
+/// Walks 1 (var-defs) + 2 (thread-shape rules), threading the defined-set and
+/// the static thread filter of the enclosing branch chain.
+///
+/// Shape rules fire only when the filter is `Known` — a branch on a runtime
+/// value makes the reachable thread set indeterminate, and the runtime
+/// semantics (rendezvous accounting, issue gates) own the check there. The
+/// exceptions are ops with NO runtime backstop (`SetMaxNReg` is sim metadata;
+/// a multi-warp `SchedNext` silently work-steals instead of failing): those
+/// require a statically-resolvable branch.
+/// Per-`barrier_id` static participant warp sets of the two hardware-barrier
+/// classes (wg_sync vs named_barrier). The 16 hardware named barriers are ONE
+/// resource shared by both classes: a warp whose arrivals count toward a
+/// wg_sync(id) AND a named_barrier(id) folds two different rendezvous into one
+/// hardware barrier. The rule keys on the statically-known WARP SETS: the
+/// warps reaching wg_sync(id) must be disjoint from the warps reaching
+/// named_barrier(id). Disjoint reuse (one warpgroup's private wg_sync(1) next
+/// to a named_barrier(1) among OTHER warpgroups) stays legal, as on hardware.
+/// Unknown filters skip, like the other static shape rules.
+#[derive(Default)]
+struct BarrierClassUse {
+    wg_sync_warps: HashMap<u32, BTreeSet<u32>>,
+    named_warps: HashMap<u32, BTreeSet<u32>>,
 }
 
-/// Walks 1 (var-defs) + 2 (scope rules), threading the defined-set, current scope,
-/// and per-role wg_sync barrier ownership. `role_token` identifies the enclosing
-/// role-like body (a counter); `next_token` hands out fresh ones.
 #[allow(clippy::too_many_arguments)]
 fn check_context(
     body: &[Stmt],
-    scope: Scope,
-    role_token: Option<u32>,
-    barriers: &mut HashMap<u32, u32>,
+    filter: &ThreadFilter,
     defined: &mut HashSet<Var>,
     num_warps: u32,
-    next_token: &mut u32,
     in_scheduler_impl: bool,
     scheduler_loop_depth: usize,
-    inside_role: bool,
+    barriers: &mut BarrierClassUse,
 ) -> R {
     for stmt in body {
         match stmt {
-            Stmt::CtaSync if inside_role => return bail("cta_sync cannot be used inside role"),
-            Stmt::CtaSync if scope != Scope::Cta => return bail("cta_sync must be in CTA scope"),
-            Stmt::ClusterSync if scope != Scope::Cta => {
-                return bail("cluster_sync must be in CTA scope")
+            Stmt::CtaSync | Stmt::ClusterSync => {
+                if let Some(set) = filter.known() {
+                    if !set.is_full_cta() {
+                        let name = if matches!(stmt, Stmt::CtaSync) {
+                            "cta_sync"
+                        } else {
+                            "cluster_sync"
+                        };
+                        return bail(format!(
+                            "{name} must be reachable by every thread of the CTA"
+                        ));
+                    }
+                }
             }
             Stmt::WgSync { barrier_id } => {
-                if scope != Scope::Warpgroup {
-                    return bail("wg_sync must be in warpgroup scope");
+                if let Some(set) = filter.known() {
+                    if set.is_exactly_one_full_warpgroup().is_none() {
+                        return bail("wg_sync must cover exactly one full warpgroup");
+                    }
+                    let warps = barriers.wg_sync_warps.entry(*barrier_id).or_default();
+                    warps.extend(set.warps_touched());
+                    // The 16 hardware named barriers are a CTA-wide resource; a
+                    // wg_sync is a warpgroup-scoped rendezvous, so one barrier_id
+                    // belongs to a single warpgroup. Two warpgroups on the same
+                    // id would collide — a cross-warpgroup rendezvous is a
+                    // named_barrier.
+                    let warpgroups: std::collections::BTreeSet<u32> =
+                        warps.iter().map(|w| w / 4).collect();
+                    if warpgroups.len() > 1 {
+                        return bail(
+                            "wg_sync barrier_id is used by more than one warpgroup \
+                             (each of the 16 hardware barriers belongs to one warpgroup; \
+                             a cross-warpgroup rendezvous is a named_barrier)",
+                        );
+                    }
+                    if let Some(named) = barriers.named_warps.get(barrier_id) {
+                        if warps.intersection(named).next().is_some() {
+                            return bail(
+                                "wg_sync barrier_id cannot alias a named_barrier reachable \
+                                 by the same warp (the 16 hardware barriers are one resource)",
+                            );
+                        }
+                    }
                 }
-                let token = role_token.ok_or_else(|| err("wg_sync must be in a role"))?;
-                let owner = *barriers.entry(*barrier_id).or_insert(token);
-                if owner != token {
-                    return bail("wg_sync barrier_id cannot be shared across roles");
+            }
+            Stmt::NamedBarrier { barrier_id, .. } => {
+                if let Some(set) = filter.known() {
+                    // A statically sub-warp participant can never fill a
+                    // count-based bar.sync — the hardware hang.
+                    let touched = set.warps_touched();
+                    if touched.is_empty() || !touched.iter().all(|&w| set.is_full_warp(w)) {
+                        return bail(
+                            "named_barrier must cover whole warps (a sub-warp participant \
+                             deadlocks)",
+                        );
+                    }
+                    let warps = barriers.named_warps.entry(*barrier_id).or_default();
+                    warps.extend(touched);
+                    if let Some(wg) = barriers.wg_sync_warps.get(barrier_id) {
+                        if warps.intersection(wg).next().is_some() {
+                            return bail(
+                                "named_barrier barrier_id cannot alias a wg_sync reachable \
+                                 by the same warp (the 16 hardware barriers are one resource)",
+                            );
+                        }
+                    }
                 }
             }
-            Stmt::WarpSync if scope == Scope::Single => {
-                return bail("warp_sync cannot be in single-thread scope");
+            Stmt::WarpSync => {
+                if let Some(set) = filter.known() {
+                    let touched = set.warps_touched();
+                    if touched.is_empty() || !touched.iter().all(|&w| set.is_full_warp(w)) {
+                        return bail(
+                            "warp_sync must cover whole warps (a sub-warp barrier deadlocks)",
+                        );
+                    }
+                }
             }
-            Stmt::TmemAlloc { .. } | Stmt::TmemDealloc { .. } if scope != Scope::Warp => {
-                return bail("tmem alloc/dealloc must be in warp scope");
+            Stmt::TmemAlloc { .. } | Stmt::TmemDealloc { .. } => {
+                if let Some(set) = filter.known() {
+                    if set.is_exactly_one_full_warp().is_none() {
+                        return bail("tmem alloc/dealloc must be issued by exactly one full warp");
+                    }
+                }
             }
+            Stmt::SetMaxNReg { .. } => match filter.known() {
+                None => {
+                    return bail("setmaxnreg requires a statically-resolvable thread branch");
+                }
+                Some(set) => {
+                    if !set.is_union_of_full_warpgroups() {
+                        return bail("setmaxnreg must cover whole warpgroup(s)");
+                    }
+                }
+            },
             _ => {}
         }
         match stmt {
@@ -1505,67 +1744,60 @@ fn check_context(
                 define_var(*var, defined)?;
                 check_context(
                     body,
-                    scope,
-                    role_token,
-                    barriers,
+                    filter,
                     defined,
                     num_warps,
-                    next_token,
                     in_scheduler_impl,
                     scheduler_loop_depth,
-                    inside_role,
+                    barriers,
                 )?;
             }
             Stmt::ForEachTask { var, body, .. } => {
                 define_var(*var, defined)?;
                 check_context(
                     body,
-                    scope,
-                    role_token,
-                    barriers,
+                    filter,
                     defined,
                     num_warps,
-                    next_token,
                     in_scheduler_impl,
                     scheduler_loop_depth,
-                    inside_role,
+                    barriers,
                 )?;
             }
             Stmt::SchedulerImpl { body, .. } => {
-                check_context(
-                    body,
-                    scope,
-                    role_token,
-                    barriers,
-                    defined,
-                    num_warps,
-                    next_token,
-                    true,
-                    0,
-                    inside_role,
-                )?;
+                check_context(body, filter, defined, num_warps, true, 0, barriers)?;
             }
             Stmt::SchedNext { var, .. } => {
                 if !in_scheduler_impl {
                     return bail("sched_next must be inside scheduler_impl");
                 }
+                // A sched_next reachable by more than one warp hands each warp
+                // a DIFFERENT task (shared cursor) with no diagnostic — the
+                // sim cannot catch it, so the branch must be statically known.
+                match filter.known() {
+                    None => {
+                        return bail("sched_next requires a statically-resolvable thread branch");
+                    }
+                    Some(set) => {
+                        if set.warps_touched().len() > 1 {
+                            return bail(
+                                "sched_next must be confined to a single warp (each warp \
+                                 advancing the shared cursor takes a different task)",
+                            );
+                        }
+                    }
+                }
                 define_var(*var, defined)?;
             }
             Stmt::Loop { body } => {
-                if !in_scheduler_impl && scope == Scope::Cta {
-                    return bail("loop must be inside scheduler_impl or role scope");
-                }
                 check_context(
                     body,
-                    scope,
-                    role_token,
-                    barriers,
+                    filter,
                     defined,
                     num_warps,
-                    next_token,
                     in_scheduler_impl,
                     scheduler_loop_depth + 1,
-                    inside_role,
+                    barriers,
                 )?;
             }
             Stmt::BreakIf { cond } => {
@@ -1576,94 +1808,38 @@ fn check_context(
                 collect_vars(cond, &mut vars);
                 require_defined(&vars, defined, "break_if condition")?;
             }
-            Stmt::KernelInit {
-                body,
-                warp,
-                lane,
-                elected,
-            } => {
-                check_role_geometry(*warp, None, num_warps, false)?;
-                let token = *next_token;
-                *next_token += 1;
-                check_context(
-                    body,
-                    nested_scope_init(*warp, *lane, *elected),
-                    Some(token),
-                    barriers,
-                    defined,
-                    num_warps,
-                    next_token,
-                    in_scheduler_impl,
-                    scheduler_loop_depth,
-                    false,
-                )?;
-            }
-            Stmt::KernelFinalize {
-                body,
-                warp,
-                lane,
-                elected,
-            } => {
-                check_role_geometry(*warp, None, num_warps, false)?;
-                let token = *next_token;
-                *next_token += 1;
-                check_context(
-                    body,
-                    nested_scope_init(*warp, *lane, *elected),
-                    Some(token),
-                    barriers,
-                    defined,
-                    num_warps,
-                    next_token,
-                    in_scheduler_impl,
-                    scheduler_loop_depth,
-                    false,
-                )?;
-            }
-            Stmt::Role {
-                body,
-                warp,
-                warpgroup,
-                elected,
-                ..
-            } => {
-                check_role_geometry(*warp, *warpgroup, num_warps, true)?;
-                let token = *next_token;
-                *next_token += 1;
-                check_context(
-                    body,
-                    nested_scope_role(*warp, *warpgroup, *elected),
-                    Some(token),
-                    barriers,
-                    defined,
-                    num_warps,
-                    next_token,
-                    in_scheduler_impl,
-                    scheduler_loop_depth,
-                    true,
-                )?;
-            }
             Stmt::If { cond, then_body } => {
                 let mut vars = Vec::new();
                 collect_vars(cond, &mut vars);
                 require_defined(&vars, defined, "if condition")?;
+                let inner = match static_thread_filter(cond, num_warps) {
+                    ThreadFilter::Known(set) => narrow(filter, &set),
+                    ThreadFilter::Unknown => ThreadFilter::Unknown,
+                };
                 check_context(
                     then_body,
-                    scope,
-                    role_token,
-                    barriers,
+                    &inner,
                     defined,
                     num_warps,
-                    next_token,
                     in_scheduler_impl,
                     scheduler_loop_depth,
-                    inside_role,
+                    barriers,
                 )?;
             }
             _ => {}
         }
     }
     Ok(())
+}
+
+/// Intersect the enclosing filter with a statically-known branch set. An
+/// Unknown enclosing filter stays Unknown: the true set is SOME subset of the
+/// branch set, which is not enough for the exact-shape rules above.
+fn narrow(outer: &ThreadFilter, branch: &ThreadSet) -> ThreadFilter {
+    match outer {
+        ThreadFilter::Known(set) => ThreadFilter::Known(set.intersect(branch)),
+        ThreadFilter::Unknown => ThreadFilter::Unknown,
+    }
 }
 
 /// Walk 3: `_check_tcgen05_cta_group_consistency`.
@@ -1802,6 +1978,13 @@ fn check_smem_pool_bounds(kernel: &Kernel) -> R {
                     }
                 }
             }
+            Stmt::WarpMma { d, a, b, c, .. } => {
+                for sl in [d, a, b, c] {
+                    if seen.insert(sl.tensor.id) {
+                        check_tensor(&sl.tensor, smem_size_bytes)?;
+                    }
+                }
+            }
             Stmt::RegFill { .. }
             | Stmt::RegUnary { .. }
             | Stmt::RegReduce { .. }
@@ -1876,19 +2059,14 @@ impl Kernel {
         }
         check_smem_pool_bounds(self)?;
         let mut defined = HashSet::new();
-        let mut barriers = HashMap::new();
-        let mut next_token = 0u32;
         check_context(
             &self.body,
-            Scope::Cta,
-            None,
-            &mut barriers,
+            &ThreadFilter::Known(ThreadSet::full(self.num_warps)),
             &mut defined,
             self.num_warps,
-            &mut next_token,
             false,
             0,
-            false,
+            &mut BarrierClassUse::default(),
         )?;
         check_cta_group_consistency(&self.body)?;
         Ok(())

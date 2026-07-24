@@ -6,7 +6,6 @@
 //! directly — the wait never re-runs. No progress in a full round ⇒ deadlock
 //! (a wake only follows a mutating step, which is itself progress).
 
-use super::cohort::CohortContext;
 use super::diagnostics::{Diagnostic, IResult};
 use super::ids::IdSpace;
 use super::outcomes::{StepStatus, WakeCondition};
@@ -21,6 +20,7 @@ use super::threads::ThreadId;
 use super::values::arrays::ValueArray1;
 use super::values::mbars::MbarCellKey;
 use super::values::tensors::{DenseTensorValue, TensorInstanceKey, TensorOwner};
+use super::warp_context::WarpContext;
 use crate::ir::{MemorySpace, Stmt};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -89,8 +89,7 @@ fn kind_name(k: super::registry::StmtKind) -> &'static str {
         }
         CtaSync | WgSync | WarpSync | ClusterSync => "exec:Sync",
         TmemAlloc | TmemDealloc => "exec:Tmem",
-        ForLoop | ForEachTask | SchedulerImpl | SchedNext | Loop | BreakIf | If | Role
-        | KernelInit | KernelFinalize => "exec:Control",
+        ForLoop | ForEachTask | SchedulerImpl | SchedNext | Loop | BreakIf | If => "exec:Control",
         _ => "exec:other",
     }
 }
@@ -234,9 +233,6 @@ impl<'k> Interpreter<'k> {
 
         loop {
             let t_mgmt = prof_now();
-            for i in 0..scheduler.schedules.len() {
-                scheduler.ensure_cta_epoch_streams(i);
-            }
             if scheduler.all_completed() {
                 prof_end("P:round_mgmt", t_mgmt);
                 return completed_result(state, kernel, &options, diagnostics, rounds, executed);
@@ -420,7 +416,7 @@ fn step_stream<'k>(
         let current_stmt_id = ids.stmt_id(stmt);
         let current_stmt_kind = super::registry::stmt_kind(stmt);
         let anchor_thread = mask.first().copied();
-        let cohort_size = mask.len();
+        let lane_count = mask.len();
         let executor = match registry.executor_for(stmt) {
             Some(e) => e,
             None => {
@@ -431,7 +427,7 @@ fn step_stream<'k>(
                         current_stmt_id,
                         current_stmt_kind,
                         anchor_thread,
-                        cohort_size,
+                        lane_count,
                     )),
                     reason: None,
                 }
@@ -440,10 +436,10 @@ fn step_stream<'k>(
         // run the executor — it mutates `state` directly via `&mut` ctx
         let texe = prof_now();
         let status = {
-            let mut ctx = CohortContext {
+            let mut ctx = WarpContext {
                 kernel,
                 stream,
-                cohort: mask,
+                lanes: mask,
                 state,
                 ids,
                 options,
@@ -472,7 +468,7 @@ fn step_stream<'k>(
                         current_stmt_id,
                         current_stmt_kind,
                         anchor_thread,
-                        cohort_size,
+                        lane_count,
                     )),
                     reason: None,
                 };
@@ -489,7 +485,7 @@ fn step_stream<'k>(
                                 current_stmt_id,
                                 current_stmt_kind,
                                 anchor_thread,
-                                cohort_size,
+                                lane_count,
                             )),
                             reason: None,
                         };
@@ -527,7 +523,7 @@ fn step_stream<'k>(
                             current_stmt_id,
                             current_stmt_kind,
                             anchor_thread,
-                            cohort_size,
+                            lane_count,
                         )
                     }),
                     reason: None,
@@ -543,7 +539,7 @@ fn anchor_step_diagnostic(
     stmt_id: usize,
     stmt_kind: StmtKind,
     anchor_thread: Option<ThreadId>,
-    cohort_size: usize,
+    lane_count: usize,
 ) -> Diagnostic {
     if diagnostic.stream_id.is_none() {
         diagnostic.stream_id = Some(stream.stream_id);
@@ -560,8 +556,8 @@ fn anchor_step_diagnostic(
         .or_insert_with(|| format!("{stmt_kind:?}"));
     diagnostic
         .details
-        .entry("cohort_size".into())
-        .or_insert_with(|| cohort_size.to_string());
+        .entry("lane_count".into())
+        .or_insert_with(|| lane_count.to_string());
     diagnostic
         .details
         .entry("stream_step".into())

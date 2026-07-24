@@ -23,10 +23,19 @@ def test_flash_attention4_builds_all_bench_configs(entry):
     assert len(kernel.args) == 4
 
 
-def test_flash_attention4_protocol_smoke_min_canonical():
-    kernel = build_flash_attention4(
-        FlashAttention4Config(seq_len=1024, num_kv_heads=4, is_causal=False, launch_shape=(1,))
-    )
+# Resident protocol tier: every kv-head config at seq <= 2048 plus one s4096
+# representative (~2 min total). Per-shape cost scales x4 per seq doubling
+# (value/trace/check alike), so the s4096/s8192 tiers are NOT resident — the
+# full 16-config sweep was verified one-off on the per-warp model (all
+# Passed; s1024 ~5 s, s2048 ~17 s, s4096 ~69 s, s8192 ~5 min each).
+_PROTOCOL_TIER = [c for c in CONFIGS if c["seq_len"] <= 2048] + [
+    next(c for c in CONFIGS if c["seq_len"] == 4096)
+]
+
+
+@pytest.mark.parametrize("entry", _PROTOCOL_TIER, ids=[c["label"] for c in _PROTOCOL_TIER])
+def test_flash_attention4_protocol_resident_tier(entry):
+    kernel = build_flash_attention4(_cfg(entry, launch_shape=(1,)))
     report = nr.check_protocol(kernel)
     assert report["status"] == "Passed"
 

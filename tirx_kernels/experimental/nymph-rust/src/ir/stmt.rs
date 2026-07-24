@@ -5,7 +5,7 @@
 //! Body-bearing control nodes hold `Vec<Stmt>` (a recursive enum; `Vec` heap-
 //! allocates so the type has a finite size).
 
-use super::dtype::{FenceKind, FenceScope};
+use super::dtype::{DType, FenceKind, FenceScope};
 use super::mbar::{MBar, MBarRef};
 use super::scalar::{ScalarInitial, ScalarValue, Var};
 use super::scheduler::Scheduler;
@@ -90,6 +90,7 @@ impl From<TensorSlice> for RegOperand {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RegUnaryOp {
     Exp2,
+    Log2,
     Rcp,
     Neg,
 }
@@ -98,6 +99,7 @@ impl RegUnaryOp {
     pub fn as_str(self) -> &'static str {
         match self {
             RegUnaryOp::Exp2 => "exp2",
+            RegUnaryOp::Log2 => "log2",
             RegUnaryOp::Rcp => "rcp",
             RegUnaryOp::Neg => "neg",
         }
@@ -106,6 +108,7 @@ impl RegUnaryOp {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "exp2" => Some(RegUnaryOp::Exp2),
+            "log2" => Some(RegUnaryOp::Log2),
             "rcp" => Some(RegUnaryOp::Rcp),
             "neg" => Some(RegUnaryOp::Neg),
             _ => None,
@@ -244,6 +247,32 @@ impl LdStShape {
     }
 }
 
+/// Memory order of a `gmem_atomic_add` (`red.<order>.gpu.global.add.s32`).
+/// `Release` orders all prior writes before the publish (the semaphore
+/// "signal"); `Relaxed` is a bare RMW with no happens-before edge.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GmemAtomicOrder {
+    Release,
+    Relaxed,
+}
+
+impl GmemAtomicOrder {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GmemAtomicOrder::Release => "release",
+            GmemAtomicOrder::Relaxed => "relaxed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "release" => Some(GmemAtomicOrder::Release),
+            "relaxed" => Some(GmemAtomicOrder::Relaxed),
+            _ => None,
+        }
+    }
+}
+
 /// PTX ldmatrix/stmatrix matrix shape.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MatrixShape {
@@ -321,25 +350,6 @@ pub enum Stmt {
     },
 
     // ---- structural / control flow (bodies recurse) ----
-    KernelInit {
-        body: Vec<Stmt>,
-        warp: Option<u32>,
-        lane: Option<u32>,
-        elected: bool,
-    },
-    KernelFinalize {
-        body: Vec<Stmt>,
-        warp: Option<u32>,
-        lane: Option<u32>,
-        elected: bool,
-    },
-    Role {
-        body: Vec<Stmt>,
-        warp: Option<u32>,
-        warpgroup: Option<u32>,
-        elected: bool,
-        maxnreg: Option<u32>,
-    },
     ForLoop {
         var: Var,
         start: ScalarValue,
@@ -369,6 +379,13 @@ pub enum Stmt {
     If {
         cond: ScalarValue,
         then_body: Vec<Stmt>,
+    },
+    /// `setmaxnreg` register reallocation for the enclosing warpgroup(s).
+    /// Simulation metadata only (register pressure is not modeled); carried in
+    /// the IR so codegen can emit the PTX directive. Validation requires the
+    /// enclosing branch to statically cover whole warpgroups.
+    SetMaxNReg {
+        nreg: u32,
     },
 
     // ---- mbarrier ----
@@ -417,6 +434,57 @@ pub enum Stmt {
         coords: Vec<ScalarValue>,
         shape: Vec<usize>,
         gmem_shape: Option<Vec<usize>>,
+        /// True for `cp.reduce.async.bulk...add.f32` (TMA reduce-add): value-mode
+        /// accumulates `dst += src` instead of overwriting. Trace/protocol treat it
+        /// like a store (a GMEM-output bulk async write) whose accesses carry the
+        /// `TmaReduce` marker.
+        reduce_add: bool,
+        /// Explicit opt-in for a NON-INTEGER (today: f32) `reduce_add`. A float
+        /// reduction is not associative, so cross-CTA reduce-adds to one location are
+        /// race-free (hardware-atomic, commutative) but ORDER-DEPENDENT — the result is
+        /// not bit-reproducible. The protocol checker can only WARN
+        /// (`nondeterministic_reduction`), and warnings are easy to miss, so validate
+        /// REJECTS a float reduce-add unless the kernel author sets this flag. With the
+        /// flag set, the checker keeps its warning.
+        allow_nondet_reduce: bool,
+    },
+    /// `cp.async.bulk.shared::cluster.shared::cta` — async bulk copy from this CTA's
+    /// SMEM (`src`) to a PEER CTA's SMEM (`dst`, the peer instance), signalling the
+    /// peer's `mbar` (via its `remote_coord`) on completion. The peer CTA is the
+    /// mbar's target. Trace/protocol model it as a local-SMEM async-proxy READ +
+    /// a peer-CTA-SMEM async-proxy WRITE (attributed to the peer's SMEM pool, so the
+    /// race checker matches it against the peer's read) + a `complete_tx` on the
+    /// PEER's mbar (so the cross-CTA happens-before closes through the peer's wait).
+    CpAsyncBulkS2Cluster {
+        dst: TensorSlice,
+        src: TensorSlice,
+        mbar: MBarRef,
+        bytes: ScalarValue,
+    },
+    /// `red.<order>.gpu.global.add.s32` — a GMEM semaphore atomic-add ("signal").
+    /// VALUE: serialized RMW of the i32 semaphore cell `sem[coords]` (`+= value`).
+    /// TRACE/protocol: a SYNC op (NOT a data access — no Read/Write on the
+    /// semaphore tensor); it publishes this stream's clock as the RELEASE clock for
+    /// the semaphore slot at its POST-increment value (value-keyed), so a later
+    /// `wait_eq` on that exact value joins it (acquire). `order=release` carries the
+    /// release fence ordering all prior writes (incl. drained reduce-adds) before
+    /// the publish.
+    GmemAtomicAdd {
+        sem: TensorSlice,
+        coords: Vec<ScalarValue>,
+        value: ScalarValue,
+        order: GmemAtomicOrder,
+    },
+    /// `ld.global.acquire.gpu` spin-loop until `sem[coords] == value` ("wait").
+    /// VALUE: BLOCK this stream (polled re-check) until the i32 cell equals `value`;
+    /// never reaching it -> the runner's deadlock detection fires. TRACE/protocol: a
+    /// SYNC op (no Read/Write) that ACQUIRES — joins the release clock published by
+    /// the `atomic_add` that PRODUCED this exact `value` (value-keyed, mirroring the
+    /// mbar phase-keyed pattern with the counter-value in place of parity).
+    GmemWaitEq {
+        sem: TensorSlice,
+        coords: Vec<ScalarValue>,
+        value: ScalarValue,
     },
     CpAsyncBulkCommitGroup,
     CpAsyncBulkWaitGroupRead {
@@ -435,13 +503,28 @@ pub enum Stmt {
         trans_a: bool,
         trans_b: bool,
         cta_group: u8,
-        /// Block-scaled MMA (`kind::mxf8f6f4` + UE8M0 scale vectors): per-row scale
-        /// factors for A and B held in TMEM as packed u32 cells (4 biased-exponent
-        /// bytes each). `sf_byte` selects which packed byte applies to this MMA's
-        /// k-slice; the operand row r dequantizes by 2^(byte - 127).
+        /// Block-scaled MMA scale vectors for A and B, held in TMEM as packed
+        /// u32 cells (4 scale bytes each).
+        ///
+        /// Two scale modes share this field set:
+        /// * fp8 block-128 (`kind::mxf8f6f4` + UE8M0): one scale per operand row,
+        ///   constant over the whole k-slice. `sf_e4m3=false`, `sf_block=0`
+        ///   (per-row); `sf_byte` selects which of the 4 packed bytes applies,
+        ///   dequant `2^(byte-127)`.
+        /// * nvfp4 block-16 (`kind::mxf4` + e4m3): one scale per 16 contiguous
+        ///   k-elements. `sf_e4m3=true`, `sf_block=16`; this MMA's k spans
+        ///   `k/16` blocks whose scales are bytes `0..k/16` of the cell, each
+        ///   decoded as e4m3.
         sfa: Option<TensorSlice>,
         sfb: Option<TensorSlice>,
         sf_byte: u8,
+        /// scale decode: e4m3 (nvfp4) when true, UE8M0 biased exponent (fp8) when false.
+        sf_e4m3: bool,
+        /// scale block width in operand elements; 0 = one scale per row (fp8).
+        sf_block: u32,
+        /// operands are packed fp4 (e2m1, 2 per u8 byte); materialize by unpacking.
+        a_fp4: bool,
+        b_fp4: bool,
     },
     /// `tcgen05.cp` — bulk SMEM -> TMEM copy of packed u32 scale-factor cells.
     /// With `cta_group=2` one leader issue drives both CTAs' datapaths: each CTA
@@ -495,6 +578,19 @@ pub enum Stmt {
         num: u32,
         trans: bool,
         dtype: MatrixDType,
+    },
+    /// Warp-level SM80 tensor-core MMA (`mma.sync.aligned.m{M}n{N}k{K}.row.col`).
+    /// D = A·Bᵀ + C, with A (M×K) / B (N×K) bf16/f16 reg fragments and C/D (M×N)
+    /// f32 reg accumulators, all in the standard mma warp fragment layout.
+    WarpMma {
+        d: TensorSlice,
+        a: TensorSlice,
+        b: TensorSlice,
+        c: TensorSlice,
+        m: u32,
+        n: u32,
+        k: u32,
+        ab_dtype: DType, // A/B operand type — the PTX .bf16 / .f16 (C/D are f32)
     },
 
     // ---- register ALU ----
@@ -573,6 +669,11 @@ pub enum Stmt {
         key_start: ScalarValue,
         group_size: u32,
         mask_value: RegOperand,
+        /// Fragment orientation. False = forward `[q-row, kv-col]` (q = query_start +
+        /// row/group_size, k = key_start + col). True = backward `[kv-row, q-col]` (the
+        /// fa-bwd fragment is transposed): k = key_start + row, q = query_start +
+        /// col/group_size — group_size lands on the q (col) axis. Both mask when k > q.
+        swap_qk: bool,
     },
     RegCombineIntFracEx2 {
         dst: TensorSlice,
@@ -602,6 +703,16 @@ pub enum Stmt {
     WgSync {
         barrier_id: u32,
     },
+    /// Named barrier across `num_warps` warps that may span warpgroups —
+    /// `bar.sync barrier_id, num_warps*32` (flashattn `NamedBarrierBwdSm100`).
+    /// Unlike WgSync (per-warpgroup), DIFFERENT NamedBarrier statements with the
+    /// same `barrier_id` rendezvous on ONE hardware barrier: the rendezvous
+    /// identity is (CTA, barrier_id), not the statement, and completion is
+    /// count-based (`num_warps * 32` arrived threads).
+    NamedBarrier {
+        barrier_id: u32,
+        num_warps: u32,
+    },
     WarpSync,
     ClusterSync,
 }
@@ -611,10 +722,7 @@ impl Stmt {
     /// mirrors Python `Stmt.child_bodies`, used by generic structural walks.
     pub fn child_bodies(&self) -> Vec<&[Stmt]> {
         match self {
-            Stmt::KernelInit { body, .. }
-            | Stmt::KernelFinalize { body, .. }
-            | Stmt::Role { body, .. }
-            | Stmt::ForLoop { body, .. }
+            Stmt::ForLoop { body, .. }
             | Stmt::ForEachTask { body, .. }
             | Stmt::SchedulerImpl { body, .. }
             | Stmt::Loop { body } => vec![body],

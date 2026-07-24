@@ -10,7 +10,7 @@ def test_value_inputs_seed_only_kernel_args_and_ignore_extra_inputs():
     out = gmem_arg(b, shape=(1,))
     reg = reg_tensor(b)
 
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.reg_load(reg[0], source[0])
         b.reg_store(out[0], reg[0])
 
@@ -21,7 +21,7 @@ def test_value_inputs_seed_only_kernel_args_and_ignore_extra_inputs():
 def test_scalar_tensor_initial_missing_input_fails_closed():
     b = builder("scalar_tensor_initial")
     source = gmem_arg(b, shape=(32,))
-    with b.role(warp=0):
+    with b.if_warp(0):
         b.scalar(initial=source[b.lane_id()], dtype=nr.ScalarDType.U32)
 
     with expect_runtime_error("missing_input"):

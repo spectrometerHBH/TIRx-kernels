@@ -2,3 +2,6 @@
 /target
 # Extracted Python extension (built by maturin, unzipped here for PYTHONPATH import).
 /_pybuild
+# Compiled Python extension + auditwheel-vendored shared libs (build artifacts).
+/python/nymph_rs/nymph_rs*.so
+/python/nymph_rs.libs/

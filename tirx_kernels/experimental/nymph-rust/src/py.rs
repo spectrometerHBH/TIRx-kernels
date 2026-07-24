@@ -6,7 +6,7 @@
 use crate::interpreter::diagnostics::{Diagnostic, Severity};
 use crate::interpreter::protocol::{
     AccessScope, BoxN, ExecutionMode, MbarTargetEvent, PoolId, ProtocolPassSummary,
-    ProtocolWarning, Region, TraceEvent, TraceEventKind,
+    ProtocolWarning, Region, SemKey, TraceEvent, TraceEventKind,
 };
 use crate::interpreter::threads::ThreadId;
 use crate::interpreter::values::arrays::ValueArray1;
@@ -646,6 +646,24 @@ fn event_to_py<'py>(py: Python<'py>, event: &TraceEvent) -> PyResult<Bound<'py, 
             out.set_item("bar_id", bar_id)?;
             out.set_item("scope", scope_to_py(py, scope)?)?;
         }
+        TraceEventKind::SemRelease {
+            key,
+            new_value,
+            order,
+            scope,
+        } => {
+            out.set_item("kind", "sem_release")?;
+            out.set_item("key", sem_key_to_py(py, key)?)?;
+            out.set_item("new_value", new_value)?;
+            out.set_item("order", order.as_str())?;
+            out.set_item("scope", scope_to_py(py, scope)?)?;
+        }
+        TraceEventKind::SemAcquire { key, value, scope } => {
+            out.set_item("kind", "sem_acquire")?;
+            out.set_item("key", sem_key_to_py(py, key)?)?;
+            out.set_item("value", value)?;
+            out.set_item("scope", scope_to_py(py, scope)?)?;
+        }
         TraceEventKind::TmemAlloc {
             cta_ids,
             region,
@@ -693,6 +711,21 @@ fn region_to_py<'py>(py: Python<'py>, region: &Region) -> PyResult<Bound<'py, Py
         boxes.append(boxn_to_py(py, b)?)?;
     }
     out.set_item("boxes", boxes)?;
+    // Per-lane attribution, present only for lane-divergent SMEM/TMEM accesses
+    // (`None` = uniform: every executing lane touches the whole region).
+    match &region.lane_boxes {
+        Some(lane_boxes) => {
+            let lanes = PyList::empty(py);
+            for (lane, b) in lane_boxes.iter() {
+                let entry = PyDict::new(py);
+                entry.set_item("lane", *lane)?;
+                entry.set_item("box", boxn_to_py(py, b)?)?;
+                lanes.append(entry)?;
+            }
+            out.set_item("lane_boxes", lanes)?;
+        }
+        None => out.set_item("lane_boxes", py.None())?,
+    }
     Ok(out)
 }
 
@@ -718,14 +751,22 @@ fn mbar_target_to_py<'py>(
     Ok(out)
 }
 
+fn sem_key_to_py<'py>(py: Python<'py>, key: &SemKey) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py);
+    out.set_item("tensor_id", key.tensor_id)?;
+    out.set_item("flat_coord", key.flat_coord)?;
+    Ok(out)
+}
+
 fn scope_to_py<'py>(py: Python<'py>, scope: &AccessScope) -> PyResult<Bound<'py, PyDict>> {
     let out = PyDict::new(py);
     out.set_item("stream_id", scope.stream_id)?;
     out.set_item("cluster_id", scope.cluster_id)?;
     out.set_item("cta_id", scope.cta_id)?;
     out.set_item("ctaid_in_cluster", scope.ctaid_in_cluster)?;
-    out.set_item("cohort_size", scope.cohort_size)?;
-    out.set_item("warp_ids", &scope.warp_ids)?;
+    out.set_item("lane_count", scope.lane_count)?;
+    out.set_item("warp_id", scope.warp_id)?;
+    out.set_item("active_lanes", scope.active_lanes)?;
     Ok(out)
 }
 
@@ -1731,11 +1772,9 @@ impl PyStmt {
             | ir::Stmt::ForEachTask { body, .. }
             | ir::Stmt::SchedulerImpl { body, .. }
             | ir::Stmt::Loop { body }
-            | ir::Stmt::Role { body, .. }
-            | ir::Stmt::KernelInit { body, .. }
-            | ir::Stmt::KernelFinalize { body, .. } => {
-                Ok(body.iter().map(|s| PyStmt(s.clone())).collect())
-            }
+            | ir::Stmt::If {
+                then_body: body, ..
+            } => Ok(body.iter().map(|s| PyStmt(s.clone())).collect()),
             _ => Err(PyAttributeError::new_err("body")),
         }
     }
@@ -1815,53 +1854,6 @@ fn mbar_def(mbar: PyMBar) -> PyStmt {
     PyStmt(ir::Stmt::MBarDef { mbar: mbar.0 })
 }
 #[pyfunction]
-#[pyo3(name = "KernelInit", signature = (body = None, warp = None, lane = None, elected = false))]
-fn kernel_init(
-    body: Option<Bound<'_, PyAny>>,
-    warp: Option<u32>,
-    lane: Option<u32>,
-    elected: bool,
-) -> PyResult<PyStmt> {
-    Ok(PyStmt(ir::Stmt::KernelInit {
-        body: opt_body(body)?,
-        warp,
-        lane,
-        elected,
-    }))
-}
-#[pyfunction]
-#[pyo3(name = "KernelFinalize", signature = (body = None, warp = None, lane = None, elected = false))]
-fn kernel_finalize(
-    body: Option<Bound<'_, PyAny>>,
-    warp: Option<u32>,
-    lane: Option<u32>,
-    elected: bool,
-) -> PyResult<PyStmt> {
-    Ok(PyStmt(ir::Stmt::KernelFinalize {
-        body: opt_body(body)?,
-        warp,
-        lane,
-        elected,
-    }))
-}
-#[pyfunction]
-#[pyo3(name = "Role", signature = (body = None, warp = None, warpgroup = None, elected = false, maxnreg = None))]
-fn role(
-    body: Option<Bound<'_, PyAny>>,
-    warp: Option<u32>,
-    warpgroup: Option<u32>,
-    elected: bool,
-    maxnreg: Option<u32>,
-) -> PyResult<PyStmt> {
-    Ok(PyStmt(ir::Stmt::Role {
-        body: opt_body(body)?,
-        warp,
-        warpgroup,
-        elected,
-        maxnreg,
-    }))
-}
-#[pyfunction]
 #[pyo3(name = "ForLoop", signature = (var, start = None, stop = None, step = None, body = None))]
 fn for_loop(
     var: PyVar,
@@ -1928,6 +1920,11 @@ fn if_stmt(cond: Bound<'_, PyAny>, then_body: Option<Bound<'_, PyAny>>) -> PyRes
         cond: coerce_scalar(&cond)?,
         then_body: opt_body(then_body)?,
     }))
+}
+#[pyfunction]
+#[pyo3(name = "SetMaxNReg", signature = (nreg))]
+fn set_max_nreg(nreg: u32) -> PyResult<PyStmt> {
+    Ok(PyStmt(ir::Stmt::SetMaxNReg { nreg }))
 }
 #[pyfunction]
 #[pyo3(name = "MBarrierInit", signature = (mbar, *, count, stage = None))]
@@ -2023,13 +2020,15 @@ fn tma_load(
     }))
 }
 #[pyfunction]
-#[pyo3(name = "TmaStore", signature = (dst, src, coords, shape, gmem_shape = None))]
+#[pyo3(name = "TmaStore", signature = (dst, src, coords, shape, gmem_shape = None, reduce_add = false, allow_nondet_reduce = false))]
 fn tma_store(
     dst: PyTensor,
     src: Bound<'_, PyAny>,
     coords: Bound<'_, PyAny>,
     shape: Vec<usize>,
     gmem_shape: Option<Vec<usize>>,
+    reduce_add: bool,
+    allow_nondet_reduce: bool,
 ) -> PyResult<PyStmt> {
     Ok(PyStmt(ir::Stmt::TmaStore {
         dst: dst.0,
@@ -2037,6 +2036,54 @@ fn tma_store(
         coords: coerce_scalar_seq(&coords)?,
         shape,
         gmem_shape,
+        reduce_add,
+        allow_nondet_reduce,
+    }))
+}
+#[pyfunction]
+#[pyo3(name = "CpAsyncBulkS2Cluster", signature = (dst, src, mbar, bytes))]
+fn cp_async_bulk_s2cluster(
+    dst: Bound<'_, PyAny>,
+    src: Bound<'_, PyAny>,
+    mbar: Bound<'_, PyAny>,
+    bytes: Bound<'_, PyAny>,
+) -> PyResult<PyStmt> {
+    Ok(PyStmt(ir::Stmt::CpAsyncBulkS2Cluster {
+        dst: coerce_slice(&dst)?,
+        src: coerce_slice(&src)?,
+        mbar: coerce_mbar_ref(&mbar)?,
+        bytes: coerce_scalar(&bytes)?,
+    }))
+}
+#[pyfunction]
+#[pyo3(name = "GmemAtomicAdd", signature = (sem, coords, value, order))]
+fn gmem_atomic_add(
+    sem: Bound<'_, PyAny>,
+    coords: Bound<'_, PyAny>,
+    value: Bound<'_, PyAny>,
+    order: &str,
+) -> PyResult<PyStmt> {
+    let order = ir::GmemAtomicOrder::parse(order).ok_or_else(|| {
+        PyRuntimeError::new_err("gmem_atomic_add order must be 'release' or 'relaxed'")
+    })?;
+    Ok(PyStmt(ir::Stmt::GmemAtomicAdd {
+        sem: coerce_slice(&sem)?,
+        coords: coerce_scalar_seq(&coords)?,
+        value: coerce_scalar(&value)?,
+        order,
+    }))
+}
+#[pyfunction]
+#[pyo3(name = "GmemWaitEq", signature = (sem, coords, value))]
+fn gmem_wait_eq(
+    sem: Bound<'_, PyAny>,
+    coords: Bound<'_, PyAny>,
+    value: Bound<'_, PyAny>,
+) -> PyResult<PyStmt> {
+    Ok(PyStmt(ir::Stmt::GmemWaitEq {
+        sem: coerce_slice(&sem)?,
+        coords: coerce_scalar_seq(&coords)?,
+        value: coerce_scalar(&value)?,
     }))
 }
 #[pyfunction]
@@ -2050,7 +2097,7 @@ fn cp_async_bulk_wait_group_read(n: u8) -> PyStmt {
     PyStmt(ir::Stmt::CpAsyncBulkWaitGroupRead { n })
 }
 #[pyfunction]
-#[pyo3(name = "Tcgen05Mma", signature = (dst, a, b, m, n, k = 16, accum = false, trans_a = false, trans_b = false, cta_group = 1, sfa = None, sfb = None, sf_byte = 0))]
+#[pyo3(name = "Tcgen05Mma", signature = (dst, a, b, m, n, k = 16, accum = false, trans_a = false, trans_b = false, cta_group = 1, sfa = None, sfb = None, sf_byte = 0, sf_e4m3 = false, sf_block = 0, a_fp4 = false, b_fp4 = false))]
 #[allow(clippy::too_many_arguments)]
 fn tcgen05_mma(
     dst: Bound<'_, PyAny>,
@@ -2066,6 +2113,10 @@ fn tcgen05_mma(
     sfa: Option<Bound<'_, PyAny>>,
     sfb: Option<Bound<'_, PyAny>>,
     sf_byte: u8,
+    sf_e4m3: bool,
+    sf_block: u32,
+    a_fp4: bool,
+    b_fp4: bool,
 ) -> PyResult<PyStmt> {
     Ok(PyStmt(ir::Stmt::Tcgen05Mma {
         dst: coerce_slice(&dst)?,
@@ -2081,6 +2132,10 @@ fn tcgen05_mma(
         sfa: sfa.map(|v| coerce_slice(&v)).transpose()?,
         sfb: sfb.map(|v| coerce_slice(&v)).transpose()?,
         sf_byte,
+        sf_e4m3,
+        sf_block,
+        a_fp4,
+        b_fp4,
     }))
 }
 #[pyfunction]
@@ -2205,6 +2260,31 @@ fn stmatrix(
         num,
         trans,
         dtype,
+    }))
+}
+
+#[pyfunction]
+#[pyo3(name = "WarpMma", signature = (d, a, b, c, m = 16, n = 8, k = 16, ab_dtype = None))]
+#[allow(clippy::too_many_arguments)]
+fn warp_mma(
+    d: Bound<'_, PyAny>,
+    a: Bound<'_, PyAny>,
+    b: Bound<'_, PyAny>,
+    c: Bound<'_, PyAny>,
+    m: u32,
+    n: u32,
+    k: u32,
+    ab_dtype: Option<PyDType>,
+) -> PyResult<PyStmt> {
+    Ok(PyStmt(ir::Stmt::WarpMma {
+        d: coerce_slice(&d)?,
+        a: coerce_slice(&a)?,
+        b: coerce_slice(&b)?,
+        c: coerce_slice(&c)?,
+        m,
+        n,
+        k,
+        ab_dtype: ab_dtype.map_or(ir::DType::Bf16, Into::into),
     }))
 }
 
@@ -2368,7 +2448,8 @@ fn reg_softmax_rescale(
 }
 
 #[pyfunction]
-#[pyo3(name = "RegCausalMask", signature = (dst, src, query_start, key_start, group_size, mask_value = None))]
+#[pyo3(name = "RegCausalMask", signature = (dst, src, query_start, key_start, group_size, mask_value = None, swap_qk = false))]
+#[allow(clippy::too_many_arguments)]
 fn reg_causal_mask(
     dst: Bound<'_, PyAny>,
     src: Bound<'_, PyAny>,
@@ -2376,6 +2457,7 @@ fn reg_causal_mask(
     key_start: Bound<'_, PyAny>,
     group_size: u32,
     mask_value: Option<Bound<'_, PyAny>>,
+    swap_qk: bool,
 ) -> PyResult<PyStmt> {
     Ok(PyStmt(ir::Stmt::RegCausalMask {
         dst: coerce_slice(&dst)?,
@@ -2387,6 +2469,7 @@ fn reg_causal_mask(
             Some(v) => coerce_reg_operand(&v)?,
             None => ir::RegOperand::Literal(ir::RegLiteral::f32(f32::NEG_INFINITY)),
         },
+        swap_qk,
     }))
 }
 
@@ -2448,6 +2531,14 @@ fn cta_sync() -> PyStmt {
 #[pyo3(name = "WgSync")]
 fn wg_sync(barrier_id: u32) -> PyStmt {
     PyStmt(ir::Stmt::WgSync { barrier_id })
+}
+#[pyfunction]
+#[pyo3(name = "NamedBarrier")]
+fn named_barrier(barrier_id: u32, num_warps: u32) -> PyStmt {
+    PyStmt(ir::Stmt::NamedBarrier {
+        barrier_id,
+        num_warps,
+    })
 }
 #[pyfunction]
 #[pyo3(name = "WarpSync")]
@@ -2593,9 +2684,6 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(scalar_store, m)?,
         wrap_pyfunction!(store_scalar, m)?,
         wrap_pyfunction!(mbar_def, m)?,
-        wrap_pyfunction!(kernel_init, m)?,
-        wrap_pyfunction!(kernel_finalize, m)?,
-        wrap_pyfunction!(role, m)?,
         wrap_pyfunction!(for_loop, m)?,
         wrap_pyfunction!(for_each_task, m)?,
         wrap_pyfunction!(scheduler_impl, m)?,
@@ -2603,6 +2691,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(loop_stmt, m)?,
         wrap_pyfunction!(break_if, m)?,
         wrap_pyfunction!(if_stmt, m)?,
+        wrap_pyfunction!(set_max_nreg, m)?,
         wrap_pyfunction!(mbarrier_init, m)?,
         wrap_pyfunction!(mbarrier_arrive, m)?,
         wrap_pyfunction!(mbarrier_wait, m)?,
@@ -2610,6 +2699,9 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(mbarrier_arrive_expect_tx, m)?,
         wrap_pyfunction!(tma_load, m)?,
         wrap_pyfunction!(tma_store, m)?,
+        wrap_pyfunction!(cp_async_bulk_s2cluster, m)?,
+        wrap_pyfunction!(gmem_atomic_add, m)?,
+        wrap_pyfunction!(gmem_wait_eq, m)?,
         wrap_pyfunction!(cp_async_bulk_commit_group, m)?,
         wrap_pyfunction!(cp_async_bulk_wait_group_read, m)?,
         wrap_pyfunction!(tcgen05_mma, m)?,
@@ -2621,6 +2713,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(tcgen05_wait_st, m)?,
         wrap_pyfunction!(ldmatrix, m)?,
         wrap_pyfunction!(stmatrix, m)?,
+        wrap_pyfunction!(warp_mma, m)?,
         wrap_pyfunction!(reg_fill, m)?,
         wrap_pyfunction!(reg_unary, m)?,
         wrap_pyfunction!(reg_add, m)?,
@@ -2641,6 +2734,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(fence, m)?,
         wrap_pyfunction!(cta_sync, m)?,
         wrap_pyfunction!(wg_sync, m)?,
+        wrap_pyfunction!(named_barrier, m)?,
         wrap_pyfunction!(warp_sync, m)?,
         wrap_pyfunction!(cluster_sync, m)?,
     ] {

@@ -1,14 +1,14 @@
 # RFC: First-Class Tile Scheduler Abstraction
 
-**Status:** Draft.
+**Status:** Implemented.
 **Scope:** Nymph IR, the value simulator (`nymph-rust`), and the bounded
 synchronization checker. Codegen is out of nymph's scope but the design must be
 codegen-compatible (§8).
 
 ## 1. Problem
 
-The old inline grid-stride loop shape baked one static scheduler into each body, and
-every body recomputed `task -> (m_idx, n_idx)` by hand. We want to **swap schedulers** —
+An inline grid-stride loop bakes one static scheduler into each body, and every
+body recomputes `task -> (m_idx, n_idx)` by hand. We want to **swap schedulers** —
 static grid-stride, atomic work-stealing, hardware CLC — without rewriting the body, and
 we want the value simulator and the bounded checker to handle a dynamic scheduler
 without proving anything about the scheduler itself.
@@ -112,10 +112,10 @@ exposes). Full assignment-confluence is out of scope (§9).
 space = k.task_space(grid=(num_m_tiles, num_n_tiles), fields=("m_idx", "n_idx"))
 sched = k.scheduler(space, policy="grid_stride")
 
-with k.role(warp=TMA_WARP):
+with k.if_warp(TMA_WARP):
     with k.for_each_task(sched) as t:
         k.tma_load(a_smem, a_gmem, coords=(t.m_idx * BLK_M, k_coord), mbar=a_full)
-with k.role(warp=MMA_WARP):
+with k.if_warp(MMA_WARP):
     with k.for_each_task(sched) as t:
         k.mbarrier_wait(a_full)
         k.tcgen05_mma(accum, a_smem, b_smem)
@@ -152,7 +152,7 @@ clc_done   = k.mbar(kind=TMA)        # CLC -> scheduler: "result landed"
 sched = k.scheduler(space, policy="custom")   # task_smem/task_full/task_empty above are the
                                               # kernel's own objects, wired in the SchedulerImpl + consumer below
 
-with k.role(warp=SCHED_WARP):                              # a real warp in the kernel
+with k.if_warp(SCHED_WARP):                              # a real warp in the kernel
     with k.scheduler_impl(sched):
         it = k.scalar(initial=0)
         with k.loop():
@@ -166,7 +166,7 @@ with k.role(warp=SCHED_WARP):                              # a real warp in the 
             k.break_if(idx < 0)                            # IR condition; never Python `not`
             k.scalar_store(it, it + 1)
 
-with k.role(warp=MMA_WARP):
+with k.if_warp(MMA_WARP):
     it = k.scalar(initial=0)
     with k.loop():                                         # explicit Loop, no sugar
         stage = it % 2                                     # runtime scalar expr

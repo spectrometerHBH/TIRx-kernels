@@ -5,7 +5,7 @@ from helpers import assert_output_eq, builder, gmem_arg, reg_tensor, run, u32
 
 def test_runs_a_simple_ordered_kernel():
     b = builder("simple_ordered")
-    with b.role():
+    with b.if_(1):
         s = b.scalar(initial=0, dtype=nr.ScalarDType.I32)
         b.scalar_store(s, 5)
 
@@ -14,7 +14,7 @@ def test_runs_a_simple_ordered_kernel():
 
 def test_runs_a_for_loop():
     b = builder("for_loop")
-    with b.role(warp=0):
+    with b.if_warp(0):
         with b.for_loop(stop=8):
             b.warp_sync()
 
@@ -27,7 +27,7 @@ def test_fence_and_cp_async_are_value_noops():
     out = gmem_arg(b, shape=(4,))
     reg = reg_tensor(b, shape=(4,))
 
-    with b.role(warpgroup=0, elected=True):
+    with b.if_warpgroup(0), b.if_((b.tid_in_wg()).eq(0)):
         b.cp_async_bulk_commit_group()
         b.cp_async_bulk_commit_group()
         b.cp_async_bulk_wait_group_read()

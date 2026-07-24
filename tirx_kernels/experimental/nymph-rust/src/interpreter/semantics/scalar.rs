@@ -1,7 +1,6 @@
 //! Scalar def/store executors — port of `semantics/scalar.py`. Write each
 //! thread's scalar directly (not eager, unlike loop vars).
 
-use super::super::cohort::CohortContext;
 use super::super::diagnostics::{IResult, InterpreterError};
 use super::super::outcomes::StepStatus;
 use super::super::registry::{StmtExecutorRegistry, StmtKind};
@@ -9,6 +8,7 @@ use super::super::scalar_eval::eval_scalar_in_env;
 use super::super::transfer::write_operand;
 use super::super::values::arrays::ValueArray1;
 use super::super::values::tensors::tensor_instance_key;
+use super::super::warp_context::WarpContext;
 use crate::ir::{MemorySpace, ScalarInitial, Stmt};
 use ndarray::Array1;
 
@@ -19,7 +19,7 @@ pub fn register(reg: &mut StmtExecutorRegistry) {
 }
 
 fn execute_scalar_def<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
+    ctx: &mut WarpContext<'a, 'k>,
     stmt: &'k Stmt,
 ) -> IResult<StepStatus> {
     let (var, initial) = match stmt {
@@ -56,8 +56,8 @@ fn execute_scalar_def<'a, 'k>(
                         .collect::<Vec<_>>(),
                 ));
             }
-            let mut out = Vec::with_capacity(ctx.cohort.len());
-            for t in ctx.cohort.clone().iter() {
+            let mut out = Vec::with_capacity(ctx.lanes.len());
+            for t in ctx.lanes.clone().iter() {
                 out.push(read_scalar_initial(ctx, slice, t)?);
             }
             out
@@ -67,7 +67,7 @@ fn execute_scalar_def<'a, 'k>(
 }
 
 fn execute_scalar_store<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
+    ctx: &mut WarpContext<'a, 'k>,
     stmt: &'k Stmt,
 ) -> IResult<StepStatus> {
     let (var, value) = match stmt {
@@ -80,7 +80,7 @@ fn execute_scalar_store<'a, 'k>(
 }
 
 fn execute_store_scalar<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
+    ctx: &mut WarpContext<'a, 'k>,
     stmt: &'k Stmt,
 ) -> IResult<StepStatus> {
     let (dst, value) = match stmt {
@@ -90,7 +90,7 @@ fn execute_store_scalar<'a, 'k>(
     let resolved_dst = ctx.eval_slice(dst)?;
     let values = ctx.eval_scalar_vec(value)?.to_vec();
     let array = ValueArray1::from_i64_compute(Array1::from(values), dst.tensor.dtype)
-        .reshape2((ctx.cohort.len(), 1))?;
+        .reshape2((ctx.lanes.len(), 1))?;
     if ctx.trace_mode() {
         ctx.emit_tensor_write(&resolved_dst)?;
     }
@@ -98,16 +98,16 @@ fn execute_store_scalar<'a, 'k>(
     Ok(StepStatus::advance())
 }
 
-fn scalar_commit(ctx: &mut CohortContext, var_id: u32, values: &[i64]) -> StepStatus {
+fn scalar_commit(ctx: &mut WarpContext, var_id: u32, values: &[i64]) -> StepStatus {
     ctx.state
         .values
         .scalars
-        .write_values(&ctx.cohort, var_id, values);
+        .write_values(&ctx.lanes, var_id, values);
     StepStatus::advance()
 }
 
 fn read_scalar_initial(
-    ctx: &mut CohortContext,
+    ctx: &mut WarpContext,
     slice: &crate::ir::TensorSlice,
     thread: &super::super::threads::ThreadId,
 ) -> IResult<i64> {

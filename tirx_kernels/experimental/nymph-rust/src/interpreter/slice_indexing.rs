@@ -1,4 +1,4 @@
-//! Cohort-resolved tensor slices + vectorized flat-index math — port of
+//! Lane-resolved tensor slices + vectorized flat-index math — port of
 //! `interpreter/slice_indexing.py`.
 
 use super::diagnostics::{IResult, InterpreterError};
@@ -8,7 +8,7 @@ use crate::ir::Tensor;
 use ndarray::Array2;
 use std::sync::Arc;
 
-/// A slice resolved over a cohort: per-thread base offsets `[A, rank]` (i64) and a
+/// A slice resolved over a lane mask: per-thread base offsets `[A, rank]` (i64) and a
 /// uniform slice `shape`.
 #[derive(Clone)]
 pub struct ResolvedSlice {
@@ -33,7 +33,7 @@ pub fn shared_flat_indices(
     let a = resolved.offsets.nrows();
 
     // Per-dim out-of-bounds is checked once, at slice resolution
-    // (`CohortContext::eval_slice`, which every `ResolvedSlice` flows through and which
+    // (`WarpContext::eval_slice`, which every `ResolvedSlice` flows through and which
     // runs in both value and trace mode), so it is not repeated here.
 
     let strides = row_major_strides(tensor_shape);

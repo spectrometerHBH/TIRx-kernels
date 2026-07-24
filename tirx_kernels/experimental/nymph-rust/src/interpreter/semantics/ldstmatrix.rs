@@ -4,7 +4,6 @@
 //! elements. For each warp, `.x1/.x2/.x4` use address lanes 0..7, 0..15, or
 //! 0..31 as the row starts for one, two, or four matrices respectively.
 
-use super::super::cohort::CohortContext;
 use super::super::diagnostics::{IResult, InterpreterError};
 use super::super::outcomes::StepStatus;
 use super::super::protocol::{MemoryAccessKind, MemoryProxy, TensorAccessKind, TraceEventKind};
@@ -14,6 +13,7 @@ use super::super::values::arrays::ValueArray2;
 use super::super::values::ldstmatrix::{
     check_num, element_coord, pack_b16x2, row_address_lane, unpack_b16x2,
 };
+use super::super::warp_context::WarpContext;
 use crate::ir::{DType, MatrixDType, MatrixShape, Stmt};
 use ndarray::Array2;
 use std::collections::HashSet;
@@ -23,10 +23,7 @@ pub fn register(reg: &mut StmtExecutorRegistry) {
     reg.register(StmtKind::StMatrix, execute_stmatrix);
 }
 
-fn execute_ldmatrix<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
-    stmt: &'k Stmt,
-) -> IResult<StepStatus> {
+fn execute_ldmatrix<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
     let (dst, src, shape, num, trans, dtype) = match stmt {
         Stmt::LdMatrix {
             dst,
@@ -39,7 +36,7 @@ fn execute_ldmatrix<'a, 'k>(
         _ => unreachable!(),
     };
     check_matrix_shape(shape, dtype, num, "ldmatrix")?;
-    ctx.check_full_warp_cohort(
+    ctx.check_full_warp(
         "ldmatrix_mask",
         "ldmatrix must be issued by one or more full warps",
     )?;
@@ -54,9 +51,9 @@ fn execute_ldmatrix<'a, 'k>(
         return Ok(StepStatus::advance());
     }
 
-    let row_lanes = lane_to_cohort_rows(ctx)?;
-    let mut source_flats = Vec::with_capacity(ctx.cohort.len() * num * 2);
-    for (ai, thread) in ctx.cohort.iter().enumerate() {
+    let row_lanes = lane_row_map(ctx)?;
+    let mut source_flats = Vec::with_capacity(ctx.lanes.len() * num * 2);
+    for (ai, thread) in ctx.lanes.iter().enumerate() {
         let lane_rows = &row_lanes[warp_index(ctx, thread.warp_id)?];
         let lane = thread.lane_id;
         for matrix_id in 0..num {
@@ -75,8 +72,8 @@ fn execute_ldmatrix<'a, 'k>(
         .pool_for(ctx.stream.cta_id)?
         .read_u16_bits_indices(&src_r.tensor, &source_flats)?;
 
-    let mut words = Array2::<u32>::zeros((ctx.cohort.len(), num));
-    for ai in 0..ctx.cohort.len() {
+    let mut words = Array2::<u32>::zeros((ctx.lanes.len(), num));
+    for ai in 0..ctx.lanes.len() {
         for matrix_id in 0..num {
             let base = (ai * num + matrix_id) * 2;
             words[[ai, matrix_id]] = pack_b16x2(bits[base], bits[base + 1]);
@@ -86,10 +83,7 @@ fn execute_ldmatrix<'a, 'k>(
     Ok(StepStatus::advance())
 }
 
-fn execute_stmatrix<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
-    stmt: &'k Stmt,
-) -> IResult<StepStatus> {
+fn execute_stmatrix<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
     let (dst, src, shape, num, trans, dtype) = match stmt {
         Stmt::StMatrix {
             dst,
@@ -102,7 +96,7 @@ fn execute_stmatrix<'a, 'k>(
         _ => unreachable!(),
     };
     check_matrix_shape(shape, dtype, num, "stmatrix")?;
-    ctx.check_full_warp_cohort(
+    ctx.check_full_warp(
         "stmatrix_mask",
         "stmatrix must be issued by one or more full warps",
     )?;
@@ -110,7 +104,7 @@ fn execute_stmatrix<'a, 'k>(
     let src_r = ctx.eval_slice(src)?;
     let dst_idx = check_row_slice(&dst_r, "stmatrix dst")?;
     check_reg_fragment(&src_r, num, "stmatrix src")?;
-    let row_lanes = lane_to_cohort_rows(ctx)?;
+    let row_lanes = lane_row_map(ctx)?;
     let dst_flats = matrix_flat_indices(ctx, &row_lanes, &dst_idx, num, trans)?;
     check_unique(
         &dst_flats,
@@ -132,7 +126,7 @@ fn execute_stmatrix<'a, 'k>(
 
     let words = read_reg_words(ctx, &src_r, num)?;
     let mut out_bits = Vec::with_capacity(dst_flats.len());
-    for ai in 0..ctx.cohort.len() {
+    for ai in 0..ctx.lanes.len() {
         for matrix_id in 0..num {
             let halves = unpack_b16x2(words[[ai, matrix_id]]);
             for half in halves {
@@ -196,28 +190,27 @@ fn check_reg_fragment(resolved: &ResolvedSlice, num: usize, label: &str) -> IRes
     Ok(())
 }
 
-fn warp_ids(ctx: &CohortContext) -> Vec<usize> {
-    let mut ids: Vec<usize> = ctx.cohort.iter().map(|t| t.warp_id).collect();
-    ids.sort_unstable();
-    ids.dedup();
-    ids
+fn warp_index(ctx: &WarpContext, warp_id: usize) -> IResult<usize> {
+    // Every lane of the mask belongs to the stream's one warp, so the only
+    // valid index is 0.
+    if ctx.lanes[0].warp_id == warp_id {
+        Ok(0)
+    } else {
+        Err(InterpreterError::new(
+            "ldstmatrix_mask",
+            "missing warp in the lane mask",
+        ))
+    }
 }
 
-fn warp_index(ctx: &CohortContext, warp_id: usize) -> IResult<usize> {
-    warp_ids(ctx)
-        .iter()
-        .position(|&id| id == warp_id)
-        .ok_or_else(|| InterpreterError::new("ldstmatrix_mask", "missing warp in cohort"))
-}
-
-fn lane_to_cohort_rows(ctx: &CohortContext) -> IResult<Vec<[usize; 32]>> {
-    let ids = warp_ids(ctx);
+fn lane_row_map(ctx: &WarpContext) -> IResult<Vec<[usize; 32]>> {
+    let ids = [ctx.lanes[0].warp_id];
     let mut rows = vec![[usize::MAX; 32]; ids.len()];
-    for (ai, thread) in ctx.cohort.iter().enumerate() {
+    for (ai, thread) in ctx.lanes.iter().enumerate() {
         let wi = ids
             .iter()
             .position(|&id| id == thread.warp_id)
-            .expect("warp id collected from cohort");
+            .expect("warp id collected from the lane mask");
         rows[wi][thread.lane_id] = ai;
     }
     for lane_rows in &rows {
@@ -232,14 +225,14 @@ fn lane_to_cohort_rows(ctx: &CohortContext) -> IResult<Vec<[usize; 32]>> {
 }
 
 fn matrix_flat_indices(
-    ctx: &CohortContext,
+    ctx: &WarpContext,
     row_lanes: &[[usize; 32]],
     row_idx: &Array2<usize>,
     num: usize,
     trans: bool,
 ) -> IResult<Vec<usize>> {
-    let mut flats = Vec::with_capacity(ctx.cohort.len() * num * 2);
-    for thread in &ctx.cohort {
+    let mut flats = Vec::with_capacity(ctx.lanes.len() * num * 2);
+    for thread in &ctx.lanes {
         let lane_rows = &row_lanes[warp_index(ctx, thread.warp_id)?];
         let lane = thread.lane_id;
         for matrix_id in 0..num {
@@ -263,21 +256,17 @@ fn check_unique(values: &[usize], code: &str, message: &str) -> IResult<()> {
     Ok(())
 }
 
-fn read_reg_words(
-    ctx: &CohortContext,
-    resolved: &ResolvedSlice,
-    num: usize,
-) -> IResult<Array2<u32>> {
+fn read_reg_words(ctx: &WarpContext, resolved: &ResolvedSlice, num: usize) -> IResult<Array2<u32>> {
     let values = ctx.registers_read(resolved)?;
     match values {
-        ValueArray2::U32(a) if a.dim() == (ctx.cohort.len(), num) => Ok(a),
-        ValueArray2::I32(a) if a.dim() == (ctx.cohort.len(), num) => Ok(a.mapv(|x| x as u32)),
+        ValueArray2::U32(a) if a.dim() == (ctx.lanes.len(), num) => Ok(a),
+        ValueArray2::I32(a) if a.dim() == (ctx.lanes.len(), num) => Ok(a.mapv(|x| x as u32)),
         // A b16 fragment: each consecutive pair IS one b32 word (the packed
         // register file the f32->b16x2 pair cvt produces on silicon — packing
         // is a register-file view, not an instruction).
-        ValueArray2::F16(a) | ValueArray2::Bf16(a) if a.dim() == (ctx.cohort.len(), 2 * num) => {
+        ValueArray2::F16(a) | ValueArray2::Bf16(a) if a.dim() == (ctx.lanes.len(), 2 * num) => {
             let dtype = resolved.tensor.dtype;
-            Ok(Array2::from_shape_fn((ctx.cohort.len(), num), |(t, w)| {
+            Ok(Array2::from_shape_fn((ctx.lanes.len(), num), |(t, w)| {
                 let lo = encode_b16(dtype, a[[t, 2 * w]]);
                 let hi = encode_b16(dtype, a[[t, 2 * w + 1]]);
                 u32::from(lo) | (u32::from(hi) << 16)
@@ -301,7 +290,7 @@ fn encode_b16(dtype: DType, value: f32) -> u16 {
 }
 
 fn write_reg_words(
-    ctx: &mut CohortContext,
+    ctx: &mut WarpContext,
     resolved: &ResolvedSlice,
     words: Array2<u32>,
 ) -> IResult<()> {
@@ -319,7 +308,7 @@ fn write_reg_words(
 }
 
 fn emit_matrix_tensor_read(
-    ctx: &mut CohortContext,
+    ctx: &mut WarpContext,
     resolved: &ResolvedSlice,
     num: usize,
     access_kind: TensorAccessKind,
@@ -336,7 +325,7 @@ fn emit_matrix_tensor_read(
 }
 
 fn emit_matrix_tensor_write(
-    ctx: &mut CohortContext,
+    ctx: &mut WarpContext,
     resolved: &ResolvedSlice,
     num: usize,
     access_kind: TensorAccessKind,
@@ -353,12 +342,12 @@ fn emit_matrix_tensor_write(
 }
 
 fn selected_row_offsets(
-    ctx: &CohortContext,
+    ctx: &WarpContext,
     resolved: &ResolvedSlice,
     num: usize,
 ) -> IResult<Vec<Vec<i64>>> {
-    let row_lanes = lane_to_cohort_rows(ctx)?;
-    let mut out = Vec::with_capacity(warp_ids(ctx).len() * num * 8);
+    let row_lanes = lane_row_map(ctx)?;
+    let mut out = Vec::with_capacity(num * 8);
     for lane_rows in row_lanes {
         for lane_ai in lane_rows.iter().take(num * 8) {
             out.push(resolved.offsets.row(*lane_ai).iter().copied().collect());

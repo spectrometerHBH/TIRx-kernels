@@ -149,22 +149,35 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
     k_groups_per_tile = config.block_k // config.mma_k
     col_blocks = config.mma_n // 8
 
-    with k.kernel_init(warp=0):
+    with k.if_warp(0):
+        # tmem_alloc is warp-collective (full warp 0); mbarrier.init is
+        # per-thread, so exactly one thread runs the inits.
         k.tmem_alloc(accum, n_cols=2 * config.mma_n, cta_group=config.cta_group)
-        for a_full in a_full_tiles:
-            k.mbarrier_init(a_full, count=1)
-        for a_empty in a_empty_tiles:
-            k.mbarrier_init(a_empty, count=1)
-        k.mbarrier_init(b_full, count=1)
-        # B is consumed by both MMA warps, so both free it each k-tile (count=2).
-        k.mbarrier_init(b_empty, count=2)
-        # Both consumer MMA warps commit to mma_done each task, so one phase
-        # completes per task only when both arrivals land (count=2).
-        k.mbarrier_init(mma_done, count=2)
-        # Both epilogue warpgroups free the accumulator each task (count=2).
-        k.mbarrier_init(accum_empty, count=2)
+        with k.if_elected():
+            for a_full in a_full_tiles:
+                k.mbarrier_init(a_full, count=1)
+            for a_empty in a_empty_tiles:
+                k.mbarrier_init(a_empty, count=1)
+            k.mbarrier_init(b_full, count=1)
+            # B is consumed by both MMA warps, so both free it each k-tile (count=2).
+            k.mbarrier_init(b_empty, count=2)
+            # Both consumer MMA warps commit to mma_done each task, so one phase
+            # completes per task only when both arrivals land (count=2).
+            k.mbarrier_init(mma_done, count=2)
+            # Both epilogue warpgroups free the accumulator each task (count=2).
+            k.mbarrier_init(accum_empty, count=2)
+    # This sync IS the prologue ordering: it publishes the TMEM alloc and the
+    # mbarrier cells to every consumer stream before any wait/arrive touches
+    # them. cta_group=2 peers read each other's mbars, so the publish must be
+    # cluster-wide there.
+    if config.cta_group == 2:
+        k.cluster_sync()
+    else:
+        k.cta_sync()
 
-    with k.role(warp=11):
+    # Producer: single thread drives the whole TMA pipeline (waits, per-thread
+    # arrive_expect_tx, single-thread tma_load issues).
+    with k.if_warp(11), k.if_elected():
         with k.for_each_task(task_scheduler) as task:
             m_tile = task.m_tile
             n_tile = task.n_tile
@@ -202,7 +215,9 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
                 )
 
     for mma_warp, a_smem in enumerate(a_smem_tiles):
-        with k.role(warp=8 + mma_warp):
+        # MMA issuer: single thread (tcgen05_mma/commit are single-thread
+        # instructions; the waits are fine from one thread too).
+        with k.if_warp(8 + mma_warp), k.if_elected():
             with k.for_each_task(task_scheduler) as task:
                 local_iter = (task.task_id - task_start) // task_step
                 # Wait until the previous task's epilogue has drained the
@@ -264,17 +279,25 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
                     k.tcgen05_commit(mma_done, cta_group=config.cta_group, multicast_cta_mask=0b11)
 
     for epilogue_wg, c_smem in enumerate(c_smem_tiles):
-        with k.role(warpgroup=epilogue_wg, maxnreg=config.epilogue_maxnreg):
+        # One named barrier per epilogue warpgroup: it carries the cross-warp
+        # program order the drain and the single-thread tail depend on.
+        wg_bar = 1 + epilogue_wg
+        with k.if_warpgroup(epilogue_wg):
+            k.set_maxnreg(config.epilogue_maxnreg)
             with k.for_each_task(task_scheduler) as task:
                 m_tile = task.m_tile
                 n_tile = task.n_tile
                 local_iter = (task.task_id - task_start) // task_step
                 k.mbarrier_wait(mma_done, phase=local_iter % 2)
                 # The previous task's bulk store still READS c_smem until its
-                # group drains — wait before overwriting (guarded off the
-                # first task, where no group exists yet).
+                # group drains. The group lives on the leader thread's stream
+                # (it issued the commit), so only the leader waits; the
+                # wg_sync publishes the drain to the other three warps before
+                # anyone overwrites c_smem. (Guarded off the first task.)
                 with k.if_(local_iter >= 1):
-                    k.cp_async_bulk_wait_group_read(0)
+                    with k.if_(k.tid_in_wg().eq(0)):
+                        k.cp_async_bulk_wait_group_read(0)
+                k.wg_sync(barrier_id=wg_bar)
                 with k.for_loop(stop=col_blocks) as col_block:
                     col = col_block * 8
                     tmem_col = epilogue_wg * config.mma_n + col
@@ -288,28 +311,39 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
                         TensorSlice(tensor=c_smem, offsets=(k.tid_in_wg(), col), shape=(1, 8)),
                         out_frag,
                     )
-                # The accumulator is fully drained; let the next task's MMA reuse it.
-                k.mbarrier_arrive(accum_empty)
-                k.fence(kind=FenceKind.ASYNC_PROXY, scope=FenceScope.CTA)
-                k.tma_store(
-                    c_gmem,
-                    c_smem,
-                    coords=(
-                        (
-                            m_tile * 2 * config.cta_group
-                            + cta_local_id
-                            + epilogue_wg * config.cta_group
-                        )
-                        * config.block_m,
-                        # Layout A keeps the whole N band in both CTAs (D is split by
-                        # M), so the column origin is the tile's N, independent of cbx.
-                        n_tile * config.mma_n,
-                    ),
-                    shape=(config.block_m, config.mma_n),
-                )
-                k.cp_async_bulk_commit_group()
+                # All four warps' accumulator drains and c_smem writes must land
+                # before the single-thread tail (accum release + bulk store).
+                k.wg_sync(barrier_id=wg_bar)
+                with k.if_(k.tid_in_wg().eq(0)):
+                    # The accumulator is fully drained (wg_sync above proves all
+                    # warps' loads retired); let the next task's MMA reuse it.
+                    # One arrive per warpgroup — accum_empty count stays 2.
+                    k.mbarrier_arrive(accum_empty)
+                    k.fence(kind=FenceKind.ASYNC_PROXY, scope=FenceScope.CTA)
+                    k.tma_store(
+                        c_gmem,
+                        c_smem,
+                        coords=(
+                            (
+                                m_tile * 2 * config.cta_group
+                                + cta_local_id
+                                + epilogue_wg * config.cta_group
+                            )
+                            * config.block_m,
+                            # Layout A keeps the whole N band in both CTAs (D is split by
+                            # M), so the column origin is the tile's N, independent of cbx.
+                            n_tile * config.mma_n,
+                        ),
+                        shape=(config.block_m, config.mma_n),
+                    )
+                    k.cp_async_bulk_commit_group()
 
-    with k.kernel_finalize(warp=0):
+    # Teardown: every warp's pipeline work happens-before the dealloc.
+    if config.cta_group == 2:
+        k.cluster_sync()
+    else:
+        k.cta_sync()
+    with k.if_warp(0):
         k.tmem_dealloc(accum, n_cols=2 * config.mma_n, cta_group=config.cta_group)
 
     return k.build()

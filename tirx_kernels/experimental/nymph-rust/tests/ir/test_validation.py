@@ -122,6 +122,143 @@ def test_rejects_mma_bad_k():
         make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=256, k=8)])
 
 
+# ---- tcgen05_mma block-scaled (f8 UE8M0 + nvfp4 e4m3) ----------------------
+
+
+def mma_f8_operands():
+    """A valid block-scaled f8 (UE8M0) MMA operand set: cg1, m=128, n=32, k=32."""
+    dst = tmem([128, 32])[:, :]
+    a = smem([128, 32], dtype=n.DType.F8E4M3)[:, :]
+    b = smem([32, 32], dtype=n.DType.F8E4M3)[:, :]
+    sfa = tmem([128, 1], dtype=n.DType.U32)[:, :]
+    sfb = tmem([128, 1], dtype=n.DType.U32)[:, :]
+    return dst, a, b, sfa, sfb
+
+
+def mma_fp4_operands():
+    """A valid NVFP4 MMA operand set: cg2, m=256, n=256, k=64 (32 packed bytes)."""
+    dst = tmem([128, 256])[:, :]
+    a = smem([128, 32], dtype=n.DType.U8)[:, :]
+    b = smem([128, 32], dtype=n.DType.U8)[:, :]
+    sfa = tmem([128, 1], dtype=n.DType.U32)[:, :]
+    sfb = tmem([128, 2], dtype=n.DType.U32)[:, :]
+    return dst, a, b, sfa, sfb
+
+
+def fp4_kwargs(**overrides):
+    kw = dict(m=256, n=256, k=64, cta_group=2, sf_e4m3=True, sf_block=16, a_fp4=True, b_fp4=True)
+    kw.update(overrides)
+    return kw
+
+
+def test_accepts_block_scaled_f8_and_nvfp4_mma():
+    dst, a, b, sfa, sfb = mma_f8_operands()
+    make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=32, k=32, sfa=sfa, sfb=sfb)])
+    dst, a, b, sfa, sfb = mma_fp4_operands()
+    make([n.Tcgen05Mma(dst=dst, a=a, b=b, sfa=sfa, sfb=sfb, **fp4_kwargs())])
+
+
+def test_rejects_mma_fp4_k():
+    dst, a, b, sfa, sfb = mma_fp4_operands()
+    with pytest.raises(ValueError, match=r"fp4 \(mxf4\) k must be 64, 128, or 256"):
+        make([n.Tcgen05Mma(dst=dst, a=a, b=b, sfa=sfa, sfb=sfb, **fp4_kwargs(k=32))])
+
+
+def test_rejects_mma_fp4_nblocks_beyond_packed_cell():
+    # k=128 spans 8 blocks of 16 — more e4m3 bytes than one packed-u32 cell holds.
+    dst, a, b, sfa, sfb = mma_fp4_operands()
+    a = smem([128, 64], dtype=n.DType.U8)[:, :]
+    b = smem([128, 64], dtype=n.DType.U8)[:, :]
+    with pytest.raises(ValueError, match="at most 4 blocks per packed-u32 scale cell"):
+        make([n.Tcgen05Mma(dst=dst, a=a, b=b, sfa=sfa, sfb=sfb, **fp4_kwargs(k=128))])
+
+
+def test_rejects_mma_m64_cg1_scale_mode():
+    dst = tmem([64, 32])[:, :]
+    a = smem([64, 32], dtype=n.DType.F8E4M3)[:, :]
+    b = smem([32, 32], dtype=n.DType.F8E4M3)[:, :]
+    sfa = tmem([128, 1], dtype=n.DType.U32)[:, :]
+    sfb = tmem([128, 1], dtype=n.DType.U32)[:, :]
+    with pytest.raises(ValueError, match="m=64 cta_group=1 does not support block-scaled"):
+        make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=64, n=32, k=32, sfa=sfa, sfb=sfb)])
+
+
+def test_rejects_mma_fp4_transposed():
+    dst, a, b, sfa, sfb = mma_fp4_operands()
+    with pytest.raises(ValueError, match="does not support trans_a/trans_b"):
+        make([n.Tcgen05Mma(dst=dst, a=a, b=b, sfa=sfa, sfb=sfb, **fp4_kwargs(trans_b=True))])
+
+
+def test_rejects_mma_fp4_shape():
+    dst, _, b, sfa, sfb = mma_fp4_operands()
+    dst = tmem([64, 32])[:, :]
+    a = smem([64, 32], dtype=n.DType.U8)[:, :]
+    b = smem([32, 32], dtype=n.DType.U8)[:, :]
+    with pytest.raises(ValueError, match="fp4 requires"):
+        make(
+            [
+                n.Tcgen05Mma(
+                    dst=dst, a=a, b=b, sfa=sfa, sfb=sfb, **fp4_kwargs(m=64, n=32, cta_group=1)
+                )
+            ]
+        )
+
+
+def test_rejects_mma_sf_e4m3_without_fp4_operands():
+    dst, a, b, sfa, sfb = mma_f8_operands()
+    with pytest.raises(ValueError, match=r"sf_e4m3 \(NVFP4\) requires fp4 operands"):
+        make([n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=32, k=32, sfa=sfa, sfb=sfb, sf_e4m3=True)])
+
+
+def test_rejects_mma_sf_e4m3_nonzero_sf_byte():
+    dst, a, b, sfa, sfb = mma_fp4_operands()
+    with pytest.raises(ValueError, match="sf_byte must be 0 for sf_e4m3"):
+        make([n.Tcgen05Mma(dst=dst, a=a, b=b, sfa=sfa, sfb=sfb, sf_byte=1, **fp4_kwargs())])
+
+
+# ---- mma_sync (WarpMma) ----------------------------------------------------
+
+
+def warp_mma_operands():
+    """A valid m16n8k16 mma.sync fragment set: A/B u32 packed words, C/D f32."""
+    d = reg([4])[:]
+    a = reg([4], dtype=n.DType.U32)[:]
+    b = reg([2], dtype=n.DType.U32)[:]
+    c = reg([4])[:]
+    return d, a, b, c
+
+
+def test_accepts_warp_mma_fragments():
+    d, a, b, c = warp_mma_operands()
+    make([n.WarpMma(d=d, a=a, b=b, c=c, m=16, n=8, k=16, ab_dtype=n.DType.BF16)])
+
+
+def test_rejects_warp_mma_shape():
+    d, a, b, c = warp_mma_operands()
+    with pytest.raises(ValueError, match="supports only m16n8k8 / m16n8k16"):
+        make([n.WarpMma(d=d, a=a, b=b, c=c, m=16, n=16, k=16)])
+
+
+def test_rejects_warp_mma_ab_dtype():
+    d, a, b, c = warp_mma_operands()
+    with pytest.raises(ValueError, match="ab_dtype must be bf16 or f16"):
+        make([n.WarpMma(d=d, a=a, b=b, c=c, m=16, n=8, k=16, ab_dtype=n.DType.F32)])
+
+
+def test_rejects_warp_mma_non_reg_operand():
+    d, a, b, c = warp_mma_operands()
+    a = smem([4], dtype=n.DType.U32)[:]
+    with pytest.raises(ValueError, match="mma_sync a must be REG"):
+        make([n.WarpMma(d=d, a=a, b=b, c=c, m=16, n=8, k=16)])
+
+
+def test_rejects_warp_mma_fragment_length():
+    d, a, b, c = warp_mma_operands()
+    a = reg([2], dtype=n.DType.U32)[:]  # want m*k/64 = 4 words
+    with pytest.raises(ValueError, match="fragment must hold 4 elements per lane"):
+        make([n.WarpMma(d=d, a=a, b=b, c=c, m=16, n=8, k=16)])
+
+
 # ---- tma ------------------------------------------------------------------
 
 
@@ -248,22 +385,7 @@ def test_rejects_tmem_alloc_bad_ncols():
         make([n.TmemAlloc(tmem([128, 256]), n_cols=33)])
 
 
-# ---- role / scope ----------------------------------------------------------
-
-
-def test_rejects_role_both_warp_and_warpgroup():
-    with pytest.raises(ValueError, match="cannot set both"):
-        make([n.Role(body=(), warp=0, warpgroup=0)])
-
-
-def test_rejects_role_maxnreg_without_warpgroup():
-    with pytest.raises(ValueError, match="maxnreg requires"):
-        make([n.Role(body=(), warp=0, maxnreg=64)])
-
-
-def test_rejects_role_warp_out_of_range():
-    with pytest.raises(ValueError, match=r"warp must be in \[0, kernel num_warps\)"):
-        make([n.Role(body=(), warp=10)])
+# ---- thread-shape rules ----------------------------------------------------
 
 
 def test_rejects_wg_sync_bad_barrier_id():
@@ -271,19 +393,82 @@ def test_rejects_wg_sync_bad_barrier_id():
         make([n.WgSync(barrier_id=99)])
 
 
-def test_rejects_cta_sync_in_warp_scope():
-    with pytest.raises(ValueError, match="cta_sync must be in CTA scope"):
-        make([n.KernelInit(body=(n.CtaSync(),), warp=0)])
+def test_rejects_cta_sync_in_partial_branch():
+    # cta_sync reached by only warp 0 can never complete on hardware.
+    with pytest.raises(ValueError, match="every thread of the CTA"):
+        make([n.If(cond=n.ScopeValue(kind="warp_id").eq(0), then_body=(n.CtaSync(),))])
+    with pytest.raises(ValueError, match="every thread of the CTA"):
+        make(
+            [n.If(cond=n.ScopeValue(kind="warpgroup_id").eq(0), then_body=(n.CtaSync(),))],
+            num_warps=8,
+        )
 
 
-def test_rejects_cta_sync_inside_role():
-    with pytest.raises(ValueError, match="cta_sync cannot be used inside role"):
-        make([n.Role(body=(n.CtaSync(),))])
+def test_accepts_cta_sync_in_full_cta_branch():
+    # A bare full-CTA branch (old: banned "inside role") is exactly the shape
+    # the per-warp model wants: reachability, not nesting, is what matters.
+    make([n.If(cond=1, then_body=(n.CtaSync(),))])
 
 
-def test_rejects_tmem_alloc_outside_warp_scope():
-    with pytest.raises(ValueError, match="must be in warp scope"):
-        make([n.TmemAlloc(tmem([128, 256]), n_cols=64)])  # at CTA scope
+def test_rejects_tmem_alloc_outside_single_warp():
+    with pytest.raises(ValueError, match="exactly one full warp"):
+        make([n.TmemAlloc(tmem([128, 256]), n_cols=64)])  # full-CTA branch
+
+
+def test_rejects_wg_sync_not_covering_full_warpgroup():
+    cond = n.ScopeValue(kind="warp_id").eq(0)
+    with pytest.raises(ValueError, match="exactly one full warpgroup"):
+        make([n.If(cond=cond, then_body=(n.WgSync(barrier_id=1),))], num_warps=8)
+
+
+def test_accepts_wg_sync_in_full_warpgroup_branch():
+    cond = n.ScopeValue(kind="warpgroup_id").eq(1)
+    make([n.If(cond=cond, then_body=(n.WgSync(barrier_id=1),))], num_warps=8)
+
+
+def _wg_branch(wg, bar):
+    return n.If(
+        cond=n.ScopeValue(kind="warpgroup_id").eq(wg), then_body=(n.WgSync(barrier_id=bar),)
+    )
+
+
+def test_accepts_wg_sync_reused_within_one_warpgroup():
+    # One warpgroup may reuse its barrier_id across many wg_syncs.
+    make([_wg_branch(0, 1), _wg_branch(0, 1), _wg_branch(0, 1)], num_warps=8)
+
+
+def test_rejects_wg_sync_barrier_id_across_two_warpgroups():
+    # Two warpgroups on the same physical barrier would collide.
+    with pytest.raises(ValueError, match="more than one warpgroup"):
+        make([_wg_branch(0, 1), _wg_branch(1, 1)], num_warps=8)
+
+
+def test_rejects_reg_cond_rescale_warpgroup_scope():
+    dst = reg([4], dtype=n.DType.F32)[:]
+    with pytest.raises(ValueError, match="scope must be warp"):
+        make([n.RegCondRescale(dst=dst, src=dst, scale=dst, threshold=dst, scope="warpgroup")])
+
+
+def test_accepts_reg_cond_rescale_warp_scope():
+    dst = reg([4], dtype=n.DType.F32)[:]
+    make([n.RegCondRescale(dst=dst, src=dst, scale=dst, threshold=dst, scope="warp")])
+
+
+def test_rejects_warp_sync_in_subwarp_branch():
+    cond = n.ScopeValue(kind="lane_id").eq(0)
+    with pytest.raises(ValueError, match="whole warps"):
+        make([n.If(cond=cond, then_body=(n.WarpSync(),))])
+
+
+def test_dynamic_branch_skips_static_sync_rules():
+    # A runtime-valued predicate makes the thread set indeterminate; the
+    # static shape rules stand down (runtime rendezvous owns the check).
+    v = n.Var(binding=n.VarBinding.SCALAR, dtype=n.ScalarDType.U32)
+    body = (
+        n.ScalarDef(var=v, initial=0),
+        n.If(cond=n.ScopeValue(kind="warp_id").eq(v), then_body=(n.WgSync(barrier_id=1),)),
+    )
+    make(body, num_warps=8)
 
 
 # ---- tcgen05 ld/st ---------------------------------------------------------
@@ -294,12 +479,12 @@ def test_accepts_non_32x32b_tcgen05_ld_st_atom():
     frag = reg([4], dtype=n.DType.U32)
     make(
         [
-            n.Role(
-                body=(
+            n.If(
+                cond=n.ScopeValue(kind="warpgroup_id").eq(0),
+                then_body=(
                     n.Tcgen05Ld(dst=frag[:], src=tm, shape="16x128b", num=2),
                     n.Tcgen05St(dst=tm, src=frag[:], shape="16x128b", num=2),
                 ),
-                warpgroup=0,
             )
         ],
         launch=(1,),
@@ -311,7 +496,9 @@ def test_rejects_invalid_tcgen05_ld_st_atom_num():
     tm = tmem([128, 32], dtype=n.DType.U32)
     frag = reg([128], dtype=n.DType.U32)
     with pytest.raises(ValueError, match="shape/num"):
-        make([n.Role(body=(n.Tcgen05Ld(dst=frag[:], src=tm, shape="16x128b", num=128),))])
+        make(
+            [n.If(cond=1, then_body=(n.Tcgen05Ld(dst=frag[:], src=tm, shape="16x128b", num=128),))]
+        )
 
 
 # ---- ldmatrix / stmatrix ---------------------------------------------------
@@ -322,12 +509,12 @@ def test_accepts_ldstmatrix_m8n8_b16_atoms():
     frag = reg([4], dtype=n.DType.U32)
     make(
         [
-            n.Role(
-                body=(
+            n.If(
+                cond=n.ScopeValue(kind="warp_id").eq(0),
+                then_body=(
                     n.LdMatrix(dst=frag[0:4], src=sm[0, 0:8], num=4, trans=True),
                     n.StMatrix(dst=sm[0, 0:8], src=frag[0:4], num=4, trans=True),
                 ),
-                warp=0,
             )
         ],
         launch=(1,),
@@ -339,11 +526,32 @@ def test_rejects_ldstmatrix_bad_spaces_shapes_and_dtype():
     sm = smem([8, 8], dtype=n.DType.U16)
     frag = reg([4], dtype=n.DType.U32)
     with pytest.raises(ValueError, match="dst must be REG"):
-        make([n.Role(body=(n.LdMatrix(dst=sm[0, 0:4], src=sm[0, 0:8], num=1),), warp=0)])
+        make(
+            [
+                n.If(
+                    cond=n.ScopeValue(kind="warp_id").eq(0),
+                    then_body=(n.LdMatrix(dst=sm[0, 0:4], src=sm[0, 0:8], num=1),),
+                )
+            ]
+        )
     with pytest.raises(ValueError, match="src slice must contain one row"):
-        make([n.Role(body=(n.LdMatrix(dst=frag[0:1], src=sm[0, 0:4], num=1),), warp=0)])
+        make(
+            [
+                n.If(
+                    cond=n.ScopeValue(kind="warp_id").eq(0),
+                    then_body=(n.LdMatrix(dst=frag[0:1], src=sm[0, 0:4], num=1),),
+                )
+            ]
+        )
     with pytest.raises(ValueError, match="src dtype must be i32/u32 words or a b16 fragment"):
-        make([n.Role(body=(n.StMatrix(dst=sm[0, 0:8], src=reg([1], dtype=n.DType.F32)[:]),))])
+        make(
+            [
+                n.If(
+                    cond=1,
+                    then_body=(n.StMatrix(dst=sm[0, 0:8], src=reg([1], dtype=n.DType.F32)[:]),),
+                )
+            ]
+        )
 
 
 # ---- var definedness -------------------------------------------------------
@@ -371,13 +579,28 @@ def test_rejects_inconsistent_cta_group():
         n.TmemAlloc(tmem([128, 256]), n_cols=64, cta_group=2),
     )
     with pytest.raises(ValueError, match="cta_group must be consistent"):
-        make([n.Role(body=body, warp=0)])
+        make([n.If(cond=n.ScopeValue(kind="warp_id").eq(0), then_body=body)])
 
 
-def test_rejects_if_branching_on_role_scope():
-    cond = n.ScopeValue(kind="warp_id")
-    with pytest.raises(ValueError, match="cannot branch on role scope"):
-        make([n.If(cond=cond, then_body=())])
+def test_if_may_branch_on_warp_and_lane_scope():
+    # Warp/lane dispatch via If IS the execution model: predicates over
+    # warp_id/warpgroup_id/lane_id are the normal case, not an error.
+    cond = n.ScopeValue(kind="warp_id").eq(0)
+    make([n.If(cond=cond, then_body=())])
+
+
+def test_setmaxnreg_requires_positive_multiple_of_8():
+    make([n.If(cond=n.ScopeValue(kind="warpgroup_id").eq(0), then_body=(n.SetMaxNReg(nreg=232),))])
+    with pytest.raises(ValueError, match="positive multiple of 8"):
+        make([n.SetMaxNReg(nreg=100)])
+    with pytest.raises(ValueError, match="positive multiple of 8"):
+        make([n.SetMaxNReg(nreg=0)])
+
+
+def test_setmaxnreg_requires_whole_warpgroups():
+    cond = n.ScopeValue(kind="warp_id").eq(0)
+    with pytest.raises(ValueError, match="whole warpgroup"):
+        make([n.If(cond=cond, then_body=(n.SetMaxNReg(nreg=232),))], num_warps=8)
 
 
 def test_rejects_loop_nonpositive_step():

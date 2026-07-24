@@ -54,15 +54,18 @@ def test_protocol_trace_scheduler_scalar_bridge_passes():
     def phase_of(var):
         return (var // 2) % 2
 
-    with b.kernel_init(warp=0):
+    # mbarrier init/arrive are per-thread now: prime from one elected thread,
+    # and publish the initialized cells to the consumer warp with a cta_sync.
+    with b.if_warp(0), b.if_elected():
         b.mbarrier_init(full, count=1, stage=0)
         b.mbarrier_init(full, count=1, stage=1)
         b.mbarrier_init(empty, count=1, stage=0)
         b.mbarrier_init(empty, count=1, stage=1)
         b.mbarrier_arrive(empty, stage=0)
         b.mbarrier_arrive(empty, stage=1)
+    b.cta_sync()
 
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         sched_iter = b.scalar(initial=0, dtype=nr.ScalarDType.I32)
         with b.scheduler_impl(sched):
             with b.loop():
@@ -73,7 +76,7 @@ def test_protocol_trace_scheduler_scalar_bridge_passes():
                 b.scalar_store(sched_iter, sched_iter + 1)
                 b.break_if(task.task_id < 0)
 
-    with b.role(warp=1, elected=True):
+    with b.if_warp(1), b.if_elected():
         consumer_iter = b.scalar(initial=0, dtype=nr.ScalarDType.I32)
         with b.loop():
             b.mbarrier_wait(full, stage=stage_of(consumer_iter), phase=phase_of(consumer_iter))
@@ -93,7 +96,7 @@ def test_protocol_trace_scheduler_scalar_bridge_passes():
 
 def test_protocol_default_omits_events_but_reports_pass_summary():
     b = builder("protocol_default_omits_events")
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.scalar(initial=0, dtype=nr.ScalarDType.I32)
 
     report = nr.check_protocol(b.build())
@@ -113,7 +116,7 @@ def test_protocol_deadlock_freedom_accepts_cta_sync():
 
 def test_protocol_deadlock_freedom_rejects_wait_group_without_commit():
     b = builder("protocol_deadlock_wait_group_missing_commit")
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.cp_async_bulk_wait_group_read()
 
     report = nr.check_protocol(b.build())
@@ -126,9 +129,12 @@ def test_protocol_deadlock_freedom_accepts_mixed_supported_blockers():
     b = builder("protocol_deadlock_mixed_supported")
     mbar = b.mbar(kind=nr.MBarKind.THREAD)
 
-    with b.kernel_init(warp=0):
+    # mbarrier init/arrive are per-thread now: keep the whole mbar handshake on
+    # one elected thread (count=1 must see exactly one arrival); the loose
+    # cta_sync stays as the third supported blocker kind.
+    with b.if_warp(0), b.if_elected():
         b.mbarrier_init(mbar, count=1)
-    with b.role():
+    with b.if_warp(0), b.if_elected():
         b.mbarrier_arrive(mbar)
         b.mbarrier_wait(mbar, phase=0)
         b.cp_async_bulk_commit_group()
@@ -145,7 +151,7 @@ def test_protocol_wait_group_read_n_retains_latest_async_source():
     source = smem_tensor(b, shape=(1,), byte_offset=0)
     out = gmem_arg(b, shape=(1,))
 
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.store_scalar(source[0], 1)
         b.fence(kind=nr.FenceKind.ASYNC_PROXY, scope=nr.FenceScope.CTA)
         b.tma_store(out, source, coords=(0,), shape=(1,))
@@ -167,7 +173,7 @@ def test_protocol_wait_group_read_zero_drains_retained_async_source():
     source = smem_tensor(b, shape=(1,), byte_offset=0)
     out = gmem_arg(b, shape=(1,))
 
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.store_scalar(source[0], 1)
         b.fence(kind=nr.FenceKind.ASYNC_PROXY, scope=nr.FenceScope.CTA)
         b.tma_store(out, source, coords=(0,), shape=(1,))
@@ -187,9 +193,10 @@ def test_protocol_wait_group_read_zero_drains_retained_async_source():
 def test_protocol_deadlock_returns_failed_report():
     b = builder("protocol_deadlock")
     mbar = b.mbar(kind=nr.MBarKind.TMA)
-    with b.kernel_init(warp=0):
+    # mbarrier.init is per-thread now: issue it from a single elected thread.
+    with b.if_warp(0), b.if_elected():
         b.mbarrier_init(mbar, count=1)
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.mbarrier_expect_tx(mbar, bytes=8)
         b.mbarrier_arrive(mbar)
         b.mbarrier_wait(mbar)
@@ -207,13 +214,18 @@ def test_protocol_blocked_mbar_wait_emits_completion_event():
     smem = smem_tensor(b, shape=(4,), byte_offset=0)
     mbar = b.mbar(kind=nr.MBarKind.TMA)
 
-    with b.kernel_init(warp=0):
+    # New model: the ISSUING thread (warp 1) arms expect_tx right before its own
+    # tma_load; warp 0 only waits. cta_sync publishes the per-thread init. The
+    # wait still blocks until the load's tx completes, which is what the
+    # completion-before-wait event ordering below pins.
+    with b.if_warp(0), b.if_elected():
         b.mbarrier_init(mbar, count=1)
-    with b.role(warp=0, elected=True):
-        b.mbarrier_arrive_expect_tx(mbar, bytes=16)
+    b.cta_sync()
+    with b.if_warp(0), b.if_elected():
         b.mbarrier_wait(mbar, phase=0)
-    with b.role(warp=1, elected=True):
+    with b.if_warp(1), b.if_elected():
         b.scalar(initial=0, dtype=nr.ScalarDType.I32)
+        b.mbarrier_arrive_expect_tx(mbar, bytes=16)
         b.tma_load(smem, source, mbar=mbar, bytes=16, coords=(0,), shape=(4,))
 
     report = nr.check_protocol(b.build(), include_events=True)
@@ -233,9 +245,10 @@ def test_protocol_payload_control_bridge_is_inconclusive():
     source = gmem_arg(b, shape=(1,))
     smem = smem_tensor(b, shape=(1,), byte_offset=0)
     mbar = b.mbar(kind=nr.MBarKind.TMA)
-    with b.kernel_init(warp=0):
+    # mbarrier.init is per-thread now: issue it from a single elected thread.
+    with b.if_warp(0), b.if_elected():
         b.mbarrier_init(mbar, count=1)
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.mbarrier_arrive_expect_tx(mbar, bytes=4)
         b.tma_load(smem, source, mbar=mbar, bytes=4, coords=(0,), shape=(1,))
         b.scalar(initial=smem[0], dtype=nr.ScalarDType.U32)
@@ -250,9 +263,10 @@ def test_protocol_skipped_bulk_write_invalidates_prior_scalar_cell():
     source = gmem_arg(b, shape=(1,))
     smem = smem_tensor(b, shape=(1,), byte_offset=0)
     mbar = b.mbar(kind=nr.MBarKind.TMA)
-    with b.kernel_init(warp=0):
+    # mbarrier.init is per-thread now: issue it from a single elected thread.
+    with b.if_warp(0), b.if_elected():
         b.mbarrier_init(mbar, count=1)
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.store_scalar(smem[0], 7)
         b.mbarrier_arrive_expect_tx(mbar, bytes=4)
         b.tma_load(smem, source, mbar=mbar, bytes=4, coords=(0,), shape=(1,))
@@ -295,11 +309,21 @@ def test_protocol_tmem_mma_layout_f_emits_union_boxes():
     b_s = smem_tensor(b, dtype=nr.DType.F16, shape=(n, k), byte_offset=a_bytes)
     dst = tmem_tensor(b, dtype=nr.DType.F32, shape=(m, n), col_start=0, lane_align=0)
 
-    with b.kernel_init(warp=0):
+    with b.if_warp(0):
         b.tmem_alloc(dst, n_cols=32)
-    with b.role(warpgroup=0):
+    # tcgen05_mma is a single-thread issue instruction now; issue it from warp
+    # 0's elected lane so alloc -> mma -> dealloc stay ordered on one stream.
+    done = b.mbar(kind=nr.MBarKind.TCGEN05)
+    with b.if_warp(0), b.if_elected():
+        b.mbarrier_init(done, count=1)
+    b.cta_sync()
+    with b.if_warp(0), b.if_elected():
         b.tcgen05_mma(dst, a_s, b_s, m=m, n=n, k=k, accum=False, cta_group=1)
-    with b.kernel_finalize(warp=0):
+        # The mma is async: commit hands it to a barrier and the wait is where
+        # it is observed to have landed — a band may not be freed before that.
+        b.tcgen05_commit(done, cta_group=1)
+    with b.if_warp(0):
+        b.mbarrier_wait(done, phase=0)
         b.tmem_dealloc(dst, n_cols=32)
 
     report = nr.check_protocol(b.build(), include_events=True)
@@ -322,17 +346,59 @@ def test_protocol_tmem_mma_layout_f_emits_union_boxes():
     ]
 
 
+def _tmem_teardown_kernel(*, drain: bool):
+    """One warp issues an mma into TMEM; another warp frees the band after a
+    cta_sync. The barrier orders the two instruction streams, but only the
+    commit's barrier says the mma has LANDED.
+    """
+    m, n, k = 64, 16, 16
+    a_bytes, b_bytes = m * k * 2, n * k * 2
+    b = builder("protocol_tmem_teardown", smem_size_bytes=a_bytes + b_bytes)
+    a_s = smem_tensor(b, dtype=nr.DType.F16, shape=(m, k), byte_offset=0)
+    b_s = smem_tensor(b, dtype=nr.DType.F16, shape=(n, k), byte_offset=a_bytes)
+    dst = tmem_tensor(b, dtype=nr.DType.F32, shape=(m, n), col_start=0, lane_align=0)
+    done = b.mbar(kind=nr.MBarKind.TCGEN05)
+    with b.if_warp(0):
+        b.tmem_alloc(dst, n_cols=32)
+        with b.if_elected():
+            b.mbarrier_init(done, count=1)
+    b.cta_sync()
+    with b.if_warp(0), b.if_elected():
+        b.tcgen05_mma(dst, a_s, b_s, m=m, n=n, k=k, accum=False, cta_group=1)
+        b.tcgen05_commit(done, cta_group=1)
+    if drain:
+        with b.if_warp(0):
+            b.mbarrier_wait(done, phase=0)
+    # Every stream's work is ordered before the free — but ordering an ISSUE
+    # is not draining an engine.
+    b.cta_sync()
+    with b.if_warp(0):
+        b.tmem_dealloc(dst, n_cols=32)
+    return b.build()
+
+
+def test_protocol_tmem_free_needs_the_drain_not_just_a_barrier():
+    report = nr.check_protocol(_tmem_teardown_kernel(drain=False))
+    assert report["status"] == "Failed"
+    assert "tmem_lifecycle_use_not_drained" in _diagnostic_codes(report), report["diagnostics"][:2]
+
+
+def test_protocol_tmem_free_after_the_commit_is_awaited_passes():
+    report = nr.check_protocol(_tmem_teardown_kernel(drain=True))
+    assert report["status"] == "Passed", report["diagnostics"][:2]
+
+
 def test_protocol_tmem_async_overlap_fails_before_wait():
     b = builder("protocol_tmem_async_overlap")
     tmem = tmem_tensor(b, dtype=nr.DType.F32, shape=(128, 32), col_start=0)
     reg = reg_tensor(b, dtype=nr.DType.F32, shape=(1,))
 
-    with b.kernel_init(warp=0):
+    with b.if_warp(0):
         b.tmem_alloc(tmem, n_cols=32)
-    with b.role(warp=0):
+    with b.if_warp(0):
         b.tcgen05_st(tmem, reg, shape="32x32b", num=1, row=0, col=0)
         b.tcgen05_st(tmem, reg, shape="32x32b", num=1, row=0, col=0)
-    with b.kernel_finalize(warp=0):
+    with b.if_warp(0):
         b.tmem_dealloc(tmem, n_cols=32)
 
     report = nr.check_protocol(b.build())
@@ -345,13 +411,17 @@ def test_protocol_proxy_fence_missing_fails():
     source = smem_tensor(b, shape=(1,), byte_offset=0)
     out = gmem_arg(b, shape=(1,))
 
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.store_scalar(source[0], 1)
         b.tma_store(out, source, coords=(0,), shape=(1,))
 
+    # An elected lane's store is ordered before its own tma_store by program
+    # order, yet the ENGINE performing the store never received the bytes:
+    # cross-proxy visibility is a second obligation on top of the ordering,
+    # and the race walk checks both against the same clocks.
     report = nr.check_protocol(b.build())
     assert report["status"] == "Failed"
-    assert _pass_status(report, "proxy_fence") == "Failed"
+    assert _pass_status(report, "memory_race_check") == "Failed"
     assert "proxy_fence_missing" in _diagnostic_codes(report)
 
 
@@ -360,14 +430,73 @@ def test_protocol_proxy_fence_present_passes():
     source = smem_tensor(b, shape=(1,), byte_offset=0)
     out = gmem_arg(b, shape=(1,))
 
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         b.store_scalar(source[0], 1)
         b.fence(kind=nr.FenceKind.ASYNC_PROXY, scope=nr.FenceScope.CTA)
         b.tma_store(out, source, coords=(0,), shape=(1,))
 
+    # The fencing lane publishes its own prior store into the engines, so the
+    # tma_store it then issues observes the bytes.
     report = nr.check_protocol(b.build())
     assert report["status"] == "Passed"
-    assert _pass_status(report, "proxy_fence") == "Passed"
+    assert _pass_status(report, "memory_race_check") == "Passed"
+
+
+def _cross_warp_proxy_kernel(*, fence: str):
+    """Warp 0 stores to SMEM, a cta_sync orders the two warps, warp 1 issues
+    the tma_store that reads those bytes. `fence` picks who publishes them
+    across the proxy boundary: nobody, the warp that cannot see them, or the
+    issuing warp (which the barrier gave the store to).
+    """
+    b = builder(f"protocol_proxy_cross_warp_{fence}", smem_size_bytes=4)
+    source = smem_tensor(b, shape=(1,), byte_offset=0)
+    out = gmem_arg(b, shape=(1,))
+    with b.if_warp(0), b.if_elected():
+        b.store_scalar(source[0], 1)
+        if fence == "unfenced_writer_only":
+            # Warp 0 does fence, but AFTER the barrier warp 1 rides; see below.
+            pass
+    b.cta_sync()
+    with b.if_warp(1), b.if_elected():
+        if fence == "issuer":
+            b.fence(kind=nr.FenceKind.ASYNC_PROXY, scope=nr.FenceScope.CTA)
+        b.tma_store(out, source, coords=(0,), shape=(1,))
+    return b.build()
+
+
+def test_protocol_proxy_fence_missing_across_warps_fails():
+    # ORDERED but UNPUBLISHED: the cta_sync gives the tma_store a
+    # happens-before edge from warp 0's store, and the engine still cannot see
+    # the bytes because no thread ever fenced. Ordering does not substitute for
+    # crossing the proxy boundary.
+    report = nr.check_protocol(_cross_warp_proxy_kernel(fence="none"))
+    assert report["status"] == "Failed"
+    assert "proxy_fence_missing" in _diagnostic_codes(report), report["diagnostics"][:2]
+
+
+def test_protocol_proxy_fence_by_the_issuing_warp_publishes_a_peer_store():
+    # The cta_sync put warp 0's store into warp 1's view, so warp 1's fence
+    # carries it across for the engine warp 1 then issues to.
+    report = nr.check_protocol(_cross_warp_proxy_kernel(fence="issuer"))
+    assert report["status"] == "Passed", report["diagnostics"][:2]
+
+
+def test_protocol_proxy_fence_by_a_warp_that_never_saw_the_store_fails():
+    # A fence publishes the EXECUTING thread's view. Warp 1 fences with nothing
+    # having carried warp 0's store to it, then warp 0 itself issues the
+    # tma_store: warp 0 is ordered against its own store by program order, but
+    # no fence of its own ever published the bytes.
+    b = builder("protocol_proxy_foreign_fence", smem_size_bytes=4)
+    source = smem_tensor(b, shape=(1,), byte_offset=0)
+    out = gmem_arg(b, shape=(1,))
+    with b.if_warp(1), b.if_elected():
+        b.fence(kind=nr.FenceKind.ASYNC_PROXY, scope=nr.FenceScope.CTA)
+    with b.if_warp(0), b.if_elected():
+        b.store_scalar(source[0], 1)
+        b.tma_store(out, source, coords=(0,), shape=(1,))
+    report = nr.check_protocol(b.build())
+    assert report["status"] == "Failed"
+    assert "proxy_fence_missing" in _diagnostic_codes(report), report["diagnostics"][:2]
 
 
 def test_protocol_trace_emits_proxy_fence_group_and_sync_metadata():
@@ -375,15 +504,19 @@ def test_protocol_trace_emits_proxy_fence_group_and_sync_metadata():
     source = smem_tensor(b, shape=(128,), byte_offset=0)
     out = gmem_arg(b, shape=(128,))
 
-    with b.role(warpgroup=0):
+    # New model: all 128 threads write, the wg_sync publishes the writes to the
+    # elected issuing thread, and the single-thread tail (fences, group ops,
+    # tma_store) runs after it — tma_store is a single-thread issue instruction.
+    with b.if_warpgroup(0):
         b.store_scalar(source[b.tid_in_wg()], b.tid_in_wg())
-        b.fence(kind=nr.FenceKind.ASYNC_PROXY, scope=nr.FenceScope.CTA)
-        b.fence(kind=nr.FenceKind.ASYNC_PROXY, scope=nr.FenceScope.CLUSTER)
-        b.fence(kind=nr.FenceKind.MEMORY, scope=nr.FenceScope.GPU)
-        b.cp_async_bulk_commit_group()
-        b.cp_async_bulk_wait_group_read()
-        b.tma_store(out, source, coords=(0,), shape=(128,))
         b.wg_sync(barrier_id=7)
+        with b.if_(b.tid_in_wg().eq(0)):
+            b.fence(kind=nr.FenceKind.ASYNC_PROXY, scope=nr.FenceScope.CTA)
+            b.fence(kind=nr.FenceKind.ASYNC_PROXY, scope=nr.FenceScope.CLUSTER)
+            b.fence(kind=nr.FenceKind.MEMORY, scope=nr.FenceScope.GPU)
+            b.cp_async_bulk_commit_group()
+            b.cp_async_bulk_wait_group_read()
+            b.tma_store(out, source, coords=(0,), shape=(128,))
 
     report = nr.check_protocol(b.build(), include_events=True)
     assert report["status"] == "Passed"
@@ -399,18 +532,23 @@ def test_protocol_trace_emits_proxy_fence_group_and_sync_metadata():
     assert _events(report, "commit_group")
     assert _events(report, "wait_group")[0]["n"] == 0
 
-    sync_arrive = _events(report, "sync_arrive")[0]
-    assert sync_arrive["sync_kind"] == "warpgroup"
-    assert sync_arrive["bar_id"] == 7
-    assert sync_arrive["thread_count"] == 128
-    assert sync_arrive["count"] == 128
-    assert sync_arrive["cycle"] == 0
+    # Each of the 4 per-warp streams logs its own SyncArrive passage with a
+    # cumulative count (32, 64, 96, 128); blocked streams may re-log count=128
+    # at wake-up, so assert the cumulative ladder as a subset.
+    sync_arrives = _events(report, "sync_arrive")
+    assert all(a["sync_kind"] == "warpgroup" for a in sync_arrives)
+    assert all(a["bar_id"] == 7 for a in sync_arrives)
+    assert all(a["thread_count"] == 128 for a in sync_arrives)
+    assert all(a["cycle"] == 0 for a in sync_arrives)
+    assert {a["count"] for a in sync_arrives} >= {32, 64, 96, 128}
 
-    sync = _events(report, "sync")[0]
-    assert sync["sync_kind"] == "warpgroup"
-    assert sync["bar_id"] == 7
-    assert sync["thread_count"] == 128
-    assert sync["cycle"] == sync_arrive["cycle"]
+    # one Sync completion per warp stream: 1 wg_sync x 4 warp streams
+    syncs = _events(report, "sync")
+    assert len(syncs) == 4
+    assert all(s["sync_kind"] == "warpgroup" for s in syncs)
+    assert all(s["bar_id"] == 7 for s in syncs)
+    assert all(s["thread_count"] == 128 for s in syncs)
+    assert all(s["cycle"] == 0 for s in syncs)
 
     assert any(
         event["proxy"] == "async"
@@ -426,7 +564,7 @@ def test_oob_tensor_slice_caught_in_value_and_trace():
     source = gmem_arg(b, shape=(2,))
     out = gmem_arg(b, shape=(1,))
     reg = reg_tensor(b, shape=(1,))
-    with b.role(warp=0, elected=True):
+    with b.if_warp(0), b.if_elected():
         idx = b.scalar(initial=3, dtype=nr.ScalarDType.I32)
         b.reg_load(reg[0], source[idx])
         b.reg_store(out[0], reg[0])
@@ -439,3 +577,28 @@ def test_oob_tensor_slice_caught_in_value_and_trace():
     report = nr.check_protocol(kernel)
     assert report["status"] == "Failed"
     assert "tensor_value" in {d["code"] for d in report["diagnostics"]}
+
+
+def test_unknown_filter_sync_scope_warns():
+    # A sync reached under a runtime-valued predicate has an Unknown static
+    # filter, so the shape rules stand down and only the runtime rendezvous
+    # verifies its scope. This warning surfaces that. Using v.eq(0) with v == 0
+    # keeps every thread in the branch, so the cta_sync completes (Passed) and
+    # the test isolates the warning rather than a masked deadlock.
+    b = builder("unknown_filter_sync")
+    v = b.scalar(initial=0)
+    with b.if_(v.eq(0)):
+        b.cta_sync()
+    report = nr.check_protocol(b.build())
+    assert report["status"] == "Passed", report["diagnostics"]
+    assert "unknown_filter_sync" in {w["code"] for w in report["warnings"]}
+
+
+def test_static_branch_sync_is_not_flagged():
+    # A statically-resolved branch has a Known filter; the shape rules verify
+    # the scope and no warning is emitted.
+    b = builder("static_branch_sync")
+    with b.if_(1):
+        b.cta_sync()
+    report = nr.check_protocol(b.build())
+    assert "unknown_filter_sync" not in {w["code"] for w in report["warnings"]}

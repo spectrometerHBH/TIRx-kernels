@@ -207,6 +207,104 @@ pub fn tensor_rect_region_clamped(
     Ok(Some(non_empty_region(owner, boxes, tensor.id)?))
 }
 
+/// Per-lane attribution of an access footprint (SMEM byte runs or TMEM
+/// `(lane, lane_byte)` boxes), PRE-coalescing across threads: one
+/// `(lane_id, box)` entry per contiguous run of each thread's slice.
+///
+/// Returns `None` (no attribution, meaning "every executing lane touches the
+/// whole region") for uniform-address multi-lane masks, non-shared spaces,
+/// and any row shape the exact projection cannot attribute. Single-thread
+/// masks are attributed to their single lane. Callers attach the result to
+/// a region built by the union builders, AFTER those validated bounds.
+pub fn lane_attributed_boxes(
+    tensor: &Arc<Tensor>,
+    offsets: &[Vec<i64>],
+    shape: &[usize],
+    lanes: &[u8],
+) -> Option<Vec<(u8, BoxN)>> {
+    if lanes.len() != offsets.len() || offsets.is_empty() {
+        return None;
+    }
+    if offsets.len() > 1 && offsets.iter().all(|row| row == &offsets[0]) {
+        return None; // uniform multi-lane lanes
+    }
+    let rank = tensor.shape.len();
+    if rank == 0 || shape.len() != rank || offsets.iter().any(|row| row.len() != rank) {
+        return None;
+    }
+    match tensor.space {
+        MemorySpace::Tmem => {
+            let mut out = Vec::with_capacity(offsets.len());
+            for (row, &lane) in offsets.iter().zip(lanes) {
+                out.push((lane, tmem_logical_box(tensor, row, shape).ok()?));
+            }
+            Some(out)
+        }
+        MemorySpace::Smem => {
+            let base = tensor.byte_offset?;
+            let elem_size = dtype_size_bytes(tensor.dtype);
+            if shape.iter().any(|&d| d == 0) {
+                return None;
+            }
+            let mut strides = vec![1usize; rank];
+            for i in (0..rank - 1).rev() {
+                strides[i] = strides[i + 1] * tensor.shape[i + 1];
+            }
+            // Trailing dims the slice covers fully fold into one run (same
+            // decomposition as `rect_region_boxes`).
+            let mut split = rank - 1;
+            while split > 0 && shape[split] == tensor.shape[split] {
+                split -= 1;
+            }
+            let run_bytes = shape[split] * strides[split] * elem_size;
+            let outer = &shape[..split];
+            let n_runs: usize = outer.iter().product();
+            let mut out = Vec::with_capacity(offsets.len());
+            for (row, &lane) in offsets.iter().zip(lanes) {
+                let mut corner = 0usize;
+                for d in 0..rank {
+                    // Bounds were validated by the union builder / eval_slice.
+                    corner += usize::try_from(row[d]).ok()? * strides[d];
+                }
+                // Odometer over the outer dims: starts ascend (row-major
+                // strides), so touching runs coalesce with a single compare.
+                let mut idx = vec![0usize; split];
+                let mut last: Option<(usize, usize)> = None;
+                for _ in 0..n_runs {
+                    let rel: usize = idx
+                        .iter()
+                        .zip(&strides[..split])
+                        .map(|(&i, &st)| i * st)
+                        .sum();
+                    let start = base + (corner + rel) * elem_size;
+                    let end = start + run_bytes;
+                    match &mut last {
+                        Some((_, le)) if start <= *le => *le = (*le).max(end),
+                        _ => {
+                            if let Some((ls, le)) = last.take() {
+                                out.push((lane, BoxN::new(vec![(ls, le)])));
+                            }
+                            last = Some((start, end));
+                        }
+                    }
+                    for d in (0..split).rev() {
+                        idx[d] += 1;
+                        if idx[d] < outer[d] {
+                            break;
+                        }
+                        idx[d] = 0;
+                    }
+                }
+                if let Some((ls, le)) = last {
+                    out.push((lane, BoxN::new(vec![(ls, le)])));
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
 pub fn tensor_region_from_offsets(
     tensor: &Arc<Tensor>,
     cta_id: usize,
@@ -588,6 +686,28 @@ pub fn box_covers(left: &BoxN, right: &BoxN) -> bool {
             .iter()
             .zip(&right.ranges)
             .all(|(&(ls, le), &(rs, re))| ls <= rs && re <= le)
+}
+
+/// One box vs a region's whole byte set — the per-lane refinement of
+/// `regions_overlap` (a lane's attributed box against the other side's
+/// footprint). A rank mismatch against a strided set has no refinement and
+/// keeps the pair conflicting.
+pub fn box_overlaps_region(bx: &BoxN, region: &Region) -> bool {
+    match &region.boxes {
+        RegionBoxes::Boxes(boxes) => boxes.iter().any(|b| boxes_overlap(bx, b)),
+        RegionBoxes::Strided {
+            start,
+            len,
+            stride,
+            count,
+        } => {
+            if bx.ranges.len() != 1 {
+                return true;
+            }
+            let (bs, be) = bx.ranges[0];
+            strided_box_intersect((*start, *len, *stride, *count), (bs, be))
+        }
+    }
 }
 
 fn tensor_byte_region(
@@ -1146,7 +1266,98 @@ fn non_empty_region(owner: PoolId, boxes: RegionBoxes, tensor_id: u32) -> IResul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{DType, Layout, TmemLayout};
+    use crate::ir::{DType, Layout, SmemSwizzleLayout, Swizzle, TmemLayout};
+
+    #[test]
+    fn lane_attribution_reproduces_each_lane_footprint() {
+        // Every lane's attributed boxes must be EXACTLY the footprint the union
+        // builder produces for that lane's offset alone: attribution decides
+        // which cross-lane pairs are races, so it has to be projection-exact.
+        let smem = |shape: Vec<usize>, byte_offset: usize| {
+            Arc::new(Tensor {
+                id: 1,
+                space: MemorySpace::Smem,
+                dtype: DType::U32,
+                shape,
+                layout: Some(Layout::Swizzle(SmemSwizzleLayout {
+                    swizzle: Swizzle::None,
+                })),
+                byte_offset: Some(byte_offset),
+            })
+        };
+        let cases: Vec<(Arc<Tensor>, Vec<Vec<i64>>, Vec<usize>)> = vec![
+            // rank-1 cells, one per lane
+            (
+                smem(vec![32], 0),
+                (0..32).map(|l| vec![l as i64]).collect(),
+                vec![1],
+            ),
+            // rank-2 full rows (one contiguous run per lane)
+            (
+                smem(vec![16, 8], 64),
+                (0..16).map(|l| vec![l as i64, 0]).collect(),
+                vec![1, 8],
+            ),
+            // rank-2 partial rows (run narrower than the tensor row)
+            (
+                smem(vec![8, 16], 0),
+                (0..8).map(|l| vec![l as i64, 4]).collect(),
+                vec![1, 4],
+            ),
+            // rank-2 multi-row slice per lane: several runs, one per outer index
+            (
+                smem(vec![16, 16], 32),
+                (0..4).map(|l| vec![4 * l as i64, 2]).collect(),
+                vec![3, 5],
+            ),
+            // rank-3, trailing dims fully covered -> runs fold together
+            (
+                smem(vec![8, 4, 4], 0),
+                (0..8).map(|l| vec![l as i64, 0, 0]).collect(),
+                vec![1, 4, 4],
+            ),
+        ];
+        for (tensor, offsets, shape) in cases {
+            let lanes: Vec<u8> = (0..offsets.len() as u8).collect();
+            let attributed = lane_attributed_boxes(&tensor, &offsets, &shape, &lanes)
+                .expect("lane-divergent offsets must attribute");
+            for (lane, offset) in offsets.iter().enumerate() {
+                let mine: Vec<BoxN> = attributed
+                    .iter()
+                    .filter(|(l, _)| *l as usize == lane)
+                    .map(|(_, b)| b.clone())
+                    .collect();
+                let expected =
+                    tensor_region_from_offsets(&tensor, 0, std::slice::from_ref(offset), &shape)
+                        .expect("union projection")
+                        .boxes
+                        .to_boxes();
+                assert_eq!(mine, expected, "lane {lane} of {:?}", tensor.shape);
+            }
+        }
+    }
+
+    #[test]
+    fn lane_attribution_declines_uniform_multi_lane_masks() {
+        let tensor = Arc::new(Tensor {
+            id: 1,
+            space: MemorySpace::Smem,
+            dtype: DType::U32,
+            shape: vec![8],
+            layout: Some(Layout::Swizzle(SmemSwizzleLayout {
+                swizzle: Swizzle::None,
+            })),
+            byte_offset: Some(0),
+        });
+        // Every lane at the same address: the region is uniform, so no lane
+        // owns a part of it.
+        let offsets: Vec<Vec<i64>> = vec![vec![2]; 32];
+        let lanes: Vec<u8> = (0..32).collect();
+        assert!(lane_attributed_boxes(&tensor, &offsets, &[1], &lanes).is_none());
+        // A single executing lane is attributed to that lane.
+        let single = lane_attributed_boxes(&tensor, &[vec![2]], &[1], &[7]).expect("single lane");
+        assert_eq!(single, vec![(7u8, BoxN::new(vec![(8, 12)]))]);
+    }
 
     #[test]
     fn same_owner_regions_overlap() {

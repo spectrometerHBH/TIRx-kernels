@@ -40,6 +40,7 @@ Region {
     owner: PoolId,
     boxes: Vec<BoxN>,
     tensor_id: u32,
+    lane_boxes: Option<Vec<(u8, BoxN)>>,
 }
 
 BoxN {
@@ -56,6 +57,14 @@ PoolId =
 `tensor_id` is diagnostic metadata. Alias identity is `owner + boxes`; two
 regions alias only when their `PoolId` values match and their boxes overlap.
 
+`lane_boxes` attributes the footprint to the warp lanes that touched it, before
+`boxes` merges them: one `(lane, box)` entry per contiguous run of each lane's
+slice. It is carried for lane-divergent SMEM/TMEM accesses (offsets that vary
+with `lane_id` / `tid_in_wg` / a per-thread scalar) and for single-lane
+masks. `None` means the access is uniform: every executing lane touches the
+whole region. `memory_race_check` reads it to tell a lane's dependency on
+itself from a dependency across lanes.
+
 Region validation rules:
 
 - `boxes` must be non-empty.
@@ -64,8 +73,8 @@ Region validation rules:
 - TMEM regions are rank-2 boxes in `(lane, lane_byte)`;
 - every range uses `start < end` and must be inside the owner pool bounds.
 
-There are no separate alternate region variants. A sparse access is represented
-as `Vec<BoxN>`, with unit boxes for individual points.
+One region type covers dense and sparse alike: a sparse access is a
+`Vec<BoxN>` with unit boxes for individual points.
 
 TMEM columns are 32-bit cells in the IR, but trace regions store lane bytes:
 `col` maps to `col * 4`. For example, columns `[8, 16)` become lane-byte range
@@ -95,7 +104,7 @@ lanes.
 Every event carries `stmt_id` and `stmt_kind`.
 
 Every `scope` carries `stream_id`, `cluster_id`, global `cta_id`,
-`ctaid_in_cluster`, `cohort_size`, and participating `warp_ids`. Mbar targets
+`ctaid_in_cluster`, `lane_count`, and the executing `warp_id`. Mbar targets
 carry `mbar_id`, `cluster_id`, `ctaid_in_cluster`, and `stage`; the checker uses
 the full identity for HB/deadlock resource keys.
 
@@ -163,14 +172,15 @@ Typical memory event shape:
         "tensor_id": 7,
         "owner": {"kind": "smem", "cta_id": 0},
         "boxes": [{"ranges": [(0, 8192)]}],
+        "lane_boxes": None,
     },
     "scope": {
         "stream_id": 0,
         "cluster_id": 0,
         "cta_id": 0,
         "ctaid_in_cluster": 0,
-        "cohort_size": 32,
-        "warp_ids": [0],
+        "lane_count": 32,
+        "warp_id": 0,
     },
 }
 ```

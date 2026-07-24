@@ -84,6 +84,16 @@ def test_fp8_blockwise_gemm_builds_supported_configs():
         assert len(kernel.args) == 5
 
 
+def test_fp8_blockwise_gemm_protocol_bench_shapes_resident_tier():
+    # Resident protocol tier for the TIRx bench shapes beyond the SUPPORTED
+    # list: 4096^3 (~6 s) and 8192^3 (~25 s). 16384^3 protocol-checks Passed
+    # too but takes ~3.5 min, so it stays a one-off verification (recorded in
+    # the PR), not resident.
+    for s in (4096, 8192):
+        kernel = build_fp8_blockwise_gemm(Fp8BlockwiseGemmConfig(m=s, n=s, k=s, launch_shape=(2,)))
+        assert nr.check_protocol(kernel)["status"] == "Passed", s
+
+
 def test_fp8_blockwise_gemm_builds_all_tirx_configs():
     # Every TIRx CONFIGS shape resolves and builds — including the partial-tile
     # squares (TMA tensormap OOB clamping) and the odd-EPI 8192^3 tiling.

@@ -5,7 +5,7 @@
 //! edited to add an op. (Rust needs an explicit `StmtKind` discriminant table in
 //! place of Python's type→handler dict, but the decoupling is the same.)
 
-use super::cohort::StmtExecutor;
+use super::warp_context::StmtExecutor;
 use crate::ir::Stmt;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -17,9 +17,6 @@ pub enum StmtKind {
     ScalarStore,
     StoreScalar,
     MBarDef,
-    KernelInit,
-    KernelFinalize,
-    Role,
     ForLoop,
     ForEachTask,
     SchedulerImpl,
@@ -27,6 +24,7 @@ pub enum StmtKind {
     Loop,
     BreakIf,
     If,
+    SetMaxNReg,
     MBarrierInit,
     MBarrierArrive,
     MBarrierWait,
@@ -34,6 +32,9 @@ pub enum StmtKind {
     MBarrierArriveExpectTx,
     TmaLoad,
     TmaStore,
+    CpAsyncBulkS2Cluster,
+    GmemAtomicAdd,
+    GmemWaitEq,
     CpAsyncBulkCommitGroup,
     CpAsyncBulkWaitGroupRead,
     Tcgen05Mma,
@@ -45,6 +46,7 @@ pub enum StmtKind {
     Tcgen05WaitSt,
     LdMatrix,
     StMatrix,
+    WarpMma,
     RegFill,
     RegUnary,
     RegAdd,
@@ -65,6 +67,7 @@ pub enum StmtKind {
     Fence,
     CtaSync,
     WgSync,
+    NamedBarrier,
     WarpSync,
     ClusterSync,
 }
@@ -78,9 +81,6 @@ pub fn stmt_kind(stmt: &Stmt) -> StmtKind {
         Stmt::ScalarStore { .. } => StmtKind::ScalarStore,
         Stmt::StoreScalar { .. } => StmtKind::StoreScalar,
         Stmt::MBarDef { .. } => StmtKind::MBarDef,
-        Stmt::KernelInit { .. } => StmtKind::KernelInit,
-        Stmt::KernelFinalize { .. } => StmtKind::KernelFinalize,
-        Stmt::Role { .. } => StmtKind::Role,
         Stmt::ForLoop { .. } => StmtKind::ForLoop,
         Stmt::ForEachTask { .. } => StmtKind::ForEachTask,
         Stmt::SchedulerImpl { .. } => StmtKind::SchedulerImpl,
@@ -88,6 +88,7 @@ pub fn stmt_kind(stmt: &Stmt) -> StmtKind {
         Stmt::Loop { .. } => StmtKind::Loop,
         Stmt::BreakIf { .. } => StmtKind::BreakIf,
         Stmt::If { .. } => StmtKind::If,
+        Stmt::SetMaxNReg { .. } => StmtKind::SetMaxNReg,
         Stmt::MBarrierInit { .. } => StmtKind::MBarrierInit,
         Stmt::MBarrierArrive { .. } => StmtKind::MBarrierArrive,
         Stmt::MBarrierWait { .. } => StmtKind::MBarrierWait,
@@ -95,6 +96,9 @@ pub fn stmt_kind(stmt: &Stmt) -> StmtKind {
         Stmt::MBarrierArriveExpectTx { .. } => StmtKind::MBarrierArriveExpectTx,
         Stmt::TmaLoad { .. } => StmtKind::TmaLoad,
         Stmt::TmaStore { .. } => StmtKind::TmaStore,
+        Stmt::CpAsyncBulkS2Cluster { .. } => StmtKind::CpAsyncBulkS2Cluster,
+        Stmt::GmemAtomicAdd { .. } => StmtKind::GmemAtomicAdd,
+        Stmt::GmemWaitEq { .. } => StmtKind::GmemWaitEq,
         Stmt::CpAsyncBulkCommitGroup => StmtKind::CpAsyncBulkCommitGroup,
         Stmt::CpAsyncBulkWaitGroupRead { .. } => StmtKind::CpAsyncBulkWaitGroupRead,
         Stmt::Tcgen05Mma { .. } => StmtKind::Tcgen05Mma,
@@ -106,6 +110,7 @@ pub fn stmt_kind(stmt: &Stmt) -> StmtKind {
         Stmt::Tcgen05WaitSt => StmtKind::Tcgen05WaitSt,
         Stmt::LdMatrix { .. } => StmtKind::LdMatrix,
         Stmt::StMatrix { .. } => StmtKind::StMatrix,
+        Stmt::WarpMma { .. } => StmtKind::WarpMma,
         Stmt::RegFill { .. } => StmtKind::RegFill,
         Stmt::RegUnary { .. } => StmtKind::RegUnary,
         Stmt::RegAdd { .. } => StmtKind::RegAdd,
@@ -126,6 +131,7 @@ pub fn stmt_kind(stmt: &Stmt) -> StmtKind {
         Stmt::Fence { .. } => StmtKind::Fence,
         Stmt::CtaSync => StmtKind::CtaSync,
         Stmt::WgSync { .. } => StmtKind::WgSync,
+        Stmt::NamedBarrier { .. } => StmtKind::NamedBarrier,
         Stmt::WarpSync => StmtKind::WarpSync,
         Stmt::ClusterSync => StmtKind::ClusterSync,
     }

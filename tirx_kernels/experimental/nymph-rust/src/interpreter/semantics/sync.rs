@@ -1,237 +1,47 @@
-//! Cooperative rendezvous — port of `semantics/sync.py`. CtaSync/WgSync/WarpSync/
-//! ClusterSync block until the whole scope arrives — `Block(Polled)`, re-run each
-//! round. The arrival/completion writes are direct; re-running is naturally
-//! idempotent (the arrival is a set union, completion is gated on `==expected`).
+//! Cooperative rendezvous — CtaSync / WgSync / NamedBarrier / WarpSync /
+//! ClusterSync.
+//!
+//! Per-warp streams arrive independently; the record in
+//! `state.values.cooperative` accumulates STREAM-granular arrival counts and
+//! every participant passes once the count reaches the scope size. Blocked
+//! streams are `Block(Polled)` and re-run each round, but a re-poll is a hash
+//! lookup + integer compare (no set algebra, no allocation) — the poll loop
+//! stays cheap even when many streams idle at a teardown barrier for
+//! thousands of rounds. Trace: one `SyncArrive` per arriving stream (the
+//! completing one carries count == thread_count) and one `Sync` per passing
+//! stream — no re-poll echoes.
 
-use super::super::cohort::CohortContext;
 use super::super::diagnostics::{IResult, InterpreterError};
 use super::super::outcomes::{StepStatus, WakeCondition};
 use super::super::protocol::TraceEventKind;
 use super::super::registry::{StmtExecutorRegistry, StmtKind};
 use super::super::scheduler::{flatten_coord, unflatten_coord, CtaActivityStatus};
-use super::super::threads::{canonical_thread_mask, ThreadId, ThreadMask};
+use super::super::threads::ThreadId;
+use super::super::values::cooperative::{SyncKey, SyncRecord};
+use super::super::warp_context::WarpContext;
 use crate::ir::Stmt;
-use std::collections::HashSet;
 
 pub fn register(reg: &mut StmtExecutorRegistry) {
     reg.register(StmtKind::CtaSync, execute_sync);
     reg.register(StmtKind::WgSync, execute_sync);
+    reg.register(StmtKind::NamedBarrier, execute_sync);
     reg.register(StmtKind::WarpSync, execute_sync);
     reg.register(StmtKind::ClusterSync, execute_sync);
 }
 
-fn cta_threads(template: &ThreadId, warp_ids: &[usize]) -> ThreadMask {
-    let mut threads = Vec::new();
-    for &w in warp_ids {
-        for lane in 0..32 {
-            threads.push(ThreadId {
-                warp_id: w,
-                lane_id: lane,
-                ..*template
-            });
-        }
-    }
-    canonical_thread_mask(threads)
-}
-
-fn cluster_threads(ctx: &CohortContext, template: &ThreadId) -> ThreadMask {
-    let cluster = &ctx.kernel.cluster_shape;
-    let launch = &ctx.kernel.launch_shape;
-    let cluster_grid: Vec<usize> = launch
-        .iter()
-        .zip(cluster.iter())
-        .map(|(l, c)| l / c)
-        .collect();
-    let num_warps = ctx.kernel.num_warps as usize;
-    let mut threads = Vec::new();
-    for ctaid_in_cluster in 0..ctx.cluster_cta_count() {
-        let local = unflatten_coord(ctaid_in_cluster, cluster);
-        let cta_coord: Vec<usize> = cluster
-            .iter()
-            .zip(template.cluster_coord.as_slice().iter())
-            .zip(local.iter())
-            .map(|((cl, cc), l)| cl * cc + l)
-            .collect();
-        let cta_id = flatten_coord(&cta_coord, launch);
-        let cluster_id = flatten_coord(template.cluster_coord.as_slice(), &cluster_grid);
-        let cta_coord_c = super::super::threads::Coord::from_slice(&cta_coord);
-        let local_c = super::super::threads::Coord::from_slice(&local);
-        for w in 0..num_warps {
-            for lane in 0..32 {
-                threads.push(ThreadId {
-                    cta_id,
-                    cta_coord: cta_coord_c,
-                    cluster_id,
-                    ctaid_in_cluster,
-                    cluster_coord: template.cluster_coord,
-                    cta_coord_in_cluster: local_c,
-                    warp_id: w,
-                    lane_id: lane,
-                });
-            }
-        }
-    }
-    canonical_thread_mask(threads)
-}
-
-fn expected_threads(ctx: &CohortContext, stmt: &Stmt) -> ThreadMask {
-    let first = &ctx.cohort[0];
-    let num_warps = ctx.kernel.num_warps as usize;
-    match stmt {
-        Stmt::ClusterSync => cluster_threads(ctx, first),
-        Stmt::CtaSync => cta_threads(first, &(0..num_warps).collect::<Vec<_>>()),
-        Stmt::WgSync { .. } => {
-            let base = first.warpgroup_id() * 4;
-            cta_threads(first, &(base..base + 4).collect::<Vec<_>>())
-        }
-        Stmt::WarpSync => {
-            let mut warps: Vec<usize> = ctx.cohort.iter().map(|t| t.warp_id).collect();
-            warps.sort_unstable();
-            warps.dedup();
-            cta_threads(first, &warps)
-        }
-        _ => unreachable!(),
-    }
-}
-
-fn sync_key(ctx: &CohortContext, stmt: &Stmt, stmt_id: usize) -> String {
-    let first = &ctx.cohort[0];
-    match stmt {
-        Stmt::ClusterSync => format!("cluster_sync:{stmt_id}:cluster{}", first.cluster_id),
-        Stmt::CtaSync => format!("cta_sync:{stmt_id}:cta{}", first.cta_id),
-        Stmt::WgSync { barrier_id } => {
-            format!(
-                "wg_sync:{stmt_id}:cta{}:wg{}:bar{}",
-                first.cta_id,
-                first.warpgroup_id(),
-                barrier_id
-            )
-        }
-        Stmt::WarpSync => {
-            let mut warps: Vec<usize> = ctx.cohort.iter().map(|t| t.warp_id).collect();
-            warps.sort_unstable();
-            warps.dedup();
-            let joined = warps
-                .iter()
-                .map(|w| w.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("warp_sync:{stmt_id}:cta{}:warps{joined}", first.cta_id)
-        }
-        _ => unreachable!(),
-    }
-}
-
-fn execute_sync<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
-    let stmt_id = ctx.stmt_id(stmt);
-    let expected: HashSet<ThreadId> = expected_threads(ctx, stmt).into_iter().collect();
-    let arriving: HashSet<ThreadId> = ctx.cohort.iter().cloned().collect();
-    if !arriving.is_subset(&expected) {
-        return Err(InterpreterError::new(
-            "invalid_sync_scope",
-            "sync cohort is outside the sync scope",
-        ));
-    }
-    let key = sync_key(ctx, stmt, stmt_id);
-    let cycle = ctx
-        .state
-        .values
-        .cooperative
-        .sync_cycles
-        .get(&key)
-        .copied()
-        .unwrap_or(0);
-    let arrived: HashSet<ThreadId> = ctx
-        .state
-        .values
-        .cooperative
-        .syncs
-        .get(&key)
-        .cloned()
-        .unwrap_or_default();
-    let completed: HashSet<ThreadId> = ctx
-        .state
-        .values
-        .cooperative
-        .rendezvous
-        .get(&key)
-        .cloned()
-        .unwrap_or_default();
-
-    if !arriving.is_disjoint(&completed) {
-        return Err(InterpreterError::new(
-            "cooperative_sync_reentry",
-            "thread re-entered a completed sync",
-        ));
-    }
-    let merged: HashSet<ThreadId> = arrived.union(&arriving).cloned().collect();
-    if !merged.is_subset(&expected) {
-        return Err(InterpreterError::new(
-            "cooperative_sync_mismatch",
-            "sync arrival set exceeds scope",
-        ));
-    }
-    if ctx.trace_mode() {
-        ctx.emit(TraceEventKind::SyncArrive {
-            sync_kind: sync_kind(stmt).to_string(),
-            thread_count: expected.len(),
-            count: merged.len(),
-            cycle,
-            bar_id: sync_bar_id(stmt),
-            scope: ctx.access_scope(),
-        })?;
-    }
-
-    if matches!(stmt, Stmt::ClusterSync) {
-        check_cluster_peer_liveness(ctx, &expected, &merged)?;
-    }
-
-    if merged != expected {
-        // record this cohort's arrival (idempotent set union) and re-poll next round
-        ctx.state.values.cooperative.syncs.insert(key, merged);
-        return Ok(StepStatus::block(WakeCondition::Polled));
-    }
-
-    // all arrived → complete: move this cohort into the rendezvous; the last one
-    // (completed == expected) clears both records so the next use starts fresh.
-    let completed_next: HashSet<ThreadId> = completed.union(&arriving).cloned().collect();
-    if completed_next == expected {
-        ctx.state.values.cooperative.syncs.remove(&key);
-        ctx.state.values.cooperative.rendezvous.remove(&key);
-        ctx.state
-            .values
-            .cooperative
-            .sync_cycles
-            .insert(key.clone(), cycle + 1);
-    } else {
-        ctx.state
-            .values
-            .cooperative
-            .syncs
-            .insert(key.clone(), expected.clone());
-        ctx.state
-            .values
-            .cooperative
-            .rendezvous
-            .insert(key, completed_next);
-    }
-    if ctx.trace_mode() {
-        ctx.emit(TraceEventKind::Sync {
-            sync_kind: sync_kind(stmt).to_string(),
-            thread_count: expected.len(),
-            cycle,
-            bar_id: sync_bar_id(stmt),
-            scope: ctx.access_scope(),
-        })?;
-    }
-    Ok(StepStatus::advance())
-}
+/// Named barriers rendezvous ACROSS statements: warpgroup A's `named_barrier(1)`
+/// and warpgroup B's `named_barrier(1)` are ONE hardware barrier. Their
+/// `SyncKey` therefore uses this sentinel in place of the statement id, and the
+/// barrier_id rides in the domain — every same-(cta, barrier_id) statement
+/// shares one `SyncRecord`.
+const NAMED_BARRIER_STMT_SENTINEL: usize = usize::MAX;
 
 fn sync_kind(stmt: &Stmt) -> &'static str {
     match stmt {
         Stmt::ClusterSync => "cluster",
         Stmt::CtaSync => "cta",
         Stmt::WgSync { .. } => "warpgroup",
+        Stmt::NamedBarrier { .. } => "named",
         Stmt::WarpSync => "warp",
         _ => unreachable!(),
     }
@@ -240,19 +50,86 @@ fn sync_kind(stmt: &Stmt) -> &'static str {
 fn sync_bar_id(stmt: &Stmt) -> Option<u32> {
     match stmt {
         Stmt::WgSync { barrier_id } => Some(*barrier_id as u32),
+        Stmt::NamedBarrier { barrier_id, .. } => Some(*barrier_id),
         _ => None,
     }
 }
 
-fn check_cluster_peer_liveness(
-    ctx: &CohortContext,
-    expected: &HashSet<ThreadId>,
-    merged: &HashSet<ThreadId>,
-) -> IResult<()> {
-    let arrived_ctas: HashSet<usize> = merged.iter().map(|t| t.cta_id).collect();
-    let expected_ctas: HashSet<usize> = expected.iter().map(|t| t.cta_id).collect();
-    for cta_id in expected_ctas {
-        if arrived_ctas.contains(&cta_id) {
+/// The rendezvous domain of this execution (which barrier INSTANCE it joins).
+fn sync_domain(stmt: &Stmt, first: &ThreadId) -> (usize, usize) {
+    match stmt {
+        Stmt::ClusterSync => (first.cluster_id, 0),
+        Stmt::CtaSync => (first.cta_id, 0),
+        Stmt::WgSync { .. } => (first.cta_id, first.warpgroup_id()),
+        Stmt::NamedBarrier { barrier_id, .. } => (first.cta_id, *barrier_id as usize),
+        Stmt::WarpSync => (first.cta_id, first.warp_id),
+        _ => unreachable!(),
+    }
+}
+
+/// Is `t` inside the barrier's scope?
+fn in_scope(stmt: &Stmt, first: &ThreadId, t: &ThreadId) -> bool {
+    match stmt {
+        Stmt::ClusterSync => t.cluster_id == first.cluster_id,
+        Stmt::CtaSync => t.cta_id == first.cta_id,
+        Stmt::WgSync { .. } => t.cta_id == first.cta_id && t.warpgroup_id() == first.warpgroup_id(),
+        // Count-based: any warp of the CTA may participate; completion is
+        // gated on num_warps*32 arrivals, not a fixed structural scope.
+        Stmt::NamedBarrier { .. } => t.cta_id == first.cta_id,
+        Stmt::WarpSync => t.cta_id == first.cta_id && t.warp_id == first.warp_id,
+        _ => unreachable!(),
+    }
+}
+
+/// Global CTA ids of the cluster containing `template` (source order).
+fn cluster_cta_ids(ctx: &WarpContext, template: &ThreadId) -> Vec<usize> {
+    let cluster = &ctx.kernel.cluster_shape;
+    let launch = &ctx.kernel.launch_shape;
+    let mut ids = Vec::with_capacity(ctx.cluster_cta_count());
+    for ctaid_in_cluster in 0..ctx.cluster_cta_count() {
+        let local = unflatten_coord(ctaid_in_cluster, cluster);
+        let cta_coord: Vec<usize> = cluster
+            .iter()
+            .zip(template.cluster_coord.as_slice().iter())
+            .zip(local.iter())
+            .map(|((cl, cc), l)| cl * cc + l)
+            .collect();
+        ids.push(flatten_coord(&cta_coord, launch));
+    }
+    ids
+}
+
+/// (expected thread count, CTA ids in scope) for a fresh record.
+fn sync_scope(ctx: &WarpContext, stmt: &Stmt, first: &ThreadId) -> (usize, Vec<usize>) {
+    let warp_threads = 32usize;
+    let cta_threads = ctx.kernel.num_warps as usize * warp_threads;
+    match stmt {
+        Stmt::ClusterSync => {
+            let ctas = cluster_cta_ids(ctx, first);
+            (ctas.len() * cta_threads, ctas)
+        }
+        Stmt::CtaSync => (cta_threads, vec![first.cta_id]),
+        Stmt::WgSync { .. } => (4 * warp_threads, vec![first.cta_id]),
+        // The statement's count operand: `bar.sync barrier_id, num_warps*32`.
+        Stmt::NamedBarrier { num_warps, .. } => {
+            (*num_warps as usize * warp_threads, vec![first.cta_id])
+        }
+        Stmt::WarpSync => {
+            // The barrier spans exactly the arriving lanes' warps (one warp
+            // under per-warp streams); a sub-warp mask can never fill it —
+            // the hardware hang, surfaced as a deadlock.
+            let mut warps: Vec<usize> = ctx.lanes.iter().map(|t| t.warp_id).collect();
+            warps.sort_unstable();
+            warps.dedup();
+            (warps.len() * warp_threads, vec![first.cta_id])
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn check_cluster_peer_liveness(ctx: &WarpContext, rec: &SyncRecord) -> IResult<()> {
+    for &cta_id in &rec.expected_ctas {
+        if rec.arrived_per_cta.contains_key(&cta_id) {
             continue;
         }
         match ctx.cta_activity(cta_id) {
@@ -272,4 +149,171 @@ fn check_cluster_peer_liveness(
         }
     }
     Ok(())
+}
+
+fn execute_sync<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
+    let named = matches!(stmt, Stmt::NamedBarrier { .. });
+    let stmt_id = if named {
+        NAMED_BARRIER_STMT_SENTINEL
+    } else {
+        ctx.stmt_id(stmt)
+    };
+    let first = ctx.lanes[0].clone();
+    let key = SyncKey {
+        stmt_id,
+        domain: sync_domain(stmt, &first),
+    };
+    let stream_id = ctx.stream.stream_id;
+
+    // Fast path: this stream already arrived this cycle (a Polled re-run).
+    if let Some(rec) = ctx.state.values.cooperative.syncs.get(&key) {
+        if rec.arrived_streams.contains_key(&stream_id) {
+            if !rec.complete() {
+                // Still waiting for the rest of the scope. O(1) per round.
+                if matches!(stmt, Stmt::ClusterSync) {
+                    check_cluster_peer_liveness(ctx, rec)?;
+                }
+                return Ok(StepStatus::block(WakeCondition::Polled));
+            }
+            if rec.passed_streams.contains(&stream_id) {
+                if named {
+                    // This stream finished the CURRENT generation and reached
+                    // its next use of the same (cta, barrier_id) while
+                    // stragglers still poll their passage. Hardware bar.sync
+                    // counts such an arrival toward the NEXT generation:
+                    // defer until the record re-arms (the stragglers pass on
+                    // their own polls, so this cannot deadlock).
+                    return Ok(StepStatus::block(WakeCondition::Polled));
+                }
+                return Err(InterpreterError::new(
+                    "cooperative_sync_reentry",
+                    "thread re-entered a completed sync",
+                ));
+            }
+            // Complete: pass. The last passer re-arms the record.
+            let n = rec.arrived_streams[&stream_id];
+            let cycle = rec.cycle;
+            let expected_count = rec.expected_count;
+            if ctx.trace_mode() {
+                ctx.emit(TraceEventKind::Sync {
+                    sync_kind: sync_kind(stmt).to_string(),
+                    thread_count: expected_count,
+                    cycle,
+                    bar_id: sync_bar_id(stmt),
+                    scope: ctx.access_scope(),
+                })?;
+            }
+            let rec = ctx.state.values.cooperative.syncs.get_mut(&key).unwrap();
+            rec.passed_streams.insert(stream_id);
+            rec.passed_count += n;
+            if rec.passed_count == rec.expected_count {
+                rec.advance_cycle();
+            }
+            return Ok(StepStatus::advance());
+        }
+    }
+
+    // First arrival of this stream for the current cycle.
+    for t in ctx.lanes.iter() {
+        if !in_scope(stmt, &first, t) {
+            return Err(InterpreterError::new(
+                "invalid_sync_scope",
+                "arriving lanes are outside the sync scope",
+            ));
+        }
+    }
+    let n = ctx.lanes.len();
+    let (expected_count, expected_ctas) = sync_scope(ctx, stmt, &first);
+    {
+        let rec = ctx
+            .state
+            .values
+            .cooperative
+            .syncs
+            .entry(key)
+            .or_insert_with(SyncRecord::default);
+        if rec.expected_count == 0 {
+            rec.expected_count = expected_count;
+            rec.expected_ctas = expected_ctas;
+        } else if named && rec.expected_count != expected_count {
+            // The record persists across generations, so every statement that
+            // names this (cta, barrier_id) must agree on the count — two
+            // different counts would rendezvous against different targets on
+            // the SAME hardware barrier.
+            return Err(InterpreterError::new(
+                "named_barrier_count_mismatch",
+                "named_barrier num_warps differs across uses of one barrier_id",
+            ));
+        }
+        if rec.complete() {
+            if named {
+                // Current generation fully arrived but not fully passed; this
+                // fresh arrival belongs to the NEXT generation — defer it
+                // until the record re-arms (see the fast-path twin above).
+                return Ok(StepStatus::block(WakeCondition::Polled));
+            }
+            // Everyone the scope expects has arrived, yet a new stream shows
+            // up — the arrival set would exceed the scope.
+            return Err(InterpreterError::new(
+                "cooperative_sync_mismatch",
+                "sync arrival set exceeds scope",
+            ));
+        }
+        if rec.arrived_count + n > rec.expected_count {
+            if named {
+                // More threads inside one generation than `num_warps * 32` —
+                // the arrival set genuinely overflows the count operand.
+                return Err(InterpreterError::new(
+                    "named_barrier_overflow",
+                    "named barrier arrivals exceed num_warps*32",
+                ));
+            }
+            return Err(InterpreterError::new(
+                "cooperative_sync_mismatch",
+                "sync arrival set exceeds scope",
+            ));
+        }
+        rec.arrived_streams.insert(stream_id, n);
+        rec.arrived_count += n;
+        *rec.arrived_per_cta.entry(first.cta_id).or_insert(0) += n;
+    }
+    let rec_snapshot = |ctx: &WarpContext| {
+        let rec = &ctx.state.values.cooperative.syncs[&key];
+        (rec.cycle, rec.arrived_count, rec.complete())
+    };
+    let (cycle, arrived_count, complete) = rec_snapshot(ctx);
+    if ctx.trace_mode() {
+        ctx.emit(TraceEventKind::SyncArrive {
+            sync_kind: sync_kind(stmt).to_string(),
+            thread_count: expected_count,
+            count: arrived_count,
+            cycle,
+            bar_id: sync_bar_id(stmt),
+            scope: ctx.access_scope(),
+        })?;
+    }
+    if !complete {
+        if matches!(stmt, Stmt::ClusterSync) {
+            let rec = &ctx.state.values.cooperative.syncs[&key];
+            check_cluster_peer_liveness(ctx, rec)?;
+        }
+        return Ok(StepStatus::block(WakeCondition::Polled));
+    }
+    // This arrival completed the barrier: pass immediately.
+    if ctx.trace_mode() {
+        ctx.emit(TraceEventKind::Sync {
+            sync_kind: sync_kind(stmt).to_string(),
+            thread_count: expected_count,
+            cycle,
+            bar_id: sync_bar_id(stmt),
+            scope: ctx.access_scope(),
+        })?;
+    }
+    let rec = ctx.state.values.cooperative.syncs.get_mut(&key).unwrap();
+    rec.passed_streams.insert(stream_id);
+    rec.passed_count += n;
+    if rec.passed_count == rec.expected_count {
+        rec.advance_cycle();
+    }
+    Ok(StepStatus::advance())
 }
