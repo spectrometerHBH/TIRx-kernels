@@ -1,12 +1,14 @@
-"""Intra-warp cross-lane memory dependency regressions.
+"""Intra-warp cross-lane memory visibility.
 
 On sm_70+ (Independent Thread Scheduling) the lanes of a warp advance through
-their shared instruction stream independently, so a memory dependency between
-DIFFERENT lanes of one warp is ordered by an explicit `warp_sync` or a
-warp-collective instruction. These pin the checker's `intra_warp_cross_lane_race`
-rule at both ends — it fires on a genuinely cross-lane dependency, and it stays
-quiet when the kernel supplies the ordering (sync, collective) or when each lane
-only depends on its own program order.
+their shared instruction stream independently: the checker's happens-before
+clock gives every (warp, lane) its own dimension, so a masked write is
+invisible to every other lane — and to every release the other lanes perform —
+until a warp-level convergence point (warp_sync / a warp-collective) or a real
+synchronization edge delivers it. These pin that visibility rule at both ends:
+an undelivered cross-lane dependency is a `memory_data_race`, and the checker
+stays quiet when the kernel supplies the ordering (convergence, a
+synchronization edge, or per-lane program order alone).
 """
 
 import nymph_rs as nr
@@ -49,7 +51,7 @@ def _rotate_kernel(*, rotate: bool, warp_sync: bool):
 def test_lane_rotated_read_after_write_without_warp_sync_is_a_race():
     report = nr.check_protocol(_rotate_kernel(rotate=True, warp_sync=False))
     assert report["status"] == "Failed"
-    assert "intra_warp_cross_lane_race" in _codes(report), report["diagnostics"]
+    assert "memory_data_race" in _codes(report), report["diagnostics"]
     detail = report["diagnostics"][0]["details"]
     assert detail["left_mode"] == "write"
     assert detail["right_mode"] == "read"
@@ -117,7 +119,7 @@ def test_collective_ordering_test_has_teeth():
     # without the collective the dependency is an unordered cross-lane one.
     report = nr.check_protocol(_stmatrix_kernel(collective=False))
     assert report["status"] == "Failed"
-    assert "intra_warp_cross_lane_race" in _codes(report), report["diagnostics"]
+    assert "memory_data_race" in _codes(report), report["diagnostics"]
 
 
 def _publish_kernel(*, write: str, warp_sync: bool, arrive: str = "elected"):
@@ -254,32 +256,66 @@ def test_within_warp_pipeline_arrive_is_not_a_publish():
     assert report["status"] == "Passed", report["diagnostics"]
 
 
-def test_partial_mask_sync_is_not_a_cross_lane_order_point():
-    # A runtime-valued predicate (Unknown static filter, bypasses validate)
-    # masks each warp down to lanes 0..15; the two half-warps fill a
-    # 32-thread named barrier together. That passage converges only the
-    # MASKED lanes, so it must not be credited as a full-warp order point:
-    # the lane-rotated read after it is still an unordered cross-lane pair.
+def _partial_barrier_kernel(*, writers_join: bool):
+    """A runtime-valued predicate (Unknown static filter, bypasses validate)
+    masks each warp down to a 16-lane half; the two half-warps fill a
+    32-thread named barrier together.
+
+    `writers_join=True`: the joining lanes 0..15 write their own cells before
+    the barrier, then read lane+1's cell after it — the barrier's
+    release/acquire delivers each ARRIVING lane's writes to every other
+    arriver (hardware bar.sync memory semantics; no warp convergence needed).
+    `writers_join=False`: lanes 16..31 write and never join; the joining
+    lanes read those cells after the barrier — an absent lane's writes are in
+    nobody's release, so the dependency stays unordered.
+    """
     b = builder("cross_lane_partial_sync", smem_size_bytes=LANES * 4)
     smem = smem_tensor(b, dtype=nr.DType.U32, shape=(LANES,), byte_offset=0)
     reg = reg_tensor(b, dtype=nr.DType.U32, shape=(1,))
     out = gmem_arg(b, dtype=nr.DType.U32, shape=(LANES,))
     with b.if_warp(0):
         half = b.scalar(initial=16, dtype=nr.ScalarDType.I32)
-        with b.if_(b.lane_id() < half):
-            b.reg_fill(reg, 7)
-            b.reg_store(_cell(smem, b.lane_id()), reg)
-            b.named_barrier(barrier_id=1, num_warps=1)
-            b.reg_load(reg, _cell(smem, (b.lane_id() + 1) % 16))
-            b.reg_store(_cell(out, b.lane_id()), reg)
+        if writers_join:
+            with b.if_(b.lane_id() < half):
+                b.reg_fill(reg, 7)
+                b.reg_store(_cell(smem, b.lane_id()), reg)
+                b.named_barrier(barrier_id=1, num_warps=1)
+                b.reg_load(reg, _cell(smem, (b.lane_id() + 1) % 16))
+                b.reg_store(_cell(out, b.lane_id()), reg)
+        else:
+            with b.if_(b.lane_id() >= half):
+                b.reg_fill(reg, 7)
+                b.reg_store(_cell(smem, b.lane_id()), reg)
+            with b.if_(b.lane_id() < half):
+                b.named_barrier(barrier_id=1, num_warps=1)
+                b.reg_load(reg, _cell(smem, 16 + (b.lane_id() % 16)))
+                b.reg_store(_cell(out, b.lane_id()), reg)
     with b.if_warp(1):
         half1 = b.scalar(initial=16, dtype=nr.ScalarDType.I32)
         with b.if_(b.lane_id() < half1):
             b.named_barrier(barrier_id=1, num_warps=1)
-    report = nr.check_protocol(b.build(), include_events=True)
-    assert report["status"] == "Failed"
-    assert "intra_warp_cross_lane_race" in _codes(report), report["diagnostics"]
+    return b.build()
+
+
+def test_partial_mask_barrier_orders_the_arrived_lanes():
+    # Each arriving lane's pre-barrier writes ride its arrival into the
+    # barrier's release; the passage's acquire hands them to every other
+    # arriver — a real rendezvous orders its members without converging the
+    # warp.
+    report = nr.check_protocol(_partial_barrier_kernel(writers_join=True), include_events=True)
+    assert report["status"] == "Passed", report["diagnostics"]
     # The construction really produced a PARTIAL-mask passage.
+    sync_lane_counts = {e["scope"]["lane_count"] for e in report["events"] if e["kind"] == "sync"}
+    assert sync_lane_counts == {16}, sync_lane_counts
+
+
+def test_partial_mask_barrier_publishes_nothing_for_absent_lanes():
+    # The writers never joined the rendezvous: no arrival carries their
+    # program order, so the post-barrier read of their cells is unordered —
+    # and the passage must not be credited as a full-warp convergence.
+    report = nr.check_protocol(_partial_barrier_kernel(writers_join=False), include_events=True)
+    assert report["status"] == "Failed"
+    assert "memory_data_race" in _codes(report), report["diagnostics"]
     sync_lane_counts = {e["scope"]["lane_count"] for e in report["events"] if e["kind"] == "sync"}
     assert sync_lane_counts == {16}, sync_lane_counts
 

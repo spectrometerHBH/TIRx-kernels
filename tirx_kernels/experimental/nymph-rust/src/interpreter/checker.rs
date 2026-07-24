@@ -215,12 +215,6 @@ struct CheckerCx<'a> {
     event_index: EventIndex<'a>,
     region_audit: TraceRegionAudit,
     ordering: OrderingAnalysis,
-    /// Per-stream sorted event indices that create intra-warp CROSS-LANE
-    /// execution order: cooperative Sync passages (warp/wg/named/cta/cluster)
-    /// and warp-collective statements. Used by the same-stream pair rule in
-    /// the memory race walk — `same_stream_cross_lane_ordered` holds the
-    /// full contract.
-    cross_lane_order_points: HashMap<usize, Vec<usize>>,
     gaps: Vec<TraceGap>,
     diagnostics: Vec<Diagnostic>,
     warnings: Vec<super::protocol::ProtocolWarning>,
@@ -233,7 +227,6 @@ impl<'a> CheckerCx<'a> {
             event_index: EventIndex::new(events),
             region_audit: TraceRegionAudit::new(kernel),
             ordering: OrderingAnalysis::empty(),
-            cross_lane_order_points: cross_lane_order_points(events),
             gaps: Vec::new(),
             diagnostics: Vec::new(),
             warnings: Vec::new(),
@@ -327,12 +320,13 @@ impl MemoryAccessMode {
 struct MemoryAccessRecord {
     event_idx: usize,
     stream_id: usize,
+    /// The executing lanes. When the region carries no per-lane attribution,
+    /// every one of these lanes touches the whole footprint.
+    mask: u32,
     mode: MemoryAccessMode,
     region: Region,
     // cached bounding spans: frontier scans reject on these in O(1)
     bounds: ((usize, usize), (usize, usize)),
-    /// stmt_kind is a warp-collective instruction (all lanes converge on it).
-    collective: bool,
     /// Access is performed by an async engine (`MemoryProxy::Async`), not by
     /// the lanes themselves — TMA loads/stores, s2cluster, tcgen05 mma/cp/ld/st.
     async_proxy: bool,
@@ -349,10 +343,10 @@ impl MemoryAccessRecord {
             } if is_shared_race_target(&region.owner) => Some(Self {
                 event_idx,
                 stream_id: scope.stream_id,
+                mask: scope.active_lanes,
                 mode: MemoryAccessMode::Read,
                 bounds: super::region::region_bounding_spans(region),
                 region: region.clone(),
-                collective: is_warp_collective_stmt(&event.stmt_kind),
                 async_proxy: *proxy == MemoryProxy::Async,
             }),
             TraceEventKind::Write {
@@ -363,10 +357,10 @@ impl MemoryAccessRecord {
             } if is_shared_race_target(&region.owner) => Some(Self {
                 event_idx,
                 stream_id: scope.stream_id,
+                mask: scope.active_lanes,
                 mode: MemoryAccessMode::Write,
                 bounds: super::region::region_bounding_spans(region),
                 region: region.clone(),
-                collective: is_warp_collective_stmt(&event.stmt_kind),
                 async_proxy: *proxy == MemoryProxy::Async,
             }),
             _ => None,
@@ -1547,65 +1541,120 @@ fn is_shared_race_target(owner: &PoolId) -> bool {
     matches!(owner, PoolId::Smem { .. } | PoolId::Tmem { .. })
 }
 
-/// Warp-collective statements: every active lane converges on the
-/// instruction, so everything any lane executed before it completes before
-/// it, and everything after starts after it — a full intra-warp cross-lane
-/// ordering point. The set holds exactly the instructions with that property.
+/// Warp-collective statements (PTX `.sync.aligned`): every lane of the warp
+/// converges on the instruction, executes it together, and its effects are
+/// warp-visible once it completes — so everything any lane executed before it
+/// completes before it, and everything after starts after it. The set holds
+/// exactly the instructions with that property, including the TMEM
+/// allocator ops (`tcgen05.alloc/dealloc` are `.sync.aligned`, PTX §9.7.17).
 /// `tcgen05.wait::ld/st` drains the EXECUTING thread's own ld/st (PTX defines
-/// it per-thread), which orders nothing across lanes, so it is not a member.
+/// it per-thread) and `tcgen05.commit`/`mma` are single-thread issues, so
+/// none of them converge anything.
 fn is_warp_collective_stmt(stmt_kind: &str) -> bool {
     matches!(
         stmt_kind,
-        "LdMatrix" | "StMatrix" | "Tcgen05Ld" | "Tcgen05St" | "WarpMma"
+        "LdMatrix"
+            | "StMatrix"
+            | "Tcgen05Ld"
+            | "Tcgen05St"
+            | "WarpMma"
+            | "TmemAlloc"
+            | "TmemDealloc"
     )
 }
 
-/// Per-stream sorted event indices that order LANES of the stream's warp
-/// against each other: cooperative Sync PASSAGE events (every sync kind —
-/// warp/warpgroup/named/cta/cluster all imply the warp converged), credited
-/// only when the passage covers the FULL warp (`lane_count == 32`; a
-/// partial-mask sync converges only the masked lanes and orders nothing for
-/// the rest), and warp-collective statements (unconditional — they already
-/// require every lane). An intra-warp mbarrier arrive->wait chain is
-/// not an ordering point: a lane-side arrive publishes only the arriving
-/// lane's program order, and crediting the per-lane acquire exactly needs
-/// lane-granular clocks, so such a chain leaves the pair unordered here
-/// (conservative — the pair is reported rather than silently allowed).
-fn cross_lane_order_points(events: &[TraceEvent]) -> HashMap<usize, Vec<usize>> {
-    let mut points: HashMap<usize, Vec<usize>> = HashMap::new();
-    for (idx, event) in events.iter().enumerate() {
-        let is_point = matches!(
-            &event.payload,
-            TraceEventKind::Sync { scope, .. } if scope.lane_count == 32
-        ) || is_warp_collective_stmt(&event.stmt_kind);
-        if !is_point {
-            continue;
-        }
-        let Some(scope) = event_scope(&event.payload) else {
-            continue;
-        };
-        // Scanned in trace order, so each stream's vec is already sorted.
-        points.entry(scope.stream_id).or_default().push(idx);
-    }
-    points
-}
-
-/// Any cross-lane ordering point of `stream_id` strictly between the two
-/// event indices?
-fn has_order_point_between(cx: &CheckerCx<'_>, stream_id: usize, lo: usize, hi: usize) -> bool {
-    let Some(points) = cx.cross_lane_order_points.get(&stream_id) else {
-        return false;
+/// Every conflicting lane-slice pair of the two accesses carries a
+/// happens-before order: `Ok(())` when the pair is race-free, else
+/// `Err(witness)` naming the first unordered `(prior_lane, current_lane)`
+/// slice pair (`None` when neither side is lane-attributed).
+///
+/// A slice is `(lane, bytes)`: the region's `lane_boxes` entry when the
+/// builder attributed bytes to lanes, else every executing lane touching the
+/// whole footprint. Same-lane pairs of one stream are program-ordered;
+/// every other pair must come out of the clock — and a release projects only
+/// its arriving lanes, so a masked write no lane published can never satisfy
+/// this. Cross-stream pairs may be ordered either way; same-stream slices
+/// only forward (a later event's lane tick is never below an earlier one's).
+fn ordered_conflict(
+    cx: &CheckerCx<'_>,
+    prior: &MemoryAccessRecord,
+    current: &MemoryAccessRecord,
+) -> Result<(), Option<(u8, u8)>> {
+    let same_stream = prior.stream_id == current.stream_id;
+    let pair_ordered = |pl: u8, cl: u8| -> bool {
+        cx.ordering
+            .ordered_lane(prior.event_idx, pl, current.event_idx, cl)
+            || (!same_stream
+                && cx
+                    .ordering
+                    .ordered_lane(current.event_idx, cl, prior.event_idx, pl))
     };
-    let first_after_lo = points.partition_point(|&p| p <= lo);
-    points.get(first_after_lo).is_some_and(|&p| p < hi)
+    let mask_lanes = |mask: u32| (0..32u8).filter(move |l| mask & (1u32 << l) != 0);
+    match (
+        prior.region.lane_boxes.as_deref(),
+        current.region.lane_boxes.as_deref(),
+    ) {
+        (Some(prior_lanes), Some(current_lanes)) => {
+            for (pl, pb) in prior_lanes.iter() {
+                for (cl, cb) in current_lanes.iter() {
+                    if boxes_overlap(pb, cb) && !pair_ordered(*pl, *cl) {
+                        return Err(Some((*pl, *cl)));
+                    }
+                }
+            }
+        }
+        (Some(prior_lanes), None) => {
+            for (pl, pb) in prior_lanes.iter() {
+                if !super::region::box_overlaps_region(pb, &current.region) {
+                    continue;
+                }
+                for cl in mask_lanes(current.mask) {
+                    if !pair_ordered(*pl, cl) {
+                        return Err(Some((*pl, cl)));
+                    }
+                }
+            }
+        }
+        (None, Some(current_lanes)) => {
+            for (cl, cb) in current_lanes.iter() {
+                if !super::region::box_overlaps_region(cb, &prior.region) {
+                    continue;
+                }
+                for pl in mask_lanes(prior.mask) {
+                    if !pair_ordered(pl, *cl) {
+                        return Err(Some((pl, *cl)));
+                    }
+                }
+            }
+        }
+        (None, None) => {
+            // Both uniform: every slice pair conflicts, so the whole-event
+            // relation (every slice of one before every slice of the other)
+            // is the exact test.
+            let ordered = cx
+                .ordering
+                .happens_before(prior.event_idx, current.event_idx)
+                || (!same_stream
+                    && cx
+                        .ordering
+                        .happens_before(current.event_idx, prior.event_idx));
+            if !ordered {
+                return Err(None);
+            }
+        }
+    }
+    Ok(())
 }
 
-/// TRUE iff every overlapping (prior lane, current lane) box pair is the SAME
-/// lane. A side without lane attribution is uniform — every executing lane
-/// touches the whole region — which can never be proven same-lane-only
-/// against an overlapping access (single-thread masks are attributed by
-/// the region builders, so `None` here really means multi-lane uniform).
-fn same_lane_only_overlap(prior: &MemoryAccessRecord, current: &MemoryAccessRecord) -> bool {
+/// Both sides lane-attributed with no byte shared across DIFFERENT lanes.
+/// Combined with the caller's footprint-coverage check, every prior lane
+/// slice is then covered by the SAME lane's current slice, and per-lane
+/// program order supplies an ordering that composes with any later conflict
+/// (prior slice ≤ covering current slice ≤ whatever current is judged
+/// against) — the condition frontier pruning needs. A side without
+/// attribution is uniform (every executing lane touches the whole region)
+/// and can never be same-lane-covered.
+fn same_lane_coverage(prior: &MemoryAccessRecord, current: &MemoryAccessRecord) -> bool {
     let (Some(prior_lanes), Some(current_lanes)) =
         (&prior.region.lane_boxes, &current.region.lane_boxes)
     else {
@@ -1621,56 +1670,28 @@ fn same_lane_only_overlap(prior: &MemoryAccessRecord, current: &MemoryAccessReco
     true
 }
 
-/// Intra-warp cross-lane ordering for a SAME-STREAM overlapping conflict pair.
-///
-/// On Volta+ (Independent Thread Scheduling) the lanes of a warp advance
-/// through their shared instruction stream independently, so program order
-/// within a stream orders each LANE against itself. A memory dependency
-/// between two lanes carries an ordering only from an explicit warp_sync or
-/// a warp-collective instruction. A same-stream pair is ordered iff any of:
-///
-///  (a) either member is a warp-collective statement (converged execution);
-///  (a') either member is an async-ENGINE access (`MemoryProxy::Async`): a
-///       copy/mma engine touches those bytes, not a lane, so lane attribution
-///       carries no information about it and no warp-level sync can order it.
-///       Its hazards are owned by the passes that model the engine's actual
-///       window: `async_group_lifetime` (bulk store source/dest until
-///       `wait_group`), `tcgen05_async_hazard` (tcgen05 mma/cp/ld/st windows
-///       until `tcgen05.commit`/`wait`, plus TMA-load SMEM tiles until an
-///       `mbarrier` wait on the load's cell). Those passes credit no implicit
-///       warp sync, and each waiting lane acquires the completing barrier
-///       individually, so the pattern `elected tma_load -> mbarrier_wait ->
-///       per-lane reads` is ordered by the barrier, not by lane convergence;
-///  (b) a cross-lane ordering point of the stream lies strictly between the
-///      two events (`cross_lane_order_points`);
-///  (c) the overlap is SAME-LANE ONLY: each lane depends only on its own
-///      program order.
-///
-/// `for_prune` is the frontier-prune variant of the predicate: pruning
-/// requires the relation to COMPOSE with a later access W ("prior ordered
-/// w.r.t. current" and "current ordered w.r.t. W" must imply "prior ordered
-/// w.r.t. W" for every rule combination). Every rule composes except
-/// "CURRENT is the async member of (a')" — a generic prior pruned under an
-/// async current would dodge a later generic W (the async exemption of
-/// current-vs-W says nothing about prior-vs-W) — so the prune variant only
-/// credits the PRIOR side of (a').
-fn same_stream_cross_lane_ordered(
+/// Is a covered frontier entry retirable under `current`? Pruning requires an
+/// ordering that COMPOSES: any later W conflicting with `prior` also
+/// conflicts with `current` (coverage, checked by the caller), and
+/// prior-before-current chained with the current-vs-W judgment settles
+/// prior-vs-W. The whole-event relation composes by transitivity; same-lane
+/// coverage composes through per-lane program order. An async-engine prior
+/// needs no frontier entry at all — its hazards live in the engine-window
+/// passes (`async_group_lifetime`, `tcgen05_async_hazard`), not in lane
+/// clocks.
+fn prune_ordered(
     cx: &CheckerCx<'_>,
     prior: &MemoryAccessRecord,
     current: &MemoryAccessRecord,
-    for_prune: bool,
 ) -> bool {
-    debug_assert_eq!(prior.stream_id, current.stream_id);
-    if prior.collective || current.collective {
-        return true; // (a)
+    if prior.async_proxy {
+        return true;
     }
-    if prior.async_proxy || (!for_prune && current.async_proxy) {
-        return true; // (a')
+    if prior.stream_id == current.stream_id && same_lane_coverage(prior, current) {
+        return true;
     }
-    if has_order_point_between(cx, current.stream_id, prior.event_idx, current.event_idx) {
-        return true; // (b)
-    }
-    same_lane_only_overlap(prior, current) // (c)
+    cx.ordering
+        .happens_before(prior.event_idx, current.event_idx)
 }
 
 #[derive(Default)]
@@ -1711,11 +1732,7 @@ fn prune_read_frontier_before_read(
     frontier.retain(|prior| {
         !super::region::bounding_spans_contain(current.bounds, prior.bounds)
             || !region_covers(&current.region, &prior.region)
-            || !((prior.stream_id == current.stream_id
-                && same_stream_cross_lane_ordered(cx, prior, current, true))
-                || cx
-                    .ordering
-                    .happens_before(prior.event_idx, current.event_idx))
+            || !prune_ordered(cx, prior, current)
     });
 }
 
@@ -1728,11 +1745,7 @@ fn prune_frontier_before(
     for prior in frontier.drain(..) {
         if super::region::bounding_spans_touch(prior.bounds, current.bounds)
             && regions_overlap(&prior.region, &current.region)
-            && ((prior.stream_id == current.stream_id
-                && same_stream_cross_lane_ordered(cx, &prior, current, true))
-                || cx
-                    .ordering
-                    .happens_before(prior.event_idx, current.event_idx))
+            && prune_ordered(cx, &prior, current)
         {
             if !(super::region::bounding_spans_contain(current.bounds, prior.bounds)
                 && region_covers(&current.region, &prior.region))
@@ -1753,11 +1766,12 @@ fn check_memory_conflicts(
 ) -> CheckResult {
     for prior in frontier {
         let same_stream = prior.stream_id == current.stream_id;
-        if same_stream
-            && (prior.collective || current.collective || prior.async_proxy || current.async_proxy)
-        {
-            // Rules (a)/(a') hold whatever the overlap shape, so they settle
-            // the pair before it pays for the overlap tests.
+        if same_stream && (prior.async_proxy || current.async_proxy) {
+            // An async-engine access conflicts through the engine's window,
+            // not through lane clocks — lane attribution carries no
+            // information about a copy/mma engine, and the passes that model
+            // the engine's actual window (`async_group_lifetime`,
+            // `tcgen05_async_hazard`) own those hazards.
             continue;
         }
         if !super::region::bounding_spans_touch(prior.bounds, current.bounds) {
@@ -1766,27 +1780,10 @@ fn check_memory_conflicts(
         if !regions_overlap(&prior.region, &current.region) {
             continue;
         }
-        if same_stream {
-            // Same warp, conflicting overlap: program order covers each lane
-            // against ITSELF only — cross-lane needs an explicit intra-warp
-            // ordering (warp_sync / collective / converged barrier).
-            if same_stream_cross_lane_ordered(cx, prior, current, false) {
-                continue;
-            }
-            report_intra_warp_cross_lane_race(cx, prior, current);
+        if let Err(lanes) = ordered_conflict(cx, prior, current) {
+            report_memory_data_race(cx, prior, current, lanes);
             return Err(ProtocolStatus::Failed);
         }
-        if cx
-            .ordering
-            .happens_before(prior.event_idx, current.event_idx)
-            || cx
-                .ordering
-                .happens_before(current.event_idx, prior.event_idx)
-        {
-            continue;
-        }
-        report_memory_data_race(cx, prior, current);
-        return Err(ProtocolStatus::Failed);
     }
     Ok(())
 }
@@ -1795,24 +1792,68 @@ fn report_memory_data_race(
     cx: &mut CheckerCx<'_>,
     left: &MemoryAccessRecord,
     right: &MemoryAccessRecord,
+    lanes: Option<(u8, u8)>,
 ) {
     let left_event = cx.event_index.events.get(left.event_idx);
     let right_event = cx.event_index.events.get(right.event_idx);
-    let witness = region_overlap_witness(&left.region, &right.region)
-        .map(|b| box_summary(&b))
-        .unwrap_or_else(|| "<unknown>".into());
-    let mut diagnostic = DiagnosticBuilder::new(
-        "memory_data_race",
-        "overlapping shared memory accesses conflict without a happens-before order",
-    )
-    .event(right_event)
-    .detail("left_event_idx", left.event_idx.to_string())
-    .detail("right_event_idx", right.event_idx.to_string())
-    .detail("left_mode", left.mode.as_str())
-    .detail("right_mode", right.mode.as_str())
-    .detail("owner", owner_summary(&left.region.owner))
-    .detail("overlap", witness)
-    .build();
+    // Witness bytes: the named lane slices' first overlapping box pair when
+    // the unordered pair is lane-attributed, else the region overlap.
+    let (lanes_detail, witness) = match (lanes, &left.region.lane_boxes, &right.region.lane_boxes) {
+        (Some((ll, rl)), Some(left_lanes), Some(right_lanes)) => {
+            let witness = left_lanes
+                .iter()
+                .filter(|(l, _)| *l == ll)
+                .flat_map(|(_, lb)| {
+                    right_lanes
+                        .iter()
+                        .filter(|(r, _)| *r == rl)
+                        .filter(|(_, rb)| boxes_overlap(lb, rb))
+                        .map(|(_, rb)| {
+                            let ranges = lb
+                                .ranges
+                                .iter()
+                                .zip(&rb.ranges)
+                                .map(|(&(ls, le), &(rs, re))| (ls.max(rs), le.min(re)))
+                                .collect();
+                            box_summary(&BoxN::new(ranges))
+                        })
+                })
+                .next();
+            (
+                format!("{ll},{rl}"),
+                witness.unwrap_or_else(|| "<unknown>".into()),
+            )
+        }
+        (Some((ll, rl)), _, _) => (
+            format!("{ll},{rl}"),
+            region_overlap_witness(&left.region, &right.region)
+                .map(|b| box_summary(&b))
+                .unwrap_or_else(|| "<unknown>".into()),
+        ),
+        (None, _, _) => (
+            "all".into(),
+            region_overlap_witness(&left.region, &right.region)
+                .map(|b| box_summary(&b))
+                .unwrap_or_else(|| "<unknown>".into()),
+        ),
+    };
+    let message = if left.stream_id == right.stream_id {
+        "conflicting lane slices of one warp overlap without a happens-before order (lanes \
+         advance independently on sm_70+; converge with warp_sync or a warp-collective before \
+         the dependent access)"
+    } else {
+        "overlapping shared memory accesses conflict without a happens-before order"
+    };
+    let mut diagnostic = DiagnosticBuilder::new("memory_data_race", message)
+        .event(right_event)
+        .detail("lanes", lanes_detail)
+        .detail("left_event_idx", left.event_idx.to_string())
+        .detail("right_event_idx", right.event_idx.to_string())
+        .detail("left_mode", left.mode.as_str())
+        .detail("right_mode", right.mode.as_str())
+        .detail("owner", owner_summary(&left.region.owner))
+        .detail("overlap", witness)
+        .build();
     if let Some(event) = left_event {
         diagnostic
             .details
@@ -1822,78 +1863,6 @@ fn report_memory_data_race(
             .insert("left_stmt_kind".into(), event.stmt_kind.clone());
     }
     if let Some(event) = right_event {
-        diagnostic
-            .details
-            .insert("right_stmt_id".into(), event.stmt_id.to_string());
-        diagnostic
-            .details
-            .insert("right_stmt_kind".into(), event.stmt_kind.clone());
-    }
-    cx.diagnostics.push(diagnostic);
-}
-
-/// Report a same-stream (intra-warp) conflicting overlap with no cross-lane
-/// ordering between the members.
-fn report_intra_warp_cross_lane_race(
-    cx: &mut CheckerCx<'_>,
-    prior: &MemoryAccessRecord,
-    current: &MemoryAccessRecord,
-) {
-    let prior_event = cx.event_index.events.get(prior.event_idx);
-    let current_event = cx.event_index.events.get(current.event_idx);
-    // Witness: the first genuinely CROSS-lane overlapping box pair when both
-    // sides are lane-attributed; otherwise the plain region overlap (a
-    // uniform side means every executing lane touches the witness bytes).
-    let (lanes, witness) = match (&prior.region.lane_boxes, &current.region.lane_boxes) {
-        (Some(prior_lanes), Some(current_lanes)) => {
-            let mut found = None;
-            'outer: for (pl, pb) in prior_lanes.iter() {
-                for (cl, cb) in current_lanes.iter() {
-                    if pl != cl && boxes_overlap(pb, cb) {
-                        let ranges = pb
-                            .ranges
-                            .iter()
-                            .zip(&cb.ranges)
-                            .map(|(&(ls, le), &(rs, re))| (ls.max(rs), le.min(re)))
-                            .collect();
-                        found = Some((format!("{pl},{cl}"), box_summary(&BoxN::new(ranges))));
-                        break 'outer;
-                    }
-                }
-            }
-            found.unwrap_or_else(|| ("<unknown>".into(), "<unknown>".into()))
-        }
-        _ => (
-            "all".into(),
-            region_overlap_witness(&prior.region, &current.region)
-                .map(|b| box_summary(&b))
-                .unwrap_or_else(|| "<unknown>".into()),
-        ),
-    };
-    let mut diagnostic = DiagnosticBuilder::new(
-        "intra_warp_cross_lane_race",
-        "cross-lane shared-memory dependency within a warp without an intervening warp-level \
-         sync (lanes execute independently on sm_70+; insert warp_sync or a warp-collective \
-         between them)",
-    )
-    .event(current_event)
-    .detail("left_event_idx", prior.event_idx.to_string())
-    .detail("right_event_idx", current.event_idx.to_string())
-    .detail("left_mode", prior.mode.as_str())
-    .detail("right_mode", current.mode.as_str())
-    .detail("owner", owner_summary(&prior.region.owner))
-    .detail("lanes", lanes)
-    .detail("overlap", witness)
-    .build();
-    if let Some(event) = prior_event {
-        diagnostic
-            .details
-            .insert("left_stmt_id".into(), event.stmt_id.to_string());
-        diagnostic
-            .details
-            .insert("left_stmt_kind".into(), event.stmt_kind.clone());
-    }
-    if let Some(event) = current_event {
         diagnostic
             .details
             .insert("right_stmt_id".into(), event.stmt_id.to_string());
@@ -3364,14 +3333,208 @@ fn event_scope(payload: &TraceEventKind) -> Option<&super::protocol::AccessScope
 
 type Clock = Vec<(usize, usize)>;
 
+// Happens-before is per LANE, not per warp. On Volta+ (Independent Thread
+// Scheduling) the 32 lanes of a warp advance through their shared instruction
+// stream independently: a store by one lane is unordered against another
+// lane's later instructions until a warp-level convergence point joins them.
+// The clock algebra encodes that directly — every (stream, lane) owns one
+// vector-clock dimension, every event ticks exactly its executing lanes'
+// dimensions, and a release publishes only the arriving lanes' clocks. What a
+// lane never published is, by construction, invisible to every consumer.
+const WARP_LANES: usize = 32;
+const FULL_MASK: u32 = u32::MAX;
+
+fn lane_dim(stream_id: usize, lane: usize) -> usize {
+    stream_id * WARP_LANES + lane
+}
+
+/// A warp-collective EVENT: the collective instruction set by statement kind,
+/// plus the TMEM allocator lifecycle events themselves — tcgen05.alloc /
+/// dealloc are `.sync.aligned` (PTX §9.7.17) whatever statement emitted them.
+fn is_warp_collective_event(event: &TraceEvent) -> bool {
+    is_warp_collective_stmt(&event.stmt_kind)
+        || matches!(
+            &event.payload,
+            TraceEventKind::TmemAlloc { .. } | TraceEventKind::TmemDealloc { .. }
+        )
+}
+
+/// A full-warp convergence: every lane of the warp synchronizes at this
+/// event, so the lanes' clocks join. Warp-collective events converge by
+/// definition; a cooperative barrier arrival/passage converges when the whole
+/// warp participates (a partial-mask rendezvous synchronizes only the masked
+/// lanes and joins nothing for the rest).
+fn is_convergence_event(event: &TraceEvent) -> bool {
+    if is_warp_collective_event(event) {
+        return true;
+    }
+    matches!(
+        &event.payload,
+        TraceEventKind::Sync { scope, .. } | TraceEventKind::SyncArrive { scope, .. }
+            if scope.active_lanes == FULL_MASK
+    )
+}
+
+/// A stream's live clock state during the trace scan.
+///
+/// Lane `l`'s effective clock is `shared ⊔ {lane_dim(l) ↦ own[l]} ⊔ extra[l]`.
+/// `shared` is the lower bound common to all 32 lanes — it grows only when the
+/// warp converges (all lane dimensions and extras fold in) or when the whole
+/// warp acquires a release together, so consecutive events share one snapshot
+/// instead of cloning a clock each. `own[l]` is lane `l`'s private dimension
+/// tick. `extra[l]` holds clocks a masked acquire delivered to lane `l` alone;
+/// it drains at the next convergence.
+struct StreamClockState {
+    shared: Arc<Clock>,
+    own: [usize; WARP_LANES],
+    extra: HashMap<u8, Arc<Clock>>,
+}
+
+impl StreamClockState {
+    fn new() -> Self {
+        Self {
+            shared: Arc::new(Clock::new()),
+            own: [0; WARP_LANES],
+            extra: HashMap::new(),
+        }
+    }
+
+    /// Join every lane's private state into the shared clock. After this, all
+    /// 32 lanes observe each other's prior events.
+    fn converge(&mut self, stream_id: usize) {
+        let shared = Arc::make_mut(&mut self.shared);
+        for lane in 0..WARP_LANES {
+            if self.own[lane] > 0 {
+                clock_set_max(shared, lane_dim(stream_id, lane), self.own[lane]);
+            }
+        }
+        for (_, clk) in self.extra.drain() {
+            join_clock(shared, &clk);
+        }
+    }
+
+    /// Tick the executing lanes' own dimensions. Integer-only: the shared
+    /// clock is untouched.
+    fn advance(&mut self, mask: u32) {
+        for lane in 0..WARP_LANES {
+            if mask & (1 << lane) != 0 {
+                self.own[lane] += 1;
+            }
+        }
+    }
+
+    /// Join a release clock into exactly the acquiring lanes. A full-warp
+    /// acquire raises the shared lower bound directly; a masked acquire
+    /// reaches only the masked lanes' private overlays.
+    fn acquire(&mut self, mask: u32, release: &Clock) {
+        if release.is_empty() {
+            return;
+        }
+        if mask == FULL_MASK {
+            join_clock(Arc::make_mut(&mut self.shared), release);
+            return;
+        }
+        for lane in 0..WARP_LANES as u8 {
+            if mask & (1u32 << lane) != 0 {
+                let entry = self
+                    .extra
+                    .entry(lane)
+                    .or_insert_with(|| Arc::new(Clock::new()));
+                join_clock(Arc::make_mut(entry), release);
+            }
+        }
+    }
+
+    /// The clock a release with executing-lane set `mask` publishes: the join
+    /// of exactly those lanes' effective clocks. Lanes outside the mask
+    /// contribute nothing — their unconverged writes stay unpublished.
+    fn published(&self, stream_id: usize, mask: u32) -> Clock {
+        let mut clock = (*self.shared).clone();
+        for lane in 0..WARP_LANES {
+            if mask & (1 << lane) == 0 {
+                continue;
+            }
+            if self.own[lane] > 0 {
+                clock_set_max(&mut clock, lane_dim(stream_id, lane), self.own[lane]);
+            }
+            if let Some(extra) = self.extra.get(&(lane as u8)) {
+                join_clock(&mut clock, extra);
+            }
+        }
+        clock
+    }
+}
+
+/// Per-event clock identity: which stream and lanes executed it, the stream's
+/// shared-clock snapshot, and any live lane overlays at that point. Own lane
+/// ticks are not stored per event — `LaneTickIndex` reconstructs them.
+#[derive(Clone)]
+struct EventHb {
+    stream_id: usize,
+    /// Executing-lane bitmask; 0 = the event carries no scope and no HB
+    /// identity.
+    mask: u32,
+    /// Position of this event within its stream's scoped-event sequence.
+    ordinal: u32,
+    shared: Arc<Clock>,
+    /// Lane overlays live at this event, for its executing lanes only.
+    extras: Vec<(u8, Arc<Clock>)>,
+}
+
+impl EventHb {
+    fn none() -> Self {
+        Self {
+            stream_id: 0,
+            mask: 0,
+            ordinal: 0,
+            shared: Arc::new(Clock::new()),
+            extras: Vec::new(),
+        }
+    }
+}
+
+/// Reconstructs `own[lane]` at any event from per-stream runs of consecutive
+/// equal-mask events: a run stores each lane's tick before the run's first
+/// event, and every event in the run ticks exactly the run's mask.
+struct LaneRun {
+    start: u32,
+    mask: u32,
+    base: [usize; WARP_LANES],
+}
+
+struct LaneTickIndex {
+    runs: Vec<Vec<LaneRun>>,
+}
+
+impl LaneTickIndex {
+    /// Lane `lane`'s own-dimension tick right after its stream's event at
+    /// `ordinal`.
+    fn tick(&self, stream_id: usize, lane: usize, ordinal: u32) -> usize {
+        let runs = &self.runs[stream_id];
+        let pos = runs.partition_point(|run| run.start <= ordinal);
+        let run = &runs[pos - 1];
+        run.base[lane]
+            + if run.mask & (1 << lane) != 0 {
+                (ordinal - run.start + 1) as usize
+            } else {
+                0
+            }
+    }
+}
+
 struct OrderingAnalysis {
-    event_clocks: Vec<Clock>,
+    meta: Vec<EventHb>,
+    ticks: LaneTickIndex,
+    /// Per stream, sorted event indices of its convergence points.
+    convergences: Vec<Vec<usize>>,
 }
 
 impl OrderingAnalysis {
     fn empty() -> Self {
         Self {
-            event_clocks: Vec::new(),
+            meta: Vec::new(),
+            ticks: LaneTickIndex { runs: Vec::new() },
+            convergences: Vec::new(),
         }
     }
 
@@ -3382,9 +3545,18 @@ impl OrderingAnalysis {
             .max()
             .map(|max_stream| max_stream + 1)
             .unwrap_or(0);
-        let mut event_clocks = vec![Clock::new(); events.len()];
-        let mut stream_clocks = vec![Clock::new(); stream_count];
+        let mut meta: Vec<EventHb> = Vec::with_capacity(events.len());
+        let no_scope = EventHb::none();
+        let mut states: Vec<StreamClockState> =
+            (0..stream_count).map(|_| StreamClockState::new()).collect();
+        let mut runs: Vec<Vec<LaneRun>> = (0..stream_count).map(|_| Vec::new()).collect();
+        let mut ordinals: Vec<u32> = vec![0; stream_count];
+        let mut convergences: Vec<Vec<usize>> = vec![Vec::new(); stream_count];
         let mut mbars: HashMap<MbarKey, MbarCycle> = HashMap::new();
+        // Release accumulation: each arriving event joins its published
+        // (lane-projected) clock as it lands; completion freezes the join as
+        // the phase's release for its waiters.
+        let mut mbar_release_acc: HashMap<MbarKey, Clock> = HashMap::new();
         let mut last_release_clocks: HashMap<MbarKey, Clock> = HashMap::new();
         // Cooperative barrier (cta_sync / wg_sync / warp_sync / cluster_sync)
         // happens-before. Per-warp streams rendezvous in shared state and each
@@ -3406,16 +3578,26 @@ impl OrderingAnalysis {
         let mut sem_releases: HashMap<(SemKey, i64), Clock> = HashMap::new();
         for (idx, event) in events.iter().enumerate() {
             let Some(scope) = event_scope(&event.payload) else {
+                meta.push(no_scope.clone());
                 continue;
             };
             let stream_id = scope.stream_id;
+            let mask = scope.active_lanes;
+
+            // Convergence joins the lanes BEFORE the event runs: everything
+            // any lane did earlier is warp-visible from here on.
+            if is_convergence_event(event) {
+                states[stream_id].converge(stream_id);
+                convergences[stream_id].push(idx);
+            }
+
             match &event.payload {
                 TraceEventKind::MbarWait { target, phase, .. } => {
                     let key = MbarKey::from_target(target);
                     let released = mbars.get(&key).is_none_or(|cycle| *phase != cycle.parity);
                     if released {
                         if let Some(release_clock) = last_release_clocks.get(&key) {
-                            join_clock(&mut stream_clocks[stream_id], release_clock);
+                            states[stream_id].acquire(mask, release_clock);
                         }
                     }
                 }
@@ -3427,23 +3609,62 @@ impl OrderingAnalysis {
                 } => {
                     let key = SyncHbKey::new(event.stmt_id, sync_kind, *bar_id, *cycle, scope);
                     if let Some(release_clock) = sync_releases.get(&key) {
-                        join_clock(&mut stream_clocks[stream_id], release_clock);
+                        states[stream_id].acquire(mask, release_clock);
                     }
                 }
                 // semaphore acquire (gmem_wait_eq): join the release published for the
                 // SPECIFIC observed value (value-keyed) — like MbarWait absorbing the
-                // producer's release clock. Done BEFORE the bump so the post-wait clock
-                // dominates the producer's add (and its drained reduce-add).
+                // producer's release clock. Done BEFORE the advance so the post-wait
+                // clock dominates the producer's add (and its drained reduce-add).
                 TraceEventKind::SemAcquire { key, value, .. } => {
                     if let Some(release_clock) = sem_releases.get(&(*key, *value)) {
-                        join_clock(&mut stream_clocks[stream_id], release_clock);
+                        states[stream_id].acquire(mask, release_clock);
                     }
                 }
                 _ => {}
             }
 
-            bump_clock(&mut stream_clocks[stream_id], stream_id);
-            event_clocks[idx] = stream_clocks[stream_id].clone();
+            // Advance the executing lanes and record the event's clock
+            // identity.
+            let ordinal = ordinals[stream_id];
+            ordinals[stream_id] += 1;
+            let new_run = runs[stream_id]
+                .last()
+                .map(|run| run.mask != mask)
+                .unwrap_or(true);
+            if new_run {
+                runs[stream_id].push(LaneRun {
+                    start: ordinal,
+                    mask,
+                    base: states[stream_id].own,
+                });
+            }
+            states[stream_id].advance(mask);
+            let extras: Vec<(u8, Arc<Clock>)> = if states[stream_id].extra.is_empty() {
+                Vec::new()
+            } else {
+                let mut extras: Vec<(u8, Arc<Clock>)> = states[stream_id]
+                    .extra
+                    .iter()
+                    .filter(|(lane, _)| mask & (1u32 << **lane) != 0)
+                    .map(|(lane, clk)| (*lane, Arc::clone(clk)))
+                    .collect();
+                extras.sort_by_key(|(lane, _)| *lane);
+                extras
+            };
+            meta.push(EventHb {
+                stream_id,
+                mask,
+                ordinal,
+                shared: Arc::clone(&states[stream_id].shared),
+                extras,
+            });
+
+            // A warp-collective instruction's effects are warp-visible once it
+            // completes: fold its own ticks straight into the shared clock.
+            if is_warp_collective_event(event) {
+                states[stream_id].converge(stream_id);
+            }
 
             match &event.payload {
                 TraceEventKind::MbarInit { target, count, .. } => {
@@ -3458,12 +3679,12 @@ impl OrderingAnalysis {
                     let key = MbarKey::from_target(target);
                     if let Some(cycle) = mbars.get_mut(&key) {
                         cycle.pending_tx -= *bytes;
-                        cycle.record_release_event(idx);
+                        let published = states[stream_id].published(stream_id, mask);
+                        let acc = mbar_release_acc.entry(key.clone()).or_default();
+                        join_clock(acc, &published);
                         if cycle.complete_if_ready() {
-                            last_release_clocks.insert(
-                                key,
-                                release_clock(&event_clocks, cycle.drain_release_events()),
-                            );
+                            let acc = mbar_release_acc.remove(&key).unwrap_or_default();
+                            last_release_clocks.insert(key, acc);
                         }
                     }
                 }
@@ -3471,12 +3692,12 @@ impl OrderingAnalysis {
                     let key = MbarKey::from_target(target);
                     if let Some(cycle) = mbars.get_mut(&key) {
                         cycle.pending_arrivals -= *count;
-                        cycle.record_release_event(idx);
+                        let published = states[stream_id].published(stream_id, mask);
+                        let acc = mbar_release_acc.entry(key.clone()).or_default();
+                        join_clock(acc, &published);
                         if cycle.complete_if_ready() {
-                            last_release_clocks.insert(
-                                key,
-                                release_clock(&event_clocks, cycle.drain_release_events()),
-                            );
+                            let acc = mbar_release_acc.remove(&key).unwrap_or_default();
+                            last_release_clocks.insert(key, acc);
                         }
                     }
                 }
@@ -3495,8 +3716,9 @@ impl OrderingAnalysis {
                     // never foreign edges, and the frozen generation join is
                     // never clobbered.
                     let key = SyncHbKey::new(event.stmt_id, sync_kind, *bar_id, *cycle, scope);
+                    let published = states[stream_id].published(stream_id, mask);
                     let acc = sync_arrivals.entry(key.clone()).or_default();
-                    join_clock(acc, &event_clocks[idx]);
+                    join_clock(acc, &published);
                     if *count == *thread_count {
                         let acc = sync_arrivals.remove(&key).unwrap_or_default();
                         let release = sync_releases.entry(key).or_default();
@@ -3513,41 +3735,158 @@ impl OrderingAnalysis {
                     order,
                     ..
                 } if *order == super::protocol::GmemAtomicOrderEvent::Release => {
-                    sem_releases.insert((*key, *new_value), event_clocks[idx].clone());
+                    sem_releases.insert(
+                        (*key, *new_value),
+                        states[stream_id].published(stream_id, mask),
+                    );
                 }
                 _ => {}
             }
         }
-        Self { event_clocks }
+        Self {
+            meta,
+            ticks: LaneTickIndex { runs },
+            convergences,
+        }
     }
 
+    /// Was a convergence point of `stream_id` in `(from, to]`? If so, every
+    /// lane's state at `from` is in the stream's shared clock by `to`.
+    fn converged_between(&self, stream_id: usize, from: usize, to: usize) -> bool {
+        let Some(points) = self.convergences.get(stream_id) else {
+            return false;
+        };
+        let next = points.partition_point(|&p| p <= from);
+        points.get(next).is_some_and(|&p| p <= to)
+    }
+
+    /// Lane `lane`'s clock component on dimension `dim` at event `idx`.
+    fn lane_view_get(&self, idx: usize, lane: u8, dim: usize) -> usize {
+        let meta = &self.meta[idx];
+        let mut tick = clock_get(&meta.shared, dim);
+        if dim == lane_dim(meta.stream_id, lane as usize) {
+            tick = tick.max(self.ticks.tick(meta.stream_id, lane as usize, meta.ordinal));
+        }
+        if let Some((_, extra)) = meta.extras.iter().find(|(l, _)| *l == lane) {
+            tick = tick.max(clock_get(extra, dim));
+        }
+        tick
+    }
+
+    /// Lane-slice happens-before: lane `from_lane`'s clock at `from` is at or
+    /// below lane `to_lane`'s clock at `to`.
+    fn ordered_lane(&self, from: usize, from_lane: u8, to: usize, to_lane: u8) -> bool {
+        if from == to {
+            return true;
+        }
+        if from >= self.meta.len() || to >= self.meta.len() {
+            return false;
+        }
+        let mf = &self.meta[from];
+        let mt = &self.meta[to];
+        if mf.mask == 0 || mt.mask == 0 {
+            return false;
+        }
+        if mf.stream_id == mt.stream_id && from < to {
+            // A lane is ordered against itself by program order; against
+            // another lane once the warp reconverged in between.
+            if from_lane == to_lane {
+                return true;
+            }
+            if self.converged_between(mf.stream_id, from, to) {
+                return true;
+            }
+        }
+        for &(dim, tick) in mf.shared.iter() {
+            if tick > self.lane_view_get(to, to_lane, dim) {
+                return false;
+            }
+        }
+        let own_dim = lane_dim(mf.stream_id, from_lane as usize);
+        let own_tick = self
+            .ticks
+            .tick(mf.stream_id, from_lane as usize, mf.ordinal);
+        if own_tick > self.lane_view_get(to, to_lane, own_dim) {
+            return false;
+        }
+        if let Some((_, extra)) = mf.extras.iter().find(|(l, _)| *l == from_lane) {
+            for &(dim, tick) in extra.iter() {
+                if tick > self.lane_view_get(to, to_lane, dim) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Event-level happens-before: EVERY executing lane slice of `from`
+    /// precedes EVERY executing lane slice of `to`.
     fn happens_before(&self, from: usize, to: usize) -> bool {
         if from == to {
             return true;
         }
-        if from >= self.event_clocks.len() || to >= self.event_clocks.len() {
+        if from >= self.meta.len() || to >= self.meta.len() {
             return false;
         }
-        if self.event_clocks[from].is_empty() || self.event_clocks[to].is_empty() {
+        let mf = &self.meta[from];
+        let mt = &self.meta[to];
+        if mf.mask == 0 || mt.mask == 0 {
             return false;
         }
-        clock_leq(&self.event_clocks[from], &self.event_clocks[to])
-    }
-}
-
-fn release_clock(event_clocks: &[Clock], release_idxs: Vec<usize>) -> Clock {
-    let mut clock = Clock::new();
-    for idx in release_idxs {
-        if let Some(release) = event_clocks.get(idx) {
-            join_clock(&mut clock, release);
+        if mf.stream_id == mt.stream_id
+            && from < to
+            && self.converged_between(mf.stream_id, from, to)
+        {
+            return true;
         }
+        // The join over `from`'s lane slices, reduced to the components not
+        // already below `to`'s shared clock. Whatever remains must sit below
+        // every executing `to` lane's private view.
+        let mut residual: Vec<(usize, usize)> = Vec::new();
+        for &(dim, tick) in mf.shared.iter() {
+            if tick > clock_get(&mt.shared, dim) {
+                residual.push((dim, tick));
+            }
+        }
+        for from_lane in 0..WARP_LANES {
+            if mf.mask & (1 << from_lane) == 0 {
+                continue;
+            }
+            let dim = lane_dim(mf.stream_id, from_lane);
+            let tick = self.ticks.tick(mf.stream_id, from_lane, mf.ordinal);
+            if tick > clock_get(&mt.shared, dim) {
+                residual.push((dim, tick));
+            }
+        }
+        for (_, extra) in mf.extras.iter() {
+            for &(dim, tick) in extra.iter() {
+                if tick > clock_get(&mt.shared, dim) {
+                    residual.push((dim, tick));
+                }
+            }
+        }
+        if residual.is_empty() {
+            return true;
+        }
+        for to_lane in 0..WARP_LANES as u8 {
+            if mt.mask & (1u32 << to_lane) == 0 {
+                continue;
+            }
+            for &(dim, tick) in &residual {
+                let mut cover = 0;
+                if dim == lane_dim(mt.stream_id, to_lane as usize) {
+                    cover = self.ticks.tick(mt.stream_id, to_lane as usize, mt.ordinal);
+                }
+                if let Some((_, extra)) = mt.extras.iter().find(|(l, _)| *l == to_lane) {
+                    cover = cover.max(clock_get(extra, dim));
+                }
+                if tick > cover {
+                    return false;
+                }
+            }
+        }
+        true
     }
-    clock
-}
-
-fn bump_clock(clock: &mut Clock, stream_id: usize) {
-    let next = clock_get(clock, stream_id) + 1;
-    clock_set_max(clock, stream_id, next);
 }
 
 fn join_clock(dst: &mut Clock, src: &Clock) {
@@ -3568,11 +3907,6 @@ fn clock_set_max(clock: &mut Clock, stream_id: usize, tick: usize) {
         Ok(idx) => clock[idx].1 = clock[idx].1.max(tick),
         Err(idx) => clock.insert(idx, (stream_id, tick)),
     }
-}
-
-fn clock_leq(left: &Clock, right: &Clock) -> bool {
-    left.iter()
-        .all(|(stream_id, tick)| *tick <= clock_get(right, *stream_id))
 }
 
 #[cfg(test)]
@@ -3882,7 +4216,10 @@ mod tests {
     }
 
     #[test]
-    fn ordering_analysis_keeps_same_stream_order() {
+    fn same_stream_program_order_is_per_lane() {
+        // Two plain full-mask events of one warp: program order holds LANE
+        // against ITSELF; across lanes the slices stay unordered until a
+        // convergence point, and the whole-event relation follows suit.
         let events = vec![
             event(1, TraceEventKind::CommitGroup { scope: scope(0) }),
             event(
@@ -3894,7 +4231,9 @@ mod tests {
             ),
         ];
         let ordering = OrderingAnalysis::new(&events);
-        assert!(ordering.happens_before(0, 1));
+        assert!(ordering.ordered_lane(0, 5, 1, 5));
+        assert!(!ordering.ordered_lane(0, 5, 1, 6));
+        assert!(!ordering.happens_before(0, 1));
         assert!(!ordering.happens_before(1, 0));
     }
 
@@ -4546,7 +4885,7 @@ mod tests {
             &events,
         );
         assert_eq!(report.status, ProtocolStatus::Failed);
-        assert!(diagnostic_codes(&report).contains("intra_warp_cross_lane_race"));
+        assert!(diagnostic_codes(&report).contains("memory_data_race"));
         let diagnostic = &report.diagnostics[0];
         assert_eq!(
             diagnostic.details.get("lanes").map(String::as_str),
@@ -4693,7 +5032,7 @@ mod tests {
             &events,
         );
         assert_eq!(report.status, ProtocolStatus::Failed);
-        assert!(diagnostic_codes(&report).contains("intra_warp_cross_lane_race"));
+        assert!(diagnostic_codes(&report).contains("memory_data_race"));
         assert_eq!(
             report.diagnostics[0]
                 .details

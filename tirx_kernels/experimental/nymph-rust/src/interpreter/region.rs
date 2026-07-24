@@ -688,6 +688,28 @@ pub fn box_covers(left: &BoxN, right: &BoxN) -> bool {
             .all(|(&(ls, le), &(rs, re))| ls <= rs && re <= le)
 }
 
+/// One box vs a region's whole byte set — the per-lane refinement of
+/// `regions_overlap` (a lane's attributed box against the other side's
+/// footprint). A rank mismatch against a strided set has no refinement and
+/// keeps the pair conflicting.
+pub fn box_overlaps_region(bx: &BoxN, region: &Region) -> bool {
+    match &region.boxes {
+        RegionBoxes::Boxes(boxes) => boxes.iter().any(|b| boxes_overlap(bx, b)),
+        RegionBoxes::Strided {
+            start,
+            len,
+            stride,
+            count,
+        } => {
+            if bx.ranges.len() != 1 {
+                return true;
+            }
+            let (bs, be) = bx.ranges[0];
+            strided_box_intersect((*start, *len, *stride, *count), (bs, be))
+        }
+    }
+}
+
 fn tensor_byte_region(
     tensor: &Arc<Tensor>,
     owner: PoolId,
