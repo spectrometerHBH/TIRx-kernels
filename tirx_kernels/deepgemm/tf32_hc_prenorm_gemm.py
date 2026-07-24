@@ -616,20 +616,21 @@ def get_kernel(**kwargs: Any):
             if warp_idx == 0:
                 if T.ptx.elect_sync():
                     # D store via TMA (writes only the valid region of boundary tiles).
-                    d_row: T.let = m_block_idx * T.uint32(block_m)
+                    m0: T.uint32 = m_block_idx * T.uint32(block_m)
                     if num_splits == 1:
                         Tx.copy_async(
-                            d[d_row : d_row + block_m, 0:block_n],
+                            d[m0 : m0 + block_m, 0:block_n],
                             smem_cd_mma,
-                            dispatch="tma_explicit",
+                            dispatch="tma_auto",
                             prefetch_tensormap=True,
                             cache_hint="evict_first",
                         )
                     else:
+                        ks: T.uint32 = k_split_idx
                         Tx.copy_async(
-                            d[k_split_idx : k_split_idx + 1, d_row : d_row + block_m, 0:block_n],
+                            d[ks, m0 : m0 + block_m, 0:block_n],
                             smem_cd_mma,
-                            dispatch="tma_explicit",
+                            dispatch="tma_auto",
                             prefetch_tensormap=True,
                             cache_hint="evict_first",
                         )

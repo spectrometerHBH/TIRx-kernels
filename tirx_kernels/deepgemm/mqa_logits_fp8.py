@@ -527,7 +527,7 @@ def get_kernel(**kwargs: Any):
                     Tx.copy_async(
                         smem_q[q_stage_idx],
                         q_gmem[q_row0 : q_row0 + block_q * num_heads, :],
-                        dispatch="tma_explicit",
+                        dispatch="tma_auto",
                         mbar=q_pipe.full.ptr_to([q_stage_idx]),
                         cta_group=1,
                         cache_hint="evict_normal",
@@ -537,7 +537,7 @@ def get_kernel(**kwargs: Any):
                     Tx.copy_async(
                         smem_weights[q_stage_idx],
                         weights_gmem[q_blk0 : q_blk0 + block_q, :],
-                        dispatch="tma_explicit",
+                        dispatch="tma_auto",
                         mbar=q_pipe.full.ptr_to([q_stage_idx]),
                         cta_group=1,
                         cache_hint="evict_normal",
@@ -569,7 +569,7 @@ def get_kernel(**kwargs: Any):
                         Tx.copy_async(
                             smem_kv[kv_stage_idx],
                             kv_gmem[kv_row0 : kv_row0 + block_kv, :],
-                            dispatch="tma_explicit",
+                            dispatch="tma_auto",
                             mbar=kv_pipe.full.ptr_to([kv_stage_idx]),
                             cta_group=1,
                             cache_hint="evict_normal",
@@ -578,7 +578,7 @@ def get_kernel(**kwargs: Any):
                         Tx.copy_async(
                             smem_kv_scales[kv_stage_idx, 0:block_kv],
                             kv_scales_gmem[kv_row0 : kv_row0 + block_kv],
-                            dispatch="tma_explicit",
+                            dispatch="tma_auto",
                             mbar=kv_pipe.full.ptr_to([kv_stage_idx]),
                             cta_group=1,
                             cache_hint="evict_normal",

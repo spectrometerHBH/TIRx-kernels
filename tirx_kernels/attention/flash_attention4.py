@@ -240,10 +240,6 @@ def _kernel(
     K_smem = pool.alloc_tcgen05_mma_AB((SMEM_PIPE_DEPTH_KV, BLK_N, HEAD_DIM), "float16")
     V_smem = K_smem.view(SMEM_PIPE_DEPTH_KV, BLK_N, HEAD_DIM)
     O_smem = pool.alloc_tcgen05_mma_AB((TMEM_PIPE_DEPTH, BLK_M, HEAD_DIM), "float16")
-    Q_tma = Q.view(BATCH_SIZE * SEQ_LEN_Q, NUM_QO_HEADS * HEAD_DIM)
-    K_tma = K.view(BATCH_SIZE * SEQ_LEN_KV, NUM_KV_HEADS * HEAD_DIM)
-    V_tma = V.view(BATCH_SIZE * SEQ_LEN_KV, NUM_KV_HEADS * HEAD_DIM)
-    O_tma = O.view(BATCH_SIZE * SEQ_LEN_Q, NUM_QO_HEADS * HEAD_DIM)
     sScale = pool.alloc((SSCALE_TOTAL_SIZE,), "float32", align=1024)
     tmem_addr = pool.alloc([1], "uint32")
     ACC_SCALE_BASE: T.let = 0
@@ -369,14 +365,16 @@ def _kernel(
                         }
                     )
                     tma_q_token = iket.range_start("issue-tma-q")
-                    q_row = T.meta_var(batch_idx * SEQ_LEN_Q + m_start + i_q * SEQ_Q_PER_TILE)
-                    q_col = T.meta_var(kv_head_idx * GQA_RATIO * HEAD_DIM)
-                    Q_smem_2d = Q_smem.sub[i_q].view(SEQ_Q_PER_TILE, GQA_RATIO * HEAD_DIM)
+                    Q_smem_4d = Q_smem.view(SMEM_PIPE_DEPTH_Q, SEQ_Q_PER_TILE, GQA_RATIO, HEAD_DIM)
                     if T.ptx.elect_sync():
                         Tx.copy_async(
-                            Q_smem_2d[:, :],
-                            Q_tma[
-                                q_row : q_row + SEQ_Q_PER_TILE, q_col : q_col + GQA_RATIO * HEAD_DIM
+                            Q_smem_4d[i_q, :, :, :],
+                            Q[
+                                batch_idx,
+                                m_start + i_q * SEQ_Q_PER_TILE : m_start
+                                + (i_q + 1) * SEQ_Q_PER_TILE,
+                                kv_head_idx * GQA_RATIO : (kv_head_idx + 1) * GQA_RATIO,
+                                :,
                             ],
                             **tma_copy_q,
                         )
@@ -394,12 +392,10 @@ def _kernel(
                         }
                     )
                     tma_k_token = iket.range_start("issue-tma-k")
-                    kv_row = T.meta_var(batch_idx * SEQ_LEN_KV + i_kv * BLK_N)
-                    kv_col = T.meta_var(kv_head_idx * HEAD_DIM)
                     if T.ptx.elect_sync():
                         Tx.copy_async(
                             K_smem[kv_pipe.stage, :, :],
-                            K_tma[kv_row : kv_row + BLK_N, kv_col : kv_col + HEAD_DIM],
+                            K[batch_idx, i_kv * BLK_N : (i_kv + 1) * BLK_N, kv_head_idx, :],
                             **tma_copy_k,
                         )
                         kv_load.full.arrive(kv_pipe.stage, CTA_GROUP * BLK_N * HEAD_DIM * F16_BYTES)
@@ -417,12 +413,10 @@ def _kernel(
                         }
                     )
                     tma_v_token = iket.range_start("issue-tma-v")
-                    kv_row = T.meta_var(batch_idx * SEQ_LEN_KV + i_kv * BLK_N)
-                    kv_col = T.meta_var(kv_head_idx * HEAD_DIM)
                     if T.ptx.elect_sync():
                         Tx.copy_async(
                             V_smem[kv_pipe.stage, :, :],
-                            V_tma[kv_row : kv_row + BLK_N, kv_col : kv_col + HEAD_DIM],
+                            V[batch_idx, i_kv * BLK_N : (i_kv + 1) * BLK_N, kv_head_idx, :],
                             **tma_copy_v,
                         )
                         kv_load.full.arrive(kv_pipe.stage, CTA_GROUP * BLK_N * HEAD_DIM * F16_BYTES)
@@ -451,15 +445,16 @@ def _kernel(
                     if i_q != 0:
                         corr_epi.full.wait(i_q, phase_tmem)
                     m_start_global = T.meta_var(m_start + i_q * SEQ_Q_PER_TILE)
-                    o_row = T.meta_var(batch_idx * SEQ_LEN_Q + m_start_global)
-                    o_col = T.meta_var(kv_head_idx * GQA_RATIO * HEAD_DIM)
-                    O_smem_2d = O_smem.sub[i_q].view(SEQ_Q_PER_TILE, GQA_RATIO * HEAD_DIM)
+                    O_smem_4d = O_smem.view(TMEM_PIPE_DEPTH, SEQ_Q_PER_TILE, GQA_RATIO, HEAD_DIM)
                     if T.ptx.elect_sync():
                         Tx.copy_async(
-                            O_tma[
-                                o_row : o_row + SEQ_Q_PER_TILE, o_col : o_col + GQA_RATIO * HEAD_DIM
+                            O[
+                                batch_idx,
+                                m_start_global : m_start_global + SEQ_Q_PER_TILE,
+                                kv_head_idx * GQA_RATIO : (kv_head_idx + 1) * GQA_RATIO,
+                                :,
                             ],
-                            O_smem_2d[:, :],
+                            O_smem_4d[i_q, :, :, :],
                             dispatch="tma_auto",
                         )
                     T.ptx.cp_async.bulk.commit_group()

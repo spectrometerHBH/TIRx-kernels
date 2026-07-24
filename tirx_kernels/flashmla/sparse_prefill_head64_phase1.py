@@ -650,7 +650,7 @@ def _kernel(
                         Tx.copy_async(
                             out.chunk((None, None, D_V // 64))[s_q_idx, :, epi_chunk_idx],
                             o_smem.chunk((None, D_V // 64))[:, epi_chunk_idx],
-                            **tma_config(dispatch="tma_explicit"),
+                            **tma_config(),
                         )
                 if warp_idx == 1:
                     if T.ptx.elect_sync():
@@ -659,7 +659,7 @@ def _kernel(
                         Tx.copy_async(
                             out.chunk((None, None, D_V // 64))[s_q_idx, :, epi_chunk_idx],
                             o_smem.chunk((None, D_V // 64))[:, epi_chunk_idx],
-                            **tma_config(dispatch="tma_explicit"),
+                            **tma_config(),
                         )
 
         if warp_idx == 0:

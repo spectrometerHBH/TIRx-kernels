@@ -455,13 +455,11 @@ def _kernel(
             T.ptx.bar.sync(BAR_WG0_SYNC, 128)
             if warp_idx == 0:
                 if T.ptx.elect_sync():
-                    q_smem_tma = q_smem.rearrange("h (chunk d0) -> chunk h d0", d0=64)
-                    for o_chunk in T.unroll(D_V // 64):
-                        Tx.copy_async(
-                            out.chunk((None, 2, D_V // 64))[o_s_q_idx, cta_idx, o_chunk],
-                            q_smem_tma[o_chunk, :, :],
-                            **tma_config(dispatch="tma_explicit"),
-                        )
+                    Tx.copy_async(
+                        out.chunk((None, 2, None))[o_s_q_idx, cta_idx, :],
+                        q_smem[:, :],
+                        **tma_config(),
+                    )
                     T.ptx.cp_async.bulk.commit_group()
 
         wg0_job_valid: T.int32 = 1

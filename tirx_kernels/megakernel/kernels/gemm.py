@@ -303,7 +303,7 @@ class GemmTile(Tile):
                 m_st = T.meta_var(m_idx * self.M_pad_size + ko * self.EPI_TILE)
                 n_st = T.meta_var(n_idx * self.BLK_N)
                 tma_config = T.meta_var(
-                    {"dispatch": "tma_explicit", "cta_group": KernelConfig.CTA_GROUP}
+                    {"dispatch": "tma_auto", "cta_group": KernelConfig.CTA_GROUP}
                     | (
                         {"cache_hint": "evict_last" if self.low_batch else ""}
                         if self.split_k_factor > 1
@@ -347,7 +347,7 @@ class GemmTile(Tile):
                         self.mma2tma_bar.wait(ks, self.phase[0])
                         B_tma_config = T.meta_var(
                             {
-                                "dispatch": "tma_explicit",
+                                "dispatch": "tma_auto",
                                 "cta_group": KernelConfig.CTA_GROUP,
                                 "mbar": self.tma2mma_bar.mbar.ptr_to([ks]),
                                 "cache_hint": "evict_first" if self.low_batch else "",
@@ -420,7 +420,7 @@ class GemmTile(Tile):
                         )
                         B_tma_config = T.meta_var(
                             {
-                                "dispatch": "tma_explicit",
+                                "dispatch": "tma_auto",
                                 "cta_group": KernelConfig.CTA_GROUP,
                                 "mbar": self.tma2mma_bar.mbar.ptr_to([ks]),
                                 "cache_hint": "evict_first" if self.low_batch else "",
@@ -488,7 +488,7 @@ class GemmTile(Tile):
                         self.mma2tma_bar.wait(ks, self.phase[0])
                         B_tma_config = T.meta_var(
                             {
-                                "dispatch": "tma_explicit",
+                                "dispatch": "tma_auto",
                                 "cta_group": KernelConfig.CTA_GROUP,
                                 "mbar": self.tma2mma_bar.mbar.ptr_to([ks]),
                                 "cache_hint": "evict_first" if self.low_batch else "",
@@ -496,7 +496,7 @@ class GemmTile(Tile):
                         )
                         A_tma_config = T.meta_var(
                             {
-                                "dispatch": "tma_explicit",
+                                "dispatch": "tma_auto",
                                 "cta_group": KernelConfig.CTA_GROUP,
                                 "mbar": self.tma2mma_bar.mbar.ptr_to([ks]),
                                 "cache_hint": "evict_last" if self.low_batch else "",
@@ -654,7 +654,7 @@ class GemmTile(Tile):
                     if T.ptx.elect_sync():
                         tma_config = T.meta_var(
                             {
-                                "dispatch": "tma_explicit",
+                                "dispatch": "tma_auto",
                                 "cta_group": KernelConfig.CTA_GROUP,
                                 "mbar": self.tma2mma_bar.mbar.ptr_to([ks]),
                                 "cache_hint": "evict_first" if self.low_batch else "",
