@@ -3449,7 +3449,7 @@ impl OrderingAnalysis {
                     if let Some(cycle) = mbars.get_mut(&key) {
                         cycle.pending_tx -= *bytes;
                         let published = states[stream_id].published(stream_id, mask, ordinal);
-                        let acc = mbar_release_acc.entry(key.clone()).or_default();
+                        let acc = mbar_release_acc.entry(key).or_default();
                         join_clock(acc, &published);
                         if cycle.complete_if_ready() {
                             let acc = mbar_release_acc.remove(&key).unwrap_or_default();
@@ -3462,7 +3462,7 @@ impl OrderingAnalysis {
                     if let Some(cycle) = mbars.get_mut(&key) {
                         cycle.pending_arrivals -= *count;
                         let published = states[stream_id].published(stream_id, mask, ordinal);
-                        let acc = mbar_release_acc.entry(key.clone()).or_default();
+                        let acc = mbar_release_acc.entry(key).or_default();
                         join_clock(acc, &published);
                         if cycle.complete_if_ready() {
                             let acc = mbar_release_acc.remove(&key).unwrap_or_default();
@@ -3665,10 +3665,6 @@ impl OrderingAnalysis {
                 continue;
             }
             for &(dim, tick) in &residual {
-                // Same-lane program order covers a lane's own component.
-                if same_stream_forward && dim == lane_dim(mt.stream_id, to_lane as usize) {
-                    continue;
-                }
                 if !self.covers(to, to_lane, dim, tick) {
                     return false;
                 }
