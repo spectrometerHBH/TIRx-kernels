@@ -96,13 +96,32 @@ Design points:
 
 ## Correctness
 
-The fp16/bf16 GEMM (m=512, n=256, k=64, cta_group=2) runs end-to-end and is **cell-exact**:
+Seven kernels are built on the warp-model IR: bootstrap_gemm, fp16_bf16_gemm,
+nvfp4_gemm (all three also lowered by the TIRx codegen through the compile
+gate), fp8_blockwise_gemm, gdn_prefill, flash_attention4, flash_bwd_sm100.
+
+The fp16/bf16 GEMM (CLC scheduler + overlap epilogue, per-shape GEMM_CONFIGS)
+runs end-to-end and is **cell-exact**:
 - vs a numpy reference `round(A @ Bᵀ, dtype)` — 0 mismatches, **fp16 and bf16**.
 - vs the **original Python interpreter** — 0 mismatches, cell for cell.
 
 This kernel exercises TMA load/store, the cta_group=2 MMA, the TMEM collective +
 scratchpad, mbarrier handshakes (incl. the precise wake), cooperative sync, the
-register ALU/cvt, and the direct-mutation runner.
+register ALU/cvt, and the direct-mutation runner. The nvfp4 block-scaled GEMM is
+cell-exact on self-consistent quantization recipes (small e2m1 codes,
+power-of-two e4m3 scales/alpha).
+
+**sim ⇄ GPU bit-exactness** (`tests/gpu/test_gpu_sim_parity.py`, CUDA-only):
+the SAME kernel + inputs run through the value simulator and through the tirx
+codegen + `tvm.compile` on a B200 — nvfp4 1024³ and fp16 1024³ (the CLC +
+overlap path) match sim bit-for-bit.
+
+**GPU perf vs canon** (`bench/RESULTS.md`, orchestrator, rounds=5, B200):
+fp16/bf16 1024 = 1.018-1.019, nvfp4 2048-16384 = 0.99-1.03; the full table and
+the nvfp4 1024 borderline analysis live in `bench/RESULTS.md`. The fp16 1024
+R2UR spot check (ncu): nymph 768 vs canon 1792 executed R2UR — the R2UR
+convergence forms (rolled k-loop, runtime accum cell, T.let decode chain,
+ring induction counters) all reach silicon.
 
 Test coverage: `cargo test` (lib unit tests — IR, the typed value layer + dtype
 coercion, engine loop — plus 11 Rust-internal integration tests in
@@ -111,7 +130,7 @@ no-partial-values-on-failure, internal commit cells) + `tests/` (Python: `ir/`
 binding/validation/structure, `interpreter/` per-op value behavior — incl.
 `test_warp_model.py`, which pins the per-warp concurrency semantics: cross-warp
 race reporting, warp-specialized intra-iteration handshakes — `kernels/`
-e2e/parity/determinism).
+e2e/parity/determinism, `gpu/` sim⇄silicon bitwise parity).
 
 ## Performance
 

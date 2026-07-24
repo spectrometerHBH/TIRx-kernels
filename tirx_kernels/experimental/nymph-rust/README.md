@@ -17,6 +17,8 @@ concurrency, ordered only by explicit synchronization.
 
 - [IR](docs/ir.md) - the Rust IR data model, validation policy, and extension
   rules.
+- [IR op semantics ledger](docs/ir-ops.md) - per-op record of what the
+  interpreter models / rejects / silently accepts vs the PTX ISA.
 - [Interpreter Architecture](docs/interpreter.md) - per-warp streams,
   scheduling, thread dispatch, blocking, value state, and the direct-mutation
   execution model.
@@ -24,8 +26,21 @@ concurrency, ordered only by explicit synchronization.
   by statement family and the current proof boundary.
 - [Hardware Verification](docs/hardware-verification.md) - B200 validation for
   the tcgen05 ld/st datapath and MMA accumulator layouts.
+- [LIMITATIONS](LIMITATIONS.md) - the known sim ↔ silicon divergences; read
+  before trusting a green sim run.
+- [Perf methodology](docs/perf-methodology.md) - how the nymph ↔ canon gap is
+  measured (bench-suite orchestrator) and diagnosed (ncu opcode diff).
 - [Port Status](STATUS.md) - current implementation, correctness, performance,
   and remaining optimization work.
+
+## Bench
+
+`bench/run_suite.py` is the thin wrapper over the bench-suite orchestrator
+(automatic GPU selection/requeue; per-workload subprocess isolation). The
+nymph kernels self-register in every worker via the repo-local
+`bench/sitecustomize.py`; the interfaces (KERNEL_META / CONFIGS / run_bench)
+live in the kernel modules. See `bench/nymph_bench_guide.md`; the baseline
+table is `bench/RESULTS.md`.
 
 ## Execution And Checking Model
 
