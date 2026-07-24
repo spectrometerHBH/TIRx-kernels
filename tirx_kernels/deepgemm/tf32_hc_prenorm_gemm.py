@@ -514,17 +514,13 @@ def get_kernel(**kwargs: Any):
                     for s in T.serial(T.uint32(0), num_total_stages):
                         stage_idx: T.uint32 = tma_st
                         smem_pipe.empty.wait(stage_idx, tma_ph)
+                        m_idx0: T.uint32 = m_block_idx * T.uint32(block_m)
+                        k_idx0: T.uint32 = k_offset + s * T.uint32(block_k)
                         # A as bf16 (exact in tf32); B as TFLOAT32 so TMA RN-truncates
                         # on load, matching the tf32 MMA (else ~1 ULP divergence).
                         Tx.copy_async(
                             smem_a_mma[stage_idx],
-                            a[
-                                m_block_idx * T.uint32(block_m) : m_block_idx * T.uint32(block_m)
-                                + block_m,
-                                k_offset + s * T.uint32(block_k) : k_offset
-                                + s * T.uint32(block_k)
-                                + block_k,
-                            ],
+                            a[m_idx0 : m_idx0 + block_m, k_idx0 : k_idx0 + block_k],
                             dispatch="tma_explicit",
                             mbar=smem_pipe.full.ptr_to([stage_idx]),
                             cta_group=1,
@@ -535,13 +531,7 @@ def get_kernel(**kwargs: Any):
                         for b_atom in T.unroll(block_k // 32):
                             Tx.copy_async(
                                 smem_b_mma[stage_idx, :, b_atom * 32 : b_atom * 32 + 32],
-                                b[
-                                    0:block_n,
-                                    k_offset + s * T.uint32(block_k) + b_atom * 32 : k_offset
-                                    + s * T.uint32(block_k)
-                                    + b_atom * 32
-                                    + 32,
-                                ],
+                                b[0:block_n, k_idx0 + b_atom * 32 : k_idx0 + b_atom * 32 + 32],
                                 dispatch="tma_explicit",
                                 mbar=smem_pipe.full.ptr_to([stage_idx]),
                                 cta_group=1,
