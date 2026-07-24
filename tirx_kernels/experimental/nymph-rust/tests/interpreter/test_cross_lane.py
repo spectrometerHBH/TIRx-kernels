@@ -170,7 +170,7 @@ def _publish_kernel(*, write: str, warp_sync: bool, arrive: str = "elected"):
     release-ordered before its own arrive).
     `warp_sync` inserts the converging sync between the write and the arrive.
     """
-    b = builder("cross_lane_publish", smem_size_bytes=STMATRIX_ROWS * 8 * 2)
+    b = builder("cross_lane_elected_arrive", smem_size_bytes=STMATRIX_ROWS * 8 * 2)
     smem = smem_tensor(b, dtype=nr.DType.U32, shape=(LANES,), byte_offset=0)
     reg = reg_tensor(b, dtype=nr.DType.U32, shape=(1,))
     out = gmem_arg(b, dtype=nr.DType.U32, shape=(LANES,))
@@ -270,7 +270,7 @@ def test_unconsumed_divergent_write_with_elected_arrive_passes():
     # reads the divergent bytes: with no conflicting access pair there is
     # nothing to order — visibility is judged where data is consumed, never
     # at the release itself.
-    b = builder("cross_lane_publish_within_warp", smem_size_bytes=LANES * 4)
+    b = builder("cross_lane_unconsumed_divergent_write", smem_size_bytes=LANES * 4)
     smem = smem_tensor(b, dtype=nr.DType.U32, shape=(LANES,), byte_offset=0)
     reg = reg_tensor(b, dtype=nr.DType.U32, shape=(1,))
     mbar = b.mbar(kind=nr.MBarKind.THREAD)
