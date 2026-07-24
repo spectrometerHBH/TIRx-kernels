@@ -293,8 +293,8 @@ def test_reg_min_caps_safe_reciprocal_for_fa4_epilogue():
     np.testing.assert_array_equal(output(outputs, out_g), f32([1.0, 1.0, 1.0, 0.5]))
 
 
-def test_reg_cond_rescale_uses_warpgroup_any_scope():
-    b = builder("reg_cond_rescale_wg", num_warps=4)
+def test_reg_cond_rescale_uses_warp_any_scope():
+    b = builder("reg_cond_rescale_warp", num_warps=4)
     src_g = gmem_arg(b, dtype=nr.DType.F32, shape=(1,))
     scale_g = gmem_arg(b, dtype=nr.DType.F32, shape=(128,))
     out_g = gmem_arg(b, dtype=nr.DType.F32, shape=(128,))
@@ -305,9 +305,12 @@ def test_reg_cond_rescale_uses_warpgroup_any_scope():
     with b.if_warpgroup(0):
         b.reg_load(src, src_g[0])
         b.reg_load(scale, scale_g[b.tid_in_wg()])
-        b.reg_cond_rescale(out, src, scale, threshold=1.0, scope="warpgroup")
+        b.reg_cond_rescale(out, src, scale, threshold=1.0, scope="warp")
         b.reg_store(out_g[b.tid_in_wg()], out)
 
+    # Both below-threshold and above-threshold scales sit in warp 0, so warp 0
+    # rescales its whole 32 rows; warps 1-3 see only scale == 1.0 (an exact
+    # float identity), so the result is 2.0 * scales regardless of scope.
     scales = np.ones(128, dtype=np.float32)
     scales[7] = 0.5
     scales[9] = 1.5
@@ -333,7 +336,7 @@ def test_reg_cond_rescale_direct_matches_slow_dynamic_slot():
     with b.if_warpgroup(0):
         b.reg_load(src_direct, src_g[b.tid_in_wg()])
         b.reg_load(scale_direct, scale_g[b.tid_in_wg()])
-        b.reg_cond_rescale(out_direct, src_direct, scale_direct, threshold=1.0, scope="warpgroup")
+        b.reg_cond_rescale(out_direct, src_direct, scale_direct, threshold=1.0, scope="warp")
         b.reg_store(direct_g[b.tid_in_wg()], out_direct)
 
         b.reg_load(src_slow[slot], src_g[b.tid_in_wg()])

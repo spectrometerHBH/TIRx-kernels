@@ -426,6 +426,34 @@ def test_accepts_wg_sync_in_full_warpgroup_branch():
     make([n.If(cond=cond, then_body=(n.WgSync(barrier_id=1),))], num_warps=8)
 
 
+def _wg_branch(wg, bar):
+    return n.If(
+        cond=n.ScopeValue(kind="warpgroup_id").eq(wg), then_body=(n.WgSync(barrier_id=bar),)
+    )
+
+
+def test_accepts_wg_sync_reused_within_one_warpgroup():
+    # One warpgroup may reuse its barrier_id across many wg_syncs.
+    make([_wg_branch(0, 1), _wg_branch(0, 1), _wg_branch(0, 1)], num_warps=8)
+
+
+def test_rejects_wg_sync_barrier_id_across_two_warpgroups():
+    # Two warpgroups on the same physical barrier would collide.
+    with pytest.raises(ValueError, match="more than one warpgroup"):
+        make([_wg_branch(0, 1), _wg_branch(1, 1)], num_warps=8)
+
+
+def test_rejects_reg_cond_rescale_warpgroup_scope():
+    dst = reg([4], dtype=n.DType.F32)[:]
+    with pytest.raises(ValueError, match="scope must be warp"):
+        make([n.RegCondRescale(dst=dst, src=dst, scale=dst, threshold=dst, scope="warpgroup")])
+
+
+def test_accepts_reg_cond_rescale_warp_scope():
+    dst = reg([4], dtype=n.DType.F32)[:]
+    make([n.RegCondRescale(dst=dst, src=dst, scale=dst, threshold=dst, scope="warp")])
+
+
 def test_rejects_warp_sync_in_subwarp_branch():
     cond = n.ScopeValue(kind="lane_id").eq(0)
     with pytest.raises(ValueError, match="whole warps"):

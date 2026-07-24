@@ -1129,7 +1129,10 @@ def _emit_o_rescale(k: IRBuilder, o_stage: Tensor, o_frag: Tensor, row_scale: Te
         col = d_tile * O_CHUNK_CELLS
         k.tcgen05_ld(o_frag, o_stage, num=O_CHUNK_CELLS, row=0, col=col)
         k.tcgen05_wait_ld()
-        k.reg_cond_rescale(o_frag, o_frag, row_scale, threshold=1.0, scope="warpgroup")
+        # A register reduction spans one warp; the group-any is only a skip
+        # optimization here (rows that need no rescale carry row_scale == 1.0,
+        # an exact float identity), so warp scope is value-equivalent.
+        k.reg_cond_rescale(o_frag, o_frag, row_scale, threshold=1.0, scope="warp")
         k.tcgen05_st(o_stage, o_frag, num=O_CHUNK_CELLS, row=0, col=col)
     k.tcgen05_wait_st()
 

@@ -1276,10 +1276,19 @@ fn validate_stmt(s: &Stmt) -> R {
             src,
             scale,
             threshold,
-            ..
+            scope,
         } => {
             if !is_float_reg_dtype(dst.tensor.dtype) {
                 return bail("reg_cond_rescale dst dtype must be f16, bf16, or f32");
+            }
+            // A register reduction sees only the executing warp's rows, so its
+            // group predicate spans one warp. A warpgroup group would need the
+            // four warps' registers together, which one warp's execution cannot
+            // provide.
+            if matches!(scope, RegCondScope::Warpgroup) {
+                return bail(
+                    "reg_cond_rescale scope must be warp (a register reduction spans one warp)",
+                );
             }
             check_reg_alu(
                 dst,
@@ -1601,6 +1610,20 @@ fn check_context(
                     }
                     let warps = barriers.wg_sync_warps.entry(*barrier_id).or_default();
                     warps.extend(set.warps_touched());
+                    // The 16 hardware named barriers are a CTA-wide resource; a
+                    // wg_sync is a warpgroup-scoped rendezvous, so one barrier_id
+                    // belongs to a single warpgroup. Two warpgroups on the same
+                    // id would collide — a cross-warpgroup rendezvous is a
+                    // named_barrier.
+                    let warpgroups: std::collections::BTreeSet<u32> =
+                        warps.iter().map(|w| w / 4).collect();
+                    if warpgroups.len() > 1 {
+                        return bail(
+                            "wg_sync barrier_id is used by more than one warpgroup \
+                             (each of the 16 hardware barriers belongs to one warpgroup; \
+                             a cross-warpgroup rendezvous is a named_barrier)",
+                        );
+                    }
                     if let Some(named) = barriers.named_warps.get(barrier_id) {
                         if warps.intersection(named).next().is_some() {
                             return bail(

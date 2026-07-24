@@ -836,7 +836,7 @@ class IRBuilder:
         scale: RegOperand,
         *,
         threshold: RegOperand = 1.0,
-        scope: RegCondScope = "warpgroup",
+        scope: RegCondScope = "warp",
     ) -> None:
         if isinstance(dst, Tensor):
             dst = dst[...]
