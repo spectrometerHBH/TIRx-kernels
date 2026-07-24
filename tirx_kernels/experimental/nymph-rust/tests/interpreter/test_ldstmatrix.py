@@ -37,7 +37,7 @@ def _ldmatrix_kernel(num, trans):
         # one elected producer thread; the warp waits before reading SMEM.
         with b.if_elected():
             b.mbarrier_arrive_expect_tx(mbar, bytes=nbytes)
-            b.tma_load(smem, source, mbar=mbar, bytes=nbytes, coords=(0, 0), shape=(rows, 8))
+            b.tma_load(smem, source, mbar=mbar, coords=(0, 0), shape=(rows, 8))
         b.mbarrier_wait(mbar, phase=0)
         b.ldmatrix(frag, smem[b.lane_id() % rows, 0:8], num=num, trans=trans)
         b.reg_store(out[b.lane_id(), 0:num], frag)

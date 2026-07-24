@@ -31,7 +31,6 @@ def test_tma_load_rejects_non_multicast_mbar_target_mismatch():
                 dst,
                 src,
                 mbar=b.mbar_ref(mbar, remote_coord=remote_coord),
-                bytes=4,
                 coords=(0,),
                 shape=(1,),
                 cta_group=cta_group,
@@ -56,7 +55,7 @@ def test_tma_load_store_value_mode_roundtrips_and_preserves_gmem_cells():
 
     with b.if_warp(0), b.if_elected():
         b.mbarrier_arrive_expect_tx(mbar, bytes=16)
-        b.tma_load(smem, source, mbar=mbar, bytes=16, coords=(0,), shape=(4,))
+        b.tma_load(smem, source, mbar=mbar, coords=(0,), shape=(4,))
         b.tma_store(out, smem, coords=(2,), shape=(4,))
         b.reg_load(reg, out)
         b.reg_store(dump, reg)
@@ -81,13 +80,7 @@ def test_tma_value_mode_uses_explicit_full_rank_gmem_shape():
     with b.if_warp(0), b.if_elected():
         b.mbarrier_arrive_expect_tx(mbar, bytes=64)
         b.tma_load(
-            smem,
-            source,
-            mbar=mbar,
-            bytes=64,
-            coords=(0, 1, 0, 0),
-            shape=(4, 4),
-            gmem_shape=(1, 2, 2, 4),
+            smem, source, mbar=mbar, coords=(0, 1, 0, 0), shape=(4, 4), gmem_shape=(1, 2, 2, 4)
         )
         b.tma_store(out, smem, coords=(0, 0, 0, 0), shape=(4, 4), gmem_shape=(1, 2, 2, 4))
         b.reg_load(reg, out[0:1, 0:2, 0:2, 0:4])
@@ -119,14 +112,15 @@ def test_tma_multicast_writes_each_cta_smem():
     with b.if_warp(0), b.if_elected():
         # The issuing thread arms expect_tx immediately before its own tma_load;
         # then BOTH CTAs gate their reads on the load's mbarrier (CTA 1 waits
-        # it remotely).
+        # it remotely). The load's mbar is the LOCAL ref: a cg2 multicast
+        # completes the tx once, on the leader's own cell (a peer-referenced
+        # mbar here is unmodelable and rejected at build time).
         with b.if_(cta_eq(b, 0)):
             b.mbarrier_arrive_expect_tx(mbar, bytes=16)
             b.tma_load(
                 smem,
                 source,
-                mbar=even_mbar,
-                bytes=16,
+                mbar=mbar,
                 coords=(0,),
                 shape=(4,),
                 multicast_cta_mask=0b11,
@@ -168,7 +162,7 @@ def test_tma_load_gmem_region_is_per_row_rectangle():
         b.mbarrier_init(mbar, count=1)
     with b.if_warp(0), b.if_elected():
         b.mbarrier_arrive_expect_tx(mbar, bytes=8)
-        b.tma_load(smem, source, mbar=mbar, bytes=8, coords=(1, 3), shape=(2, 4))
+        b.tma_load(smem, source, mbar=mbar, coords=(1, 3), shape=(2, 4))
         b.mbarrier_wait(mbar, phase=0)
     report = nr.check_protocol(b.build(), include_events=True)
     assert report["status"] == "Passed"
@@ -190,7 +184,7 @@ def test_tma_load_gmem_region_clamps_partial_tile():
         b.mbarrier_init(mbar, count=1)
     with b.if_warp(0), b.if_elected():
         b.mbarrier_arrive_expect_tx(mbar, bytes=16)
-        b.tma_load(smem, source, mbar=mbar, bytes=16, coords=(3, 12), shape=(2, 8))
+        b.tma_load(smem, source, mbar=mbar, coords=(3, 12), shape=(2, 8))
         b.mbarrier_wait(mbar, phase=0)
     report = nr.check_protocol(b.build(), include_events=True)
     assert report["status"] == "Passed"
@@ -237,7 +231,7 @@ def _tma_load_fake_release_kernel(wait_tma):
     with b.if_warp(0):
         with b.if_(b.lane_id().eq(0)):
             b.mbarrier_arrive_expect_tx(tma_mbar, bytes=64)
-            b.tma_load(smem, source, mbar=tma_mbar, bytes=64, coords=(0, 0), shape=(4, 4))
+            b.tma_load(smem, source, mbar=tma_mbar, coords=(0, 0), shape=(4, 4))
             if wait_tma:
                 b.mbarrier_wait(tma_mbar, phase=0)
             b.mbarrier_arrive(ready)

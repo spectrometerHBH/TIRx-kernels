@@ -1,57 +1,64 @@
-from helpers import builder, expect_runtime_error, run, tmem_tensor
+import pytest
+from helpers import builder, expect_runtime_error, run
 
 
 def test_tmem_lifecycle_failures_are_fail_closed():
+    # Most invalid lifecycle shapes now fail closed at kernel BUILD time: the
+    # validator's single-live-base-0-band walk (base_col == 0, one live band,
+    # dealloc must match) rejects them before the interpreter ever runs,
+    # shadowing the old runtime codes (tmem_already_allocated,
+    # missing_tmem_allocation, tmem_allocation_overlap,
+    # tmem_allocation_mismatch).
     cases = []
 
     b = builder("tmem_duplicate")
-    duplicate = tmem_tensor(b, col_start=0)
     with b.if_warp(0):
-        b.tmem_alloc(duplicate, n_cols=128)
-        b.tmem_alloc(duplicate, n_cols=128)
-    cases.append((b, "tmem_already_allocated"))
+        b.tmem_alloc(0, 128)
+        b.tmem_alloc(0, 128)
+    cases.append((b, "while another allocation is still live"))
 
     b = builder("tmem_missing")
-    missing = tmem_tensor(b, col_start=0)
     with b.if_warp(0):
-        b.tmem_dealloc(missing, n_cols=128)
-    cases.append((b, "missing_tmem_allocation"))
+        b.tmem_dealloc(0, 128)
+    cases.append((b, "tmem_dealloc does not match a live allocation"))
 
     b = builder("tmem_overlap")
-    overlap_a = tmem_tensor(b, col_start=0)
-    overlap_b = tmem_tensor(b, col_start=32)
     with b.if_warp(0):
-        b.tmem_alloc(overlap_a, n_cols=64)
-        b.tmem_alloc(overlap_b, n_cols=64)
-    cases.append((b, "tmem_allocation_overlap"))
-
-    b = builder("tmem_order")
-    small = tmem_tensor(b, col_start=128)
-    large = tmem_tensor(b, col_start=0)
-    with b.if_warp(0):
-        b.tmem_alloc(small, n_cols=64)
-        b.tmem_alloc(large, n_cols=128)
-    cases.append((b, "tmem_allocation_order"))
+        b.tmem_alloc(0, 64)
+        b.tmem_alloc(32, 64)
+    cases.append((b, "tmem_alloc base_col must be 0"))
 
     b = builder("tmem_mismatch")
-    alloc = tmem_tensor(b, col_start=0)
-    mismatch = tmem_tensor(b, col_start=32)
     with b.if_warp(0):
-        b.tmem_alloc(alloc, n_cols=64)
+        b.tmem_alloc(0, 64)
     with b.if_warp(0):
-        b.tmem_dealloc(mismatch, n_cols=64)
-    cases.append((b, "tmem_allocation_mismatch"))
+        b.tmem_dealloc(32, 64)
+    cases.append((b, "tmem_dealloc does not match a live allocation"))
 
-    for case, code in cases:
-        with expect_runtime_error(code):
-            run(case.build())
+    for case, pattern in cases:
+        with pytest.raises(ValueError, match=pattern):
+            case.build()
+
+    # tmem_allocation_order stays a RUNTIME failure: a freed band may be
+    # re-allocated (the single-live-band rule is satisfied), but the new
+    # band's n_cols may not exceed the previous one's within a CTA.
+    b = builder("tmem_order")
+    with b.if_warp(0):
+        b.tmem_alloc(0, 64)
+        b.tmem_dealloc(0, 64)
+        b.tmem_alloc(0, 128)
+    with expect_runtime_error("tmem_allocation_order"):
+        run(b.build())
 
 
 def test_tmem_cta_group2_missing_peer_fails_closed():
+    # A cta_group=2 alloc needs a cluster pair; with a 1-CTA cluster the
+    # validator rejects the alloc's cta_group against the kernel-level group
+    # at build time (shadowing the old runtime tmem_collective_peer failure —
+    # with a real pair the peer always exists).
     b = builder("tmem_cta_group2_missing_peer")
-    missing = tmem_tensor(b, col_start=0)
     with b.if_warp(0):
-        b.tmem_alloc(missing, n_cols=128, cta_group=2)
+        b.tmem_alloc(0, 128, cta_group=2)
 
-    with expect_runtime_error("tmem_collective_peer"):
-        run(b.build())
+    with pytest.raises(ValueError, match=r"tmem_alloc cta_group=2 != kernel cta_group=1"):
+        b.build()

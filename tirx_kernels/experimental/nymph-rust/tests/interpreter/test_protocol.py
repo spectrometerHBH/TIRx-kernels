@@ -1,13 +1,5 @@
 import nymph_rs as nr
-from helpers import (
-    builder,
-    expect_runtime_error,
-    gmem_arg,
-    reg_tensor,
-    smem_tensor,
-    tmem_tensor,
-    u32,
-)
+from helpers import builder, expect_runtime_error, gmem_arg, reg_tensor, smem_tensor, tmem_band, u32
 from nymph_rs.kernels import build_fp16_bf16_gemm
 from nymph_rs.kernels.fp16_bf16_gemm import Fp16Bf16GemmConfig
 
@@ -199,7 +191,7 @@ def test_protocol_deadlock_returns_failed_report():
     with b.if_warp(0), b.if_elected():
         b.mbarrier_expect_tx(mbar, bytes=8)
         b.mbarrier_arrive(mbar)
-        b.mbarrier_wait(mbar)
+        b.mbarrier_wait(mbar, phase=0)
 
     report = nr.check_protocol(b.build(), include_events=True)
     assert report["status"] == "Failed"
@@ -226,7 +218,7 @@ def test_protocol_blocked_mbar_wait_emits_completion_event():
     with b.if_warp(1), b.if_elected():
         b.scalar(initial=0, dtype=nr.ScalarDType.I32)
         b.mbarrier_arrive_expect_tx(mbar, bytes=16)
-        b.tma_load(smem, source, mbar=mbar, bytes=16, coords=(0,), shape=(4,))
+        b.tma_load(smem, source, mbar=mbar, coords=(0,), shape=(4,))
 
     report = nr.check_protocol(b.build(), include_events=True)
     assert report["status"] == "Passed"
@@ -250,7 +242,7 @@ def test_protocol_payload_control_bridge_is_inconclusive():
         b.mbarrier_init(mbar, count=1)
     with b.if_warp(0), b.if_elected():
         b.mbarrier_arrive_expect_tx(mbar, bytes=4)
-        b.tma_load(smem, source, mbar=mbar, bytes=4, coords=(0,), shape=(1,))
+        b.tma_load(smem, source, mbar=mbar, coords=(0,), shape=(1,))
         b.scalar(initial=smem[0], dtype=nr.ScalarDType.U32)
 
     report = nr.check_protocol(b.build())
@@ -269,7 +261,7 @@ def test_protocol_skipped_bulk_write_invalidates_prior_scalar_cell():
     with b.if_warp(0), b.if_elected():
         b.store_scalar(smem[0], 7)
         b.mbarrier_arrive_expect_tx(mbar, bytes=4)
-        b.tma_load(smem, source, mbar=mbar, bytes=4, coords=(0,), shape=(1,))
+        b.tma_load(smem, source, mbar=mbar, coords=(0,), shape=(1,))
         b.scalar(initial=smem[0], dtype=nr.ScalarDType.U32)
 
     report = nr.check_protocol(b.build())
@@ -278,7 +270,7 @@ def test_protocol_skipped_bulk_write_invalidates_prior_scalar_cell():
 
 
 def test_protocol_gemm_trace_runs_without_payload_inputs():
-    cfg = Fp16Bf16GemmConfig(k=16, block_k=16, launch_shape=(2,))
+    cfg = Fp16Bf16GemmConfig(k=16, blk_k=16, launch_shape=(2,))
     kernel = build_fp16_bf16_gemm(cfg)
 
     report = nr.check_protocol(kernel, include_events=True)
@@ -307,10 +299,10 @@ def test_protocol_tmem_mma_layout_f_emits_union_boxes():
     b = builder("protocol_tmem_layout_f_boxes", smem_size_bytes=a_bytes + b_bytes)
     a_s = smem_tensor(b, dtype=nr.DType.F16, shape=(m, k), byte_offset=0)
     b_s = smem_tensor(b, dtype=nr.DType.F16, shape=(n, k), byte_offset=a_bytes)
-    dst = tmem_tensor(b, dtype=nr.DType.F32, shape=(m, n), col_start=0, lane_align=0)
+    dst = tmem_band(dtype=nr.DType.F32)
 
     with b.if_warp(0):
-        b.tmem_alloc(dst, n_cols=32)
+        b.tmem_alloc(0, 32)
     # tcgen05_mma is a single-thread issue instruction now; issue it from warp
     # 0's elected lane so alloc -> mma -> dealloc stay ordered on one stream.
     done = b.mbar(kind=nr.MBarKind.TCGEN05)
@@ -318,13 +310,13 @@ def test_protocol_tmem_mma_layout_f_emits_union_boxes():
         b.mbarrier_init(done, count=1)
     b.cta_sync()
     with b.if_warp(0), b.if_elected():
-        b.tcgen05_mma(dst, a_s, b_s, m=m, n=n, k=k, accum=False, cta_group=1)
+        b.tcgen05_mma(dst.at(0, 0), a_s, b_s, m=m, n=n, k=k, accum=False, cta_group=1)
         # The mma is async: commit hands it to a barrier and the wait is where
         # it is observed to have landed — a band may not be freed before that.
         b.tcgen05_commit(done, cta_group=1)
     with b.if_warp(0):
         b.mbarrier_wait(done, phase=0)
-        b.tmem_dealloc(dst, n_cols=32)
+        b.tmem_dealloc(0, 32)
 
     report = nr.check_protocol(b.build(), include_events=True)
     assert report["status"] == "Passed"
@@ -356,15 +348,15 @@ def _tmem_teardown_kernel(*, drain: bool):
     b = builder("protocol_tmem_teardown", smem_size_bytes=a_bytes + b_bytes)
     a_s = smem_tensor(b, dtype=nr.DType.F16, shape=(m, k), byte_offset=0)
     b_s = smem_tensor(b, dtype=nr.DType.F16, shape=(n, k), byte_offset=a_bytes)
-    dst = tmem_tensor(b, dtype=nr.DType.F32, shape=(m, n), col_start=0, lane_align=0)
+    dst = tmem_band(dtype=nr.DType.F32)
     done = b.mbar(kind=nr.MBarKind.TCGEN05)
     with b.if_warp(0):
-        b.tmem_alloc(dst, n_cols=32)
+        b.tmem_alloc(0, 32)
         with b.if_elected():
             b.mbarrier_init(done, count=1)
     b.cta_sync()
     with b.if_warp(0), b.if_elected():
-        b.tcgen05_mma(dst, a_s, b_s, m=m, n=n, k=k, accum=False, cta_group=1)
+        b.tcgen05_mma(dst.at(0, 0), a_s, b_s, m=m, n=n, k=k, accum=False, cta_group=1)
         b.tcgen05_commit(done, cta_group=1)
     if drain:
         with b.if_warp(0):
@@ -373,7 +365,7 @@ def _tmem_teardown_kernel(*, drain: bool):
     # is not draining an engine.
     b.cta_sync()
     with b.if_warp(0):
-        b.tmem_dealloc(dst, n_cols=32)
+        b.tmem_dealloc(0, 32)
     return b.build()
 
 
@@ -390,16 +382,16 @@ def test_protocol_tmem_free_after_the_commit_is_awaited_passes():
 
 def test_protocol_tmem_async_overlap_fails_before_wait():
     b = builder("protocol_tmem_async_overlap")
-    tmem = tmem_tensor(b, dtype=nr.DType.F32, shape=(128, 32), col_start=0)
+    tmem = tmem_band(dtype=nr.DType.F32)
     reg = reg_tensor(b, dtype=nr.DType.F32, shape=(1,))
 
     with b.if_warp(0):
-        b.tmem_alloc(tmem, n_cols=32)
+        b.tmem_alloc(0, 32)
     with b.if_warp(0):
-        b.tcgen05_st(tmem, reg, shape="32x32b", num=1, row=0, col=0)
-        b.tcgen05_st(tmem, reg, shape="32x32b", num=1, row=0, col=0)
+        b.tcgen05_st(tmem.at(0, 0), reg, shape="32x32b", num=1)
+        b.tcgen05_st(tmem.at(0, 0), reg, shape="32x32b", num=1)
     with b.if_warp(0):
-        b.tmem_dealloc(tmem, n_cols=32)
+        b.tmem_dealloc(0, 32)
 
     report = nr.check_protocol(b.build())
     assert report["status"] == "Failed"
