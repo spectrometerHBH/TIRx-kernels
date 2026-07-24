@@ -1575,6 +1575,20 @@ fn ordered_conflict(
     current: &MemoryAccessRecord,
 ) -> Result<(), Option<(u8, u8)>> {
     let same_stream = prior.stream_id == current.stream_id;
+    // The whole-event relation (every slice of one before every slice of the
+    // other) settles every pair at the cost of one clock sweep — the common
+    // case for converged same-stream pairs and release-chained cross-stream
+    // pairs. Only when it fails does the pair need slice-level resolution.
+    if cx
+        .ordering
+        .happens_before(prior.event_idx, current.event_idx)
+        || (!same_stream
+            && cx
+                .ordering
+                .happens_before(current.event_idx, prior.event_idx))
+    {
+        return Ok(());
+    }
     let pair_ordered = |pl: u8, cl: u8| -> bool {
         cx.ordering
             .ordered_lane(prior.event_idx, pl, current.event_idx, cl)
@@ -1623,18 +1637,8 @@ fn ordered_conflict(
         }
         (None, None) => {
             // Both uniform: every slice pair conflicts, so the whole-event
-            // relation (every slice of one before every slice of the other)
-            // is the exact test.
-            let ordered = cx
-                .ordering
-                .happens_before(prior.event_idx, current.event_idx)
-                || (!same_stream
-                    && cx
-                        .ordering
-                        .happens_before(current.event_idx, prior.event_idx));
-            if !ordered {
-                return Err(None);
-            }
+            // relation above was already the exact test.
+            return Err(None);
         }
     }
     Ok(())
@@ -1681,11 +1685,13 @@ fn prune_ordered(
     if prior.async_proxy {
         return true;
     }
-    if prior.stream_id == current.stream_id && same_lane_coverage(prior, current) {
+    if cx
+        .ordering
+        .happens_before(prior.event_idx, current.event_idx)
+    {
         return true;
     }
-    cx.ordering
-        .happens_before(prior.event_idx, current.event_idx)
+    prior.stream_id == current.stream_id && same_lane_coverage(prior, current)
 }
 
 #[derive(Default)]
@@ -3143,15 +3149,31 @@ type Clock = Vec<(usize, usize)>;
 // Scheduling) the 32 lanes of a warp advance through their shared instruction
 // stream independently: a store by one lane is unordered against another
 // lane's later instructions until a warp-level convergence point joins them.
-// The clock algebra encodes that directly — every (stream, lane) owns one
-// vector-clock dimension, every event ticks exactly its executing lanes'
-// dimensions, and a release publishes only the arriving lanes' clocks. What a
-// lane never published is, by construction, invisible to every consumer.
+// A release publishes only the arriving lanes' progress; what a lane never
+// published is, by construction, invisible to every consumer.
+//
+// All of a stream's lanes share ONE number line — the stream's event ordinal
+// (1-based trace position within the stream). A clock entry means:
+//
+//   prefix_dim(S) ↦ v      every event of stream S with ordinal <= v, by ANY
+//                          lane, happens-before me (the all-lane prefix: the
+//                          stream's last convergence, or a full-warp arrive);
+//   lane_dim(S, l) ↦ v     lane l's events with ordinal <= v happen-before me
+//                          (the refinement a masked release carries).
+//
+// So a full-warp publication is ONE prefix entry, an elected arrive is ONE
+// lane entry, and clocks stay O(streams) with a short lane tail — per-lane
+// precision costs only where divergent publication actually happens.
 const WARP_LANES: usize = 32;
+const STREAM_DIMS: usize = WARP_LANES + 1;
 const FULL_MASK: u32 = u32::MAX;
 
 fn lane_dim(stream_id: usize, lane: usize) -> usize {
-    stream_id * WARP_LANES + lane
+    stream_id * STREAM_DIMS + lane
+}
+
+fn prefix_dim(stream_id: usize) -> usize {
+    stream_id * STREAM_DIMS + WARP_LANES
 }
 
 /// A warp-collective EVENT: the collective instruction set by statement kind,
@@ -3183,49 +3205,36 @@ fn is_convergence_event(event: &TraceEvent) -> bool {
 
 /// A stream's live clock state during the trace scan.
 ///
-/// Lane `l`'s effective clock is `shared ⊔ {lane_dim(l) ↦ own[l]} ⊔ extra[l]`.
-/// `shared` is the lower bound common to all 32 lanes — it grows only when the
-/// warp converges (all lane dimensions and extras fold in) or when the whole
-/// warp acquires a release together, so consecutive events share one snapshot
-/// instead of cloning a clock each. `own[l]` is lane `l`'s private dimension
-/// tick. `extra[l]` holds clocks a masked acquire delivered to lane `l` alone;
-/// it drains at the next convergence.
+/// Lane `l`'s effective clock is `shared ⊔ {lane_dim(l) ↦ this event's
+/// ordinal} ⊔ extra[l]`. `shared` is the lower bound common to all 32 lanes —
+/// its own-stream prefix entry advances at convergence points, and full-warp
+/// acquires join into it directly — so consecutive events share one snapshot.
+/// `extra[l]` holds clocks a masked acquire delivered to lane `l` alone; it
+/// drains at the next convergence.
 struct StreamClockState {
     shared: Arc<Clock>,
-    own: [usize; WARP_LANES],
     extra: HashMap<u8, Arc<Clock>>,
+    /// The NEXT event's 1-based ordinal on this stream's number line.
+    next_ordinal: usize,
 }
 
 impl StreamClockState {
     fn new() -> Self {
         Self {
             shared: Arc::new(Clock::new()),
-            own: [0; WARP_LANES],
             extra: HashMap::new(),
+            next_ordinal: 1,
         }
     }
 
-    /// Join every lane's private state into the shared clock. After this, all
-    /// 32 lanes observe each other's prior events.
-    fn converge(&mut self, stream_id: usize) {
+    /// Raise the all-lane prefix to ordinal `upto` and fold the lane
+    /// overlays: every lane now observes everything any lane did through
+    /// `upto`.
+    fn converge(&mut self, stream_id: usize, upto: usize) {
         let shared = Arc::make_mut(&mut self.shared);
-        for lane in 0..WARP_LANES {
-            if self.own[lane] > 0 {
-                clock_set_max(shared, lane_dim(stream_id, lane), self.own[lane]);
-            }
-        }
+        clock_set_max(shared, prefix_dim(stream_id), upto);
         for (_, clk) in self.extra.drain() {
             join_clock(shared, &clk);
-        }
-    }
-
-    /// Tick the executing lanes' own dimensions. Integer-only: the shared
-    /// clock is untouched.
-    fn advance(&mut self, mask: u32) {
-        for lane in 0..WARP_LANES {
-            if mask & (1 << lane) != 0 {
-                self.own[lane] += 1;
-            }
         }
     }
 
@@ -3251,18 +3260,26 @@ impl StreamClockState {
         }
     }
 
-    /// The clock a release with executing-lane set `mask` publishes: the join
-    /// of exactly those lanes' effective clocks. Lanes outside the mask
-    /// contribute nothing — their unconverged writes stay unpublished.
-    fn published(&self, stream_id: usize, mask: u32) -> Clock {
+    /// The clock a release at ordinal `ordinal` with executing-lane set
+    /// `mask` publishes: the join of exactly those lanes' effective clocks.
+    /// Every arriving lane's whole history rides its own entry (its events
+    /// all sit at ordinals <= `ordinal`); a full warp collapses to one
+    /// prefix entry. Lanes outside the mask contribute nothing — their
+    /// unconverged writes stay unpublished.
+    fn published(&self, stream_id: usize, mask: u32, ordinal: usize) -> Clock {
         let mut clock = (*self.shared).clone();
+        if mask == FULL_MASK {
+            clock_set_max(&mut clock, prefix_dim(stream_id), ordinal);
+            for (_, extra) in self.extra.iter() {
+                join_clock(&mut clock, extra);
+            }
+            return clock;
+        }
         for lane in 0..WARP_LANES {
             if mask & (1 << lane) == 0 {
                 continue;
             }
-            if self.own[lane] > 0 {
-                clock_set_max(&mut clock, lane_dim(stream_id, lane), self.own[lane]);
-            }
+            clock_set_max(&mut clock, lane_dim(stream_id, lane), ordinal);
             if let Some(extra) = self.extra.get(&(lane as u8)) {
                 join_clock(&mut clock, extra);
             }
@@ -3271,17 +3288,16 @@ impl StreamClockState {
     }
 }
 
-/// Per-event clock identity: which stream and lanes executed it, the stream's
-/// shared-clock snapshot, and any live lane overlays at that point. Own lane
-/// ticks are not stored per event — `LaneTickIndex` reconstructs them.
+/// Per-event clock identity: which stream and lanes executed it at which
+/// ordinal, the stream's shared-clock snapshot, and any live lane overlays.
 #[derive(Clone)]
 struct EventHb {
     stream_id: usize,
     /// Executing-lane bitmask; 0 = the event carries no scope and no HB
     /// identity.
     mask: u32,
-    /// Position of this event within its stream's scoped-event sequence.
-    ordinal: u32,
+    /// This event's 1-based position on its stream's number line.
+    ordinal: usize,
     shared: Arc<Clock>,
     /// Lane overlays live at this event, for its executing lanes only.
     extras: Vec<(u8, Arc<Clock>)>,
@@ -3299,49 +3315,13 @@ impl EventHb {
     }
 }
 
-/// Reconstructs `own[lane]` at any event from per-stream runs of consecutive
-/// equal-mask events: a run stores each lane's tick before the run's first
-/// event, and every event in the run ticks exactly the run's mask.
-struct LaneRun {
-    start: u32,
-    mask: u32,
-    base: [usize; WARP_LANES],
-}
-
-struct LaneTickIndex {
-    runs: Vec<Vec<LaneRun>>,
-}
-
-impl LaneTickIndex {
-    /// Lane `lane`'s own-dimension tick right after its stream's event at
-    /// `ordinal`.
-    fn tick(&self, stream_id: usize, lane: usize, ordinal: u32) -> usize {
-        let runs = &self.runs[stream_id];
-        let pos = runs.partition_point(|run| run.start <= ordinal);
-        let run = &runs[pos - 1];
-        run.base[lane]
-            + if run.mask & (1 << lane) != 0 {
-                (ordinal - run.start + 1) as usize
-            } else {
-                0
-            }
-    }
-}
-
 struct OrderingAnalysis {
     meta: Vec<EventHb>,
-    ticks: LaneTickIndex,
-    /// Per stream, sorted event indices of its convergence points.
-    convergences: Vec<Vec<usize>>,
 }
 
 impl OrderingAnalysis {
     fn empty() -> Self {
-        Self {
-            meta: Vec::new(),
-            ticks: LaneTickIndex { runs: Vec::new() },
-            convergences: Vec::new(),
-        }
+        Self { meta: Vec::new() }
     }
 
     fn new(events: &[TraceEvent]) -> Self {
@@ -3355,9 +3335,6 @@ impl OrderingAnalysis {
         let no_scope = EventHb::none();
         let mut states: Vec<StreamClockState> =
             (0..stream_count).map(|_| StreamClockState::new()).collect();
-        let mut runs: Vec<Vec<LaneRun>> = (0..stream_count).map(|_| Vec::new()).collect();
-        let mut ordinals: Vec<u32> = vec![0; stream_count];
-        let mut convergences: Vec<Vec<usize>> = vec![Vec::new(); stream_count];
         let mut mbars: HashMap<MbarKey, MbarCycle> = HashMap::new();
         // Release accumulation: each arriving event joins its published
         // (lane-projected) clock as it lands; completion freezes the join as
@@ -3382,19 +3359,20 @@ impl OrderingAnalysis {
         // cross-stream HB(producer-of-value.add, waiter.post-wait): stream t's reduce-add +
         // drain happens-before stream t+1's acquire happens-before stream t+1's reduce-add.
         let mut sem_releases: HashMap<(SemKey, i64), Clock> = HashMap::new();
-        for (idx, event) in events.iter().enumerate() {
+        for event in events.iter() {
             let Some(scope) = event_scope(&event.payload) else {
                 meta.push(no_scope.clone());
                 continue;
             };
             let stream_id = scope.stream_id;
             let mask = scope.active_lanes;
+            let ordinal = states[stream_id].next_ordinal;
+            states[stream_id].next_ordinal += 1;
 
             // Convergence joins the lanes BEFORE the event runs: everything
             // any lane did earlier is warp-visible from here on.
             if is_convergence_event(event) {
-                states[stream_id].converge(stream_id);
-                convergences[stream_id].push(idx);
+                states[stream_id].converge(stream_id, ordinal - 1);
             }
 
             match &event.payload {
@@ -3430,22 +3408,7 @@ impl OrderingAnalysis {
                 _ => {}
             }
 
-            // Advance the executing lanes and record the event's clock
-            // identity.
-            let ordinal = ordinals[stream_id];
-            ordinals[stream_id] += 1;
-            let new_run = runs[stream_id]
-                .last()
-                .map(|run| run.mask != mask)
-                .unwrap_or(true);
-            if new_run {
-                runs[stream_id].push(LaneRun {
-                    start: ordinal,
-                    mask,
-                    base: states[stream_id].own,
-                });
-            }
-            states[stream_id].advance(mask);
+            // Record the event's clock identity.
             let extras: Vec<(u8, Arc<Clock>)> = if states[stream_id].extra.is_empty() {
                 Vec::new()
             } else {
@@ -3466,10 +3429,10 @@ impl OrderingAnalysis {
                 extras,
             });
 
-            // A warp-collective instruction's effects are warp-visible once it
-            // completes: fold its own ticks straight into the shared clock.
+            // A warp-collective instruction's effects are warp-visible once
+            // it completes: raise the prefix over the event itself.
             if is_warp_collective_event(event) {
-                states[stream_id].converge(stream_id);
+                states[stream_id].converge(stream_id, ordinal);
             }
 
             match &event.payload {
@@ -3485,7 +3448,7 @@ impl OrderingAnalysis {
                     let key = MbarKey::from_target(target);
                     if let Some(cycle) = mbars.get_mut(&key) {
                         cycle.pending_tx -= *bytes;
-                        let published = states[stream_id].published(stream_id, mask);
+                        let published = states[stream_id].published(stream_id, mask, ordinal);
                         let acc = mbar_release_acc.entry(key.clone()).or_default();
                         join_clock(acc, &published);
                         if cycle.complete_if_ready() {
@@ -3498,7 +3461,7 @@ impl OrderingAnalysis {
                     let key = MbarKey::from_target(target);
                     if let Some(cycle) = mbars.get_mut(&key) {
                         cycle.pending_arrivals -= *count;
-                        let published = states[stream_id].published(stream_id, mask);
+                        let published = states[stream_id].published(stream_id, mask, ordinal);
                         let acc = mbar_release_acc.entry(key.clone()).or_default();
                         join_clock(acc, &published);
                         if cycle.complete_if_ready() {
@@ -3522,7 +3485,7 @@ impl OrderingAnalysis {
                     // never foreign edges, and the frozen generation join is
                     // never clobbered.
                     let key = SyncHbKey::new(event.stmt_id, sync_kind, *bar_id, *cycle, scope);
-                    let published = states[stream_id].published(stream_id, mask);
+                    let published = states[stream_id].published(stream_id, mask, ordinal);
                     let acc = sync_arrivals.entry(key.clone()).or_default();
                     join_clock(acc, &published);
                     if *count == *thread_count {
@@ -3543,40 +3506,72 @@ impl OrderingAnalysis {
                 } if *order == super::protocol::GmemAtomicOrderEvent::Release => {
                     sem_releases.insert(
                         (*key, *new_value),
-                        states[stream_id].published(stream_id, mask),
+                        states[stream_id].published(stream_id, mask, ordinal),
                     );
                 }
                 _ => {}
             }
         }
-        Self {
-            meta,
-            ticks: LaneTickIndex { runs },
-            convergences,
-        }
+        Self { meta }
     }
 
-    /// Was a convergence point of `stream_id` in `(from, to]`? If so, every
-    /// lane's state at `from` is in the stream's shared clock by `to`.
-    fn converged_between(&self, stream_id: usize, from: usize, to: usize) -> bool {
-        let Some(points) = self.convergences.get(stream_id) else {
-            return false;
-        };
-        let next = points.partition_point(|&p| p <= from);
-        points.get(next).is_some_and(|&p| p <= to)
+    /// Is lane `lane` of `stream` at `ordinal` visible to lane `to_lane` at
+    /// event `to`? Through the stream's all-lane prefix, through the lane's
+    /// own refinement entry (snapshot or overlay), or — same stream, same
+    /// lane — through program order.
+    fn slice_visible(
+        &self,
+        stream: usize,
+        lane: u8,
+        ordinal: usize,
+        to: usize,
+        to_lane: u8,
+    ) -> bool {
+        let mt = &self.meta[to];
+        if mt.stream_id == stream && to_lane == lane && mt.ordinal >= ordinal {
+            return true;
+        }
+        let ld = lane_dim(stream, lane as usize);
+        let pd = prefix_dim(stream);
+        if clock_get(&mt.shared, pd) >= ordinal || clock_get(&mt.shared, ld) >= ordinal {
+            return true;
+        }
+        if let Some((_, extra)) = mt.extras.iter().find(|(l, _)| *l == to_lane) {
+            if clock_get(extra, pd) >= ordinal || clock_get(extra, ld) >= ordinal {
+                return true;
+            }
+        }
+        false
     }
 
-    /// Lane `lane`'s clock component on dimension `dim` at event `idx`.
-    fn lane_view_get(&self, idx: usize, lane: u8, dim: usize) -> usize {
-        let meta = &self.meta[idx];
-        let mut tick = clock_get(&meta.shared, dim);
-        if dim == lane_dim(meta.stream_id, lane as usize) {
-            tick = tick.max(self.ticks.tick(meta.stream_id, lane as usize, meta.ordinal));
+    /// Does lane `to_lane` at `to` cover clock component `(dim, tick)`? A
+    /// lane-dimension component is also covered by its stream's all-lane
+    /// prefix, and `to_lane`'s own dimension sits at `to`'s ordinal.
+    fn covers(&self, to: usize, to_lane: u8, dim: usize, tick: usize) -> bool {
+        let mt = &self.meta[to];
+        let mut cover = clock_get(&mt.shared, dim);
+        if dim == lane_dim(mt.stream_id, to_lane as usize) {
+            cover = cover.max(mt.ordinal);
         }
-        if let Some((_, extra)) = meta.extras.iter().find(|(l, _)| *l == lane) {
-            tick = tick.max(clock_get(extra, dim));
+        if let Some((_, extra)) = mt.extras.iter().find(|(l, _)| *l == to_lane) {
+            cover = cover.max(clock_get(extra, dim));
         }
-        tick
+        if cover >= tick {
+            return true;
+        }
+        // A lane component is subsumed by its stream's all-lane prefix.
+        let slot = dim % STREAM_DIMS;
+        if slot < WARP_LANES {
+            let pd = dim - slot + WARP_LANES;
+            let mut prefix = clock_get(&mt.shared, pd);
+            if let Some((_, extra)) = mt.extras.iter().find(|(l, _)| *l == to_lane) {
+                prefix = prefix.max(clock_get(extra, pd));
+            }
+            if prefix >= tick {
+                return true;
+            }
+        }
+        false
     }
 
     /// Lane-slice happens-before: lane `from_lane`'s clock at `from` is at or
@@ -3593,31 +3588,21 @@ impl OrderingAnalysis {
         if mf.mask == 0 || mt.mask == 0 {
             return false;
         }
-        if mf.stream_id == mt.stream_id && from < to {
-            // A lane is ordered against itself by program order; against
-            // another lane once the warp reconverged in between.
-            if from_lane == to_lane {
-                return true;
-            }
-            if self.converged_between(mf.stream_id, from, to) {
-                return true;
-            }
-        }
-        for &(dim, tick) in mf.shared.iter() {
-            if tick > self.lane_view_get(to, to_lane, dim) {
-                return false;
-            }
-        }
-        let own_dim = lane_dim(mf.stream_id, from_lane as usize);
-        let own_tick = self
-            .ticks
-            .tick(mf.stream_id, from_lane as usize, mf.ordinal);
-        if own_tick > self.lane_view_get(to, to_lane, own_dim) {
+        if !self.slice_visible(mf.stream_id, from_lane, mf.ordinal, to, to_lane) {
             return false;
+        }
+        // A stream's shared clock only grows along its trace order, so the
+        // forward same-stream case skips comparing it.
+        if !(mf.stream_id == mt.stream_id && from < to) {
+            for &(dim, tick) in mf.shared.iter() {
+                if !self.covers(to, to_lane, dim, tick) {
+                    return false;
+                }
+            }
         }
         if let Some((_, extra)) = mf.extras.iter().find(|(l, _)| *l == from_lane) {
             for &(dim, tick) in extra.iter() {
-                if tick > self.lane_view_get(to, to_lane, dim) {
+                if !self.covers(to, to_lane, dim, tick) {
                     return false;
                 }
             }
@@ -3639,34 +3624,35 @@ impl OrderingAnalysis {
         if mf.mask == 0 || mt.mask == 0 {
             return false;
         }
-        if mf.stream_id == mt.stream_id
-            && from < to
-            && self.converged_between(mf.stream_id, from, to)
-        {
-            return true;
-        }
+        let same_stream_forward = mf.stream_id == mt.stream_id && from < to;
         // The join over `from`'s lane slices, reduced to the components not
         // already below `to`'s shared clock. Whatever remains must sit below
-        // every executing `to` lane's private view.
+        // every executing `to` lane's private view. A stream's shared clock
+        // only grows along its trace order, so the forward same-stream case
+        // skips comparing it.
         let mut residual: Vec<(usize, usize)> = Vec::new();
-        for &(dim, tick) in mf.shared.iter() {
-            if tick > clock_get(&mt.shared, dim) {
-                residual.push((dim, tick));
+        if !same_stream_forward {
+            for &(dim, tick) in mf.shared.iter() {
+                if !shared_covers(&mt.shared, dim, tick) {
+                    residual.push((dim, tick));
+                }
             }
         }
-        for from_lane in 0..WARP_LANES {
-            if mf.mask & (1 << from_lane) == 0 {
-                continue;
-            }
-            let dim = lane_dim(mf.stream_id, from_lane);
-            let tick = self.ticks.tick(mf.stream_id, from_lane, mf.ordinal);
-            if tick > clock_get(&mt.shared, dim) {
-                residual.push((dim, tick));
+        // The own components {lane l of from's stream at from's ordinal}.
+        if clock_get(&mt.shared, prefix_dim(mf.stream_id)) < mf.ordinal {
+            for from_lane in 0..WARP_LANES {
+                if mf.mask & (1 << from_lane) == 0 {
+                    continue;
+                }
+                let dim = lane_dim(mf.stream_id, from_lane);
+                if clock_get(&mt.shared, dim) < mf.ordinal {
+                    residual.push((dim, mf.ordinal));
+                }
             }
         }
         for (_, extra) in mf.extras.iter() {
             for &(dim, tick) in extra.iter() {
-                if tick > clock_get(&mt.shared, dim) {
+                if !shared_covers(&mt.shared, dim, tick) {
                     residual.push((dim, tick));
                 }
             }
@@ -3679,20 +3665,27 @@ impl OrderingAnalysis {
                 continue;
             }
             for &(dim, tick) in &residual {
-                let mut cover = 0;
-                if dim == lane_dim(mt.stream_id, to_lane as usize) {
-                    cover = self.ticks.tick(mt.stream_id, to_lane as usize, mt.ordinal);
+                // Same-lane program order covers a lane's own component.
+                if same_stream_forward && dim == lane_dim(mt.stream_id, to_lane as usize) {
+                    continue;
                 }
-                if let Some((_, extra)) = mt.extras.iter().find(|(l, _)| *l == to_lane) {
-                    cover = cover.max(clock_get(extra, dim));
-                }
-                if tick > cover {
+                if !self.covers(to, to_lane, dim, tick) {
                     return false;
                 }
             }
         }
         true
     }
+}
+
+/// Does a shared clock cover component `(dim, tick)`, counting a lane
+/// component as covered by its stream's all-lane prefix?
+fn shared_covers(shared: &Clock, dim: usize, tick: usize) -> bool {
+    if clock_get(shared, dim) >= tick {
+        return true;
+    }
+    let slot = dim % STREAM_DIMS;
+    slot < WARP_LANES && clock_get(shared, dim - slot + WARP_LANES) >= tick
 }
 
 fn join_clock(dst: &mut Clock, src: &Clock) {
