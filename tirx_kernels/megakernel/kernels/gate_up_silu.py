@@ -138,7 +138,9 @@ class GateUpSiluTile(GemmTile):
             if tid_in_wg == 0:
                 m_st = T.meta_var(m_idx * self.M_pad_size + ko * self.EPI_TILE)
                 n_st = T.meta_var(n_idx * self.BLK_N // 2)
-                tma_config = T.meta_var({"dispatch": "tma", "cta_group": KernelConfig.CTA_GROUP})
+                tma_config = T.meta_var(
+                    {"dispatch": "tma_explicit", "cta_group": KernelConfig.CTA_GROUP}
+                )
                 Tx.thread.copy_async(
                     output[m_st : m_st + self.EPI_TILE, n_st : n_st + self.BLK_N // 2],
                     self.output_smem[self.stage, :, :],

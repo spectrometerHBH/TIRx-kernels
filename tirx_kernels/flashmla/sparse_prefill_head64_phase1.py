@@ -51,11 +51,7 @@ WG1_ROWS_PER_WARP = (B_TOPK // 4) // WG1_NUM_WARPS
 # KV gather4 TMA knobs shared by both gather call sites.
 _mma_config = partial(tcgen05_config, cta_group=1)
 _kv_gather_tma = partial(
-    tma_config,
-    cta_group=1,
-    gather_axis=0,
-    dst_gather_axis=1,
-    cache_hint=T.uint64(0x14F0000000000000),
+    tma_config, dispatch="tma_explicit", cta_group=1, cache_hint=T.uint64(0x14F0000000000000)
 )
 
 
@@ -654,7 +650,7 @@ def _kernel(
                         Tx.copy_async(
                             out.chunk((None, None, D_V // 64))[s_q_idx, :, epi_chunk_idx],
                             o_smem.chunk((None, D_V // 64))[:, epi_chunk_idx],
-                            **tma_config(),
+                            **tma_config(dispatch="tma_explicit"),
                         )
                 if warp_idx == 1:
                     if T.ptx.elect_sync():
@@ -663,7 +659,7 @@ def _kernel(
                         Tx.copy_async(
                             out.chunk((None, None, D_V // 64))[s_q_idx, :, epi_chunk_idx],
                             o_smem.chunk((None, D_V // 64))[:, epi_chunk_idx],
-                            **tma_config(),
+                            **tma_config(dispatch="tma_explicit"),
                         )
 
         if warp_idx == 0:
@@ -711,19 +707,26 @@ def _kernel(
 
                 @T.inline
                 def gather_nope_part(part_idx, bar):
-                    Tx.copy_async(
-                        k_nope_warp.chunk((None, None, 2))[cur_buf, :, part_idx],
-                        kv_nope_tma.chunk((None, 2))[:, part_idx],
-                        **_kv_gather_tma(
-                            mbar=bar.ptr_to([cur_buf]),
-                            mbarrier_addr=d_qk == D_V and s_kv >= 65536,
-                            indexer=[
-                                selected_idx[local_row, j]
-                                for local_row in range(WG1_ROWS_PER_WARP)
-                                for j in range(4)
-                            ],
-                        ),
-                    )
+                    dst_part = k_nope_warp.sub[
+                        cur_buf, :, part_idx * (D_V // 2) : (part_idx + 1) * (D_V // 2)
+                    ]
+                    src_part = kv_nope_tma.sub[
+                        :, part_idx * (D_V // 2) : (part_idx + 1) * (D_V // 2)
+                    ]
+                    for row_group in T.unroll(WG1_ROWS_PER_WARP):
+                        for col_atom in T.unroll((D_V // 2) // 64):
+                            Tx.copy_async(
+                                dst_part[
+                                    row_group * 4 : row_group * 4 + 4,
+                                    col_atom * 64 : col_atom * 64 + 64,
+                                ],
+                                src_part[0:1, col_atom * 64 : col_atom * 64 + 64],
+                                **_kv_gather_tma(
+                                    mbar=bar.ptr_to([cur_buf]),
+                                    mbarrier_addr=d_qk == D_V and s_kv >= 65536,
+                                    gather4=[selected_idx[row_group, j] for j in range(4)],
+                                ),
+                            )
 
                 if not should_skip_tma:
                     gather_nope_part(0, bar_kv_nope_ready_part0)

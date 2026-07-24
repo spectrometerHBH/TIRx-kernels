@@ -306,33 +306,51 @@ def _kernel(
                 n_idx * DG_BLOCK_N if SWAP_AB else n_idx * DG_BLOCK_N + cluster_rank * BLK_N
             )
             sf_n = T.meta_var(n_idx * DG_BLOCK_N)
+            SFA_flat = SFA.view(
+                SFA.shape[0] * SFA.shape[1], layout=T.TileLayout(T.S[SFA.shape[0] * SFA.shape[1]])
+            )
+            SFB_flat = SFB.view(
+                SFB.shape[0] * SFB.shape[1], layout=T.TileLayout(T.S[SFB.shape[0] * SFB.shape[1]])
+            )
 
             @T.inline
             def tma_load(k_tile):
                 smem_pipe.empty.wait(tma_cur.stage, tma_cur.phase)
                 stage = tma_cur.stage
                 k = T.meta_var(k_tile * BLK_K)
-                tma_copy = T.meta_var(
+                tma_explicit_copy = T.meta_var(
                     {
-                        "dispatch": "tma",
+                        "dispatch": "tma_explicit",
                         "mbar": smem_pipe.full.ptr_to([stage]),
                         "cta_group": 1,
                         "cache_hint": "evict_normal",
                         "prefetch_tensormap": True,
                     }
                 )
-                Tx.copy_async(A_smem[stage], A[a_m : a_m + BLK_M, k : k + BLK_K], **tma_copy)
-                Tx.copy_async(B_smem[stage], B[b_n : b_n + BLK_N, k : k + BLK_K], **tma_copy)
+                Tx.copy_async(
+                    A_smem[stage], A[a_m : a_m + BLK_M, k : k + BLK_K], **tma_explicit_copy
+                )
+                Tx.copy_async(
+                    B_smem[stage], B[b_n : b_n + BLK_N, k : k + BLK_K], **tma_explicit_copy
+                )
                 if k_tile % 4 == 0:
                     Tx.copy_async(
                         SFA_smem[stage, 0:DG_BLOCK_M],
-                        SFA[k_tile // 4, sf_m : sf_m + DG_BLOCK_M],
-                        **tma_copy,
+                        SFA_flat[
+                            (k_tile // 4) * SFA.shape[1] + sf_m : (k_tile // 4) * SFA.shape[1]
+                            + sf_m
+                            + DG_BLOCK_M
+                        ],
+                        **tma_explicit_copy,
                     )
                     Tx.copy_async(
                         SFB_smem[stage, 0:DG_BLOCK_N],
-                        SFB[k_tile // 4, sf_n : sf_n + DG_BLOCK_N],
-                        **tma_copy,
+                        SFB_flat[
+                            (k_tile // 4) * SFB.shape[1] + sf_n : (k_tile // 4) * SFB.shape[1]
+                            + sf_n
+                            + DG_BLOCK_N
+                        ],
+                        **tma_explicit_copy,
                     )
 
                 smem_pipe.full.arrive(
@@ -480,14 +498,21 @@ def _kernel(
                     tmem_pipe.empty.arrive(tmem_idx, remote=0)
                 T.ptx.fence.proxy_async("shared::cta")
                 T.cuda.warpgroup_sync(10)
-                d_m: T.let = m_idx * DG_BLOCK_M + (ot * 16 if SWAP_AB else 0)
-                d_n: T.let = n_idx * DG_BLOCK_N + (0 if SWAP_AB else ot * EPI_TILE)
                 if warp_id == 0:
                     if T.ptx.elect_sync():
                         Tx.copy_async(
-                            D[d_m : d_m + D_TILE_M, d_n : d_n + D_TILE_N],
+                            D[
+                                m_idx * DG_BLOCK_M + (ot * 16 if SWAP_AB else 0) : m_idx
+                                * DG_BLOCK_M
+                                + (ot * 16 if SWAP_AB else 0)
+                                + D_TILE_M,
+                                n_idx * DG_BLOCK_N + (0 if SWAP_AB else ot * EPI_TILE) : n_idx
+                                * DG_BLOCK_N
+                                + (0 if SWAP_AB else ot * EPI_TILE)
+                                + D_TILE_N,
+                            ],
                             D_smem[stage],
-                            dispatch="tma",
+                            dispatch="tma_auto",
                             prefetch_tensormap=True,
                         )
                         T.ptx.cp_async.bulk.commit_group()
@@ -502,8 +527,9 @@ def _kernel(
         if tid_in_wg == 0:
             T.ptx.cp_async.bulk.wait_group(0)
         T.cuda.warpgroup_sync(10)
-    tmem_pool.dealloc()
+    # The epilogue warpgroup and peer CTA must finish all TMEM reads first.
     T.cuda.cluster_sync()
+    tmem_pool.dealloc()
 
 
 def tir_kernel(M: int, N: int, K: int):

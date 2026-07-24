@@ -192,7 +192,7 @@ def _kernel(
                 stage = tma_cur.stage
                 tma_config = T.meta_var(
                     {
-                        "dispatch": "tma",
+                        "dispatch": "tma_auto",
                         "cta_group": 2,
                         "mbar": smem_full_cta0.ptr_to([stage]),
                         # Prefetch the A/B tensormaps at entry.
@@ -334,7 +334,7 @@ def _kernel(
                         Tx.copy_async(
                             D[d_m : d_m + BLK_M, d_n : d_n + EPI_N],
                             Dsmem[0, db],
-                            dispatch="tma",
+                            dispatch="tma_auto",
                             cache_hint="evict_first",  # evict-first L2 policy for the store
                             prefetch_tensormap=True,  # prefetch the D tensormap
                         )
@@ -373,7 +373,7 @@ def _kernel(
                         Tx.copy_async(
                             D[d_m : d_m + BLK_M, d_n : d_n + EPI_N],
                             Dsmem[wg_id, db],
-                            dispatch="tma",
+                            dispatch="tma_auto",
                             cache_hint="evict_first",  # evict-first L2 policy
                             prefetch_tensormap=True,  # prefetch the D tensormap
                         )

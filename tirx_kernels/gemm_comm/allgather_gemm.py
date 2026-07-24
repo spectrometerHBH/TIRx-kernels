@@ -768,7 +768,7 @@ def _build_kernel():
 
                             @T.inline
                             def tma_load(is_remain, ks):
-                                tma_copy = T.meta_var({"dispatch": "tma", "mbar": tma_finished.ptr_to([ks]), "cta_group": CTA_GROUP})
+                                tma_copy = T.meta_var({"dispatch": "tma_auto", "mbar": tma_finished.ptr_to([ks]), "cta_group": CTA_GROUP})
                                 stage_k = T.meta_var(stage * BLK_K)
                                 mma2tma.wait(ks, 0, phase[0])
                                 if rank * LOCAL_GEMM_M_CLUSTERS <= m_idx and m_idx < (rank + 1) * LOCAL_GEMM_M_CLUSTERS:
@@ -862,6 +862,7 @@ def _build_kernel():
                     for i in T.unroll(MMA_N // TMEM_LD_SIZE): # load (MMA_M // 2, MMA_N)
                         col_st = T.meta_var(wg_id * MMA_N + i * TMEM_LD_SIZE)
                         Tx.wg.copy_async(reg_wg[:, :], tmem[:, col_st : col_st + TMEM_LD_SIZE])
+                        T.ptx.tcgen05.wait.ld()
                         Tx.cast(reg_fp16[i * TMEM_LD_SIZE : (i + 1) * TMEM_LD_SIZE], reg[:])
 
                     # the tmem can be overwritten by the next tile
@@ -875,7 +876,7 @@ def _build_kernel():
                         if lane_id == 0 and warp_id == 0:
                             m_st = T.meta_var((m_idx * NUM_CONSUMER * CTA_GROUP + wg_id * CTA_GROUP + cbx) * BLK_M)
                             n_st = T.meta_var(n_idx * BLK_N * CTA_GROUP + i * EPI_TILE)
-                            Tx.copy_async(out[m_st : m_st + BLK_M, n_st : n_st + EPI_TILE], D_smem[wg_id, :, :], dispatch="tma")
+                            Tx.copy_async(out[m_st : m_st + BLK_M, n_st : n_st + EPI_TILE], D_smem[wg_id, :, :], dispatch="tma_auto")
                             T.ptx.cp_async.bulk.commit_group()
                             T.ptx.cp_async.bulk.wait_group(0)
                         T.cuda.warpgroup_sync(wg_id)
@@ -884,13 +885,14 @@ def _build_kernel():
 
             tile_scheduler.next_tile(cbx, bx, rank, warp_id_in_cta, lane_id)
 
+        # All local and peer-CTA TMEM users must finish before collective deallocation.
+        T.ptx.barrier.cluster.arrive()
+        T.ptx.barrier.cluster.wait()
+
         # dealloc TMEM
         if (wg_id == 0) & (warp_id == 0):
             T.ptx.tcgen05.relinquish_alloc_permit(cta_group=CTA_GROUP)
             T.ptx.tcgen05.dealloc(tmem_addr, n_cols=N_COLS, cta_group=CTA_GROUP)
-
-        T.ptx.barrier.cluster.arrive()
-        T.ptx.barrier.cluster.wait()
 
     # fmt: on
 

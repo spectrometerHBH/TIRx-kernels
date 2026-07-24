@@ -18,7 +18,24 @@
 
 import pytest
 
+import tvm
+from tirx_kernels.megakernel.moe import MegaKernelMOE
+from tirx_kernels.megakernel.utils.config import MEGAKERNEL_MOE_BENCH_CONFIG
 from tirx_kernels.runner import run_kernel_test
+
+
+def test_megakernel_gather4_compiler_path():
+    class GatherMOE(MegaKernelMOE):
+        def set_tiles(self, batch_size, low_batch):
+            super().set_tiles(batch_size, low_batch)
+            self.group_gemm_gate_up_silu.use_tma_gather4 = True
+            self.group_gemm_down.use_tma_gather4 = True
+
+    megakernel = GatherMOE(config=MEGAKERNEL_MOE_BENCH_CONFIG, world_size=1, profiler_on=False)
+    megakernel._compile_batch_size = 1
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
+    with target:
+        tvm.tirx.transform.LowerTIRx()(megakernel.get_module("static"))
 
 
 @pytest.mark.parametrize("batch_size", [1, 128])

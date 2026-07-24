@@ -593,7 +593,7 @@ def get_kernel(**kwargs: Any):
                     Tx.copy_async(
                         smem_q[q_stage_idx],
                         q_gmem[q_row0 : q_row0 + block_q * num_heads, :],
-                        dispatch="tma",
+                        dispatch="tma_explicit",
                         mbar=q_pipe.full.ptr_to([q_stage_idx]),
                         cta_group=1,
                         cache_hint="evict_normal",
@@ -603,7 +603,7 @@ def get_kernel(**kwargs: Any):
                     Tx.copy_async(
                         smem_sf_q_2d[q_stage_idx],
                         sf_q_gmem[q_blk0 : q_blk0 + block_q, :],
-                        dispatch="tma",
+                        dispatch="tma_explicit",
                         mbar=q_pipe.full.ptr_to([q_stage_idx]),
                         cta_group=1,
                         cache_hint="evict_normal",
@@ -612,7 +612,7 @@ def get_kernel(**kwargs: Any):
                     Tx.copy_async(
                         smem_weights[q_stage_idx],
                         weights_gmem[q_blk0 : q_blk0 + block_q, :],
-                        dispatch="tma",
+                        dispatch="tma_explicit",
                         mbar=q_pipe.full.ptr_to([q_stage_idx]),
                         cta_group=1,
                         cache_hint="evict_normal",
@@ -647,7 +647,7 @@ def get_kernel(**kwargs: Any):
                         Tx.copy_async(
                             smem_kv[kv_stage_idx],
                             kv_gmem[kv_row0 : kv_row0 + block_kv, :],
-                            dispatch="tma",
+                            dispatch="tma_explicit",
                             mbar=kv_pipe.full.ptr_to([kv_stage_idx]),
                             cta_group=1,
                             cache_hint="evict_normal",
@@ -656,7 +656,7 @@ def get_kernel(**kwargs: Any):
                         Tx.copy_async(
                             smem_sf_kv[kv_stage_idx : kv_stage_idx + 1, 0:block_kv],
                             sf_kv_gmem[0:1, kv_row0 : kv_row0 + block_kv],
-                            dispatch="tma",
+                            dispatch="tma_explicit",
                             mbar=kv_pipe.full.ptr_to([kv_stage_idx]),
                             cta_group=1,
                             cache_hint="evict_normal",

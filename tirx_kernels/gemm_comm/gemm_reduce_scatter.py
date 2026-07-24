@@ -1010,9 +1010,10 @@ def test_mma_ss_tma_2sm_persistent(
                 signal_rank = Tx.meta_var(comm_m_idx // (LOCAL_M // TILE_M))
                 sem.semaphore_notify(signal_rank, tid, comm_m_idx_local, n_idx, rs_queue)
         tile_scheduler.next_tile(cbx, bx, rank, warp_id_in_cta, lane_id)
-    tmem_pool.dealloc()
+    # Synchronize every local and peer-CTA TMEM user before collective deallocation.
     Tx.ptx.barrier.cluster.arrive()
     Tx.ptx.barrier.cluster.wait()
+    tmem_pool.dealloc()
 
 
 def build_kernel(config: GemmRSConfig | None = None) -> tvm.IRModule:

@@ -182,7 +182,7 @@ def tirx_dispatch_rmsnorm(dim: int, batch_size: int, SMEM_PER_CTA=220, MAX_THREA
         norm_factor: T.f32
         batch_idx = cluster_id
         if t_idx == 0 & t_idy == 0:
-            tma_copy_in = T.meta_var({"dispatch": "tma", "mbar": input_bar.ptr_to([0])})
+            tma_copy_in = T.meta_var({"dispatch": "tma_auto", "mbar": input_bar.ptr_to([0])})
             for tma_chunk in T.serial(NUM_TMA_CHUNKS):
                 tma_off = T.meta_var(tma_chunk * TMA_TILE)
                 Tx.copy_async(
@@ -499,7 +499,7 @@ def tirx_input_DSMEM_write_TMA_wts_GMEM(
         norm_factor: T.f32
         batch_idx = cluster_id
         if t_idx == 0 & t_idy == 0:
-            tma_copy_in = T.meta_var({"dispatch": "tma", "mbar": input_bar.ptr_to([0])})
+            tma_copy_in = T.meta_var({"dispatch": "tma_auto", "mbar": input_bar.ptr_to([0])})
             for tma_chunk in T.serial(NUM_TMA_CHUNKS):
                 tma_off = T.meta_var(tma_chunk * TMA_TILE)
                 Tx.copy_async(

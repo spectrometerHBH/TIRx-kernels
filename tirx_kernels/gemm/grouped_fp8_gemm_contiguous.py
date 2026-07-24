@@ -180,7 +180,7 @@ def _kernel(
     TILE_GROUPS_ROW_SIZE: T.constexpr = 16,
     SCHED_CLUSTER_SIZE: T.constexpr = 1,
     SCHED_SERPENTINE: T.constexpr = False,
-    TMA_L2_PROMOTION: T.constexpr = 256,
+    TMA_L2_PROMOTION: T.constexpr = "L2::256B",
 ):
     CTA_GROUP = T.meta_var(LOGICAL_M_CLUSTER * LOGICAL_N_CLUSTER)
     CTA_MASK = T.meta_var((1 << CTA_GROUP) - 1)
@@ -303,6 +303,9 @@ def _kernel(
                 n_idx * DG_BLOCK_N if SWAP_AB else n_idx * DG_BLOCK_N + cluster_rank * BLK_N
             )
             sf_n = T.meta_var(n_idx * DG_BLOCK_N)
+            B_2d = B.view(NUM_GROUPS * N, K)
+            SFA_flat = SFA.view(SFA.shape[0] * SFA.shape[1])
+            SFB_flat = SFB.view(SFB.shape[0] * SFB.shape[1] * SFB.shape[2])
 
             @T.inline
             def tma_load(k_tile):
@@ -312,21 +315,21 @@ def _kernel(
                 group: T.let = GROUPED_LAYOUT[sf_m]
                 tma_copy = T.meta_var(
                     {
-                        "dispatch": "tma",
+                        "dispatch": "tma_auto",
                         "mbar": smem_pipe.full.ptr_to([stage]),
                         "cta_group": 1,
                         "cache_hint": "evict_normal",
-                        "l2_promotion": TMA_L2_PROMOTION,
+                        "tensormap_l2_promotion": TMA_L2_PROMOTION,
                         "prefetch_tensormap": True,
                     }
                 )
                 tma_copy_evict_last = T.meta_var(
                     {
-                        "dispatch": "tma",
+                        "dispatch": "tma_auto",
                         "mbar": smem_pipe.full.ptr_to([stage]),
                         "cta_group": 1,
                         "cache_hint": "evict_last",
-                        "l2_promotion": TMA_L2_PROMOTION,
+                        "tensormap_l2_promotion": TMA_L2_PROMOTION,
                         "prefetch_tensormap": True,
                     }
                 )
@@ -339,22 +342,31 @@ def _kernel(
                 if (NUM_GROUPS == 4 and K == 4096) or (NUM_GROUPS == 8 and K == 2048):
                     Tx.copy_async(
                         B_smem[stage],
-                        B[group, b_n : b_n + BLK_N, k : k + BLK_K],
+                        B_2d[group * N + b_n : group * N + b_n + BLK_N, k : k + BLK_K],
                         **tma_copy_evict_last,
                     )
                 else:
                     Tx.copy_async(
-                        B_smem[stage], B[group, b_n : b_n + BLK_N, k : k + BLK_K], **tma_copy
+                        B_smem[stage],
+                        B_2d[group * N + b_n : group * N + b_n + BLK_N, k : k + BLK_K],
+                        **tma_copy,
                     )
                 if k_tile % 4 == 0:
                     Tx.copy_async(
                         SFA_smem[stage, 0:DG_BLOCK_M],
-                        SFA[k_tile // 4, sf_m : sf_m + DG_BLOCK_M],
+                        SFA_flat[(k_tile // 4) * M + sf_m : (k_tile // 4) * M + sf_m + DG_BLOCK_M],
                         **tma_copy,
                     )
                     Tx.copy_async(
                         SFB_smem[stage, 0:DG_BLOCK_N],
-                        SFB[group, k_tile // 4, sf_n : sf_n + DG_BLOCK_N],
+                        SFB_flat[
+                            (group * (K // 512) + k_tile // 4) * N + sf_n : (
+                                group * (K // 512) + k_tile // 4
+                            )
+                            * N
+                            + sf_n
+                            + DG_BLOCK_N
+                        ],
                         **tma_copy,
                     )
 
@@ -527,15 +539,22 @@ def _kernel(
                     tmem_pipe.empty.arrive(tmem_idx, remote=0)
                 T.ptx.fence.proxy_async("shared::cta")
                 T.cuda.warpgroup_sync(10)
-                d_m: T.let = m_idx * DG_BLOCK_M + (ot * 16 if SWAP_AB else 0)
-                d_n: T.let = n_idx * DG_BLOCK_N + (0 if SWAP_AB else ot * EPI_TILE)
                 if warp_id == 0:
                     if T.ptx.elect_sync():
                         Tx.copy_async(
-                            D[d_m : d_m + D_TILE_M, d_n : d_n + D_TILE_N],
+                            D[
+                                m_idx * DG_BLOCK_M + (ot * 16 if SWAP_AB else 0) : m_idx
+                                * DG_BLOCK_M
+                                + (ot * 16 if SWAP_AB else 0)
+                                + D_TILE_M,
+                                n_idx * DG_BLOCK_N + (0 if SWAP_AB else ot * EPI_TILE) : n_idx
+                                * DG_BLOCK_N
+                                + (0 if SWAP_AB else ot * EPI_TILE)
+                                + D_TILE_N,
+                            ],
                             D_smem[stage],
-                            dispatch="tma",
-                            l2_promotion=TMA_L2_PROMOTION,
+                            dispatch="tma_auto",
+                            tensormap_l2_promotion=TMA_L2_PROMOTION,
                             prefetch_tensormap=True,
                         )
                         T.ptx.cp_async.bulk.commit_group()
@@ -550,11 +569,12 @@ def _kernel(
         if tid_in_wg == 0:
             T.ptx.cp_async.bulk.wait_group(0)
         T.cuda.warpgroup_sync(10)
-    tmem_pool.dealloc()
+    # The epilogue warpgroup and every CTA sharing the allocation must finish first.
     if CTA_GROUP > 1:
         T.cuda.cluster_sync()
     else:
         T.cuda.cta_sync()
+    tmem_pool.dealloc()
 
 
 def grouped_fp8_gemm_contiguous(num_groups: int, M: int, N: int, K: int):
@@ -590,7 +610,9 @@ def grouped_fp8_gemm_contiguous(num_groups: int, M: int, N: int, K: int):
         TILE_GROUPS_ROW_SIZE=tile_groups_row_size,
         SCHED_CLUSTER_SIZE=2 if cluster_schedule else 1,
         SCHED_SERPENTINE=cluster_schedule,
-        TMA_L2_PROMOTION=(128 if K in (2048, 7168) or (num_groups == 8 and K == 4096) else 256),
+        TMA_L2_PROMOTION=(
+            "L2::128B" if K in (2048, 7168) or (num_groups == 8 and K == 4096) else "L2::256B"
+        ),
     )
 
 

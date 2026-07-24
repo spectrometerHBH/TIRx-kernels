@@ -514,29 +514,42 @@ def get_kernel(**kwargs: Any):
                     for s in T.serial(T.uint32(0), num_total_stages):
                         stage_idx: T.uint32 = tma_st
                         smem_pipe.empty.wait(stage_idx, tma_ph)
-                        m_idx0: T.uint32 = m_block_idx * T.uint32(block_m)
-                        k_idx0: T.uint32 = k_offset + s * T.uint32(block_k)
                         # A as bf16 (exact in tf32); B as TFLOAT32 so TMA RN-truncates
                         # on load, matching the tf32 MMA (else ~1 ULP divergence).
                         Tx.copy_async(
                             smem_a_mma[stage_idx],
-                            a[m_idx0 : m_idx0 + block_m, k_idx0 : k_idx0 + block_k],
-                            dispatch="tma",
+                            a[
+                                m_block_idx * T.uint32(block_m) : m_block_idx * T.uint32(block_m)
+                                + block_m,
+                                k_offset + s * T.uint32(block_k) : k_offset
+                                + s * T.uint32(block_k)
+                                + block_k,
+                            ],
+                            dispatch="tma_explicit",
                             mbar=smem_pipe.full.ptr_to([stage_idx]),
                             cta_group=1,
                             cache_hint="evict_first",
+                            oob="zero",
                             prefetch_tensormap=True,
                         )
-                        Tx.copy_async(
-                            smem_b_mma[stage_idx],
-                            b[0:block_n, k_idx0 : k_idx0 + block_k],
-                            dispatch="tma",
-                            mbar=smem_pipe.full.ptr_to([stage_idx]),
-                            cta_group=1,
-                            cache_hint="evict_last",
-                            tma_dtype="tf32",
-                            prefetch_tensormap=True,
-                        )
+                        for b_atom in T.unroll(block_k // 32):
+                            Tx.copy_async(
+                                smem_b_mma[stage_idx, :, b_atom * 32 : b_atom * 32 + 32],
+                                b[
+                                    0:block_n,
+                                    k_offset + s * T.uint32(block_k) + b_atom * 32 : k_offset
+                                    + s * T.uint32(block_k)
+                                    + b_atom * 32
+                                    + 32,
+                                ],
+                                dispatch="tma_explicit",
+                                mbar=smem_pipe.full.ptr_to([stage_idx]),
+                                cta_group=1,
+                                cache_hint="evict_last",
+                                oob="zero",
+                                tma_dtype="tf32",
+                                prefetch_tensormap=True,
+                            )
                         smem_pipe.full.arrive(
                             stage_idx,
                             tx_count=T.uint32(smem_a_size_per_stage + smem_b_size_per_stage),
@@ -603,21 +616,20 @@ def get_kernel(**kwargs: Any):
             if warp_idx == 0:
                 if T.ptx.elect_sync():
                     # D store via TMA (writes only the valid region of boundary tiles).
-                    m0: T.uint32 = m_block_idx * T.uint32(block_m)
+                    d_row: T.let = m_block_idx * T.uint32(block_m)
                     if num_splits == 1:
                         Tx.copy_async(
-                            d[m0 : m0 + block_m, 0:block_n],
+                            d[d_row : d_row + block_m, 0:block_n],
                             smem_cd_mma,
-                            dispatch="tma",
+                            dispatch="tma_explicit",
                             prefetch_tensormap=True,
                             cache_hint="evict_first",
                         )
                     else:
-                        ks: T.uint32 = k_split_idx
                         Tx.copy_async(
-                            d[ks, m0 : m0 + block_m, 0:block_n],
+                            d[k_split_idx : k_split_idx + 1, d_row : d_row + block_m, 0:block_n],
                             smem_cd_mma,
-                            dispatch="tma",
+                            dispatch="tma_explicit",
                             prefetch_tensormap=True,
                             cache_hint="evict_first",
                         )

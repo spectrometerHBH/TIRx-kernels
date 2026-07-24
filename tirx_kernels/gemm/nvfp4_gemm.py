@@ -239,7 +239,7 @@ def _tma_g2s_args(bar, stage, cta_mask, cta_group):
     """Shared kwargs for the A/B and SF TMA g2s loads; only the mbarrier and
     cta_mask vary."""
     return {
-        "dispatch": "tma",
+        "dispatch": "tma_auto",
         "cta_group": cta_group,
         "mbar": T.reinterpret("handle", T.ptx.map_shared_rank(bar.ptr_to([stage]), 0)),
         "cta_mask": cta_mask,
@@ -540,7 +540,7 @@ def _kernel(
                     Tx.copy_async(
                         D[d_m : d_m + CTA_M, d_n_out : d_n_out + EPI_TILE],
                         output_smem[epi_wb_state.stage, 0:CTA_M, 0:EPI_TILE],
-                        dispatch="tma",
+                        dispatch="tma_auto",
                         cache_hint="evict_first",
                         prefetch_tensormap=True,
                     )
