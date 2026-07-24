@@ -4280,6 +4280,7 @@ mod tests {
             smem_size_bytes: 64,
             launch_shape: vec![1],
             cluster_shape: vec![1],
+            smem_pool: false,
         }
     }
 

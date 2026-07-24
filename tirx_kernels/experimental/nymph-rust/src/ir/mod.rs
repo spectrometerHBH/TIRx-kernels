@@ -18,6 +18,8 @@ pub mod tensor;
 pub mod thread_filter;
 pub mod validate;
 
+pub mod codegen;
+
 // Re-export everything so callers can write `nymph::ir::Tensor` etc.
 pub use dtype::*;
 pub use kernel::*;
@@ -114,6 +116,7 @@ mod tests {
             smem_size_bytes: 256 * 16 * 2,
             launch_shape: vec![2],
             cluster_shape: vec![2],
+            smem_pool: false,
         };
 
         // Arg tensor data is reachable directly through its Arc.
@@ -133,6 +136,7 @@ mod tests {
             smem_size_bytes: 0,
             launch_shape: vec![2],
             cluster_shape: vec![2],
+            smem_pool: false,
         }
     }
 
