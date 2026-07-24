@@ -56,10 +56,9 @@ WG2_ROWS_PER_PART = (B_TOPK // 2) // 4 // WG2_NUM_WARPS
 _mma_config = partial(tcgen05_config, cta_group=2)
 _kv_gather_tma = partial(
     tma_config,
+    dispatch="tma_explicit",
     cta_group=2,
     cta_mask=T.uint16(1),
-    gather_axis=0,
-    dst_gather_axis=0,
     cache_hint=T.uint64(0x14F0000000000000),
 )
 
@@ -635,23 +634,25 @@ def _kernel(
                 @T.inline
                 def gather_k_part(col_start, col_count, tx_dim, bar):
                     if not should_skip_tma:
-                        # One wide gather4 (like head64/small_topk); dispatch splits into per-atom
-                        # TMAs, ncu-verified = per-64-col loop. Keep sub bounds concrete for swizzle.
                         k_gather_tile = k_smem.sub[
                             :, col_start * 64 : col_start * 64 + col_count * 64
                         ].tile(0, (-1, WG1_NUM_WARPS, 4))[:, wg1_warp_idx, :]
-                        Tx.copy_async(
-                            k_gather_tile[:, :],
-                            kv_tma[:, col_start * 64 : col_start * 64 + col_count * 64],
-                            **_kv_gather_tma(
-                                mbar=leader_mbar(bar.ptr_to([cur_buf])),
-                                indexer=[
-                                    indices_int4[row, lane]
-                                    for row in range(WG1_ROWS_PER_WARP)
-                                    for lane in range(4)
-                                ],
-                            ),
-                        )
+                        for row_group in T.unroll(WG1_ROWS_PER_WARP):
+                            for col_atom in T.unroll(col_count):
+                                col = T.meta_var((col_start + col_atom) * 64)
+                                Tx.copy_async(
+                                    k_gather_tile[
+                                        row_group * 4 : row_group * 4 + 4,
+                                        col_atom * 64 : col_atom * 64 + 64,
+                                    ],
+                                    kv_tma[0:1, col : col + 64],
+                                    **_kv_gather_tma(
+                                        mbar=leader_mbar(bar.ptr_to([cur_buf])),
+                                        gather4=[
+                                            indices_int4[row_group, lane] for lane in range(4)
+                                        ],
+                                    ),
+                                )
                     else:
                         T.ptx.mbarrier.complete_tx(
                             bar.ptr_to([cur_buf]),
@@ -696,24 +697,24 @@ def _kernel(
                         s_q, stride_indices_s_q // B_TOPK, 2, WG2_ROWS_PER_PART, WG2_NUM_WARPS, 4
                     ).sub[s_q_idx, k, part, :, wg2_warp_idx, :]
                     Tx.copy(token_buf[:, :], idx_block[:, :], cache="nc")
-                    # One wide gather4 over all D_V//2 cols (like head64/small_topk); dispatch splits
-                    # into per-atom TMAs, ncu-verified equal to a per-64-col loop (see K-gather note).
                     src0: T.let = cta_idx * 256
                     v_gather_tile = v_smem_gemm.tile(0, (2, -1, WG2_NUM_WARPS, 4))[
                         part, :, wg2_warp_idx, :
                     ]
-                    Tx.copy_async(
-                        v_gather_tile[:, :],
-                        kv_tma[:, src0 : src0 + (D_V // 2)],
-                        **_kv_gather_tma(
-                            mbar=leader_mbar(bar.ptr_to([cur_buf])),
-                            indexer=[
-                                token_buf[row, lane]
-                                for row in range(WG2_ROWS_PER_PART)
-                                for lane in range(4)
-                            ],
-                        ),
-                    )
+                    for row_group in T.unroll(WG2_ROWS_PER_PART):
+                        for col_atom in T.unroll((D_V // 2) // 64):
+                            col = T.meta_var(src0 + col_atom * 64)
+                            Tx.copy_async(
+                                v_gather_tile[
+                                    row_group * 4 : row_group * 4 + 4,
+                                    col_atom * 64 : col_atom * 64 + 64,
+                                ],
+                                kv_tma[0:1, col : col + 64],
+                                **_kv_gather_tma(
+                                    mbar=leader_mbar(bar.ptr_to([cur_buf])),
+                                    gather4=[token_buf[row_group, lane] for lane in range(4)],
+                                ),
+                            )
 
                 token_idxs_part0 = T.alloc_local((WG2_ROWS_PER_PART, 4), "int32")
                 gather_v_part(0, 0, token_idxs_part0, bar_v_part0_ready)

@@ -15,8 +15,8 @@ moving ratio is a real perf signal. Rows where the reference impl
 itself drifted > 20% are flagged ⚠ — workload's environment was
 unstable, so the ratio Δ is less trustworthy.
 
-The report lists every comparable workload in a single table, sorted by
-ratio Δ from most-improved to most-regressed (positive → negative).
+The report lists comparable workloads in one table sorted by ratio Δ from
+most-improved to most-regressed (positive → negative).
 Baseline workloads that were attempted this run but produced no comparable
 measurement (failed, interfered, or missing an impl) are listed in a separate
 "Not comparable in current run" section so lost coverage is never silent.
@@ -174,6 +174,22 @@ def build_report(
     def w(line: str = "") -> None:
         out.write(line + "\n")
 
+    def write_ratio_table(table_rows: list[tuple]) -> None:
+        if not table_rows:
+            return
+        w(
+            "| kernel | config | ours impl | ref | ours (µs) | ref (µs) | ratio | saved | "
+            "ratio Δ | ours Δ | ref Δ |"
+        )
+        w("|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|")
+        for k, c, ours, ref, our_us, ref_us, cr, sr, d, our_d, ref_d in table_rows:
+            flag = " ⚠" if abs(ref_d) > 20 else ""
+            w(
+                f"| {k} | {c} | {ours} | {ref} | {our_us:.2f} | {ref_us:.2f} | {cr:.3f} | "
+                f"{sr:.3f} | {d:+.1f}% | {our_d:+.1f}% | {ref_d:+.1f}%{flag} |"
+            )
+        w()
+
     n_regressions = sum(1 for r in rows if r[8] <= -threshold_pct)
     n_improvements = sum(1 for r in rows if r[8] >= threshold_pct)
 
@@ -197,19 +213,7 @@ def build_report(
     )
     w()
 
-    if rows:
-        w(
-            "| kernel | config | ours impl | ref | ours (µs) | ref (µs) | ratio | saved | "
-            "ratio Δ | ours Δ | ref Δ |"
-        )
-        w("|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|")
-        for k, c, ours, ref, our_us, ref_us, cr, sr, d, our_d, ref_d in rows:
-            flag = " ⚠" if abs(ref_d) > 20 else ""
-            w(
-                f"| {k} | {c} | {ours} | {ref} | {our_us:.2f} | {ref_us:.2f} | {cr:.3f} | "
-                f"{sr:.3f} | {d:+.1f}% | {our_d:+.1f}% | {ref_d:+.1f}%{flag} |"
-            )
-        w()
+    write_ratio_table(rows)
 
     if not_comparable:
         w(f"## Not comparable in current run ({len(not_comparable)})")

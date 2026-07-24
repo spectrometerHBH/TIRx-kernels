@@ -303,7 +303,7 @@ class GemmTile(Tile):
                 m_st = T.meta_var(m_idx * self.M_pad_size + ko * self.EPI_TILE)
                 n_st = T.meta_var(n_idx * self.BLK_N)
                 tma_config = T.meta_var(
-                    {"dispatch": "tma", "cta_group": KernelConfig.CTA_GROUP}
+                    {"dispatch": "tma_explicit", "cta_group": KernelConfig.CTA_GROUP}
                     | (
                         {"cache_hint": "evict_last" if self.low_batch else ""}
                         if self.split_k_factor > 1
@@ -332,9 +332,7 @@ class GemmTile(Tile):
             self.smem_manager.arrive_specific(lane_id, self.output_smem, 0)
 
     @T.inline
-    def _run(
-        self, m_idx, n_idx, k_idx, A, B, output, profiler: CudaProfiler = None, A_tensormap=None
-    ):
+    def _run(self, m_idx, n_idx, k_idx, A, B, output, profiler: CudaProfiler = None):
         wg_id = T.warpgroup_id([KernelConfig.WG_NUMBER])
         T.warpgroup_id([KernelConfig.WG_NUMBER])
         warp_id = T.warp_id_in_wg([KernelConfig.WARP_NUMBER])
@@ -349,7 +347,7 @@ class GemmTile(Tile):
                         self.mma2tma_bar.wait(ks, self.phase[0])
                         B_tma_config = T.meta_var(
                             {
-                                "dispatch": "tma",
+                                "dispatch": "tma_auto",
                                 "cta_group": KernelConfig.CTA_GROUP,
                                 "mbar": self.tma2mma_bar.mbar.ptr_to([ks]),
                                 "cache_hint": "evict_first" if self.low_batch else "",
@@ -357,13 +355,10 @@ class GemmTile(Tile):
                         )
                         A_tma_config = T.meta_var(
                             {
-                                "dispatch": "tma",
+                                "dispatch": "tma_explicit",
                                 "cta_group": KernelConfig.CTA_GROUP,
                                 "mbar": self.tma2mma_bar.mbar.ptr_to([ks]),
                                 "cache_hint": "evict_last" if self.low_batch else "",
-                                "tile_mode": "tile_gather4",
-                                "box_dim": [1, self.BLK_K],
-                                "tensormap": A_tensormap,
                             }
                         )
                         if self.profiler_on:
@@ -425,7 +420,7 @@ class GemmTile(Tile):
                         )
                         B_tma_config = T.meta_var(
                             {
-                                "dispatch": "tma",
+                                "dispatch": "tma_auto",
                                 "cta_group": KernelConfig.CTA_GROUP,
                                 "mbar": self.tma2mma_bar.mbar.ptr_to([ks]),
                                 "cache_hint": "evict_first" if self.low_batch else "",
@@ -493,7 +488,7 @@ class GemmTile(Tile):
                         self.mma2tma_bar.wait(ks, self.phase[0])
                         B_tma_config = T.meta_var(
                             {
-                                "dispatch": "tma",
+                                "dispatch": "tma_auto",
                                 "cta_group": KernelConfig.CTA_GROUP,
                                 "mbar": self.tma2mma_bar.mbar.ptr_to([ks]),
                                 "cache_hint": "evict_first" if self.low_batch else "",
@@ -501,10 +496,11 @@ class GemmTile(Tile):
                         )
                         A_tma_config = T.meta_var(
                             {
-                                "dispatch": "tma",
+                                "dispatch": "tma_explicit",
                                 "cta_group": KernelConfig.CTA_GROUP,
                                 "mbar": self.tma2mma_bar.mbar.ptr_to([ks]),
                                 "cache_hint": "evict_last" if self.low_batch else "",
+                                "oob": "zero",
                             }
                         )
                         if self.profiler_on:
@@ -659,7 +655,7 @@ class GemmTile(Tile):
                     if T.ptx.elect_sync():
                         tma_config = T.meta_var(
                             {
-                                "dispatch": "tma",
+                                "dispatch": "tma_auto",
                                 "cta_group": KernelConfig.CTA_GROUP,
                                 "mbar": self.tma2mma_bar.mbar.ptr_to([ks]),
                                 "cache_hint": "evict_first" if self.low_batch else "",
@@ -677,11 +673,9 @@ class GemmTile(Tile):
                         profiler.end(ProfileEventType.TMA, lane_id == 0)
 
     @T.inline
-    def run(
-        self, m_idx, n_idx, k_idx, A, B, output, profiler: CudaProfiler = None, A_tensormap=None
-    ):
+    def run(self, m_idx, n_idx, k_idx, A, B, output, profiler: CudaProfiler = None):
         self._alloc_local(m_idx)
-        self._run(m_idx, n_idx, k_idx, A, B, output, profiler, A_tensormap=A_tensormap)
+        self._run(m_idx, n_idx, k_idx, A, B, output, profiler)
         self.smem_manager.advance()
 
     def _cp_async_load_A_tile(self, m_idx, ks, stage_k, tid, lane_id, A, mbar):

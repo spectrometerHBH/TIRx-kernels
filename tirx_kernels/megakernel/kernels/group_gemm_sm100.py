@@ -192,6 +192,7 @@ class GroupGEMMTile(GemmTile):
 
     @T.inline
     def _tma_gather4_A(self, ks, A, m_idx, k_st, tma_config, tid, lane_id):
+        A_stage = self.A_smem.sub[ks]
         for rg in T.unroll(0, self.BLK_M // 8):
             row_group = T.meta_var(rg * 8)
             row_idx = T.alloc_buffer([8], "int32", scope="local")
@@ -208,33 +209,17 @@ class GroupGEMMTile(GemmTile):
                         self.smem_sorted_token_ids_gather4[row_group + r + 4] // self.top_k
                     )
 
-            T.ptx.cp_async.bulk.tensor.g2c_tile_gather4(
-                2,
-                self.A_smem.ptr_to([ks, row_group, 0]),
-                tma_config["mbar"],
-                T.address_of(tma_config["tensormap"]),
-                0,
-                tma_config["cta_group"],
-                tma_config["cache_hint"],
-                k_st,
-                row_idx[0],
-                row_idx[1],
-                row_idx[2],
-                row_idx[3],
+            Tx.copy_async(
+                A_stage[row_group : row_group + 4, :],
+                A[0:1, k_st : k_st + self.BLK_K],
+                gather4=[row_idx[0], row_idx[1], row_idx[2], row_idx[3]],
+                **tma_config,
             )
-            T.ptx.cp_async.bulk.tensor.g2c_tile_gather4(
-                2,
-                self.A_smem.ptr_to([ks, row_group + 4, 4 * (2**self.SWIZZLE)]),
-                tma_config["mbar"],
-                T.address_of(tma_config["tensormap"]),
-                0,
-                tma_config["cta_group"],
-                tma_config["cache_hint"],
-                k_st,
-                row_idx[4],
-                row_idx[5],
-                row_idx[6],
-                row_idx[7],
+            Tx.copy_async(
+                A_stage[row_group + 4 : row_group + 8, :],
+                A[0:1, k_st : k_st + self.BLK_K],
+                gather4=[row_idx[4], row_idx[5], row_idx[6], row_idx[7]],
+                **tma_config,
             )
 
     @classmethod
@@ -378,7 +363,6 @@ class GroupGEMMTile(GemmTile):
         routing_weights,
         sorted_token_ids,
         valid_num_tokens,
-        A_tensormap=None,
         profiler=None,
     ):
         self.set_moe_info(expert_ids, routing_weights, sorted_token_ids)
@@ -395,19 +379,13 @@ class GroupGEMMTile(GemmTile):
         tid = T.thread_id([256])
         if num_tokens_in_block <= 32:
             self.set_BLK_M(32)
-            GemmTile._run(
-                self, m_idx, n_idx, k_idx, A, B, output, profiler, A_tensormap=A_tensormap
-            )
+            GemmTile._run(self, m_idx, n_idx, k_idx, A, B, output, profiler)
         elif num_tokens_in_block <= 64:
             self.set_BLK_M(64)
-            GemmTile._run(
-                self, m_idx, n_idx, k_idx, A, B, output, profiler, A_tensormap=A_tensormap
-            )
+            GemmTile._run(self, m_idx, n_idx, k_idx, A, B, output, profiler)
         else:
             self.set_BLK_M(128)
-            GemmTile._run(
-                self, m_idx, n_idx, k_idx, A, B, output, profiler, A_tensormap=A_tensormap
-            )
+            GemmTile._run(self, m_idx, n_idx, k_idx, A, B, output, profiler)
         self.smem_manager.advance()
 
 

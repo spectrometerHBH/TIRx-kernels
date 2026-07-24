@@ -521,22 +521,25 @@ def get_kernel(**kwargs: Any):
                         Tx.copy_async(
                             smem_a_mma[stage_idx],
                             a[m_idx0 : m_idx0 + block_m, k_idx0 : k_idx0 + block_k],
-                            dispatch="tma",
+                            dispatch="tma_explicit",
                             mbar=smem_pipe.full.ptr_to([stage_idx]),
                             cta_group=1,
                             cache_hint="evict_first",
+                            oob="zero",
                             prefetch_tensormap=True,
                         )
-                        Tx.copy_async(
-                            smem_b_mma[stage_idx],
-                            b[0:block_n, k_idx0 : k_idx0 + block_k],
-                            dispatch="tma",
-                            mbar=smem_pipe.full.ptr_to([stage_idx]),
-                            cta_group=1,
-                            cache_hint="evict_last",
-                            tma_dtype="tf32",
-                            prefetch_tensormap=True,
-                        )
+                        for b_atom in T.unroll(block_k // 32):
+                            Tx.copy_async(
+                                smem_b_mma[stage_idx, :, b_atom * 32 : b_atom * 32 + 32],
+                                b[0:block_n, k_idx0 + b_atom * 32 : k_idx0 + b_atom * 32 + 32],
+                                dispatch="tma_explicit",
+                                mbar=smem_pipe.full.ptr_to([stage_idx]),
+                                cta_group=1,
+                                cache_hint="evict_last",
+                                oob="zero",
+                                tma_dtype="tf32",
+                                prefetch_tensormap=True,
+                            )
                         smem_pipe.full.arrive(
                             stage_idx,
                             tx_count=T.uint32(smem_a_size_per_stage + smem_b_size_per_stage),
@@ -608,7 +611,7 @@ def get_kernel(**kwargs: Any):
                         Tx.copy_async(
                             d[m0 : m0 + block_m, 0:block_n],
                             smem_cd_mma,
-                            dispatch="tma",
+                            dispatch="tma_auto",
                             prefetch_tensormap=True,
                             cache_hint="evict_first",
                         )
@@ -617,7 +620,7 @@ def get_kernel(**kwargs: Any):
                         Tx.copy_async(
                             d[ks, m0 : m0 + block_m, 0:block_n],
                             smem_cd_mma,
-                            dispatch="tma",
+                            dispatch="tma_auto",
                             prefetch_tensormap=True,
                             cache_hint="evict_first",
                         )

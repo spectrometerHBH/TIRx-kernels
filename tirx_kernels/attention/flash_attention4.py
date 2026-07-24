@@ -359,16 +359,16 @@ def _kernel(
                     q_load.empty.wait(i_q, phase_q_load)
                     tma_copy_q = T.meta_var(
                         {
-                            "dispatch": "tma",
+                            "dispatch": "tma_auto",
                             "mbar": q_load.full.buf.ptr_to([i_q]),
                             "cta_group": CTA_GROUP,
                         }
                     )
                     tma_q_token = iket.range_start("issue-tma-q")
-                    Q_smem_3d = Q_smem.view(SMEM_PIPE_DEPTH_Q, SEQ_Q_PER_TILE, GQA_RATIO, HEAD_DIM)
+                    Q_smem_4d = Q_smem.view(SMEM_PIPE_DEPTH_Q, SEQ_Q_PER_TILE, GQA_RATIO, HEAD_DIM)
                     if T.ptx.elect_sync():
                         Tx.copy_async(
-                            Q_smem_3d[i_q, :, :, :],
+                            Q_smem_4d[i_q, :, :, :],
                             Q[
                                 batch_idx,
                                 m_start + i_q * SEQ_Q_PER_TILE : m_start
@@ -386,7 +386,7 @@ def _kernel(
                     kv_load.empty.wait(kv_pipe.stage, kv_pipe.phase)
                     tma_copy_k = T.meta_var(
                         {
-                            "dispatch": "tma",
+                            "dispatch": "tma_auto",
                             "mbar": kv_load.full.buf.ptr_to([kv_pipe.stage]),
                             "cta_group": CTA_GROUP,
                         }
@@ -407,7 +407,7 @@ def _kernel(
                     kv_load.empty.wait(kv_pipe.stage, kv_pipe.phase)
                     tma_copy_v = T.meta_var(
                         {
-                            "dispatch": "tma",
+                            "dispatch": "tma_auto",
                             "mbar": kv_load.full.buf.ptr_to([kv_pipe.stage]),
                             "cta_group": CTA_GROUP,
                         }
@@ -445,7 +445,7 @@ def _kernel(
                     if i_q != 0:
                         corr_epi.full.wait(i_q, phase_tmem)
                     m_start_global = T.meta_var(m_start + i_q * SEQ_Q_PER_TILE)
-                    O_smem_3d = O_smem.view(TMEM_PIPE_DEPTH, SEQ_Q_PER_TILE, GQA_RATIO, HEAD_DIM)
+                    O_smem_4d = O_smem.view(TMEM_PIPE_DEPTH, SEQ_Q_PER_TILE, GQA_RATIO, HEAD_DIM)
                     if T.ptx.elect_sync():
                         Tx.copy_async(
                             O[
@@ -454,8 +454,8 @@ def _kernel(
                                 kv_head_idx * GQA_RATIO : (kv_head_idx + 1) * GQA_RATIO,
                                 :,
                             ],
-                            O_smem_3d[i_q, :, :, :],
-                            dispatch="tma",
+                            O_smem_4d[i_q, :, :, :],
+                            dispatch="tma_auto",
                         )
                     T.ptx.cp_async.bulk.commit_group()
                 for i_q in T.unroll(SMEM_PIPE_DEPTH_Q):

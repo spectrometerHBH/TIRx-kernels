@@ -314,7 +314,7 @@ def _kernel(
                 k = T.meta_var(k_tile * BLK_K)
                 tma_copy = T.meta_var(
                     {
-                        "dispatch": "tma",
+                        "dispatch": "tma_auto",
                         "mbar": smem_pipe.full.ptr_to([stage]),
                         "cta_group": 1,
                         "cache_hint": "evict_normal",
@@ -487,7 +487,7 @@ def _kernel(
                         Tx.copy_async(
                             D[d_m : d_m + D_TILE_M, d_n : d_n + D_TILE_N],
                             D_smem[stage],
-                            dispatch="tma",
+                            dispatch="tma_auto",
                             prefetch_tensormap=True,
                         )
                         T.ptx.cp_async.bulk.commit_group()
@@ -502,8 +502,9 @@ def _kernel(
         if tid_in_wg == 0:
             T.ptx.cp_async.bulk.wait_group(0)
         T.cuda.warpgroup_sync(10)
-    tmem_pool.dealloc()
+    # The epilogue warpgroup and peer CTA must finish all TMEM reads first.
     T.cuda.cluster_sync()
+    tmem_pool.dealloc()
 
 
 def tir_kernel(M: int, N: int, K: int):

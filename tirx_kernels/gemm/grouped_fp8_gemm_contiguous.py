@@ -180,7 +180,7 @@ def _kernel(
     TILE_GROUPS_ROW_SIZE: T.constexpr = 16,
     SCHED_CLUSTER_SIZE: T.constexpr = 1,
     SCHED_SERPENTINE: T.constexpr = False,
-    TMA_L2_PROMOTION: T.constexpr = 256,
+    TMA_L2_PROMOTION: T.constexpr = "L2::256B",
 ):
     CTA_GROUP = T.meta_var(LOGICAL_M_CLUSTER * LOGICAL_N_CLUSTER)
     CTA_MASK = T.meta_var((1 << CTA_GROUP) - 1)
@@ -312,21 +312,21 @@ def _kernel(
                 group: T.let = GROUPED_LAYOUT[sf_m]
                 tma_copy = T.meta_var(
                     {
-                        "dispatch": "tma",
+                        "dispatch": "tma_auto",
                         "mbar": smem_pipe.full.ptr_to([stage]),
                         "cta_group": 1,
                         "cache_hint": "evict_normal",
-                        "l2_promotion": TMA_L2_PROMOTION,
+                        "tensormap_l2_promotion": TMA_L2_PROMOTION,
                         "prefetch_tensormap": True,
                     }
                 )
                 tma_copy_evict_last = T.meta_var(
                     {
-                        "dispatch": "tma",
+                        "dispatch": "tma_auto",
                         "mbar": smem_pipe.full.ptr_to([stage]),
                         "cta_group": 1,
                         "cache_hint": "evict_last",
-                        "l2_promotion": TMA_L2_PROMOTION,
+                        "tensormap_l2_promotion": TMA_L2_PROMOTION,
                         "prefetch_tensormap": True,
                     }
                 )
@@ -488,6 +488,11 @@ def _kernel(
         STORE_TILES = T.meta_var(MMA_N // EPI)
         D_TILE_M = T.meta_var(16 if SWAP_AB else DG_BLOCK_M)
         D_TILE_N = T.meta_var(DG_BLOCK_N if SWAP_AB else EPI_TILE)
+        # Four-group shapes regress when the two 2 KiB legacy stores are fused
+        # into one 4 KiB rank-3 store. Eight-group shapes do not benefit from
+        # retaining that split, so keep the direct auto plan there.
+        D_TMA_ISSUES = T.meta_var(2 if SWAP_AB and NUM_GROUPS == 4 else 1)
+        D_TMA_TILE_N = T.meta_var(D_TILE_N // D_TMA_ISSUES)
 
         @T.inline
         def epilogue():
@@ -531,13 +536,18 @@ def _kernel(
                 d_n: T.let = n_idx * DG_BLOCK_N + (0 if SWAP_AB else ot * EPI_TILE)
                 if warp_id == 0:
                     if T.ptx.elect_sync():
-                        Tx.copy_async(
-                            D[d_m : d_m + D_TILE_M, d_n : d_n + D_TILE_N],
-                            D_smem[stage],
-                            dispatch="tma",
-                            l2_promotion=TMA_L2_PROMOTION,
-                            prefetch_tensormap=True,
-                        )
+                        for d_atom in T.unroll(D_TMA_ISSUES):
+                            d_atom_n = T.meta_var(d_atom * D_TMA_TILE_N)
+                            Tx.copy_async(
+                                D[
+                                    d_m : d_m + D_TILE_M,
+                                    d_n + d_atom_n : d_n + d_atom_n + D_TMA_TILE_N,
+                                ],
+                                D_smem[stage, :, d_atom_n : d_atom_n + D_TMA_TILE_N],
+                                dispatch="tma_auto",
+                                tensormap_l2_promotion=TMA_L2_PROMOTION,
+                                prefetch_tensormap=True,
+                            )
                         T.ptx.cp_async.bulk.commit_group()
 
         T.cuda.trap_when_assert_failed(tmem_pool.addr == 0)
@@ -550,11 +560,12 @@ def _kernel(
         if tid_in_wg == 0:
             T.ptx.cp_async.bulk.wait_group(0)
         T.cuda.warpgroup_sync(10)
-    tmem_pool.dealloc()
+    # The epilogue warpgroup and every CTA sharing the allocation must finish first.
     if CTA_GROUP > 1:
         T.cuda.cluster_sync()
     else:
         T.cuda.cta_sync()
+    tmem_pool.dealloc()
 
 
 def grouped_fp8_gemm_contiguous(num_groups: int, M: int, N: int, K: int):
@@ -590,7 +601,9 @@ def grouped_fp8_gemm_contiguous(num_groups: int, M: int, N: int, K: int):
         TILE_GROUPS_ROW_SIZE=tile_groups_row_size,
         SCHED_CLUSTER_SIZE=2 if cluster_schedule else 1,
         SCHED_SERPENTINE=cluster_schedule,
-        TMA_L2_PROMOTION=(128 if K in (2048, 7168) or (num_groups == 8 and K == 4096) else 256),
+        TMA_L2_PROMOTION=(
+            "L2::128B" if K in (2048, 7168) or (num_groups == 8 and K == 4096) else "L2::256B"
+        ),
     )
 
 

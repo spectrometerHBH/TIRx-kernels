@@ -61,8 +61,6 @@ DEFAULT_BASELINE = SCRIPT_DIR / "baseline.json"
 DEFAULT_REGRESSION_THRESHOLD = 1.0
 POLL_INTERVAL = 5.0  # seconds between GPU re-checks when none is free
 MONITOR_INTERVAL = 0.5  # seconds between nvidia-smi polls during a workload
-# 0 means auto: one worker per probe-OK GPU (see main()).
-DEFAULT_CPU_WORKERS = 0
 DEFAULT_UTIL_THRESHOLD = 0.0  # % GPU util above which a card counts as busy.
 DEFAULT_MEM_THRESHOLD = 0.0  # % compute-app memory above which a card counts as busy.
 
@@ -424,8 +422,14 @@ def _gpu_uuid_of(idx: str) -> str | None:
     return None
 
 
-def _pids_on_gpu(uuid: str) -> set[int]:
-    """Set of PIDs currently using the given GPU UUID."""
+def _compute_pids_by_gpu_uuid() -> dict[str, set[int]]:
+    """Return every compute-app PID grouped by physical GPU UUID.
+
+    Unlike ``pmon`` SM utilization, a compute context remains visible between
+    short kernel bursts.  The authoritative benchmark gate already rejects
+    resident compute-app memory before assignment, so the runtime monitor must
+    apply the same isolation rule when a context appears after assignment.
+    """
     try:
         out = subprocess.run(
             ["nvidia-smi", "--query-compute-apps=pid,gpu_uuid", "--format=csv,noheader"],
@@ -434,78 +438,29 @@ def _pids_on_gpu(uuid: str) -> set[int]:
             timeout=5,
         ).stdout
     except Exception:
-        return set()
-    pids: set[int] = set()
-    for line in out.splitlines():
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) >= 2 and parts[1] == uuid:
-            try:
-                pids.add(int(parts[0]))
-            except ValueError:
-                pass
-    return pids
-
-
-def _pid_sm_on_gpu(gpu_index: str) -> dict[int, float]:
-    """Map PID -> sm-utilization (%) for every compute process on the given
-    physical GPU, via `nvidia-smi pmon`.
-
-    This is the signal that separates a neighbor *actively burning the GPU*
-    from one merely *parking resident VRAM* at 0% sm — and, crucially, it is
-    per-process, so it stays meaningful while our own kernel pegs the
-    device-level utilization. A single `pmon -c 1` snapshot is ~0.15s here.
-
-    pmon `-s u` columns: gpu  pid  type  sm  mem  enc  dec  jpg  ofa  command.
-    Inactive rows show "-" for pid/sm; those are skipped.
-    """
-    try:
-        out = subprocess.run(
-            ["nvidia-smi", "pmon", "-i", str(gpu_index), "-c", "1", "-s", "u"],
-            capture_output=True,
-            text=True,
-            timeout=8,
-        ).stdout
-    except Exception:
         return {}
-    result: dict[int, float] = {}
+    result: dict[str, set[int]] = {}
     for line in out.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        fields = line.split()
-        if len(fields) < 4:
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 2:
             continue
         try:
-            pid = int(fields[1])
-            sm = float(fields[3])
+            pid = int(parts[0])
         except ValueError:
-            continue  # pid or sm is "-" (no active process this sample)
-        result[pid] = sm
+            continue
+        result.setdefault(parts[1], set()).add(pid)
     return result
 
 
-def _active_strangers(gpu_index: str, our_pids: set[int], sm_threshold: float) -> dict[int, float]:
-    """PIDs on `gpu_index` that are NOT ours and whose sm-util exceeds threshold.
-
-    Empty result == no neighbor is actively computing right now, so an
-    idle-but-resident squatter (sm 0) does not count as interference and we
-    are free to share the card."""
+def _resident_strangers_on_gpu_uuids(gpu_uuids: tuple[str, ...], our_pids: set[int]) -> set[int]:
+    """Foreign compute contexts resident on any assigned physical GPU."""
+    pids_by_uuid = _compute_pids_by_gpu_uuid()
     return {
-        pid: sm
-        for pid, sm in _pid_sm_on_gpu(gpu_index).items()
-        if pid not in our_pids and sm > sm_threshold
+        pid
+        for gpu_uuid in gpu_uuids
+        for pid in pids_by_uuid.get(gpu_uuid, ())
+        if pid not in our_pids
     }
-
-
-def _active_strangers_on_gpus(
-    gpu_indices: tuple[str, ...], our_pids: set[int], sm_threshold: float
-) -> dict[int, float]:
-    """Merge active intruders observed on any GPU assigned to one workload."""
-    active: dict[int, float] = {}
-    for gpu_index in gpu_indices:
-        for pid, sm in _active_strangers(gpu_index, our_pids, sm_threshold).items():
-            active[pid] = max(active.get(pid, 0.0), sm)
-    return active
 
 
 class _BenchPidRegistry:
@@ -614,22 +569,15 @@ def _run_subprocess_monitored(
 
     Returns (returncode, interfered, intruder_pids, cancelled).
 
-    Interference == another tenant is actually computing on an assigned card, i.e. a
-    PID that is not registered as ours has sm-utilization above `sm_threshold`.
+    Interference means any foreign CUDA compute context is resident on an
+    assigned card.  The acquisition gate already rejects compute-app memory at
+    the default zero threshold.  Applying the same rule while a workload runs
+    closes the sampling hole where a resident process launches only short
+    kernels between `pmon` SM-utilization snapshots.
 
-    Two-stage protection, both using per-PID sm-util (`nvidia-smi pmon`):
-
-    1. **Pre-spawn check**: if any stranger is already actively computing,
-       someone grabbed an assigned card between pool acquisition and now (or
-       an idle-looking card just woke up). Don't launch — return INTERFERED so
-       the dispatcher requeues this workload.
-
-    2. **Per-poll check**: at every `monitor_interval`, take the per-PID sm
-       map, drop registered bench PIDs (and their descendants, e.g. nvcc),
-       and if any remaining PID is above the sm threshold, SIGTERM the
-       subprocess. This catches a brand-new intruder *and* a resident neighbor
-       that bursts its own sm mid-run — per-PID sm stays meaningful even while
-       our own kernel pegs the device-level utilization.
+    Protection is applied immediately before spawn and after every process wait
+    poll.  Registered bench subprocesses and their descendants (for example
+    nvcc) are excluded.
     """
     proc: subprocess.Popen | None = None
     registered_pid: int | None = None
@@ -637,11 +585,17 @@ def _run_subprocess_monitored(
     cancelled = False
     if cancel_event is not None and cancel_event.is_set():
         return -1, False, [], True
-    if gpu_indices:
-        pre = _active_strangers_on_gpus(gpu_indices, _our_pids(), sm_threshold)
+    resolved_gpu_uuids = [_gpu_uuid_of(gpu_index) for gpu_index in gpu_indices]
+    if any(gpu_uuid is None for gpu_uuid in resolved_gpu_uuids):
+        with open(log_path, "w") as lf:
+            lf.write("RACE_LOST: could not resolve every assigned GPU UUID for monitoring\n")
+        return -1, True, [], False
+    gpu_uuids = tuple(gpu_uuid for gpu_uuid in resolved_gpu_uuids if gpu_uuid is not None)
+    if gpu_uuids:
+        pre = _resident_strangers_on_gpu_uuids(gpu_uuids, _our_pids())
         if pre:
             with open(log_path, "w") as lf:
-                lf.write(f"RACE_LOST: pre-spawn check — active strangers {pre}\n")
+                lf.write(f"RACE_LOST: pre-spawn check — foreign compute contexts {pre}\n")
             return -1, True, sorted(pre), False
     with open(log_path, "w") as lf:
         proc = subprocess.Popen(
@@ -660,11 +614,11 @@ def _run_subprocess_monitored(
                 break  # subprocess exited normally
             except subprocess.TimeoutExpired:
                 pass
-            if not gpu_indices:
+            if not gpu_uuids:
                 continue
-            active = _active_strangers_on_gpus(gpu_indices, _our_pids(), sm_threshold)
-            if active:
-                intruders = sorted(active)
+            resident = _resident_strangers_on_gpu_uuids(gpu_uuids, _our_pids())
+            if resident:
+                intruders = sorted(resident)
                 _terminate_subprocess(proc)
                 break
     except KeyboardInterrupt:
@@ -1305,13 +1259,7 @@ def _finalize_bench_record(row: dict, *, rounds: int) -> None:
 
 
 def run_scheduled_jobs(
-    workloads: list[dict],
-    pool: GpuPool,
-    log_dir: Path,
-    *,
-    rounds: int,
-    cooldown: float,
-    cpu_workers: int,
+    workloads: list[dict], pool: GpuPool, log_dir: Path, *, rounds: int, cooldown: float
 ) -> tuple[list[dict], list[tuple[str, str, int, str]]]:
     """Run one subprocess per workload and stop the suite on the first failure.
 
@@ -1412,7 +1360,7 @@ def run_scheduled_jobs(
                     )
             pending.task_done()
 
-    n_workers = min(cpu_workers, n_jobs)
+    n_workers = min(pool.total_visible(), n_jobs)
     with ThreadPoolExecutor(max_workers=n_workers, thread_name_prefix="bench") as ex:
         futs = [ex.submit(worker) for _ in range(n_workers)]
         with state_lock:
@@ -1484,9 +1432,8 @@ def main() -> None:
         "--util-threshold",
         type=float,
         default=DEFAULT_UTIL_THRESHOLD,
-        help="%% GPU/sm utilization above which a card counts as "
-        "actively in use: selection skips such cards and the "
-        "monitor requeues if a neighbor crosses it mid-run "
+        help="%% GPU utilization above which assignment skips a card. "
+        "Once assigned, any foreign CUDA compute context requeues the workload "
         f"(default {DEFAULT_UTIL_THRESHOLD:g})",
     )
     ap.add_argument(
@@ -1508,13 +1455,6 @@ def main() -> None:
         type=float,
         default=DEFAULT_COOLDOWN_S,
         help=f"Seconds to sleep before every implementation (default {DEFAULT_COOLDOWN_S:g}).",
-    )
-    ap.add_argument(
-        "--cpu-workers",
-        type=int,
-        default=DEFAULT_CPU_WORKERS,
-        help="Concurrent bench workers (default 0 = probe-OK GPU count). "
-        "Each worker atomically holds all GPUs requested by its workload.",
     )
     ap.add_argument(
         "--check-imports",
@@ -1633,8 +1573,7 @@ def main() -> None:
         allowed=usable, util_threshold=args.util_threshold, mem_threshold=args.mem_threshold
     )
     n_gpus = len(usable)
-    cpu_workers = args.cpu_workers if args.cpu_workers > 0 else n_gpus
-    cpu_workers = min(cpu_workers, n_gpus)
+    n_workers = min(n_gpus, len(workloads))
 
     _repo_git = collect_repo_git()
     label = args.label or _repo_git.get("tirx-kernels") or _repo_git.get("tir") or "local"
@@ -1646,17 +1585,12 @@ def main() -> None:
     )
     print(
         f"[bench-suite] {len(workloads)} workloads, {n_gpus} probe-OK GPU(s) in pool, "
-        f"{cpu_workers} worker(s), label={label}{agg_note}",
+        f"{n_workers} worker(s), label={label}{agg_note}",
         flush=True,
     )
 
     results, retry_log = run_scheduled_jobs(
-        workloads,
-        pool,
-        log_dir,
-        rounds=args.rounds,
-        cooldown=args.cooldown,
-        cpu_workers=cpu_workers,
+        workloads, pool, log_dir, rounds=args.rounds, cooldown=args.cooldown
     )
 
     if retry_log:

@@ -4990,12 +4990,14 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
                     T.ptx.bar.sync(
                         epilogue_full_sync_barrier_idx, kernel_config.num_epilogue_threads
                     )
+            epilogue_thread_idx = epilogue_warp_idx * 32 + lane_idx
+            epilogue_nvlink_barrier_before_combine_reduce(epilogue_thread_idx)
+            # The grid barrier above includes every epilogue thread in both CTAs,
+            # so no peer can still be accessing TMEM when warp 0 deallocates it.
             if epilogue_warp_idx == 0:
                 T.ptx.tcgen05.dealloc(
                     T.uint32(0), n_cols=num_tmem_cols, cta_group=kernel_config.num_ctas_per_cluster
                 )
-            epilogue_thread_idx = epilogue_warp_idx * 32 + lane_idx
-            epilogue_nvlink_barrier_before_combine_reduce(epilogue_thread_idx)
             T.evaluate(
                 sync_unaligned(
                     dispatch_with_epilogue_sync_barrier_idx,

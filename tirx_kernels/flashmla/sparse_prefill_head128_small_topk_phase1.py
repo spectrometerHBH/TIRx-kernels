@@ -61,10 +61,9 @@ WG3_ELEMS_PER_THREAD = B_TOPK // 2
 _mma_config = partial(tcgen05_config, cta_group=2, smem_desc="local_hoist")
 _kv_gather_tma = partial(
     tma_config,
+    dispatch="tma_explicit",
     cta_group=2,
     cta_mask=T.uint16(1),
-    gather_axis=0,
-    dst_gather_axis=0,
     cache_hint=T.uint64(0x14F0000000000000),
 )
 
@@ -546,20 +545,29 @@ def _kernel(
                     src_col: T.let = cta_idx * (D_QK // 2)
                     # Rows interleave (row_group, warp, pair, lane4): this warp's 8-row stripes of each
                     # 64-col chunk. Col reshaped to (chunk,64); row picks this warp's rows via rank-preserving tile.
-                    k_gather_tile = k_smem_gemm_cur.view(B_TOPK, (D_QK // 2) // 64, 64).tile(
-                        0, (-1, 4, 2, 4)
+                    k_gather_tile = (
+                        k_smem_gemm_cur.view(B_TOPK, (D_QK // 2) // 64, 64).tile(0, (-1, 4, 2, 4))
                     )[:, wg1_warp_idx, :, :]
                     kv_tma = kv.view(
                         s_kv, D_QK, layout=TileLayout(S[(s_kv, D_QK) : (stride_kv_s_kv, 1)])
                     )
-                    Tx.copy_async(
-                        k_gather_tile[:, :, :],
-                        kv_tma[:, src_col : src_col + D_QK // 2],
-                        **_kv_gather_tma(
-                            mbar=leader_mbar(bar_KV_full.ptr_to([k_buf_idx])),
-                            indexer=[cur_indices[i] for i in range(WG1_ROWS_PER_WARP)],
-                        ),
-                    )
+                    k_gather_tile_2d = k_gather_tile.view(WG1_ROWS_PER_WARP, D_QK // 2)
+                    for row_group in T.unroll(WG1_ROWS_PER_WARP // 4):
+                        for col_atom in T.unroll((D_QK // 2) // 64):
+                            col = T.meta_var(src_col + col_atom * 64)
+                            Tx.copy_async(
+                                k_gather_tile_2d[
+                                    row_group * 4 : row_group * 4 + 4,
+                                    col_atom * 64 : col_atom * 64 + 64,
+                                ],
+                                kv_tma[0:1, col : col + 64],
+                                **_kv_gather_tma(
+                                    mbar=leader_mbar(bar_KV_full.ptr_to([k_buf_idx])),
+                                    gather4=[
+                                        cur_indices[row_group * 4 + lane] for lane in range(4)
+                                    ],
+                                ),
+                            )
                     wg1_rs = wg1_rs + 1
 
                 bar_clc_full.wait(0, wg1_outer_loop_phase)
