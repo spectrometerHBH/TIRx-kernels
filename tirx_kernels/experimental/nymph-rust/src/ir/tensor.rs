@@ -9,16 +9,16 @@
 //! builder): equality/hash compare ids only, so two `Arc` clones of the same tensor
 //! are "the same tensor", and two distinct tensors with identical fields are not.
 
-use super::dtype::{DType, MemorySpace, Swizzle, TmemLayoutKind};
+use super::dtype::{DType, MemorySpace, Swizzle};
 use super::scalar::ScalarValue;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-/// `Layout` (base + 2 subclasses) -> a Rust enum.
+/// `Layout` — only SMEM swizzle remains: TMEM is no longer a tensor and has no
+/// layout abstraction (see `TmemOperand`).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Layout {
     Swizzle(SmemSwizzleLayout),
-    Tmem(TmemLayout),
 }
 
 /// `SmemSwizzleLayout`.
@@ -27,13 +27,29 @@ pub struct SmemSwizzleLayout {
     pub swizzle: Swizzle,
 }
 
-/// `TmemLayout`. `lane_align` is the MMA accumulator d-tmem lane field (0 or 16),
-/// NOT part of the view mapping (see the Python docstring).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct TmemLayout {
-    pub kind: TmemLayoutKind,
-    pub col_start: usize,
-    pub lane_align: u8, // 0 or 16
+/// A TMEM reference: absolute physical address + cell interpretation.
+///
+/// TMEM is a 128-lane x 512-column grid of 32-bit cells, allocated by column
+/// band (`TmemAlloc`); it is NOT a tensor and has no layout. Every TMEM
+/// instruction takes this explicit absolute physical `(lane, col)` base
+/// address plus the `dtype` that says how the addressed cells are (un)packed
+/// (f32/i32/u32 one value per cell; f16/bf16 two per cell, low half first;
+/// f8e4m3 one raw scale byte per cell). `row` is the lane in [0, 128), `col`
+/// the column in [0, 512).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct TmemOperand {
+    pub row: ScalarValue,
+    pub col: ScalarValue,
+    pub dtype: DType,
+}
+
+/// A `Tcgen05Mma` A/B operand: an SMEM tile (`TensorSlice`), or TMEM cells
+/// (`TmemOperand`) — the value model's accumulator-readback abstraction (the
+/// GDN state read straight out of TMEM).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum MmaOperand {
+    Slice(TensorSlice),
+    Tmem(TmemOperand),
 }
 
 /// `Tensor` — the data, plus a stable `id` for identity. Held by `Arc<Tensor>`

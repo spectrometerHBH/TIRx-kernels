@@ -141,6 +141,34 @@ impl GmemAtomicOrderEvent {
     }
 }
 
+/// Memory semantics carried on a `ClusterBarrierArrive` event (mirrors
+/// `ir::ClusterBarrierSem`, kept local for the same reason). Per PTX §9.7.14.3
+/// only `Release` publishes a memory happens-before edge; `Relaxed` carries
+/// control order only (it unblocks the cluster-barrier waits).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClusterBarrierSemEvent {
+    Relaxed,
+    Release,
+}
+
+impl ClusterBarrierSemEvent {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClusterBarrierSemEvent::Relaxed => "relaxed",
+            ClusterBarrierSemEvent::Release => "release",
+        }
+    }
+}
+
+impl From<crate::ir::ClusterBarrierSem> for ClusterBarrierSemEvent {
+    fn from(sem: crate::ir::ClusterBarrierSem) -> Self {
+        match sem {
+            crate::ir::ClusterBarrierSem::Relaxed => ClusterBarrierSemEvent::Relaxed,
+            crate::ir::ClusterBarrierSem::Release => ClusterBarrierSemEvent::Release,
+        }
+    }
+}
+
 /// N-dimensional half-open physical byte box.
 ///
 /// SMEM, GMEM, and REG use rank-1 byte ranges. TMEM uses rank-2 boxes in
@@ -453,6 +481,12 @@ impl TmemAsyncKind {
 pub enum FenceEventKind {
     Generic,
     ProxyAsync,
+    /// `fence.mbarrier_init` — a cluster-scope RELEASE fence (PTX
+    /// `fence.mbarrier_init.release.cluster`): canon's release-side fence before
+    /// the relaxed prologue cluster-barrier arrive. Distinct from `Generic`
+    /// (which carries the sim-only Memory/View markers) because it seals a
+    /// relaxed `barrier.cluster.arrive` into a fence-synchronized release.
+    MbarrierInit,
 }
 
 impl FenceEventKind {
@@ -460,6 +494,7 @@ impl FenceEventKind {
         match self {
             FenceEventKind::Generic => "generic",
             FenceEventKind::ProxyAsync => "proxy_async",
+            FenceEventKind::MbarrierInit => "mbarrier_init",
         }
     }
 }
@@ -597,6 +632,25 @@ pub enum TraceEventKind {
     TmemDealloc {
         cta_ids: Vec<usize>,
         region: Region,
+        scope: AccessScope,
+    },
+    /// Split cluster barrier (`barrier.cluster.arrive`, aligned): every cluster
+    /// thread arrives exactly once (non-blocking) in the prologue; `count` is the
+    /// cumulative cluster-wide arrived-thread total after this arrival. `sem` is
+    /// the PTX memory semantics: `Release` publishes the cohort's clock into the
+    /// per-cluster accumulator (the join the waits acquire once
+    /// `count == thread_count`); `Relaxed` publishes NO memory edge (control
+    /// order only — the deadlock graph still witnesses the wait against it).
+    ClusterBarrierArrive {
+        thread_count: usize,
+        count: usize,
+        sem: ClusterBarrierSemEvent,
+        scope: AccessScope,
+    },
+    /// Split cluster barrier (`barrier.cluster.wait`, per warp): an ACQUIRE —
+    /// emitted only when the wait passes (every cluster thread's arrive is in),
+    /// so it joins the cluster's full arrival clock into the waiting stream.
+    ClusterBarrierWait {
         scope: AccessScope,
     },
     SchedulerNext {

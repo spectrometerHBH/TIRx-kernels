@@ -15,7 +15,57 @@ use ndarray::Array1;
 pub fn register(reg: &mut StmtExecutorRegistry) {
     reg.register(StmtKind::ScalarDef, execute_scalar_def);
     reg.register(StmtKind::ScalarStore, execute_scalar_store);
+    reg.register(StmtKind::ScalarLet, execute_scalar_let);
     reg.register(StmtKind::StoreScalar, execute_store_scalar);
+    reg.register(StmtKind::ShuffleSync, execute_shuffle_sync);
+}
+
+/// Warp shuffle/broadcast: `var` = `src` evaluated on lane `src_lane` of each warp,
+/// broadcast to all lanes (a faithful `__shfl_sync`). If `src` is warp-uniform the
+/// broadcast is a no-op (every lane already holds the same value); if it is NOT, the
+/// broadcast changes it — and because this runs in the value model, the resulting
+/// mismatch is caught. The shuffle is per warp (the 32-lane `__shfl_sync` width), so
+/// the source value is taken from the same (cta, warp).
+fn execute_shuffle_sync<'a, 'k>(
+    ctx: &mut WarpContext<'a, 'k>,
+    stmt: &'k Stmt,
+) -> IResult<StepStatus> {
+    let (var, src, src_lane) = match stmt {
+        Stmt::ShuffleSync { var, src, src_lane } => (var, src, src_lane),
+        _ => unreachable!(),
+    };
+    let var_id = var.id.0;
+    let per_thread = ctx.eval_scalar_vec(src)?.to_vec();
+    let lanes = ctx.eval_scalar_vec(src_lane)?.to_vec();
+    let mut by_lane: std::collections::HashMap<(usize, usize, usize), i64> =
+        std::collections::HashMap::new();
+    for (i, t) in ctx.lanes.iter().enumerate() {
+        by_lane.insert((t.cta_id, t.warp_id, t.lane_id), per_thread[i]);
+    }
+    let mut out = Vec::with_capacity(ctx.lanes.len());
+    for (i, t) in ctx.lanes.iter().enumerate() {
+        // The shfl source lane must address the issuing warp's own 32 lanes —
+        // an out-of-range lane is hardware UB (the old code silently clamped a
+        // negative lane to 0 and computed the wrong broadcast).
+        let sl = lanes[i];
+        if !(0..32).contains(&sl) {
+            return Err(InterpreterError::new(
+                "shuffle_sync_lane_range",
+                "shuffle_sync source lane is outside [0, 32)",
+            ));
+        }
+        let v = by_lane
+            .get(&(t.cta_id, t.warp_id, sl as usize))
+            .copied()
+            .ok_or_else(|| {
+                InterpreterError::new(
+                    "shuffle_sync_lane_missing",
+                    "shuffle_sync source lane is not in the executing warp's lane mask",
+                )
+            })?;
+        out.push(v);
+    }
+    Ok(scalar_commit(ctx, var_id, &out))
 }
 
 fn execute_scalar_def<'a, 'k>(
@@ -72,6 +122,21 @@ fn execute_scalar_store<'a, 'k>(
 ) -> IResult<StepStatus> {
     let (var, value) = match stmt {
         Stmt::ScalarStore { var, value } => (var, value),
+        _ => unreachable!(),
+    };
+    let var_id = var.id.0;
+    let values = ctx.eval_scalar_vec(value)?.to_vec();
+    Ok(scalar_commit(ctx, var_id, &values))
+}
+
+/// `let` binding: value-wise identical to a scalar store (evaluate + bind). Its
+/// single-assignment contract is a validate-time rule; the interpreter just binds.
+fn execute_scalar_let<'a, 'k>(
+    ctx: &mut WarpContext<'a, 'k>,
+    stmt: &'k Stmt,
+) -> IResult<StepStatus> {
+    let (var, value) = match stmt {
+        Stmt::ScalarLet { var, value } => (var, value),
         _ => unreachable!(),
     };
     let var_id = var.id.0;

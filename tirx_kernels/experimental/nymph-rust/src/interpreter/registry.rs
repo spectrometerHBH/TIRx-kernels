@@ -13,14 +13,19 @@ pub enum StmtKind {
     TensorDef,
     TmemAlloc,
     TmemDealloc,
+    TmemRelinquish,
     ScalarDef,
     ScalarStore,
+    ScalarLet,
+    ShuffleSync,
     StoreScalar,
     MBarDef,
     ForLoop,
     ForEachTask,
     SchedulerImpl,
     SchedNext,
+    ClcTryCancel,
+    ClcQueryCancel,
     Loop,
     BreakIf,
     If,
@@ -70,6 +75,8 @@ pub enum StmtKind {
     NamedBarrier,
     WarpSync,
     ClusterSync,
+    ClusterBarrierArrive,
+    ClusterBarrierWait,
 }
 
 pub fn stmt_kind(stmt: &Stmt) -> StmtKind {
@@ -77,14 +84,19 @@ pub fn stmt_kind(stmt: &Stmt) -> StmtKind {
         Stmt::TensorDef { .. } => StmtKind::TensorDef,
         Stmt::TmemAlloc { .. } => StmtKind::TmemAlloc,
         Stmt::TmemDealloc { .. } => StmtKind::TmemDealloc,
+        Stmt::TmemRelinquish { .. } => StmtKind::TmemRelinquish,
         Stmt::ScalarDef { .. } => StmtKind::ScalarDef,
         Stmt::ScalarStore { .. } => StmtKind::ScalarStore,
+        Stmt::ScalarLet { .. } => StmtKind::ScalarLet,
+        Stmt::ShuffleSync { .. } => StmtKind::ShuffleSync,
         Stmt::StoreScalar { .. } => StmtKind::StoreScalar,
         Stmt::MBarDef { .. } => StmtKind::MBarDef,
         Stmt::ForLoop { .. } => StmtKind::ForLoop,
         Stmt::ForEachTask { .. } => StmtKind::ForEachTask,
         Stmt::SchedulerImpl { .. } => StmtKind::SchedulerImpl,
         Stmt::SchedNext { .. } => StmtKind::SchedNext,
+        Stmt::ClcTryCancel { .. } => StmtKind::ClcTryCancel,
+        Stmt::ClcQueryCancel { .. } => StmtKind::ClcQueryCancel,
         Stmt::Loop { .. } => StmtKind::Loop,
         Stmt::BreakIf { .. } => StmtKind::BreakIf,
         Stmt::If { .. } => StmtKind::If,
@@ -134,13 +146,16 @@ pub fn stmt_kind(stmt: &Stmt) -> StmtKind {
         Stmt::NamedBarrier { .. } => StmtKind::NamedBarrier,
         Stmt::WarpSync => StmtKind::WarpSync,
         Stmt::ClusterSync => StmtKind::ClusterSync,
+        Stmt::ClusterBarrierArrive { .. } => StmtKind::ClusterBarrierArrive,
+        Stmt::ClusterBarrierWait => StmtKind::ClusterBarrierWait,
     }
 }
 
 impl StmtKind {
-    /// `ClusterSync` is the last variant; the enum is fieldless so `as usize`
-    /// gives a contiguous 0..COUNT index — used to dispatch via a flat array.
-    pub const COUNT: usize = StmtKind::ClusterSync as usize + 1;
+    /// `ClusterBarrierWait` is the last variant; the enum is fieldless so `as
+    /// usize` gives a contiguous 0..COUNT index — used to dispatch via a flat
+    /// array.
+    pub const COUNT: usize = StmtKind::ClusterBarrierWait as usize + 1;
     #[inline]
     pub fn index(self) -> usize {
         self as usize

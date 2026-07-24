@@ -3,9 +3,9 @@
 //! Layout (mirrors the Python module structure):
 //! - `dtype`  — the simple enums (MemorySpace, DType, ScalarOp, ...)
 //! - `scalar` — Var (identity model), ScalarExpr, ScalarValue, ScalarInitial
-//! - `tensor` — Tensor (table/id model), TensorSlice, Layout, TmemLayout
+//! - `tensor` — Tensor (table/id model), TensorSlice, Layout, TmemOperand/MmaOperand
 //! - `mbar`   — MBar (table/id model), MBarRef
-//! - `stmt`   — the big Stmt enum (~41 variants)
+//! - `stmt`   — the big Stmt enum (~45 variants)
 //! - `kernel` — Kernel (owns the tensor/mbar tables)
 
 pub mod dtype;
@@ -101,6 +101,7 @@ mod tests {
                     dst: a_slice.clone(),
                     src: a_slice.clone(),
                 }],
+                unroll: true,
             },
             Stmt::CtaSync,
         ];
