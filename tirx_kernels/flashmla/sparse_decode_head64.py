@@ -508,14 +508,6 @@ def _ceil_div(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
 
 
-def _device_sm_count(device: torch.device | str) -> int:
-    device_obj = torch.device(device)
-    device_index = device_obj.index
-    if device_index is None:
-        device_index = torch.cuda.current_device()
-    return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
-
-
 def _kv_storage_spec(
     model_type: ModelType, num_blocks: int, page_block_size: int
 ) -> tuple[int, int, int, int]:
@@ -532,342 +524,6 @@ def _kv_storage_spec(
         stride_kv_block = _ceil_div(page_block_size * bytes_per_token, tma_k_stride) * tma_k_stride
     num_tma_rows = num_blocks * (stride_kv_block // tma_k_stride)
     return bytes_per_token, tma_k_stride, stride_kv_block, num_tma_rows
-
-
-def _max_splits_bucket(num_sm_parts: int) -> int:
-    # combine.cu:176-187 MLA_NUM_SPLITS_SWITCH(params.num_sm_parts, ...).
-    for bucket in (32, 64, 96, 128, 160):
-        if num_sm_parts <= bucket:
-            return bucket
-    raise ValueError(f"FlashMLA combine supports at most 160 SM partitions, got {num_sm_parts}")
-
-
-def _build_decode_scheduler(
-    cfg: SparseFlashMLADecodeHead64Config,
-    topk_length_cpu: torch.Tensor,
-    extra_topk_length_cpu: torch.Tensor,
-    num_sm_parts: int,
-    device: torch.device | str,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Host replica of get_mla_metadata_kernel for sparse decode.
-
-    The CUDA implementation uses one warp only to build these small metadata
-    arrays.  Keeping this out of the timed kernel matches FlashMLA's reuse of
-    FlashMLASchedMeta across decode invocations.
-    """
-
-    block_size_n = B_TOPK
-    fixed_overhead_num_blocks = 5
-    seqlens_k: list[int] = []
-    num_blocks: list[int] = []
-    first_block_idx: list[int] = []
-    last_block_idx: list[int] = []
-    total_num_blocks = 0
-
-    for batch_idx in range(cfg.b):
-        cur_s_k = int(topk_length_cpu[batch_idx]) if cfg.have_topk_length else cfg.topk
-        if cur_s_k == 0:
-            cur_s_k = 1
-        if cfg.extra_topk:
-            cur_s_k = _ceil_div(cur_s_k, block_size_n) * block_size_n
-            cur_s_k += (
-                int(extra_topk_length_cpu[batch_idx])
-                if cfg.have_extra_topk_length
-                else cfg.extra_topk
-            )
-        seqlens_k.append(cur_s_k)
-        first = 0
-        last = max(cur_s_k - 1, 0) // block_size_n
-        blocks = last - first + 1
-        first_block_idx.append(first)
-        last_block_idx.append(last)
-        num_blocks.append(blocks)
-        total_num_blocks += blocks + fixed_overhead_num_blocks
-
-    payload = _ceil_div(total_num_blocks, num_sm_parts) + fixed_overhead_num_blocks
-    metadata = torch.zeros((num_sm_parts, 8), dtype=torch.int32)
-    num_splits = torch.zeros((cfg.b + 1,), dtype=torch.int32)
-    now_req_idx = 0
-    now_block = 0
-    now_n_split_idx = 0
-    cum_num_splits = 0
-
-    for partition_idx in range(num_sm_parts):
-        # CUDA leaves partitions after all requests with begin_req_idx >= b;
-        # only that field is consumed because the main kernel returns at once.
-        if now_req_idx >= cfg.b:
-            metadata[partition_idx, 0] = cfg.b
-            continue
-
-        begin_req_idx = now_req_idx
-        begin_block_idx = now_block + first_block_idx[now_req_idx]
-        begin_split_idx = now_n_split_idx
-        is_first_req_splitted = int(now_block != 0)
-        remain_payload = payload
-        while now_req_idx < cfg.b:
-            now_remain_blocks = num_blocks[now_req_idx] - now_block
-            if remain_payload >= now_remain_blocks + fixed_overhead_num_blocks:
-                cum_num_splits += now_n_split_idx + 1
-                num_splits[now_req_idx + 1] = cum_num_splits
-                remain_payload -= now_remain_blocks + fixed_overhead_num_blocks
-                now_req_idx += 1
-                now_block = 0
-                now_n_split_idx = 0
-            else:
-                if remain_payload - fixed_overhead_num_blocks > 0:
-                    now_block += remain_payload - fixed_overhead_num_blocks
-                    now_n_split_idx += 1
-                    remain_payload = 0
-                break
-
-        end_req_idx = now_req_idx if now_block > 0 else now_req_idx - 1
-        if now_block > 0:
-            end_block_idx = now_block + first_block_idx[now_req_idx]
-        else:
-            prev_req_idx = now_req_idx - 1
-            end_block_idx = 0 if seqlens_k[prev_req_idx] == 0 else last_block_idx[prev_req_idx] + 1
-        is_last_req_splitted = int(
-            end_block_idx != last_block_idx[end_req_idx] + 1 and seqlens_k[end_req_idx] != 0
-        )
-        if begin_req_idx == end_req_idx:
-            split = int(bool(is_first_req_splitted or is_last_req_splitted))
-            is_first_req_splitted = split
-            is_last_req_splitted = split
-        metadata[partition_idx] = torch.tensor(
-            [
-                begin_req_idx,
-                end_req_idx,
-                begin_block_idx,
-                end_block_idx,
-                begin_split_idx,
-                is_first_req_splitted,
-                is_last_req_splitted,
-                0,
-            ],
-            dtype=torch.int32,
-        )
-
-    if not (now_req_idx == cfg.b and now_block == 0 and now_n_split_idx == 0):
-        raise RuntimeError("host scheduler did not consume every sparse decode request")
-    return metadata.to(device=device), num_splits.to(device=device)
-
-
-@torch.inference_mode()
-def _quantize_fp8_kv_cache(
-    source: torch.Tensor, model_type: ModelType
-) -> tuple[torch.Tensor, torch.Tensor, int, int]:
-    """Pack the exact V32 or MODEL1 sparse-FP8 cache byte layout."""
-
-    num_blocks, page_block_size, h_kv, d_qk = source.shape
-    if h_kv != 1:
-        raise ValueError("sparse decode FP8 cache requires h_kv=1")
-    expected_d_qk = 576 if model_type is ModelType.V32 else 512
-    if d_qk != expected_d_qk:
-        raise ValueError(f"{model_type.value} requires d_qk={expected_d_qk}")
-
-    bytes_per_token, _, stride_kv_block, num_tma_rows = _kv_storage_spec(
-        model_type, num_blocks, page_block_size
-    )
-    storage = torch.empty((num_blocks * stride_kv_block,), dtype=torch.uint8, device=source.device)
-    source_rows = source[:, :, 0, :]
-
-    if model_type is ModelType.V32:
-        d_nope, tile_size, num_tiles = 512, 128, 4
-        physical_rows = storage.as_strided(
-            (num_blocks, page_block_size, 656), (stride_kv_block, 656, 1)
-        )
-        scale_view = physical_rows[:, :, 512:528].view(torch.float32)
-        physical_rows[:, :, 528:656].view(torch.bfloat16).copy_(source_rows[:, :, d_nope:])
-        for tile_idx in range(num_tiles):
-            values = source_rows[:, :, tile_idx * tile_size : (tile_idx + 1) * tile_size].float()
-            scale = torch.pow(
-                2.0, (values.abs().amax(dim=-1) / 448.0).clamp_min(1.0e-4).log2().ceil()
-            )
-            quantized = (values / scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
-            physical_rows[:, :, tile_idx * tile_size : (tile_idx + 1) * tile_size].copy_(
-                quantized.view(torch.uint8)
-            )
-            scale_view[:, :, tile_idx].copy_(scale)
-    else:
-        d_nope, tile_size, num_tiles = 448, 64, 7
-        # MODEL1 is not token-interleaved: all 576-byte NoPE/RoPE rows come
-        # first, followed by a page tail of 8 scale bytes per token.
-        physical_rows = storage.as_strided(
-            (num_blocks, page_block_size, 576), (stride_kv_block, 576, 1)
-        )
-        scale_rows = storage.as_strided(
-            (num_blocks, page_block_size, 8),
-            (stride_kv_block, 8, 1),
-            storage_offset=page_block_size * 576,
-        )
-        physical_rows[:, :, d_nope:576].view(torch.bfloat16).copy_(source_rows[:, :, d_nope:])
-        for tile_idx in range(num_tiles):
-            values = source_rows[:, :, tile_idx * tile_size : (tile_idx + 1) * tile_size].float()
-            scale = torch.pow(
-                2.0, (values.abs().amax(dim=-1) / 448.0).clamp_min(1.0e-4).log2().ceil()
-            )
-            quantized = (values / scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
-            physical_rows[:, :, tile_idx * tile_size : (tile_idx + 1) * tile_size].copy_(
-                quantized.view(torch.uint8)
-            )
-            scale_rows[:, :, tile_idx].copy_(scale.to(torch.float8_e8m0fnu).view(torch.uint8))
-
-    # The public API validates this logical shape/stride while the kernel uses
-    # the same allocation as a flat byte address and applies MODEL_TYPE layout.
-    public_view = storage.view(torch.float8_e4m3fn).as_strided(
-        (num_blocks, page_block_size, 1, bytes_per_token),
-        (stride_kv_block, bytes_per_token, bytes_per_token, 1),
-    )
-    return public_view, storage, stride_kv_block, num_tma_rows
-
-
-def _noncontiguous_copy(tensor: torch.Tensor) -> torch.Tensor:
-    """Mirror tests/kernelkit/generate.py::non_contiguousify."""
-
-    padded_shape = [
-        dim + 128 if dim_idx == tensor.ndim - 1 else dim + 1
-        for dim_idx, dim in enumerate(tensor.shape)
-    ]
-    storage = torch.empty(padded_shape, dtype=tensor.dtype, device=tensor.device)
-    view = storage[tuple(slice(0, dim) for dim in tensor.shape)]
-    view.copy_(tensor)
-    return view
-
-
-def _noncontiguous_randn(
-    shape: tuple[int, ...], *, dtype: torch.dtype, device: torch.device, generator: torch.Generator
-) -> torch.Tensor:
-    """Mirror tests/kernelkit/generate.py::gen_non_contiguous_randn_tensor."""
-
-    padded_shape = [
-        dim + 128 if dim_idx == len(shape) - 1 else dim + 1 for dim_idx, dim in enumerate(shape)
-    ]
-    storage = torch.randn(padded_shape, dtype=dtype, device=device, generator=generator)
-    return storage[tuple(slice(0, dim) for dim in shape)]
-
-
-def _batched_randperm(
-    permutation_ranges: torch.Tensor, permutation_size: int, generator: torch.Generator
-) -> torch.Tensor:
-    """Mirror FlashMLA's `_randperm_batch(..., paddings=[-1])`."""
-
-    batch_size = permutation_ranges.numel()
-    max_range = max(int(permutation_ranges.max().item()), permutation_size)
-    random_values = torch.rand(
-        (batch_size, max_range),
-        dtype=torch.float32,
-        device=permutation_ranges.device,
-        generator=generator,
-    )
-    positions = torch.arange(max_range, device=permutation_ranges.device)
-    random_values.masked_fill_(positions.view(1, -1) >= permutation_ranges.view(-1, 1), -math.inf)
-    result = random_values.topk(permutation_size, dim=-1, sorted=True).indices.to(torch.int32)
-    result.masked_fill_(result >= permutation_ranges.view(-1, 1), -1)
-    return result
-
-
-@torch.inference_mode()
-def _prepare_upstream_kv_scope(
-    cfg: SparseFlashMLADecodeHead64Config,
-    *,
-    s_kv: int,
-    topk: int,
-    page_block_size: int,
-    have_topk_length: bool,
-    device: torch.device,
-    device_generator: torch.Generator,
-    cpu_generator: torch.Generator,
-    python_rng: random.Random,
-) -> dict[str, Any]:
-    """Reproduce generate_testcase_for_decode's physical paged-KV scope."""
-
-    cache_seqlens_cpu = torch.full((cfg.b,), s_kv, dtype=torch.int32)
-    if cfg.is_varlen:
-        for batch_idx in range(cfg.b):
-            cache_seqlens_cpu[batch_idx] = int(
-                max(python_rng.normalvariate(s_kv, s_kv / 2), cfg.s_q)
-            )
-    if cfg.have_zero_seqlen_k:
-        zero_mask = torch.randn((cfg.b,), dtype=torch.float32, generator=cpu_generator) > 0
-        cache_seqlens_cpu[zero_mask] = 0
-
-    max_seqlen_alignment = 4 * page_block_size
-    max_seqlen_pad = (
-        max(_ceil_div(int(cache_seqlens_cpu.max().item()), max_seqlen_alignment), 1)
-        * max_seqlen_alignment
-    )
-    blocks_per_sequence = max_seqlen_pad // page_block_size
-    num_blocks = cfg.b * blocks_per_sequence
-
-    block_ids = torch.arange(num_blocks, dtype=torch.int32, device=device)
-    block_table = block_ids.index_select(
-        0, torch.randperm(num_blocks, device=device, generator=device_generator)
-    ).view(cfg.b, blocks_per_sequence)
-
-    source = _noncontiguous_randn(
-        (num_blocks, page_block_size, cfg.h_kv, cfg.d_qk),
-        dtype=torch.bfloat16,
-        device=device,
-        generator=device_generator,
-    )
-    source = source / 10
-    source.clamp_(min=-1.0, max=1.0)
-
-    if cfg.is_all_indices_invalid:
-        absolute_indices = torch.full((cfg.b, cfg.s_q, topk), -1, dtype=torch.int32, device=device)
-    else:
-        ranges = cache_seqlens_cpu.to(device=device).repeat_interleave(cfg.s_q)
-        absolute_indices = _batched_randperm(ranges, topk, device_generator).view(
-            cfg.b, cfg.s_q, topk
-        )
-
-    safe_indices = absolute_indices.clamp_min(0)
-    batch_block_offsets = (
-        torch.arange(cfg.b, dtype=torch.int32, device=device) * blocks_per_sequence
-    ).view(cfg.b, 1, 1)
-    block_lookup = safe_indices // page_block_size + batch_block_offsets
-    physical_blocks = block_table.view(-1).index_select(0, block_lookup.view(-1).long())
-    indices = (
-        physical_blocks.view(cfg.b, cfg.s_q, topk) * page_block_size
-        + safe_indices % page_block_size
-    )
-    indices.masked_fill_(absolute_indices < 0, -1)
-
-    if have_topk_length:
-        topk_length = torch.randint(
-            0, topk + 1, (cfg.b,), dtype=torch.int32, device=device, generator=device_generator
-        )
-        topk_length_cpu = topk_length.cpu()
-    else:
-        topk_length = torch.zeros((cfg.b,), dtype=torch.int32, device=device)
-        topk_length_cpu = torch.zeros((cfg.b,), dtype=torch.int32)
-
-    masked_indices = indices
-    if have_topk_length:
-        masked_indices = indices.clone()
-        positions = torch.arange(topk, device=device).view(1, 1, topk)
-        masked_indices.masked_fill_(positions >= topk_length.view(cfg.b, 1, 1), -1)
-    nonused_tokens = torch.ones((num_blocks * page_block_size,), dtype=torch.bool, device=device)
-    used_tokens = masked_indices.long()
-    nonused_tokens[used_tokens] = False
-    source.view(-1, cfg.d_qk)[nonused_tokens] = float("nan")
-
-    kv, kv_storage, stride_kv_block, num_tma_rows = _quantize_fp8_kv_cache(
-        source, cfg.normalized_model_type
-    )
-    del source
-    indices = _noncontiguous_copy(indices)
-    return {
-        "kv": kv,
-        "kv_storage": kv_storage,
-        "indices": indices,
-        "topk_length": topk_length,
-        "topk_length_cpu": topk_length_cpu,
-        "cache_seqlens_cpu": cache_seqlens_cpu,
-        "num_blocks": num_blocks,
-        "stride_kv_block": stride_kv_block,
-        "num_tma_rows": num_tma_rows,
-    }
 
 
 @T.jit
@@ -936,11 +592,16 @@ def _kernel(
     # packed substitutes.
     q = T.match_buffer(
         q_h,
-        ((b - 1) * stride_q_b + (s_q - 1) * stride_q_s_q + (B_H - 1) * stride_q_h_q + d_qk,),
+        (b, stride_q_b // stride_q_s_q, stride_q_s_q // stride_q_h_q, stride_q_h_q),
         "bfloat16",
         scope="global",
     )
-    kv = T.match_buffer(kv_h, (num_blocks * stride_kv_block,), "uint8", scope="global")
+    kv = T.match_buffer(
+        kv_h,
+        (num_blocks * (stride_kv_block // tma_k_stride), tma_k_stride // BF16_BYTES),
+        "bfloat16",
+        scope="global",
+    )
     indices = T.match_buffer(
         indices_h,
         ((b - 1) * stride_indices_b + (s_q - 1) * stride_indices_s_q + topk,),
@@ -959,7 +620,7 @@ def _kernel(
     )
     out = T.match_buffer(
         out_h,
-        ((b - 1) * stride_o_b + (s_q - 1) * stride_o_s_q + (B_H - 1) * stride_o_h_q + D_V,),
+        (b, stride_o_b // stride_o_s_q, stride_o_s_q // stride_o_h_q, stride_o_h_q),
         "bfloat16",
         scope="global",
     )
@@ -986,7 +647,13 @@ def _kernel(
     num_splits = T.match_buffer(num_splits_h, (b + 1,), "int32", scope="global")
     if extra_kv_h is not None:
         extra_kv = T.match_buffer(
-            extra_kv_h, (extra_num_blocks * stride_extra_kv_block,), "uint8", scope="global"
+            extra_kv_h,
+            (
+                extra_num_blocks * (stride_extra_kv_block // tma_k_stride),
+                tma_k_stride // BF16_BYTES,
+            ),
+            "bfloat16",
+            scope="global",
         )
     if extra_indices_h is not None:
         extra_indices = T.match_buffer(
@@ -998,76 +665,15 @@ def _kernel(
     if extra_topk_length_h is not None:
         extra_topk_length = T.match_buffer(extra_topk_length_h, (b,), "int32", scope="global")
 
-    # kernel.cuh:909-937.  tma_explicit encodes the two MODEL_TYPE-specific
-    # rank-2 views from the runtime storage pointer and strides.  The public
-    # layout is (TMA row, inner element); CUDA reverses it to
-    # globalDim={inner, rows} and issues gather4 coordinates
-    # {inner_column, row0, row1, row2, row3}.
-    kv_nope_tma = T.decl_buffer(
-        (num_blocks * (stride_kv_block // tma_k_stride), d_nope // 8),
-        "int64",
-        data=kv.data,
-        scope="global",
-        layout=TileLayout(
-            S[
-                (num_blocks * (stride_kv_block // tma_k_stride), d_nope // 8) : (
-                    tma_k_stride // 8,
-                    1,
-                )
-            ]
-        ),
-    )
-    kv_rope_data: T.let = T.reinterpret(
-        PointerType(PrimType("bfloat16")),
-        T.handle_add_byte_offset(kv.data, d_nope + (16 if is_v32 else 0)),
-    )
-    kv_rope_tma = T.decl_buffer(
-        (num_blocks * (stride_kv_block // tma_k_stride), 64),
-        "bfloat16",
-        data=kv_rope_data,
-        scope="global",
-        layout=TileLayout(
-            S[
-                (num_blocks * (stride_kv_block // tma_k_stride), 64) : (
-                    tma_k_stride // BF16_BYTES,
-                    1,
-                )
-            ]
-        ),
-    )
+    # kernel.cuh:909-937.  Split the physical row storage into the two
+    # MODEL_TYPE-specific TensorMap views.  CUDA consumes both as
+    # (TMA row, inner element) gather4 operands.
+    kv_nope_tma = kv.view("int64").sub[:, : d_nope // 8]
+    kv_rope_start = T.meta_var((d_nope + (16 if is_v32 else 0)) // BF16_BYTES)
+    kv_rope_tma = kv.sub[:, kv_rope_start : kv_rope_start + 64]
     if extra_kv_h is not None:
-        extra_kv_nope_tma = T.decl_buffer(
-            (extra_num_blocks * (stride_extra_kv_block // tma_k_stride), d_nope // 8),
-            "int64",
-            data=extra_kv.data,
-            scope="global",
-            layout=TileLayout(
-                S[
-                    (extra_num_blocks * (stride_extra_kv_block // tma_k_stride), d_nope // 8) : (
-                        tma_k_stride // 8,
-                        1,
-                    )
-                ]
-            ),
-        )
-        extra_kv_rope_data: T.let = T.reinterpret(
-            PointerType(PrimType("bfloat16")),
-            T.handle_add_byte_offset(extra_kv.data, d_nope + (16 if is_v32 else 0)),
-        )
-        extra_kv_rope_tma = T.decl_buffer(
-            (extra_num_blocks * (stride_extra_kv_block // tma_k_stride), 64),
-            "bfloat16",
-            data=extra_kv_rope_data,
-            scope="global",
-            layout=TileLayout(
-                S[
-                    (extra_num_blocks * (stride_extra_kv_block // tma_k_stride), 64) : (
-                        tma_k_stride // BF16_BYTES,
-                        1,
-                    )
-                ]
-            ),
-        )
+        extra_kv_nope_tma = extra_kv.view("int64").sub[:, : d_nope // 8]
+        extra_kv_rope_tma = extra_kv.sub[:, kv_rope_start : kv_rope_start + 64]
 
     T.device_entry()
     T.attr(
@@ -1078,34 +684,10 @@ def _kernel(
     # Python values; binding either as an ordinary scalar would turn it
     # into a TIR expression and destroy the C++ if-constexpr structure.
     source_smem_size = T.meta_var(232192 if is_v32 else 218848)
-    q_strided = q.view(
-        b,
-        s_q,
-        B_H,
-        d_qk,
-        layout=TileLayout(S[(b, s_q, B_H, d_qk) : (stride_q_b, stride_q_s_q, stride_q_h_q, 1)]),
-    )
+    q_strided = q.sub[:, :s_q, :B_H, :d_qk]
     if is_v32:
-        # Preserve CuTe's single SW64 tail transaction explicitly.  Splitting
-        # d_qk into (18, 32) makes the final two 32-column atoms a rank-5
-        # TensorMap box with CUDA-order shape (32, 64, 2, 1, 1).
-        q_tail_tma = q.view(
-            b,
-            s_q,
-            d_qk // 32,
-            B_H,
-            32,
-            layout=TileLayout(
-                S[(b, s_q, d_qk // 32, B_H, 32) : (stride_q_b, stride_q_s_q, 32, stride_q_h_q, 1)]
-            ),
-        )
-    out_strided = out.view(
-        b,
-        s_q,
-        B_H,
-        D_V,
-        layout=TileLayout(S[(b, s_q, B_H, D_V) : (stride_o_b, stride_o_s_q, stride_o_h_q, 1)]),
-    )
+        q_tail_tma = q_strided.view(b, s_q, B_H, d_qk // 32, 32).permute(0, 1, 3, 2, 4)
+    out_strided = out.sub[:, :s_q, :B_H, :D_V]
 
     # kernel.cuh:25-33.  Grid is exactly (s_q, num_sm_parts, 1), with
     # three 128-thread warpgroups and the same canonical role indices.
@@ -1661,14 +1243,21 @@ def _kernel(
                 tma_coords_step_per_block: T.let = stride_kv_block // tma_k_stride
                 tma_coords_step_per_extra_block: T.let = stride_extra_kv_block // tma_k_stride
                 k_scales_ptr_u64: T.let = T.reinterpret(
-                    "uint64", kv.ptr_to([d_nope if is_v32 else page_block_size * (d_nope + 2 * 64)])
+                    "uint64",
+                    (
+                        kv.ptr_to([0, d_nope // BF16_BYTES])
+                        if is_v32
+                        else kv.ptr_to([page_block_size, 0])
+                    ),
                 )
                 extra_k_scales_ptr_u64: T.uint64 = T.uint64(0)
                 if extra_kv_h is not None:
                     extra_k_scales_ptr_u64 = T.reinterpret(
                         "uint64",
-                        extra_kv.ptr_to(
-                            [d_nope if is_v32 else extra_page_block_size * (d_nope + 2 * 64)]
+                        (
+                            extra_kv.ptr_to([0, d_nope // BF16_BYTES])
+                            if is_v32
+                            else extra_kv.ptr_to([extra_page_block_size, 0])
                         ),
                     )
             # kernel.cuh:77-118, expanded once for all WG1 threads.  Non-elected
@@ -2543,7 +2132,13 @@ def _kernel_shape_params(
     prepared_num_blocks: int | None = None,
     prepared_extra_num_blocks: int | None = None,
 ) -> dict[str, int]:
-    num_sm_parts = _device_sm_count(device) // cfg.s_q
+    device_obj = torch.device(device)
+    device_index = device_obj.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    num_sm_parts = (
+        int(torch.cuda.get_device_properties(device_index).multi_processor_count) // cfg.s_q
+    )
     num_sm_parts = max(num_sm_parts, 1)
     num_blocks = (
         prepared_num_blocks
@@ -2575,6 +2170,10 @@ def _kernel_shape_params(
         stride_extra_kv_block = 0
         extra_num_tma_rows = 0
 
+    max_splits = next((bucket for bucket in (32, 64, 96, 128, 160) if num_sm_parts <= bucket), None)
+    if max_splits is None:
+        raise ValueError(f"FlashMLA combine supports at most 160 SM partitions, got {num_sm_parts}")
+
     return {
         "num_sm_parts": num_sm_parts,
         "num_blocks": num_blocks,
@@ -2588,7 +2187,7 @@ def _kernel_shape_params(
         "extra_kv_bytes": extra_num_blocks * stride_extra_kv_block,
         "extra_indices_elems": cfg.b * cfg.s_q * cfg.extra_topk,
         "split_rows": cfg.b + num_sm_parts,
-        "max_splits": _max_splits_bucket(num_sm_parts),
+        "max_splits": max_splits,
     }
 
 
@@ -2688,32 +2287,181 @@ def prepare_data(**kwargs: Any) -> dict[str, Any]:
     else:
         attn_sink = torch.zeros((cfg.h_q,), dtype=torch.float32, device=device)
 
-    kv_scope = _prepare_upstream_kv_scope(
-        cfg,
-        s_kv=cfg.s_kv,
-        topk=cfg.topk,
-        page_block_size=cfg.page_block_size,
-        have_topk_length=cfg.have_topk_length,
-        device=device,
-        device_generator=device_generator,
-        cpu_generator=cpu_generator,
-        python_rng=python_rng,
-    )
-
+    scope_specs = [(cfg.s_kv, cfg.topk, cfg.page_block_size, cfg.have_topk_length)]
     if cfg.extra_topk:
-        extra_scope = _prepare_upstream_kv_scope(
-            cfg,
-            s_kv=cfg.extra_s_kv,
-            topk=cfg.extra_topk,
-            page_block_size=cfg.extra_page_block_size,
-            have_topk_length=cfg.have_extra_topk_length,
-            device=device,
-            device_generator=device_generator,
-            cpu_generator=cpu_generator,
-            python_rng=python_rng,
+        scope_specs.append(
+            (cfg.extra_s_kv, cfg.extra_topk, cfg.extra_page_block_size, cfg.have_extra_topk_length)
         )
-    else:
-        extra_scope = None
+
+    prepared_scopes = []
+    for s_kv, topk, page_block_size, have_topk_length in scope_specs:
+        cache_seqlens_cpu = torch.full((cfg.b,), s_kv, dtype=torch.int32)
+        if cfg.is_varlen:
+            for batch_idx in range(cfg.b):
+                cache_seqlens_cpu[batch_idx] = int(
+                    max(python_rng.normalvariate(s_kv, s_kv / 2), cfg.s_q)
+                )
+        if cfg.have_zero_seqlen_k:
+            zero_mask = torch.randn((cfg.b,), dtype=torch.float32, generator=cpu_generator) > 0
+            cache_seqlens_cpu[zero_mask] = 0
+
+        max_seqlen_alignment = 4 * page_block_size
+        max_seqlen_pad = (
+            max(_ceil_div(int(cache_seqlens_cpu.max().item()), max_seqlen_alignment), 1)
+            * max_seqlen_alignment
+        )
+        blocks_per_sequence = max_seqlen_pad // page_block_size
+        num_blocks = cfg.b * blocks_per_sequence
+
+        block_ids = torch.arange(num_blocks, dtype=torch.int32, device=device)
+        block_table = block_ids.index_select(
+            0, torch.randperm(num_blocks, device=device, generator=device_generator)
+        ).view(cfg.b, blocks_per_sequence)
+
+        source_shape = (num_blocks, page_block_size, cfg.h_kv, cfg.d_qk)
+        source_storage = torch.randn(
+            tuple(
+                dim + 128 if dim_idx == len(source_shape) - 1 else dim + 1
+                for dim_idx, dim in enumerate(source_shape)
+            ),
+            dtype=torch.bfloat16,
+            device=device,
+            generator=device_generator,
+        )
+        source = source_storage[tuple(slice(0, dim) for dim in source_shape)] / 10
+        source.clamp_(min=-1.0, max=1.0)
+
+        if cfg.is_all_indices_invalid:
+            absolute_indices = torch.full(
+                (cfg.b, cfg.s_q, topk), -1, dtype=torch.int32, device=device
+            )
+        else:
+            permutation_ranges = cache_seqlens_cpu.to(device=device).repeat_interleave(cfg.s_q)
+            max_range = max(int(permutation_ranges.max().item()), topk)
+            random_values = torch.rand(
+                (permutation_ranges.numel(), max_range),
+                dtype=torch.float32,
+                device=device,
+                generator=device_generator,
+            )
+            positions = torch.arange(max_range, device=device)
+            random_values.masked_fill_(
+                positions.view(1, -1) >= permutation_ranges.view(-1, 1), -math.inf
+            )
+            absolute_indices = (
+                random_values.topk(topk, dim=-1, sorted=True)
+                .indices.to(torch.int32)
+                .view(cfg.b, cfg.s_q, topk)
+            )
+            absolute_indices.masked_fill_(
+                absolute_indices >= permutation_ranges.view(cfg.b, cfg.s_q, 1), -1
+            )
+
+        safe_indices = absolute_indices.clamp_min(0)
+        batch_block_offsets = (
+            torch.arange(cfg.b, dtype=torch.int32, device=device) * blocks_per_sequence
+        ).view(cfg.b, 1, 1)
+        block_lookup = safe_indices // page_block_size + batch_block_offsets
+        physical_blocks = block_table.view(-1).index_select(0, block_lookup.view(-1).long())
+        indices = (
+            physical_blocks.view(cfg.b, cfg.s_q, topk) * page_block_size
+            + safe_indices % page_block_size
+        )
+        indices.masked_fill_(absolute_indices < 0, -1)
+
+        if have_topk_length:
+            topk_length = torch.randint(
+                0, topk + 1, (cfg.b,), dtype=torch.int32, device=device, generator=device_generator
+            )
+            topk_length_cpu = topk_length.cpu()
+            masked_indices = indices.clone()
+            masked_indices.masked_fill_(
+                torch.arange(topk, device=device).view(1, 1, topk) >= topk_length.view(cfg.b, 1, 1),
+                -1,
+            )
+        else:
+            topk_length = torch.zeros((cfg.b,), dtype=torch.int32, device=device)
+            topk_length_cpu = torch.zeros((cfg.b,), dtype=torch.int32)
+            masked_indices = indices
+
+        nonused_tokens = torch.ones(
+            (num_blocks * page_block_size,), dtype=torch.bool, device=device
+        )
+        nonused_tokens[masked_indices.long()] = False
+        source.view(-1, cfg.d_qk)[nonused_tokens] = float("nan")
+
+        bytes_per_token, _, stride_kv_block, num_tma_rows = _kv_storage_spec(
+            cfg.normalized_model_type, num_blocks, page_block_size
+        )
+        kv_storage = torch.empty((num_blocks * stride_kv_block,), dtype=torch.uint8, device=device)
+        source_rows = source[:, :, 0, :]
+        if cfg.normalized_model_type is ModelType.V32:
+            d_nope, tile_size, num_tiles = 512, 128, 4
+            physical_rows = kv_storage.as_strided(
+                (num_blocks, page_block_size, 656), (stride_kv_block, 656, 1)
+            )
+            scale_view = physical_rows[:, :, 512:528].view(torch.float32)
+            physical_rows[:, :, 528:656].view(torch.bfloat16).copy_(source_rows[:, :, d_nope:])
+            for tile_idx in range(num_tiles):
+                values = source_rows[
+                    :, :, tile_idx * tile_size : (tile_idx + 1) * tile_size
+                ].float()
+                scale = torch.pow(
+                    2.0, (values.abs().amax(dim=-1) / 448.0).clamp_min(1.0e-4).log2().ceil()
+                )
+                physical_rows[:, :, tile_idx * tile_size : (tile_idx + 1) * tile_size].copy_(
+                    (values / scale.unsqueeze(-1)).to(torch.float8_e4m3fn).view(torch.uint8)
+                )
+                scale_view[:, :, tile_idx].copy_(scale)
+        else:
+            d_nope, tile_size, num_tiles = 448, 64, 7
+            physical_rows = kv_storage.as_strided(
+                (num_blocks, page_block_size, 576), (stride_kv_block, 576, 1)
+            )
+            scale_rows = kv_storage.as_strided(
+                (num_blocks, page_block_size, 8),
+                (stride_kv_block, 8, 1),
+                storage_offset=page_block_size * 576,
+            )
+            physical_rows[:, :, d_nope:576].view(torch.bfloat16).copy_(source_rows[:, :, d_nope:])
+            for tile_idx in range(num_tiles):
+                values = source_rows[
+                    :, :, tile_idx * tile_size : (tile_idx + 1) * tile_size
+                ].float()
+                scale = torch.pow(
+                    2.0, (values.abs().amax(dim=-1) / 448.0).clamp_min(1.0e-4).log2().ceil()
+                )
+                physical_rows[:, :, tile_idx * tile_size : (tile_idx + 1) * tile_size].copy_(
+                    (values / scale.unsqueeze(-1)).to(torch.float8_e4m3fn).view(torch.uint8)
+                )
+                scale_rows[:, :, tile_idx].copy_(scale.to(torch.float8_e8m0fnu).view(torch.uint8))
+        del source
+
+        kv = kv_storage.view(torch.float8_e4m3fn).as_strided(
+            (num_blocks, page_block_size, 1, bytes_per_token),
+            (stride_kv_block, bytes_per_token, bytes_per_token, 1),
+        )
+        indices_storage = torch.empty(
+            (cfg.b + 1, cfg.s_q + 1, topk + 128), dtype=torch.int32, device=device
+        )
+        indices_view = indices_storage[: cfg.b, : cfg.s_q, :topk]
+        indices_view.copy_(indices)
+        prepared_scopes.append(
+            {
+                "kv": kv,
+                "kv_storage": kv_storage,
+                "indices": indices_view,
+                "topk_length": topk_length,
+                "topk_length_cpu": topk_length_cpu,
+                "cache_seqlens_cpu": cache_seqlens_cpu,
+                "num_blocks": num_blocks,
+                "stride_kv_block": stride_kv_block,
+                "num_tma_rows": num_tma_rows,
+            }
+        )
+
+    kv_scope = prepared_scopes[0]
+    extra_scope = prepared_scopes[1] if cfg.extra_topk else None
 
     shape = _kernel_shape_params(
         cfg,
@@ -2721,18 +2469,11 @@ def prepare_data(**kwargs: Any) -> dict[str, Any]:
         prepared_num_blocks=kv_scope["num_blocks"],
         prepared_extra_num_blocks=(extra_scope["num_blocks"] if extra_scope is not None else None),
     )
-    if (
-        kv_scope["stride_kv_block"] != shape["stride_kv_block"]
-        or kv_scope["num_tma_rows"] != shape["num_tma_rows"]
-    ):
-        raise AssertionError("prepared KV layout disagrees with runtime shape")
-    if extra_scope is not None and (
-        extra_scope["stride_kv_block"] != shape["stride_extra_kv_block"]
-        or extra_scope["num_tma_rows"] != shape["extra_num_tma_rows"]
-    ):
-        raise AssertionError("prepared extra KV layout disagrees with runtime shape")
-
-    q = _noncontiguous_copy(q_contiguous)
+    q_storage = torch.empty(
+        (cfg.b + 1, cfg.s_q + 1, cfg.h_q + 1, cfg.d_qk + 128), dtype=torch.bfloat16, device=device
+    )
+    q = q_storage[: cfg.b, : cfg.s_q, : cfg.h_q, : cfg.d_qk]
+    q.copy_(q_contiguous)
     del q_contiguous
     indices = kv_scope["indices"]
     if cfg.inject_invalid_indices:
@@ -2748,10 +2489,101 @@ def prepare_data(**kwargs: Any) -> dict[str, Any]:
         if extra_scope is not None
         else torch.zeros((cfg.b,), dtype=torch.int32)
     )
-    tile_scheduler_metadata, num_splits = _build_decode_scheduler(
-        cfg, topk_length_cpu, extra_topk_length_cpu, shape["num_sm_parts"], device
-    )
-    out = torch.empty((cfg.b, cfg.s_q, cfg.h_q, D_V), dtype=torch.bfloat16, device=device)
+
+    block_size_n = B_TOPK
+    fixed_overhead_num_blocks = 5
+    seqlens_k = []
+    num_blocks_per_request = []
+    first_block_idx = []
+    last_block_idx = []
+    total_num_blocks = 0
+    for batch_idx in range(cfg.b):
+        cur_s_k = int(topk_length_cpu[batch_idx]) if cfg.have_topk_length else cfg.topk
+        if cur_s_k == 0:
+            cur_s_k = 1
+        if cfg.extra_topk:
+            cur_s_k = _ceil_div(cur_s_k, block_size_n) * block_size_n
+            cur_s_k += (
+                int(extra_topk_length_cpu[batch_idx])
+                if cfg.have_extra_topk_length
+                else cfg.extra_topk
+            )
+        seqlens_k.append(cur_s_k)
+        last = max(cur_s_k - 1, 0) // block_size_n
+        blocks = last + 1
+        first_block_idx.append(0)
+        last_block_idx.append(last)
+        num_blocks_per_request.append(blocks)
+        total_num_blocks += blocks + fixed_overhead_num_blocks
+
+    num_sm_parts = shape["num_sm_parts"]
+    payload = _ceil_div(total_num_blocks, num_sm_parts) + fixed_overhead_num_blocks
+    tile_scheduler_metadata = torch.zeros((num_sm_parts, 8), dtype=torch.int32)
+    num_splits = torch.zeros((cfg.b + 1,), dtype=torch.int32)
+    now_req_idx = 0
+    now_block = 0
+    now_n_split_idx = 0
+    cum_num_splits = 0
+    for partition_idx in range(num_sm_parts):
+        if now_req_idx >= cfg.b:
+            tile_scheduler_metadata[partition_idx, 0] = cfg.b
+            continue
+
+        begin_req_idx = now_req_idx
+        begin_block_idx = now_block + first_block_idx[now_req_idx]
+        begin_split_idx = now_n_split_idx
+        is_first_req_splitted = int(now_block != 0)
+        remain_payload = payload
+        while now_req_idx < cfg.b:
+            now_remain_blocks = num_blocks_per_request[now_req_idx] - now_block
+            if remain_payload >= now_remain_blocks + fixed_overhead_num_blocks:
+                cum_num_splits += now_n_split_idx + 1
+                num_splits[now_req_idx + 1] = cum_num_splits
+                remain_payload -= now_remain_blocks + fixed_overhead_num_blocks
+                now_req_idx += 1
+                now_block = 0
+                now_n_split_idx = 0
+            else:
+                if remain_payload - fixed_overhead_num_blocks > 0:
+                    now_block += remain_payload - fixed_overhead_num_blocks
+                    now_n_split_idx += 1
+                break
+
+        end_req_idx = now_req_idx if now_block > 0 else now_req_idx - 1
+        if now_block > 0:
+            end_block_idx = now_block + first_block_idx[now_req_idx]
+        else:
+            prev_req_idx = now_req_idx - 1
+            end_block_idx = 0 if seqlens_k[prev_req_idx] == 0 else last_block_idx[prev_req_idx] + 1
+        is_last_req_splitted = int(
+            end_block_idx != last_block_idx[end_req_idx] + 1 and seqlens_k[end_req_idx] != 0
+        )
+        if begin_req_idx == end_req_idx:
+            split = int(bool(is_first_req_splitted or is_last_req_splitted))
+            is_first_req_splitted = split
+            is_last_req_splitted = split
+        tile_scheduler_metadata[partition_idx] = torch.tensor(
+            [
+                begin_req_idx,
+                end_req_idx,
+                begin_block_idx,
+                end_block_idx,
+                begin_split_idx,
+                is_first_req_splitted,
+                is_last_req_splitted,
+                0,
+            ],
+            dtype=torch.int32,
+        )
+
+    if not (now_req_idx == cfg.b and now_block == 0 and now_n_split_idx == 0):
+        raise RuntimeError("host scheduler did not consume every sparse decode request")
+    tile_scheduler_metadata = tile_scheduler_metadata.to(device=device)
+    num_splits = num_splits.to(device=device)
+
+    out_elements = cfg.b * cfg.s_q * cfg.h_q * D_V
+    out_storage = torch.empty((out_elements + cfg.h_q * D_V,), dtype=torch.bfloat16, device=device)
+    out = out_storage[:out_elements].view(cfg.b, cfg.s_q, cfg.h_q, D_V)
     lse = torch.empty((cfg.b, cfg.s_q, cfg.h_q), dtype=torch.float32, device=device)
     lse_accum = torch.empty(
         (shape["split_rows"], cfg.s_q, cfg.h_q), dtype=torch.float32, device=device
@@ -2865,25 +2697,28 @@ def _tirx_main_args(case: dict[str, Any], start_head_idx: int) -> tuple[Any, ...
     cfg: SparseFlashMLADecodeHead64Config = case["config"]
     if start_head_idx % B_H or start_head_idx + B_H > cfg.h_q:
         raise ValueError(f"invalid head64 slice {start_head_idx} for h_q={cfg.h_q}")
+    tma_k_stride = 656 if cfg.normalized_model_type is ModelType.V32 else 576
 
-    q_extent = (
-        (cfg.b - 1) * case["stride_q_b"]
-        + (cfg.s_q - 1) * case["stride_q_s_q"]
-        + (B_H - 1) * case["stride_q_h_q"]
-        + cfg.d_qk
+    q_storage_shape = (
+        cfg.b,
+        case["stride_q_b"] // case["stride_q_s_q"],
+        case["stride_q_s_q"] // case["stride_q_h_q"],
+        case["stride_q_h_q"],
     )
+    q_extent = math.prod(q_storage_shape)
     indices_extent = (
         (cfg.b - 1) * case["stride_indices_b"]
         + (cfg.s_q - 1) * case["stride_indices_s_q"]
         + cfg.topk
     )
     lse_extent = (cfg.b - 1) * case["stride_lse_b"] + (cfg.s_q - 1) * case["stride_lse_s_q"] + B_H
-    out_extent = (
-        (cfg.b - 1) * case["stride_o_b"]
-        + (cfg.s_q - 1) * case["stride_o_s_q"]
-        + (B_H - 1) * case["stride_o_h_q"]
-        + D_V
+    out_storage_shape = (
+        cfg.b,
+        case["stride_o_b"] // case["stride_o_s_q"],
+        case["stride_o_s_q"] // case["stride_o_h_q"],
+        case["stride_o_h_q"],
     )
+    out_extent = math.prod(out_storage_shape)
     lse_accum_extent = (
         (case["shape"]["split_rows"] - 1) * case["stride_lse_accum_split"]
         + (cfg.s_q - 1) * case["stride_lse_accum_s_q"]
@@ -2903,15 +2738,17 @@ def _tirx_main_args(case: dict[str, Any], start_head_idx: int) -> tuple[Any, ...
     args = (
         _flat_storage_alias(
             case["q"], element_offset=start_head_idx * case["stride_q_h_q"], extent=q_extent
-        ),
-        case["kv_storage"],
+        ).view(q_storage_shape),
+        case["kv_storage"]
+        .view(torch.bfloat16)
+        .view(case["shape"]["num_tma_rows"], tma_k_stride // BF16_BYTES),
         _flat_storage_alias(case["indices"], extent=indices_extent),
         case["topk_length"] if cfg.have_topk_length else None,
         (case["attn_sink"][start_head_idx : start_head_idx + B_H] if cfg.have_attn_sink else None),
         _flat_storage_alias(case["lse"], element_offset=start_head_idx, extent=lse_extent),
         _flat_storage_alias(
             case["out"], element_offset=start_head_idx * case["stride_o_h_q"], extent=out_extent
-        ),
+        ).view(out_storage_shape),
         _flat_storage_alias(
             case["lse_accum"], element_offset=start_head_idx, extent=lse_accum_extent
         ),
@@ -2922,7 +2759,13 @@ def _tirx_main_args(case: dict[str, Any], start_head_idx: int) -> tuple[Any, ...
         ),
         case["tile_scheduler_metadata"],
         case["num_splits"],
-        case["extra_kv_storage"],
+        (
+            case["extra_kv_storage"]
+            .view(torch.bfloat16)
+            .view(case["shape"]["extra_num_tma_rows"], tma_k_stride // BF16_BYTES)
+            if case["extra_kv_storage"] is not None
+            else None
+        ),
         (
             _flat_storage_alias(case["extra_indices"], extent=extra_indices_extent)
             if case["extra_indices"] is not None
