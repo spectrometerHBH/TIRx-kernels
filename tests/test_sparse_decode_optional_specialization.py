@@ -27,10 +27,6 @@ MAIN_PARAMETER_NAMES = (
     "extra_kv_h",
     "extra_indices_h",
     "extra_topk_length_h",
-    "tensor_map_kv_nope",
-    "tensor_map_kv_rope",
-    "tensor_map_extra_kv_nope",
-    "tensor_map_extra_kv_rope",
     "sm_scale_div_log2",
     "stride_q_b",
     "stride_q_s_q",
@@ -111,7 +107,7 @@ def test_main_optional_specializations_have_static_abi(model_type, presence) -> 
     expected_params = _expected_params(MAIN_PARAMETER_NAMES, MAIN_OPTIONAL_BUFFER_PARAMS, presence)
 
     assert [param.name for param in kernel.params] == expected_params
-    assert len(kernel.params) == 44 + sum(presence)
+    assert len(kernel.params) == 40 + sum(presence)
     optional_buffers = {
         param.name for param in kernel.buffer_map if param.name in MAIN_OPTIONAL_BUFFER_PARAMS
     }

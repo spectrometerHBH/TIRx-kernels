@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ctypes
 import math
 import random
 from dataclasses import dataclass, fields
@@ -64,9 +63,16 @@ COMBINE_OPTIONAL_BUFFER_PARAMS = ("attn_sink_h",)
 MainPresenceMask = tuple[bool, bool, bool, bool, bool]
 MAIN_OPTIONAL_ARG_INDICES = (3, 4, 11, 12, 13)
 COMBINE_OPTIONAL_ARG_INDICES = (5,)
-_TMA_PREFETCH_SEQUENCE = "flashmla_q_sw128,flashmla_o,flashmla_q_sw64"
 
 _mma_config = partial(tcgen05_config, cta_group=1)
+_kv_gather_tma = partial(
+    tma_config,
+    dispatch="tma_explicit",
+    cta_group=1,
+    cache_hint=T.uint64(0x14F0000000000000),
+    mbarrier_addr=True,
+    tensormap_l2_promotion="L2::128B",
+)
 
 
 # CUDA kerutils/device/sm100/intrinsics.cuh:54-76.  TIRx's ordinary vector
@@ -102,55 +108,6 @@ def _mul_f32x2(a, b):
     return T.cuda.func_call(
         "tirx_flashmla_mul_f32x2", a, b, source_code=_MUL_F32X2_SRC, return_type="uint64"
     )
-
-
-# kernel.cuh:600/634 selects between two CUtensorMap addresses as ``const
-# void*`` before ku::tma_gather4 converts the selected pointer to the PTX u64
-# operand.  Retain that pointer-typed select locally: selecting two already
-# integerized addresses makes nvcc generate a measurably worse instruction
-# sequence on SM100.
-_SELECT_TENSORMAP_SRC = r"""
-__device__ __forceinline__ unsigned long long tirx_flashmla_select_tensormap(
-    bool use_extra, unsigned long long extra_addr, unsigned long long normal_addr) {
-  const void* extra_ptr = reinterpret_cast<const void*>(extra_addr);
-  const void* normal_ptr = reinterpret_cast<const void*>(normal_addr);
-  return reinterpret_cast<unsigned long long>(use_extra ? extra_ptr : normal_ptr);
-}
-"""
-
-
-def _select_tensormap(use_extra, extra_addr, normal_addr):
-    return T.cuda.func_call(
-        "tirx_flashmla_select_tensormap",
-        use_extra,
-        extra_addr,
-        normal_addr,
-        source_code=_SELECT_TENSORMAP_SRC,
-        return_type="uint64",
-    )
-
-
-# CUDA kerutils/device/sm100/intrinsics.cuh:7-23.  The source converts the
-# shared destination and mbarrier pointers to uint32 before issuing the exact
-# CTA-group::1 gather.  Keeping those operands explicit lets each producer
-# retain one current-stage shared base instead of rebuilding a generic 64-bit
-# pointer at every source-unrolled call site.
-_TMA_GATHER4_SHARED_ADDR_SRC = r"""
-__device__ __forceinline__ void tirx_flashmla_tma_gather4_shared_addr(
-    unsigned int dst_addr, unsigned long long desc_addr, int col_idx,
-    int row0, int row1, int row2, int row3, unsigned int mbar_addr,
-    unsigned long long cache_hint) {
-  asm volatile(
-      "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4."
-      "mbarrier::complete_tx::bytes.cta_group::1.L2::cache_hint "
-      "[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-      :
-      : "r"(dst_addr), "l"(desc_addr), "r"(col_idx),
-        "r"(row0), "r"(row1), "r"(row2), "r"(row3),
-        "r"(mbar_addr), "l"(cache_hint)
-      : "memory");
-}
-"""
 
 
 # CUDA kernel.cuh:704-710.  CUDA exposes the float2->e8m0x2 conversion only
@@ -747,106 +704,6 @@ def _kv_storage_spec(
     return bytes_per_token, tma_k_stride, stride_kv_block, num_tma_rows
 
 
-class _AlignedTensorMap:
-    """Own one source-compatible, 64-byte-aligned CUtensorMap value."""
-
-    def __init__(self) -> None:
-        # CUtensorMap is 128 bytes.  ctypes zero-initializes the backing store,
-        # which also gives the exact all-zero optional descriptor used when the
-        # source's extra_topk is zero.
-        self._storage = ctypes.create_string_buffer(128 + 64)
-        base = ctypes.addressof(self._storage)
-        self.ptr = ctypes.c_void_p((base + 63) & ~63)
-
-
-def _encode_sparse_kv_tensormap(
-    *,
-    storage: torch.Tensor,
-    base_offset_bytes: int,
-    tensor_dtype: str,
-    global_inner_dim: int,
-    global_outer_dim: int,
-    global_outer_stride_bytes: int,
-    box_inner_dim: int,
-    swizzle: int,
-) -> _AlignedTensorMap:
-    """Encode kernel.cuh:909-937's two-dimensional KV TensorMaps."""
-
-    import tvm
-
-    desc = _AlignedTensorMap()
-    encode_tensormap = tvm.get_global_func("runtime.cuTensorMapEncodeTiled")
-    encode_tensormap(
-        desc.ptr,
-        tensor_dtype,
-        2,
-        ctypes.c_void_p(int(storage.data_ptr()) + base_offset_bytes),
-        global_inner_dim,
-        global_outer_dim,
-        global_outer_stride_bytes,
-        box_inner_dim,
-        1,
-        1,
-        1,
-        0,  # CU_TENSOR_MAP_INTERLEAVE_NONE
-        swizzle,
-        2,  # CU_TENSOR_MAP_L2_PROMOTION_L2_128B
-        0,  # CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
-    )
-    return desc
-
-
-def _build_sparse_kv_tensormaps(case: dict[str, Any]) -> dict[str, _AlignedTensorMap]:
-    """Build the four explicit CUtensorMap members in the CUDA TmaParams."""
-
-    cfg: SparseFlashMLADecodeHead64Config = case["config"]
-    shape: dict[str, int] = case["shape"]
-    is_v32 = cfg.normalized_model_type is ModelType.V32
-    d_nope = 512 if is_v32 else 448
-    tma_k_stride = 656 if is_v32 else 576
-    rope_offset_bytes = d_nope + (16 if is_v32 else 0)
-    rope_tile = 32 if is_v32 else 64
-    rope_swizzle = 2 if is_v32 else 3
-
-    def encode_pair(
-        storage: torch.Tensor, num_tma_rows: int
-    ) -> tuple[_AlignedTensorMap, _AlignedTensorMap]:
-        nope = _encode_sparse_kv_tensormap(
-            storage=storage,
-            base_offset_bytes=0,
-            tensor_dtype="int64",
-            global_inner_dim=d_nope // 8,
-            global_outer_dim=num_tma_rows,
-            global_outer_stride_bytes=tma_k_stride,
-            box_inner_dim=d_nope // 8,
-            swizzle=0,
-        )
-        rope = _encode_sparse_kv_tensormap(
-            storage=storage,
-            base_offset_bytes=rope_offset_bytes,
-            tensor_dtype="bfloat16",
-            global_inner_dim=64,
-            global_outer_dim=num_tma_rows,
-            global_outer_stride_bytes=tma_k_stride,
-            box_inner_dim=rope_tile,
-            swizzle=rope_swizzle,
-        )
-        return nope, rope
-
-    kv_nope, kv_rope = encode_pair(case["kv_storage"], shape["num_tma_rows"])
-    if cfg.extra_topk:
-        extra_nope, extra_rope = encode_pair(case["extra_kv_storage"], shape["extra_num_tma_rows"])
-    else:
-        extra_nope = _AlignedTensorMap()
-        extra_rope = _AlignedTensorMap()
-    return {
-        "kv_nope": kv_nope,
-        "kv_rope": kv_rope,
-        "extra_kv_nope": extra_nope,
-        "extra_kv_rope": extra_rope,
-    }
-
-
 def _max_splits_bucket(num_sm_parts: int) -> int:
     # combine.cu:176-187 MLA_NUM_SPLITS_SWITCH(params.num_sm_parts, ...).
     for bucket in (32, 64, 96, 128, 160):
@@ -1257,13 +1114,6 @@ def _make_sparse_decode_head64_kernel(model_type: ModelType):
         pool.move_base_to(q_sw128_end)
         return None
 
-    def rope_stage_base_ptr(k_full, k_rope, stage):
-        """Return the unswizzled physical base of one RoPE ring stage."""
-
-        if is_v32:
-            return k_rope.ptr_to([stage, 0, 0])
-        return k_full.ptr_to([stage, 0, d_nope])
-
     def emit_no_split_epilogue(
         o_epi_frag,
         o_epi_bf16_frag,
@@ -1308,10 +1158,7 @@ def _make_sparse_decode_head64_kernel(model_type: ModelType):
                                 out_strided[batch_idx, s_q_idx, :, col_base : col_base + 64],
                                 o_smem[:, col_base : col_base + 64],
                                 **tma_config(
-                                    prefetch_tensormap=False,
-                                    tensormap_l2_promotion="L2::128B",
-                                    tensormap_label="flashmla_o",
-                                    tensormap_assume_aligned_strides=True,
+                                    dispatch="tma_explicit", tensormap_l2_promotion="L2::128B"
                                 ),
                             )
             warp1_col_base = col_base + D_V // 4
@@ -1325,10 +1172,7 @@ def _make_sparse_decode_head64_kernel(model_type: ModelType):
                                 ],
                                 o_smem[:, warp1_col_base : warp1_col_base + 64],
                                 **tma_config(
-                                    prefetch_tensormap=False,
-                                    tensormap_l2_promotion="L2::128B",
-                                    tensormap_label="flashmla_o",
-                                    tensormap_assume_aligned_strides=True,
+                                    dispatch="tma_explicit", tensormap_l2_promotion="L2::128B"
                                 ),
                             )
 
@@ -1342,25 +1186,6 @@ def _make_sparse_decode_head64_kernel(model_type: ModelType):
         # assignment retained at each source loop tail.
         for int4_lane in range(4):
             T.buffer_store(dst, src[int4_lane], [int4_lane])
-
-    def issue_gather4(dst_addr, mbar_addr, tensor_map_addr, column, indices):
-        """Emit ku::tma_gather4's single CTA-group source instruction."""
-
-        T.evaluate(
-            T.cuda.func_call(
-                "tirx_flashmla_tma_gather4_shared_addr",
-                dst_addr,
-                tensor_map_addr,
-                column,
-                indices[0],
-                indices[1],
-                indices[2],
-                indices[3],
-                mbar_addr,
-                T.uint64(0x14F0000000000000),
-                source_code=_TMA_GATHER4_SHARED_ADDR_SRC,
-            )
-        )
 
     @T.jit
     def _kernel(
@@ -1378,10 +1203,6 @@ def _make_sparse_decode_head64_kernel(model_type: ModelType):
         extra_kv_h: T.Optional(T.handle),
         extra_indices_h: T.Optional(T.handle),
         extra_topk_length_h: T.Optional(T.handle),
-        tensor_map_kv_nope: T.TensorMap(),
-        tensor_map_kv_rope: T.TensorMap(),
-        tensor_map_extra_kv_nope: T.TensorMap(),
-        tensor_map_extra_kv_rope: T.TensorMap(),
         sm_scale_div_log2: T.float32,
         stride_q_b: T.int32,
         stride_q_s_q: T.int32,
@@ -1490,6 +1311,77 @@ def _make_sparse_decode_head64_kernel(model_type: ModelType):
         if extra_topk_length_h is not None:
             extra_topk_length = T.match_buffer(extra_topk_length_h, (b,), "int32", scope="global")
 
+        # kernel.cuh:909-937.  tma_explicit encodes the two MODEL_TYPE-specific
+        # rank-2 views from the runtime storage pointer and strides.  The public
+        # layout is (TMA row, inner element); CUDA reverses it to
+        # globalDim={inner, rows} and issues gather4 coordinates
+        # {inner_column, row0, row1, row2, row3}.
+        kv_nope_tma = T.decl_buffer(
+            (num_blocks * (stride_kv_block // tma_k_stride), d_nope // 8),
+            "int64",
+            data=kv.data,
+            scope="global",
+            layout=TileLayout(
+                S[
+                    (num_blocks * (stride_kv_block // tma_k_stride), d_nope // 8) : (
+                        tma_k_stride // 8,
+                        1,
+                    )
+                ]
+            ),
+        )
+        kv_rope_data: T.let = T.reinterpret(
+            PointerType(PrimType("bfloat16")),
+            T.handle_add_byte_offset(kv.data, d_nope + (16 if is_v32 else 0)),
+        )
+        kv_rope_tma = T.decl_buffer(
+            (num_blocks * (stride_kv_block // tma_k_stride), 64),
+            "bfloat16",
+            data=kv_rope_data,
+            scope="global",
+            layout=TileLayout(
+                S[
+                    (num_blocks * (stride_kv_block // tma_k_stride), 64) : (
+                        tma_k_stride // BF16_BYTES,
+                        1,
+                    )
+                ]
+            ),
+        )
+        if extra_kv_h is not None:
+            extra_kv_nope_tma = T.decl_buffer(
+                (extra_num_blocks * (stride_extra_kv_block // tma_k_stride), d_nope // 8),
+                "int64",
+                data=extra_kv.data,
+                scope="global",
+                layout=TileLayout(
+                    S[
+                        (
+                            extra_num_blocks * (stride_extra_kv_block // tma_k_stride),
+                            d_nope // 8,
+                        ) : (tma_k_stride // 8, 1)
+                    ]
+                ),
+            )
+            extra_kv_rope_data: T.let = T.reinterpret(
+                PointerType(PrimType("bfloat16")),
+                T.handle_add_byte_offset(extra_kv.data, d_nope + (16 if is_v32 else 0)),
+            )
+            extra_kv_rope_tma = T.decl_buffer(
+                (extra_num_blocks * (stride_extra_kv_block // tma_k_stride), 64),
+                "bfloat16",
+                data=extra_kv_rope_data,
+                scope="global",
+                layout=TileLayout(
+                    S[
+                        (extra_num_blocks * (stride_extra_kv_block // tma_k_stride), 64) : (
+                            tma_k_stride // BF16_BYTES,
+                            1,
+                        )
+                    ]
+                ),
+            )
+
         T.device_entry()
         T.attr(
             {
@@ -1510,6 +1402,28 @@ def _make_sparse_decode_head64_kernel(model_type: ModelType):
             d_qk,
             layout=TileLayout(S[(b, s_q, B_H, d_qk) : (stride_q_b, stride_q_s_q, stride_q_h_q, 1)]),
         )
+        if is_v32:
+            # Preserve CuTe's single SW64 tail transaction explicitly.  Splitting
+            # d_qk into (18, 32) makes the final two 32-column atoms a rank-5
+            # TensorMap box with CUDA-order shape (32, 64, 2, 1, 1).
+            q_tail_tma = q.view(
+                b,
+                s_q,
+                d_qk // 32,
+                B_H,
+                32,
+                layout=TileLayout(
+                    S[
+                        (b, s_q, d_qk // 32, B_H, 32) : (
+                            stride_q_b,
+                            stride_q_s_q,
+                            32,
+                            stride_q_h_q,
+                            1,
+                        )
+                    ]
+                ),
+            )
         out_strided = out.view(
             b,
             s_q,
@@ -1537,6 +1451,10 @@ def _make_sparse_decode_head64_kernel(model_type: ModelType):
         model_kv_union = T.meta_var(allocate_model_kv_union(pool, u_base))
         k_full = T.meta_var(model_kv_union[0])
         k_rope = T.meta_var(model_kv_union[1])
+        # V32's RoPE member has its own interleaved stage layout.  MODEL1's
+        # member aliases the final 64 columns of each 512-column k_full stage;
+        # retain that parent slice so tma_explicit sees the true stage stride.
+        k_rope_tma = T.meta_var(k_rope if is_v32 else k_full.sub[:, :, d_nope : d_nope + 64])
         raw_nope = pool.alloc((NUM_BUFS, B_TOPK, d_nope // 8), "uint64", align=1024)
         kv_union_end = T.meta_var(pool.offset)
 
@@ -1621,14 +1539,12 @@ def _make_sparse_decode_head64_kernel(model_type: ModelType):
                 prefetch_size="L2::256B",
             )
 
-        # kernel.cuh:35-67.  Q/O/Q-tail descriptors are ordered by the lowering
-        # sequence attached to their copy sites.  The four KV maps mirror the
-        # explicit CUtensorMap members of TmaParams; prefetch only the two normal
-        # maps, exactly as the source's _TMA_PREFETCH_SEQUENCE does.
+        # kernel.cuh:35-67.  Each copy site requests the lowering's ordinary
+        # descriptor prefetch.  tma_explicit deduplicates the two normal KV
+        # descriptors and intentionally does not prefetch src_selector
+        # candidates, matching the source's normal-only KV prefetch.
         if warp_idx == 0:
             if T.ptx.elect_sync() != T.uint32(0):
-                T.evaluate(T.ptx.prefetch_tensormap(T.address_of(tensor_map_kv_nope)))
-                T.evaluate(T.ptx.prefetch_tensormap(T.address_of(tensor_map_kv_rope)))
                 T.ptx.mbarrier.init(bar_last_store_done.ptr_to([0]), 128)
                 T.ptx.mbarrier.init(bar_q_tma.ptr_to([0]), 1)
                 T.ptx.mbarrier.init(bar_q_utccp.ptr_to([0]), 1)
@@ -2120,34 +2036,23 @@ def _make_sparse_decode_head64_kernel(model_type: ModelType):
                                         batch_idx, s_q_idx, :, q_tile * 64 : (q_tile + 1) * 64
                                     ],
                                     **tma_config(
+                                        dispatch="tma_explicit",
                                         mbar=bar_q_tma.ptr_to([0]),
                                         cta_group=1,
                                         cache_hint="evict_first",
-                                        prefetch_tensormap=False,
                                         tensormap_l2_promotion="L2::128B",
-                                        tensormap_label="flashmla_q_sw128",
-                                        tensormap_assume_aligned_strides=True,
-                                        zero_tensormap_labels=(
-                                            None if model_is_v32 else "flashmla_q_sw64"
-                                        ),
-                                        prefetch_tensormap_sequence=(
-                                            None if model_is_v32 else _TMA_PREFETCH_SEQUENCE
-                                        ),
                                     ),
                                 )
                             if model_is_v32:
                                 Tx.copy_async(
-                                    q_sw64[:, :],
-                                    q_strided[batch_idx, s_q_idx, :, 512:576],
+                                    q_sw64.rearrange("h (a c) -> a h c", a=2, c=32)[:, :, :],
+                                    q_tail_tma[batch_idx, s_q_idx, 16:18, :, :],
                                     **tma_config(
+                                        dispatch="tma_explicit",
                                         mbar=bar_q_tma.ptr_to([0]),
                                         cta_group=1,
                                         cache_hint="evict_first",
-                                        prefetch_tensormap=False,
                                         tensormap_l2_promotion="L2::128B",
-                                        tensormap_label="flashmla_q_sw64",
-                                        tensormap_assume_aligned_strides=True,
-                                        prefetch_tensormap_sequence=_TMA_PREFETCH_SEQUENCE,
                                     ),
                                 )
                             bar_q_tma.arrive(0, tx_count=B_H * d_qk * BF16_BYTES)
@@ -2229,12 +2134,6 @@ def _make_sparse_decode_head64_kernel(model_type: ModelType):
                             for block_idx in T.serial(start_block, end_block, unroll=False):
                                 bar_valid_ready.wait(rs_index.stage, rs_index.phase)
                                 bar_raw_free.wait(rs_buf.stage, rs_buf.phase ^ 1)
-                                cur_raw_stage_addr: T.uint32 = T.cuda.cvta_generic_to_shared(
-                                    raw_nope.ptr_to([rs_buf.stage, 0, 0])
-                                )
-                                cur_raw_mbar_addr: T.uint32 = T.cuda.cvta_generic_to_shared(
-                                    bar_raw_ready.ptr_to([rs_buf.stage])
-                                )
                                 cur_indices = T.alloc_local((4,), "int32")
                                 next_indices = T.alloc_local((4,), "int32")
                                 Tx.copy(
@@ -2250,16 +2149,18 @@ def _make_sparse_decode_head64_kernel(model_type: ModelType):
                                             tma_coord[rs_index.stage, row + 4 : row + 8],
                                             dispatch="vec_128b",
                                         )
-                                    issue_gather4(
-                                        cur_raw_stage_addr + T.cast(row * d_nope, "uint32"),
-                                        cur_raw_mbar_addr,
-                                        _select_tensormap(
-                                            block_idx >= num_orig_blocks,
-                                            T.address_of(tensor_map_extra_kv_nope),
-                                            T.address_of(tensor_map_kv_nope),
+                                    Tx.copy_async(
+                                        raw_nope.sub[rs_buf.stage, :, :][row : row + 4, :],
+                                        kv_nope_tma[0:1, :],
+                                        **_kv_gather_tma(
+                                            mbar=bar_raw_ready.ptr_to([rs_buf.stage]),
+                                            gather4=[cur_indices[j] for j in range(4)],
+                                            src_selector=(
+                                                [(block_idx >= num_orig_blocks, extra_kv_nope_tma)]
+                                                if extra_kv_h is not None
+                                                else None
+                                            ),
                                         ),
-                                        0,
-                                        cur_indices,
                                     )
                                     assign_int4_registers(cur_indices, next_indices)
                                 bar_raw_ready.arrive(rs_buf.stage, tx_count=B_TOPK * d_nope)
@@ -2271,12 +2172,6 @@ def _make_sparse_decode_head64_kernel(model_type: ModelType):
                             # kernel.cuh:616-652.  RoPE remains bf16 and uses the
                             # model-specific SW64 (two 32-col gathers) or SW128
                             # (one 64-col gather) destination.
-                            rope_stage0_base_u64: T.let = T.reinterpret(
-                                "uint64", rope_stage_base_ptr(k_full, k_rope, 0)
-                            )
-                            rope_stage1_base_u64: T.let = T.reinterpret(
-                                "uint64", rope_stage_base_ptr(k_full, k_rope, 1)
-                            )
                             bar_q_utccp.wait(0, batch_bar_phase)
                             bar_last_store_done.wait(0, batch_bar_phase)
                             for block_idx in T.serial(start_block, end_block, unroll=False):
@@ -2285,22 +2180,6 @@ def _make_sparse_decode_head64_kernel(model_type: ModelType):
                                     bar_qk_done.wait(rs_buf.stage, rs_buf.phase ^ 1)
                                 else:
                                     bar_sv_done.wait(rs_buf.stage, rs_buf.phase ^ 1)
-                                # kernel.cuh:640 selects the current ring-stage
-                                # ``rope.data()`` once for this dynamic block.
-                                # Keep this mutable scalar outside both
-                                # source-unrolled loops so lowering does not
-                                # clone the stage select into every gather.
-                                cur_rope_stage_base_u64: T.uint64 = rope_stage0_base_u64
-                                if rs_buf.stage != 0:
-                                    cur_rope_stage_base_u64 = rope_stage1_base_u64
-                                cur_rope_stage_addr: T.uint32 = T.cuda.cvta_generic_to_shared(
-                                    T.reinterpret(
-                                        PointerType(PrimType("bfloat16")), cur_rope_stage_base_u64
-                                    )
-                                )
-                                cur_rope_mbar_addr: T.uint32 = T.cuda.cvta_generic_to_shared(
-                                    bar_rope_ready.ptr_to([rs_buf.stage])
-                                )
                                 cur_indices = T.alloc_local((4,), "int32")
                                 next_indices = T.alloc_local((4,), "int32")
                                 Tx.copy(
@@ -2317,20 +2196,29 @@ def _make_sparse_decode_head64_kernel(model_type: ModelType):
                                             dispatch="vec_128b",
                                         )
                                     for rope_part in T.unroll(64 // rope_tile):
-                                        rope_dst_addr: T.let = cur_rope_stage_addr + T.cast(
-                                            (rope_part * B_TOPK + row) * rope_tile * BF16_BYTES,
-                                            "uint32",
-                                        )
-                                        issue_gather4(
-                                            rope_dst_addr,
-                                            cur_rope_mbar_addr,
-                                            _select_tensormap(
-                                                block_idx >= num_orig_blocks,
-                                                T.address_of(tensor_map_extra_kv_rope),
-                                                T.address_of(tensor_map_kv_rope),
+                                        Tx.copy_async(
+                                            k_rope_tma.sub[rs_buf.stage, :, :][
+                                                row : row + 4,
+                                                rope_part * rope_tile : (rope_part + 1) * rope_tile,
+                                            ],
+                                            kv_rope_tma[
+                                                0:1,
+                                                rope_part * rope_tile : (rope_part + 1) * rope_tile,
+                                            ],
+                                            **_kv_gather_tma(
+                                                mbar=bar_rope_ready.ptr_to([rs_buf.stage]),
+                                                gather4=[cur_indices[j] for j in range(4)],
+                                                src_selector=(
+                                                    [
+                                                        (
+                                                            block_idx >= num_orig_blocks,
+                                                            extra_kv_rope_tma,
+                                                        )
+                                                    ]
+                                                    if extra_kv_h is not None
+                                                    else None
+                                                ),
                                             ),
-                                            rope_part * rope_tile,
-                                            cur_indices,
                                         )
                                     assign_int4_registers(cur_indices, next_indices)
                                 bar_rope_ready.arrive(
@@ -3000,8 +2888,9 @@ def _kernel_shape_params(
             raise AssertionError("original and extra KV caches must use one MODEL_TYPE")
         extra_page_block_size = cfg.extra_page_block_size
     else:
-        # kernel.cuh:934-950 leaves both optional TensorMaps all-zero and all
-        # optional runtime shape/stride fields at zero when extra KV is absent.
+        # kernel.cuh:934-950 leaves all optional runtime shape/stride fields at
+        # zero when extra KV is absent.  Optional specialization removes the
+        # extra buffer views and their generated descriptors entirely.
         extra_num_blocks = 0
         extra_page_block_size = 0
         stride_extra_kv_block = 0
@@ -3249,13 +3138,12 @@ def prepare_data(**kwargs: Any) -> dict[str, Any]:
         "stride_o_accum_s_q": o_accum.stride(1),
         "stride_o_accum_h_q": o_accum.stride(2),
     }
-    case["tensor_maps"] = _build_sparse_kv_tensormaps(case)
     _validate_tirx_launch_case(case)
     return case
 
 
 def _validate_tirx_launch_case(case: dict[str, Any]) -> None:
-    """Mirror kernel.cuh:859-868/909-912 before TensorMap creation."""
+    """Validate the runtime storage assumptions encoded by the TMA views."""
 
     cfg: SparseFlashMLADecodeHead64Config = case["config"]
     if cfg.normalized_model_type is ModelType.MODEL1 and case["stride_kv_row"] != 584:
@@ -3364,10 +3252,6 @@ def _tirx_main_args(case: dict[str, Any], start_head_idx: int) -> tuple[Any, ...
             else None
         ),
         case["extra_topk_length"] if cfg.have_extra_topk_length else None,
-        case["tensor_maps"]["kv_nope"].ptr,
-        case["tensor_maps"]["kv_rope"].ptr,
-        case["tensor_maps"]["extra_kv_nope"].ptr,
-        case["tensor_maps"]["extra_kv_rope"].ptr,
         case["sm_scale_div_log2"],
         case["stride_q_b"],
         case["stride_q_s_q"],
