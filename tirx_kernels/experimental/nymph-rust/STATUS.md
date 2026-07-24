@@ -46,14 +46,15 @@ Design points:
   independently (sm_70+); above the warp everything is concurrency. All ordering
   is explicit and checked: cross-warp/cross-CTA ordering comes from sync ops, and
   cross-LANE ordering inside a warp comes from a warp-level sync — `warp_sync`, a
-  warp-collective instruction (ldmatrix/stmatrix/tcgen05_ld/tcgen05_st/warp MMA),
-  or a cooperative barrier the warp passes. Thread dispatch is `If` over
-  per-thread predicates (`if_warp` / `if_warpgroup` / `if_lane` / `if_elected`
-  sugar). Cross-warp access pairs inside one CTA are ordinary concurrency and get
-  race-checked like any other pair (pinned by
-  `tests/interpreter/test_warp_model.py`); cross-lane pairs inside one warp are
-  verified by `memory_race_check` and reported as `intra_warp_cross_lane_race`
-  (pinned by `tests/interpreter/test_cross_lane.py`).
+  warp-collective instruction (ldmatrix/stmatrix/tcgen05_ld/tcgen05_st/warp MMA,
+  TMEM alloc/dealloc), or a synchronization edge that delivered the writing
+  lane's order. Thread dispatch is `If` over per-thread predicates (`if_warp` /
+  `if_warpgroup` / `if_lane` / `if_elected` sugar). The checker's
+  happens-before clock is per (warp, lane) — releases publish only their
+  arriving lanes — so cross-warp and cross-lane pairs alike are judged by
+  `memory_race_check` as `memory_data_race` (pinned by
+  `tests/interpreter/test_warp_model.py` and
+  `tests/interpreter/test_cross_lane.py`).
 - **Lane vectorization** — handlers operate on whole `ThreadMask`s, never loop
   threads in op logic.
 - **Direct mutation** — every executor takes `&mut WarpContext` (holding `&mut state`),

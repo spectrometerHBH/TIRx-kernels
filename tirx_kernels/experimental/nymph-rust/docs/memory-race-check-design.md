@@ -40,9 +40,10 @@ This pass does not prove prior-write completeness, read-from identity, or write
 consumption. A read without a prior write is not an error by itself. A write that
 is never read is not an error by itself.
 
-The pass reports two race codes: `memory_data_race` for an unordered pair
-across streams, and `intra_warp_cross_lane_race` for an unordered pair
-between two lanes of one warp.
+The pass reports one race code, `memory_data_race`, whether the unordered
+pair sits on two streams or on two lanes of one warp — both are the same
+missing edge in the per-lane happens-before relation. The diagnostic carries
+a lane-pair witness when the conflict is lane-attributed.
 
 ## Access Model
 
@@ -73,16 +74,15 @@ MemoryRaceFrontier {
 Events are processed in canonical trace order, but cross-stream trace order is
 not an ordering proof.
 
-- `Read`: query overlapping entries in the write frontier. An overlapping write
-  on another stream that is unordered both ways is a `memory_data_race`; one on
-  the same stream that lacks an intra-warp ordering fact (see Ordering Inputs)
-  is an `intra_warp_cross_lane_race`. Then prune older read-frontier entries
-  that are covered by this read and ordered before it, and append the read to
-  the read frontier.
+- `Read`: query overlapping entries in the write frontier. A conflicting
+  lane-slice pair with no happens-before order in either direction (see
+  Ordering Inputs) is a `memory_data_race`. Then prune older read-frontier
+  entries that are covered by this read and prunably ordered before it, and
+  append the read to the read frontier.
 - `Write`: query overlapping entries in both the write frontier and the read
-  frontier, applying the same two rules. Then prune older frontier entries that
-  are fully covered by the new write and ordered before it. Finally append the
-  new write.
+  frontier with the same rule. Then prune older frontier entries that are
+  fully covered by the new write and prunably ordered before it. Finally
+  append the new write.
 
 Reads never split existing writes or define global spatial partitions. A large write followed
 by a partial read performs an overlap/HB query against the large write; it does
@@ -91,36 +91,44 @@ conservatively.
 
 ## Ordering Inputs
 
-The pass calls shared ordering analysis:
+Happens-before is per LANE. `OrderingAnalysis` gives every `(stream, lane)`
+its own vector-clock dimension: an event ticks exactly its executing lanes
+(the trace scope's `active_lanes` mask), a release publishes the join of the
+ARRIVING lanes' clocks only, an acquire joins the release into the acquiring
+lanes, and a warp-level convergence point — a warp-collective instruction
+(`ldmatrix`, `stmatrix`, `tcgen05.ld/st`, warp MMA, the `.sync.aligned` TMEM
+alloc/dealloc) or a full-warp cooperative passage — folds all 32 lanes into
+one shared clock. On sm_70+ the lanes of a warp advance independently, so
+this is the hardware relation: a masked write is invisible to every other
+lane, and to every release those lanes perform, until a convergence point or
+a real synchronization edge delivers it.
+
+The race walk judges conflicting SLICE pairs through two queries:
 
 ```text
-happens_before(a_event_idx, b_event_idx) -> bool
+ordered_lane(a_event, a_lane, b_event, b_lane) -> bool   // one slice pair
+happens_before(a_event, b_event) -> bool                  // every slice pair
 ```
 
-Ordering facts are schedule-independent:
+A slice is `(lane, bytes)`: the region's `lane_boxes` entry when the builder
+attributed bytes to lanes (lane-divergent SMEM/TMEM accesses and single-lane
+masks), else every executing lane touching the whole footprint. For each
+overlapping slice pair the pass requires `ordered_lane` in one direction
+(either direction across streams; only forward within one stream, where a
+later event's lane tick can never sit below an earlier one's). Same-lane
+same-stream pairs are ordered by per-lane program order; everything else
+must come out of the clock. When neither side is attributed, every pair
+conflicts and the whole-event `happens_before` is the exact test.
 
-- same-stream program order, which orders each LANE of the warp against itself;
-- mbar release to matching mbar wait.
+Same-stream pairs where either member is performed by an async engine
+(`proxy = async`) are not judged here: a copy/mma engine touches those bytes,
+not a lane, and the engine-window passes (`async_group_lifetime`,
+`tcgen05_async_hazard`) own those hazards against their own drains.
 
-Cross-stream trace vector order is a happens-before edge only where one of
-these facts supplies it.
-
-A same-stream pair whose lanes differ needs an intra-warp ordering fact, since
-the lanes of a warp advance independently (sm_70+). Such a pair is ordered when
-any of these holds:
-
-- either member is a warp-collective instruction, which every lane converges
-  on (`ldmatrix`, `stmatrix`, `tcgen05.ld`, `tcgen05.st`, warp MMA);
-- either member is performed by an async engine (`proxy = async`), whose window
-  is checked by the async passes against its own drain;
-- a cross-lane ordering point of that stream lies strictly between the two
-  events: a passed cooperative barrier or a warp-collective instruction;
-- the overlap is same-lane only, i.e. every overlapping pair of per-lane boxes
-  belongs to one lane, so per-lane program order already covers it.
-
-Per-lane attribution rides on the access record as `Region.lane_boxes`, filled
-for lane-divergent SMEM/TMEM accesses and for single-lane masks. An access
-without it is uniform: every executing lane touches the whole region.
+Frontier pruning needs an ordering that COMPOSES with any later conflict:
+the whole-event relation (transitive), or same-lane coverage — both sides
+attributed, no byte shared across different lanes, so each prior slice is
+covered by the same lane's current slice under per-lane program order.
 
 ## Projection Requirements
 
@@ -138,22 +146,21 @@ tensor footprints.
 
 ## Diagnostics
 
-`memory_data_race` (cross-stream) and `intra_warp_cross_lane_race` (cross-lane
-within one warp) diagnostics include:
+`memory_data_race` diagnostics include:
 
 - `left_event_idx` and `right_event_idx`;
 - left/right `stmt_id` and `stmt_kind` when available;
 - left/right access modes;
 - owner summary;
-- one overlapping witness box.
-
-`intra_warp_cross_lane_race` also carries `lanes`, the two lanes whose
-footprints overlap (`all` when a uniform region puts every executing lane on
-one side).
+- `lanes`, the unordered slice pair's lane numbers (`all` when neither side
+  is lane-attributed);
+- one overlapping witness box (the named lanes' overlap when attributed).
 
 The pass works on SMEM and TMEM through the same `Region` overlap path. Tests
 cover physical SMEM aliasing, write/write and write/read races, read/read
 non-conflicts, owner separation, non-overlap, mbar HB ordering,
-large-write/partial-read behavior, TMEM Layout F untouched lane gaps, and each
-intra-warp rule: lane-rotated dependency, `warp_sync` ordering, same-lane
-reuse, warp-collective ordering, and async-engine members.
+large-write/partial-read behavior, TMEM Layout F untouched lane gaps, and the
+per-lane visibility theorems: lane-rotated dependency, `warp_sync` delivery,
+same-lane reuse, warp-collective convergence, masked-write handoffs,
+divergent-write publication through narrow and full-warp arrives, and
+partial-mask rendezvous (arrived lanes ordered, absent lanes not).

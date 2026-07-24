@@ -230,8 +230,10 @@ writes or drive global spatial partitioning.
 
 The pass does not prove prior-write completeness, read-from identity, or write
 consumption. A read without a prior write is not an error by itself, and an
-unread write is not an error by itself. Failures use `memory_data_race`
-across streams and `intra_warp_cross_lane_race` between lanes of one warp.
+unread write is not an error by itself. Failures use `memory_data_race`,
+across streams and between lanes of one warp alike — the happens-before
+clock is per (warp, lane), so both are the same missing edge (the diagnostic
+names the lane pair when the conflict is lane-attributed).
 
 ## 8. Pass Notes
 
