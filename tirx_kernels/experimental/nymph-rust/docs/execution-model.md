@@ -42,8 +42,10 @@ that fiction is *certified*, not axiomatic (see §3).
    warp-mates' unconverged writes.
 4. **Between proxies there is only the fence**: generic-proxy effects
    (ordinary ld/st) consumed by the async proxy (TMA / tensormap / tcgen05
-   engines) must cross `fence.proxy.*` (`fence.mbarrier_init` likewise for
-   mbarrier-object publication). Fence-synchronization is a per-THREAD
+   engines) must cross `fence.proxy.*`. (Hardware asks the same of
+   mbarrier-object publication via `fence.mbarrier_init`; the IR has no such
+   op yet, so that one is a gap rather than a rule the checker enforces —
+   see section 5.) Fence-synchronization is a per-THREAD
    relation: a fence releases the executing thread's own view — its own
    prior accesses, plus whatever a convergence point or barrier had already
    carried into it. This is a SECOND obligation on top of rule 3, not a
@@ -80,15 +82,15 @@ that fiction is *certified*, not axiomatic (see §3).
   of races the model reports contains every race hardware could exhibit.
   The only way to break the direction is to invent an edge hardware does
   not give (treating a relaxed arrive as a release, sharing multicast tx
-  counts on one mbar) — the per-op ledger (`docs/ir-ops.md`) and hardware
+  counts on one mbar) — the per-op ledger in section 5 and the hardware
   fixtures guard that boundary.
 - **Codegen discipline: faithful translation + fail closed.** IR that
-  cannot be faithfully lowered is rejected in validate/codegen; silent
-  degradation (dropping a field, changing a semantic) is this system's
-  worst enemy.
+  cannot be faithfully lowered must be rejected rather than silently
+  degraded (dropping a field, changing a semantic is this system's worst
+  enemy). The lowering itself is not part of this layer.
 - End-to-end proposition: `check passed + codegen faithful + model ⊆
-  hardware ⇒ hardware output == simulator output`. Where this cannot yet be
-  held, the gap is listed honestly in `LIMITATIONS.md`.
+  hardware ⇒ hardware output == simulator output`. The gaps that stop this
+  from holding today are listed in section 5's seams.
 
 ## 4. The checker's formalization
 
@@ -103,9 +105,9 @@ that fiction is *certified*, not axiomatic (see §3).
   rendezvous), semaphore (value-keyed release/acquire), and — for the
   cross-proxy obligation of rule 4 — `fence.proxy.*`, which releases the
   fencing thread's view into the async-proxy engines so that an engine
-  access acquires it like any other release. Section 5 is the per-op ledger. A new op must pass the exhaustiveness
-  gate (every `Stmt` variant handled explicitly in validate / interpreter /
-  checker / codegen); the vocabulary never drifts silently.
+  access acquires it like any other release. Section 5 is the per-op ledger,
+  and every op that joins belongs in it — a discipline, not something the
+  code checks (see the seams).
 - The checker judges **every conflicting access pair** by happens-before
   and every wait by a witness — it checks no "scenario rules", so new
   patterns need no new patches; "a masked write is invisible" is a
@@ -183,9 +185,22 @@ waiting any one of those barriers suffices.
   (§9.7.17.8.5, per-thread); orders nothing across lanes.
 - `tcgen05.commit` / `tcgen05.mma` — single-thread issues; no convergence.
 
-**Seams to keep in view**: `WarpSync` is checker/simulator vocabulary that
-codegen does not lower to `bar.warp.sync`, so a proof leaning on it compiles
-to code that relies on the warp launching converged; and the value simulator
-lands async-engine effects at issue, which is why the engine's real timing
-envelope is owned entirely by the checker's async-window passes
-(`async_group_lifetime`, `tcgen05_async_hazard`) rather than by the values.
+**Seams to keep in view**:
+
+- `WarpSync` is checker/simulator vocabulary that codegen does not lower to
+  `bar.warp.sync`, so a proof leaning on it compiles to code that relies on
+  the warp launching converged.
+- The value simulator lands async-engine effects at issue, which is why the
+  engine's real timing envelope is owned entirely by the checker's
+  async-window passes (`async_group_lifetime`, `tcgen05_async_hazard`)
+  rather than by the values.
+- **`fence.mbarrier_init` has no IR op**, so the publication of an mbarrier
+  OBJECT (as opposed to the data a barrier hands over) is not checked: a
+  kernel that initializes barrier cells and lets a peer use them without
+  that fence is accepted. `MbarInit` is modeled as an ordinary event on its
+  stream.
+- **A new trace event kind orders nothing by default.** The scan that builds
+  the clock decides acquires and releases with `match` arms that end in a
+  catch-all, so an op added later is silently unordered rather than rejected
+  — the closed vocabulary of section 4 is a discipline here, not something
+  the code enforces.
