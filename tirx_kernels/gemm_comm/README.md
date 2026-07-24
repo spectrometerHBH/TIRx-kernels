@@ -71,27 +71,23 @@ TIRx and cuBLASMp retain their direct launch closures. All headline values use
 the same Kineto full-span protocol, so ratios never mix timers.
 
 cuBLASMp 0.10 requires nvmath-python, NCCL4Py, and a compatible recent NCCL.
-Every benchmark requires absolute paths for all four runtime dependencies so a
-loader-path change cannot silently alter the comparison:
+All four runtime libraries are auto-discovered from the installed pip
+packages (`nvidia-nccl-cu13`, `nvidia-cublas`, `nvidia-cublasmp-cu13`, and
+`nvidia-nvshmem-cu13`, or the cu12 variants on CUDA 12 hosts) — there are no
+environment variables or flags to set. Discovery requires exactly one
+resolved file per library so a loader-path change cannot silently alter the
+comparison; pin versions with pip. TVM's compile-time NVSHMEM finder is
+pointed at a shim derived from the same pip package automatically.
 
 ```bash
-export TIRX_NCCL_LIBRARY=/path/to/libnccl.so.2
-export TIRX_CUBLAS_LIBRARY=/path/to/libcublas.so
-export TIRX_CUBLASMP_LIBRARY=/path/to/libcublasmp.so.0
-export TIRX_NVSHMEM_LIBRARY=/path/to/libnvshmem_host.so
-export PYTHONPATH=/path/to/nvmath-python:/path/to/cublasmp-package:$PYTHONPATH
+pip install nvidia-nccl-cu13 nvidia-cublas nvidia-cublasmp-cu13 nvidia-nvshmem-cu13
+pip install nvmath-python nccl4py
 ```
-
-Under `python -m tirx_kernels.bench_suite`, the same locks (plus
-`NVSHMEM_HOME`) can be passed as suite flags — `--nccl-library`,
-`--cublas-library`, `--cublasmp-library`, `--nvshmem-library`,
-`--nvshmem-home` — and the suite fails at startup when a GemmComm workload is
-present but a lock is missing.
 
 The selected files are preloaded only in newly spawned rank workers. Each
 result records the actual shared object resolving the NCCL, cuBLAS, cuBLASMp,
 and NVSHMEM API symbol together with its runtime version, and fails if any
-loaded file differs from its configured lock. cuBLASMp builder failures remain
+loaded file differs from its discovered lock. cuBLASMp builder failures remain
 visible in `errors`, which bench-suite treats as a failed workload.
 
 The result's `ratios` mapping is always `baseline_us / tirx_us`; values greater

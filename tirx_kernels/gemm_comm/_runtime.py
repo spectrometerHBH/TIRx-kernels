@@ -39,12 +39,8 @@ from tvm_ffi import Shape
 import tvm
 from tvm.tirx.bench import DistributedBenchContext
 
-_LOCKED_LIBRARY_ENVS = {
-    "nccl": "TIRX_NCCL_LIBRARY",
-    "cublas": "TIRX_CUBLAS_LIBRARY",
-    "cublasmp": "TIRX_CUBLASMP_LIBRARY",
-    "nvshmem": "TIRX_NVSHMEM_LIBRARY",
-}
+from ._lib_discovery import discover_libraries, ensure_nvshmem_home
+
 _PROCESS_GROUP_TIMEOUT = timedelta(seconds=60)
 
 
@@ -109,9 +105,10 @@ def _loaded_nvshmem_mc_ptr():
     """Resolve nvshmemx_mc_ptr from the host library already loaded by TVM."""
 
     candidates = [None]
-    configured = os.environ.get(_LOCKED_LIBRARY_ENVS["nvshmem"])
-    if configured:
-        candidates.append(configured)
+    try:
+        candidates.append(str(discover_libraries()["nvshmem"]))
+    except RuntimeError:
+        pass
     candidates.extend(("libnvshmem_host.so.3", "libnvshmem_host.so"))
     checked = set()
     for candidate in candidates:
@@ -172,7 +169,7 @@ def sync_communication_to_compute(runtime: DistributedRuntime) -> None:
 
 @contextmanager
 def _rank_library_preload(*, required: bool = False):
-    """Preload explicitly selected communication libraries in spawned ranks."""
+    """Preload the discovered communication libraries in spawned ranks."""
 
     libraries = _locked_library_paths(required=required)
     if not libraries:
@@ -193,31 +190,14 @@ def _rank_library_preload(*, required: bool = False):
 
 
 def _locked_library_paths(*, required: bool) -> dict[str, Path]:
-    """Resolve the exact shared-library files selected for rank workers."""
+    """Resolve the pip-installed communication libraries for rank workers."""
 
-    result: dict[str, Path] = {}
-    missing = []
-    for name, env_name in _LOCKED_LIBRARY_ENVS.items():
-        configured = os.environ.get(env_name)
-        if not configured:
-            if required:
-                missing.append(env_name)
-            continue
-        path = Path(configured)
-        if not path.is_absolute():
-            raise ValueError(f"{env_name} must be an absolute path: {configured}")
-        try:
-            path = path.resolve(strict=True)
-        except FileNotFoundError as error:
-            raise FileNotFoundError(f"{env_name} does not exist: {configured}") from error
-        if not path.is_file():
-            raise FileNotFoundError(f"{env_name} is not a file: {configured}")
-        result[name] = path
-    if missing:
-        raise RuntimeError(
-            "distributed GemmComm benchmarks require explicit library locks: " + ", ".join(missing)
-        )
-    return result
+    try:
+        return discover_libraries()
+    except RuntimeError:
+        if required:
+            raise
+        return {}
 
 
 def _broadcast_nvshmem_uid(rank: int) -> Shape:
@@ -331,7 +311,20 @@ def run_distributed(
 
     with tempfile.TemporaryDirectory(prefix="tirx-gemm-comm-") as tmpdir:
         library_path = Path(tmpdir) / "kernel.so"
-        executable = tvm.compile(ir_module, target=tvm.target.Target("cuda"), tir_pipeline="tirx")
+        # TVM's compile-time NVSHMEM finder only accepts a libnvshmem.so/.a
+        # layout; point it at the shim derived from the pip package for the
+        # duration of the compile (see _lib_discovery.ensure_nvshmem_home).
+        previous_nvshmem_home = os.environ.get("NVSHMEM_HOME")
+        os.environ["NVSHMEM_HOME"] = str(ensure_nvshmem_home())
+        try:
+            executable = tvm.compile(
+                ir_module, target=tvm.target.Target("cuda"), tir_pipeline="tirx"
+            )
+        finally:
+            if previous_nvshmem_home is None:
+                os.environ.pop("NVSHMEM_HOME", None)
+            else:
+                os.environ["NVSHMEM_HOME"] = previous_nvshmem_home
         executable.export_library(str(library_path))
 
         context = mp.get_context("spawn")

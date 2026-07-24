@@ -266,9 +266,8 @@ class _CublasNcclLaunch:
             self._graph.replay()
 
 
-def _load_global(env_name: str, sonames: tuple[str, ...]) -> ctypes.CDLL:
-    configured = os.environ.get(env_name)
-    candidates = [configured] if configured else []
+def _load_global(primary: str | None, sonames: tuple[str, ...]) -> ctypes.CDLL:
+    candidates = [primary] if primary else []
     candidates.extend(sonames)
     for candidate in candidates:
         if not candidate:
@@ -282,13 +281,18 @@ def _load_global(env_name: str, sonames: tuple[str, ...]) -> ctypes.CDLL:
     discovered = ctypes.util.find_library(library_name)
     if discovered is not None:
         return ctypes.CDLL(discovered, mode=ctypes.RTLD_GLOBAL)
-    raise RuntimeError(f"unable to load {sonames[0]}; set {env_name} to its absolute path")
+    raise RuntimeError(f"unable to load {sonames[0]}")
 
 
 def _load_cublasmp_bindings():
+    from ._lib_discovery import discover_libraries
+
+    try:
+        primary = str(discover_libraries()["cublasmp"])
+    except RuntimeError:
+        primary = None
     _load_global(
-        "TIRX_CUBLASMP_LIBRARY",
-        ("libcublasmp.so.0", "libcublasmp.so", "libcublasMp.so.0", "libcublasMp.so"),
+        primary, ("libcublasmp.so.0", "libcublasmp.so", "libcublasMp.so.0", "libcublasMp.so")
     )
     from nvmath import CudaDataType
     from nvmath.bindings import cublas, cublasMp

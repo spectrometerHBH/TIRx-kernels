@@ -4,7 +4,6 @@ import sys
 import threading
 import time
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -561,115 +560,125 @@ def test_run_scheduled_jobs_cancels_inflight_work(
     assert [(record["config"], record["status"]) for record in records] == [("fails", "FAIL")]
 
 
-# ── Communication-library locks ──────────────────────────────────────────────
+# ── Communication-library discovery ──────────────────────────────────────────
 
 _GEMM_COMM_WORKLOAD = [{"kernel": "allgather_gemm", "config": "cfg", "num_gpus": 1}]
 _PLAIN_WORKLOAD = [{"kernel": "fp16_bf16_gemm", "config": "cfg", "num_gpus": 1}]
 
 
-def _lock_args(**overrides):
-    values = {
-        "nvshmem_home": None,
-        "nccl_library": None,
-        "cublas_library": None,
-        "cublasmp_library": None,
-        "nvshmem_library": None,
-    }
-    values.update(overrides)
-    return SimpleNamespace(**values)
-
-
 @pytest.fixture
-def clean_lock_env(monkeypatch: pytest.MonkeyPatch):
-    """Unset every lock env var and restore both env and module state afterwards."""
-    names = [env_name for env_name, _ in run._LIBRARY_LOCKS.values()]
-    originals = {name: os.environ.get(name) for name in names}
-    for name in names:
-        monkeypatch.delenv(name, raising=False)
-    yield
-    for name, value in originals.items():
-        if value is None:
-            os.environ.pop(name, None)
-        else:
-            os.environ[name] = value
+def fake_site(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Redirect library discovery at a fake site-packages root."""
+    from tirx_kernels.gemm_comm import _lib_discovery
+
+    root = tmp_path / "site-packages"
+    root.mkdir()
+    monkeypatch.setattr(_lib_discovery, "_site_roots", lambda: [root])
+    return root
 
 
-def _valid_lock_paths(tmp_path: Path) -> dict[str, str]:
-    home = tmp_path / "nvshmem"
-    home.mkdir()
-    paths = {"nvshmem_home": str(home)}
-    for option, soname in [
-        ("nccl_library", "libnccl.so.2"),
-        ("cublas_library", "libcublas.so"),
-        ("cublasmp_library", "libcublasmp.so.0"),
-        ("nvshmem_library", "libnvshmem_host.so.3"),
-    ]:
-        lib = tmp_path / soname
-        lib.touch()
-        paths[option] = str(lib)
-    return paths
+def _make_lib(root: Path, rel_dir: str, soname: str, real_soname: str | None = None) -> Path:
+    lib_dir = root / rel_dir
+    lib_dir.mkdir(parents=True, exist_ok=True)
+    target = lib_dir / (real_soname or soname)
+    target.touch()
+    if real_soname is not None:
+        (lib_dir / soname).symlink_to(target)
+    return target
 
 
-def test_uses_gemm_comm_detects_distributed_kernels() -> None:
-    assert run._uses_gemm_comm(_GEMM_COMM_WORKLOAD)
-    assert run._uses_gemm_comm(_GEMM_COMM_WORKLOAD + _PLAIN_WORKLOAD)
-    assert not run._uses_gemm_comm(_PLAIN_WORKLOAD)
+def _populate_all_libs(root: Path) -> None:
+    _make_lib(root, "nvidia/nccl/lib", "libnccl.so.2")
+    _make_lib(root, "nvidia/cu13/lib", "libcublas.so.13")
+    _make_lib(root, "nvidia/cublasmp/cu13/lib", "libcublasmp.so.0")
+    _make_lib(root, "nvidia/nvshmem/lib", "libnvshmem_host.so.3")
 
 
-def test_resolve_library_locks_optional_without_gemm_comm(clean_lock_env) -> None:
-    assert run._resolve_library_locks(_lock_args(), _PLAIN_WORKLOAD) == {}
+def test_discover_libraries_resolves_unique_installs(fake_site: Path) -> None:
+    from tirx_kernels.gemm_comm import _lib_discovery
+
+    _populate_all_libs(fake_site)
+
+    libraries = _lib_discovery.discover_libraries()
+
+    assert set(libraries) == {"nccl", "cublas", "cublasmp", "nvshmem"}
+    assert libraries["nccl"].name == "libnccl.so.2"
+    assert libraries["nvshmem"].name == "libnvshmem_host.so.3"
 
 
-def test_resolve_library_locks_required_for_gemm_comm(clean_lock_env, capsys) -> None:
+def test_discover_libraries_reports_missing_package(fake_site: Path) -> None:
+    from tirx_kernels.gemm_comm import _lib_discovery
+
+    with pytest.raises(RuntimeError, match="pip install nvidia-nccl-cu13"):
+        _lib_discovery.discover_libraries()
+
+
+def test_discover_libraries_rejects_ambiguous_installs(
+    fake_site: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tirx_kernels.gemm_comm import _lib_discovery
+
+    other = fake_site.parent / "other-site"
+    other.mkdir()
+    monkeypatch.setattr(_lib_discovery, "_site_roots", lambda: [fake_site, other])
+    _make_lib(fake_site, "nvidia/nccl/lib", "libnccl.so.2")
+    _make_lib(other, "nvidia/nccl/lib", "libnccl.so.2")
+
+    with pytest.raises(RuntimeError, match="multiple distinct"):
+        _lib_discovery._discover_one("nccl")
+
+
+def test_ensure_nvshmem_home_shims_pip_layout(fake_site: Path) -> None:
+    from tirx_kernels.gemm_comm import _lib_discovery
+
+    host = _make_lib(fake_site, "nvidia/nvshmem/lib", "libnvshmem_host.so.3")
+    include = fake_site / "nvidia/nvshmem/include"
+    include.mkdir(parents=True)
+    (include / "nvshmem.h").touch()
+
+    home = _lib_discovery.ensure_nvshmem_home()
+
+    # TVM finder contract: include/nvshmem.h + lib/libnvshmem.so
+    assert (home / "include/nvshmem.h").is_file()
+    assert (home / "lib/libnvshmem.so").resolve() == host.resolve()
+    assert (home / "lib/libnvshmem_host.so.3").resolve() == host.resolve()
+
+
+def test_ensure_nvshmem_home_prefers_native_layout(fake_site: Path) -> None:
+    from tirx_kernels.gemm_comm import _lib_discovery
+
+    _make_lib(fake_site, "nvidia/nvshmem/lib", "libnvshmem_host.so.3")
+    _make_lib(fake_site, "nvidia/nvshmem/lib", "libnvshmem.so")
+    include = fake_site / "nvidia/nvshmem/include"
+    include.mkdir(parents=True)
+    (include / "nvshmem.h").touch()
+
+    assert _lib_discovery.ensure_nvshmem_home() == fake_site / "nvidia/nvshmem"
+
+
+def test_check_gemm_comm_libraries_noop_without_gemm_comm() -> None:
+    run._check_gemm_comm_libraries(_PLAIN_WORKLOAD)
+
+
+def test_check_gemm_comm_libraries_passes_with_discovery(
+    fake_site: Path, capsys: pytest.CaptureFixture
+) -> None:
+    _populate_all_libs(fake_site)
+    include = fake_site / "nvidia/nvshmem/include"
+    include.mkdir(parents=True)
+    (include / "nvshmem.h").touch()
+
+    run._check_gemm_comm_libraries(_GEMM_COMM_WORKLOAD)
+
+    out = capsys.readouterr().out
+    assert "gemm_comm libraries" in out
+
+
+def test_check_gemm_comm_libraries_exits_when_discovery_fails(
+    fake_site: Path, capsys: pytest.CaptureFixture
+) -> None:
     with pytest.raises(SystemExit) as excinfo:
-        run._resolve_library_locks(_lock_args(), _GEMM_COMM_WORKLOAD)
+        run._check_gemm_comm_libraries(_GEMM_COMM_WORKLOAD)
 
     assert excinfo.value.code == 2
-    err = capsys.readouterr().err
-    for flag in (
-        "--nvshmem-home",
-        "--nccl-library",
-        "--cublas-library",
-        "--cublasmp-library",
-        "--nvshmem-library",
-    ):
-        assert flag in err
-
-
-def test_resolve_library_locks_accepts_valid_paths(clean_lock_env, tmp_path: Path) -> None:
-    resolved = run._resolve_library_locks(
-        _lock_args(**_valid_lock_paths(tmp_path)), _GEMM_COMM_WORKLOAD
-    )
-
-    assert set(resolved) == {env_name for env_name, _ in run._LIBRARY_LOCKS.values()}
-    for env_name, raw in resolved.items():
-        assert os.environ[env_name] == raw
-        assert Path(raw).is_absolute()
-
-
-def test_resolve_library_locks_env_fallback(clean_lock_env, tmp_path: Path, monkeypatch) -> None:
-    paths = _valid_lock_paths(tmp_path)
-    for option, (env_name, _kind) in run._LIBRARY_LOCKS.items():
-        monkeypatch.setenv(env_name, paths[option])
-
-    resolved = run._resolve_library_locks(_lock_args(), _GEMM_COMM_WORKLOAD)
-
-    assert len(resolved) == len(run._LIBRARY_LOCKS)
-
-
-def test_resolve_library_locks_rejects_missing_file(clean_lock_env, tmp_path: Path) -> None:
-    args = _lock_args(nccl_library=str(tmp_path / "no-such-lib.so"))
-
-    with pytest.raises(SystemExit) as excinfo:
-        run._resolve_library_locks(args, _PLAIN_WORKLOAD)
-
-    assert excinfo.value.code == 2
-
-
-def test_resolve_library_locks_rejects_relative_path(clean_lock_env) -> None:
-    args = _lock_args(nccl_library="libnccl.so.2")
-
-    with pytest.raises(SystemExit) as excinfo:
-        run._resolve_library_locks(args, _PLAIN_WORKLOAD)
-
-    assert excinfo.value.code == 2
+    assert "gemm_comm library check failed" in capsys.readouterr().err
