@@ -18,7 +18,7 @@ def test_mbarrier_wait_runtime_failures_are_closed():
 
     b = builder("mbar_duplicate")
     duplicate = b.mbar(kind=nr.MBarKind.TMA)
-    # elected so the error pins DOUBLE init, not the multi-thread-cohort init.
+    # elected so the error pins DOUBLE init, not the multi-lane init.
     with b.if_warp(0), b.if_elected():
         b.mbarrier_init(duplicate, count=1)
         b.mbarrier_init(duplicate, count=1)

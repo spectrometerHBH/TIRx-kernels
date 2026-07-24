@@ -61,7 +61,7 @@ regions alias only when their `PoolId` values match and their boxes overlap.
 `boxes` merges them: one `(lane, box)` entry per contiguous run of each lane's
 slice. It is carried for lane-divergent SMEM/TMEM accesses (offsets that vary
 with `lane_id` / `tid_in_wg` / a per-thread scalar) and for single-lane
-cohorts. `None` means the access is uniform: every executing lane touches the
+masks. `None` means the access is uniform: every executing lane touches the
 whole region. `memory_race_check` reads it to tell a lane's dependency on
 itself from a dependency across lanes.
 
@@ -104,7 +104,7 @@ lanes.
 Every event carries `stmt_id` and `stmt_kind`.
 
 Every `scope` carries `stream_id`, `cluster_id`, global `cta_id`,
-`ctaid_in_cluster`, `cohort_size`, and participating `warp_ids`. Mbar targets
+`ctaid_in_cluster`, `lane_count`, and the executing `warp_id`. Mbar targets
 carry `mbar_id`, `cluster_id`, `ctaid_in_cluster`, and `stage`; the checker uses
 the full identity for HB/deadlock resource keys.
 
@@ -179,8 +179,8 @@ Typical memory event shape:
         "cluster_id": 0,
         "cta_id": 0,
         "ctaid_in_cluster": 0,
-        "cohort_size": 32,
-        "warp_ids": [0],
+        "lane_count": 32,
+        "warp_id": 0,
     },
 }
 ```

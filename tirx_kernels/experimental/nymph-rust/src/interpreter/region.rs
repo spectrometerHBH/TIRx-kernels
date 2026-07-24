@@ -207,14 +207,14 @@ pub fn tensor_rect_region_clamped(
     Ok(Some(non_empty_region(owner, boxes, tensor.id)?))
 }
 
-/// Per-lane attribution of a cohort access footprint (SMEM byte runs or TMEM
+/// Per-lane attribution of an access footprint (SMEM byte runs or TMEM
 /// `(lane, lane_byte)` boxes), PRE-coalescing across threads: one
 /// `(lane_id, box)` entry per contiguous run of each thread's slice.
 ///
 /// Returns `None` (no attribution, meaning "every executing lane touches the
-/// whole region") for uniform-address multi-lane cohorts, non-shared spaces,
+/// whole region") for uniform-address multi-lane masks, non-shared spaces,
 /// and any row shape the exact projection cannot attribute. Single-thread
-/// cohorts are attributed to their single lane. Callers attach the result to
+/// masks are attributed to their single lane. Callers attach the result to
 /// a region built by the union builders, AFTER those validated bounds.
 pub fn lane_attributed_boxes(
     tensor: &Arc<Tensor>,
@@ -226,7 +226,7 @@ pub fn lane_attributed_boxes(
         return None;
     }
     if offsets.len() > 1 && offsets.iter().all(|row| row == &offsets[0]) {
-        return None; // uniform multi-lane cohort
+        return None; // uniform multi-lane lanes
     }
     let rank = tensor.shape.len();
     if rank == 0 || shape.len() != rank || offsets.iter().any(|row| row.len() != rank) {
@@ -1316,7 +1316,7 @@ mod tests {
     }
 
     #[test]
-    fn lane_attribution_declines_uniform_multi_lane_cohorts() {
+    fn lane_attribution_declines_uniform_multi_lane_masks() {
         let tensor = Arc::new(Tensor {
             id: 1,
             space: MemorySpace::Smem,

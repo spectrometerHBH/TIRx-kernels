@@ -31,7 +31,7 @@ concurrency, ordered only by explicit synchronization.
 
 The value simulator interprets one concrete execution of a bounded IR program.
 Given inputs, the canonical execution engine steps source-ordered execution
-streams, executes each statement over the active cohort, and produces terminal
+streams, executes each statement over the active lanes, and produces terminal
 runtime values and GMEM outputs.
 
 This deterministic execution is useful for regression tests and value

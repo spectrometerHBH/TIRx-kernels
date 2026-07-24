@@ -2,7 +2,6 @@
 //! small REG value language needed by FA-style kernels. Trace-only execution
 //! still records only operand reads and destination writes.
 
-use super::super::cohort::CohortContext;
 use super::super::diagnostics::{IResult, InterpreterError};
 use super::super::outcomes::StepStatus;
 use super::super::registry::{StmtExecutorRegistry, StmtKind};
@@ -11,6 +10,7 @@ use super::super::transfer::{read_operand_array, read_transfer_array, write_oper
 use super::super::values::arrays::ValueArray2;
 use super::super::values::dtypes::round_scalar;
 use super::super::values::registers::{RegisterKey, RegisterTensorValue};
+use super::super::warp_context::WarpContext;
 use crate::ir::{
     DType, MemorySpace, RegBinaryOp, RegCondScope, RegLiteral, RegOperand, RegReduceOp, RegUnaryOp,
     Rounding, Stmt, Tensor, TensorSlice,
@@ -42,10 +42,10 @@ pub fn register(reg: &mut StmtExecutorRegistry) {
 }
 
 fn reg_op_exec(
-    ctx: &mut CohortContext,
+    ctx: &mut WarpContext,
     dst: &TensorSlice,
     operands: &[&RegOperand],
-    f: impl FnOnce(&mut CohortContext, &TensorSlice) -> IResult<()>,
+    f: impl FnOnce(&mut WarpContext, &TensorSlice) -> IResult<()>,
 ) -> IResult<StepStatus> {
     if !ctx.value_mode() {
         let resolved_dst = ctx.eval_slice(dst)?;
@@ -62,7 +62,7 @@ fn reg_op_exec(
     Ok(StepStatus::advance())
 }
 
-fn emit_operand_read(ctx: &mut CohortContext, operand: &RegOperand) -> IResult<()> {
+fn emit_operand_read(ctx: &mut WarpContext, operand: &RegOperand) -> IResult<()> {
     if let RegOperand::Slice(slice) = operand {
         let resolved = ctx.eval_slice(slice)?;
         ctx.emit_tensor_read(&resolved)?;
@@ -70,11 +70,11 @@ fn emit_operand_read(ctx: &mut CohortContext, operand: &RegOperand) -> IResult<(
     Ok(())
 }
 
-fn dst_shape(ctx: &CohortContext, dst: &TensorSlice) -> IResult<(usize, usize)> {
+fn dst_shape(ctx: &WarpContext, dst: &TensorSlice) -> IResult<(usize, usize)> {
     let timer = super::super::runner::prof_now();
     let resolved = ctx.eval_slice(dst)?;
     let out = Ok((
-        ctx.cohort.len(),
+        ctx.lanes.len(),
         super::super::values::indexing::numel(&resolved.shape),
     ));
     super::super::runner::prof_end("REG:dst_shape", timer);
@@ -82,7 +82,7 @@ fn dst_shape(ctx: &CohortContext, dst: &TensorSlice) -> IResult<(usize, usize)> 
 }
 
 fn read_reg_operand(
-    ctx: &CohortContext,
+    ctx: &WarpContext,
     operand: &RegOperand,
     shape: (usize, usize),
     dst_dtype: DType,
@@ -138,11 +138,7 @@ fn literal_array(value: RegLiteral, dtype: DType, shape: (usize, usize)) -> Valu
     }
 }
 
-fn write_reg_result(
-    ctx: &mut CohortContext,
-    dst: &TensorSlice,
-    values: &ValueArray2,
-) -> IResult<()> {
+fn write_reg_result(ctx: &mut WarpContext, dst: &TensorSlice, values: &ValueArray2) -> IResult<()> {
     let timer = super::super::runner::prof_now();
     let resolved_dst = ctx.eval_slice(dst)?;
     let out = write_operand(ctx, &resolved_dst, values);
@@ -181,7 +177,7 @@ impl DirectFloatInput {
     }
 }
 
-fn resolve_reg_range(ctx: &CohortContext, slice: &TensorSlice) -> IResult<Option<RegRange>> {
+fn resolve_reg_range(ctx: &WarpContext, slice: &TensorSlice) -> IResult<Option<RegRange>> {
     if slice.tensor.space != MemorySpace::Reg {
         return Ok(None);
     }
@@ -197,12 +193,12 @@ fn resolve_reg_range(ctx: &CohortContext, slice: &TensorSlice) -> IResult<Option
     }))
 }
 
-fn direct_rows(ctx: &CohortContext) -> Vec<usize> {
+fn direct_rows(ctx: &WarpContext) -> Vec<usize> {
     ctx.rows()
 }
 
 fn direct_float_input(
-    ctx: &CohortContext,
+    ctx: &WarpContext,
     operand: &RegOperand,
     compute_dtype: DType,
     dst_len: usize,
@@ -246,7 +242,7 @@ fn direct_float_input(
 }
 
 fn write_direct_float_result_with(
-    ctx: &mut CohortContext,
+    ctx: &mut WarpContext,
     dst: &RegRange,
     rows: &[usize],
     mut value_at: impl FnMut(usize, usize) -> f32,
@@ -268,11 +264,7 @@ fn write_direct_float_result_with(
     inst.write_float_row_range_with(rows, dst.start, dst.len, |ai, j| value_at(ai, j))
 }
 
-fn try_direct_fill(
-    ctx: &mut CohortContext,
-    dst: &TensorSlice,
-    value: &RegOperand,
-) -> IResult<bool> {
+fn try_direct_fill(ctx: &mut WarpContext, dst: &TensorSlice, value: &RegOperand) -> IResult<bool> {
     let Some(dst_range) = resolve_reg_range(ctx, dst)? else {
         return Ok(false);
     };
@@ -291,7 +283,7 @@ fn try_direct_fill(
 }
 
 fn try_direct_binary(
-    ctx: &mut CohortContext,
+    ctx: &mut WarpContext,
     dst: &TensorSlice,
     lhs: &RegOperand,
     rhs: &RegOperand,
@@ -335,7 +327,7 @@ fn try_direct_binary(
 }
 
 fn try_direct_fma(
-    ctx: &mut CohortContext,
+    ctx: &mut WarpContext,
     dst: &TensorSlice,
     a: &RegOperand,
     b: &RegOperand,
@@ -366,7 +358,7 @@ fn try_direct_fma(
 }
 
 fn try_direct_reduce(
-    ctx: &mut CohortContext,
+    ctx: &mut WarpContext,
     dst: &TensorSlice,
     src: &RegOperand,
     op: RegReduceOp,
@@ -426,7 +418,7 @@ fn try_direct_reduce(
 
 #[allow(clippy::too_many_arguments)]
 fn try_direct_causal_mask(
-    ctx: &mut CohortContext,
+    ctx: &mut WarpContext,
     dst: &TensorSlice,
     src: &RegOperand,
     query_start: &crate::ir::ScalarValue,
@@ -463,7 +455,7 @@ fn try_direct_causal_mask(
     )?;
     let k0 =
         ctx.eval_scalar_uniform(key_start, "reg_causal_mask key_start", "divergent_operands")?;
-    let tid_in_wg: Vec<usize> = ctx.cohort.iter().map(|thread| thread.tid_in_wg()).collect();
+    let tid_in_wg: Vec<usize> = ctx.lanes.iter().map(|thread| thread.tid_in_wg()).collect();
     let timer = super::super::runner::prof_now();
     write_direct_float_result_with(ctx, &dst_range, &rows, |ai, j| {
         // swap_qk: bwd transposed fragment [kv-row, q-col] — k(kv)=row, q=col/gs.
@@ -489,7 +481,7 @@ fn try_direct_causal_mask(
 }
 
 fn try_direct_cond_rescale(
-    ctx: &mut CohortContext,
+    ctx: &mut WarpContext,
     dst: &TensorSlice,
     src: &RegOperand,
     scale: &RegOperand,
@@ -548,7 +540,7 @@ fn try_direct_cond_rescale(
     Ok(true)
 }
 
-fn try_direct_cvt(ctx: &mut CohortContext, dst: &TensorSlice, src: &TensorSlice) -> IResult<bool> {
+fn try_direct_cvt(ctx: &mut WarpContext, dst: &TensorSlice, src: &TensorSlice) -> IResult<bool> {
     let Some(dst_range) = resolve_reg_range(ctx, dst)? else {
         return Ok(false);
     };
@@ -612,7 +604,7 @@ fn binary_int(lhs: Array2<i64>, rhs: Array2<i64>, op: RegBinaryOp) -> IResult<Ar
 }
 
 fn execute_binary(
-    ctx: &mut CohortContext,
+    ctx: &mut WarpContext,
     dst: &TensorSlice,
     lhs: &RegOperand,
     rhs: &RegOperand,
@@ -642,10 +634,7 @@ fn execute_binary(
     write_reg_result(ctx, dst, &out)
 }
 
-fn execute_reg_fill<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
-    stmt: &'k Stmt,
-) -> IResult<StepStatus> {
+fn execute_reg_fill<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
     let (dst, value) = match stmt {
         Stmt::RegFill { dst, value } => (dst, value),
         _ => unreachable!(),
@@ -660,10 +649,7 @@ fn execute_reg_fill<'a, 'k>(
     })
 }
 
-fn execute_reg_unary<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
-    stmt: &'k Stmt,
-) -> IResult<StepStatus> {
+fn execute_reg_unary<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
     let (dst, src, op) = match stmt {
         Stmt::RegUnary { dst, src, op } => (dst, src, *op),
         _ => unreachable!(),
@@ -688,7 +674,7 @@ fn execute_reg_unary<'a, 'k>(
     })
 }
 
-fn execute_reg_add<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
+fn execute_reg_add<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
     match stmt {
         Stmt::RegAdd {
             dst,
@@ -701,7 +687,7 @@ fn execute_reg_add<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> I
         _ => unreachable!(),
     }
 }
-fn execute_reg_sub<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
+fn execute_reg_sub<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
     match stmt {
         Stmt::RegSub {
             dst,
@@ -714,7 +700,7 @@ fn execute_reg_sub<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> I
         _ => unreachable!(),
     }
 }
-fn execute_reg_mul<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
+fn execute_reg_mul<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
     match stmt {
         Stmt::RegMul { dst, lhs, rhs } => reg_op_exec(ctx, dst, &[lhs, rhs], |ctx, dst| {
             execute_binary(ctx, dst, lhs, rhs, RegBinaryOp::Mul, Rounding::Rn)
@@ -722,7 +708,7 @@ fn execute_reg_mul<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> I
         _ => unreachable!(),
     }
 }
-fn execute_reg_max<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
+fn execute_reg_max<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
     match stmt {
         Stmt::RegMax { dst, lhs, rhs } => reg_op_exec(ctx, dst, &[lhs, rhs], |ctx, dst| {
             execute_binary(ctx, dst, lhs, rhs, RegBinaryOp::Max, Rounding::Rn)
@@ -730,7 +716,7 @@ fn execute_reg_max<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> I
         _ => unreachable!(),
     }
 }
-fn execute_reg_min<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
+fn execute_reg_min<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
     match stmt {
         Stmt::RegMin { dst, lhs, rhs } => reg_op_exec(ctx, dst, &[lhs, rhs], |ctx, dst| {
             execute_binary(ctx, dst, lhs, rhs, RegBinaryOp::Min, Rounding::Rn)
@@ -738,7 +724,7 @@ fn execute_reg_min<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> I
         _ => unreachable!(),
     }
 }
-fn execute_reg_fma<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
+fn execute_reg_fma<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
     match stmt {
         Stmt::RegFma { dst, a, b, c } => reg_op_exec(ctx, dst, &[a, b, c], |ctx, dst| {
             if try_direct_fma(ctx, dst, a, b, c)? {
@@ -769,7 +755,7 @@ fn execute_reg_fma<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> I
 }
 
 fn execute_reg_bitwise<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
+    ctx: &mut WarpContext<'a, 'k>,
     stmt: &'k Stmt,
 ) -> IResult<StepStatus> {
     match stmt {
@@ -781,7 +767,7 @@ fn execute_reg_bitwise<'a, 'k>(
 }
 
 fn execute_reg_reduce<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
+    ctx: &mut WarpContext<'a, 'k>,
     stmt: &'k Stmt,
 ) -> IResult<StepStatus> {
     let (dst, src, op) = match stmt {
@@ -833,7 +819,7 @@ fn execute_reg_reduce<'a, 'k>(
 }
 
 fn execute_reg_cond_rescale<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
+    ctx: &mut WarpContext<'a, 'k>,
     stmt: &'k Stmt,
 ) -> IResult<StepStatus> {
     let (dst, src, scale, threshold, scope) = match stmt {
@@ -892,7 +878,7 @@ fn execute_reg_cond_rescale<'a, 'k>(
 }
 
 fn execute_reg_softmax_rescale<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
+    ctx: &mut WarpContext<'a, 'k>,
     stmt: &'k Stmt,
 ) -> IResult<StepStatus> {
     let (row_max, row_scale, row_max_old, row_max_new, scale_log2, threshold) = match stmt {
@@ -966,7 +952,7 @@ fn execute_reg_softmax_rescale<'a, 'k>(
 }
 
 fn execute_reg_causal_mask<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
+    ctx: &mut WarpContext<'a, 'k>,
     stmt: &'k Stmt,
 ) -> IResult<StepStatus> {
     let (dst, src, query_start, key_start, group_size, mask_value, swap_qk) = match stmt {
@@ -1026,7 +1012,7 @@ fn execute_reg_causal_mask<'a, 'k>(
         let src_v = read_reg_operand(ctx, src, shape, dtype)?.to_f32_compute();
         let mask_v = read_reg_operand(ctx, mask_value, shape, dtype)?.to_f32_compute();
         let timer = super::super::runner::prof_now();
-        let rows: Vec<usize> = ctx.cohort.iter().map(|thread| thread.tid_in_wg()).collect();
+        let rows: Vec<usize> = ctx.lanes.iter().map(|thread| thread.tid_in_wg()).collect();
         let out = Array2::from_shape_fn(shape, |(ai, j)| {
             // swap_qk: bwd transposed fragment [kv-row, q-col] — k(kv)=row, q=col/gs.
             let (q, k) = if swap_qk {
@@ -1046,7 +1032,7 @@ fn execute_reg_causal_mask<'a, 'k>(
 }
 
 fn execute_reg_combine_int_frac_ex2<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
+    ctx: &mut WarpContext<'a, 'k>,
     stmt: &'k Stmt,
 ) -> IResult<StepStatus> {
     let (dst, rounded, frac_ex2) = match stmt {
@@ -1077,7 +1063,7 @@ fn execute_reg_combine_int_frac_ex2<'a, 'k>(
     })
 }
 
-fn execute_reg_cvt<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
+fn execute_reg_cvt<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
     match stmt {
         Stmt::RegCvt { dst, src, .. } => {
             let src_op = RegOperand::Slice(src.clone());
@@ -1095,7 +1081,7 @@ fn execute_reg_cvt<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> I
 }
 
 fn execute_reg_transfer<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
+    ctx: &mut WarpContext<'a, 'k>,
     stmt: &'k Stmt,
 ) -> IResult<StepStatus> {
     let (dst, src) = match stmt {

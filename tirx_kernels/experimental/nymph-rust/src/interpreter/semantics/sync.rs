@@ -11,7 +11,6 @@
 //! completing one carries count == thread_count) and one `Sync` per passing
 //! stream — no re-poll echoes.
 
-use super::super::cohort::CohortContext;
 use super::super::diagnostics::{IResult, InterpreterError};
 use super::super::outcomes::{StepStatus, WakeCondition};
 use super::super::protocol::TraceEventKind;
@@ -19,6 +18,7 @@ use super::super::registry::{StmtExecutorRegistry, StmtKind};
 use super::super::scheduler::{flatten_coord, unflatten_coord, CtaActivityStatus};
 use super::super::threads::ThreadId;
 use super::super::values::cooperative::{SyncKey, SyncRecord};
+use super::super::warp_context::WarpContext;
 use crate::ir::Stmt;
 
 pub fn register(reg: &mut StmtExecutorRegistry) {
@@ -82,7 +82,7 @@ fn in_scope(stmt: &Stmt, first: &ThreadId, t: &ThreadId) -> bool {
 }
 
 /// Global CTA ids of the cluster containing `template` (source order).
-fn cluster_cta_ids(ctx: &CohortContext, template: &ThreadId) -> Vec<usize> {
+fn cluster_cta_ids(ctx: &WarpContext, template: &ThreadId) -> Vec<usize> {
     let cluster = &ctx.kernel.cluster_shape;
     let launch = &ctx.kernel.launch_shape;
     let mut ids = Vec::with_capacity(ctx.cluster_cta_count());
@@ -100,7 +100,7 @@ fn cluster_cta_ids(ctx: &CohortContext, template: &ThreadId) -> Vec<usize> {
 }
 
 /// (expected thread count, CTA ids in scope) for a fresh record.
-fn sync_scope(ctx: &CohortContext, stmt: &Stmt, first: &ThreadId) -> (usize, Vec<usize>) {
+fn sync_scope(ctx: &WarpContext, stmt: &Stmt, first: &ThreadId) -> (usize, Vec<usize>) {
     let warp_threads = 32usize;
     let cta_threads = ctx.kernel.num_warps as usize * warp_threads;
     match stmt {
@@ -115,10 +115,10 @@ fn sync_scope(ctx: &CohortContext, stmt: &Stmt, first: &ThreadId) -> (usize, Vec
             (*num_warps as usize * warp_threads, vec![first.cta_id])
         }
         Stmt::WarpSync => {
-            // The barrier spans exactly the arriving cohort's warps (one warp
-            // under per-warp streams); a sub-warp cohort can never fill it —
+            // The barrier spans exactly the arriving lanes' warps (one warp
+            // under per-warp streams); a sub-warp mask can never fill it —
             // the hardware hang, surfaced as a deadlock.
-            let mut warps: Vec<usize> = ctx.cohort.iter().map(|t| t.warp_id).collect();
+            let mut warps: Vec<usize> = ctx.lanes.iter().map(|t| t.warp_id).collect();
             warps.sort_unstable();
             warps.dedup();
             (warps.len() * warp_threads, vec![first.cta_id])
@@ -127,7 +127,7 @@ fn sync_scope(ctx: &CohortContext, stmt: &Stmt, first: &ThreadId) -> (usize, Vec
     }
 }
 
-fn check_cluster_peer_liveness(ctx: &CohortContext, rec: &SyncRecord) -> IResult<()> {
+fn check_cluster_peer_liveness(ctx: &WarpContext, rec: &SyncRecord) -> IResult<()> {
     for &cta_id in &rec.expected_ctas {
         if rec.arrived_per_cta.contains_key(&cta_id) {
             continue;
@@ -151,14 +151,14 @@ fn check_cluster_peer_liveness(ctx: &CohortContext, rec: &SyncRecord) -> IResult
     Ok(())
 }
 
-fn execute_sync<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
+fn execute_sync<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
     let named = matches!(stmt, Stmt::NamedBarrier { .. });
     let stmt_id = if named {
         NAMED_BARRIER_STMT_SENTINEL
     } else {
         ctx.stmt_id(stmt)
     };
-    let first = ctx.cohort[0].clone();
+    let first = ctx.lanes[0].clone();
     let key = SyncKey {
         stmt_id,
         domain: sync_domain(stmt, &first),
@@ -214,15 +214,15 @@ fn execute_sync<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IRes
     }
 
     // First arrival of this stream for the current cycle.
-    for t in ctx.cohort.iter() {
+    for t in ctx.lanes.iter() {
         if !in_scope(stmt, &first, t) {
             return Err(InterpreterError::new(
                 "invalid_sync_scope",
-                "sync cohort is outside the sync scope",
+                "arriving lanes are outside the sync scope",
             ));
         }
     }
-    let n = ctx.cohort.len();
+    let n = ctx.lanes.len();
     let (expected_count, expected_ctas) = sync_scope(ctx, stmt, &first);
     {
         let rec = ctx
@@ -277,7 +277,7 @@ fn execute_sync<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IRes
         rec.arrived_count += n;
         *rec.arrived_per_cta.entry(first.cta_id).or_insert(0) += n;
     }
-    let rec_snapshot = |ctx: &CohortContext| {
+    let rec_snapshot = |ctx: &WarpContext| {
         let rec = &ctx.state.values.cooperative.syncs[&key];
         (rec.cycle, rec.arrived_count, rec.complete())
     };

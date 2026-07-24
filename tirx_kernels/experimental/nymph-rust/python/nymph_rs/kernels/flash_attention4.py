@@ -668,7 +668,7 @@ def _emit_tma_load_role(
 ) -> None:
     # Single-thread TMA producer stream (lane 0 of warp 13): mbarrier waits
     # are fine from one thread, arrive_expect_tx is per-thread (one arm per
-    # load), and tma_load requires a single-thread cohort.
+    # load), and tma_load requires a single-thread mask.
     with k.if_warp(13), k.if_elected():
         with _persistent_task_loop(k, task_smem, task_full, task_empty) as (
             _task_id,
@@ -777,7 +777,7 @@ def _emit_mma_role(
     seq_q_per_tile: int,
 ) -> None:
     # Single-thread MMA issuer stream (lane 0 of warp 12): tcgen05_mma and
-    # tcgen05_commit require a single-thread cohort, and the k/v/q release
+    # tcgen05_commit require a single-thread mask, and the k/v/q release
     # arrives are per-thread (each buffer's empty barrier counts exactly one
     # arrival per k-tile).
     with k.if_warp(12), k.if_elected():

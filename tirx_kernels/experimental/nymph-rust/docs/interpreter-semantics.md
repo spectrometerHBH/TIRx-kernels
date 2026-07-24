@@ -6,18 +6,18 @@ ordering, latency, cache, descriptor, or compiler-lowering semantics.
 
 Structural control statements are interpreter core: `If`, `ForLoop`,
 `ForEachTask`, `SchedulerImpl`, `Loop`, and `BreakIf`. All thread dispatch is
-`If` over per-thread scalar predicates. Leaf-style operation statements execute through built-in cohort
+`If` over per-thread scalar predicates. Leaf-style operation statements execute through built-in
 executors. Unsupported statements fail closed with `unsupported_stmt`.
 
 Each execution stream is one warp, and a statement executes over the stream's
-active cohort — the lanes that survive the enclosing `If` masks. Statement
+active lane mask — the lanes that survive the enclosing `If` masks. Statement
 semantics follow the PTX execution-thread model:
 
 - per-thread instructions (`mbarrier` arrive/expect_tx/arrive_expect_tx):
   every executing thread applies its operand once; the trace carries one event
   per statement with summed counts;
 - single-thread instructions (`tma_load`, `tma_store`, `tcgen05_mma`,
-  `tcgen05_cp`, `tcgen05_commit`): the executing cohort must be exactly one
+  `tcgen05_cp`, `tcgen05_commit`): the executing mask must be exactly one
   thread; `mbarrier_init` is per-thread and therefore also demands a
   single-thread branch, because every executing thread would re-initialize
   the cell;
@@ -42,15 +42,15 @@ documented in [Protocol Trace](protocol-trace.md).
 | Statement family | Status | Runtime behavior | Main fail-closed conditions |
 | --- | --- | --- | --- |
 | `TensorDef`, `MBarDef` | Core metadata | Discovery metadata only; no dynamic execution stream effect. Mbar definitions seed runtime mbar identity availability. | Invalid metadata is rejected by IR validation. |
-| `ScalarDef`, `ScalarStore`, `StoreScalar` | Reviewed scalar | Per-thread scalar values in the active cohort. `ScalarDef(initial=TensorSlice)` can load one GMEM/SMEM scalar in value mode, and in trace mode when the scalar cell is concrete and valid. `StoreScalar` writes a scalar expression to an SMEM scalar slice in both modes. | Missing input in value mode, invalid skipped-payload scalar bridge in trace mode, unsupported scalar dtype, unresolved expression, undefined variable. |
+| `ScalarDef`, `ScalarStore`, `StoreScalar` | Reviewed scalar | Per-thread scalar values across the active lanes. `ScalarDef(initial=TensorSlice)` can load one GMEM/SMEM scalar in value mode, and in trace mode when the scalar cell is concrete and valid. `StoreScalar` writes a scalar expression to an SMEM scalar slice in both modes. | Missing input in value mode, invalid skipped-payload scalar bridge in trace mode, unsupported scalar dtype, unresolved expression, undefined variable. |
 | `SetMaxNReg` | Reviewed metadata | `setmaxnreg` directive for the enclosing warpgroup(s); simulation metadata only, register pressure is not modeled. | Validation requires a statically-resolvable branch covering whole warpgroup(s) and `nreg` a positive multiple of 8. |
 | `ForLoop` | Core structural | Requires uniform bounds and positive step; writes the loop variable before body execution; repeated body statements are distinct dynamic occurrences. | `divergent_loop_bounds`, `invalid_loop_step`, undefined loop variable use. |
 | `ForEachTask` | Reviewed scheduler | Functional scheduler consumer loop. `grid_stride` maps each cluster to the canonical task subsequence and writes a task variable before each body execution. | Invalid scheduler metadata, unsupported policy, undefined task variable use. |
 | `SchedulerImpl`, `SchedNext`, `Loop`, `BreakIf` | Reviewed scheduler | Concurrent scheduler body executes as ordinary stream code. `SchedNext` returns the canonical flat task index and `-1` terminal sentinel; `Loop`/`BreakIf` model runtime scheduler/consumer loops. | Invalid scheduler policy, missing dynamic loop for `BreakIf`, divergent/unresolved break condition, invalid task space. |
-| `If` | Core structural | Evaluates the condition per thread over the active cohort, pushes a true-lane child frame, and reconverges to the parent frame. All thread dispatch (warp/warpgroup/lane selection) is expressed this way; `static_thread_filter` resolves canonical predicates for placement validation. | Unresolved condition. |
+| `If` | Core structural | Evaluates the condition per thread over the active lanes, pushes a true-lane child frame, and reconverges to the parent frame. All thread dispatch (warp/warpgroup/lane selection) is expressed this way; `static_thread_filter` resolves canonical predicates for placement validation. | Unresolved condition. |
 | `TmemAlloc`, `TmemDealloc` | Reviewed lifecycle | Issued by exactly one full warp (statically validated when the dispatch predicate resolves). `cta_group=1` acts on the issuing CTA. `cta_group=2` is a CTA-pair collective that blocks until the peer reaches the same collective occurrence. Allocation ensures a scratchpad; deallocation clears the physical range. | Invalid mask, missing peer, duplicate allocation, non-identical overlap, allocation order violation, missing/mismatched deallocation, leaked allocation. |
-| `MBarrierInit` | Reviewed phase | Initializes a mbar cell with expected arrivals, pending arrivals, zero pending tx bytes, and parity 0. Per-thread instruction: every executing thread would re-initialize the cell, so it must execute from a single-thread branch. | Multi-thread cohort, duplicate init, invalid stage, remote CTA out of range, divergent target. |
-| `MBarrierArrive` | Reviewed phase | Per-thread: every executing thread arrives once with its own count; parity flips when arrivals and pending tx bytes reach zero. A phase can complete and re-arm mid-cohort. The trace carries one event with the summed count. | Uninitialized cell, non-positive count, arrival underflow, invalid stage, divergent operands. |
+| `MBarrierInit` | Reviewed phase | Initializes a mbar cell with expected arrivals, pending arrivals, zero pending tx bytes, and parity 0. Per-thread instruction: every executing thread would re-initialize the cell, so it must execute from a single-thread branch. | Multi-lane mask, duplicate init, invalid stage, remote CTA out of range, divergent target. |
+| `MBarrierArrive` | Reviewed phase | Per-thread: every executing thread arrives once with its own count; parity flips when arrivals and pending tx bytes reach zero. A phase can complete and re-arm partway through the lanes. The trace carries one event with the summed count. | Uninitialized cell, non-positive count, arrival underflow, invalid stage, divergent operands. |
 | `MBarrierExpectTx` | Reviewed phase | Per-thread: every executing thread adds its byte count to the current phase; the trace carries one event with the summed bytes. | Uninitialized cell, invalid stage, divergent target. |
 | `MBarrierArriveExpectTx` | Reviewed phase | Per-thread: each executing thread applies expect-tx, then one arrival, in the value model. | Uninitialized cell, arrival overflow/underflow, invalid stage, divergent target. |
 | `MBarrierWait` | Reviewed phase | Blocks while the requested phase is current. Phase-less waits park on the current parity through a precise `WakeCondition::Mbar` and advance without re-running when parity flips. | Uninitialized cell, invalid phase, invalid stage, divergent target. |

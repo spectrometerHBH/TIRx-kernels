@@ -1,7 +1,7 @@
 //! Cooperative barrier rendezvous state.
 //!
 //! One `SyncRecord` per (statement, rendezvous domain): per-warp streams
-//! arrive once each (stream-granular bookkeeping — a stream's cohort arrives
+//! arrive once each (stream-granular bookkeeping — a stream's lanes arrive
 //! atomically), the completing arrival flips the record to complete, and each
 //! participant passes on its next poll. Counts, not thread sets: a blocked
 //! stream's re-poll is a hash lookup and an integer compare.

@@ -1526,7 +1526,7 @@ fn has_order_point_between(cx: &CheckerCx<'_>, stream_id: usize, lo: usize, hi: 
 /// TRUE iff every overlapping (prior lane, current lane) box pair is the SAME
 /// lane. A side without lane attribution is uniform — every executing lane
 /// touches the whole region — which can never be proven same-lane-only
-/// against an overlapping access (single-thread cohorts are attributed by
+/// against an overlapping access (single-thread masks are attributed by
 /// the region builders, so `None` here really means multi-lane uniform).
 fn same_lane_only_overlap(prior: &MemoryAccessRecord, current: &MemoryAccessRecord) -> bool {
     let (Some(prior_lanes), Some(current_lanes)) =
@@ -2423,7 +2423,7 @@ impl SyncHbKey {
                 cycle,
             };
         }
-        let first_warp = scope.warp_ids.first().copied().unwrap_or(0);
+        let first_warp = scope.warp_id;
         let domain = match sync_kind {
             "cluster" => (scope.cluster_id, 0),
             "warpgroup" => (scope.cta_id, first_warp / 4),
@@ -2487,12 +2487,8 @@ struct SyncKey {
 
 fn sync_resource_scope(sync_kind: &str, scope: &super::protocol::AccessScope) -> String {
     match sync_kind {
-        "warp" => format!("cta:{}:warps:{:?}", scope.cta_id, scope.warp_ids),
-        "warpgroup" => format!(
-            "cta:{}:wg:{}",
-            scope.cta_id,
-            scope.warp_ids.first().copied().unwrap_or(0) / 4
-        ),
+        "warp" => format!("cta:{}:warp:{}", scope.cta_id, scope.warp_id),
+        "warpgroup" => format!("cta:{}:wg:{}", scope.cta_id, scope.warp_id / 4),
         "cta" => format!("cta:{}", scope.cta_id),
         "cluster" => format!("cluster:{}", scope.cluster_id),
         // Named barriers rendezvous streams from DIFFERENT statements/warp sets
@@ -3333,8 +3329,8 @@ mod tests {
             cluster_id,
             cta_id: 0,
             ctaid_in_cluster: 0,
-            cohort_size: 32,
-            warp_ids: vec![0],
+            lane_count: 32,
+            warp_id: 0,
         }
     }
 
@@ -4417,8 +4413,8 @@ mod tests {
     }
 
     #[test]
-    fn cross_lane_reports_single_lane_cohorts_by_lane() {
-        // A single-thread cohort is attributed to its lane, so lane 0's write
+    fn cross_lane_reports_single_lane_masks_by_lane() {
+        // A single-thread mask is attributed to its lane, so lane 0's write
         // followed by lane 3's read of the same cell is cross-lane.
         let kernel = lane_cells_kernel("cross_lane_single_thread");
         let events = vec![

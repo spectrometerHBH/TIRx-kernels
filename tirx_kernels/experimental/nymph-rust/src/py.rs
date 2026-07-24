@@ -764,8 +764,8 @@ fn scope_to_py<'py>(py: Python<'py>, scope: &AccessScope) -> PyResult<Bound<'py,
     out.set_item("cluster_id", scope.cluster_id)?;
     out.set_item("cta_id", scope.cta_id)?;
     out.set_item("ctaid_in_cluster", scope.ctaid_in_cluster)?;
-    out.set_item("cohort_size", scope.cohort_size)?;
-    out.set_item("warp_ids", &scope.warp_ids)?;
+    out.set_item("lane_count", scope.lane_count)?;
+    out.set_item("warp_id", scope.warp_id)?;
     Ok(out)
 }
 

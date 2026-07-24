@@ -58,7 +58,7 @@ def test_runtime_failure_message_includes_execution_anchor():
     assert "stream_id=" in message
     assert "thread=cta0:warp0:lane0" in message
     assert "stmt_kind=RegLoad" in message
-    assert "cohort_size=1" in message
+    assert "lane_count=1" in message
 
 
 def test_mbarrier_wait_rejects_divergent_phase():

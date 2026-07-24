@@ -1,6 +1,6 @@
 //! Scalar-IR evaluation — port of `interpreter/scalar_eval.py`.
 //! Evaluates ScalarValue/ScalarExpr/Var/ScopeValue to concrete i64, per-thread or
-//! vectorized over a cohort. Index ALU uses i64 with Python floor-div/floor-mod
+//! vectorized over a lane mask. Index ALU uses i64 with Python floor-div/floor-mod
 //! (sign follows divisor) — NOT Rust's truncating `/`/`%`.
 
 use super::diagnostics::{IResult, InterpreterError};
@@ -69,8 +69,8 @@ pub fn eval_scalar_in_env(value: &ScalarValue, thread: &ThreadId, env: &Env) -> 
     }
 }
 
-/// Whether `value` is provably identical across a cohort.
-pub fn scalar_is_cohort_uniform(value: &ScalarValue) -> bool {
+/// Whether `value` is provably identical across a lane mask.
+pub fn scalar_is_lane_invariant(value: &ScalarValue) -> bool {
     match value {
         ScalarValue::Int(_) => true,
         ScalarValue::Var(v) => matches!(v.binding, VarBinding::Loop | VarBinding::Task),
@@ -81,7 +81,7 @@ pub fn scalar_is_cohort_uniform(value: &ScalarValue) -> bool {
                 | ScopeValueKind::WarpId
                 | ScopeValueKind::WarpgroupId
         ),
-        ScalarValue::Expr(e) => e.args.iter().all(scalar_is_cohort_uniform),
+        ScalarValue::Expr(e) => e.args.iter().all(scalar_is_lane_invariant),
     }
 }
 
@@ -91,21 +91,21 @@ fn env_for<'a>(scalars: &'a ScalarValues, thread: &ThreadId) -> &'a Env {
 
 pub fn eval_scalar_known_uniform(
     value: &ScalarValue,
-    cohort: &ThreadMask,
+    lanes: &ThreadMask,
     scalars: &ScalarValues,
 ) -> IResult<Option<i64>> {
-    if cohort.is_empty() {
+    if lanes.is_empty() {
         return Ok(None);
     }
-    let first = &cohort[0];
+    let first = &lanes[0];
     match value {
         ScalarValue::Int(n) => Ok(Some(*n)),
         ScalarValue::Var(v) => match v.binding {
             VarBinding::Loop | VarBinding::Task => eval_scalar_at(value, first, scalars).map(Some),
-            VarBinding::Scalar => Ok(scalars.uniform_value(cohort, v.id.0)),
+            VarBinding::Scalar => Ok(scalars.uniform_value(lanes, v.id.0)),
         },
         ScalarValue::Scope(kind) => {
-            if scalar_is_cohort_uniform(value) {
+            if scalar_is_lane_invariant(value) {
                 Ok(Some(eval_scope_value(*kind, first)))
             } else {
                 Ok(None)
@@ -120,28 +120,28 @@ pub fn eval_scalar_known_uniform(
             }
             match e.op.arity() {
                 1 => {
-                    let Some(a0) = eval_scalar_known_uniform(&e.args[0], cohort, scalars)? else {
+                    let Some(a0) = eval_scalar_known_uniform(&e.args[0], lanes, scalars)? else {
                         return Ok(None);
                     };
                     eval_scalar_op(e.op, &[a0]).map(Some)
                 }
                 2 => {
-                    let Some(a0) = eval_scalar_known_uniform(&e.args[0], cohort, scalars)? else {
+                    let Some(a0) = eval_scalar_known_uniform(&e.args[0], lanes, scalars)? else {
                         return Ok(None);
                     };
-                    let Some(a1) = eval_scalar_known_uniform(&e.args[1], cohort, scalars)? else {
+                    let Some(a1) = eval_scalar_known_uniform(&e.args[1], lanes, scalars)? else {
                         return Ok(None);
                     };
                     eval_scalar_op(e.op, &[a0, a1]).map(Some)
                 }
                 3 => {
-                    let Some(a0) = eval_scalar_known_uniform(&e.args[0], cohort, scalars)? else {
+                    let Some(a0) = eval_scalar_known_uniform(&e.args[0], lanes, scalars)? else {
                         return Ok(None);
                     };
-                    let Some(a1) = eval_scalar_known_uniform(&e.args[1], cohort, scalars)? else {
+                    let Some(a1) = eval_scalar_known_uniform(&e.args[1], lanes, scalars)? else {
                         return Ok(None);
                     };
-                    let Some(a2) = eval_scalar_known_uniform(&e.args[2], cohort, scalars)? else {
+                    let Some(a2) = eval_scalar_known_uniform(&e.args[2], lanes, scalars)? else {
                         return Ok(None);
                     };
                     eval_scalar_op(e.op, &[a0, a1, a2]).map(Some)
@@ -164,39 +164,39 @@ pub fn eval_scalar_at(
 /// Vectorized per-thread eval into an i64 array (uniform values eval once).
 pub fn eval_scalar_vec(
     value: &ScalarValue,
-    cohort: &ThreadMask,
+    lanes: &ThreadMask,
     scalars: &ScalarValues,
 ) -> IResult<Array1<i64>> {
-    if cohort.is_empty() {
+    if lanes.is_empty() {
         return Ok(Array1::zeros(0));
     }
-    if scalar_is_cohort_uniform(value) {
-        let v = eval_scalar_at(value, &cohort[0], scalars)?;
-        return Ok(Array1::from_elem(cohort.len(), v));
+    if scalar_is_lane_invariant(value) {
+        let v = eval_scalar_at(value, &lanes[0], scalars)?;
+        return Ok(Array1::from_elem(lanes.len(), v));
     }
-    let mut out = Array1::<i64>::zeros(cohort.len());
-    for (i, t) in cohort.iter().enumerate() {
+    let mut out = Array1::<i64>::zeros(lanes.len());
+    for (i, t) in lanes.iter().enumerate() {
         out[i] = eval_scalar_in_env(value, t, env_for(scalars, t))?;
     }
     Ok(out)
 }
 
-/// Require a value uniform across the cohort, return the single int.
+/// Require a value uniform across the lane mask, return the single int.
 pub fn eval_scalar_uniform(
     value: &ScalarValue,
-    cohort: &ThreadMask,
+    lanes: &ThreadMask,
     scalars: &ScalarValues,
     label: &str,
     code: &str,
 ) -> IResult<i64> {
-    if scalar_is_cohort_uniform(value) {
-        return eval_scalar_at(value, &cohort[0], scalars);
+    if scalar_is_lane_invariant(value) {
+        return eval_scalar_at(value, &lanes[0], scalars);
     }
-    if let Some(v) = eval_scalar_known_uniform(value, cohort, scalars)? {
+    if let Some(v) = eval_scalar_known_uniform(value, lanes, scalars)? {
         return Ok(v);
     }
-    let first = eval_scalar_at(value, &cohort[0], scalars)?;
-    for thread in cohort.iter().skip(1) {
+    let first = eval_scalar_at(value, &lanes[0], scalars)?;
+    for thread in lanes.iter().skip(1) {
         if eval_scalar_at(value, thread, scalars)? != first {
             return Err(InterpreterError::new(
                 code,

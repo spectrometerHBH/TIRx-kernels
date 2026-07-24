@@ -1,7 +1,6 @@
 //! Bulk GMEM<->SMEM TMA — port of `semantics/tma.py`. Loads complete-tx the
 //! signaled mbar(s) and (in value mode) copy the tile; stores copy SMEM->GMEM.
 
-use super::super::cohort::CohortContext;
 use super::super::diagnostics::{IResult, InterpreterError};
 use super::super::mbar_ops::{
     complete_mbarrier_tx, initialized_mbar_cell, multicast_target_ctas, peer_ctaid_in_cluster,
@@ -16,6 +15,7 @@ use super::super::registry::{StmtExecutorRegistry, StmtKind};
 use super::super::values::indexing::numel;
 use super::super::values::mbars::{MbarCell, MbarCellKey};
 use super::super::values::tensors::{DenseTensorValue, TensorInstanceKey, TensorOwner};
+use super::super::warp_context::WarpContext;
 use crate::ir::{DType, MemorySpace, Stmt, Tensor, TensorSlice};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -39,7 +39,7 @@ fn dtype_bytes(d: DType) -> i64 {
 }
 
 fn uniform_tuple(
-    ctx: &CohortContext,
+    ctx: &WarpContext,
     values: &[crate::ir::ScalarValue],
     label: &str,
 ) -> IResult<Vec<usize>> {
@@ -100,10 +100,7 @@ fn for_each_valid_outer_row(
     }
 }
 
-fn execute_tma_load<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
-    stmt: &'k Stmt,
-) -> IResult<StepStatus> {
+fn execute_tma_load<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
     ctx.check_single_thread_issue("tma_load_mask", "tma_load")?;
     let (dst, src, mbar, bytes, coords, shape, gmem_shape, mbar_stage, multicast, cta_group) =
         match stmt {
@@ -275,7 +272,7 @@ fn execute_tma_load<'a, 'k>(
 }
 
 fn mbar_signal_targets(
-    ctx: &CohortContext,
+    ctx: &WarpContext,
     base: MbarTarget,
     dst_ctas: &[usize],
     cta_group: u8,
@@ -341,7 +338,7 @@ fn mbar_signal_targets(
 /// Complete-tx the target mbar cell(s) directly and return their keys (the runner
 /// re-checks each key's parked waiters). Duplicate targets coalesce.
 fn apply_mbar_complete_tx(
-    ctx: &mut CohortContext,
+    ctx: &mut WarpContext,
     targets: &[MbarTarget],
     byte_count: i64,
 ) -> IResult<Vec<MbarCellKey>> {
@@ -369,10 +366,7 @@ fn apply_mbar_complete_tx(
     Ok(keys)
 }
 
-fn execute_tma_store<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
-    stmt: &'k Stmt,
-) -> IResult<StepStatus> {
+fn execute_tma_store<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
     let (dst, src, coords, shape, gmem_shape, reduce_add) = match stmt {
         Stmt::TmaStore {
             dst,
@@ -473,7 +467,7 @@ fn execute_tma_store<'a, 'k>(
 /// barrier before reading) + a `complete_tx` on the PEER's mbar (mbar.remote_coord).
 /// The peer CTA = the mbar's resolved target, keeping dest and signal consistent.
 fn execute_cp_async_bulk_s2cluster<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
+    ctx: &mut WarpContext<'a, 'k>,
     stmt: &'k Stmt,
 ) -> IResult<StepStatus> {
     ctx.check_single_thread_issue("cp_async_bulk_s2cluster_mask", "cp_async_bulk_s2cluster")?;
@@ -582,7 +576,7 @@ fn execute_cp_async_bulk_s2cluster<'a, 'k>(
 }
 
 fn invalidate_gmem_block(
-    ctx: &mut CohortContext,
+    ctx: &mut WarpContext,
     tensor: &Arc<Tensor>,
     offsets: &[usize],
     shape: &[usize],
@@ -609,7 +603,7 @@ fn invalidate_gmem_block(
 
 #[allow(clippy::too_many_arguments)]
 fn store_write(
-    ctx: &mut CohortContext,
+    ctx: &mut WarpContext,
     dst: &Arc<crate::ir::Tensor>,
     src: &TensorSlice,
     coords: &[usize],

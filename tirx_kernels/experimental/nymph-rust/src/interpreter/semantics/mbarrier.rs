@@ -6,11 +6,10 @@
 //! init/arrive/expect-tx are PER-THREAD instructions (PTX): every executing
 //! thread applies its operand once, so a full-warp arrive(1) is 32 arrivals
 //! and an unguarded init is a double-init error — exactly the hardware
-//! behavior. The cell address (mbar + stage) must still be cohort-uniform.
+//! behavior. The cell address (mbar + stage) must still be uniform across the lanes.
 //! The trace carries ONE event per statement with the summed count/bytes, so
 //! arrival accounting downstream is unchanged.
 
-use super::super::cohort::CohortContext;
 use super::super::diagnostics::{IResult, InterpreterError};
 use super::super::mbar_ops::{
     arrive_mbarrier_cell, expect_tx_cell, initialized_mbar_cell, uniform_mbar_target,
@@ -20,6 +19,7 @@ use super::super::protocol::TraceEventKind;
 use super::super::registry::{StmtExecutorRegistry, StmtKind};
 use super::super::scalar_eval;
 use super::super::values::mbars::MbarCell;
+use super::super::warp_context::WarpContext;
 use crate::ir::{ScalarValue, Stmt};
 
 pub fn register(reg: &mut StmtExecutorRegistry) {
@@ -33,20 +33,20 @@ pub fn register(reg: &mut StmtExecutorRegistry) {
     reg.register(StmtKind::MBarrierWait, execute_mbarrier_wait);
 }
 
-fn eval_mbar_wait_phase(ctx: &CohortContext<'_, '_>, phase: &ScalarValue) -> IResult<u8> {
+fn eval_mbar_wait_phase(ctx: &WarpContext<'_, '_>, phase: &ScalarValue) -> IResult<u8> {
     let timer = super::super::runner::prof_now();
-    let proven_uniform = scalar_eval::scalar_is_cohort_uniform(phase);
+    let proven_uniform = scalar_eval::scalar_is_lane_invariant(phase);
     super::super::runner::prof_end("MWait:phase_classify", timer);
 
     let v = if proven_uniform {
         let timer = super::super::runner::prof_now();
-        let v = scalar_eval::eval_scalar_at(phase, &ctx.cohort[0], &ctx.state.values.scalars)?;
+        let v = scalar_eval::eval_scalar_at(phase, &ctx.lanes[0], &ctx.state.values.scalars)?;
         super::super::runner::prof_end("MWait:phase_eval_one", timer);
         v
     } else {
         let timer = super::super::runner::prof_now();
         if let Some(v) =
-            scalar_eval::eval_scalar_known_uniform(phase, &ctx.cohort, &ctx.state.values.scalars)?
+            scalar_eval::eval_scalar_known_uniform(phase, &ctx.lanes, &ctx.state.values.scalars)?
         {
             super::super::runner::prof_end("MWait:phase_fact", timer);
             v
@@ -54,10 +54,10 @@ fn eval_mbar_wait_phase(ctx: &CohortContext<'_, '_>, phase: &ScalarValue) -> IRe
             super::super::runner::prof_end("MWait:phase_fact", timer);
             let timer = super::super::runner::prof_now();
             let first =
-                scalar_eval::eval_scalar_at(phase, &ctx.cohort[0], &ctx.state.values.scalars)?;
+                scalar_eval::eval_scalar_at(phase, &ctx.lanes[0], &ctx.state.values.scalars)?;
             super::super::runner::prof_end("MWait:phase_eval_one", timer);
             let timer = super::super::runner::prof_now();
-            for thread in ctx.cohort.iter().skip(1) {
+            for thread in ctx.lanes.iter().skip(1) {
                 if scalar_eval::eval_scalar_at(phase, thread, &ctx.state.values.scalars)? != first {
                     return Err(InterpreterError::new(
                         "divergent_mbarrier_operands",
@@ -80,7 +80,7 @@ fn eval_mbar_wait_phase(ctx: &CohortContext<'_, '_>, phase: &ScalarValue) -> IRe
 }
 
 fn execute_mbarrier_init<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
+    ctx: &mut WarpContext<'a, 'k>,
     stmt: &'k Stmt,
 ) -> IResult<StepStatus> {
     let (mbar, count, stage) = match stmt {
@@ -111,7 +111,7 @@ fn execute_mbarrier_init<'a, 'k>(
     }
     // Per-thread instruction: a second executing thread re-initializes the
     // live cell — the same UB an unguarded init has on hardware.
-    if ctx.cohort.len() > 1 {
+    if ctx.lanes.len() > 1 {
         return Err(InterpreterError::new(
             "mbarrier_already_initialized",
             "mbarrier.init is per-thread: every executing thread initializes the cell \
@@ -122,7 +122,7 @@ fn execute_mbarrier_init<'a, 'k>(
 }
 
 fn execute_mbarrier_arrive<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
+    ctx: &mut WarpContext<'a, 'k>,
     stmt: &'k Stmt,
 ) -> IResult<StepStatus> {
     let (mbar, stage, count) = match stmt {
@@ -131,12 +131,12 @@ fn execute_mbarrier_arrive<'a, 'k>(
     };
     let target = uniform_mbar_target(ctx, mbar, stage.as_ref())?;
     // Per-thread instruction: every executing thread arrives with its own
-    // count. Fold sequentially so a phase can complete and re-arm mid-cohort
+    // count. Fold sequentially so a phase can complete and re-arm partway through the lanes
     // (hardware rollover); the trace carries one event with the summed count.
-    let uniform_count = if scalar_eval::scalar_is_cohort_uniform(count) {
+    let uniform_count = if scalar_eval::scalar_is_lane_invariant(count) {
         Some(scalar_eval::eval_scalar_at(
             count,
-            &ctx.cohort[0],
+            &ctx.lanes[0],
             &ctx.state.values.scalars,
         )?)
     } else {
@@ -144,10 +144,10 @@ fn execute_mbarrier_arrive<'a, 'k>(
     };
     let mut cell = initialized_mbar_cell(ctx, target.key())?;
     let mut total = 0i64;
-    for i in 0..ctx.cohort.len() {
+    for i in 0..ctx.lanes.len() {
         let c = match uniform_count {
             Some(c) => c,
-            None => scalar_eval::eval_scalar_at(count, &ctx.cohort[i], &ctx.state.values.scalars)?,
+            None => scalar_eval::eval_scalar_at(count, &ctx.lanes[i], &ctx.state.values.scalars)?,
         };
         cell = arrive_mbarrier_cell(cell, c)?;
         total += c;
@@ -165,7 +165,7 @@ fn execute_mbarrier_arrive<'a, 'k>(
 }
 
 fn execute_mbarrier_expect_tx<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
+    ctx: &mut WarpContext<'a, 'k>,
     stmt: &'k Stmt,
 ) -> IResult<StepStatus> {
     let (mbar, bytes, stage) = match stmt {
@@ -175,7 +175,7 @@ fn execute_mbarrier_expect_tx<'a, 'k>(
     let target = uniform_mbar_target(ctx, mbar, stage.as_ref())?;
     let cell = initialized_mbar_cell(ctx, target.key())?;
     // Per-thread instruction: every executing thread adds its byte count.
-    let total = bytes as i64 * ctx.cohort.len() as i64;
+    let total = bytes as i64 * ctx.lanes.len() as i64;
     let updated = expect_tx_cell(cell, total);
     let key = target.key();
     ctx.state.values.mbars.cells.insert(key, updated);
@@ -190,7 +190,7 @@ fn execute_mbarrier_expect_tx<'a, 'k>(
 }
 
 fn execute_mbarrier_arrive_expect_tx<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
+    ctx: &mut WarpContext<'a, 'k>,
     stmt: &'k Stmt,
 ) -> IResult<StepStatus> {
     let (mbar, bytes, stage) = match stmt {
@@ -201,7 +201,7 @@ fn execute_mbarrier_arrive_expect_tx<'a, 'k>(
     let mut cell = initialized_mbar_cell(ctx, target.key())?;
     // Per-thread instruction: each executing thread expects its bytes and
     // arrives once (sequential fold — see execute_mbarrier_arrive).
-    let n = ctx.cohort.len();
+    let n = ctx.lanes.len();
     for _ in 0..n {
         cell = arrive_mbarrier_cell(expect_tx_cell(cell, bytes as i64), 1)?;
     }
@@ -224,7 +224,7 @@ fn execute_mbarrier_arrive_expect_tx<'a, 'k>(
 }
 
 fn execute_mbarrier_wait<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
+    ctx: &mut WarpContext<'a, 'k>,
     stmt: &'k Stmt,
 ) -> IResult<StepStatus> {
     let (mbar, stage, phase) = match stmt {

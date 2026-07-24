@@ -59,7 +59,7 @@ Region {
     tensor_id: u32,
     // Per-lane attribution of `boxes`, before they are merged across the
     // warp's lanes. Carried for lane-divergent SMEM/TMEM accesses and for
-    // single-lane cohorts; `None` means every executing lane touches the
+    // single-lane masks; `None` means every executing lane touches the
     // whole region.
     lane_boxes: Option<Vec<(u8, BoxN)>>,
 }
@@ -97,7 +97,7 @@ TraceEventKind::Write {
 non-memory event.
 
 `AccessScope` includes `stream_id`, `cluster_id`, global `cta_id`,
-`ctaid_in_cluster`, `cohort_size`, and `warp_ids`. `MbarTargetEvent` includes
+`ctaid_in_cluster`, `lane_count`, and `warp_id`. `MbarTargetEvent` includes
 `mbar_id`, `cluster_id`, `ctaid_in_cluster`, and `stage`. Resource keys for
 mbarrier, sync, deadlock, and cluster-scope fences must use cluster identity
 where applicable.

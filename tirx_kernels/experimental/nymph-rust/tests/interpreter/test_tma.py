@@ -25,7 +25,7 @@ def test_tma_load_rejects_non_multicast_mbar_target_mismatch():
         src = gmem_arg(b, dtype=nr.DType.F32, shape=(1,))
         mbar = b.mbar(kind=nr.MBarKind.TMA)
         # tma_load is a single-thread issue instruction now: elect one thread,
-        # so the mbar-target check (not the cohort mask gate) is what fires.
+        # so the mbar-target check (not the issue-mask gate) is what fires.
         with b.if_warp(0), b.if_elected():
             b.tma_load(
                 dst,

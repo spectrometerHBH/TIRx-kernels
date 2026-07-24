@@ -1,17 +1,17 @@
 //! Fence — a trace marker (no value effect) — port of `semantics/fence.py`.
 
-use super::super::cohort::CohortContext;
 use super::super::diagnostics::IResult;
 use super::super::outcomes::StepStatus;
 use super::super::protocol::{FenceEventKind, TraceEventKind};
 use super::super::registry::{StmtExecutorRegistry, StmtKind};
+use super::super::warp_context::WarpContext;
 use crate::ir::{FenceKind, Stmt};
 
 pub fn register(reg: &mut StmtExecutorRegistry) {
     reg.register(StmtKind::Fence, execute_fence);
 }
 
-fn execute_fence<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
+fn execute_fence<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
     let (kind, scope) = match stmt {
         Stmt::Fence { kind, scope } => (*kind, *scope),
         _ => unreachable!(),

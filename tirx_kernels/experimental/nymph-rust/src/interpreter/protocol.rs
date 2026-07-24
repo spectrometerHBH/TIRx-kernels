@@ -85,8 +85,8 @@ pub struct AccessScope {
     pub cluster_id: usize,
     pub cta_id: usize,
     pub ctaid_in_cluster: usize,
-    pub cohort_size: usize,
-    pub warp_ids: Vec<usize>,
+    pub lane_count: usize,
+    pub warp_id: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -294,8 +294,8 @@ pub struct Region {
     /// Per-LANE attribution of the footprint, PRE-coalescing across threads:
     /// `(lane_id, that lane's byte box)` — a lane may contribute several boxes
     /// (one per contiguous run of its slice). Filled only for lane-divergent
-    /// cohort accesses to shared-race-target pools (SMEM/TMEM) and for
-    /// single-thread cohorts (attributed to the single lane). `None` means
+    /// accesses to shared-race-target pools (SMEM/TMEM) and for
+    /// single-thread masks (attributed to their one lane). `None` means
     /// "uniform": every executing lane touches the whole region. The checker
     /// uses this for the intra-warp cross-lane race rule; the union `boxes`
     /// stays the authority for every other overlap walk. Behind an `Arc` so

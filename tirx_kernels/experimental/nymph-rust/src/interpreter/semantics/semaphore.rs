@@ -8,12 +8,12 @@
 //! race checker never flags the semaphore itself). The HB plumbing lives in
 //! `checker.rs::OrderingAnalysis::new`.
 
-use super::super::cohort::CohortContext;
 use super::super::diagnostics::{IResult, InterpreterError};
 use super::super::outcomes::{StepStatus, WakeCondition};
 use super::super::protocol::{GmemAtomicOrderEvent, SemKey, TraceEventKind};
 use super::super::registry::{StmtExecutorRegistry, StmtKind};
 use super::super::values::tensors::row_major_strides;
+use super::super::warp_context::WarpContext;
 use crate::ir::{GmemAtomicOrder, MemorySpace, Stmt, TensorSlice};
 
 pub fn register(reg: &mut StmtExecutorRegistry) {
@@ -25,7 +25,7 @@ pub fn register(reg: &mut StmtExecutorRegistry) {
 /// slice's tensor + the per-dim cell coords. The semaphore is SHARED across CTAs,
 /// so the key carries no cta_id — it is global by tensor identity.
 fn resolve_sem_key(
-    ctx: &CohortContext,
+    ctx: &WarpContext,
     sem: &TensorSlice,
     coords: &[crate::ir::ScalarValue],
     label: &str,
@@ -71,10 +71,10 @@ fn resolve_sem_key(
 /// this stream's release clock (value-keyed acquire).
 ///
 /// A single-thread issue op in this model: `red.global` is per-thread PTX, so a
-/// multi-thread cohort would RMW the counter once per thread — the kernel must
+/// a multi-lane mask would RMW the counter once per thread — the kernel must
 /// elect one thread (all known emitters signal from an elected lane).
 fn execute_gmem_atomic_add<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
+    ctx: &mut WarpContext<'a, 'k>,
     stmt: &'k Stmt,
 ) -> IResult<StepStatus> {
     ctx.check_single_thread_issue("gmem_atomic_add_mask", "gmem_atomic_add")?;
@@ -119,11 +119,11 @@ fn execute_gmem_atomic_add<'a, 'k>(
 /// atomic_add that PRODUCED this exact `value`. The event is emitted ONCE, when the
 /// wait is satisfied, so the acquired clock reflects the producing release.
 ///
-/// Any cohort may spin (the load is read-only and the awaited value is
-/// cohort-uniform, so every lane observes the same satisfaction) — one blocking
-/// check and one SemAcquire per cohort.
+/// Any lane mask may spin (the load is read-only and the awaited value is
+/// uniform across the lanes, so every lane observes the same satisfaction) — one blocking
+/// check and one SemAcquire per executing mask.
 fn execute_gmem_wait_eq<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
+    ctx: &mut WarpContext<'a, 'k>,
     stmt: &'k Stmt,
 ) -> IResult<StepStatus> {
     let (sem, coords, value) = match stmt {

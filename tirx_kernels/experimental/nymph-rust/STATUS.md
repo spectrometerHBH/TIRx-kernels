@@ -28,7 +28,7 @@ File layout mirrors the Python package; the **modularity contract is preserved**
   `cooperative`, `runtime`, `tcgen05_datapath`.
 - engine: `ids`, `scalar_eval` (floor-div/mod, scope values, uniform fast path),
   `outcomes` (the `StepStatus` + `WakeCondition` protocol), `state`, `slice_indexing`,
-  `cohort` (the vectorized per-thread surface + register/shared read-write), `mbar_ops`
+  `warp_context` (the executor context + lane-vectorized register/shared read-write), `mbar_ops`
   (pure phase-cell algebra + target resolution), `elementwise` (reg ALU), `transfer`,
   `tmem` (alloc lifecycle), `scheduler` (per-warp streams, frame stack, grid
   expansion, CTA activity), `runner` (the main loop, dispatch, direct mutation,
@@ -54,9 +54,9 @@ Design points:
   `tests/interpreter/test_warp_model.py`); cross-lane pairs inside one warp are
   verified by `memory_race_check` and reported as `intra_warp_cross_lane_race`
   (pinned by `tests/interpreter/test_cross_lane.py`).
-- **Cohort vectorization** — handlers operate on whole `ThreadMask`s, never loop
+- **Lane vectorization** — handlers operate on whole `ThreadMask`s, never loop
   threads in op logic.
-- **Direct mutation** — every executor takes `&mut CohortContext` (holding `&mut state`),
+- **Direct mutation** — every executor takes `&mut WarpContext` (holding `&mut state`),
   mutates state in place, and returns a light `StepStatus` (`Advance{wakes}` /
   `AdvanceContinue` / `Block(WakeCondition)` / `Fail`). There is no staged commit.
 - **Precise wake** — a stream that blocks on `mbarrier_wait` parks on a
@@ -126,10 +126,10 @@ operands and accumulates in place into the TMEM grid.
 when off). `NYMPH_BLAS_THREADS=N` pins the OpenBLAS thread count (default 1).
 
 ### Remaining levers (not yet done)
-- **Vectorize `scalar_eval::eval_scalar_vec`** — it still loops the cohort for non-uniform
+- **Vectorize `scalar_eval::eval_scalar_vec`** — it still loops the lanes for non-uniform
   (lane-dependent) offsets where Python uses numpy; array-based eval would cut `eval_slice`
   and the per-stmt cost across the board.
-- **Avoid the per-statement cohort clone** in `current_stmt` (return an index/slice).
+- **Avoid the per-statement lane-mask clone** in `current_stmt` (return an index/slice).
 - **Multithreading** — the Rust interpreter has no GIL; independent CTAs/tasks could run
   on a thread pool. The Python interpreter cannot.
 

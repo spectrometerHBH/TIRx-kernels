@@ -569,7 +569,7 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
 
     # ---- MMA (TIRx wg0/warp1, cluster leader only) ----
     # Single thread: tcgen05_cp/tcgen05_mma/tcgen05_commit require a
-    # single-thread cohort; the waits are fine from one thread too.
+    # single-thread mask; the waits are fine from one thread too.
     with k.if_warp(1), k.if_elected():
         with k.for_each_task(task_scheduler) as task:
             local_iter = (task.task_id - task_start) // task_step

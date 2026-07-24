@@ -1,7 +1,7 @@
-//! The cohort-vectorized execution surface — port of `cohort.py` (+ the
-//! `cohort_services.py` register/shared read-write helpers, merged here as methods
-//! to keep the borrow story simple; the per-op modularity is preserved by the
-//! registry, not by splitting the services).
+//! The executor context: one warp, its active lane mask, and the
+//! lane-vectorized register/shared read-write services the executors call.
+//! Keeping the services here (rather than in their own module) keeps the
+//! borrow story simple; per-op modularity comes from the executor registry.
 
 use super::diagnostics::{IResult, InterpreterError};
 use super::ids::IdSpace;
@@ -24,12 +24,12 @@ use crate::ir::{Kernel, MemorySpace, ScalarValue, Stmt, TensorSlice};
 use ndarray::{Array1, Array2};
 use std::collections::HashMap;
 
-pub struct CohortContext<'a, 'k> {
+pub struct WarpContext<'a, 'k> {
     pub kernel: &'k Kernel,
     pub stream: &'a mut ExecutionStream<'k>,
     /// The executing lane mask: the active lanes of ONE warp (<= 32), all
     /// sharing the stream's `(cta_id, warp_id)`.
-    pub cohort: ThreadMask,
+    pub lanes: ThreadMask,
     pub state: &'a mut InterpreterState,
     pub ids: &'a IdSpace,
     pub options: &'a RunOptions,
@@ -41,7 +41,7 @@ pub struct CohortContext<'a, 'k> {
 /// Executor signature — registered per Stmt variant. Higher-ranked over `'k` so a
 /// control executor can push a `&'k [Stmt]` body onto the stream's frame stack.
 /// Executors mutate `ctx.state` directly and return a `StepStatus`.
-pub type StmtExecutor = for<'a, 'k> fn(&mut CohortContext<'a, 'k>, &'k Stmt) -> IResult<StepStatus>;
+pub type StmtExecutor = for<'a, 'k> fn(&mut WarpContext<'a, 'k>, &'k Stmt) -> IResult<StepStatus>;
 
 fn resolved_offset_rows(resolved: &ResolvedSlice) -> Vec<Vec<i64>> {
     resolved
@@ -65,17 +65,17 @@ fn uniform_offset(resolved: &ResolvedSlice) -> Option<Vec<i64>> {
         .then_some(first)
 }
 
-fn contiguous_register_row_span(cohort: &ThreadMask) -> Option<(usize, usize)> {
-    let first = cohort.iter().next().map(register_row)?;
-    cohort
+fn contiguous_register_row_span(lanes: &ThreadMask) -> Option<(usize, usize)> {
+    let first = lanes.iter().next().map(register_row)?;
+    lanes
         .iter()
         .skip(1)
         .enumerate()
         .all(|(i, thread)| register_row(thread) == first + i + 1)
-        .then_some((first, cohort.len()))
+        .then_some((first, lanes.len()))
 }
 
-impl<'a, 'k> CohortContext<'a, 'k> {
+impl<'a, 'k> WarpContext<'a, 'k> {
     pub fn mode(&self) -> ExecutionMode {
         self.state.mode
     }
@@ -107,23 +107,20 @@ impl<'a, 'k> CohortContext<'a, 'k> {
         InterpreterError::new("trace_inconclusive", "protocol trace is inconclusive")
     }
     pub fn access_scope(&self) -> AccessScope {
-        let mut warp_ids: Vec<usize> = self.cohort.iter().map(|t| t.warp_id).collect();
-        warp_ids.sort_unstable();
-        warp_ids.dedup();
         AccessScope {
             stream_id: self.stream.stream_id,
             cluster_id: self.stream.cluster_id,
             cta_id: self.stream.cta_id,
             ctaid_in_cluster: self.stream.ctaid_in_cluster,
-            cohort_size: self.cohort.len(),
-            warp_ids,
+            lane_count: self.lanes.len(),
+            warp_id: self.lanes[0].warp_id,
         }
     }
     pub fn tensor_region(&mut self, resolved: &ResolvedSlice) -> IResult<Region> {
         if resolved.tensor.space == MemorySpace::Reg {
             if let (Some(offset), Some((row_start, row_count))) = (
                 uniform_offset(resolved),
-                contiguous_register_row_span(&self.cohort),
+                contiguous_register_row_span(&self.lanes),
             ) {
                 return region::reg_tensor_region_from_uniform_offset(
                     &resolved.tensor,
@@ -135,7 +132,7 @@ impl<'a, 'k> CohortContext<'a, 'k> {
                 );
             }
             let offsets = resolved_offset_rows(resolved);
-            let register_rows: Vec<usize> = self.cohort.iter().map(register_row).collect();
+            let register_rows: Vec<usize> = self.lanes.iter().map(register_row).collect();
             return region::reg_tensor_region_from_offsets(
                 &resolved.tensor,
                 self.stream.cta_id,
@@ -153,14 +150,14 @@ impl<'a, 'k> CohortContext<'a, 'k> {
         )?;
         // Lane attribution for shared-race-target pools: the checker's
         // intra-warp cross-lane rule needs to know WHICH lane touched which
-        // bytes when the cohort addresses divergently (offsets referencing
+        // bytes when the lanes address divergently (offsets referencing
         // lane_id / tid_in_wg / per-thread scalars). Uniform multi-lane
-        // cohorts stay `None` (every executing lane touches the whole
-        // region); single-thread cohorts attribute the single lane.
+        // masks stay `None` (every executing lane touches the whole
+        // region); a single-thread mask attributes its one lane.
         if matches!(resolved.tensor.space, MemorySpace::Smem | MemorySpace::Tmem)
-            && offsets.len() == self.cohort.len()
+            && offsets.len() == self.lanes.len()
         {
-            let lanes: Vec<u8> = self.cohort.iter().map(|t| t.lane_id as u8).collect();
+            let lanes: Vec<u8> = self.lanes.iter().map(|t| t.lane_id as u8).collect();
             region.lane_boxes =
                 region::lane_attributed_boxes(&resolved.tensor, &offsets, &resolved.shape, &lanes)
                     .map(std::sync::Arc::new);
@@ -291,31 +288,31 @@ impl<'a, 'k> CohortContext<'a, 'k> {
     /// PTX single-thread issue instructions (tcgen05.mma/cp/commit, TMA bulk
     /// copies): exactly one executing thread, or the op would issue N times.
     pub fn check_single_thread_issue(&self, code: &str, op: &str) -> IResult<()> {
-        if self.cohort.len() != 1 {
+        if self.lanes.len() != 1 {
             return Err(InterpreterError::new(
                 code,
                 format!(
                     "{op} is a single-thread instruction ({} threads executing); \
                      wrap it in an elected branch",
-                    self.cohort.len()
+                    self.lanes.len()
                 ),
             ));
         }
         Ok(())
     }
 
-    pub fn check_full_warp_cohort(
+    pub fn check_full_warp(
         &self,
         code: impl Into<String>,
         message: impl Into<String>,
     ) -> IResult<()> {
         let code = code.into();
         let message = message.into();
-        if self.cohort.is_empty() || self.cohort.len() % 32 != 0 {
+        if self.lanes.is_empty() || self.lanes.len() % 32 != 0 {
             return Err(InterpreterError::new(code.clone(), message.clone()));
         }
         let mut lanes_by_warp: HashMap<(usize, usize), u32> = HashMap::new();
-        for thread in &self.cohort {
+        for thread in &self.lanes {
             if thread.lane_id >= 32 {
                 return Err(InterpreterError::new(code.clone(), message.clone()));
             }
@@ -351,7 +348,7 @@ impl<'a, 'k> CohortContext<'a, 'k> {
     }
 
     pub fn eval_scalar_vec(&self, value: &ScalarValue) -> IResult<Array1<i64>> {
-        scalar_eval::eval_scalar_vec(value, &self.cohort, &self.state.values.scalars)
+        scalar_eval::eval_scalar_vec(value, &self.lanes, &self.state.values.scalars)
     }
     pub fn eval_scalar_at(&self, value: &ScalarValue, thread: &ThreadId) -> IResult<i64> {
         scalar_eval::eval_scalar_at(value, thread, &self.state.values.scalars)
@@ -364,7 +361,7 @@ impl<'a, 'k> CohortContext<'a, 'k> {
     ) -> IResult<i64> {
         scalar_eval::eval_scalar_uniform(
             value,
-            &self.cohort,
+            &self.lanes,
             &self.state.values.scalars,
             label,
             code,
@@ -372,13 +369,13 @@ impl<'a, 'k> CohortContext<'a, 'k> {
     }
 
     pub fn rows(&self) -> Vec<usize> {
-        self.cohort.iter().map(register_row).collect()
+        self.lanes.iter().map(register_row).collect()
     }
 
-    /// Resolve a slice over the cohort: per-thread offsets `[A, rank]` + uniform shape.
+    /// Resolve a slice over the lane mask: per-thread offsets `[A, rank]` + uniform shape.
     pub fn eval_slice(&self, value: &TensorSlice) -> IResult<ResolvedSlice> {
         let rank = value.offsets.len();
-        let a = self.cohort.len();
+        let a = self.lanes.len();
         let mut offsets = Array2::<i64>::zeros((a, rank));
         for (d, off) in value.offsets.iter().enumerate() {
             let col = self.eval_scalar_vec(off)?;
@@ -463,7 +460,7 @@ impl<'a, 'k> CohortContext<'a, 'k> {
         Ok(value.data.gather2(&idx))
     }
 
-    /// Scatter a cohort's `values` straight into the shared (GMEM/SMEM) tensor
+    /// Scatter the lanes' `values` straight into the shared (GMEM/SMEM) tensor
     /// instance.
     pub fn shared_write(&mut self, resolved: &ResolvedSlice, values: &ValueArray2) -> IResult<()> {
         if resolved.tensor.space == MemorySpace::Smem {
@@ -486,7 +483,7 @@ impl<'a, 'k> CohortContext<'a, 'k> {
             if sorted.windows(2).any(|w| w[0] == w[1]) {
                 return Err(InterpreterError::new(
                     "overlapping_tensor_write",
-                    "cohort shared write overlaps",
+                    "lanes write overlapping bytes",
                 ));
             }
             let flat_values = values.flatten_to_1d();
@@ -519,7 +516,7 @@ impl<'a, 'k> CohortContext<'a, 'k> {
         if sorted.windows(2).any(|w| w[0] == w[1]) {
             return Err(InterpreterError::new(
                 "overlapping_tensor_write",
-                "cohort shared write overlaps",
+                "lanes write overlapping bytes",
             ));
         }
         let inst = self
@@ -577,7 +574,7 @@ impl<'a, 'k> CohortContext<'a, 'k> {
         inst.gather_rows(&rows, &cols)
     }
 
-    /// Scatter a cohort's `values` straight into the register instance.
+    /// Scatter the lanes' `values` straight into the register instance.
     pub fn registers_write(
         &mut self,
         resolved: &ResolvedSlice,

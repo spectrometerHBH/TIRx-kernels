@@ -26,7 +26,7 @@ verifies each of them.
 - `ids.rs` - discovery-order identity helpers.
 - `registry.rs` and `semantics/` - statement executor dispatch and built-in
   per-op executors.
-- `cohort.rs`, `slice_indexing.rs`, `transfer.rs`, `elementwise.rs`, and
+- `warp_context.rs`, `slice_indexing.rs`, `transfer.rs`, `elementwise.rs`, and
   `mbar_ops.rs` - vectorized execution surface and shared services used by
   statement executors.
 - `values/` - runtime values for GMEM/SMEM tensors, registers, TMEM, mbarriers,
@@ -37,15 +37,15 @@ verifies each of them.
 ## Execution Surface
 
 Built-in statements execute through `StmtExecutorRegistry` and
-`CohortContext`. Each semantics module registers executors for its statement
+`WarpContext`. Each semantics module registers executors for its statement
 kinds. `default_executor_registry()` builds the dispatch table by iterating
 those registrars; adding a new op family should not require editing the runner.
 
-Executors operate on a whole active cohort. Tensor and register value movement
-is vectorized over the cohort; scalar and protocol metadata may still be
+Executors operate on a warp's whole active lane mask. Tensor and register value
+movement is vectorized over those lanes; scalar and protocol metadata may still be
 resolved per active thread when uniformity or scope values matter.
 
-Rust uses a direct-mutation model. An executor receives `&mut CohortContext`,
+Rust uses a direct-mutation model. An executor receives `&mut WarpContext`,
 mutates `ctx.state` directly after its local checks, and returns a light
 `StepStatus`:
 
@@ -117,7 +117,7 @@ metadata declarations and have no dynamic stream effect.
 All thread dispatch is `Stmt::If` over a free-form per-thread scalar predicate
 built from thread-coordinate scope values: `warp_id()`, `lane_id()`,
 `warpgroup_id()`, and `tid_in_wg()`. `If` evaluates its condition over the
-active cohort, pushes a child frame containing only the true lanes, and
+active lanes, pushes a child frame containing only the true lanes, and
 reconverges to the parent frame when the child drains. A divergent `If` never
 splits a stream; masked execution inside one warp is exactly the hardware
 model.
@@ -185,7 +185,7 @@ A stream that blocks is parked with a `WakeCondition`.
   sync rendezvous, TMEM collective, and peer-active gates whose retry paths
   are idempotent. Cooperative syncs (`cta_sync`, `wg_sync`, `warp_sync`,
   `cluster_sync`) rendezvous in shared state with stream-granular arrival
-  counts — a stream's cohort arrives atomically — so a blocked stream's
+  counts — a stream's lanes arrive atomically — so a blocked stream's
   re-poll is an O(1) hash lookup and count compare.
 
 If an entire scheduler round makes no progress, the run fails with

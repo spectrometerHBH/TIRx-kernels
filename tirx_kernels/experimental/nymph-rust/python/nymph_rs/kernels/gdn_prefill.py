@@ -33,7 +33,7 @@ and the project memory for the full op map). State S[K,V] carried in TMEM.
 # Per-warp execution model audit (mirrors the fp16/fa4 pattern): mbarrier.init
 # and every once-per-execution issue (tma_load / tcgen05_mma / tcgen05_commit)
 # run from a single elected thread; mbarrier.arrive is per-thread, so the
-# warpgroup/warp-wide arrive sites scale their barrier counts to the cohort
+# warpgroup/warp-wide arrive sites scale their barrier counts to the number of arriving lanes
 # size (each thread signs off its own rows/reads — see bar_spec).
 
 from __future__ import annotations
@@ -393,8 +393,8 @@ def build_gdn_prefill(config: GdnPrefillConfig = GdnPrefillConfig()) -> Kernel:
     sinp_reg = reg(iod, (128,))  # state_inp bf16 staging fragment (128 halves = 64 cells)
 
     # mbarrier.arrive is PER-THREAD: each producer thread arrives once after its
-    # own rows/reads land, so a completed phase proves the whole cohort finished
-    # without a producer-side sync (the fa4 audit pattern). Counts = cohort size.
+    # own rows/reads land, so a completed phase proves every arriving lane finished
+    # without a producer-side sync (the fa4 audit pattern). Counts = number of arriving lanes.
     CG0_T = 128  # CG0 arrives are warpgroup-wide (warps 0-3)
     CG1_T = 128  # CG1 arrives are warpgroup-wide (warps 4-7)
     GATE_T = 32  # gate warp arrives warp-wide (each lane signs off its gcs/beta lanes)
@@ -608,7 +608,7 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
 
     # ============== TMA-load warp (9): cp.async.bulk.tensor (UTMALDG) ==============
     # Single-thread TMA producer stream: arrive_expect_tx is per-thread (one arm
-    # per load) and tma_load requires a single-thread cohort.
+    # per load) and tma_load requires a single-thread mask.
     with k.if_warp(TMA_WARP), k.if_elected():
         gc = k.scalar(initial=0)  # cumulative chunk index, carried across the persistent
         with k.for_each_task(
@@ -663,7 +663,7 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                 with k.if_(gc > 0):
                     k.mbarrier_wait(bars["chunk_free"], phase=ph(gc - 1))
                 # TMA issue is single-thread: arrive_expect_tx is per-thread (one
-                # arm per load) and tma_load needs a single-thread cohort.
+                # arm per load) and tma_load needs a single-thread mask.
                 with k.if_elected():
                     k.mbarrier_arrive_expect_tx(bars["tg"], bytes=BT * 4)
                     k.tma_load(
@@ -736,7 +736,7 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
 
     # ============== MMA warp (8): issues all 7 GEMMs (UTCHMMA) ==============
     # Single-thread MMA issuer stream: tcgen05_mma/tcgen05_commit require a
-    # single-thread cohort; the k_free arrive is one arrival (count=1).
+    # single-thread mask; the k_free arrive is one arrival (count=1).
     with k.if_warp(MMA_WARP), k.if_elected():
         # gc = every-chunk pipeline state; gc_pos = the GEMM3/4 pipeline (used only on
         # chunk>0 — S_prev exists), advancing on its own cadence (= flashinfer's separate

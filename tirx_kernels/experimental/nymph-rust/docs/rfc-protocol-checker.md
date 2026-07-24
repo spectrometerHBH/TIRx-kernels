@@ -22,7 +22,7 @@ value work that is irrelevant to protocol checking.
 The important performance target is that protocol trace mode must not behave like
 "value mode plus logging". For example, a GEMM trace must not gather SMEM operands,
 call OpenBLAS, or scatter numeric accumulator values into TMEM. It only needs the
-protocol facts: which cohort issued the MMA, which SMEM regions were read, which
+protocol facts: which lanes issued the MMA, which SMEM regions were read, which
 TMEM region was written, and which barriers/syncs order those effects.
 
 ## 2. Design Goals
@@ -112,11 +112,11 @@ task ids, mbar stages/phases, offsets, and branch conditions.
 
 ## 5. Handler Contract
 
-Each statement handler continues to receive `&mut CohortContext` and return
+Each statement handler continues to receive `&mut WarpContext` and return
 `StepStatus`. The difference is that the context exposes mode-specific helpers:
 
 ```rust
-impl CohortContext {
+impl WarpContext {
     fn mode(&self) -> ExecutionMode;
     fn value(&mut self) -> IResult<&mut ValueState>;
     fn trace(&mut self) -> IResult<&mut TraceState>;
@@ -127,7 +127,7 @@ impl CohortContext {
 Handlers own the mode split:
 
 ```rust
-fn execute_tcgen05_mma(ctx: &mut CohortContext, stmt: &Stmt) -> IResult<StepStatus> {
+fn execute_tcgen05_mma(ctx: &mut WarpContext, stmt: &Stmt) -> IResult<StepStatus> {
     let spec = resolve_mma_spec(ctx, stmt)?;
     match ctx.mode() {
         ExecutionMode::Value => execute_mma_value(ctx, spec),
@@ -169,8 +169,8 @@ pub struct AccessScope {
     cluster_id: usize,
     cta_id: usize,
     ctaid_in_cluster: usize,
-    cohort_size: usize,
-    warp_ids: Vec<usize>,
+    lane_count: usize,
+    warp_id: usize,
 }
 
 pub struct MbarTargetEvent {
@@ -313,7 +313,7 @@ demand-driven value liveness. The pseudocode below is the common shape every han
 trace branch follows; handlers still own their mode split as described in §5.
 
 ```rust
-fn execute_trace(stmt: &Stmt, ctx: &mut CohortContext) -> IResult<StepStatus> {
+fn execute_trace(stmt: &Stmt, ctx: &mut WarpContext) -> IResult<StepStatus> {
     // This may call scalar_def_from_tensor_cell. If that bridge reads invalid data,
     // the run returns an inconclusive trace report instead of continuing on a guessed
     // control path.
@@ -336,7 +336,7 @@ fn execute_trace(stmt: &Stmt, ctx: &mut CohortContext) -> IResult<StepStatus> {
     Ok(StepStatus::Advance)
 }
 
-fn scalar_def_from_tensor_cell(cell: TensorCell, ctx: &mut CohortContext) -> IResult<Scalar> {
+fn scalar_def_from_tensor_cell(cell: TensorCell, ctx: &mut WarpContext) -> IResult<Scalar> {
     if let Some(value) = ctx.trace_tensor_cells().read_valid_scalar(cell)? {
         return Ok(value);
     }

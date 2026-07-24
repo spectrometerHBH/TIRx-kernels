@@ -1,9 +1,9 @@
 //! mbarrier target resolution + pure phase-cell algebra — port of `mbar_ops.py`.
 
-use super::cohort::CohortContext;
 use super::diagnostics::{IResult, InterpreterError};
 use super::threads::ThreadId;
 use super::values::mbars::{MbarCell, MbarCellKey, MbarIdentity};
+use super::warp_context::WarpContext;
 use crate::ir::{MBarRef, ScalarValue};
 
 #[derive(Clone, Copy, Debug)]
@@ -28,7 +28,7 @@ pub fn retarget_mbar(target: MbarTarget, ctaid_in_cluster: usize) -> MbarTarget 
 }
 
 pub fn resolve_mbar_target(
-    ctx: &CohortContext,
+    ctx: &WarpContext,
     mbar: &MBarRef,
     stage_value: Option<&ScalarValue>,
     thread: &ThreadId,
@@ -54,11 +54,11 @@ pub fn resolve_mbar_target(
 }
 
 pub fn uniform_mbar_target(
-    ctx: &CohortContext,
+    ctx: &WarpContext,
     mbar: &MBarRef,
     stage_value: Option<&ScalarValue>,
 ) -> IResult<MbarTarget> {
-    let target = resolve_mbar_target(ctx, mbar, stage_value, &ctx.cohort[0])?;
+    let target = resolve_mbar_target(ctx, mbar, stage_value, &ctx.lanes[0])?;
     if let Some(s) = stage_value {
         ctx.eval_scalar_uniform(s, "mbarrier stage", "divergent_mbarrier_operands")?;
     }
@@ -68,7 +68,7 @@ pub fn uniform_mbar_target(
     Ok(target)
 }
 
-pub fn initialized_mbar_cell(ctx: &CohortContext, key: MbarCellKey) -> IResult<MbarCell> {
+pub fn initialized_mbar_cell(ctx: &WarpContext, key: MbarCellKey) -> IResult<MbarCell> {
     ctx.state
         .values
         .mbars
@@ -137,7 +137,7 @@ pub fn complete_mbarrier_tx(cell: MbarCell, byte_count: i64) -> IResult<MbarCell
 // ---- cluster/CTA helpers ----
 
 pub fn peer_ctaid_in_cluster(
-    ctx: &CohortContext,
+    ctx: &WarpContext,
     ctaid_in_cluster: usize,
     code: &str,
     msg: &str,
@@ -150,7 +150,7 @@ pub fn peer_ctaid_in_cluster(
 }
 
 pub fn multicast_target_ctas(
-    ctx: &CohortContext,
+    ctx: &WarpContext,
     mask: u16,
     code_prefix: &str,
     label: &str,
@@ -172,7 +172,7 @@ pub fn multicast_target_ctas(
     Ok((0..addressable).filter(|c| mask & (1 << c) != 0).collect())
 }
 
-pub fn check_mbar_remote_coord(ctx: &CohortContext, ctaid_in_cluster: usize) -> IResult<()> {
+pub fn check_mbar_remote_coord(ctx: &WarpContext, ctaid_in_cluster: usize) -> IResult<()> {
     if ctaid_in_cluster >= ctx.cluster_cta_count() {
         return Err(InterpreterError::new(
             "mbarrier_remote_cta_oob",

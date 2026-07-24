@@ -5,7 +5,7 @@
 //! edited to add an op. (Rust needs an explicit `StmtKind` discriminant table in
 //! place of Python's type→handler dict, but the decoupling is the same.)
 
-use super::cohort::StmtExecutor;
+use super::warp_context::StmtExecutor;
 use crate::ir::Stmt;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]

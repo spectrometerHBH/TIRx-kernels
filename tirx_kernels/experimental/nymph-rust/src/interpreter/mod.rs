@@ -2,7 +2,7 @@
 //!
 //! Modular per-op dispatch: a registry maps each `Stmt` variant to an executor;
 //! semantics modules register their executors, so adding an op does not edit the
-//! runner. Executors operate on cohort-vectorized masks, mutate state directly
+//! runner. Executors operate on warp lane masks, mutate state directly
 //! through `&mut state`, and return a light `StepStatus`. The one blocking op on
 //! the hot path — `mbarrier_wait` — parks on a `WakeCondition` and is advanced
 //! precisely (never re-run) when a later cell write flips its parity; rare
@@ -12,7 +12,6 @@
 
 pub mod blas;
 pub mod checker;
-pub mod cohort;
 pub mod diagnostics;
 pub mod elementwise;
 pub mod ids;
@@ -31,6 +30,7 @@ pub mod threads;
 pub mod tmem;
 pub mod transfer;
 pub mod values;
+pub mod warp_context;
 
 pub use protocol::{
     ExecutionMode, ProtocolReport, ProtocolStatus, ProtocolWarning, TraceEvent, TraceEventKind,

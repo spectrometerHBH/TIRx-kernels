@@ -2064,7 +2064,7 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
             # next chunk (cp_async_bulk_wait_group(0) @4015, only when not the LAST chunk) + a
             # wg_sync so the 128 threads observe the drain before overwriting the slice. Only
             # thread 0 issued the bulk store, so the commit/drain is thread-0-only (flashattn's
-            # leader_warp @4005); the wg_sync is the cohort rendezvous (all 128 threads).
+            # leader_warp @4005); the wg_sync is the rendezvous (all 128 threads).
             if j < nchunks - 1:
                 with k.if_(tid.eq(0)):
                     k.cp_async_bulk_commit_group()
@@ -2449,7 +2449,7 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
                             # hd192: sdQ fully drained — free the aliased region for the next block's dS
                             # export (flash_bwd_sm100.py:3670). Per-thread arrive from every reduce-wg
                             # thread (count=WG_T), each behind the wg_sync that published thread-0's
-                            # drain to the cohort.
+                            # drain to the other lanes.
                             k.wg_sync(barrier_id=1)
                             k.mbarrier_arrive(bars["dQaccum_empty"])
                         continue

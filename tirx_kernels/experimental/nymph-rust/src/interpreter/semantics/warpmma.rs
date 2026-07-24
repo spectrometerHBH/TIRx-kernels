@@ -15,12 +15,12 @@
 //!   C,D (M×N, f32): `m*n/32` f32 regs/lane. reg ri holds
 //!     [(ri/2)*8 + g][2t + ri%2].
 
-use super::super::cohort::CohortContext;
 use super::super::diagnostics::{IResult, InterpreterError};
 use super::super::outcomes::StepStatus;
 use super::super::registry::{StmtExecutorRegistry, StmtKind};
 use super::super::values::arrays::ValueArray2;
 use super::super::values::ldstmatrix::unpack_b16x2;
+use super::super::warp_context::WarpContext;
 use crate::ir::{DType, Stmt};
 use half::f16;
 use ndarray::Array2;
@@ -72,10 +72,7 @@ fn ab_words(arr: ValueArray2, ab_dtype: DType, label: &str) -> IResult<Array2<u3
     }
 }
 
-fn execute_warp_mma<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
-    stmt: &'k Stmt,
-) -> IResult<StepStatus> {
+fn execute_warp_mma<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
     let (d, a, b, c, m, n, kk, ab_dtype) = match stmt {
         Stmt::WarpMma {
             d,
@@ -89,7 +86,7 @@ fn execute_warp_mma<'a, 'k>(
         } => (d, a, b, c, *m as usize, *n as usize, *k as usize, *ab_dtype),
         _ => unreachable!(),
     };
-    ctx.check_full_warp_cohort(
+    ctx.check_full_warp(
         "warp_mma_mask",
         "mma.sync must be issued by one or more full warps",
     )?;
@@ -113,7 +110,7 @@ fn execute_warp_mma<'a, 'k>(
     let a_w = ab_words(ctx.registers_read(&a_r)?, ab_dtype, "A")?;
     let b_w = ab_words(ctx.registers_read(&b_r)?, ab_dtype, "B")?;
     let c_f = ctx.registers_read(&c_r)?.to_f32_compute();
-    let nthreads = ctx.cohort.len();
+    let nthreads = ctx.lanes.len();
     if a_w.ncols() != len_a || b_w.ncols() != len_b || c_f.ncols() != len_cd {
         return Err(InterpreterError::new(
             "warp_mma_shape",
@@ -126,13 +123,13 @@ fn execute_warp_mma<'a, 'k>(
     if nthreads % 32 != 0 {
         return Err(InterpreterError::new(
             "warp_mma_mask",
-            "mma.sync cohort must be whole warps",
+            "mma.sync must execute on whole warps",
         ));
     }
 
-    // group cohort threads into warps: warp_id -> [lane -> cohort_ai]
+    // group the lanes by warp: warp_id -> [lane -> index]
     let mut warps: BTreeMap<usize, [Option<usize>; 32]> = BTreeMap::new();
-    for (ai, t) in ctx.cohort.iter().enumerate() {
+    for (ai, t) in ctx.lanes.iter().enumerate() {
         warps.entry(t.warp_id).or_insert([None; 32])[t.lane_id] = Some(ai);
     }
 

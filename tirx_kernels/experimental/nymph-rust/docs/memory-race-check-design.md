@@ -119,7 +119,7 @@ any of these holds:
   belongs to one lane, so per-lane program order already covers it.
 
 Per-lane attribution rides on the access record as `Region.lane_boxes`, filled
-for lane-divergent SMEM/TMEM accesses and for single-lane cohorts. An access
+for lane-divergent SMEM/TMEM accesses and for single-lane masks. An access
 without it is uniform: every executing lane touches the whole region.
 
 ## Projection Requirements

@@ -134,7 +134,7 @@ def _tcgen05_role_failure_kernel(op, *, row=0, col=0, elected=False):
             b.tcgen05_st(src, dst, row=row, col=col)
 
     if elected:
-        # A single-lane cohort: ld/st are warp-collective, so this is the
+        # A single-lane mask: ld/st are warp-collective, so this is the
         # partial-warp shape the mask check rejects.
         with b.if_warp(0), b.if_elected():
             emit()

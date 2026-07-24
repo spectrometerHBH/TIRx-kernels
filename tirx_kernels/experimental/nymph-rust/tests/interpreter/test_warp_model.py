@@ -4,7 +4,7 @@
    by all four warps followed by a single-thread bulk store need the wg_sync
    between them, and the checker reports the race when it is missing.
 2. PTX execution-thread rules hold: single-thread issue ops reject
-   multi-thread cohorts, and mbarrier arrives are per-thread (one full-warp
+   multi-lane masks, and mbarrier arrives are per-thread (one full-warp
    arrive(1) fills a count=32 barrier).
 3. Warps interleave freely, so a consumer that precedes its producer in
    source order still completes.
@@ -46,7 +46,7 @@ def test_wg_sync_between_staging_and_store_passes():
     assert report["status"] == "Passed", report["diagnostics"]
 
 
-def test_single_thread_issue_ops_reject_multi_thread_cohorts():
+def test_single_thread_issue_ops_reject_multi_lane_masks():
     # tma_store from a full warp: PTX says single-thread issue.
     b = builder("gate_tma", num_warps=4, smem_size_bytes=64)
     out = gmem_arg(b, shape=(4,))

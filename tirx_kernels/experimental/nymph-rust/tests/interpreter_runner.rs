@@ -768,7 +768,7 @@ fn tma_and_reg_runtime_failures_expose_no_partial_values() {
         launch_shape: vec![1],
         cluster_shape: vec![1],
     };
-    // A 32-thread cohort reaching tma_store now trips the PTX single-thread
+    // A 32-lane mask reaching tma_store now trips the PTX single-thread
     // issue gate before operand checks (divergent coords are unconstructible
     // from a single thread).
     let divergent_result = run_value_kernel(&divergent, HashMap::new());

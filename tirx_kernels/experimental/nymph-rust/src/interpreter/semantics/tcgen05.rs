@@ -2,7 +2,6 @@
 //! The GEMM compute core: D = A @ Bᵀ (f32 accumulate from f16/bf16), placed into
 //! the TMEM accumulator; ld/st move the accumulator to/from registers.
 
-use super::super::cohort::CohortContext;
 use super::super::diagnostics::{IResult, InterpreterError};
 use super::super::mbar_ops::{
     arrive_mbarrier_cell, initialized_mbar_cell, multicast_target_ctas, peer_ctaid_in_cluster,
@@ -24,6 +23,7 @@ use super::super::values::tcgen05_datapath::{
     datapath_has_cell_aliases_cached, datapath_index_arrays_cached, datapath_index_summary_cached,
 };
 use super::super::values::tmem::{tmem_layout_for, TMEM_COLS, TMEM_ROWS};
+use super::super::warp_context::WarpContext;
 use crate::ir::{MemorySpace, Stmt, TensorSlice};
 use ndarray::{Array1, Array2};
 use std::collections::HashMap;
@@ -45,7 +45,7 @@ pub fn register(reg: &mut StmtExecutorRegistry) {
     reg.register(StmtKind::Tcgen05Cp, execute_cp);
 }
 
-fn execute_wait<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
+fn execute_wait<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
     if ctx.trace_mode() {
         let async_kind = match stmt {
             Stmt::Tcgen05WaitLd => TmemAsyncKind::Ld,
@@ -60,7 +60,7 @@ fn execute_wait<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IRes
     Ok(StepStatus::advance())
 }
 
-fn execute_commit<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
+fn execute_commit<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
     ctx.check_single_thread_issue("tcgen05_commit_mask", "tcgen05_commit")?;
     let (mbar, stage, cta_group, multicast) = match stmt {
         Stmt::Tcgen05Commit {
@@ -155,7 +155,7 @@ fn check_row_alignment(row: i64, shape: &str, label: &str) -> IResult<()> {
 }
 
 fn resolve_datapath(
-    ctx: &CohortContext,
+    ctx: &WarpContext,
     stmt_row: &crate::ir::ScalarValue,
     stmt_col: &crate::ir::ScalarValue,
     shape: &str,
@@ -163,7 +163,7 @@ fn resolve_datapath(
     tmem_tensor: &crate::ir::Tensor,
     label: &str,
 ) -> IResult<(Array2<usize>, Array2<usize>, usize)> {
-    ctx.check_full_warp_cohort(
+    ctx.check_full_warp(
         format!("tcgen05_{label}_mask"),
         format!("tcgen05_{label} must be issued by one or more full warps"),
     )?;
@@ -173,10 +173,10 @@ fn resolve_datapath(
     let (lane_idx, col_idx) = datapath_index_arrays_cached(shape, num as usize)?;
     let reg_size = lane_idx.ncols();
     let col_start = tmem_layout_for(tmem_tensor)?.col_start;
-    let a = ctx.cohort.len();
+    let a = ctx.lanes.len();
     let mut lanes = Array2::<usize>::zeros((a, reg_size));
     let mut cols = Array2::<usize>::zeros((a, reg_size));
-    for (ai, t) in ctx.cohort.iter().enumerate() {
+    for (ai, t) in ctx.lanes.iter().enumerate() {
         let subpart = (32 * (t.warp_id % 4)) as i64;
         for r in 0..reg_size {
             let lane = row + subpart + lane_idx[[t.lane_id, r]] as i64;
@@ -195,7 +195,7 @@ fn resolve_datapath(
 }
 
 fn resolve_datapath_bounds(
-    ctx: &CohortContext,
+    ctx: &WarpContext,
     stmt_row: &crate::ir::ScalarValue,
     stmt_col: &crate::ir::ScalarValue,
     shape: &str,
@@ -203,7 +203,7 @@ fn resolve_datapath_bounds(
     tmem_tensor: &crate::ir::Tensor,
     label: &str,
 ) -> IResult<DatapathBounds> {
-    ctx.check_full_warp_cohort(
+    ctx.check_full_warp(
         format!("tcgen05_{label}_mask"),
         format!("tcgen05_{label} must be issued by one or more full warps"),
     )?;
@@ -221,7 +221,7 @@ fn resolve_datapath_bounds(
         ));
     }
     let mut checked_warps = Vec::new();
-    for t in &ctx.cohort {
+    for t in &ctx.lanes {
         if checked_warps.contains(&t.warp_id) {
             continue;
         }
@@ -250,7 +250,7 @@ fn resolve_datapath_bounds(
 }
 
 fn trace_ldst_tmem_region(
-    ctx: &CohortContext,
+    ctx: &WarpContext,
     stmt_row: &crate::ir::ScalarValue,
     stmt_col: &crate::ir::ScalarValue,
     shape: &str,
@@ -258,7 +258,7 @@ fn trace_ldst_tmem_region(
     tmem_tensor: &crate::ir::Tensor,
     label: &str,
 ) -> IResult<(Region, usize)> {
-    ctx.check_full_warp_cohort(
+    ctx.check_full_warp(
         format!("tcgen05_{label}_mask"),
         format!("tcgen05_{label} must be issued by one or more full warps"),
     )?;
@@ -278,7 +278,7 @@ fn trace_ldst_tmem_region(
 
     let mut subparts = Vec::new();
     let mut rects = Vec::new();
-    for thread in &ctx.cohort {
+    for thread in &ctx.lanes {
         let subpart = thread.warp_id % 4;
         if subparts.contains(&subpart) {
             continue;
@@ -311,7 +311,7 @@ fn trace_ldst_tmem_region(
     ))
 }
 
-fn execute_ld<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
+fn execute_ld<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
     let (dst, src, shape, num, row, col) = match stmt {
         Stmt::Tcgen05Ld {
             dst,
@@ -382,7 +382,7 @@ fn execute_ld<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResul
     super::super::runner::prof_end("TcLd:dst_check", t_dst);
     let flat_lanes: Vec<usize> = lanes.iter().copied().collect();
     let flat_cols: Vec<usize> = cols.iter().copied().collect();
-    let a = ctx.cohort.len();
+    let a = ctx.lanes.len();
     if is_packed_tmem_dtype(src.dtype) {
         let values = {
             let scratch = ctx.state.values.tmem.scratchpad_for(ctx.stream.cta_id)?;
@@ -417,7 +417,7 @@ fn execute_ld<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResul
     Ok(StepStatus::advance())
 }
 
-fn execute_st<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
+fn execute_st<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
     let (dst, src, shape, num, row, col) = match stmt {
         Stmt::Tcgen05St {
             dst,
@@ -545,7 +545,7 @@ fn execute_st<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResul
 }
 
 fn read_packed_half_register_pairs(
-    ctx: &CohortContext,
+    ctx: &WarpContext,
     src_r: &ResolvedSlice,
     reg_size: usize,
 ) -> IResult<Vec<(f32, f32)>> {
@@ -614,7 +614,7 @@ fn check_reg_fragment(
     Ok(())
 }
 
-fn check_tmem_st_no_overlap(ctx: &CohortContext, shape: &str, num: u32) -> IResult<()> {
+fn check_tmem_st_no_overlap(ctx: &WarpContext, shape: &str, num: u32) -> IResult<()> {
     if datapath_has_cell_aliases_cached(shape, num as usize)? {
         return Err(InterpreterError::new(
             "overlapping_tmem_write",
@@ -622,7 +622,7 @@ fn check_tmem_st_no_overlap(ctx: &CohortContext, shape: &str, num: u32) -> IResu
         ));
     }
     let mut subpart_owner = [None; 4];
-    for thread in &ctx.cohort {
+    for thread in &ctx.lanes {
         let subpart = thread.warp_id % 4;
         match subpart_owner[subpart] {
             Some(owner) if owner == thread.warp_id => {}
@@ -638,7 +638,7 @@ fn check_tmem_st_no_overlap(ctx: &CohortContext, shape: &str, num: u32) -> IResu
     Ok(())
 }
 
-fn check_tmem_region_allocated(ctx: &CohortContext, region: &Region, label: &str) -> IResult<()> {
+fn check_tmem_region_allocated(ctx: &WarpContext, region: &Region, label: &str) -> IResult<()> {
     let PoolId::Tmem { cta_id } = region.owner else {
         return Err(InterpreterError::new(
             "trace_region_owner",
@@ -676,7 +676,7 @@ fn check_tmem_region_allocated(ctx: &CohortContext, region: &Region, label: &str
 }
 
 fn tmem_col_range_allocated(
-    ctx: &CohortContext,
+    ctx: &WarpContext,
     cta_id: usize,
     col_start: usize,
     col_end: usize,
@@ -687,7 +687,7 @@ fn tmem_col_range_allocated(
 }
 
 fn check_tmem_cells_allocated<I>(
-    ctx: &CohortContext,
+    ctx: &WarpContext,
     cta_id: usize,
     cols: I,
     label: &str,
@@ -738,7 +738,7 @@ fn shape_str(shape: &crate::ir::LdStShape) -> &'static str {
 
 // ---- MMA ----
 
-fn execute_mma<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
+fn execute_mma<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
     let (
         dst,
         a_sl,
@@ -807,12 +807,12 @@ fn execute_mma<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResu
                 "tcgen05_mma cta_group=2 value model supports only m in {128, 256}",
             ));
         }
-        if ctx.cohort[0].ctaid_in_cluster & 1 == 1 {
+        if ctx.lanes[0].ctaid_in_cluster & 1 == 1 {
             return Ok(StepStatus::advance());
         }
         let peer_local = peer_ctaid_in_cluster(
             ctx,
-            ctx.cohort[0].ctaid_in_cluster,
+            ctx.lanes[0].ctaid_in_cluster,
             "tcgen05_mma_peer",
             "mma peer out of range",
         )?;
@@ -926,7 +926,7 @@ fn execute_mma<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResu
 
 #[allow(clippy::too_many_arguments)]
 fn trace_mma(
-    ctx: &mut CohortContext,
+    ctx: &mut WarpContext,
     dst: &TensorSlice,
     a_sl: &TensorSlice,
     b_sl: &TensorSlice,
@@ -1038,7 +1038,7 @@ fn trace_mma(
 /// `byte_base=sf_byte` (one scale per row); nvfp4 with `byte_base=0` and
 /// `nblocks=k/16` (bytes 0..k/16 of the cell).
 fn read_scale_blocks(
-    ctx: &CohortContext,
+    ctx: &WarpContext,
     sl: &TensorSlice,
     byte_base: usize,
     nblocks: usize,
@@ -1122,7 +1122,7 @@ fn apply_block_scales(buf: &mut [f32], scales: &[f32], k: usize, nblocks: usize)
 /// so a later same-stream MMA read can never observe a stale cell; retirement
 /// toward other streams is observed through `tcgen05_commit` (the trace records
 /// an async `Tmem(Cp)` write window drained by the commit).
-fn execute_cp<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
+fn execute_cp<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
     ctx.check_single_thread_issue("tcgen05_cp_mask", "tcgen05_cp")?;
     let (dst, src, cta_group) = match stmt {
         Stmt::Tcgen05Cp {
@@ -1133,12 +1133,12 @@ fn execute_cp<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResul
         _ => unreachable!(),
     };
     let cta_ids: Vec<usize> = if cta_group == 2 {
-        if ctx.cohort[0].ctaid_in_cluster & 1 == 1 {
+        if ctx.lanes[0].ctaid_in_cluster & 1 == 1 {
             return Ok(StepStatus::advance());
         }
         let peer_local = peer_ctaid_in_cluster(
             ctx,
-            ctx.cohort[0].ctaid_in_cluster,
+            ctx.lanes[0].ctaid_in_cluster,
             "tcgen05_cp_peer",
             "cp peer out of range",
         )?;
@@ -1228,7 +1228,7 @@ fn execute_cp<'a, 'k>(ctx: &mut CohortContext<'a, 'k>, stmt: &'k Stmt) -> IResul
 /// iterate the same `cta_ids` — deriving the CTA set independently per path
 /// is how peer-SMEM reads went unrecorded.
 fn mma_operand_regions(
-    ctx: &CohortContext,
+    ctx: &WarpContext,
     slice: &TensorSlice,
     resolved: &ResolvedSlice,
     cta_ids: &[usize],
@@ -1413,7 +1413,7 @@ fn tmem_regions_from_mma_blocks(
 /// returns the FULL-rank offsets (for the pool's rect path) plus the trailing
 /// (rows, cols) of the box, after checking the leading extents are all 1.
 fn squeeze_operand(
-    ctx: &CohortContext,
+    ctx: &WarpContext,
     sl: &TensorSlice,
 ) -> IResult<(Vec<usize>, Vec<usize>, usize, usize)> {
     let off = eval_uniform_usize(ctx, &sl.offsets, "mma operand offset")?;
@@ -1438,7 +1438,7 @@ fn squeeze_operand(
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn accumulate_inplace(
-    ctx: &mut CohortContext,
+    ctx: &mut WarpContext,
     dst: &TensorSlice,
     a_sl: &TensorSlice,
     b_sl: &TensorSlice,
@@ -1603,7 +1603,7 @@ fn accumulate_inplace(
 }
 
 fn eval_uniform_usize(
-    ctx: &CohortContext,
+    ctx: &WarpContext,
     vals: &[crate::ir::ScalarValue],
     label: &str,
 ) -> IResult<Vec<usize>> {
@@ -1651,7 +1651,7 @@ fn check_mma_operand_shapes(
 }
 
 fn read_operand(
-    ctx: &CohortContext,
+    ctx: &WarpContext,
     sl: &TensorSlice,
     transpose: bool,
     cta_id: usize,
@@ -1731,7 +1731,7 @@ fn read_operand(
 /// EVERY CTA in `cta_ids` (row-concatenated in cta order; one CTA for
 /// cta_group=1).
 fn read_operand_ctas(
-    ctx: &CohortContext,
+    ctx: &WarpContext,
     sl: &TensorSlice,
     transpose: bool,
     cta_ids: &[usize],
@@ -1750,7 +1750,7 @@ fn read_operand_ctas(
 
 /// For each logical (m,n): (cta_idx, lane, col_local).
 fn inplace_geometry(
-    ctx: &CohortContext,
+    ctx: &WarpContext,
     dst: &TensorSlice,
     cta_group: u8,
 ) -> IResult<(usize, usize)> {
@@ -1795,7 +1795,7 @@ fn inplace_geometry(
 /// coordinates ARE the layout — no per-element placement table.
 #[allow(clippy::too_many_arguments)]
 fn accumulate_blocks(
-    ctx: &mut CohortContext,
+    ctx: &mut WarpContext,
     dst: &TensorSlice,
     product: &Array2<f32>,
     m: usize,

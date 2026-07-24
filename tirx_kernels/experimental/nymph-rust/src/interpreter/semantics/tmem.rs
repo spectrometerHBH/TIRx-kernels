@@ -1,6 +1,5 @@
 //! TMEM alloc/dealloc lifecycle + CTA-pair collective — port of `semantics/tmem.py`.
 
-use super::super::cohort::CohortContext;
 use super::super::diagnostics::{IResult, InterpreterError};
 use super::super::mbar_ops::peer_ctaid_in_cluster;
 use super::super::outcomes::{StepStatus, WakeCondition};
@@ -13,6 +12,7 @@ use super::super::tmem::{
     TmemAllocation, TmemAllocationKey, TmemCollectiveArrival, TmemCollectiveKey,
 };
 use super::super::values::tmem::tmem_physical_range;
+use super::super::warp_context::WarpContext;
 use crate::ir::{Stmt, Tensor};
 use std::sync::Arc;
 
@@ -22,13 +22,13 @@ pub fn register(reg: &mut StmtExecutorRegistry) {
 }
 
 fn execute_tmem_alloc<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
+    ctx: &mut WarpContext<'a, 'k>,
     stmt: &'k Stmt,
 ) -> IResult<StepStatus> {
     lifecycle(ctx, stmt, "alloc")
 }
 fn execute_tmem_dealloc<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
+    ctx: &mut WarpContext<'a, 'k>,
     stmt: &'k Stmt,
 ) -> IResult<StepStatus> {
     lifecycle(ctx, stmt, "dealloc")
@@ -50,15 +50,15 @@ fn fields<'k>(stmt: &'k Stmt) -> (&'k Arc<Tensor>, usize, u8) {
     }
 }
 
-fn check_full_warp_issue(cohort: &ThreadMask) -> IResult<()> {
-    if cohort.len() != 32 {
+fn check_full_warp_issue(lanes: &ThreadMask) -> IResult<()> {
+    if lanes.len() != 32 {
         return Err(InterpreterError::new(
             "invalid_tmem_issue_mask",
             "tmem alloc/dealloc must be a full warp",
         ));
     }
-    let first = &cohort[0];
-    for (i, t) in cohort.iter().enumerate() {
+    let first = &lanes[0];
+    for (i, t) in lanes.iter().enumerate() {
         if t.cta_id != first.cta_id || t.warp_id != first.warp_id || t.lane_id != i {
             return Err(InterpreterError::new(
                 "invalid_tmem_issue_mask",
@@ -70,11 +70,11 @@ fn check_full_warp_issue(cohort: &ThreadMask) -> IResult<()> {
 }
 
 fn lifecycle<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
+    ctx: &mut WarpContext<'a, 'k>,
     stmt: &'k Stmt,
     op: &'static str,
 ) -> IResult<StepStatus> {
-    check_full_warp_issue(&ctx.cohort)?;
+    check_full_warp_issue(&ctx.lanes)?;
     let (tensor, n_cols, cta_group) = fields(stmt);
     let (col_start, n_cols_phys) = tmem_physical_range(tensor, n_cols).map_err(|e| e)?;
     let _ = n_cols_phys;
@@ -89,7 +89,7 @@ fn lifecycle<'a, 'k>(
 /// Apply the alloc/dealloc lifecycle directly: allocation records, the value-mode
 /// scratchpad ensure/clear, and the last-alloc-cols marker.
 fn lifecycle_apply(
-    ctx: &mut CohortContext,
+    ctx: &mut WarpContext,
     stmt: &Stmt,
     op: &str,
     cta_ids: &[usize],
@@ -273,14 +273,14 @@ fn ranges_overlap(lhs_start: usize, lhs_cols: usize, rhs_start: usize, rhs_cols:
 }
 
 fn cta_group_2<'a, 'k>(
-    ctx: &mut CohortContext<'a, 'k>,
+    ctx: &mut WarpContext<'a, 'k>,
     stmt: &'k Stmt,
     op: &'static str,
     col_start: usize,
     n_cols: usize,
 ) -> IResult<StepStatus> {
     let stmt_id = ctx.stmt_id(stmt);
-    let current = ctx.cohort[0].clone();
+    let current = ctx.lanes[0].clone();
     let peer_local = peer_ctaid_in_cluster(
         ctx,
         current.ctaid_in_cluster,
