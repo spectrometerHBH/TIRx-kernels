@@ -229,6 +229,8 @@ fn execute_tma_load<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IR
             gmem_shape,
             mbar_stage,
             multicast_cta_mask,
+            cache_hint: _,
+            prefetch_tensormap: _,
             cta_group,
         } => (
             dst,
@@ -487,6 +489,8 @@ fn execute_tma_store<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> I
             reduce_add,
             // Validate-gated opt-in marker — no value/trace semantics of its own.
             allow_nondet_reduce: _,
+            cache_hint: _,
+            prefetch_tensormap: _,
         } => (dst, src, coords, shape, gmem_shape, *reduce_add),
         _ => unreachable!(),
     };

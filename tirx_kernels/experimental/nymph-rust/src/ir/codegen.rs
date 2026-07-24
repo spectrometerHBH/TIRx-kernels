@@ -262,7 +262,10 @@ fn classify_scope(set: Option<ThreadSet>, parent: &ScopeInfo) -> ScopeInfo {
 
 /// The child scope info of an `If` body: `parent` refined by `cond`.
 fn child_scope_info(cond: &ScalarValue, parent: &ScopeInfo, num_warps: u32) -> ScopeInfo {
-    let set = match (parent.set.as_ref(), static_thread_filter(cond, num_warps).known()) {
+    let set = match (
+        parent.set.as_ref(),
+        static_thread_filter(cond, num_warps).known(),
+    ) {
         (Some(p), Some(f)) => Some(p.intersect(f)),
         (None, Some(f)) => Some(f.clone()),
         _ => None,
@@ -281,9 +284,21 @@ fn as_lane_zero_equality(cond: &ScalarValue) -> bool {
     e.args
         .iter()
         .any(|a| matches!(a, ScalarValue::Scope(ScopeValueKind::LaneId)))
-        && e.args
-            .iter()
-            .any(|a| matches!(a, ScalarValue::Int(0)))
+        && e.args.iter().any(|a| matches!(a, ScalarValue::Int(0)))
+}
+
+/// True when any statement in the body is (or contains) a persistent loop —
+/// used to keep the prologue `thread_rank() == 0` guard off hot worker loops.
+fn body_has_loop(body: &[Stmt]) -> bool {
+    body.iter().any(|s| {
+        matches!(
+            s,
+            Stmt::ForLoop { .. }
+                | Stmt::Loop { .. }
+                | Stmt::ForEachTask { .. }
+                | Stmt::SchedulerImpl { .. }
+        ) || s.child_bodies().iter().any(|b| body_has_loop(b))
+    })
 }
 
 /// A warp/warpgroup equality condition (`warp_id == w` / `wg_id == g`, either
@@ -966,7 +981,9 @@ fn emit_tmem_view_decls(out: &mut Emitter, ind: usize, ctx: &Ctx) {
 fn unit_contains_tmem_alloc(unit: &TopUnit) -> bool {
     fn stmt_has_alloc(s: &Stmt) -> bool {
         matches!(s, Stmt::TmemAlloc { .. })
-            || s.child_bodies().iter().any(|b| b.iter().any(stmt_has_alloc))
+            || s.child_bodies()
+                .iter()
+                .any(|b| b.iter().any(stmt_has_alloc))
     }
     match unit {
         TopUnit::Stmt(s) => stmt_has_alloc(s),
@@ -1164,9 +1181,8 @@ fn chain_top_level_ifs(body: &[Stmt]) -> Vec<TopUnit> {
     let mut out: Vec<TopUnit> = Vec::with_capacity(body.len());
     let mut i = 0;
     while i < body.len() {
-        let is_eq_if = |s: &Stmt| {
-            matches!(s, Stmt::If { cond, .. } if as_scope_equality(cond).is_some())
-        };
+        let is_eq_if =
+            |s: &Stmt| matches!(s, Stmt::If { cond, .. } if as_scope_equality(cond).is_some());
         if !is_eq_if(&body[i]) {
             out.push(TopUnit::Stmt(body[i].clone()));
             i += 1;
@@ -1382,6 +1398,8 @@ fn collect_sf_ids(k: &Kernel) -> SfIds {
             gmem_shape: _,
             mbar_stage: _,
             multicast_cta_mask: _,
+            cache_hint: _,
+            prefetch_tensormap: _,
             cta_group: _,
         } = s
         {
@@ -1432,6 +1450,8 @@ fn collect_from_stmt(s: &Stmt, map: &mut HashMap<u32, Arc<Tensor>>) {
             gmem_shape: _,
             mbar_stage: _,
             multicast_cta_mask: _,
+            cache_hint: _,
+            prefetch_tensormap: _,
             cta_group: _,
         } => {
             note_slice(dst, map);
@@ -1445,6 +1465,8 @@ fn collect_from_stmt(s: &Stmt, map: &mut HashMap<u32, Arc<Tensor>>) {
             gmem_shape: _,
             reduce_add: _,
             allow_nondet_reduce: _,
+            cache_hint: _,
+            prefetch_tensormap: _,
         } => {
             note_tensor(dst, map);
             note_slice(src, map);
@@ -1998,6 +2020,8 @@ fn stmt_mbar_refs(s: &Stmt) -> Vec<&super::mbar::MBarRef> {
             gmem_shape: _,
             mbar_stage: _,
             multicast_cta_mask: _,
+            cache_hint: _,
+            prefetch_tensormap: _,
             cta_group: _,
         } => vec![mbar],
         ClcTryCancel {
@@ -2702,11 +2726,43 @@ fn emit_stmt(
                 .copied()
                 .filter(|w| *w > 0)
                 .unwrap_or_else(|| tensor.shape.first().copied().unwrap_or(0));
-            out.push_str(&format!(
-                "{p}{name} = T.wg_reg_tile({width}, dtype=\"{dt}\")\n",
-                p = pad(indent),
-                dt = dtype_str(tensor.dtype),
-            ));
+            match &tensor.reg_frag {
+                // STMATRIX epilogue datapath (canon's nvfp4 epilogue): the reg frag is
+                // a `tcgen05.{ld,st}`-atom fragment, not a plain thread-axis tile, so the
+                // reg->smem store lowers to STSM/stmatrix (vs the thread-axis tile's plain
+                // STS, which carries 5.4x the SMEM bank conflicts). The read frag is
+                // `alloc_tcgen05_ldst_frag(instr_shape, (128, W), dtype)`; the cast (output)
+                // frag is `alloc_cast_frag(<read_frag>, dtype)`, inheriting the read frag's
+                // (lane, register) layout so the f32->bf16 cast is a per-thread no-movement op.
+                Some(super::tensor::RegFrag::Stmatrix {
+                    instr_shape,
+                    cast_of,
+                }) => match cast_of {
+                    None => {
+                        out.push_str(&format!(
+                            "{p}{name} = T.alloc_tcgen05_ldst_frag(\"{instr_shape}\", ({wg_threads}, {width}), \"{dt}\")\n",
+                            p = pad(indent),
+                            wg_threads = WG_THREADS,
+                            dt = dtype_str(tensor.dtype),
+                        ));
+                    }
+                    Some(src_id) => {
+                        let src_name = ctx.tensor_name(*src_id)?.to_string();
+                        out.push_str(&format!(
+                            "{p}{name} = T.alloc_cast_frag({src_name}, \"{dt}\")\n",
+                            p = pad(indent),
+                            dt = dtype_str(tensor.dtype),
+                        ));
+                    }
+                },
+                None => {
+                    out.push_str(&format!(
+                        "{p}{name} = T.wg_reg_tile({width}, dtype=\"{dt}\")\n",
+                        p = pad(indent),
+                        dt = dtype_str(tensor.dtype),
+                    ));
+                }
+            }
             Ok(())
         }
         // ---- definitions handled in the header; skip in the body walk ----
@@ -2789,11 +2845,16 @@ fn emit_stmt(
             // {(0, 0)} (an elect nested in the warp-0 prologue branch), the
             // CTA-uniform `T.cuda.thread_rank() == 0` — canon's prologue form.
             if as_lane_zero_equality(cond) {
-                let thread_rank0 = child
-                    .set
-                    .as_ref()
-                    .and_then(|s| s.single_thread())
-                    == Some((0, 0));
+                // The thread_rank form is canon's PROLOGUE guard (one-time init
+                // code). A warp-0 elected region that CONTAINS a persistent loop
+                // (a worker role that happens to live on warp 0 — the nvfp4 MMA
+                // warp) is a hot loop guard, and canon writes `elect_sync()`
+                // there: the thread_rank predicate (a %tid.x read + compare on
+                // the vector path) measurably degrades ptxas's handling of the
+                // loop (nvfp4 1024: 6.26 -> 5.22 us on the guard form alone).
+                // So the narrowing applies only to loop-free (one-time) bodies.
+                let thread_rank0 = !body_has_loop(then_body)
+                    && child.set.as_ref().and_then(|s| s.single_thread()) == Some((0, 0));
                 // `barrier.cluster.wait` is WARP-COLLECTIVE and deadlocks when
                 // only the elected lane waits: peel any leading
                 // ClusterBarrierWaits out of the elect to the enclosing (warp)
@@ -3206,6 +3267,8 @@ fn emit_stmt(
             gmem_shape,
             mbar_stage,
             multicast_cta_mask,
+            cache_hint,
+            prefetch_tensormap,
             cta_group,
         } => {
             // The emitted `Tx.copy_async(..., cta_group=)` uses the KERNEL-level engine
@@ -3246,10 +3309,26 @@ fn emit_stmt(
                 Some(mask) => format!(", cta_mask={mask}"),
                 None => String::new(),
             };
+            // `cache_hint`: the per-load L2 eviction policy (canon's `cache_hint` on
+            // its g2c loads); None = no hint (the codegen-default policy).
+            let cache_hint_kw = match cache_hint {
+                Some(hint) => format!(", cache_hint=\"{hint}\""),
+                None => String::new(),
+            };
+            // `prefetch_tensormap` (IR-carried; the canonical prefetches the A/B
+            // tensormaps at entry — a `warp_id_in_cta==0`-guarded `prefetch.tensormap`,
+            // synthesized by the TMA dispatch from this config flag). On the
+            // latency-bound small shapes this hides the first descriptor fetch behind
+            // the prologue.
+            let prefetch_kw = if *prefetch_tensormap {
+                ", prefetch_tensormap=True"
+            } else {
+                ""
+            };
             emit_guarded(
                 out,
                 &format!(
-                    "Tx.copy_async({dst_s}, {src_s}, dispatch=\"tma\", mbar={mbar_name}.ptr_to([{mbar_slot}]), cta_group={cg}{cta_mask})",
+                    "Tx.copy_async({dst_s}, {src_s}, dispatch=\"tma\", mbar={mbar_name}.ptr_to([{mbar_slot}]), cta_group={cg}{cta_mask}{cache_hint_kw}{prefetch_kw})",
                     cg = ctx.cta_group,
                 ),
             );
@@ -3604,7 +3683,16 @@ fn emit_stmt(
                 let src_off = src.offsets.first().unwrap_or(&zero);
                 let width = src.shape.first().and_then(as_int).unwrap_or(0).max(0) as usize;
                 let src_s = emit_reg_view_slice(out, &p, &src.tensor, src_off, width, ctx)?;
-                out.push_str(&format!("{p}Tx.wg.copy({dst_s}, {src_s})\n"));
+                // STMATRIX epilogue: a `tcgen05.{ld,st}`-atom src frag stores reg->smem via
+                // `dispatch="ldstmatrix"` (canon's `regs_to_smem`), lowering to STSM. The
+                // kernel slices the store in 16-col chunks (stmatrix.x4 granularity). A plain
+                // thread-axis frag (reg_frag=None) keeps the default `Tx.wg.copy` (STS).
+                let dispatch = if src.tensor.reg_frag.is_some() {
+                    ", dispatch=\"ldstmatrix\""
+                } else {
+                    ""
+                };
+                out.push_str(&format!("{p}Tx.wg.copy({dst_s}, {src_s}{dispatch})\n"));
             } else {
                 // GMEM store (bootstrap direct epilogue): the warpgroup-collective
                 // `Tx.wg.copy(C[row:row+128, c0:c1], reg[:, :])`. The reg fragment is a
@@ -3632,6 +3720,8 @@ fn emit_stmt(
             gmem_shape,
             reduce_add,
             allow_nondet_reduce: _,
+            cache_hint,
+            prefetch_tensormap,
         } => {
             // `reduce_add` (`cp.reduce.async.bulk...add`) has no `Tx.copy_async`-level
             // dispatch in TIRx (only the raw PTX intrinsic exists) — emitting a plain
@@ -3645,9 +3735,24 @@ fn emit_stmt(
             // (thread 0 of a warpgroup branch, the elected lane of a warp branch).
             let src_s = emit_smem_tile(src, ctx)?;
             let dst_s = emit_gmem_region(dst, coords, gmem_extents(gmem_shape, shape), ctx)?;
+            // Both hints are IR-carried. `cache_hint="evict_first"` (canon's epilogue
+            // store policy): the store band is write-once output, never re-read by
+            // this kernel — dead lines must not pack L2 and evict the live operand
+            // tiles / TMA tensormaps.
+            let cache_hint_kw = match cache_hint {
+                Some(hint) => format!(", cache_hint=\"{hint}\""),
+                None => String::new(),
+            };
+            let prefetch_kw = if *prefetch_tensormap {
+                ", prefetch_tensormap=True"
+            } else {
+                ""
+            };
             emit_guarded(
                 out,
-                &format!("Tx.copy_async({dst_s}, {src_s}, dispatch=\"tma\")"),
+                &format!(
+                    "Tx.copy_async({dst_s}, {src_s}, dispatch=\"tma\"{cache_hint_kw}{prefetch_kw})"
+                ),
             );
             Ok(())
         }
@@ -3997,6 +4102,7 @@ mod tests {
             shape: vec![16, 16],
             layout: None,
             byte_offset: None,
+            reg_frag: None,
         })
     }
 
@@ -4022,7 +4128,10 @@ mod tests {
         Stmt::If {
             cond: ScalarValue::expr(
                 ScalarOp::Eq,
-                vec![ScalarValue::Scope(ScopeValueKind::WarpId), ScalarValue::Int(w)],
+                vec![
+                    ScalarValue::Scope(ScopeValueKind::WarpId),
+                    ScalarValue::Int(w),
+                ],
             ),
             then_body: body,
         }
@@ -4047,7 +4156,10 @@ mod tests {
         Stmt::If {
             cond: ScalarValue::expr(
                 ScalarOp::Eq,
-                vec![ScalarValue::Scope(ScopeValueKind::LaneId), ScalarValue::Int(0)],
+                vec![
+                    ScalarValue::Scope(ScopeValueKind::LaneId),
+                    ScalarValue::Int(0),
+                ],
             ),
             then_body: body,
         }
@@ -4097,7 +4209,10 @@ mod tests {
             unroll: false,
         };
         let src = kernel_to_tirx_source(&kernel(vec![rolled])).unwrap();
-        assert!(src.contains("for v0 in T.serial(4, unroll=False):"), "{src}");
+        assert!(
+            src.contains("for v0 in T.serial(4, unroll=False):"),
+            "{src}"
+        );
     }
 
     /// Arg names: A–H for the existing kernels, the full alphabet after, then
@@ -4161,6 +4276,7 @@ mod tests {
             shape: vec![1],
             layout: None,
             byte_offset: Some(0),
+            reg_frag: None,
         });
         let load = TensorSlice {
             tensor: mailbox.clone(),
@@ -4287,7 +4403,10 @@ mod tests {
         assert_eq!(count, 3, "{src}");
         // And the two adjacent inits inside ONE guard when the If is absent.
         let src2 = kernel_to_tirx_source(&kernel_n(
-            vec![Stmt::MBarDef { mbar: mbar.clone() }, wg_if(0, vec![init(), init()])],
+            vec![
+                Stmt::MBarDef { mbar: mbar.clone() },
+                wg_if(0, vec![init(), init()]),
+            ],
             8,
         ))
         .unwrap();
@@ -4388,6 +4507,28 @@ mod tests {
         let src = kernel_to_tirx_source(&kernel(vec![
             Stmt::MBarDef { mbar: mbar.clone() },
             warp_if(2, vec![elected_if(vec![init()])]),
+        ]))
+        .unwrap();
+        assert!(src.contains("if T.ptx.elect_sync():"), "{src}");
+        assert!(!src.contains("if T.cuda.thread_rank() == 0:"), "{src}");
+        // A warp-0 elected region CONTAINING a persistent loop (a worker role
+        // on warp 0, e.g. the nvfp4 MMA warp) is a hot-loop guard, not the
+        // prologue: it emits elect_sync, not thread_rank.
+        let loop_body = vec![Stmt::ForLoop {
+            var: crate::ir::scalar::Var {
+                id: crate::ir::scalar::VarId(90),
+                binding: crate::ir::dtype::VarBinding::Loop,
+                dtype: crate::ir::dtype::ScalarDType::I32,
+            },
+            start: crate::ir::scalar::ScalarValue::Int(0),
+            stop: crate::ir::scalar::ScalarValue::Int(4),
+            step: crate::ir::scalar::ScalarValue::Int(1),
+            body: vec![init()],
+            unroll: true,
+        }];
+        let src = kernel_to_tirx_source(&kernel(vec![
+            Stmt::MBarDef { mbar: mbar.clone() },
+            warp_if(0, vec![elected_if(loop_body)]),
         ]))
         .unwrap();
         assert!(src.contains("if T.ptx.elect_sync():"), "{src}");
@@ -4495,6 +4636,7 @@ mod tests {
             shape: vec![8],
             layout: None,
             byte_offset: None,
+            reg_frag: None,
         })
     }
 
