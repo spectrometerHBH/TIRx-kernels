@@ -86,6 +86,37 @@ def test_same_lane_reuse_across_loop_iterations_needs_no_sync():
     assert report["status"] == "Passed", report["diagnostics"]
 
 
+def _masked_handoff_kernel(*, warp_sync: bool):
+    """Lanes 16..31 store their own cells under a mask; lanes 0..15 then read
+    those cells. The writes live only in the writers' own lane dimensions
+    until a convergence point folds them into the warp-shared clock."""
+    b = builder("cross_lane_masked_handoff", smem_size_bytes=LANES * 4)
+    smem = smem_tensor(b, dtype=nr.DType.U32, shape=(LANES,), byte_offset=0)
+    reg = reg_tensor(b, dtype=nr.DType.U32, shape=(1,))
+    out = gmem_arg(b, dtype=nr.DType.U32, shape=(LANES,))
+    with b.if_warp(0):
+        b.reg_fill(reg, 7)
+        with b.if_(b.lane_id() >= 16):
+            b.reg_store(_cell(smem, b.lane_id()), reg)
+        if warp_sync:
+            b.warp_sync()
+        with b.if_(b.lane_id() < 16):
+            b.reg_load(reg, _cell(smem, 16 + b.lane_id()))
+            b.reg_store(_cell(out, b.lane_id()), reg)
+    return b.build()
+
+
+def test_masked_write_is_invisible_to_other_lanes_without_convergence():
+    report = nr.check_protocol(_masked_handoff_kernel(warp_sync=False))
+    assert report["status"] == "Failed"
+    assert "memory_data_race" in _codes(report), report["diagnostics"]
+
+
+def test_convergence_delivers_the_masked_write_to_every_lane():
+    report = nr.check_protocol(_masked_handoff_kernel(warp_sync=True))
+    assert report["status"] == "Passed", report["diagnostics"]
+
+
 def _stmatrix_kernel(*, collective: bool):
     """A cross-lane SMEM producer followed by a lane-rotated row read.
 
