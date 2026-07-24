@@ -4,6 +4,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -558,3 +559,117 @@ def test_run_scheduled_jobs_cancels_inflight_work(
     assert set(calls) == {"fails", "active"}
     assert retry_log == []
     assert [(record["config"], record["status"]) for record in records] == [("fails", "FAIL")]
+
+
+# ── Communication-library locks ──────────────────────────────────────────────
+
+_GEMM_COMM_WORKLOAD = [{"kernel": "allgather_gemm", "config": "cfg", "num_gpus": 1}]
+_PLAIN_WORKLOAD = [{"kernel": "fp16_bf16_gemm", "config": "cfg", "num_gpus": 1}]
+
+
+def _lock_args(**overrides):
+    values = {
+        "nvshmem_home": None,
+        "nccl_library": None,
+        "cublas_library": None,
+        "cublasmp_library": None,
+        "nvshmem_library": None,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+@pytest.fixture
+def clean_lock_env(monkeypatch: pytest.MonkeyPatch):
+    """Unset every lock env var and restore both env and module state afterwards."""
+    names = [env_name for env_name, _ in run._LIBRARY_LOCKS.values()]
+    originals = {name: os.environ.get(name) for name in names}
+    for name in names:
+        monkeypatch.delenv(name, raising=False)
+    yield
+    for name, value in originals.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+
+
+def _valid_lock_paths(tmp_path: Path) -> dict[str, str]:
+    home = tmp_path / "nvshmem"
+    home.mkdir()
+    paths = {"nvshmem_home": str(home)}
+    for option, soname in [
+        ("nccl_library", "libnccl.so.2"),
+        ("cublas_library", "libcublas.so"),
+        ("cublasmp_library", "libcublasmp.so.0"),
+        ("nvshmem_library", "libnvshmem_host.so.3"),
+    ]:
+        lib = tmp_path / soname
+        lib.touch()
+        paths[option] = str(lib)
+    return paths
+
+
+def test_uses_gemm_comm_detects_distributed_kernels() -> None:
+    assert run._uses_gemm_comm(_GEMM_COMM_WORKLOAD)
+    assert run._uses_gemm_comm(_GEMM_COMM_WORKLOAD + _PLAIN_WORKLOAD)
+    assert not run._uses_gemm_comm(_PLAIN_WORKLOAD)
+
+
+def test_resolve_library_locks_optional_without_gemm_comm(clean_lock_env) -> None:
+    assert run._resolve_library_locks(_lock_args(), _PLAIN_WORKLOAD) == {}
+
+
+def test_resolve_library_locks_required_for_gemm_comm(clean_lock_env, capsys) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        run._resolve_library_locks(_lock_args(), _GEMM_COMM_WORKLOAD)
+
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    for flag in (
+        "--nvshmem-home",
+        "--nccl-library",
+        "--cublas-library",
+        "--cublasmp-library",
+        "--nvshmem-library",
+    ):
+        assert flag in err
+
+
+def test_resolve_library_locks_accepts_valid_paths(clean_lock_env, tmp_path: Path) -> None:
+    resolved = run._resolve_library_locks(
+        _lock_args(**_valid_lock_paths(tmp_path)), _GEMM_COMM_WORKLOAD
+    )
+
+    assert set(resolved) == {env_name for env_name, _ in run._LIBRARY_LOCKS.values()}
+    for env_name, raw in resolved.items():
+        assert os.environ[env_name] == raw
+        assert Path(raw).is_absolute()
+
+
+def test_resolve_library_locks_env_fallback(clean_lock_env, tmp_path: Path, monkeypatch) -> None:
+    paths = _valid_lock_paths(tmp_path)
+    for option, (env_name, _kind) in run._LIBRARY_LOCKS.items():
+        monkeypatch.setenv(env_name, paths[option])
+
+    resolved = run._resolve_library_locks(_lock_args(), _GEMM_COMM_WORKLOAD)
+
+    assert len(resolved) == len(run._LIBRARY_LOCKS)
+
+
+def test_resolve_library_locks_rejects_missing_file(clean_lock_env, tmp_path: Path) -> None:
+    args = _lock_args(nccl_library=str(tmp_path / "no-such-lib.so"))
+
+    with pytest.raises(SystemExit) as excinfo:
+        run._resolve_library_locks(args, _PLAIN_WORKLOAD)
+
+    assert excinfo.value.code == 2
+
+
+def test_resolve_library_locks_rejects_relative_path(clean_lock_env) -> None:
+    args = _lock_args(nccl_library="libnccl.so.2")
+
+    with pytest.raises(SystemExit) as excinfo:
+        run._resolve_library_locks(args, _PLAIN_WORKLOAD)
+
+    assert excinfo.value.code == 2

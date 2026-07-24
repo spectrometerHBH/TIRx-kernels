@@ -26,7 +26,21 @@ two hard host requirements beyond torch/DeepGEMM:
 - **SGLang** checkout on `PYTHONPATH` (plus its CUTLASS DSL): the fp8 paged MQA
   rows bench the `sglang_cutedsl` reference unconditionally.
 - **NVSHMEM**: required by the `allgather_gemm` / `gemm_reduce_scatter`
-  (GemmComm) rows.
+  (GemmComm) rows. When any GemmComm row is present, the suite validates five
+  library locks at startup and exits with a config error if any is missing or
+  invalid — pass them as flags or env vars:
+
+  | Flag | Env var | Points at |
+  |------|---------|-----------|
+  | `--nvshmem-home` | `NVSHMEM_HOME` | NVSHMEM install prefix (compile-time headers) |
+  | `--nccl-library` | `TIRX_NCCL_LIBRARY` | `libnccl.so` |
+  | `--cublas-library` | `TIRX_CUBLAS_LIBRARY` | `libcublas.so` |
+  | `--cublasmp-library` | `TIRX_CUBLASMP_LIBRARY` | `libcublasmp.so` |
+  | `--nvshmem-library` | `TIRX_NVSHMEM_LIBRARY` | `libnvshmem_host.so` |
+
+  The four libraries must be absolute paths to existing files; they pin the
+  exact shared objects preloaded into every spawned rank worker so a
+  loader-path change cannot silently alter the comparison.
 
 `--filter` is include-only and cannot exclude rows. On a host without NVSHMEM,
 run a trimmed workload list:
@@ -166,6 +180,11 @@ defaults to FlashInfer's `auto` backend; set
 | `--cpu-workers` | `0` (= GPU count) | Concurrent workload workers (capped at GPU count) |
 | `--util-threshold` | `0` | Skip GPUs with SM utilization above this percent |
 | `--mem-threshold` | `0` | Skip GPUs with compute-app memory-used percent above this percent |
+| `--nvshmem-home` | `$NVSHMEM_HOME` | NVSHMEM install prefix (required by GemmComm workloads) |
+| `--nccl-library` | `$TIRX_NCCL_LIBRARY` | Absolute path to `libnccl.so` (required by GemmComm workloads) |
+| `--cublas-library` | `$TIRX_CUBLAS_LIBRARY` | Absolute path to `libcublas.so` (required by GemmComm workloads) |
+| `--cublasmp-library` | `$TIRX_CUBLASMP_LIBRARY` | Absolute path to `libcublasmp.so` (required by GemmComm workloads) |
+| `--nvshmem-library` | `$TIRX_NVSHMEM_LIBRARY` | Absolute path to `libnvshmem_host.so` (required by GemmComm workloads) |
 
 Round aggregation is always the arithmetic mean. The raw five-element sample arrays
 remain in the run JSON for variance and outlier inspection.

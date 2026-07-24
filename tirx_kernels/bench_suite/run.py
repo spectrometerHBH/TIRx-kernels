@@ -121,6 +121,81 @@ def load_workloads(path: Path) -> list[dict]:
     return out
 
 
+# ── Communication-library locks ──────────────────────────────────────────────
+
+# CLI option name -> (env var, path kind). gemm_comm (distributed) workloads
+# hard-require all five so a loader-path change cannot silently alter the
+# comparison against the NCCL/cuBLAS/cuBLASMp/NVSHMEM reference impls; the
+# resolved paths are exported to every bench subprocess via os.environ.
+_LIBRARY_LOCKS = {
+    "nvshmem_home": ("NVSHMEM_HOME", "dir"),
+    "nccl_library": ("TIRX_NCCL_LIBRARY", "file"),
+    "cublas_library": ("TIRX_CUBLAS_LIBRARY", "file"),
+    "cublasmp_library": ("TIRX_CUBLASMP_LIBRARY", "file"),
+    "nvshmem_library": ("TIRX_NVSHMEM_LIBRARY", "file"),
+}
+
+
+def _uses_gemm_comm(workloads: list[dict]) -> bool:
+    """True when any workload's kernel module lives in tirx_kernels.gemm_comm."""
+    for kernel in {w["kernel"] for w in workloads}:
+        try:
+            if find_spec(f"tirx_kernels.gemm_comm.{kernel}") is not None:
+                return True
+        except ModuleNotFoundError:
+            continue
+    return False
+
+
+def _resolve_library_locks(args, workloads: list[dict]) -> dict[str, str]:
+    """Validate communication-library paths and export them for bench subprocesses.
+
+    gemm_comm workloads require every lock (CLI flag or env var); any missing
+    or invalid path is a config error (exit 2) at suite entry, instead of a
+    mid-sweep failure inside a spawned rank worker. Locks are optional for
+    other workloads, but explicitly provided paths are still validated.
+    """
+    required = _uses_gemm_comm(workloads)
+    resolved: dict[str, str] = {}
+    problems: list[str] = []
+    for option, (env_name, kind) in _LIBRARY_LOCKS.items():
+        flag = f"--{option.replace('_', '-')}"
+        raw = getattr(args, option, None) or os.environ.get(env_name)
+        if not raw:
+            if required:
+                problems.append(f"{flag} (or {env_name}) is not set")
+            continue
+        path = Path(raw)
+        if not path.is_absolute():
+            problems.append(f"{flag} must be an absolute path: {raw}")
+            continue
+        try:
+            path = path.resolve(strict=True)
+        except FileNotFoundError:
+            problems.append(f"{flag} does not exist: {raw}")
+            continue
+        if kind == "file" and not path.is_file():
+            problems.append(f"{flag} is not a file: {raw}")
+            continue
+        if kind == "dir" and not path.is_dir():
+            problems.append(f"{flag} is not a directory: {raw}")
+            continue
+        resolved[env_name] = str(path)
+    if problems:
+        for problem in problems:
+            print(f"[bench-suite] {problem}", file=sys.stderr)
+        if required:
+            print(
+                "[bench-suite] gemm_comm workloads lock their "
+                "NCCL/cuBLAS/cuBLASMp/NVSHMEM libraries so a loader-path change "
+                "cannot silently alter the comparison.",
+                file=sys.stderr,
+            )
+        sys.exit(2)
+    os.environ.update(resolved)
+    return resolved
+
+
 # ── GPU pool ─────────────────────────────────────────────────────────────────
 
 
@@ -1517,6 +1592,41 @@ def main() -> None:
         "Each worker atomically holds all GPUs requested by its workload.",
     )
     ap.add_argument(
+        "--nvshmem-home",
+        type=str,
+        default=os.environ.get("NVSHMEM_HOME"),
+        help="NVSHMEM install prefix used at kernel compile time "
+        "(default: NVSHMEM_HOME env; required by gemm_comm workloads)",
+    )
+    ap.add_argument(
+        "--nccl-library",
+        type=str,
+        default=os.environ.get("TIRX_NCCL_LIBRARY"),
+        help="Absolute path to libnccl.so "
+        "(default: TIRX_NCCL_LIBRARY env; required by gemm_comm workloads)",
+    )
+    ap.add_argument(
+        "--cublas-library",
+        type=str,
+        default=os.environ.get("TIRX_CUBLAS_LIBRARY"),
+        help="Absolute path to libcublas.so "
+        "(default: TIRX_CUBLAS_LIBRARY env; required by gemm_comm workloads)",
+    )
+    ap.add_argument(
+        "--cublasmp-library",
+        type=str,
+        default=os.environ.get("TIRX_CUBLASMP_LIBRARY"),
+        help="Absolute path to libcublasmp.so "
+        "(default: TIRX_CUBLASMP_LIBRARY env; required by gemm_comm workloads)",
+    )
+    ap.add_argument(
+        "--nvshmem-library",
+        type=str,
+        default=os.environ.get("TIRX_NVSHMEM_LIBRARY"),
+        help="Absolute path to libnvshmem_host.so "
+        "(default: TIRX_NVSHMEM_LIBRARY env; required by gemm_comm workloads)",
+    )
+    ap.add_argument(
         "--check-imports",
         action="store_true",
         help="Import every unique kernel in --workloads and exit (for CI import gates)",
@@ -1545,6 +1655,11 @@ def main() -> None:
         names = check_workload_imports(workloads, strict=True)
         print(f"[bench-suite] import check ok ({len(names)} kernels from {args.workloads})")
         return
+
+    # Fail fast on missing/invalid communication-library locks before any GPU
+    # work; a missing lock would otherwise surface mid-sweep inside a spawned
+    # rank worker. Resolved paths are exported for all bench subprocesses.
+    _resolve_library_locks(args, workloads)
 
     out_dir = args.out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)

@@ -82,6 +82,12 @@ export TIRX_NVSHMEM_LIBRARY=/path/to/libnvshmem_host.so
 export PYTHONPATH=/path/to/nvmath-python:/path/to/cublasmp-package:$PYTHONPATH
 ```
 
+Under `python -m tirx_kernels.bench_suite`, the same locks (plus
+`NVSHMEM_HOME`) can be passed as suite flags — `--nccl-library`,
+`--cublas-library`, `--cublasmp-library`, `--nvshmem-library`,
+`--nvshmem-home` — and the suite fails at startup when a GemmComm workload is
+present but a lock is missing.
+
 The selected files are preloaded only in newly spawned rank workers. Each
 result records the actual shared object resolving the NCCL, cuBLAS, cuBLASMp,
 and NVSHMEM API symbol together with its runtime version, and fails if any
