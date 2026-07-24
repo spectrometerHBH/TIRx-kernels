@@ -263,8 +263,8 @@ def _mma64_kernel(dtype, lane_align, accum, trans_a, trans_b):
             b.mbarrier_init(ma, count=1)
             b.mbarrier_init(mb, count=1)
             b.mbarrier_init(mc, count=1)
-    # Publish the alloc + mbar cells to every warp stream (no implicit barrier
-    # between kernel_init and roles in the per-warp model).
+    # Publish the alloc + mbar cells to every warp stream before any consumer
+    # touches them.
     b.cta_sync()
 
     with b.if_warpgroup(0):

@@ -118,8 +118,8 @@ def test_tma_multicast_writes_each_cta_smem():
 
     with b.if_warp(0), b.if_elected():
         # The issuing thread arms expect_tx immediately before its own tma_load;
-        # then BOTH CTAs gate their reads on the load's mbarrier (CTA 1 waits it
-        # remotely) — the old epoch barrier between role and finalize is gone.
+        # then BOTH CTAs gate their reads on the load's mbarrier (CTA 1 waits
+        # it remotely).
         with b.if_(cta_eq(b, 0)):
             b.mbarrier_arrive_expect_tx(mbar, bytes=16)
             b.tma_load(
@@ -229,7 +229,7 @@ def _tma_load_fake_release_kernel(wait_tma):
     tma_mbar = b.mbar(kind=nr.MBarKind.TMA)
     ready = b.mbar(kind=nr.MBarKind.THREAD)
     # Per-thread init on one elected thread; the cta_sync publishes the
-    # initialized cells to warp 4 (no implicit init epoch anymore).
+    # initialized cells to warp 4.
     with b.if_warp(0), b.if_elected():
         b.mbarrier_init(tma_mbar, count=1)
         b.mbarrier_init(ready, count=1)

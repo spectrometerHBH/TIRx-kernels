@@ -166,10 +166,9 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
             k.mbarrier_init(mma_done, count=2)
             # Both epilogue warpgroups free the accumulator each task (count=2).
             k.mbarrier_init(accum_empty, count=2)
-    # Publish the prologue (TMEM alloc + mbarrier cells) to every consumer
-    # before any wait/arrive touches them. There is no implicit barrier
-    # between top-level statements — this sync IS the prologue ordering.
-    # cta_group=2 peers read each other's mbars, so the publish must be
+    # This sync IS the prologue ordering: it publishes the TMEM alloc and the
+    # mbarrier cells to every consumer stream before any wait/arrive touches
+    # them. cta_group=2 peers read each other's mbars, so the publish must be
     # cluster-wide there.
     if config.cta_group == 2:
         k.cluster_sync()
@@ -280,8 +279,8 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
                     k.tcgen05_commit(mma_done, cta_group=config.cta_group, multicast_cta_mask=0b11)
 
     for epilogue_wg, c_smem in enumerate(c_smem_tiles):
-        # One named barrier per epilogue warpgroup: the cross-warp program
-        # order the old whole-role stream provided implicitly is now explicit.
+        # One named barrier per epilogue warpgroup: it carries the cross-warp
+        # program order the drain and the single-thread tail depend on.
         wg_bar = 1 + epilogue_wg
         with k.if_warpgroup(epilogue_wg):
             k.set_maxnreg(config.epilogue_maxnreg)

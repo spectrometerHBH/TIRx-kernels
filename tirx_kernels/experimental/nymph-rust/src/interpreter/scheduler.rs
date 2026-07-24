@@ -2,9 +2,9 @@
 //!
 //! One stream per (cta, warp), each running the WHOLE kernel body top to
 //! bottom — the warp is the hardware's own lockstep unit, everything above it
-//! is concurrency. There are no epochs and no implicit barriers: cross-warp
-//! and cross-CTA ordering comes only from explicit sync ops (mbarrier waits
-//! park and wake event-driven; collective syncs rendezvous in shared state).
+//! is concurrency. Cross-warp and cross-CTA ordering comes from explicit sync
+//! ops: mbarrier waits park and wake event-driven, collective syncs rendezvous
+//! in shared state.
 //! Each stream owns a frame stack; loop-var writes are eager. Bodies are
 //! borrowed from the kernel (`'k`), zero-copy. `flatten/unflatten_coord` are
 //! dimension-0-fastest.
@@ -148,8 +148,8 @@ pub struct SchedulerState<'k> {
 
 impl<'k> SchedulerState<'k> {
     /// Per-warp streams: every (cta, warp) runs the WHOLE kernel body from
-    /// the start, exactly like hardware. There are no phases and no implicit
-    /// barriers — all cross-warp ordering comes from explicit sync ops.
+    /// the start, exactly like hardware; all cross-warp ordering comes from
+    /// explicit sync ops.
     pub fn from_kernel(kernel: &'k Kernel) -> SchedulerState<'k> {
         let cta_thread_masks = expand_threads_by_cta(kernel);
         let num_warps = kernel.num_warps as usize;
@@ -175,9 +175,8 @@ impl<'k> SchedulerState<'k> {
         }
     }
 
-    /// With eager materialization a CTA is Active until its last warp stream
-    /// completes, then Exited. (`NotStarted` no longer occurs: every stream
-    /// exists from round 0.)
+    /// Every stream exists from round 0, so a CTA is Active until its last
+    /// warp stream completes, then Exited.
     pub fn cta_activity_status(&self, cta_id: usize) -> CtaActivityStatus {
         if cta_id >= self.schedules.len() {
             return CtaActivityStatus::Missing;

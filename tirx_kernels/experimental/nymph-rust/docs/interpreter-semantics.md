@@ -6,8 +6,7 @@ ordering, latency, cache, descriptor, or compiler-lowering semantics.
 
 Structural control statements are interpreter core: `If`, `ForLoop`,
 `ForEachTask`, `SchedulerImpl`, `Loop`, and `BreakIf`. All thread dispatch is
-`If` over per-thread scalar predicates; there are no dedicated dispatch
-statements. Leaf-style operation statements execute through built-in cohort
+`If` over per-thread scalar predicates. Leaf-style operation statements execute through built-in cohort
 executors. Unsupported statements fail closed with `unsupported_stmt`.
 
 Each execution stream is one warp, and a statement executes over the stream's

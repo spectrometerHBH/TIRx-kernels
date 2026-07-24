@@ -446,10 +446,10 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
                 k.mbarrier_init(tmem_full, count=1, stage=s)
                 # One arrival per CTA: each CTA's epilogue leader thread.
                 k.mbarrier_init(tmem_empty, count=cta_group, stage=s)
-    # Publish the prologue (TMEM alloc + mbarrier cells) to every stream before
-    # any wait/arrive touches them. There is no implicit barrier between
-    # top-level statements — this sync IS the prologue ordering, and it must be
-    # cluster-wide: the peer CTA arrives at the LEADER's trans_done/tmem_empty.
+    # This sync IS the prologue ordering: it publishes the TMEM alloc and the
+    # mbarrier cells to every stream before any wait/arrive touches them. It
+    # must be cluster-wide — the peer CTA arrives at the LEADER's
+    # trans_done/tmem_empty.
     k.cluster_sync()
 
     # ---- TMA producer (TIRx wg0/warp0) ----
@@ -518,7 +518,7 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
     # ---- scale-factor permute (TIRx wg0/warp2) ----
     # Whole-warp scope: the permute reg ops are warp-collective. Once-per-warp
     # ops (the padding zeroing, the trans_done arrive) narrow to one elected
-    # thread; warp-stream program order covers store -> arrive without a sync.
+    # thread.
     with k.if_warp(2):
         # The TMA writes only the first DG_BLOCK rows of each (128-aligned) scale
         # buffer; the tcgen05.cp copies the whole aligned buffer. Zero the padding
@@ -636,9 +636,9 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
     # ---- epilogue (TIRx wg1) ----
     # Full-warpgroup scope for the warp-collective accumulator drains; every
     # once-per-execution op (bulk-group wait, tmem_empty arrive, tma_store,
-    # commit_group) narrows to the leader thread, with the cross-warp program
-    # order the old whole-role stream provided implicitly made explicit as
-    # wg_syncs (barrier_id=10, the warpgroup's one named barrier).
+    # commit_group) narrows to the leader thread, and wg_syncs (barrier_id=10,
+    # the warpgroup's one named barrier) carry the cross-warp program order
+    # between the two.
     with k.if_warpgroup(1):
         with k.for_each_task(task_scheduler) as task:
             local_iter = (task.task_id - task_start) // task_step

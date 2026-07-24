@@ -93,8 +93,8 @@ def test_tcgen05_commit_runtime_failures_are_closed():
     with expect_runtime_error("mbarrier_arrive_overflow"):
         run(b.build())
 
-    # No epochs anymore, so "CTA 0 exits before CTA 1 commits" must be built
-    # explicitly: CTA 0's LAST statement remote-arrives CTA 1's `go` barrier and
+    # "CTA 0 exits before CTA 1 commits" is built explicitly out of the
+    # kernel's own handshake: CTA 0's LAST statement remote-arrives CTA 1's `go` barrier and
     # then CTA 0 runs off the end of its program; CTA 1 waits `go` and burns a
     # few filler statements so CTA 0's streams retire before the commit issues.
     b = builder("tcgen05_commit_peer_exited", launch_shape=(2,), cluster_shape=(2,))

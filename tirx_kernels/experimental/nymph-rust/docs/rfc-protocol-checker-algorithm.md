@@ -27,8 +27,15 @@ Full checker passes run only after trace execution returns `Passed`.
   order.
 - Each modeled op is atomic at checker granularity.
 - Different streams may interleave arbitrarily. Warps of one CTA are separate
-  streams: cross-warp pairs carry no implicit ordering, and there is no
-  same-stream exemption above the warp.
+  streams, so cross-warp pairs are ordered only by explicit synchronization.
+- Within one stream, program order orders each LANE against itself. A pair of
+  accesses by DIFFERENT lanes of the warp is ordered by a warp-level sync
+  between them: a passed cooperative barrier (`warp_sync`, `wg_sync`,
+  `cta_sync`, a named barrier, `cluster_sync`) or a warp-collective
+  instruction (`ldmatrix`, `stmatrix`, `tcgen05.ld`, `tcgen05.st`, warp MMA),
+  which every lane converges on. An access performed by an async engine
+  (`proxy = async`) is ordered by its own drain rule, checked by the async
+  passes.
 - Barriers, waits, syncs, fences, commits, and async drains constrain legal
   interleavings.
 - Event vector order is canonical trace order, not cross-stream

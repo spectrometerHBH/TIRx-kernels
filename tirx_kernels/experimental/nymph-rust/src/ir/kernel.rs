@@ -1,6 +1,6 @@
-//! The `Kernel` — the whole executable IR. With the `Arc<Tensor>` / `Arc<MBar>`
-//! model there is no separate table: each tensor/mbar's data is owned by its `Arc`
-//! and shared wherever it's referenced. The kernel just lists its argument tensors.
+//! The `Kernel` — the whole executable IR. Each tensor/mbar's data is owned by
+//! its `Arc<Tensor>` / `Arc<MBar>` and shared wherever it is referenced, so the
+//! kernel itself just lists its argument tensors.
 
 use super::stmt::Stmt;
 use super::tensor::Tensor;

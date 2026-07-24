@@ -64,8 +64,8 @@ Region validation rules:
 - TMEM regions are rank-2 boxes in `(lane, lane_byte)`;
 - every range uses `start < end` and must be inside the owner pool bounds.
 
-There are no separate alternate region variants. A sparse access is represented
-as `Vec<BoxN>`, with unit boxes for individual points.
+One region type covers dense and sparse alike: a sparse access is a
+`Vec<BoxN>` with unit boxes for individual points.
 
 TMEM columns are 32-bit cells in the IR, but trace regions store lane bytes:
 `col` maps to `col * 4`. For example, columns `[8, 16)` become lane-byte range

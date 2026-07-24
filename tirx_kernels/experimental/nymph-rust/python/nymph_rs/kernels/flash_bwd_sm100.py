@@ -390,7 +390,7 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
     # flashattn: GQA f32 -> gcd(128//4, hdim/2)=gcd(32,..) (=dK_reduce_ncol); MHA bf16 ->
     # gcd(128//2, hdim/2)=gcd(64,..) (=epi_tile[1]). Per-wg row = RNCOL*dkv_bytes = 128 B either
     # way, so f32 total = tile_n*RNCOL*NUM_CWG*4 = bf16 total = tile_n*RNCOL*NUM_CWG*2 = 32 KB ==
-    # bf16 sK, so the sdK→sK / sdV→sV alias no longer grows them past 227 KB.
+    # bf16 sK, so the sdK→sK / sdV→sV alias keeps SMEM within the 227 KB budget.
     NUM_CWG = 2  # two compute warpgroups (each owns a wg-half)
     _dkv_bytes = 4 if gqa else 2  # f32 (GQA reduce) / bf16 (MHA store)
     DK_RNCOL = _math_gcd(128 // _dkv_bytes, hdim // 2)  # GQA:32  MHA:64 (chunk width, dK)
@@ -802,11 +802,11 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
                 stg = spec[2] if len(spec) > 2 else 1
                 for s in range(stg):
                     k.mbarrier_init(bars[nm], count=spec[1], stage=s)
-    # Publish the prologue (TMEM alloc + mbarrier cells) to every stream before
-    # any wait/arrive touches them — there is no implicit barrier between
-    # top-level statements. 2-CTA peers read each other's mbars (peer_bars /
-    # peer_free / the s2cluster's remote dS_cluster_full), so the publish must
-    # be cluster-wide there.
+    # This sync IS the prologue ordering: it publishes the TMEM alloc and the
+    # mbarrier cells to every stream before any wait/arrive touches them.
+    # 2-CTA peers read each other's mbars (peer_bars / peer_free / the
+    # s2cluster's remote dS_cluster_full), so the publish must be cluster-wide
+    # there.
     if use_2cta:
         k.cluster_sync()
     else:
@@ -2473,10 +2473,10 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
                     # async op that thread 0 issues — it cannot carry a per-row predicate, so a partial
                     # last Q-tile's OOB rows (mb*TILE_M+tid >= slen_q) would reduce-add into the NEXT
                     # packed sequence's VALID dQ rows (the interior boundary the TMA clamp does NOT
-                    # squash). Value-correctness no longer RESTS on the compute OOB-mask chain making
-                    # those rows incidentally bit-exact 0 (masked fragS=-inf -> P=0 -> dS=0 -> dQ=0):
-                    # instead we make the 0-addend EXPLICIT by zeroing the OOB rows of the sdQ staging
-                    # buffer before the reduce-add. Each thread owns row `tid`, so it stages its own
+                    # squash). Value correctness must not rest on the compute OOB-mask chain making
+                    # those rows incidentally bit-exact 0 (masked fragS=-inf -> P=0 -> dS=0 -> dQ=0),
+                    # so the 0-addend is EXPLICIT: the OOB rows of the sdQ staging buffer are zeroed
+                    # before the reduce-add. Each thread owns row `tid`, so it stages its own
                     # fragdQ for a valid row and an explicit 0.0 for an OOB row. (D1: the staged zero
                     # is now load-bearing, not incidental; the FINAL sequence's tail still overruns the
                     # buffer end where the TMA clamp squashes it.)

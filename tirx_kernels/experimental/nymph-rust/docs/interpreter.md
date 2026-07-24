@@ -3,11 +3,15 @@
 The interpreter runs one bounded Nymph kernel by expanding every modeled GPU
 thread, materializing one execution stream per `(cta, warp)`, and stepping
 those streams in deterministic source order. Every stream runs the whole
-kernel body top to bottom. The warp is the hardware's lockstep unit — its 32
-lanes step together under masked execution — and everything above the warp is
-concurrency. There are no implicit barriers of any kind: cross-warp and
-cross-CTA ordering must be expressed by modeled synchronization or explicit
-protocol handshakes.
+kernel body top to bottom. A warp's 32 lanes share one instruction stream and
+execute it under masked divergence; the lanes advance through it independently
+(sm_70+ Independent Thread Scheduling), so a memory dependency between two
+lanes of one warp is ordered by a warp-level sync — `warp_sync`, a
+warp-collective instruction, or a cooperative barrier the warp passes. Above
+the warp, everything is concurrency. All ordering is explicit: cross-lane,
+cross-warp, and cross-CTA dependencies alike must be expressed by modeled
+synchronization or explicit protocol handshakes, and the protocol checker
+verifies each of them.
 
 ## Modules
 

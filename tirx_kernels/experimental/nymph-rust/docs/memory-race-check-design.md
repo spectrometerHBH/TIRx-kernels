@@ -95,10 +95,28 @@ happens_before(a_event_idx, b_event_idx) -> bool
 
 Ordering facts are schedule-independent:
 
-- same-stream program order;
+- same-stream program order, which orders each LANE of the warp against itself;
 - mbar release to matching mbar wait.
 
-Cross-stream trace vector order is not a happens-before edge.
+Cross-stream trace vector order is a happens-before edge only where one of
+these facts supplies it.
+
+A same-stream pair whose lanes differ needs an intra-warp ordering fact, since
+the lanes of a warp advance independently (sm_70+). Such a pair is ordered when
+any of these holds:
+
+- either member is a warp-collective instruction, which every lane converges
+  on (`ldmatrix`, `stmatrix`, `tcgen05.ld`, `tcgen05.st`, warp MMA);
+- either member is performed by an async engine (`proxy = async`), whose window
+  is checked by the async passes against its own drain;
+- a cross-lane ordering point of that stream lies strictly between the two
+  events: a passed cooperative barrier or a warp-collective instruction;
+- the overlap is same-lane only, i.e. every overlapping pair of per-lane boxes
+  belongs to one lane, so per-lane program order already covers it.
+
+Per-lane attribution rides on the access record as `Region.lane_boxes`, filled
+for lane-divergent SMEM/TMEM accesses and for single-lane cohorts. An access
+without it is uniform: every executing lane touches the whole region.
 
 ## Projection Requirements
 
@@ -116,7 +134,8 @@ tensor footprints.
 
 ## Diagnostics
 
-`memory_data_race` diagnostics include:
+`memory_data_race` (cross-stream) and `intra_warp_cross_lane_race` (cross-lane
+within one warp) diagnostics include:
 
 - `left_event_idx` and `right_event_idx`;
 - left/right `stmt_id` and `stmt_kind` when available;
@@ -124,7 +143,13 @@ tensor footprints.
 - owner summary;
 - one overlapping witness box.
 
+`intra_warp_cross_lane_race` also carries `lanes`, the two lanes whose
+footprints overlap (`all` when a uniform region puts every executing lane on
+one side).
+
 The pass works on SMEM and TMEM through the same `Region` overlap path. Tests
 cover physical SMEM aliasing, write/write and write/read races, read/read
-non-conflicts, owner separation, non-overlap, same-stream and mbar HB ordering,
-large-write/partial-read behavior, and TMEM Layout F untouched lane gaps.
+non-conflicts, owner separation, non-overlap, mbar HB ordering,
+large-write/partial-read behavior, TMEM Layout F untouched lane gaps, and each
+intra-warp rule: lane-rotated dependency, `warp_sync` ordering, same-lane
+reuse, warp-collective ordering, and async-engine members.

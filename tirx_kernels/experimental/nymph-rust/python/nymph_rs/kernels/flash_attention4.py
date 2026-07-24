@@ -668,8 +668,7 @@ def _emit_tma_load_role(
 ) -> None:
     # Single-thread TMA producer stream (lane 0 of warp 13): mbarrier waits
     # are fine from one thread, arrive_expect_tx is per-thread (one arm per
-    # load), and tma_load requires a single-thread cohort — the old nested
-    # elected roles collapse into the stream itself.
+    # load), and tma_load requires a single-thread cohort.
     with k.if_warp(13), k.if_elected():
         with _persistent_task_loop(k, task_smem, task_full, task_empty) as (
             _task_id,

@@ -540,10 +540,8 @@ class IRBuilder:
     def if_elected(self) -> Iterator[None]:
         """Lane 0 of EVERY warp in context (`lane_id() == 0`).
 
-        NOTE: this is per-warp election, not the old `role(elected=True)`
-        semantics. For one thread per warpgroup use
-        `if_(tid_in_wg().eq(0))`; for one thread per CTA nest it under
-        `if_warp(w)`.
+        For one thread per warpgroup use `if_(tid_in_wg().eq(0))`; for one
+        thread per CTA nest this under `if_warp(w)`.
         """
         with self.if_(self.lane_id().eq(0)):
             yield

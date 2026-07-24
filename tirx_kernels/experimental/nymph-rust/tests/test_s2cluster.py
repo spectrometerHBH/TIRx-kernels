@@ -10,11 +10,9 @@ the cross-CTA happens-before closes through the peer's wait). Test both:
   - WITHOUT the wait → the peer reads s2cluster-written SMEM before waiting its barrier
     → the checker flags it (access-before-wait / race), proving the HB isn't faked.
 
-Per-warp adaptation of the nymph-codegen original: `role(warp=0)` becomes
-`if_warp(0)`; the per-thread mbarrier.init moves under `if_warp(0) + if_elected()`
-and is published to the peer CTA with an explicit top-level `cluster_sync()`
-(the old role-epoch model published inits implicitly); the s2cluster issue is
-single-thread (`tid_in_wg()==0`, its per-warp issue gate).
+The per-thread mbarrier.init runs under `if_warp(0) + if_elected()` and is
+published to the peer CTA by a top-level `cluster_sync()`; the s2cluster issue
+is single-thread (`tid_in_wg()==0`, its issue gate).
 """
 
 import numpy as np

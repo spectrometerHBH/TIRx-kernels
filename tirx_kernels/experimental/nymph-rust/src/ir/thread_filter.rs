@@ -1,9 +1,9 @@
 //! Static per-thread evaluation of `If` predicates.
 //!
-//! Under the per-warp execution model, all thread dispatch is `If` over a
-//! free-form scalar predicate. Validation rules that used to hang off `Role`
-//! structure (wg_sync scope, tmem alloc warp scope, setmaxnreg warpgroup
-//! coverage, ...) instead ask: *which threads of a CTA can enter this branch?*
+//! All thread dispatch is `If` over a free-form scalar predicate, so the
+//! validation rules that constrain an op's execution scope (wg_sync coverage,
+//! tmem alloc warp scope, setmaxnreg warpgroup coverage, ...) all reduce to
+//! one question: *which threads of a CTA can enter this branch?*
 //!
 //! `static_thread_filter(cond, num_warps)` answers that by evaluating the
 //! predicate at every (warp_id, lane_id) point of one CTA. Predicates built

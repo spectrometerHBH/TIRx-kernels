@@ -1,17 +1,13 @@
-"""Per-warp execution model regressions.
+"""Per-warp execution model regressions — the load-bearing properties.
 
-These pin the three behaviors the model switch was FOR — each was wrong or
-unrepresentable under the fused role-stream model:
-
-1. Intra-warpgroup cross-warp races are REAL races: staging writes by all
-   warps followed by a single-thread bulk store must be rejected without the
-   wg_sync (the fused model's same-stream shortcut silently ordered them).
-2. PTX execution-thread rules are enforced: single-thread issue ops reject
-   multi-thread cohorts, and mbarrier arrives really are per-thread (one
-   full-warp arrive(1) fills a count=32 barrier — under once-per-execution
-   semantics the waiter would deadlock).
-3. Cross-warp producer/consumer where the CONSUMER precedes the producer in
-   source order completes (the fused epoch schedule falsely deadlocked it).
+1. Cross-warp accesses inside one warpgroup are race-checked: staging writes
+   by all four warps followed by a single-thread bulk store need the wg_sync
+   between them, and the checker reports the race when it is missing.
+2. PTX execution-thread rules hold: single-thread issue ops reject
+   multi-thread cohorts, and mbarrier arrives are per-thread (one full-warp
+   arrive(1) fills a count=32 barrier).
+3. Warps interleave freely, so a consumer that precedes its producer in
+   source order still completes.
 """
 
 import numpy as np
@@ -37,8 +33,8 @@ def _epilogue_kernel(with_wg_sync: bool):
 
 
 def test_missing_wg_sync_between_staging_and_store_is_a_race():
-    # The exact hole the fused model had: warp 1's reg_store vs warp 0's
-    # tma_store read were same-stream there and never checked.
+    # warp 1's reg_store and warp 0's tma_store read overlap in c_smem with
+    # nothing ordering them.
     report = nr.check_protocol(_epilogue_kernel(with_wg_sync=False))
     assert report["status"] == "Failed"
     codes = {d["code"] for d in report["diagnostics"]}
@@ -79,9 +75,8 @@ def test_single_thread_issue_ops_reject_multi_thread_cohorts():
 
 def test_mbarrier_arrive_is_per_thread():
     # count=32; warp 1 issues ONE arrive(1) statement with all 32 threads.
-    # Per-thread semantics fills the barrier and the waiter completes; the
-    # old once-per-execution semantics would leave 31 pending arrivals and
-    # deadlock the waiter.
+    # Each thread applies the operand, so the 32 arrivals fill the barrier and
+    # the waiter completes.
     b = builder("mbar_per_thread", num_warps=4)
     mbar = b.mbar(kind=nr.MBarKind.THREAD, stages=1)
     with b.if_warp(0):
@@ -97,8 +92,8 @@ def test_mbarrier_arrive_is_per_thread():
 
 def test_consumer_before_producer_in_source_order_completes():
     # warp 0 (earlier in source) WAITS; warp 1 (later in source) ARRIVES.
-    # The fused epoch model serialized source order and falsely deadlocked
-    # this shape; per-warp streams interleave and complete it.
+    # Source order does not constrain warps, so the two streams interleave and
+    # the handshake completes.
     b = builder("consume_then_produce", num_warps=4, smem_size_bytes=64)
     src = gmem_arg(b, shape=(4,))
     out = gmem_arg(b, shape=(4,))

@@ -1557,10 +1557,8 @@ fn define_var(var: Var, defined: &mut HashSet<Var>) -> R {
 /// classes (wg_sync vs named_barrier). The 16 hardware named barriers are ONE
 /// resource shared by both classes: a warp whose arrivals count toward a
 /// wg_sync(id) AND a named_barrier(id) folds two different rendezvous into one
-/// hardware barrier. The old rule was role-scoped ("one role may not use the
-/// same barrier_id for both classes"); roles no longer exist, so the per-warp
-/// re-derivation keys on the statically-known WARP SETS instead: the warps
-/// reaching wg_sync(id) must be disjoint from the warps reaching
+/// hardware barrier. The rule keys on the statically-known WARP SETS: the
+/// warps reaching wg_sync(id) must be disjoint from the warps reaching
 /// named_barrier(id). Disjoint reuse (one warpgroup's private wg_sync(1) next
 /// to a named_barrier(1) among OTHER warpgroups) stays legal, as on hardware.
 /// Unknown filters skip, like the other static shape rules.

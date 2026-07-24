@@ -90,9 +90,7 @@ def test_fp8_blockwise_gemm_protocol_bench_shapes_resident_tier():
     # too but takes ~3.5 min, so it stays a one-off verification (recorded in
     # the PR), not resident.
     for s in (4096, 8192):
-        kernel = build_fp8_blockwise_gemm(
-            Fp8BlockwiseGemmConfig(m=s, n=s, k=s, launch_shape=(2,))
-        )
+        kernel = build_fp8_blockwise_gemm(Fp8BlockwiseGemmConfig(m=s, n=s, k=s, launch_shape=(2,)))
         assert nr.check_protocol(kernel)["status"] == "Passed", s
 
 

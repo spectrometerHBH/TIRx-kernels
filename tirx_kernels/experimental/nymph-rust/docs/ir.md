@@ -29,8 +29,8 @@ and interpretation.
 
 ## Conventions
 
-- Statements are variants of one `Stmt` enum. There is no intermediate
-  op-family base class.
+- Statements are variants of one flat `Stmt` enum, so every structural walk
+  matches exhaustively over the full set.
 - Body-bearing variants implement `Stmt::child_bodies()`. Structural walks use
   this hook, so new control nodes must expose their nested bodies there.
 - Tensor layouts are metadata for lowering and for modeled TMEM physical
