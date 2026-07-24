@@ -1,14 +1,14 @@
 {
-  "timestamp": "6",
-  "label": "6d46ac95-dirty",
+  "timestamp": "2",
+  "label": "691feec4-dirty",
   "git": {
-    "tir": "d25621f5",
-    "tirx-kernels": "aa97050f",
+    "tir": "8777f744-dirty",
+    "tirx-kernels": "691feec4-dirty",
     "tirx-bench-ci": null
   },
   "kernel_tree": {
-    "tir:python/tvm/tirx": "2ad8f7e977d9daf7cf89e8a57bb8a577e74a01f8",
-    "tirx-kernels:tirx_kernels": "358949c5606de9d776fed221074d6cebf9e0f969"
+    "tir:python/tvm/tirx": "7e0e555b403a27365d5fddccf3d2e68d55dd9aad",
+    "tirx-kernels:tirx_kernels": "0af5247128a47c9b3b0034bbc0f5232848774b2c"
   },
   "baselines": {
     "torch": {
@@ -79,12 +79,12 @@
       "label": "tp1_m8192_n106496_k16384_fp16_dynamic",
       "status": "ok",
       "impls": {
-        "tirx": 23208.03229014079,
-        "cublas_nccl_cudagraph": 20919.927914937336,
-        "cublasmp_split_p2p": 21170.632203420002
+        "tirx": 19295.329399999988,
+        "cublas_nccl_cudagraph": 17885.302799999987,
+        "cublasmp_split_p2p": 18124.6783
       },
       "aggregated": {
-        "rounds": 6,
+        "rounds": 5,
         "method": "mean"
       }
     },
@@ -94,12 +94,12 @@
       "label": "tp1_m8192_n24576_k4096_fp16_dynamic",
       "status": "ok",
       "impls": {
-        "tirx": 1067.0560002326965,
-        "cublas_nccl_cudagraph": 1024.159997701645,
-        "cublasmp_split_p2p": 1069.925328095754
+        "tirx": 1050.5499000000011,
+        "cublas_nccl_cudagraph": 1013.5965000000026,
+        "cublasmp_split_p2p": 1059.8718000000104
       },
       "aggregated": {
-        "rounds": 6,
+        "rounds": 5,
         "method": "mean"
       }
     },
@@ -109,12 +109,12 @@
       "label": "tp1_m8192_n51200_k5120_fp16_dynamic",
       "status": "ok",
       "impls": {
-        "tirx": 2976.4373302459717,
-        "cublas_nccl_cudagraph": 2814.293305079142,
-        "cublasmp_split_p2p": 2843.06134780248
+        "tirx": 2872.787599999988,
+        "cublas_nccl_cudagraph": 2674.343999999996,
+        "cublasmp_split_p2p": 2778.756499999993
       },
       "aggregated": {
-        "rounds": 6,
+        "rounds": 5,
         "method": "mean"
       }
     },
@@ -124,72 +124,12 @@
       "label": "tp1_m8192_n57344_k8192_fp16_dynamic",
       "status": "ok",
       "impls": {
-        "tirx": 6234.509348869324,
-        "cublas_nccl_cudagraph": 5514.538645744324,
-        "cublasmp_split_p2p": 5614.63729540507
+        "tirx": 5463.561800000008,
+        "cublas_nccl_cudagraph": 4846.3457999999955,
+        "cublasmp_split_p2p": 4935.7216
       },
       "aggregated": {
-        "rounds": 6,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "allgather_gemm",
-      "config": "tp4_m8192_n106496_k16384_fp16_dynamic",
-      "label": "tp4_m8192_n106496_k16384_fp16_dynamic",
-      "status": "ok",
-      "impls": {
-        "tirx": 5298.365354537964,
-        "cublas_nccl_cudagraph": 5697.373350461324,
-        "cublasmp_split_p2p": 5636.576016743978
-      },
-      "aggregated": {
-        "rounds": 6,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "allgather_gemm",
-      "config": "tp4_m8192_n24576_k4096_fp16_dynamic",
-      "label": "tp4_m8192_n24576_k4096_fp16_dynamic",
-      "status": "ok",
-      "impls": {
-        "tirx": 301.67466898759204,
-        "cublas_nccl_cudagraph": 375.86400161186856,
-        "cublasmp_split_p2p": 305.08266637722653
-      },
-      "aggregated": {
-        "rounds": 6,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "allgather_gemm",
-      "config": "tp4_m8192_n51200_k5120_fp16_dynamic",
-      "label": "tp4_m8192_n51200_k5120_fp16_dynamic",
-      "status": "ok",
-      "impls": {
-        "tirx": 706.5626680850983,
-        "cublas_nccl_cudagraph": 809.2106630404791,
-        "cublasmp_split_p2p": 723.623995979627
-      },
-      "aggregated": {
-        "rounds": 6,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "allgather_gemm",
-      "config": "tp4_m8192_n57344_k8192_fp16_dynamic",
-      "label": "tp4_m8192_n57344_k8192_fp16_dynamic",
-      "status": "ok",
-      "impls": {
-        "tirx": 1316.6880011558533,
-        "cublas_nccl_cudagraph": 1477.885325749715,
-        "cublasmp_split_p2p": 1425.2159893512726
-      },
-      "aggregated": {
-        "rounds": 6,
+        "rounds": 5,
         "method": "mean"
       }
     },
@@ -199,50 +139,8 @@
       "label": "t64_m64_h7168_i3072_e384_k6_g1",
       "status": "ok",
       "impls": {
-        "tirx": 1297.0,
-        "deepgemm": 1289.0
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_fp8_fp4_mega_moe",
-      "config": "t64_m64_h7168_i3072_e384_k6_g2",
-      "label": "t64_m64_h7168_i3072_e384_k6_g2",
-      "status": "ok",
-      "impls": {
-        "deepgemm": 902.8421999999999,
-        "tirx": 913.1806
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_fp8_fp4_mega_moe",
-      "config": "t64_m64_h7168_i3072_e384_k6_g4",
-      "label": "t64_m64_h7168_i3072_e384_k6_g4",
-      "status": "ok",
-      "impls": {
-        "deepgemm": 597.952,
-        "tirx": 598.2578
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_fp8_fp4_mega_moe",
-      "config": "t64_m64_h7168_i3072_e384_k6_g6",
-      "label": "t64_m64_h7168_i3072_e384_k6_g6",
-      "status": "ok",
-      "impls": {
-        "deepgemm": 474.46180000000004,
-        "tirx": 486.6194
+        "tirx": 1297.2,
+        "deepgemm": 1289.2
       },
       "aggregated": {
         "rounds": 5,
@@ -255,134 +153,8 @@
       "label": "t8192_m8192_h7168_i3072_e384_k6_g1",
       "status": "ok",
       "impls": {
-        "tirx": 3372.2000000000003,
-        "deepgemm": 3375.8
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_fp8_fp4_mega_moe",
-      "config": "t8192_m8192_h7168_i3072_e384_k6_g2",
-      "label": "t8192_m8192_h7168_i3072_e384_k6_g2",
-      "status": "ok",
-      "impls": {
-        "deepgemm": 3182.2,
-        "tirx": 3183.7999999999997
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_fp8_fp4_mega_moe",
-      "config": "t8192_m8192_h7168_i3072_e384_k6_g4",
-      "label": "t8192_m8192_h7168_i3072_e384_k6_g4",
-      "status": "ok",
-      "impls": {
-        "deepgemm": 2765.8,
-        "tirx": 2797.6
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_fp8_fp4_mega_moe",
-      "config": "t8192_m8192_h7168_i3072_e384_k6_g6",
-      "label": "t8192_m8192_h7168_i3072_e384_k6_g6",
-      "status": "ok",
-      "impls": {
-        "deepgemm": 2908.6,
-        "tirx": 2917.6
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_mqa_logits",
-      "config": "s2048_skv4096_h64_d128_bf16_compressed_cp",
-      "label": "s2048_skv4096_h64_d128_bf16_compressed_cp",
-      "status": "ok",
-      "impls": {
-        "tirx": 40.23854773269531,
-        "deepgemm": 40.97248021793249
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_mqa_logits",
-      "config": "s2048_skv4096_h64_d128_bf16_compressed_nocp",
-      "label": "s2048_skv4096_h64_d128_bf16_compressed_nocp",
-      "status": "ok",
-      "impls": {
-        "tirx": 52.31652240475275,
-        "deepgemm": 53.08539393280862
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_mqa_logits",
-      "config": "s2048_skv4096_h64_d128_bf16_dense_cp",
-      "label": "s2048_skv4096_h64_d128_bf16_dense_cp",
-      "status": "ok",
-      "impls": {
-        "tirx": 40.6919131293068,
-        "deepgemm": 41.642195275127335
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_mqa_logits",
-      "config": "s2048_skv4096_h64_d128_bf16_dense_nocp",
-      "label": "s2048_skv4096_h64_d128_bf16_dense_nocp",
-      "status": "ok",
-      "impls": {
-        "tirx": 53.075725002986594,
-        "deepgemm": 54.51389331506681
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_mqa_logits",
-      "config": "s2048_skv4096_h64_d128_f32_compressed_cp",
-      "label": "s2048_skv4096_h64_d128_f32_compressed_cp",
-      "status": "ok",
-      "impls": {
-        "tirx": 40.24049067378578,
-        "deepgemm": 42.58542968703317
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_mqa_logits",
-      "config": "s2048_skv4096_h64_d128_f32_compressed_nocp",
-      "label": "s2048_skv4096_h64_d128_f32_compressed_nocp",
-      "status": "ok",
-      "impls": {
-        "tirx": 51.86387287065547,
-        "deepgemm": 55.166867737211454
+        "tirx": 3467.0000000000005,
+        "deepgemm": 3468.0
       },
       "aggregated": {
         "rounds": 5,
@@ -395,260 +167,8 @@
       "label": "s2048_skv4096_h64_d128_f32_dense_cp",
       "status": "ok",
       "impls": {
-        "tirx": 38.98136671894596,
-        "deepgemm": 39.492009085364934
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_mqa_logits",
-      "config": "s2048_skv4096_h64_d128_f32_dense_nocp",
-      "label": "s2048_skv4096_h64_d128_f32_dense_nocp",
-      "status": "ok",
-      "impls": {
-        "tirx": 50.32685260350828,
-        "deepgemm": 51.02278085957549
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_mqa_logits",
-      "config": "s2048_skv8192_h64_d128_bf16_compressed_cp",
-      "label": "s2048_skv8192_h64_d128_bf16_compressed_cp",
-      "status": "ok",
-      "impls": {
-        "tirx": 70.18643802041831,
-        "deepgemm": 71.30292902047324
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_mqa_logits",
-      "config": "s2048_skv8192_h64_d128_bf16_compressed_nocp",
-      "label": "s2048_skv8192_h64_d128_bf16_compressed_nocp",
-      "status": "ok",
-      "impls": {
-        "tirx": 107.45679225049905,
-        "deepgemm": 108.74619411025196
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_mqa_logits",
-      "config": "s2048_skv8192_h64_d128_bf16_dense_cp",
-      "label": "s2048_skv8192_h64_d128_bf16_dense_cp",
-      "status": "ok",
-      "impls": {
-        "tirx": 70.7711096153496,
-        "deepgemm": 72.82951893014187
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_mqa_logits",
-      "config": "s2048_skv8192_h64_d128_bf16_dense_nocp",
-      "label": "s2048_skv8192_h64_d128_bf16_dense_nocp",
-      "status": "ok",
-      "impls": {
-        "tirx": 108.28052273227226,
-        "deepgemm": 111.76949339293316
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_mqa_logits",
-      "config": "s2048_skv8192_h64_d128_f32_compressed_cp",
-      "label": "s2048_skv8192_h64_d128_f32_compressed_cp",
-      "status": "ok",
-      "impls": {
-        "tirx": 69.6394663365779,
-        "deepgemm": 73.95859380184466
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_mqa_logits",
-      "config": "s2048_skv8192_h64_d128_f32_compressed_nocp",
-      "label": "s2048_skv8192_h64_d128_f32_compressed_nocp",
-      "status": "ok",
-      "impls": {
-        "tirx": 106.60604634244592,
-        "deepgemm": 113.30145538934349
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_mqa_logits",
-      "config": "s2048_skv8192_h64_d128_f32_dense_cp",
-      "label": "s2048_skv8192_h64_d128_f32_dense_cp",
-      "status": "ok",
-      "impls": {
-        "tirx": 66.93655007091166,
-        "deepgemm": 67.93175061345875
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_mqa_logits",
-      "config": "s2048_skv8192_h64_d128_f32_dense_nocp",
-      "label": "s2048_skv8192_h64_d128_f32_dense_nocp",
-      "status": "ok",
-      "impls": {
-        "tirx": 101.64207424650483,
-        "deepgemm": 103.01848545679917
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_mqa_logits",
-      "config": "s4096_skv4096_h64_d128_bf16_compressed_cp",
-      "label": "s4096_skv4096_h64_d128_bf16_compressed_cp",
-      "status": "ok",
-      "impls": {
-        "tirx": 70.9980568119521,
-        "deepgemm": 72.29972497301813
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_mqa_logits",
-      "config": "s4096_skv4096_h64_d128_bf16_compressed_nocp",
-      "label": "s4096_skv4096_h64_d128_bf16_compressed_nocp",
-      "status": "ok",
-      "impls": {
-        "tirx": 71.02130281862179,
-        "deepgemm": 72.10353226112008
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_mqa_logits",
-      "config": "s4096_skv4096_h64_d128_bf16_dense_cp",
-      "label": "s4096_skv4096_h64_d128_bf16_dense_cp",
-      "status": "ok",
-      "impls": {
-        "tirx": 71.65938972326337,
-        "deepgemm": 73.98187534016391
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_mqa_logits",
-      "config": "s4096_skv4096_h64_d128_bf16_dense_nocp",
-      "label": "s4096_skv4096_h64_d128_bf16_dense_nocp",
-      "status": "ok",
-      "impls": {
-        "tirx": 71.64315660547751,
-        "deepgemm": 73.8289078522327
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_mqa_logits",
-      "config": "s4096_skv4096_h64_d128_f32_compressed_cp",
-      "label": "s4096_skv4096_h64_d128_f32_compressed_cp",
-      "status": "ok",
-      "impls": {
-        "tirx": 70.81306985553564,
-        "deepgemm": 75.37516676171278
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_mqa_logits",
-      "config": "s4096_skv4096_h64_d128_f32_compressed_nocp",
-      "label": "s4096_skv4096_h64_d128_f32_compressed_nocp",
-      "status": "ok",
-      "impls": {
-        "tirx": 70.51744946609351,
-        "deepgemm": 75.23017787708028
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_mqa_logits",
-      "config": "s4096_skv4096_h64_d128_f32_dense_cp",
-      "label": "s4096_skv4096_h64_d128_f32_dense_cp",
-      "status": "ok",
-      "impls": {
-        "tirx": 68.37454037384644,
-        "deepgemm": 69.25586297482343
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_mqa_logits",
-      "config": "s4096_skv4096_h64_d128_f32_dense_nocp",
-      "label": "s4096_skv4096_h64_d128_f32_dense_nocp",
-      "status": "ok",
-      "impls": {
-        "tirx": 68.27194396988098,
-        "deepgemm": 69.05907547963778
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_mqa_logits",
-      "config": "s4096_skv8192_h64_d128_bf16_compressed_cp",
-      "label": "s4096_skv8192_h64_d128_bf16_compressed_cp",
-      "status": "ok",
-      "impls": {
-        "tirx": 125.57730873115348,
-        "deepgemm": 127.10235330944083
+        "tirx": 38.82877881200293,
+        "deepgemm": 39.07321434003938
       },
       "aggregated": {
         "rounds": 5,
@@ -661,120 +181,8 @@
       "label": "s4096_skv8192_h64_d128_bf16_compressed_nocp",
       "status": "ok",
       "impls": {
-        "tirx": 179.44146666123603,
-        "deepgemm": 181.44066605420792
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_mqa_logits",
-      "config": "s4096_skv8192_h64_d128_bf16_dense_cp",
-      "label": "s4096_skv8192_h64_d128_bf16_dense_cp",
-      "status": "ok",
-      "impls": {
-        "tirx": 126.86073154784488,
-        "deepgemm": 130.8271274165601
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_mqa_logits",
-      "config": "s4096_skv8192_h64_d128_bf16_dense_nocp",
-      "label": "s4096_skv8192_h64_d128_bf16_dense_nocp",
-      "status": "ok",
-      "impls": {
-        "tirx": 181.34686941698584,
-        "deepgemm": 187.0449656924423
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_mqa_logits",
-      "config": "s4096_skv8192_h64_d128_f32_compressed_cp",
-      "label": "s4096_skv8192_h64_d128_f32_compressed_cp",
-      "status": "ok",
-      "impls": {
-        "tirx": 124.81013101122275,
-        "deepgemm": 132.79961996489382
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_mqa_logits",
-      "config": "s4096_skv8192_h64_d128_f32_compressed_nocp",
-      "label": "s4096_skv8192_h64_d128_f32_compressed_nocp",
-      "status": "ok",
-      "impls": {
-        "tirx": 177.86040441969558,
-        "deepgemm": 189.6516179287572
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_mqa_logits",
-      "config": "s4096_skv8192_h64_d128_f32_dense_cp",
-      "label": "s4096_skv8192_h64_d128_f32_dense_cp",
-      "status": "ok",
-      "impls": {
-        "tirx": 119.36470790840396,
-        "deepgemm": 120.59299994310577
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_mqa_logits",
-      "config": "s4096_skv8192_h64_d128_f32_dense_nocp",
-      "label": "s4096_skv8192_h64_d128_f32_dense_nocp",
-      "status": "ok",
-      "impls": {
-        "tirx": 169.63294191092288,
-        "deepgemm": 171.97941797323108
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b16_n1_mp128_ps32_h64_d128_bf16_fixed",
-      "label": "b16_n1_mp128_ps32_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 5.397622236260101,
-        "deepgemm": 5.691036972997959
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b16_n1_mp128_ps32_h64_d128_f32_fixed",
-      "label": "b16_n1_mp128_ps32_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 5.659284106272545,
-        "deepgemm": 6.00197937437476
+        "tirx": 181.09581573511153,
+        "deepgemm": 182.38335695916487
       },
       "aggregated": {
         "rounds": 5,
@@ -787,260 +195,8 @@
       "label": "b16_n1_mp128_ps64_h64_d128_bf16_fixed",
       "status": "ok",
       "impls": {
-        "tirx": 6.180089434944547,
-        "deepgemm": 6.594517263029694
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b16_n1_mp128_ps64_h64_d128_f32_fixed",
-      "label": "b16_n1_mp128_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 5.956032301079817,
-        "deepgemm": 6.278446343860071
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b16_n1_mp1_ps32_h64_d128_bf16_fixed",
-      "label": "b16_n1_mp1_ps32_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.649493866437195,
-        "deepgemm": 5.020277713513581
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b16_n1_mp1_ps32_h64_d128_f32_fixed",
-      "label": "b16_n1_mp1_ps32_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.628820702557396,
-        "deepgemm": 4.999159212124033
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b16_n1_mp1_ps64_h64_d128_bf16_fixed",
-      "label": "b16_n1_mp1_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.314439352947622,
-        "deepgemm": 4.6783083766193645
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b16_n1_mp1_ps64_h64_d128_f32_fixed",
-      "label": "b16_n1_mp1_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.247300716809319,
-        "deepgemm": 4.612438004888024
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b16_n1_mp32_ps32_h64_d128_bf16_fixed",
-      "label": "b16_n1_mp32_ps32_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.843831860429225,
-        "deepgemm": 5.099042482559668
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b16_n1_mp32_ps32_h64_d128_f32_fixed",
-      "label": "b16_n1_mp32_ps32_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.9167486243717535,
-        "deepgemm": 5.212841310769533
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b16_n1_mp32_ps64_h64_d128_bf16_fixed",
-      "label": "b16_n1_mp32_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 5.057119663516523,
-        "deepgemm": 5.320630191066616
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b16_n1_mp32_ps64_h64_d128_f32_fixed",
-      "label": "b16_n1_mp32_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.900939918037114,
-        "deepgemm": 5.158457657057169
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b16_n1_mp8_ps32_h64_d128_bf16_fixed",
-      "label": "b16_n1_mp8_ps32_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.627854066352893,
-        "deepgemm": 5.156222437301424
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b16_n1_mp8_ps32_h64_d128_f32_fixed",
-      "label": "b16_n1_mp8_ps32_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.601940387814754,
-        "deepgemm": 5.105888871367279
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b16_n1_mp8_ps64_h64_d128_bf16_fixed",
-      "label": "b16_n1_mp8_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.777034118167434,
-        "deepgemm": 5.009076918530084
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b16_n1_mp8_ps64_h64_d128_f32_fixed",
-      "label": "b16_n1_mp8_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.833537480897835,
-        "deepgemm": 5.022107887790413
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b1_n1_mp128_ps32_h64_d128_bf16_fixed",
-      "label": "b1_n1_mp128_ps32_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.917222880180354,
-        "deepgemm": 5.375681393622536
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b1_n1_mp128_ps32_h64_d128_f32_fixed",
-      "label": "b1_n1_mp128_ps32_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.465378033742273,
-        "deepgemm": 4.755997380090178
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b1_n1_mp128_ps64_h64_d128_bf16_fixed",
-      "label": "b1_n1_mp128_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.8720996439561715,
-        "deepgemm": 5.190597479731631
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b1_n1_mp128_ps64_h64_d128_f32_fixed",
-      "label": "b1_n1_mp128_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.919866640247685,
-        "deepgemm": 5.24044911677424
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b1_n1_mp1_ps32_h64_d128_bf16_fixed",
-      "label": "b1_n1_mp1_ps32_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.296838575293396,
-        "deepgemm": 5.112136853958844
+        "tirx": 6.1342675922130105,
+        "deepgemm": 6.5764112508353545
       },
       "aggregated": {
         "rounds": 5,
@@ -1053,904 +209,8 @@
       "label": "b1_n1_mp1_ps32_h64_d128_f32_fixed",
       "status": "ok",
       "impls": {
-        "tirx": 4.345375821475649,
-        "deepgemm": 5.206703419100578
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b1_n1_mp1_ps64_h64_d128_bf16_fixed",
-      "label": "b1_n1_mp1_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 3.9484278941427378,
-        "deepgemm": 5.009306302022496
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b1_n1_mp1_ps64_h64_d128_f32_fixed",
-      "label": "b1_n1_mp1_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 3.9447304347976297,
-        "deepgemm": 4.99773864484184
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b1_n1_mp32_ps32_h64_d128_bf16_fixed",
-      "label": "b1_n1_mp32_ps32_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.432823243183849,
-        "deepgemm": 4.69695834261339
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b1_n1_mp32_ps32_h64_d128_f32_fixed",
-      "label": "b1_n1_mp32_ps32_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.997257191834361,
-        "deepgemm": 5.191022679547226
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b1_n1_mp32_ps64_h64_d128_bf16_fixed",
-      "label": "b1_n1_mp32_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 5.0568128457814865,
-        "deepgemm": 5.361379640980136
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b1_n1_mp32_ps64_h64_d128_f32_fixed",
-      "label": "b1_n1_mp32_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 5.017537293763014,
-        "deepgemm": 5.35024585453502
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b1_n1_mp8_ps32_h64_d128_bf16_fixed",
-      "label": "b1_n1_mp8_ps32_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.385797613327905,
-        "deepgemm": 4.8430059519129385
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b1_n1_mp8_ps32_h64_d128_f32_fixed",
-      "label": "b1_n1_mp8_ps32_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 5.150299130605493,
-        "deepgemm": 5.52551931048215
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b1_n1_mp8_ps64_h64_d128_bf16_fixed",
-      "label": "b1_n1_mp8_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.923462225802903,
-        "deepgemm": 5.277066875241206
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b1_n1_mp8_ps64_h64_d128_f32_fixed",
-      "label": "b1_n1_mp8_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.390968748878823,
-        "deepgemm": 4.769115769141671
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b2_n1_mp128_ps32_h64_d128_bf16_fixed",
-      "label": "b2_n1_mp128_ps32_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 5.025809185785734,
-        "deepgemm": 5.510682820716762
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b2_n1_mp128_ps32_h64_d128_f32_fixed",
-      "label": "b2_n1_mp128_ps32_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.992366462704348,
-        "deepgemm": 5.217748934387451
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b2_n1_mp128_ps64_h64_d128_bf16_fixed",
-      "label": "b2_n1_mp128_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.60732360841463,
-        "deepgemm": 4.835481779655708
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b2_n1_mp128_ps64_h64_d128_f32_fixed",
-      "label": "b2_n1_mp128_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.794153186306387,
-        "deepgemm": 4.873675635875062
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b2_n1_mp1_ps32_h64_d128_bf16_fixed",
-      "label": "b2_n1_mp1_ps32_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.149775140776816,
-        "deepgemm": 4.919408663977889
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b2_n1_mp1_ps32_h64_d128_f32_fixed",
-      "label": "b2_n1_mp1_ps32_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.106912975897617,
-        "deepgemm": 4.472767675737486
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b2_n1_mp1_ps64_h64_d128_bf16_fixed",
-      "label": "b2_n1_mp1_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.052825279381182,
-        "deepgemm": 4.4514103001057705
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b2_n1_mp1_ps64_h64_d128_f32_fixed",
-      "label": "b2_n1_mp1_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.474159506805436,
-        "deepgemm": 5.130179618753354
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b2_n1_mp32_ps32_h64_d128_bf16_fixed",
-      "label": "b2_n1_mp32_ps32_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.420008295365095,
-        "deepgemm": 4.694952615320455
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b2_n1_mp32_ps32_h64_d128_f32_fixed",
-      "label": "b2_n1_mp32_ps32_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.666122431671585,
-        "deepgemm": 5.071252891554876
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b2_n1_mp32_ps64_h64_d128_bf16_fixed",
-      "label": "b2_n1_mp32_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.890166613292929,
-        "deepgemm": 5.491407648077608
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b2_n1_mp32_ps64_h64_d128_f32_fixed",
-      "label": "b2_n1_mp32_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.861926635298836,
-        "deepgemm": 5.368152426588904
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b2_n1_mp8_ps32_h64_d128_bf16_fixed",
-      "label": "b2_n1_mp8_ps32_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 5.087021011606963,
-        "deepgemm": 5.275222666753483
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b2_n1_mp8_ps32_h64_d128_f32_fixed",
-      "label": "b2_n1_mp8_ps32_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.369263921215608,
-        "deepgemm": 4.5359090286826165
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b2_n1_mp8_ps64_h64_d128_bf16_fixed",
-      "label": "b2_n1_mp8_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.450648097327986,
-        "deepgemm": 4.607567839522597
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b2_n1_mp8_ps64_h64_d128_f32_fixed",
-      "label": "b2_n1_mp8_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.386829845606398,
-        "deepgemm": 4.5848664927929565
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b4_n1_mp128_ps32_h64_d128_bf16_fixed",
-      "label": "b4_n1_mp128_ps32_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 5.04074890578564,
-        "deepgemm": 5.286795308387729
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b4_n1_mp128_ps32_h64_d128_f32_fixed",
-      "label": "b4_n1_mp128_ps32_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.808674883013952,
-        "deepgemm": 4.979848589949141
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b4_n1_mp128_ps64_h64_d128_bf16_fixed",
-      "label": "b4_n1_mp128_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 5.097662855203797,
-        "deepgemm": 5.337694831757694
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b4_n1_mp128_ps64_h64_d128_f32_fixed",
-      "label": "b4_n1_mp128_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 5.157622108827158,
-        "deepgemm": 5.436927243203
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b4_n1_mp1_ps32_h64_d128_bf16_fixed",
-      "label": "b4_n1_mp1_ps32_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.279211025628284,
-        "deepgemm": 4.626143551795365
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b4_n1_mp1_ps32_h64_d128_f32_fixed",
-      "label": "b4_n1_mp1_ps32_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.227948650409594,
-        "deepgemm": 4.613151890618723
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b4_n1_mp1_ps64_h64_d128_bf16_fixed",
-      "label": "b4_n1_mp1_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.1189619116852745,
-        "deepgemm": 4.5761328549092175
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b4_n1_mp1_ps64_h64_d128_f32_fixed",
-      "label": "b4_n1_mp1_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.156356394261112,
-        "deepgemm": 4.5671517718406545
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b4_n1_mp32_ps32_h64_d128_bf16_fixed",
-      "label": "b4_n1_mp32_ps32_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.5401946742318815,
-        "deepgemm": 4.99644451948013
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b4_n1_mp32_ps32_h64_d128_f32_fixed",
-      "label": "b4_n1_mp32_ps32_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.697507727200251,
-        "deepgemm": 4.912734410956363
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b4_n1_mp32_ps64_h64_d128_bf16_fixed",
-      "label": "b4_n1_mp32_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.754424410352016,
-        "deepgemm": 5.015975483390455
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b4_n1_mp32_ps64_h64_d128_f32_fixed",
-      "label": "b4_n1_mp32_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.795217243801294,
-        "deepgemm": 4.971312446400194
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b4_n1_mp8_ps32_h64_d128_bf16_fixed",
-      "label": "b4_n1_mp8_ps32_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.499937779992101,
-        "deepgemm": 4.970341009564464
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b4_n1_mp8_ps32_h64_d128_f32_fixed",
-      "label": "b4_n1_mp8_ps32_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.681181262542691,
-        "deepgemm": 4.857044039613479
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b4_n1_mp8_ps64_h64_d128_bf16_fixed",
-      "label": "b4_n1_mp8_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.742981310808113,
-        "deepgemm": 4.859595519978607
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b4_n1_mp8_ps64_h64_d128_f32_fixed",
-      "label": "b4_n1_mp8_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.5114804567418085,
-        "deepgemm": 4.906546239645225
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b8_n1_mp128_ps32_h64_d128_bf16_fixed",
-      "label": "b8_n1_mp128_ps32_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 5.0649391329534685,
-        "deepgemm": 5.413079342317688
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b8_n1_mp128_ps32_h64_d128_f32_fixed",
-      "label": "b8_n1_mp128_ps32_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 5.103849288572373,
-        "deepgemm": 5.374242899616451
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b8_n1_mp128_ps64_h64_d128_bf16_fixed",
-      "label": "b8_n1_mp128_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 5.379532293216292,
-        "deepgemm": 5.6059843961821905
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b8_n1_mp128_ps64_h64_d128_f32_fixed",
-      "label": "b8_n1_mp128_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 5.264063497032338,
-        "deepgemm": 5.495868321440064
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b8_n1_mp1_ps32_h64_d128_bf16_fixed",
-      "label": "b8_n1_mp1_ps32_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.103583407545591,
-        "deepgemm": 5.056230939850535
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b8_n1_mp1_ps32_h64_d128_f32_fixed",
-      "label": "b8_n1_mp1_ps32_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.155606086934626,
-        "deepgemm": 4.64888919487891
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b8_n1_mp1_ps64_h64_d128_bf16_fixed",
-      "label": "b8_n1_mp1_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.109730972304334,
-        "deepgemm": 4.536844300893175
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b8_n1_mp1_ps64_h64_d128_f32_fixed",
-      "label": "b8_n1_mp1_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.358648441648578,
-        "deepgemm": 4.841321750271094
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b8_n1_mp32_ps32_h64_d128_bf16_fixed",
-      "label": "b8_n1_mp32_ps32_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.511511448988471,
-        "deepgemm": 4.842469826940377
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b8_n1_mp32_ps32_h64_d128_f32_fixed",
-      "label": "b8_n1_mp32_ps32_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.512922335152725,
-        "deepgemm": 4.814307903276392
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b8_n1_mp32_ps64_h64_d128_bf16_fixed",
-      "label": "b8_n1_mp32_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.966569583083967,
-        "deepgemm": 5.353157779148059
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b8_n1_mp32_ps64_h64_d128_f32_fixed",
-      "label": "b8_n1_mp32_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.965558750992624,
-        "deepgemm": 5.3167193357705225
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b8_n1_mp8_ps32_h64_d128_bf16_fixed",
-      "label": "b8_n1_mp8_ps32_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.887612563211245,
-        "deepgemm": 5.153421342703737
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b8_n1_mp8_ps32_h64_d128_f32_fixed",
-      "label": "b8_n1_mp8_ps32_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.597514336095551,
-        "deepgemm": 5.0780784419172775
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b8_n1_mp8_ps64_h64_d128_bf16_fixed",
-      "label": "b8_n1_mp8_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.504427774442404,
-        "deepgemm": 4.763292904533085
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp4_paged_mqa_logits",
-      "config": "b8_n1_mp8_ps64_h64_d128_f32_fixed",
-      "label": "b8_n1_mp8_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.450890520280387,
-        "deepgemm": 4.79412904507888
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_mqa_logits",
-      "config": "s2048_skv4096_h64_d128_bf16_compressed_cp",
-      "label": "s2048_skv4096_h64_d128_bf16_compressed_cp",
-      "status": "ok",
-      "impls": {
-        "tirx": 41.507356841620435,
-        "deepgemm": 41.99983319414596
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_mqa_logits",
-      "config": "s2048_skv4096_h64_d128_bf16_compressed_nocp",
-      "label": "s2048_skv4096_h64_d128_bf16_compressed_nocp",
-      "status": "ok",
-      "impls": {
-        "tirx": 53.18545290872815,
-        "deepgemm": 54.1207246952412
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_mqa_logits",
-      "config": "s2048_skv4096_h64_d128_bf16_dense_cp",
-      "label": "s2048_skv4096_h64_d128_bf16_dense_cp",
-      "status": "ok",
-      "impls": {
-        "tirx": 40.74776702716763,
-        "deepgemm": 41.463409547367654
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_mqa_logits",
-      "config": "s2048_skv4096_h64_d128_bf16_dense_nocp",
-      "label": "s2048_skv4096_h64_d128_bf16_dense_nocp",
-      "status": "ok",
-      "impls": {
-        "tirx": 52.020161027099356,
-        "deepgemm": 53.439140428852866
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_mqa_logits",
-      "config": "s2048_skv4096_h64_d128_f32_compressed_cp",
-      "label": "s2048_skv4096_h64_d128_f32_compressed_cp",
-      "status": "ok",
-      "impls": {
-        "tirx": 40.34715488457886,
-        "deepgemm": 43.27567080367575
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_mqa_logits",
-      "config": "s2048_skv4096_h64_d128_f32_compressed_nocp",
-      "label": "s2048_skv4096_h64_d128_f32_compressed_nocp",
-      "status": "ok",
-      "impls": {
-        "tirx": 51.607421754286754,
-        "deepgemm": 56.235395553715236
+        "tirx": 4.293985562632909,
+        "deepgemm": 5.101123172350671
       },
       "aggregated": {
         "rounds": 5,
@@ -1963,260 +223,8 @@
       "label": "s2048_skv4096_h64_d128_f32_dense_cp",
       "status": "ok",
       "impls": {
-        "tirx": 40.40705171655995,
-        "deepgemm": 41.12223123015805
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_mqa_logits",
-      "config": "s2048_skv4096_h64_d128_f32_dense_nocp",
-      "label": "s2048_skv4096_h64_d128_f32_dense_nocp",
-      "status": "ok",
-      "impls": {
-        "tirx": 51.60474696146877,
-        "deepgemm": 52.88096705193649
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_mqa_logits",
-      "config": "s2048_skv8192_h64_d128_bf16_compressed_cp",
-      "label": "s2048_skv8192_h64_d128_bf16_compressed_cp",
-      "status": "ok",
-      "impls": {
-        "tirx": 68.91783845471102,
-        "deepgemm": 71.04405873233392
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_mqa_logits",
-      "config": "s2048_skv8192_h64_d128_bf16_compressed_nocp",
-      "label": "s2048_skv8192_h64_d128_bf16_compressed_nocp",
-      "status": "ok",
-      "impls": {
-        "tirx": 106.28752226840774,
-        "deepgemm": 110.19224085816224
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_mqa_logits",
-      "config": "s2048_skv8192_h64_d128_bf16_dense_cp",
-      "label": "s2048_skv8192_h64_d128_bf16_dense_cp",
-      "status": "ok",
-      "impls": {
-        "tirx": 67.50340765631353,
-        "deepgemm": 70.31562734881142
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_mqa_logits",
-      "config": "s2048_skv8192_h64_d128_bf16_dense_nocp",
-      "label": "s2048_skv8192_h64_d128_bf16_dense_nocp",
-      "status": "ok",
-      "impls": {
-        "tirx": 105.38236182520903,
-        "deepgemm": 109.91648174973467
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_mqa_logits",
-      "config": "s2048_skv8192_h64_d128_f32_compressed_cp",
-      "label": "s2048_skv8192_h64_d128_f32_compressed_cp",
-      "status": "ok",
-      "impls": {
-        "tirx": 66.95741120444059,
-        "deepgemm": 74.60054191920872
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_mqa_logits",
-      "config": "s2048_skv8192_h64_d128_f32_compressed_nocp",
-      "label": "s2048_skv8192_h64_d128_f32_compressed_nocp",
-      "status": "ok",
-      "impls": {
-        "tirx": 104.82580774014447,
-        "deepgemm": 116.27375543736423
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_mqa_logits",
-      "config": "s2048_skv8192_h64_d128_f32_dense_cp",
-      "label": "s2048_skv8192_h64_d128_f32_dense_cp",
-      "status": "ok",
-      "impls": {
-        "tirx": 67.20502483185318,
-        "deepgemm": 70.01276358882757
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_mqa_logits",
-      "config": "s2048_skv8192_h64_d128_f32_dense_nocp",
-      "label": "s2048_skv8192_h64_d128_f32_dense_nocp",
-      "status": "ok",
-      "impls": {
-        "tirx": 104.8944149334694,
-        "deepgemm": 109.85411571400509
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_mqa_logits",
-      "config": "s4096_skv4096_h64_d128_bf16_compressed_cp",
-      "label": "s4096_skv4096_h64_d128_bf16_compressed_cp",
-      "status": "ok",
-      "impls": {
-        "tirx": 71.85783974406908,
-        "deepgemm": 72.55721406224305
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_mqa_logits",
-      "config": "s4096_skv4096_h64_d128_bf16_compressed_nocp",
-      "label": "s4096_skv4096_h64_d128_bf16_compressed_nocp",
-      "status": "ok",
-      "impls": {
-        "tirx": 71.99377956213256,
-        "deepgemm": 73.11386391189988
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_mqa_logits",
-      "config": "s4096_skv4096_h64_d128_bf16_dense_cp",
-      "label": "s4096_skv4096_h64_d128_bf16_dense_cp",
-      "status": "ok",
-      "impls": {
-        "tirx": 70.84483434725784,
-        "deepgemm": 72.01690555796681
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_mqa_logits",
-      "config": "s4096_skv4096_h64_d128_bf16_dense_nocp",
-      "label": "s4096_skv4096_h64_d128_bf16_dense_nocp",
-      "status": "ok",
-      "impls": {
-        "tirx": 70.7505307169488,
-        "deepgemm": 72.24343415776795
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_mqa_logits",
-      "config": "s4096_skv4096_h64_d128_f32_compressed_cp",
-      "label": "s4096_skv4096_h64_d128_f32_compressed_cp",
-      "status": "ok",
-      "impls": {
-        "tirx": 70.21240614299025,
-        "deepgemm": 76.48479380677213
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_mqa_logits",
-      "config": "s4096_skv4096_h64_d128_f32_compressed_nocp",
-      "label": "s4096_skv4096_h64_d128_f32_compressed_nocp",
-      "status": "ok",
-      "impls": {
-        "tirx": 70.13548006798302,
-        "deepgemm": 76.47405281566733
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_mqa_logits",
-      "config": "s4096_skv4096_h64_d128_f32_dense_cp",
-      "label": "s4096_skv4096_h64_d128_f32_dense_cp",
-      "status": "ok",
-      "impls": {
-        "tirx": 70.1991424034588,
-        "deepgemm": 71.62558765277659
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_mqa_logits",
-      "config": "s4096_skv4096_h64_d128_f32_dense_nocp",
-      "label": "s4096_skv4096_h64_d128_f32_dense_nocp",
-      "status": "ok",
-      "impls": {
-        "tirx": 70.87498991044939,
-        "deepgemm": 71.51907443180814
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_mqa_logits",
-      "config": "s4096_skv8192_h64_d128_bf16_compressed_cp",
-      "label": "s4096_skv8192_h64_d128_bf16_compressed_cp",
-      "status": "ok",
-      "impls": {
-        "tirx": 128.38404679792393,
-        "deepgemm": 130.4801110002379
+        "tirx": 40.51161437785488,
+        "deepgemm": 41.061396451075716
       },
       "aggregated": {
         "rounds": 5,
@@ -2229,92 +237,8 @@
       "label": "s4096_skv8192_h64_d128_bf16_compressed_nocp",
       "status": "ok",
       "impls": {
-        "tirx": 185.84095037629965,
-        "deepgemm": 191.5683611382494
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_mqa_logits",
-      "config": "s4096_skv8192_h64_d128_bf16_dense_cp",
-      "label": "s4096_skv8192_h64_d128_bf16_dense_cp",
-      "status": "ok",
-      "impls": {
-        "tirx": 126.04598126529119,
-        "deepgemm": 130.29692876606742
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_mqa_logits",
-      "config": "s4096_skv8192_h64_d128_bf16_dense_nocp",
-      "label": "s4096_skv8192_h64_d128_bf16_dense_nocp",
-      "status": "ok",
-      "impls": {
-        "tirx": 182.26523349503717,
-        "deepgemm": 189.54229814277247
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_mqa_logits",
-      "config": "s4096_skv8192_h64_d128_f32_compressed_cp",
-      "label": "s4096_skv8192_h64_d128_f32_compressed_cp",
-      "status": "ok",
-      "impls": {
-        "tirx": 125.39776290276421,
-        "deepgemm": 135.45421182507167
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_mqa_logits",
-      "config": "s4096_skv8192_h64_d128_f32_compressed_nocp",
-      "label": "s4096_skv8192_h64_d128_f32_compressed_nocp",
-      "status": "ok",
-      "impls": {
-        "tirx": 183.4872283761934,
-        "deepgemm": 199.38465377231117
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_mqa_logits",
-      "config": "s4096_skv8192_h64_d128_f32_dense_cp",
-      "label": "s4096_skv8192_h64_d128_f32_dense_cp",
-      "status": "ok",
-      "impls": {
-        "tirx": 124.9908743548479,
-        "deepgemm": 128.80840865436545
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_mqa_logits",
-      "config": "s4096_skv8192_h64_d128_f32_dense_nocp",
-      "label": "s4096_skv8192_h64_d128_f32_dense_nocp",
-      "status": "ok",
-      "impls": {
-        "tirx": 184.02045516247296,
-        "deepgemm": 190.89610128365226
+        "tirx": 184.54123890790916,
+        "deepgemm": 189.0791135215452
       },
       "aggregated": {
         "rounds": 5,
@@ -2327,159 +251,9 @@
       "label": "b16_n1_mp128_ps64_h64_d128_bf16_fixed",
       "status": "ok",
       "impls": {
-        "tirx": 6.737358311934756,
-        "deepgemm": 6.905331954747887,
-        "sglang_cutedsl": 6.734577871840051
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b16_n1_mp128_ps64_h64_d128_f32_fixed",
-      "label": "b16_n1_mp128_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 6.848719165449265,
-        "deepgemm": 7.0918868910373485,
-        "sglang_cutedsl": 6.9363010567715815
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b16_n1_mp1_ps64_h64_d128_bf16_fixed",
-      "label": "b16_n1_mp1_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.7145101993719845,
-        "deepgemm": 5.030652046528684,
-        "sglang_cutedsl": 4.815816245820372
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b16_n1_mp1_ps64_h64_d128_f32_fixed",
-      "label": "b16_n1_mp1_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.318834593126773,
-        "deepgemm": 4.62301624085498,
-        "sglang_cutedsl": 4.720117818047339
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b16_n1_mp32_ps64_h64_d128_bf16_fixed",
-      "label": "b16_n1_mp32_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 5.197135699857852,
-        "deepgemm": 5.498247198153004,
-        "sglang_cutedsl": 5.3544108555694585
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b16_n1_mp32_ps64_h64_d128_f32_fixed",
-      "label": "b16_n1_mp32_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 5.384996308379097,
-        "deepgemm": 5.704768334733877,
-        "sglang_cutedsl": 5.522204490905277
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b16_n1_mp8_ps64_h64_d128_bf16_fixed",
-      "label": "b16_n1_mp8_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.8658398999893615,
-        "deepgemm": 5.260710960526081,
-        "sglang_cutedsl": 4.927617525163316
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b16_n1_mp8_ps64_h64_d128_f32_fixed",
-      "label": "b16_n1_mp8_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.57439917735352,
-        "deepgemm": 4.857163887553349,
-        "sglang_cutedsl": 5.083897640107243
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b1_n1_mp128_ps64_h64_d128_bf16_fixed",
-      "label": "b1_n1_mp128_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.817959635551054,
-        "deepgemm": 5.116843702229868,
-        "sglang_cutedsl": 4.803337427225577
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b1_n1_mp128_ps64_h64_d128_f32_fixed",
-      "label": "b1_n1_mp128_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.750278823040297,
-        "deepgemm": 5.033220028902043,
-        "sglang_cutedsl": 4.783933074297206
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b1_n1_mp1_ps64_h64_d128_bf16_fixed",
-      "label": "b1_n1_mp1_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.449857107775812,
-        "deepgemm": 4.927676476821637,
-        "sglang_cutedsl": 4.674294547124103
+        "tirx": 6.7725557950281,
+        "deepgemm": 6.896233400250659,
+        "sglang_cutedsl": 6.754896839522339
       },
       "aggregated": {
         "rounds": 5,
@@ -2492,485 +266,9 @@
       "label": "b1_n1_mp1_ps64_h64_d128_f32_fixed",
       "status": "ok",
       "impls": {
-        "tirx": 4.3089997908769915,
-        "deepgemm": 4.96193213788933,
-        "sglang_cutedsl": 4.421417371423889
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b1_n1_mp32_ps64_h64_d128_bf16_fixed",
-      "label": "b1_n1_mp32_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.490544816265128,
-        "deepgemm": 4.701413685626145,
-        "sglang_cutedsl": 4.599381774454364
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b1_n1_mp32_ps64_h64_d128_f32_fixed",
-      "label": "b1_n1_mp32_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.735341333159126,
-        "deepgemm": 5.05252792556782,
-        "sglang_cutedsl": 4.667755624098131
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b1_n1_mp8_ps64_h64_d128_bf16_fixed",
-      "label": "b1_n1_mp8_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.816329500072757,
-        "deepgemm": 4.99214992085462,
-        "sglang_cutedsl": 4.846715566659872
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b1_n1_mp8_ps64_h64_d128_f32_fixed",
-      "label": "b1_n1_mp8_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.751872974417163,
-        "deepgemm": 4.923100452585693,
-        "sglang_cutedsl": 4.820933765558273
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b2_n1_mp128_ps64_h64_d128_bf16_fixed",
-      "label": "b2_n1_mp128_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.975257502196932,
-        "deepgemm": 5.280892956091524,
-        "sglang_cutedsl": 4.975611379147383
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b2_n1_mp128_ps64_h64_d128_f32_fixed",
-      "label": "b2_n1_mp128_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.825101779804807,
-        "deepgemm": 5.074363648675528,
-        "sglang_cutedsl": 4.834063522916445
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b2_n1_mp1_ps64_h64_d128_bf16_fixed",
-      "label": "b2_n1_mp1_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.602953973532333,
-        "deepgemm": 4.880404224327284,
-        "sglang_cutedsl": 4.661814439639873
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b2_n1_mp1_ps64_h64_d128_f32_fixed",
-      "label": "b2_n1_mp1_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.47963107347905,
-        "deepgemm": 4.762149082321537,
-        "sglang_cutedsl": 4.760820707673245
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b2_n1_mp32_ps64_h64_d128_bf16_fixed",
-      "label": "b2_n1_mp32_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.717925036989785,
-        "deepgemm": 4.926227631669806,
-        "sglang_cutedsl": 4.866279077855897
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b2_n1_mp32_ps64_h64_d128_f32_fixed",
-      "label": "b2_n1_mp32_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.788041507598172,
-        "deepgemm": 4.967621992672618,
-        "sglang_cutedsl": 4.726125813819231
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b2_n1_mp8_ps64_h64_d128_bf16_fixed",
-      "label": "b2_n1_mp8_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.750644032490151,
-        "deepgemm": 4.995772933101182,
-        "sglang_cutedsl": 4.862021132059075
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b2_n1_mp8_ps64_h64_d128_f32_fixed",
-      "label": "b2_n1_mp8_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.503827947325289,
-        "deepgemm": 4.671650795075029,
-        "sglang_cutedsl": 4.642018037464907
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b4_n1_mp128_ps64_h64_d128_bf16_fixed",
-      "label": "b4_n1_mp128_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 5.167604102884775,
-        "deepgemm": 5.44104421547014,
-        "sglang_cutedsl": 5.293984331319917
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b4_n1_mp128_ps64_h64_d128_f32_fixed",
-      "label": "b4_n1_mp128_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 5.143412450828902,
-        "deepgemm": 5.4958674718768545,
-        "sglang_cutedsl": 5.182248023504478
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b4_n1_mp1_ps64_h64_d128_bf16_fixed",
-      "label": "b4_n1_mp1_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.680199145252423,
-        "deepgemm": 4.830800576823266,
-        "sglang_cutedsl": 4.773893814921233
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b4_n1_mp1_ps64_h64_d128_f32_fixed",
-      "label": "b4_n1_mp1_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.281455351946856,
-        "deepgemm": 4.515103614169455,
-        "sglang_cutedsl": 4.546001714011303
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b4_n1_mp32_ps64_h64_d128_bf16_fixed",
-      "label": "b4_n1_mp32_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.881234300752287,
-        "deepgemm": 5.292382334051569,
-        "sglang_cutedsl": 4.858861017761719
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b4_n1_mp32_ps64_h64_d128_f32_fixed",
-      "label": "b4_n1_mp32_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.523808691073727,
-        "deepgemm": 4.8053734800031505,
-        "sglang_cutedsl": 4.9230258796785735
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b4_n1_mp8_ps64_h64_d128_bf16_fixed",
-      "label": "b4_n1_mp8_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.444731063096998,
-        "deepgemm": 4.657200435577116,
-        "sglang_cutedsl": 4.551235572189064
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b4_n1_mp8_ps64_h64_d128_f32_fixed",
-      "label": "b4_n1_mp8_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.465513780006445,
-        "deepgemm": 4.664796261840824,
-        "sglang_cutedsl": 4.62654657795913
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b8_n1_mp128_ps64_h64_d128_bf16_fixed",
-      "label": "b8_n1_mp128_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 5.75557574595117,
-        "deepgemm": 6.00220360113214,
-        "sglang_cutedsl": 5.908652010761807
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b8_n1_mp128_ps64_h64_d128_f32_fixed",
-      "label": "b8_n1_mp128_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 6.271472017745274,
-        "deepgemm": 6.711537899758422,
-        "sglang_cutedsl": 6.45770408620821
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b8_n1_mp1_ps64_h64_d128_bf16_fixed",
-      "label": "b8_n1_mp1_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.262766199241412,
-        "deepgemm": 4.584737063238227,
-        "sglang_cutedsl": 4.619718357001586
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b8_n1_mp1_ps64_h64_d128_f32_fixed",
-      "label": "b8_n1_mp1_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.747008823118315,
-        "deepgemm": 5.334857377243535,
-        "sglang_cutedsl": 4.777292929841828
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b8_n1_mp32_ps64_h64_d128_bf16_fixed",
-      "label": "b8_n1_mp32_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 5.0782820776600355,
-        "deepgemm": 5.500382625315076,
-        "sglang_cutedsl": 5.228091680893301
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b8_n1_mp32_ps64_h64_d128_f32_fixed",
-      "label": "b8_n1_mp32_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 5.098777493392043,
-        "deepgemm": 5.4407863267784675,
-        "sglang_cutedsl": 5.199901635512548
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b8_n1_mp8_ps64_h64_d128_bf16_fixed",
-      "label": "b8_n1_mp8_ps64_h64_d128_bf16_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.568195662992877,
-        "deepgemm": 4.788998846099299,
-        "sglang_cutedsl": 4.8481466323521225
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_fp8_paged_mqa_logits",
-      "config": "b8_n1_mp8_ps64_h64_d128_f32_fixed",
-      "label": "b8_n1_mp8_ps64_h64_d128_f32_fixed",
-      "status": "ok",
-      "impls": {
-        "tirx": 4.780188160417939,
-        "deepgemm": 5.373918227108433,
-        "sglang_cutedsl": 4.857413078724863
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m1024_n24_k16384_s9",
-      "label": "m1024_n24_k16384_s9",
-      "status": "ok",
-      "impls": {
-        "tirx": 11.193609941324578,
-        "deepgemm": 11.703519680167288
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m1024_n24_k28672_s9",
-      "label": "m1024_n24_k28672_s9",
-      "status": "ok",
-      "impls": {
-        "tirx": 15.583417027250116,
-        "deepgemm": 17.281553063064003
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m1152_n24_k16384_s8",
-      "label": "m1152_n24_k16384_s8",
-      "status": "ok",
-      "impls": {
-        "tirx": 11.833453818811336,
-        "deepgemm": 12.568136257247984
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m1152_n24_k28672_s8",
-      "label": "m1152_n24_k28672_s8",
-      "status": "ok",
-      "impls": {
-        "tirx": 16.53777307741796,
-        "deepgemm": 18.69456154418711
+        "tirx": 4.413259366126502,
+        "deepgemm": 5.003289323306024,
+        "sglang_cutedsl": 4.483371832879638
       },
       "aggregated": {
         "rounds": 5,
@@ -2983,50 +281,8 @@
       "label": "m128_n24_k16384_s64",
       "status": "ok",
       "impls": {
-        "tirx": 5.215885166525734,
-        "deepgemm": 5.213027377346192
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m128_n24_k28672_s74",
-      "label": "m128_n24_k28672_s74",
-      "status": "ok",
-      "impls": {
-        "tirx": 6.104268775908912,
-        "deepgemm": 6.105783020256684
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m1344_n24_k16384_s7",
-      "label": "m1344_n24_k16384_s7",
-      "status": "ok",
-      "impls": {
-        "tirx": 13.077434563177796,
-        "deepgemm": 14.062658620462454
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m1344_n24_k28672_s7",
-      "label": "m1344_n24_k28672_s7",
-      "status": "ok",
-      "impls": {
-        "tirx": 18.668951601871466,
-        "deepgemm": 21.06034339543746
+        "tirx": 5.235183672352303,
+        "deepgemm": 5.228863789202711
       },
       "aggregated": {
         "rounds": 5,
@@ -3039,8 +295,8 @@
       "label": "m137_n24_k7680_s16",
       "status": "ok",
       "impls": {
-        "tirx": 5.523576494670149,
-        "deepgemm": 5.533958752424199
+        "tirx": 5.344071406442185,
+        "deepgemm": 5.360712946759494
       },
       "aggregated": {
         "rounds": 5,
@@ -3053,274 +309,8 @@
       "label": "m13_n24_k7168_s1",
       "status": "ok",
       "impls": {
-        "tirx": 20.81201014428364,
-        "deepgemm": 21.252332440881275
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m1536_n24_k16384_s6",
-      "label": "m1536_n24_k16384_s6",
-      "status": "ok",
-      "impls": {
-        "tirx": 14.227483585909015,
-        "deepgemm": 15.60208005907524
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m1536_n24_k28672_s6",
-      "label": "m1536_n24_k28672_s6",
-      "status": "ok",
-      "impls": {
-        "tirx": 20.27843059413392,
-        "deepgemm": 23.368449943863595
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m1856_n24_k16384_s5",
-      "label": "m1856_n24_k16384_s5",
-      "status": "ok",
-      "impls": {
-        "tirx": 15.878469941436885,
-        "deepgemm": 17.596377385461867
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m1856_n24_k28672_s5",
-      "label": "m1856_n24_k28672_s5",
-      "status": "ok",
-      "impls": {
-        "tirx": 23.79245625148848,
-        "deepgemm": 27.61057495705693
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m192_n24_k16384_s49",
-      "label": "m192_n24_k16384_s49",
-      "status": "ok",
-      "impls": {
-        "tirx": 5.926325420217493,
-        "deepgemm": 5.904223563233168
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m192_n24_k28672_s49",
-      "label": "m192_n24_k28672_s49",
-      "status": "ok",
-      "impls": {
-        "tirx": 7.2645761603393755,
-        "deepgemm": 7.167601511546156
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m2048_n24_k16384_s4",
-      "label": "m2048_n24_k16384_s4",
-      "status": "ok",
-      "impls": {
-        "tirx": 17.02829059390295,
-        "deepgemm": 19.179759991740926
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m2048_n24_k28672_s4",
-      "label": "m2048_n24_k28672_s4",
-      "status": "ok",
-      "impls": {
-        "tirx": 25.478796282189816,
-        "deepgemm": 30.082905893874035
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m2368_n24_k16384_s4",
-      "label": "m2368_n24_k16384_s4",
-      "status": "ok",
-      "impls": {
-        "tirx": 18.78088353121821,
-        "deepgemm": 21.092071780737538
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m2368_n24_k28672_s4",
-      "label": "m2368_n24_k28672_s4",
-      "status": "ok",
-      "impls": {
-        "tirx": 27.94364768209291,
-        "deepgemm": 33.19907244389398
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m256_n24_k16384_s37",
-      "label": "m256_n24_k16384_s37",
-      "status": "ok",
-      "impls": {
-        "tirx": 6.343419816301433,
-        "deepgemm": 6.28739027101466
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m256_n24_k28672_s37",
-      "label": "m256_n24_k28672_s37",
-      "status": "ok",
-      "impls": {
-        "tirx": 8.087362841801093,
-        "deepgemm": 8.009054581139843
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m3136_n24_k16384_s3",
-      "label": "m3136_n24_k16384_s3",
-      "status": "ok",
-      "impls": {
-        "tirx": 22.30793506237356,
-        "deepgemm": 26.021596828016648
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m3136_n24_k28672_s3",
-      "label": "m3136_n24_k28672_s3",
-      "status": "ok",
-      "impls": {
-        "tirx": 35.116420205217736,
-        "deepgemm": 41.9162959921153
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m320_n24_k16384_s29",
-      "label": "m320_n24_k16384_s29",
-      "status": "ok",
-      "impls": {
-        "tirx": 6.933430953475432,
-        "deepgemm": 6.854556026236469
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m320_n24_k28672_s29",
-      "label": "m320_n24_k28672_s29",
-      "status": "ok",
-      "impls": {
-        "tirx": 8.94520619294345,
-        "deepgemm": 8.965545549904345
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m384_n24_k16384_s24",
-      "label": "m384_n24_k16384_s24",
-      "status": "ok",
-      "impls": {
-        "tirx": 7.502341444681313,
-        "deepgemm": 7.4210180387677775
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m384_n24_k28672_s24",
-      "label": "m384_n24_k28672_s24",
-      "status": "ok",
-      "impls": {
-        "tirx": 9.378665375364863,
-        "deepgemm": 9.47225974228532
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m4096_n24_k16384_s2",
-      "label": "m4096_n24_k16384_s2",
-      "status": "ok",
-      "impls": {
-        "tirx": 29.43881155295492,
-        "deepgemm": 34.79800711826169
+        "tirx": 20.834422069177045,
+        "deepgemm": 21.30151795625998
       },
       "aggregated": {
         "rounds": 5,
@@ -3333,22 +323,8 @@
       "label": "m4096_n24_k28672_s16",
       "status": "ok",
       "impls": {
-        "tirx": 57.387669318134186,
-        "deepgemm": 62.75464683089118
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m4096_n24_k28672_s2",
-      "label": "m4096_n24_k28672_s2",
-      "status": "ok",
-      "impls": {
-        "tirx": 45.51096057344123,
-        "deepgemm": 54.77129709524928
+        "tirx": 57.449738335652185,
+        "deepgemm": 62.796679128493324
       },
       "aggregated": {
         "rounds": 5,
@@ -3361,148 +337,8 @@
       "label": "m4096_n24_k7168_s1",
       "status": "ok",
       "impls": {
-        "tirx": 22.539607496863432,
-        "deepgemm": 23.707281317944318
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m448_n24_k16384_s21",
-      "label": "m448_n24_k16384_s21",
-      "status": "ok",
-      "impls": {
-        "tirx": 7.812926948851675,
-        "deepgemm": 7.752527483024585
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m448_n24_k28672_s21",
-      "label": "m448_n24_k28672_s21",
-      "status": "ok",
-      "impls": {
-        "tirx": 10.269111527738497,
-        "deepgemm": 10.444695632849701
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m4736_n24_k16384_s2",
-      "label": "m4736_n24_k16384_s2",
-      "status": "ok",
-      "impls": {
-        "tirx": 32.62676663373863,
-        "deepgemm": 38.10940693108858
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m4736_n24_k28672_s2",
-      "label": "m4736_n24_k28672_s2",
-      "status": "ok",
-      "impls": {
-        "tirx": 50.146157557088515,
-        "deepgemm": 59.906687273051716
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m512_n24_k16384_s18",
-      "label": "m512_n24_k16384_s18",
-      "status": "ok",
-      "impls": {
-        "tirx": 8.460821008632953,
-        "deepgemm": 8.381785175577471
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m512_n24_k28672_s18",
-      "label": "m512_n24_k28672_s18",
-      "status": "ok",
-      "impls": {
-        "tirx": 10.572549760532185,
-        "deepgemm": 10.859792726193342
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m576_n24_k16384_s16",
-      "label": "m576_n24_k16384_s16",
-      "status": "ok",
-      "impls": {
-        "tirx": 8.975726743053006,
-        "deepgemm": 8.969003463329166
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m576_n24_k28672_s16",
-      "label": "m576_n24_k28672_s16",
-      "status": "ok",
-      "impls": {
-        "tirx": 11.288569100067205,
-        "deepgemm": 11.702980756193437
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m640_n24_k16384_s14",
-      "label": "m640_n24_k16384_s14",
-      "status": "ok",
-      "impls": {
-        "tirx": 9.055874258803403,
-        "deepgemm": 9.098373520499848
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m640_n24_k28672_s14",
-      "label": "m640_n24_k28672_s14",
-      "status": "ok",
-      "impls": {
-        "tirx": 11.754936207061055,
-        "deepgemm": 12.488183408570299
+        "tirx": 22.476916846920357,
+        "deepgemm": 23.605206867565126
       },
       "aggregated": {
         "rounds": 5,
@@ -3515,64 +351,8 @@
       "label": "m64_n24_k28672_s112",
       "status": "ok",
       "impls": {
-        "tirx": 5.124802619791466,
-        "deepgemm": 5.133567858719273
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m704_n24_k16384_s13",
-      "label": "m704_n24_k16384_s13",
-      "status": "ok",
-      "impls": {
-        "tirx": 9.561359464544985,
-        "deepgemm": 9.726284987095886
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m704_n24_k28672_s13",
-      "label": "m704_n24_k28672_s13",
-      "status": "ok",
-      "impls": {
-        "tirx": 12.55224356705348,
-        "deepgemm": 13.443068437599486
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m768_n24_k16384_s12",
-      "label": "m768_n24_k16384_s12",
-      "status": "ok",
-      "impls": {
-        "tirx": 10.23636891373104,
-        "deepgemm": 10.38521836596767
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m768_n24_k28672_s12",
-      "label": "m768_n24_k28672_s12",
-      "status": "ok",
-      "impls": {
-        "tirx": 13.316231027334695,
-        "deepgemm": 14.403154122746715
+        "tirx": 5.1296373564547535,
+        "deepgemm": 5.132768983363409
       },
       "aggregated": {
         "rounds": 5,
@@ -3585,8 +365,8 @@
       "label": "m8192_n24_k16384_s1",
       "status": "ok",
       "impls": {
-        "tirx": 51.36336638141368,
-        "deepgemm": 60.34451902421603
+        "tirx": 51.21178845915159,
+        "deepgemm": 60.20608015355306
       },
       "aggregated": {
         "rounds": 5,
@@ -3599,64 +379,8 @@
       "label": "m8192_n24_k28672_s1",
       "status": "ok",
       "impls": {
-        "tirx": 84.08462954117849,
-        "deepgemm": 92.39304098433453
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m832_n24_k16384_s11",
-      "label": "m832_n24_k16384_s11",
-      "status": "ok",
-      "impls": {
-        "tirx": 10.250486071917988,
-        "deepgemm": 10.448206299296123
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m832_n24_k28672_s11",
-      "label": "m832_n24_k28672_s11",
-      "status": "ok",
-      "impls": {
-        "tirx": 13.732140152466334,
-        "deepgemm": 15.021147606101472
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m896_n24_k16384_s10",
-      "label": "m896_n24_k16384_s10",
-      "status": "ok",
-      "impls": {
-        "tirx": 10.691680856081552,
-        "deepgemm": 10.966695257268748
-      },
-      "aggregated": {
-        "rounds": 5,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "deepgemm_sm100_tf32_hc_prenorm_gemm",
-      "config": "m896_n24_k28672_s10",
-      "label": "m896_n24_k28672_s10",
-      "status": "ok",
-      "impls": {
-        "tirx": 14.435027294932395,
-        "deepgemm": 15.817821283314759
+        "tirx": 83.45294720143164,
+        "deepgemm": 91.7668796957812
       },
       "aggregated": {
         "rounds": 5,
@@ -3669,8 +393,8 @@
       "label": "s1024_h32kv16",
       "status": "ok",
       "impls": {
-        "tir": 19.836679462230514,
-        "flashattn_sm100": 20.061415276779428
+        "tir": 19.851459042336106,
+        "flashattn_sm100": 20.125151751199464
       },
       "aggregated": {
         "rounds": 5,
@@ -3683,8 +407,8 @@
       "label": "s1024_h32kv16_causal",
       "status": "ok",
       "impls": {
-        "tir": 20.38340775008148,
-        "flashattn_sm100": 20.134220955952873
+        "tir": 20.371594195323368,
+        "flashattn_sm100": 20.13308745494043
       },
       "aggregated": {
         "rounds": 5,
@@ -3697,8 +421,8 @@
       "label": "s1024_h32kv32",
       "status": "ok",
       "impls": {
-        "tir": 20.371741324980306,
-        "flashattn_sm100": 20.407379358761272
+        "tir": 20.093184642649618,
+        "flashattn_sm100": 20.288567695885476
       },
       "aggregated": {
         "rounds": 5,
@@ -3711,8 +435,8 @@
       "label": "s1024_h32kv32_causal",
       "status": "ok",
       "impls": {
-        "tir": 21.04371200558893,
-        "flashattn_sm100": 21.275216423767823
+        "tir": 21.006093709553696,
+        "flashattn_sm100": 21.27458508671574
       },
       "aggregated": {
         "rounds": 5,
@@ -3725,8 +449,8 @@
       "label": "s1024_h32kv4",
       "status": "ok",
       "impls": {
-        "tir": 19.24909433221995,
-        "flashattn_sm100": 19.795384534929838
+        "tir": 19.134600289605405,
+        "flashattn_sm100": 19.690599819102825
       },
       "aggregated": {
         "rounds": 5,
@@ -3739,8 +463,8 @@
       "label": "s1024_h32kv4_causal",
       "status": "ok",
       "impls": {
-        "tir": 19.36499208750724,
-        "flashattn_sm100": 19.714324639561024
+        "tir": 19.338723052392353,
+        "flashattn_sm100": 19.648948419694854
       },
       "aggregated": {
         "rounds": 5,
@@ -3753,8 +477,8 @@
       "label": "s1024_h32kv8",
       "status": "ok",
       "impls": {
-        "tir": 19.65702578799433,
-        "flashattn_sm100": 19.933997083767597
+        "tir": 19.632108693044515,
+        "flashattn_sm100": 19.927963954651492
       },
       "aggregated": {
         "rounds": 5,
@@ -3767,8 +491,8 @@
       "label": "s1024_h32kv8_causal",
       "status": "ok",
       "impls": {
-        "tir": 19.734228558588338,
-        "flashattn_sm100": 19.844600843864345
+        "tir": 19.833666321114105,
+        "flashattn_sm100": 20.101013156256563
       },
       "aggregated": {
         "rounds": 5,
@@ -3781,8 +505,8 @@
       "label": "s2048_h32kv16",
       "status": "ok",
       "impls": {
-        "tir": 57.55215770950186,
-        "flashattn_sm100": 58.00159274649494
+        "tir": 57.22301631518917,
+        "flashattn_sm100": 57.79236001448797
       },
       "aggregated": {
         "rounds": 5,
@@ -3795,8 +519,8 @@
       "label": "s2048_h32kv16_causal",
       "status": "ok",
       "impls": {
-        "tir": 36.331448001866725,
-        "flashattn_sm100": 38.64387880653534
+        "tir": 36.20249383309013,
+        "flashattn_sm100": 38.44553028455223
       },
       "aggregated": {
         "rounds": 5,
@@ -3809,8 +533,8 @@
       "label": "s2048_h32kv32",
       "status": "ok",
       "impls": {
-        "tir": 59.12785056711311,
-        "flashattn_sm100": 59.65899701366971
+        "tir": 59.29021948278235,
+        "flashattn_sm100": 59.7580708377644
       },
       "aggregated": {
         "rounds": 5,
@@ -3823,8 +547,8 @@
       "label": "s2048_h32kv32_causal",
       "status": "ok",
       "impls": {
-        "tir": 40.378365281316036,
-        "flashattn_sm100": 40.175169714788304
+        "tir": 40.577481099723244,
+        "flashattn_sm100": 39.88874370372191
       },
       "aggregated": {
         "rounds": 5,
@@ -3837,8 +561,8 @@
       "label": "s2048_h32kv4",
       "status": "ok",
       "impls": {
-        "tir": 55.4535068556782,
-        "flashattn_sm100": 56.43563335317043
+        "tir": 55.26752219781446,
+        "flashattn_sm100": 56.087638308817304
       },
       "aggregated": {
         "rounds": 5,
@@ -3851,8 +575,8 @@
       "label": "s2048_h32kv4_causal",
       "status": "ok",
       "impls": {
-        "tir": 35.09168194759984,
-        "flashattn_sm100": 37.94368568264037
+        "tir": 35.22682661965772,
+        "flashattn_sm100": 37.854705751250705
       },
       "aggregated": {
         "rounds": 5,
@@ -3865,8 +589,8 @@
       "label": "s2048_h32kv8",
       "status": "ok",
       "impls": {
-        "tir": 56.27354594941199,
-        "flashattn_sm100": 56.87099857812912
+        "tir": 56.33590103839275,
+        "flashattn_sm100": 56.96754349933284
       },
       "aggregated": {
         "rounds": 5,
@@ -3879,8 +603,8 @@
       "label": "s2048_h32kv8_causal",
       "status": "ok",
       "impls": {
-        "tir": 35.086901389055924,
-        "flashattn_sm100": 37.850786279288734
+        "tir": 35.70643720415552,
+        "flashattn_sm100": 37.80373385353914
       },
       "aggregated": {
         "rounds": 5,
@@ -3893,8 +617,8 @@
       "label": "s4096_h32kv16",
       "status": "ok",
       "impls": {
-        "tir": 213.18210632770348,
-        "flashattn_sm100": 216.09090289928923
+        "tir": 212.86961992237121,
+        "flashattn_sm100": 216.0091582101448
       },
       "aggregated": {
         "rounds": 5,
@@ -3907,8 +631,8 @@
       "label": "s4096_h32kv16_causal",
       "status": "ok",
       "impls": {
-        "tir": 111.99184172763327,
-        "flashattn_sm100": 117.85400977816334
+        "tir": 112.62347454366032,
+        "flashattn_sm100": 117.94783840248843
       },
       "aggregated": {
         "rounds": 5,
@@ -3921,8 +645,8 @@
       "label": "s4096_h32kv32",
       "status": "ok",
       "impls": {
-        "tir": 216.26200194188544,
-        "flashattn_sm100": 219.59059556537173
+        "tir": 213.71730177791085,
+        "flashattn_sm100": 218.79902565204887
       },
       "aggregated": {
         "rounds": 5,
@@ -3935,8 +659,8 @@
       "label": "s4096_h32kv32_causal",
       "status": "ok",
       "impls": {
-        "tir": 122.4922030258524,
-        "flashattn_sm100": 121.20010753499484
+        "tir": 122.64084272629636,
+        "flashattn_sm100": 121.94550079003533
       },
       "aggregated": {
         "rounds": 5,
@@ -3949,8 +673,8 @@
       "label": "s4096_h32kv4",
       "status": "ok",
       "impls": {
-        "tir": 205.82056650756084,
-        "flashattn_sm100": 210.37240485367948
+        "tir": 208.77107868881333,
+        "flashattn_sm100": 210.99648228701858
       },
       "aggregated": {
         "rounds": 5,
@@ -3963,8 +687,8 @@
       "label": "s4096_h32kv4_causal",
       "status": "ok",
       "impls": {
-        "tir": 109.93795512392269,
-        "flashattn_sm100": 114.61833743361403
+        "tir": 108.96063682330438,
+        "flashattn_sm100": 114.22906100613595
       },
       "aggregated": {
         "rounds": 5,
@@ -3977,8 +701,8 @@
       "label": "s4096_h32kv8",
       "status": "ok",
       "impls": {
-        "tir": 207.8017384015721,
-        "flashattn_sm100": 210.42354119627495
+        "tir": 208.19136994724056,
+        "flashattn_sm100": 212.90240731113536
       },
       "aggregated": {
         "rounds": 5,
@@ -3991,8 +715,8 @@
       "label": "s4096_h32kv8_causal",
       "status": "ok",
       "impls": {
-        "tir": 109.55195835061669,
-        "flashattn_sm100": 115.48901738501068
+        "tir": 110.66509344971784,
+        "flashattn_sm100": 115.6321063707632
       },
       "aggregated": {
         "rounds": 5,
@@ -4005,8 +729,8 @@
       "label": "s8192_h32kv16",
       "status": "ok",
       "impls": {
-        "tir": 773.8496361387967,
-        "flashattn_sm100": 773.725492593504
+        "tir": 772.8332615747437,
+        "flashattn_sm100": 783.9207034659594
       },
       "aggregated": {
         "rounds": 5,
@@ -4019,8 +743,8 @@
       "label": "s8192_h32kv16_causal",
       "status": "ok",
       "impls": {
-        "tir": 464.3977272191635,
-        "flashattn_sm100": 421.85414360521236
+        "tir": 464.96529197244143,
+        "flashattn_sm100": 424.9840503831409
       },
       "aggregated": {
         "rounds": 5,
@@ -4033,8 +757,8 @@
       "label": "s8192_h32kv32",
       "status": "ok",
       "impls": {
-        "tir": 779.9157414913252,
-        "flashattn_sm100": 783.6444971253593
+        "tir": 783.2523994995396,
+        "flashattn_sm100": 799.4478430857142
       },
       "aggregated": {
         "rounds": 5,
@@ -4047,8 +771,8 @@
       "label": "s8192_h32kv32_causal",
       "status": "ok",
       "impls": {
-        "tir": 437.9537287190586,
-        "flashattn_sm100": 432.41350763595227
+        "tir": 433.3246928376018,
+        "flashattn_sm100": 430.1334286533671
       },
       "aggregated": {
         "rounds": 5,
@@ -4061,8 +785,8 @@
       "label": "s8192_h32kv4",
       "status": "ok",
       "impls": {
-        "tir": 762.3605287679454,
-        "flashattn_sm100": 775.7642561638779
+        "tir": 764.4908828083028,
+        "flashattn_sm100": 777.3582390378937
       },
       "aggregated": {
         "rounds": 5,
@@ -4075,8 +799,8 @@
       "label": "s8192_h32kv4_causal",
       "status": "ok",
       "impls": {
-        "tir": 412.12171965012715,
-        "flashattn_sm100": 422.7868565660368
+        "tir": 406.1899659901931,
+        "flashattn_sm100": 420.60362090572715
       },
       "aggregated": {
         "rounds": 5,
@@ -4089,8 +813,8 @@
       "label": "s8192_h32kv8",
       "status": "ok",
       "impls": {
-        "tir": 765.2638018852714,
-        "flashattn_sm100": 779.5499872765904
+        "tir": 763.0541915953123,
+        "flashattn_sm100": 777.389816610577
       },
       "aggregated": {
         "rounds": 5,
@@ -4103,8 +827,8 @@
       "label": "s8192_h32kv8_causal",
       "status": "ok",
       "impls": {
-        "tir": 410.5884479443808,
-        "flashattn_sm100": 421.3691160838696
+        "tir": 407.79177430666977,
+        "flashattn_sm100": 420.18930975604826
       },
       "aggregated": {
         "rounds": 5,
@@ -4117,10 +841,10 @@
       "label": "bf16_1024x1024x1024",
       "status": "ok",
       "impls": {
-        "tir": 6.829943905254103,
-        "torch-cublas": 5.978079769300925,
-        "deepgemm-cublaslt": 5.978845189381599,
-        "deepgemm-bf16": 6.771040799201596
+        "tir": 6.839419264377733,
+        "torch-cublas": 5.983806677163036,
+        "deepgemm-cublaslt": 5.993900375132788,
+        "deepgemm-bf16": 6.810111750779516
       },
       "aggregated": {
         "rounds": 5,
@@ -4133,10 +857,10 @@
       "label": "bf16_16384x16384x16384",
       "status": "ok",
       "impls": {
-        "tir": 5515.230488888888,
-        "torch-cublas": 5578.0705333333335,
-        "deepgemm-cublaslt": 5589.963033333333,
-        "deepgemm-bf16": 6445.806481617647
+        "tir": 5670.4596111111105,
+        "torch-cublas": 5427.3314666666665,
+        "deepgemm-cublaslt": 5468.817844444445,
+        "deepgemm-bf16": 6417.953285
       },
       "aggregated": {
         "rounds": 5,
@@ -4149,10 +873,10 @@
       "label": "bf16_2048x2048x2048",
       "status": "ok",
       "impls": {
-        "tir": 16.38370120465797,
-        "torch-cublas": 15.71714514885922,
-        "deepgemm-cublaslt": 15.69813161740061,
-        "deepgemm-bf16": 17.2569570257969
+        "tir": 16.265103339046195,
+        "torch-cublas": 15.800385650341624,
+        "deepgemm-cublaslt": 15.81987430687167,
+        "deepgemm-bf16": 17.1367051212998
       },
       "aggregated": {
         "rounds": 5,
@@ -4165,10 +889,10 @@
       "label": "bf16_4096x4096x4096",
       "status": "ok",
       "impls": {
-        "tir": 93.40626503730327,
-        "torch-cublas": 89.18067452053731,
-        "deepgemm-cublaslt": 89.43144219028738,
-        "deepgemm-bf16": 89.58844095012796
+        "tir": 93.61351524131766,
+        "torch-cublas": 89.76465587171495,
+        "deepgemm-cublaslt": 90.02393400398044,
+        "deepgemm-bf16": 89.58623847107633
       },
       "aggregated": {
         "rounds": 5,
@@ -4181,10 +905,10 @@
       "label": "bf16_8192x8192x8192",
       "status": "ok",
       "impls": {
-        "tir": 678.5796751477542,
-        "torch-cublas": 705.4324181926618,
-        "deepgemm-cublaslt": 708.8169357862282,
-        "deepgemm-bf16": 694.3811
+        "tir": 695.8846521332374,
+        "torch-cublas": 716.2780664734299,
+        "deepgemm-cublaslt": 718.5873698719984,
+        "deepgemm-bf16": 723.1890088235294
       },
       "aggregated": {
         "rounds": 5,
@@ -4197,8 +921,8 @@
       "label": "fp16_1024x1024x1024",
       "status": "ok",
       "impls": {
-        "tir": 6.978307281356452,
-        "torch-cublas": 6.10037089655238
+        "tir": 6.983398048388098,
+        "torch-cublas": 6.08553361227988
       },
       "aggregated": {
         "rounds": 5,
@@ -4211,8 +935,8 @@
       "label": "fp16_16384x16384x16384",
       "status": "ok",
       "impls": {
-        "tir": 5922.647941176471,
-        "torch-cublas": 5831.1984555555555
+        "tir": 6021.272635294118,
+        "torch-cublas": 5877.846411111111
       },
       "aggregated": {
         "rounds": 5,
@@ -4225,8 +949,8 @@
       "label": "fp16_2048x2048x2048",
       "status": "ok",
       "impls": {
-        "tir": 16.400254155249478,
-        "torch-cublas": 16.03984602851463
+        "tir": 16.51885132204239,
+        "torch-cublas": 16.106123682967723
       },
       "aggregated": {
         "rounds": 5,
@@ -4239,8 +963,8 @@
       "label": "fp16_4096x4096x4096",
       "status": "ok",
       "impls": {
-        "tir": 94.23279540734069,
-        "torch-cublas": 91.22796515673554
+        "tir": 95.60501958749404,
+        "torch-cublas": 91.69902184924219
       },
       "aggregated": {
         "rounds": 5,
@@ -4253,8 +977,8 @@
       "label": "fp16_8192x8192x8192",
       "status": "ok",
       "impls": {
-        "tir": 723.613726397211,
-        "torch-cublas": 756.1901565579459
+        "tir": 732.7518996632997,
+        "torch-cublas": 747.5037572586979
       },
       "aggregated": {
         "rounds": 5,
@@ -4267,8 +991,8 @@
       "label": "deepgemm_m4096_n2112_k7168",
       "status": "ok",
       "impls": {
-        "tir": 50.32285445099124,
-        "deepgemm": 49.14053777024635
+        "tir": 50.472239939947194,
+        "deepgemm": 49.48488976077253
       },
       "aggregated": {
         "rounds": 5,
@@ -4281,8 +1005,8 @@
       "label": "deepgemm_m4096_n24576_k1536",
       "status": "ok",
       "impls": {
-        "tir": 116.03775505539429,
-        "deepgemm": 113.88937585311021
+        "tir": 115.06061962981109,
+        "deepgemm": 114.60858156939422
       },
       "aggregated": {
         "rounds": 5,
@@ -4295,8 +1019,8 @@
       "label": "deepgemm_m4096_n32768_k512",
       "status": "ok",
       "impls": {
-        "tir": 68.32546265543716,
-        "deepgemm": 70.75595091134119
+        "tir": 68.22281224350216,
+        "deepgemm": 71.60527428394019
       },
       "aggregated": {
         "rounds": 5,
@@ -4309,8 +1033,8 @@
       "label": "deepgemm_m4096_n4096_k7168",
       "status": "ok",
       "impls": {
-        "tir": 82.45254061512698,
-        "deepgemm": 81.76918146454749
+        "tir": 81.1150385447032,
+        "deepgemm": 80.93435242446562
       },
       "aggregated": {
         "rounds": 5,
@@ -4323,8 +1047,8 @@
       "label": "deepgemm_m4096_n576_k7168",
       "status": "ok",
       "impls": {
-        "tir": 20.02491195756294,
-        "deepgemm": 19.083323770162956
+        "tir": 20.256968733638097,
+        "deepgemm": 19.08946156535612
       },
       "aggregated": {
         "rounds": 5,
@@ -4337,8 +1061,8 @@
       "label": "deepgemm_m4096_n7168_k16384",
       "status": "ok",
       "impls": {
-        "tir": 337.1708557830227,
-        "deepgemm": 337.84375430034214
+        "tir": 327.87620025968744,
+        "deepgemm": 327.00522733663894
       },
       "aggregated": {
         "rounds": 5,
@@ -4351,8 +1075,8 @@
       "label": "deepgemm_m4096_n7168_k2048",
       "status": "ok",
       "impls": {
-        "tir": 43.202333073984754,
-        "deepgemm": 42.30155727217757
+        "tir": 43.37933318604022,
+        "deepgemm": 42.51854608049503
       },
       "aggregated": {
         "rounds": 5,
@@ -4365,12 +1089,12 @@
       "label": "tp1_m8192_n16384_k53248_fp16_dynamic",
       "status": "ok",
       "impls": {
-        "tirx": 10815.157334009806,
-        "cublas_nccl_cudagraph": 10489.352067311605,
-        "cublasmp_split_p2p": 11427.41060256958
+        "tirx": 9356.575300000002,
+        "cublas_nccl_cudagraph": 9029.742100000001,
+        "cublasmp_split_p2p": 9836.31700000001
       },
       "aggregated": {
-        "rounds": 6,
+        "rounds": 5,
         "method": "mean"
       }
     },
@@ -4380,12 +1104,12 @@
       "label": "tp1_m8192_n4096_k12288_fp16_dynamic",
       "status": "ok",
       "impls": {
-        "tirx": 593.3013409376144,
-        "cublas_nccl_cudagraph": 563.6559973160425,
-        "cublasmp_split_p2p": 753.8853287696838
+        "tirx": 593.4696999999984,
+        "cublas_nccl_cudagraph": 561.6200999999986,
+        "cublasmp_split_p2p": 747.7858000000031
       },
       "aggregated": {
-        "rounds": 6,
+        "rounds": 5,
         "method": "mean"
       }
     },
@@ -4395,12 +1119,12 @@
       "label": "tp1_m8192_n5120_k25600_fp16_dynamic",
       "status": "ok",
       "impls": {
-        "tirx": 1526.695986588796,
-        "cublas_nccl_cudagraph": 1459.0133527914684,
-        "cublasmp_split_p2p": 1868.9119915167491
+        "tirx": 1515.5371000000146,
+        "cublas_nccl_cudagraph": 1442.0078000000035,
+        "cublasmp_split_p2p": 1841.007799999995
       },
       "aggregated": {
-        "rounds": 6,
+        "rounds": 5,
         "method": "mean"
       }
     },
@@ -4410,72 +1134,12 @@
       "label": "tp1_m8192_n8192_k28672_fp16_dynamic",
       "status": "ok",
       "impls": {
-        "tirx": 2482.2586377461753,
-        "cublas_nccl_cudagraph": 2450.5146543184915,
-        "cublasmp_split_p2p": 2930.002669493357
+        "tirx": 2523.2398000000003,
+        "cublas_nccl_cudagraph": 2467.169599999995,
+        "cublasmp_split_p2p": 2902.886200000002
       },
       "aggregated": {
-        "rounds": 6,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "gemm_reduce_scatter",
-      "config": "tp4_m8192_n16384_k53248_fp16_dynamic",
-      "label": "tp4_m8192_n16384_k53248_fp16_dynamic",
-      "status": "ok",
-      "impls": {
-        "tirx": 2604.8026283582053,
-        "cublas_nccl_cudagraph": 2775.765339533488,
-        "cublasmp_split_p2p": 2743.7493403752646
-      },
-      "aggregated": {
-        "rounds": 6,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "gemm_reduce_scatter",
-      "config": "tp4_m8192_n4096_k12288_fp16_dynamic",
-      "label": "tp4_m8192_n4096_k12288_fp16_dynamic",
-      "status": "ok",
-      "impls": {
-        "tirx": 262.0026667912801,
-        "cublas_nccl_cudagraph": 252.5120029846827,
-        "cublasmp_split_p2p": 249.314667036136
-      },
-      "aggregated": {
-        "rounds": 6,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "gemm_reduce_scatter",
-      "config": "tp4_m8192_n5120_k25600_fp16_dynamic",
-      "label": "tp4_m8192_n5120_k25600_fp16_dynamic",
-      "status": "ok",
-      "impls": {
-        "tirx": 478.03467015425366,
-        "cublas_nccl_cudagraph": 484.1093346476555,
-        "cublasmp_split_p2p": 431.3306659460068
-      },
-      "aggregated": {
-        "rounds": 6,
-        "method": "mean"
-      }
-    },
-    {
-      "kernel": "gemm_reduce_scatter",
-      "config": "tp4_m8192_n8192_k28672_fp16_dynamic",
-      "label": "tp4_m8192_n8192_k28672_fp16_dynamic",
-      "status": "ok",
-      "impls": {
-        "tirx": 756.1146666606268,
-        "cublas_nccl_cudagraph": 840.053324898084,
-        "cublasmp_split_p2p": 783.8986764351527
-      },
-      "aggregated": {
-        "rounds": 6,
+        "rounds": 5,
         "method": "mean"
       }
     },
@@ -4485,8 +1149,8 @@
       "label": "large_g4_m8192_n4096_k2048",
       "status": "ok",
       "impls": {
-        "tir": 163.34337990854615,
-        "deepgemm": 169.87972342149934
+        "tir": 161.91051704412428,
+        "deepgemm": 162.35240683578232
       },
       "aggregated": {
         "rounds": 5,
@@ -4499,8 +1163,8 @@
       "label": "large_g4_m8192_n4096_k4096",
       "status": "ok",
       "impls": {
-        "tir": 366.74645092237137,
-        "deepgemm": 371.54775335740146
+        "tir": 348.7676477342605,
+        "deepgemm": 365.81818166763077
       },
       "aggregated": {
         "rounds": 5,
@@ -4513,8 +1177,8 @@
       "label": "large_g4_m8192_n6144_k7168",
       "status": "ok",
       "impls": {
-        "tir": 979.9912851485149,
-        "deepgemm": 986.3397826839827
+        "tir": 989.9543171717172,
+        "deepgemm": 1030.5004375
       },
       "aggregated": {
         "rounds": 5,
@@ -4527,8 +1191,8 @@
       "label": "large_g4_m8192_n7168_k3072",
       "status": "ok",
       "impls": {
-        "tir": 490.23280349124093,
-        "deepgemm": 506.3522563374673
+        "tir": 505.82464343785057,
+        "deepgemm": 526.2586942188246
       },
       "aggregated": {
         "rounds": 5,
@@ -4541,8 +1205,8 @@
       "label": "large_g8_m4096_n4096_k2048",
       "status": "ok",
       "impls": {
-        "tir": 182.70270349174845,
-        "deepgemm": 192.17278815231134
+        "tir": 188.77914853187627,
+        "deepgemm": 198.07185389180628
       },
       "aggregated": {
         "rounds": 5,
@@ -4555,8 +1219,8 @@
       "label": "large_g8_m4096_n4096_k4096",
       "status": "ok",
       "impls": {
-        "tir": 358.795193443016,
-        "deepgemm": 360.01709604765944
+        "tir": 349.4309475428018,
+        "deepgemm": 347.19071938013985
       },
       "aggregated": {
         "rounds": 5,
@@ -4569,8 +1233,8 @@
       "label": "large_g8_m4096_n6144_k7168",
       "status": "ok",
       "impls": {
-        "tir": 1092.701306067845,
-        "deepgemm": 1144.8009
+        "tir": 1129.2648382022473,
+        "deepgemm": 1148.2562574712645
       },
       "aggregated": {
         "rounds": 5,
@@ -4583,8 +1247,8 @@
       "label": "large_g8_m4096_n7168_k3072",
       "status": "ok",
       "impls": {
-        "tir": 504.26428338279516,
-        "deepgemm": 536.9235412264657
+        "tir": 528.6296646206342,
+        "deepgemm": 545.58127097455
       },
       "aggregated": {
         "rounds": 5,
@@ -4597,11 +1261,11 @@
       "label": "moe_a3b_bs1024_all",
       "status": "ok",
       "impls": {
-        "tir_static": 253.5294307637113,
-        "tir_dynamic": 251.75458602169476,
-        "tir_unfused": 269.4263309856987,
-        "sglang_full": 368.9248438547313,
-        "flashinfer_full": 338.672501014162
+        "tir_static": 254.5459142471012,
+        "tir_dynamic": 250.68941051721356,
+        "tir_unfused": 271.11147838633605,
+        "sglang_full": 366.6708086317472,
+        "flashinfer_full": 340.00002946517634
       },
       "aggregated": {
         "rounds": 5,
@@ -4614,11 +1278,11 @@
       "label": "moe_a3b_bs128_all",
       "status": "ok",
       "impls": {
-        "tir_static": 222.66451956284322,
-        "tir_dynamic": 219.63064844819021,
-        "tir_unfused": 229.0844134719119,
-        "sglang_full": 257.2693106144075,
-        "flashinfer_full": 260.5438041348281
+        "tir_static": 223.31242756802348,
+        "tir_dynamic": 220.20847193375818,
+        "tir_unfused": 231.18497592814128,
+        "sglang_full": 254.80058327848752,
+        "flashinfer_full": 260.8024506259301
       },
       "aggregated": {
         "rounds": 5,
@@ -4631,11 +1295,11 @@
       "label": "moe_a3b_bs1_all",
       "status": "ok",
       "impls": {
-        "tir_static": 34.323615291753626,
-        "tir_dynamic": 38.450887196347125,
-        "tir_unfused": 34.372297583790655,
-        "sglang_full": 57.68441689503514,
-        "flashinfer_full": 64.91477788435839
+        "tir_static": 33.63158111718923,
+        "tir_dynamic": 37.80421692626925,
+        "tir_unfused": 34.8429545509233,
+        "sglang_full": 53.80776708196676,
+        "flashinfer_full": 60.537814905604954
       },
       "aggregated": {
         "rounds": 5,
@@ -4648,11 +1312,11 @@
       "label": "moe_a3b_bs2048_all",
       "status": "ok",
       "impls": {
-        "tir_static": 338.16877918191636,
-        "tir_dynamic": 337.79378558573046,
-        "tir_unfused": 351.416092589847,
-        "sglang_full": 455.5760352791878,
-        "flashinfer_full": 413.78394227763397
+        "tir_static": 336.853436520072,
+        "tir_dynamic": 337.81434113033436,
+        "tir_unfused": 349.7044371244619,
+        "sglang_full": 453.5882318713507,
+        "flashinfer_full": 407.23227766704514
       },
       "aggregated": {
         "rounds": 5,
@@ -4665,11 +1329,11 @@
       "label": "moe_a3b_bs32_all",
       "status": "ok",
       "impls": {
-        "tir_static": 205.45296784049472,
-        "tir_dynamic": 203.69781908204635,
-        "tir_unfused": 207.2779918416253,
-        "sglang_full": 242.95990077589428,
-        "flashinfer_full": 244.09500302310553
+        "tir_static": 203.20118874315892,
+        "tir_dynamic": 203.6942918599466,
+        "tir_unfused": 211.03775641736317,
+        "sglang_full": 238.33324481127835,
+        "flashinfer_full": 238.9274894789488
       },
       "aggregated": {
         "rounds": 5,
@@ -4682,11 +1346,11 @@
       "label": "moe_a3b_bs4096_all",
       "status": "ok",
       "impls": {
-        "tir_static": 519.9968452350176,
-        "tir_dynamic": 529.6217057914012,
-        "tir_unfused": 536.9672716825397,
-        "sglang_full": 659.9393365704718,
-        "flashinfer_full": 597.4913350787853
+        "tir_static": 526.0153768010442,
+        "tir_dynamic": 534.9025984543762,
+        "tir_unfused": 539.4193110455151,
+        "sglang_full": 663.5941025923254,
+        "flashinfer_full": 598.7854002850057
       },
       "aggregated": {
         "rounds": 5,
@@ -4699,11 +1363,11 @@
       "label": "moe_a3b_bs512_all",
       "status": "ok",
       "impls": {
-        "tir_static": 235.0351231662495,
-        "tir_dynamic": 234.05812402323542,
-        "tir_unfused": 242.30888914493627,
-        "sglang_full": 307.2537825635692,
-        "flashinfer_full": 294.81962606409274
+        "tir_static": 234.78836655292537,
+        "tir_dynamic": 232.57197717477084,
+        "tir_unfused": 248.75511909313275,
+        "sglang_full": 308.06179793381585,
+        "flashinfer_full": 293.7047538863183
       },
       "aggregated": {
         "rounds": 5,
@@ -4716,11 +1380,11 @@
       "label": "moe_a3b_bs8_all",
       "status": "ok",
       "impls": {
-        "tir_static": 101.7217021754696,
-        "tir_dynamic": 102.6952318416058,
-        "tir_unfused": 110.03126463444711,
-        "sglang_full": 134.12141627357136,
-        "flashinfer_full": 146.54523155009917
+        "tir_static": 103.39332530635893,
+        "tir_dynamic": 102.62051377275905,
+        "tir_unfused": 111.05308782685397,
+        "sglang_full": 137.11865815310486,
+        "flashinfer_full": 142.51762675650085
       },
       "aggregated": {
         "rounds": 5,
@@ -4733,9 +1397,9 @@
       "label": "1024x1024x1024",
       "status": "ok",
       "impls": {
-        "tir": 5.4791750232773735,
-        "flashinfer": 4.538810558189995,
-        "cublaslt_nvfp4": 4.563022824558008
+        "tir": 5.212921659043406,
+        "flashinfer": 4.623380508991196,
+        "cublaslt_nvfp4": 4.524751922436695
       },
       "aggregated": {
         "rounds": 5,
@@ -4748,9 +1412,9 @@
       "label": "16384x16384x16384",
       "status": "ok",
       "impls": {
-        "tir": 1519.7452397278314,
-        "flashinfer": 1436.00735942029,
-        "cublaslt_nvfp4": 1417.6958200000001
+        "tir": 1515.0943696969698,
+        "flashinfer": 1434.624504477612,
+        "cublaslt_nvfp4": 1470.8436294117646
       },
       "aggregated": {
         "rounds": 5,
@@ -4763,9 +1427,9 @@
       "label": "2048x2048x2048",
       "status": "ok",
       "impls": {
-        "tir": 8.493145106395767,
-        "flashinfer": 7.748208374389758,
-        "cublaslt_nvfp4": 7.633725828582334
+        "tir": 8.571425028584,
+        "flashinfer": 7.522380072893264,
+        "cublaslt_nvfp4": 7.474695489502995
       },
       "aggregated": {
         "rounds": 5,
@@ -4778,9 +1442,9 @@
       "label": "4096x4096x4096",
       "status": "ok",
       "impls": {
-        "tir": 29.578055206596886,
-        "flashinfer": 31.086866046961827,
-        "cublaslt_nvfp4": 28.787714686726297
+        "tir": 29.62644524124634,
+        "flashinfer": 30.757219815700772,
+        "cublaslt_nvfp4": 28.686729888274854
       },
       "aggregated": {
         "rounds": 5,
@@ -4793,9 +1457,9 @@
       "label": "8192x8192x8192",
       "status": "ok",
       "impls": {
-        "tir": 184.86467861402684,
-        "flashinfer": 181.11991828219092,
-        "cublaslt_nvfp4": 182.31569526284397
+        "tir": 185.88687925456713,
+        "flashinfer": 177.46575606658948,
+        "cublaslt_nvfp4": 183.91122769561886
       },
       "aggregated": {
         "rounds": 5,
@@ -4808,8 +1472,8 @@
       "label": "bench_regular_dqk512_hq128_s4096_kv32768_topk2048",
       "status": "ok",
       "impls": {
-        "tirx": 1721.0172612195122,
-        "flashmla": 1735.7986316949152
+        "tirx": 1720.3042606060606,
+        "flashmla": 1742.0048983050847
       },
       "aggregated": {
         "rounds": 5,
@@ -4822,8 +1486,8 @@
       "label": "bench_regular_dqk512_hq128_s4096_kv65536_topk2048",
       "status": "ok",
       "impls": {
-        "tirx": 1862.4760059259258,
-        "flashmla": 1894.8345595286196
+        "tirx": 1884.2058657407408,
+        "flashmla": 1893.9394296296296
       },
       "aggregated": {
         "rounds": 5,
@@ -4836,8 +1500,8 @@
       "label": "bench_regular_dqk512_hq128_s4096_kv8192_topk2048",
       "status": "ok",
       "impls": {
-        "tirx": 1709.0215715254237,
-        "flashmla": 1734.5634406779661
+        "tirx": 1724.0275986771394,
+        "flashmla": 1726.3318983050847
       },
       "aggregated": {
         "rounds": 5,
@@ -4850,9 +1514,9 @@
       "label": "bench_regular_dqk576_hq128_s4096_kv32768_topk2048",
       "status": "ok",
       "impls": {
-        "tirx": 1802.4898535714285,
-        "flashmla": 1830.1270285714286,
-        "trtllm_gen": 2049.0881080018503
+        "tirx": 1829.0657035714285,
+        "flashmla": 1845.118982142857,
+        "trtllm_gen": 2068.9037521469318
       },
       "aggregated": {
         "rounds": 5,
@@ -4865,9 +1529,9 @@
       "label": "bench_regular_dqk576_hq128_s4096_kv65536_topk2048",
       "status": "ok",
       "impls": {
-        "tirx": 2023.8197696470588,
-        "flashmla": 2000.9210196078432,
-        "trtllm_gen": 2199.823721111111
+        "tirx": 1999.179537254902,
+        "flashmla": 1988.379073076923,
+        "trtllm_gen": 2165.1377832981993
       },
       "aggregated": {
         "rounds": 5,
@@ -4880,9 +1544,9 @@
       "label": "bench_regular_dqk576_hq128_s4096_kv8192_topk2048",
       "status": "ok",
       "impls": {
-        "tirx": 1791.3009898366606,
-        "flashmla": 1793.884501754386,
-        "trtllm_gen": 2030.435576729628
+        "tirx": 1804.8582642857143,
+        "flashmla": 1818.18425,
+        "trtllm_gen": 2051.3737754078015
       },
       "aggregated": {
         "rounds": 5,
@@ -4895,8 +1559,8 @@
       "label": "bench_smalltopk_dqk512_hq128_s4096_kv32768_topk1280",
       "status": "ok",
       "impls": {
-        "tirx": 1148.8238113636364,
-        "flashmla": 1167.9827795454546
+        "tirx": 1158.2862424418604,
+        "flashmla": 1175.4128093023255
       },
       "aggregated": {
         "rounds": 5,
@@ -4909,8 +1573,8 @@
       "label": "bench_smalltopk_dqk512_hq128_s4096_kv65536_topk1280",
       "status": "ok",
       "impls": {
-        "tirx": 1179.5890439215686,
-        "flashmla": 1209.733865882353
+        "tirx": 1204.5302780162667,
+        "flashmla": 1214.1590722891567
       },
       "aggregated": {
         "rounds": 5,
@@ -4923,8 +1587,8 @@
       "label": "bench_smalltopk_dqk512_hq128_s4096_kv8192_topk1280",
       "status": "ok",
       "impls": {
-        "tirx": 1150.467889446186,
-        "flashmla": 1166.8383218390804
+        "tirx": 1146.6569343396702,
+        "flashmla": 1160.860520101577
       },
       "aggregated": {
         "rounds": 5,
@@ -4937,8 +1601,8 @@
       "label": "bench_dqk512_hq64_s4096_kv32768_topk512",
       "status": "ok",
       "impls": {
-        "tirx": 369.8019645508995,
-        "flashmla": 378.8894199979724
+        "tirx": 368.69794112396414,
+        "flashmla": 380.8613048951057
       },
       "aggregated": {
         "rounds": 5,
@@ -4951,8 +1615,8 @@
       "label": "bench_dqk512_hq64_s4096_kv49152_topk512",
       "status": "ok",
       "impls": {
-        "tirx": 373.0716293513128,
-        "flashmla": 381.93090652580156
+        "tirx": 375.8816745983732,
+        "flashmla": 386.3110449093071
       },
       "aggregated": {
         "rounds": 5,
@@ -4965,8 +1629,8 @@
       "label": "bench_dqk512_hq64_s4096_kv65536_topk512",
       "status": "ok",
       "impls": {
-        "tirx": 381.5666436870273,
-        "flashmla": 387.65333205879773
+        "tirx": 376.3355781023063,
+        "flashmla": 387.90960367638826
       },
       "aggregated": {
         "rounds": 5,
@@ -4979,8 +1643,8 @@
       "label": "bench_dqk512_hq64_s4096_kv8192_topk512",
       "status": "ok",
       "impls": {
-        "tirx": 363.39674597063305,
-        "flashmla": 373.3127991888756
+        "tirx": 362.8557216635409,
+        "flashmla": 371.8569645556216
       },
       "aggregated": {
         "rounds": 5,
@@ -4993,9 +1657,9 @@
       "label": "bench_dqk576_hq64_s4096_kv32768_topk512",
       "status": "ok",
       "impls": {
-        "tirx": 383.7199627708784,
-        "flashmla": 401.1418996731093,
-        "trtllm_gen": 467.92338035496516
+        "tirx": 381.8868688872607,
+        "flashmla": 395.3827453180762,
+        "trtllm_gen": 466.93755285597246
       },
       "aggregated": {
         "rounds": 5,
@@ -5008,9 +1672,9 @@
       "label": "bench_dqk576_hq64_s4096_kv49152_topk512",
       "status": "ok",
       "impls": {
-        "tirx": 388.7866111476694,
-        "flashmla": 402.58653441002866,
-        "trtllm_gen": 470.4101505383023
+        "tirx": 394.7215793766161,
+        "flashmla": 410.2900998555761,
+        "trtllm_gen": 477.0997341654396
       },
       "aggregated": {
         "rounds": 5,
@@ -5023,9 +1687,9 @@
       "label": "bench_dqk576_hq64_s4096_kv65536_topk512",
       "status": "ok",
       "impls": {
-        "tirx": 401.6096226013531,
-        "flashmla": 417.1230019913749,
-        "trtllm_gen": 484.87681460675645
+        "tirx": 400.95225040831866,
+        "flashmla": 416.17800792688047,
+        "trtllm_gen": 487.72293960666985
       },
       "aggregated": {
         "rounds": 5,
@@ -5038,9 +1702,9 @@
       "label": "bench_dqk576_hq64_s4096_kv8192_topk512",
       "status": "ok",
       "impls": {
-        "tirx": 369.2718158437954,
-        "flashmla": 381.5985726373567,
-        "trtllm_gen": 459.3726172145912
+        "tirx": 377.68298355386526,
+        "flashmla": 387.25895112085595,
+        "trtllm_gen": 464.1193425993856
       },
       "aggregated": {
         "rounds": 5,

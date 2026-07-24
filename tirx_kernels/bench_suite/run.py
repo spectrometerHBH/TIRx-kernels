@@ -61,8 +61,6 @@ DEFAULT_BASELINE = SCRIPT_DIR / "baseline.json"
 DEFAULT_REGRESSION_THRESHOLD = 1.0
 POLL_INTERVAL = 5.0  # seconds between GPU re-checks when none is free
 MONITOR_INTERVAL = 0.5  # seconds between nvidia-smi polls during a workload
-# 0 means auto: one worker per probe-OK GPU (see main()).
-DEFAULT_CPU_WORKERS = 0
 DEFAULT_UTIL_THRESHOLD = 0.0  # % GPU util above which a card counts as busy.
 DEFAULT_MEM_THRESHOLD = 0.0  # % compute-app memory above which a card counts as busy.
 
@@ -1261,13 +1259,7 @@ def _finalize_bench_record(row: dict, *, rounds: int) -> None:
 
 
 def run_scheduled_jobs(
-    workloads: list[dict],
-    pool: GpuPool,
-    log_dir: Path,
-    *,
-    rounds: int,
-    cooldown: float,
-    cpu_workers: int,
+    workloads: list[dict], pool: GpuPool, log_dir: Path, *, rounds: int, cooldown: float
 ) -> tuple[list[dict], list[tuple[str, str, int, str]]]:
     """Run one subprocess per workload and stop the suite on the first failure.
 
@@ -1368,7 +1360,7 @@ def run_scheduled_jobs(
                     )
             pending.task_done()
 
-    n_workers = min(cpu_workers, n_jobs)
+    n_workers = min(pool.total_visible(), n_jobs)
     with ThreadPoolExecutor(max_workers=n_workers, thread_name_prefix="bench") as ex:
         futs = [ex.submit(worker) for _ in range(n_workers)]
         with state_lock:
@@ -1463,13 +1455,6 @@ def main() -> None:
         type=float,
         default=DEFAULT_COOLDOWN_S,
         help=f"Seconds to sleep before every implementation (default {DEFAULT_COOLDOWN_S:g}).",
-    )
-    ap.add_argument(
-        "--cpu-workers",
-        type=int,
-        default=DEFAULT_CPU_WORKERS,
-        help="Concurrent bench workers (default 0 = probe-OK GPU count). "
-        "Each worker atomically holds all GPUs requested by its workload.",
     )
     ap.add_argument(
         "--check-imports",
@@ -1588,8 +1573,7 @@ def main() -> None:
         allowed=usable, util_threshold=args.util_threshold, mem_threshold=args.mem_threshold
     )
     n_gpus = len(usable)
-    cpu_workers = args.cpu_workers if args.cpu_workers > 0 else n_gpus
-    cpu_workers = min(cpu_workers, n_gpus)
+    n_workers = min(n_gpus, len(workloads))
 
     _repo_git = collect_repo_git()
     label = args.label or _repo_git.get("tirx-kernels") or _repo_git.get("tir") or "local"
@@ -1601,17 +1585,12 @@ def main() -> None:
     )
     print(
         f"[bench-suite] {len(workloads)} workloads, {n_gpus} probe-OK GPU(s) in pool, "
-        f"{cpu_workers} worker(s), label={label}{agg_note}",
+        f"{n_workers} worker(s), label={label}{agg_note}",
         flush=True,
     )
 
     results, retry_log = run_scheduled_jobs(
-        workloads,
-        pool,
-        log_dir,
-        rounds=args.rounds,
-        cooldown=args.cooldown,
-        cpu_workers=cpu_workers,
+        workloads, pool, log_dir, rounds=args.rounds, cooldown=args.cooldown
     )
 
     if retry_log:

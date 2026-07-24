@@ -16,6 +16,14 @@ from tirx_kernels.megakernel.moe import BENCH_CONFIGS as MEGAKERNEL_MOE_BENCH_CO
 from tirx_kernels.megakernel.moe import _estimate_bench_launch_slots
 
 
+class _ScheduledJobsPool:
+    def __init__(self, capacity: int) -> None:
+        self.capacity = capacity
+
+    def total_visible(self) -> int:
+        return self.capacity
+
+
 def test_bench_suite_standard_sampling_defaults() -> None:
     assert run.DEFAULT_ROUNDS == 5
     assert run.DEFAULT_COOLDOWN_S == 1.0
@@ -55,7 +63,7 @@ def test_default_workloads_include_full_megakernel_moe_sweep() -> None:
     assert all("timer" not in w for w in megakernel_moe_workloads)
 
 
-def test_default_workloads_include_manual_gemm_comm_kineto_profiles() -> None:
+def test_default_workloads_include_manual_tp1_gemm_comm_kineto_profiles() -> None:
     workloads = run.load_workloads(run.DEFAULT_WORKLOADS)
     selected = [
         workload
@@ -67,7 +75,7 @@ def test_default_workloads_include_manual_gemm_comm_kineto_profiles() -> None:
         "allgather_gemm": {config["label"]: config for config in ALLGATHER_GEMM_CONFIGS},
         "gemm_reduce_scatter": {config["label"]: config for config in GEMM_RS_CONFIGS},
     }
-    assert len(selected) == 16
+    assert len(selected) == 8
     assert all(workload["config"] in configs_by_kernel[workload["kernel"]] for workload in selected)
     assert all(workload["timer"] == "kineto" for workload in selected)
     assert all(
@@ -517,11 +525,10 @@ def test_run_scheduled_jobs_stops_after_first_failure(
     monkeypatch.setattr(run, "run_one", fake_run_one)
     records, retry_log = run.run_scheduled_jobs(
         [{"kernel": "kernel", "config": "fails"}, {"kernel": "kernel", "config": "must_not_start"}],
-        object(),
+        _ScheduledJobsPool(1),
         tmp_path,
         rounds=1,
         cooldown=0,
-        cpu_workers=1,
     )
 
     assert calls == ["fails"]
@@ -551,11 +558,10 @@ def test_run_scheduled_jobs_retries_interference(
     monkeypatch.setattr(run, "run_one", fake_run_one)
     records, retry_log = run.run_scheduled_jobs(
         [{"kernel": "kernel", "config": "config"}],
-        object(),
+        _ScheduledJobsPool(1),
         tmp_path,
         rounds=1,
         cooldown=0,
-        cpu_workers=1,
     )
 
     assert attempts == [1, 2]
@@ -594,11 +600,10 @@ def test_run_scheduled_jobs_cancels_inflight_work(
             {"kernel": "kernel", "config": "active"},
             {"kernel": "kernel", "config": "must_not_start"},
         ],
-        object(),
+        _ScheduledJobsPool(2),
         tmp_path,
         rounds=1,
         cooldown=0,
-        cpu_workers=2,
     )
 
     assert set(calls) == {"fails", "active"}

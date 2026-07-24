@@ -3,6 +3,8 @@
 Pre-commit regression benchmark for TIRx kernels. Runs the curated workload
 sweep in `workloads.yaml` against the **working tree**, assigns GPUs
 automatically, and writes run JSON + reports under `.bench-suite/`.
+The default sweep contains 113 representative single-GPU workloads, including
+the TP1 AllGather+GEMM and GEMM+ReduceScatter profiles.
 
 ```bash
 cd /path/to/tirx-kernels
@@ -27,6 +29,12 @@ two hard host requirements beyond torch/DeepGEMM:
   rows bench the `sglang_cutedsl` reference unconditionally.
 - **NVSHMEM**: required by the `allgather_gemm` / `gemm_reduce_scatter`
   (GemmComm) rows.
+
+GemmComm benchmark rows additionally require absolute runtime-library locks:
+`TIRX_NCCL_LIBRARY`, `TIRX_CUBLAS_LIBRARY`, `TIRX_CUBLASMP_LIBRARY`, and
+`TIRX_NVSHMEM_LIBRARY`. `NVSHMEM_HOME` points to the development installation
+used while compiling the TIRx kernels. These locks affect only the spawned
+GemmComm rank workers.
 
 `--filter` is include-only and cannot exclude rows. On a host without NVSHMEM,
 run a trimmed workload list:
@@ -89,7 +97,7 @@ Run artifacts (logs, `runs/*.json`, `reports/*`) live under `.bench-suite/` and 
    terminates the suite's in-flight subprocesses, writes the partial run for
    diagnosis, and exits with code 1. `INTERFERED` is not a workload failure and
    is requeued; `SKIP` workloads are accepted without retry.
-4. **Dynamic free GPU queue** (`--cpu-workers 0` = one worker per probe-OK GPU):
+4. **Dynamic free GPU queue** (one worker per probe-OK GPU):
    workers pull jobs from a shared queue; each job atomically claims all required
    free cards, runs one subprocess, then releases the full set. Whoever finishes
    first grabs the next satisfiable job — no static workload→GPU binding and no
@@ -125,12 +133,14 @@ diagnostic run that will not be promoted.
 
 ```bash
 python -m tirx_kernels.bench_suite
-python tirx_kernels/bench_suite/promote_baseline.py .bench-suite/runs/<id>.json --merge
+python tirx_kernels/bench_suite/promote_baseline.py .bench-suite/runs/<id>.json
 ```
 
-`promote_baseline.py <run>.json --merge` patches the ok rows from a run JSON into
-`baseline.json` by `(kernel, config)` and regenerates `baseline.md`. Promoted runs use
-the arithmetic mean of all five samples; no samples are trimmed or silently dropped.
+The replacement form above is used for a complete default sweep so removed
+workloads do not remain in `baseline.json`. For a targeted update,
+`promote_baseline.py <run>.json --merge` patches only the ok rows by
+`(kernel, config)`. Both forms regenerate `baseline.md`. Promoted runs use the
+arithmetic mean of all five samples; no samples are trimmed or silently dropped.
 
 Spot-check one workload: `python -m tirx_kernels.bench --kernel ... --config ... --rounds 5`
 
@@ -163,7 +173,6 @@ defaults to FlashInfer's `auto` backend; set
 |------|---------|---------|
 | `--rounds N` | `5` | Complete standard-timer calls per implementation/workload |
 | `--cooldown` | `1.0` | Seconds before every implementation in every round |
-| `--cpu-workers` | `0` (= GPU count) | Concurrent workload workers (capped at GPU count) |
 | `--util-threshold` | `0` | Skip GPUs with SM utilization above this percent |
 | `--mem-threshold` | `0` | Skip GPUs with compute-app memory-used percent above this percent |
 
