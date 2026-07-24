@@ -7,18 +7,18 @@ defaults:
   # Timer, warmup, repeat, rounds, and cooldown use bench-suite defaults.
 
 workloads:
-  - {kernel: sparse_flashmla_decode_head64, config: deepseek_v4_v32_hq64_b128_sq2_sk32768_topk2048}
-  - {kernel: sparse_flashmla_decode_head64, config: up_perf_4720_model1_hq64_b2_sq2_sk16384_topk128_page256_xsk16384_xtopk512_xpage64_var_fulltopk_fullxtopk_mixedindices_nonzeroseqlen_sink}
-  - {kernel: sparse_flashmla_decode_head64, config: up_perf_4721_model1_hq64_b64_sq2_sk16384_topk128_page256_xsk16384_xtopk512_xpage64_var_fulltopk_fullxtopk_mixedindices_nonzeroseqlen_sink}
-  - {kernel: sparse_flashmla_decode_head64, config: up_perf_4722_model1_hq64_b74_sq2_sk16384_topk128_page256_xsk16384_xtopk512_xpage64_var_fulltopk_fullxtopk_mixedindices_nonzeroseqlen_sink}
-  - {kernel: sparse_flashmla_decode_head64, config: up_perf_4723_model1_hq64_b128_sq2_sk16384_topk128_page256_xsk16384_xtopk512_xpage64_var_fulltopk_fullxtopk_mixedindices_nonzeroseqlen_sink}
-  - {kernel: sparse_flashmla_decode_head64, config: up_perf_4724_model1_hq64_b148_sq2_sk16384_topk128_page256_xsk16384_xtopk512_xpage64_var_fulltopk_fullxtopk_mixedindices_nonzeroseqlen_sink}
-  - {kernel: sparse_flashmla_decode_head64, config: up_perf_4725_model1_hq64_b256_sq2_sk16384_topk128_page256_xsk16384_xtopk512_xpage64_var_fulltopk_fullxtopk_mixedindices_nonzeroseqlen_sink}
-  - {kernel: sparse_flashmla_decode_head64, config: up_perf_4732_model1_hq64_b2_sq2_sk16384_topk128_page256_xsk16384_xtopk1024_xpage2_var_fulltopk_xtopklen_mixedindices_nonzeroseqlen_sink}
-  - {kernel: sparse_flashmla_decode_head64, config: up_perf_4733_model1_hq64_b64_sq2_sk16384_topk128_page256_xsk16384_xtopk1024_xpage2_var_fulltopk_xtopklen_mixedindices_nonzeroseqlen_sink}
-  - {kernel: sparse_flashmla_decode_head64, config: up_perf_4734_model1_hq64_b74_sq2_sk16384_topk128_page256_xsk16384_xtopk1024_xpage2_var_fulltopk_xtopklen_mixedindices_nonzeroseqlen_sink}
-  - {kernel: sparse_flashmla_decode_head64, config: up_perf_4735_model1_hq64_b128_sq2_sk16384_topk128_page256_xsk16384_xtopk1024_xpage2_var_fulltopk_xtopklen_mixedindices_nonzeroseqlen_sink}
-  - {kernel: sparse_flashmla_decode_head64, config: up_perf_4736_model1_hq64_b148_sq2_sk16384_topk128_page256_xsk16384_xtopk1024_xpage2_var_fulltopk_xtopklen_mixedindices_nonzeroseqlen_sink}
-  - {kernel: sparse_flashmla_decode_head64, config: up_perf_4737_model1_hq64_b256_sq2_sk16384_topk128_page256_xsk16384_xtopk1024_xpage2_var_fulltopk_xtopklen_mixedindices_nonzeroseqlen_sink}
-  - {kernel: sparse_flashmla_decode_head64, config: up_perf_4744_model1_hq64_b148_sq2_sk32768_topk16384_page64_var_fulltopk_fullxtopk_mixedindices_nonzeroseqlen_sink}
-  - {kernel: sparse_flashmla_decode_head64, config: up_perf_4745_v32_hq64_b148_sq2_sk32768_topk16384_page64_var_fulltopk_fullxtopk_mixedindices_nonzeroseqlen_sink}
+  - {kernel: sparse_flashmla_decode_head64, config: deepseek_v4_v32_b128_sq2_sk32768_topk2048_p64}
+  - {kernel: sparse_flashmla_decode_head64, config: model1_b2_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64}
+  - {kernel: sparse_flashmla_decode_head64, config: model1_b64_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64}
+  - {kernel: sparse_flashmla_decode_head64, config: model1_b74_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64}
+  - {kernel: sparse_flashmla_decode_head64, config: model1_b128_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64}
+  - {kernel: sparse_flashmla_decode_head64, config: model1_b148_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64}
+  - {kernel: sparse_flashmla_decode_head64, config: model1_b256_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64}
+  - {kernel: sparse_flashmla_decode_head64, config: model1_b2_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen}
+  - {kernel: sparse_flashmla_decode_head64, config: model1_b64_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen}
+  - {kernel: sparse_flashmla_decode_head64, config: model1_b74_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen}
+  - {kernel: sparse_flashmla_decode_head64, config: model1_b128_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen}
+  - {kernel: sparse_flashmla_decode_head64, config: model1_b148_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen}
+  - {kernel: sparse_flashmla_decode_head64, config: model1_b256_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen}
+  - {kernel: sparse_flashmla_decode_head64, config: model1_b148_sq2_sk32768_topk16384_p64}
+  - {kernel: sparse_flashmla_decode_head64, config: v32_b148_sq2_sk32768_topk16384_p64}

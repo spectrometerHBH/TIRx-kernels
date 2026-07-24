@@ -292,371 +292,201 @@ class SparseFlashMLADecodeHead64Config:
             raise ValueError("extra_topk_length requires an extra KV cache")
 
 
-def _dispatch_record(model_type: ModelType, h_q: int) -> str:
-    d_qk = 576 if model_type is ModelType.V32 else 512
-    if h_q == B_H:
-        head_dispatch = "h_q=64 -> direct head64 launch"
-    else:
-        head_dispatch = "h_q=128,d_qk=576 -> host launches the same head64 kernel twice"
-    return (
-        f"sm100f + sparse FP8 + {head_dispatch} + h_kv=1 + d_v=512 + topk>0 -> "
-        "sm100::decode::head64::run_flash_splitkv_mla_fp8_sparse_kernel<"
-        f"ModelType::{model_type.value}>; d_qk={d_qk} is derived from MODEL_TYPE"
-    )
-
-
-_UPSTREAM_REGULAR_SHAPES = (
-    (512, 64, 2),
-    (512, 64, 64),
-    (512, 64, 69),
-    (1024, 576, 2),
-    (1024, 576, 61),
-    (2046, 2048, 2),
-    (2046, 2048, 64),
-    (2046, 2048, 576),
-)
-_UPSTREAM_CORNER_SHAPES = ((512, 64, 61), (650, 576, 53))
-
-
-def _raw_upstream_case(
-    *,
-    group: str,
-    b: int,
-    h_q: int,
-    s_q: int,
-    s_kv: int,
-    is_varlen: bool,
-    topk: int,
-    d_qk: int,
-    page_block_size: int = 64,
-    is_all_indices_invalid: bool = False,
-    have_zero_seqlen_k: bool = False,
-    have_topk_length: bool = False,
-    have_attn_sink: bool = True,
-    extra_s_kv: int | None = None,
-    extra_topk: int | None = None,
-    extra_page_block_size: int | None = None,
-    have_extra_topk_length: bool = False,
-) -> dict[str, Any]:
-    return {
-        "upstream_group": group,
-        "b": b,
-        "h_q": h_q,
-        "s_q": s_q,
-        "s_kv": s_kv,
-        "is_varlen": is_varlen,
-        "topk": topk,
-        "d_qk": d_qk,
-        "page_block_size": page_block_size,
-        "is_all_indices_invalid": is_all_indices_invalid,
-        "have_zero_seqlen_k": have_zero_seqlen_k,
-        "have_topk_length": have_topk_length,
-        "have_attn_sink": have_attn_sink,
-        "extra_s_kv": extra_s_kv,
-        "extra_topk": extra_topk,
-        "extra_page_block_size": extra_page_block_size,
-        "have_extra_topk_length": have_extra_topk_length,
-    }
-
-
-def _upstream_label(source_index: int, raw: dict[str, Any]) -> str:
-    model = "v32" if raw["d_qk"] == 576 else "model1"
-    label = (
-        f"up_{raw['upstream_group'][:4]}_{source_index:04d}_{model}"
-        f"_hq{raw['h_q']}_b{raw['b']}_sq{raw['s_q']}"
-        f"_sk{raw['s_kv']}_topk{raw['topk']}_page{raw['page_block_size']}"
-    )
-    if raw["extra_topk"] is not None:
-        label += (
-            f"_xsk{raw['extra_s_kv']}_xtopk{raw['extra_topk']}_xpage{raw['extra_page_block_size']}"
-        )
-    modes = (
-        "var" if raw["is_varlen"] else "fixed",
-        "topklen" if raw["have_topk_length"] else "fulltopk",
-        "xtopklen" if raw["have_extra_topk_length"] else "fullxtopk",
-        "allinvalid" if raw["is_all_indices_invalid"] else "mixedindices",
-        "zeroseqlen" if raw["have_zero_seqlen_k"] else "nonzeroseqlen",
-        "sink" if raw["have_attn_sink"] else "nosink",
-    )
-    return f"{label}_{'_'.join(modes)}"
-
-
-def _materialize_upstream_case(source_index: int, raw: dict[str, Any]) -> dict[str, Any]:
-    model_type = ModelType.V32 if raw["d_qk"] == 576 else ModelType.MODEL1
-    return {
-        "label": _upstream_label(source_index, raw),
-        "model_type": model_type.value,
-        "b": raw["b"],
-        "s_q": raw["s_q"],
-        "s_kv": raw["s_kv"],
-        "topk": raw["topk"],
-        "page_block_size": raw["page_block_size"],
-        "h_q": raw["h_q"],
-        "have_attn_sink": raw["have_attn_sink"],
-        "have_topk_length": raw["have_topk_length"],
-        "is_varlen": raw["is_varlen"],
-        "is_all_indices_invalid": raw["is_all_indices_invalid"],
-        "have_zero_seqlen_k": raw["have_zero_seqlen_k"],
-        "extra_s_kv": raw["extra_s_kv"] or 0,
-        "extra_topk": raw["extra_topk"] or 0,
-        "extra_page_block_size": raw["extra_page_block_size"] or 0,
-        "have_extra_topk_length": raw["have_extra_topk_length"],
-        # FlashMLA's Counter assigns this same ordinal as the deterministic seed.
-        "seed": source_index,
-        "upstream_group": raw["upstream_group"],
-        "upstream_case_index": source_index,
-        "dispatch_reason": _dispatch_record(model_type, raw["h_q"]),
-    }
-
-
-def _generate_upstream_sparse_decode_matrix() -> tuple[list[dict[str, Any]], int]:
-    """Transcribe tests/test_flash_mla_sparse_decoding.py::gen_testcase."""
-
-    correctness: list[dict[str, Any]] = []
-    corners: list[dict[str, Any]] = []
-    for d_qk in (576, 512):
-        extra_modes = (False, True) if d_qk == 512 else (False,)
-        for have_extra_kv in extra_modes:
-            extra_length_modes = (False, True) if have_extra_kv else (False,)
-            for have_extra_topk_length in extra_length_modes:
-                topk_length_modes = (False, True) if d_qk == 512 else (False,)
-                for have_topk_length in topk_length_modes:
-                    for h_q in (64, 128):
-                        for s_kv, topk, page_block_size in _UPSTREAM_REGULAR_SHAPES:
-                            extra_shapes = (
-                                _UPSTREAM_REGULAR_SHAPES if have_extra_kv else ((None, None, None),)
-                            )
-                            for extra_s_kv, extra_topk, extra_page_block_size in extra_shapes:
-                                for b in (4, 74, 321):
-                                    for s_q in (1, 3):
-                                        varlen_modes = (
-                                            (True, False)
-                                            if b == 74
-                                            and not have_topk_length
-                                            and not have_extra_topk_length
-                                            else (True,)
-                                        )
-                                        for is_varlen in varlen_modes:
-                                            correctness.append(
-                                                _raw_upstream_case(
-                                                    group="correctness",
-                                                    b=b,
-                                                    h_q=h_q,
-                                                    s_q=s_q,
-                                                    s_kv=s_kv,
-                                                    is_varlen=is_varlen,
-                                                    topk=topk,
-                                                    d_qk=d_qk,
-                                                    page_block_size=page_block_size,
-                                                    have_topk_length=have_topk_length,
-                                                    extra_s_kv=extra_s_kv,
-                                                    extra_topk=extra_topk,
-                                                    extra_page_block_size=extra_page_block_size,
-                                                    have_extra_topk_length=(have_extra_topk_length),
-                                                )
-                                            )
-
-                        for s_kv, topk, page_block_size in _UPSTREAM_CORNER_SHAPES:
-                            extra_shapes = (
-                                _UPSTREAM_CORNER_SHAPES if have_extra_kv else ((None, None, None),)
-                            )
-                            for extra_s_kv, extra_topk, extra_page_block_size in extra_shapes:
-                                for b in (4, 74, 321):
-                                    varlen_modes = (
-                                        (True, False)
-                                        if b == 74
-                                        and not have_topk_length
-                                        and not have_extra_topk_length
-                                        else (True,)
-                                    )
-                                    for is_varlen in varlen_modes:
-                                        for is_all_indices_invalid in (True, False):
-                                            for have_zero_seqlen_k in (True, False):
-                                                for have_attn_sink in (True, False):
-                                                    if not (
-                                                        is_all_indices_invalid
-                                                        or have_zero_seqlen_k
-                                                        or have_attn_sink
-                                                    ):
-                                                        continue
-                                                    corners.append(
-                                                        _raw_upstream_case(
-                                                            group="corner",
-                                                            b=b,
-                                                            h_q=h_q,
-                                                            s_q=3,
-                                                            s_kv=s_kv,
-                                                            is_varlen=is_varlen,
-                                                            topk=topk,
-                                                            d_qk=d_qk,
-                                                            page_block_size=page_block_size,
-                                                            is_all_indices_invalid=(
-                                                                is_all_indices_invalid
-                                                            ),
-                                                            have_zero_seqlen_k=(have_zero_seqlen_k),
-                                                            have_topk_length=have_topk_length,
-                                                            have_attn_sink=have_attn_sink,
-                                                            extra_s_kv=extra_s_kv,
-                                                            extra_topk=extra_topk,
-                                                            extra_page_block_size=(
-                                                                extra_page_block_size
-                                                            ),
-                                                            have_extra_topk_length=(
-                                                                have_extra_topk_length
-                                                            ),
-                                                        )
-                                                    )
-
-    performance: list[dict[str, Any]] = []
-    production = (
-        (
-            _raw_upstream_case(
-                group="performance",
-                b=0,
-                h_q=128,
-                s_q=2,
-                s_kv=32768,
-                is_varlen=True,
-                topk=2048,
-                d_qk=576,
-            ),
-            (2, 64, 74, 128),
-        ),
-        (
-            _raw_upstream_case(
-                group="performance",
-                b=0,
-                h_q=64,
-                s_q=2,
-                s_kv=16384,
-                is_varlen=True,
-                topk=128,
-                d_qk=512,
-                page_block_size=256,
-                extra_s_kv=16384,
-                extra_topk=512,
-                extra_page_block_size=64,
-            ),
-            (2, 64, 74, 128, 148, 256),
-        ),
-        (
-            _raw_upstream_case(
-                group="performance",
-                b=0,
-                h_q=128,
-                s_q=2,
-                s_kv=16384,
-                is_varlen=True,
-                topk=128,
-                d_qk=512,
-                page_block_size=256,
-                extra_s_kv=16384,
-                extra_topk=1024,
-                extra_page_block_size=64,
-            ),
-            (2, 64, 74, 128, 148, 256),
-        ),
-        (
-            _raw_upstream_case(
-                group="performance",
-                b=0,
-                h_q=64,
-                s_q=2,
-                s_kv=16384,
-                is_varlen=True,
-                topk=128,
-                d_qk=512,
-                page_block_size=256,
-                extra_s_kv=16384,
-                extra_topk=1024,
-                extra_page_block_size=2,
-                have_extra_topk_length=True,
-            ),
-            (2, 64, 74, 128, 148, 256),
-        ),
-        (
-            _raw_upstream_case(
-                group="performance",
-                b=0,
-                h_q=128,
-                s_q=2,
-                s_kv=16384,
-                is_varlen=True,
-                topk=128,
-                d_qk=512,
-                page_block_size=256,
-                extra_s_kv=16384,
-                extra_topk=1024,
-                extra_page_block_size=2,
-                have_extra_topk_length=True,
-            ),
-            (2, 64, 74, 128, 148, 256),
-        ),
-    )
-    for base, batch_sizes in production:
-        for b in batch_sizes:
-            performance.append({**base, "b": b})
-    for h_q in (64, 128):
-        for d_qk in (512, 576):
-            performance.append(
-                _raw_upstream_case(
-                    group="performance",
-                    b=148,
-                    h_q=h_q,
-                    s_q=2,
-                    s_kv=32768,
-                    is_varlen=True,
-                    topk=16384,
-                    d_qk=d_qk,
-                )
-            )
-
-    all_cases = correctness + corners + performance
-    in_scope = [
-        _materialize_upstream_case(source_index, raw)
-        for source_index, raw in enumerate(all_cases)
-        if raw["h_q"] == B_H
-    ]
-    return in_scope, len(all_cases)
-
-
-UPSTREAM_TEST_CONFIGS, UPSTREAM_TOTAL_CASES = _generate_upstream_sparse_decode_matrix()
-UPSTREAM_CONFIGS = [
-    config for config in UPSTREAM_TEST_CONFIGS if config["upstream_group"] == "performance"
+CONFIGS = [
+    {
+        "label": "deepseek_v4_v32_b128_sq2_sk32768_topk2048_p64",
+        "model_type": "V32",
+        "b": 128,
+        "s_q": 2,
+        "s_kv": 32768,
+        "topk": 2048,
+        "page_block_size": 64,
+        "have_attn_sink": True,
+    },
+    {
+        "label": "model1_b2_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
+        "model_type": "MODEL1",
+        "b": 2,
+        "s_q": 2,
+        "s_kv": 16384,
+        "topk": 128,
+        "page_block_size": 256,
+        "have_attn_sink": True,
+        "extra_s_kv": 16384,
+        "extra_topk": 512,
+        "extra_page_block_size": 64,
+    },
+    {
+        "label": "model1_b64_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
+        "model_type": "MODEL1",
+        "b": 64,
+        "s_q": 2,
+        "s_kv": 16384,
+        "topk": 128,
+        "page_block_size": 256,
+        "have_attn_sink": True,
+        "extra_s_kv": 16384,
+        "extra_topk": 512,
+        "extra_page_block_size": 64,
+    },
+    {
+        "label": "model1_b74_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
+        "model_type": "MODEL1",
+        "b": 74,
+        "s_q": 2,
+        "s_kv": 16384,
+        "topk": 128,
+        "page_block_size": 256,
+        "have_attn_sink": True,
+        "extra_s_kv": 16384,
+        "extra_topk": 512,
+        "extra_page_block_size": 64,
+    },
+    {
+        "label": "model1_b128_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
+        "model_type": "MODEL1",
+        "b": 128,
+        "s_q": 2,
+        "s_kv": 16384,
+        "topk": 128,
+        "page_block_size": 256,
+        "have_attn_sink": True,
+        "extra_s_kv": 16384,
+        "extra_topk": 512,
+        "extra_page_block_size": 64,
+    },
+    {
+        "label": "model1_b148_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
+        "model_type": "MODEL1",
+        "b": 148,
+        "s_q": 2,
+        "s_kv": 16384,
+        "topk": 128,
+        "page_block_size": 256,
+        "have_attn_sink": True,
+        "extra_s_kv": 16384,
+        "extra_topk": 512,
+        "extra_page_block_size": 64,
+    },
+    {
+        "label": "model1_b256_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
+        "model_type": "MODEL1",
+        "b": 256,
+        "s_q": 2,
+        "s_kv": 16384,
+        "topk": 128,
+        "page_block_size": 256,
+        "have_attn_sink": True,
+        "extra_s_kv": 16384,
+        "extra_topk": 512,
+        "extra_page_block_size": 64,
+    },
+    {
+        "label": "model1_b2_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
+        "model_type": "MODEL1",
+        "b": 2,
+        "s_q": 2,
+        "s_kv": 16384,
+        "topk": 128,
+        "page_block_size": 256,
+        "have_attn_sink": True,
+        "extra_s_kv": 16384,
+        "extra_topk": 1024,
+        "extra_page_block_size": 2,
+        "have_extra_topk_length": True,
+    },
+    {
+        "label": "model1_b64_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
+        "model_type": "MODEL1",
+        "b": 64,
+        "s_q": 2,
+        "s_kv": 16384,
+        "topk": 128,
+        "page_block_size": 256,
+        "have_attn_sink": True,
+        "extra_s_kv": 16384,
+        "extra_topk": 1024,
+        "extra_page_block_size": 2,
+        "have_extra_topk_length": True,
+    },
+    {
+        "label": "model1_b74_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
+        "model_type": "MODEL1",
+        "b": 74,
+        "s_q": 2,
+        "s_kv": 16384,
+        "topk": 128,
+        "page_block_size": 256,
+        "have_attn_sink": True,
+        "extra_s_kv": 16384,
+        "extra_topk": 1024,
+        "extra_page_block_size": 2,
+        "have_extra_topk_length": True,
+    },
+    {
+        "label": "model1_b128_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
+        "model_type": "MODEL1",
+        "b": 128,
+        "s_q": 2,
+        "s_kv": 16384,
+        "topk": 128,
+        "page_block_size": 256,
+        "have_attn_sink": True,
+        "extra_s_kv": 16384,
+        "extra_topk": 1024,
+        "extra_page_block_size": 2,
+        "have_extra_topk_length": True,
+    },
+    {
+        "label": "model1_b148_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
+        "model_type": "MODEL1",
+        "b": 148,
+        "s_q": 2,
+        "s_kv": 16384,
+        "topk": 128,
+        "page_block_size": 256,
+        "have_attn_sink": True,
+        "extra_s_kv": 16384,
+        "extra_topk": 1024,
+        "extra_page_block_size": 2,
+        "have_extra_topk_length": True,
+    },
+    {
+        "label": "model1_b256_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
+        "model_type": "MODEL1",
+        "b": 256,
+        "s_q": 2,
+        "s_kv": 16384,
+        "topk": 128,
+        "page_block_size": 256,
+        "have_attn_sink": True,
+        "extra_s_kv": 16384,
+        "extra_topk": 1024,
+        "extra_page_block_size": 2,
+        "have_extra_topk_length": True,
+    },
+    {
+        "label": "model1_b148_sq2_sk32768_topk16384_p64",
+        "model_type": "MODEL1",
+        "b": 148,
+        "s_q": 2,
+        "s_kv": 32768,
+        "topk": 16384,
+        "page_block_size": 64,
+        "have_attn_sink": True,
+    },
+    {
+        "label": "v32_b148_sq2_sk32768_topk16384_p64",
+        "model_type": "V32",
+        "b": 148,
+        "s_q": 2,
+        "s_kv": 32768,
+        "topk": 16384,
+        "page_block_size": 64,
+        "have_attn_sink": True,
+    },
 ]
 
-# The task requires this h_q=64 DeepSeek-V4 case to remain the primary benchmark,
-# even though upstream's production V3.2 row uses the head64x2 h_q=128 host path.
-PRIMARY_BENCH_CONFIG = {
-    "label": "deepseek_v4_v32_hq64_b128_sq2_sk32768_topk2048",
-    "model_type": ModelType.V32.value,
-    "b": 128,
-    "s_q": 2,
-    "s_kv": 32768,
-    "topk": 2048,
-    "page_block_size": 64,
-    "h_q": 64,
-    "have_attn_sink": True,
-    "is_varlen": True,
-    "seed": UPSTREAM_TOTAL_CASES,
-    "upstream_group": "required_primary",
-    "upstream_case_index": None,
-    "dispatch_reason": _dispatch_record(ModelType.V32, 64),
-}
-
-# CONFIGS and BENCH_CONFIGS contain the 14 upstream performance cases whose
-# public h_q is 64, plus the required h_q=64 DeepSeek-V4 primary.  Upstream's
-# 2,358 h_q=64 correctness/corner cases have num_runs=0 and are not benchmark
-# shapes.  Public h_q=128 is outside the clarified scope.
-CONFIGS = [PRIMARY_BENCH_CONFIG, *UPSTREAM_CONFIGS]
-BENCH_CONFIGS = CONFIGS
-
-assert UPSTREAM_TOTAL_CASES == 4748
-assert len(UPSTREAM_TEST_CONFIGS) == 2372
-assert len(UPSTREAM_CONFIGS) == 14
-assert sum(config["model_type"] == ModelType.MODEL1.value for config in UPSTREAM_CONFIGS) == 13
-assert sum(config["model_type"] == ModelType.V32.value for config in UPSTREAM_CONFIGS) == 1
-assert len(BENCH_CONFIGS) == 15
 
 KERNEL_META = {
     "name": "sparse_flashmla_decode_head64",
@@ -1040,1477 +870,810 @@ def _prepare_upstream_kv_scope(
     }
 
 
-@lru_cache(maxsize=2)
-def _make_sparse_decode_head64_kernel(model_type: ModelType):
-    """One CUDA-structure transcription, configured by the MODEL_TYPE enum."""
+@T.jit
+def _kernel(
+    q_h: T.handle,
+    kv_h: T.handle,
+    indices_h: T.handle,
+    topk_length_h: T.Optional(T.handle),
+    attn_sink_h: T.Optional(T.handle),
+    lse_h: T.handle,
+    out_h: T.handle,
+    lse_accum_h: T.handle,
+    o_accum_h: T.handle,
+    tile_scheduler_metadata_h: T.handle,
+    num_splits_h: T.handle,
+    extra_kv_h: T.Optional(T.handle),
+    extra_indices_h: T.Optional(T.handle),
+    extra_topk_length_h: T.Optional(T.handle),
+    sm_scale_div_log2: T.float32,
+    stride_q_b: T.int32,
+    stride_q_s_q: T.int32,
+    stride_q_h_q: T.int32,
+    stride_kv_block: T.int32,
+    stride_kv_row: T.int32,
+    stride_indices_b: T.int32,
+    stride_indices_s_q: T.int32,
+    stride_lse_b: T.int32,
+    stride_lse_s_q: T.int32,
+    stride_o_b: T.int32,
+    stride_o_s_q: T.int32,
+    stride_o_h_q: T.int32,
+    stride_extra_kv_block: T.int32,
+    stride_extra_kv_row: T.int32,
+    stride_extra_indices_b: T.int32,
+    stride_extra_indices_s_q: T.int32,
+    stride_lse_accum_split: T.int32,
+    stride_lse_accum_s_q: T.int32,
+    stride_o_accum_split: T.int32,
+    stride_o_accum_s_q: T.int32,
+    stride_o_accum_h_q: T.int32,
+    b: T.int32,
+    s_q: T.int32,
+    topk: T.int32,
+    extra_topk: T.int32,
+    num_blocks: T.int32,
+    extra_num_blocks: T.int32,
+    page_block_size: T.int32,
+    extra_page_block_size: T.int32,
+    num_sm_parts: T.int32,
+    *,
+    model_type: T.constexpr,
+):
+    is_v32 = T.meta_var(model_type is ModelType.V32)
+    d_qk = T.meta_var(576 if is_v32 else 512)
+    d_nope = T.meta_var(512 if is_v32 else 448)
+    num_scales = T.meta_var(4 if is_v32 else 8)
+    tma_k_stride = T.meta_var(656 if is_v32 else 576)
+    q_tail_start = T.meta_var(256 if is_v32 else 224)
+    rope_tile = T.meta_var(32 if is_v32 else 64)
+    rows_per_group = T.meta_var(B_TOPK // (128 // 8))
+    cols_per_group = T.meta_var(d_nope // (8 * 8))
 
-    is_v32 = model_type is ModelType.V32
-    d_qk = 576 if is_v32 else 512
-    d_nope = 512 if is_v32 else 448
-    num_scales = 4 if is_v32 else 8
-    tma_k_stride = 656 if is_v32 else 576
-    q_tail_start = 256 if is_v32 else 224
-    rope_tile = 32 if is_v32 else 64
-    rows_per_group = B_TOPK // (128 // 8)
-    cols_per_group = d_nope // (8 * 8)
-    k_rope_swizzle = SwizzleMode.SWIZZLE_64B_ATOM if is_v32 else SwizzleMode.SWIZZLE_128B_ATOM
-
-    def allocate_model_kv_union(pool, u_base):
-        """Select config.h's MODEL_TYPE union layout at parser time."""
-
-        if is_v32:
-            v32_stage_elems = B_TOPK * (D_V + 64)
-            k_full = pool.alloc(
-                (NUM_BUFS, B_TOPK, D_V),
-                "bfloat16",
-                align=1024,
-                layout=ComposeLayout(
-                    3,
-                    3,
-                    3,
-                    TileLayout(
-                        S[(NUM_BUFS, B_TOPK, 8, 64) : (v32_stage_elems, 64, B_TOPK * 64, 1)]
-                    ),
-                ),
-            )
-            pool.move_base_to(u_base + B_TOPK * D_V * BF16_BYTES)
-            k_rope = pool.alloc(
-                (NUM_BUFS, B_TOPK, 64),
-                "bfloat16",
-                align=1024,
-                layout=ComposeLayout(
-                    3,
-                    2,
-                    3,
-                    TileLayout(
-                        S[(NUM_BUFS, B_TOPK, 2, 32) : (v32_stage_elems, 32, B_TOPK * 32, 1)]
-                    ),
-                ),
-            )
-            pool.move_base_to(u_base + NUM_BUFS * v32_stage_elems * BF16_BYTES)
-        else:
-            k_full = pool.alloc_tcgen05_mma_AB((NUM_BUFS, B_TOPK, D_V), "bfloat16")
-            k_full_end = pool.offset
-            # MODEL1's RoPE aliases k_full[..., 448:512].
-            pool.move_base_to(u_base)
-            k_rope = pool.alloc_tcgen05_mma_AB(
-                (NUM_BUFS, B_TOPK, 64), "bfloat16", swizzle_mode=k_rope_swizzle
-            )
-            pool.move_base_to(k_full_end)
-        return k_full, k_rope
-
-    def allocate_q_sw64_tail(pool, q_sw128_end):
-        """Allocate only V32's nonzero q-SW64 member at parser time."""
-
-        if is_v32:
-            pool.move_base_to(q_sw128_end)
-            q_sw64 = pool.alloc_tcgen05_mma_AB(
-                (B_H, 64), "bfloat16", swizzle_mode=SwizzleMode.SWIZZLE_64B_ATOM
-            )
-            q_with_tail_end = pool.offset
-            pool.move_base_to(q_with_tail_end)
-            return q_sw64
-        # config.h:163: bf16 q_sw64[B_H * 0] reserves no storage.
-        pool.move_base_to(q_sw128_end)
-        return None
-
-    def emit_no_split_epilogue(
-        o_epi_frag,
-        o_epi_bf16_frag,
-        o_epi,
-        o_win,
-        o_smem_win,
-        o_smem,
-        out_strided,
-        output_scale_pair,
-        warp_idx,
-        batch_idx,
-        s_q_idx,
-    ):
-        """Meta-expand CUDA's CUTE_UNROLL before TMA layout dispatch."""
-
-        # TilePrimitiveDispatch runs before a TIR ``T.unroll`` pass.  Execute
-        # this ordinary Python helper eagerly so every SW128 shared-memory
-        # region has the same concrete 64-column origin that CuTe sees after
-        # CUTE_UNROLL, while batch/query coordinates remain runtime values.
-        for epi_i in range((D_V // 2) // 64):
-            Tx.wg.copy_async(o_epi_frag[:, :], o_win.chunk((None, (D_V // 2) // 64))[:, epi_i])
-            T.evaluate(T.ptx.tcgen05.wait.ld())
-            for scale_i in range(64 // 2):
-                scaled_pair = T.Bind(
-                    _mul_f32x2(
-                        T.cuda.make_float2(o_epi[scale_i * 2], o_epi[scale_i * 2 + 1]),
-                        output_scale_pair,
-                    )
-                )
-                T.buffer_store(o_epi, T.cuda.float2_x(scaled_pair), [scale_i * 2])
-                T.buffer_store(o_epi, T.cuda.float2_y(scaled_pair), [scale_i * 2 + 1])
-            Tx.wg.cast(o_epi_bf16_frag[:, :], o_epi_frag[:, :])
-            col_base = (D_V // 2 if epi_i * 64 >= D_V // 4 else 0) + (epi_i * 64) % (D_V // 4)
-            Tx.wg.copy(o_smem_win.chunk((None, (D_V // 2) // 64))[:, epi_i], o_epi_bf16_frag[:, :])
-            T.evaluate(T.ptx.fence.proxy_async("shared::cta"))
-            T.evaluate(T.ptx.bar.sync(BAR_WG0_SYNC, 128))
-            with T.If(warp_idx == 0):
-                with T.Then():
-                    with T.If(T.ptx.elect_sync() != T.uint32(0)):
-                        with T.Then():
-                            Tx.copy_async(
-                                out_strided[batch_idx, s_q_idx, :, col_base : col_base + 64],
-                                o_smem[:, col_base : col_base + 64],
-                                **tma_config(
-                                    dispatch="tma_explicit", tensormap_l2_promotion="L2::128B"
-                                ),
-                            )
-            warp1_col_base = col_base + D_V // 4
-            with T.If(warp_idx == 1):
-                with T.Then():
-                    with T.If(T.ptx.elect_sync() != T.uint32(0)):
-                        with T.Then():
-                            Tx.copy_async(
-                                out_strided[
-                                    batch_idx, s_q_idx, :, warp1_col_base : warp1_col_base + 64
-                                ],
-                                o_smem[:, warp1_col_base : warp1_col_base + 64],
-                                **tma_config(
-                                    dispatch="tma_explicit", tensormap_l2_promotion="L2::128B"
-                                ),
-                            )
-
-    def assign_int4_registers(dst, src):
-        """Emit CUDA's local ``int4`` value assignment as four register lanes."""
-
-        # Both operands are thread-local register fragments.  A memory-vector
-        # dispatcher would incorrectly require an address space; eager lane
-        # stores preserve the C++ aggregate assignment and let SSA/codegen
-        # coalesce or eliminate the register moves, including the final dead
-        # assignment retained at each source loop tail.
-        for int4_lane in range(4):
-            T.buffer_store(dst, src[int4_lane], [int4_lane])
-
-    @T.jit
-    def _kernel(
-        q_h: T.handle,
-        kv_h: T.handle,
-        indices_h: T.handle,
-        topk_length_h: T.Optional(T.handle),
-        attn_sink_h: T.Optional(T.handle),
-        lse_h: T.handle,
-        out_h: T.handle,
-        lse_accum_h: T.handle,
-        o_accum_h: T.handle,
-        tile_scheduler_metadata_h: T.handle,
-        num_splits_h: T.handle,
-        extra_kv_h: T.Optional(T.handle),
-        extra_indices_h: T.Optional(T.handle),
-        extra_topk_length_h: T.Optional(T.handle),
-        sm_scale_div_log2: T.float32,
-        stride_q_b: T.int32,
-        stride_q_s_q: T.int32,
-        stride_q_h_q: T.int32,
-        stride_kv_block: T.int32,
-        stride_kv_row: T.int32,
-        stride_indices_b: T.int32,
-        stride_indices_s_q: T.int32,
-        stride_lse_b: T.int32,
-        stride_lse_s_q: T.int32,
-        stride_o_b: T.int32,
-        stride_o_s_q: T.int32,
-        stride_o_h_q: T.int32,
-        stride_extra_kv_block: T.int32,
-        stride_extra_kv_row: T.int32,
-        stride_extra_indices_b: T.int32,
-        stride_extra_indices_s_q: T.int32,
-        stride_lse_accum_split: T.int32,
-        stride_lse_accum_s_q: T.int32,
-        stride_o_accum_split: T.int32,
-        stride_o_accum_s_q: T.int32,
-        stride_o_accum_h_q: T.int32,
-        b: T.int32,
-        s_q: T.int32,
-        topk: T.int32,
-        extra_topk: T.int32,
-        num_blocks: T.int32,
-        extra_num_blocks: T.int32,
-        page_block_size: T.int32,
-        extra_page_block_size: T.int32,
-        num_sm_parts: T.int32,
-    ):
-        # params.h:71-99.  Optional tensor presence is specialized before FFI,
-        # while every source stride remains a runtime kernel operand.  The
-        # views are descriptor/addressing views over the caller's storage, not
-        # packed substitutes.
-        q = T.match_buffer(
-            q_h,
-            ((b - 1) * stride_q_b + (s_q - 1) * stride_q_s_q + (B_H - 1) * stride_q_h_q + d_qk,),
-            "bfloat16",
-            scope="global",
+    # params.h:71-99.  Optional tensor presence is specialized before FFI,
+    # while every source stride remains a runtime kernel operand.  The
+    # views are descriptor/addressing views over the caller's storage, not
+    # packed substitutes.
+    q = T.match_buffer(
+        q_h,
+        ((b - 1) * stride_q_b + (s_q - 1) * stride_q_s_q + (B_H - 1) * stride_q_h_q + d_qk,),
+        "bfloat16",
+        scope="global",
+    )
+    kv = T.match_buffer(kv_h, (num_blocks * stride_kv_block,), "uint8", scope="global")
+    indices = T.match_buffer(
+        indices_h,
+        ((b - 1) * stride_indices_b + (s_q - 1) * stride_indices_s_q + topk,),
+        "int32",
+        scope="global",
+    )
+    if topk_length_h is not None:
+        topk_length = T.match_buffer(topk_length_h, (b,), "int32", scope="global")
+    if attn_sink_h is not None:
+        attn_sink = T.match_buffer(attn_sink_h, (B_H,), "float32", scope="global")
+    lse = T.match_buffer(
+        lse_h,
+        ((b - 1) * stride_lse_b + (s_q - 1) * stride_lse_s_q + B_H,),
+        "float32",
+        scope="global",
+    )
+    out = T.match_buffer(
+        out_h,
+        ((b - 1) * stride_o_b + (s_q - 1) * stride_o_s_q + (B_H - 1) * stride_o_h_q + D_V,),
+        "bfloat16",
+        scope="global",
+    )
+    lse_accum = T.match_buffer(
+        lse_accum_h,
+        ((b + num_sm_parts - 1) * stride_lse_accum_split + (s_q - 1) * stride_lse_accum_s_q + B_H,),
+        "float32",
+        scope="global",
+    )
+    o_accum = T.match_buffer(
+        o_accum_h,
+        (
+            (b + num_sm_parts - 1) * stride_o_accum_split
+            + (s_q - 1) * stride_o_accum_s_q
+            + (B_H - 1) * stride_o_accum_h_q
+            + D_V,
+        ),
+        "float32",
+        scope="global",
+    )
+    tile_scheduler_metadata = T.match_buffer(
+        tile_scheduler_metadata_h, (num_sm_parts, 8), "int32", scope="global"
+    )
+    num_splits = T.match_buffer(num_splits_h, (b + 1,), "int32", scope="global")
+    if extra_kv_h is not None:
+        extra_kv = T.match_buffer(
+            extra_kv_h, (extra_num_blocks * stride_extra_kv_block,), "uint8", scope="global"
         )
-        kv = T.match_buffer(kv_h, (num_blocks * stride_kv_block,), "uint8", scope="global")
-        indices = T.match_buffer(
-            indices_h,
-            ((b - 1) * stride_indices_b + (s_q - 1) * stride_indices_s_q + topk,),
+    if extra_indices_h is not None:
+        extra_indices = T.match_buffer(
+            extra_indices_h,
+            ((b - 1) * stride_extra_indices_b + (s_q - 1) * stride_extra_indices_s_q + extra_topk,),
             "int32",
             scope="global",
         )
-        if topk_length_h is not None:
-            topk_length = T.match_buffer(topk_length_h, (b,), "int32", scope="global")
-        if attn_sink_h is not None:
-            attn_sink = T.match_buffer(attn_sink_h, (B_H,), "float32", scope="global")
-        lse = T.match_buffer(
-            lse_h,
-            ((b - 1) * stride_lse_b + (s_q - 1) * stride_lse_s_q + B_H,),
-            "float32",
-            scope="global",
-        )
-        out = T.match_buffer(
-            out_h,
-            ((b - 1) * stride_o_b + (s_q - 1) * stride_o_s_q + (B_H - 1) * stride_o_h_q + D_V,),
-            "bfloat16",
-            scope="global",
-        )
-        lse_accum = T.match_buffer(
-            lse_accum_h,
-            (
-                (b + num_sm_parts - 1) * stride_lse_accum_split
-                + (s_q - 1) * stride_lse_accum_s_q
-                + B_H,
-            ),
-            "float32",
-            scope="global",
-        )
-        o_accum = T.match_buffer(
-            o_accum_h,
-            (
-                (b + num_sm_parts - 1) * stride_o_accum_split
-                + (s_q - 1) * stride_o_accum_s_q
-                + (B_H - 1) * stride_o_accum_h_q
-                + D_V,
-            ),
-            "float32",
-            scope="global",
-        )
-        tile_scheduler_metadata = T.match_buffer(
-            tile_scheduler_metadata_h, (num_sm_parts, 8), "int32", scope="global"
-        )
-        num_splits = T.match_buffer(num_splits_h, (b + 1,), "int32", scope="global")
-        if extra_kv_h is not None:
-            extra_kv = T.match_buffer(
-                extra_kv_h, (extra_num_blocks * stride_extra_kv_block,), "uint8", scope="global"
-            )
-        if extra_indices_h is not None:
-            extra_indices = T.match_buffer(
-                extra_indices_h,
-                (
-                    (b - 1) * stride_extra_indices_b
-                    + (s_q - 1) * stride_extra_indices_s_q
-                    + extra_topk,
-                ),
-                "int32",
-                scope="global",
-            )
-        if extra_topk_length_h is not None:
-            extra_topk_length = T.match_buffer(extra_topk_length_h, (b,), "int32", scope="global")
+    if extra_topk_length_h is not None:
+        extra_topk_length = T.match_buffer(extra_topk_length_h, (b,), "int32", scope="global")
 
-        # kernel.cuh:909-937.  tma_explicit encodes the two MODEL_TYPE-specific
-        # rank-2 views from the runtime storage pointer and strides.  The public
-        # layout is (TMA row, inner element); CUDA reverses it to
-        # globalDim={inner, rows} and issues gather4 coordinates
-        # {inner_column, row0, row1, row2, row3}.
-        kv_nope_tma = T.decl_buffer(
-            (num_blocks * (stride_kv_block // tma_k_stride), d_nope // 8),
+    # kernel.cuh:909-937.  tma_explicit encodes the two MODEL_TYPE-specific
+    # rank-2 views from the runtime storage pointer and strides.  The public
+    # layout is (TMA row, inner element); CUDA reverses it to
+    # globalDim={inner, rows} and issues gather4 coordinates
+    # {inner_column, row0, row1, row2, row3}.
+    kv_nope_tma = T.decl_buffer(
+        (num_blocks * (stride_kv_block // tma_k_stride), d_nope // 8),
+        "int64",
+        data=kv.data,
+        scope="global",
+        layout=TileLayout(
+            S[
+                (num_blocks * (stride_kv_block // tma_k_stride), d_nope // 8) : (
+                    tma_k_stride // 8,
+                    1,
+                )
+            ]
+        ),
+    )
+    kv_rope_data: T.let = T.reinterpret(
+        PointerType(PrimType("bfloat16")),
+        T.handle_add_byte_offset(kv.data, d_nope + (16 if is_v32 else 0)),
+    )
+    kv_rope_tma = T.decl_buffer(
+        (num_blocks * (stride_kv_block // tma_k_stride), 64),
+        "bfloat16",
+        data=kv_rope_data,
+        scope="global",
+        layout=TileLayout(
+            S[
+                (num_blocks * (stride_kv_block // tma_k_stride), 64) : (
+                    tma_k_stride // BF16_BYTES,
+                    1,
+                )
+            ]
+        ),
+    )
+    if extra_kv_h is not None:
+        extra_kv_nope_tma = T.decl_buffer(
+            (extra_num_blocks * (stride_extra_kv_block // tma_k_stride), d_nope // 8),
             "int64",
-            data=kv.data,
+            data=extra_kv.data,
             scope="global",
             layout=TileLayout(
                 S[
-                    (num_blocks * (stride_kv_block // tma_k_stride), d_nope // 8) : (
+                    (extra_num_blocks * (stride_extra_kv_block // tma_k_stride), d_nope // 8) : (
                         tma_k_stride // 8,
                         1,
                     )
                 ]
             ),
         )
-        kv_rope_data: T.let = T.reinterpret(
+        extra_kv_rope_data: T.let = T.reinterpret(
             PointerType(PrimType("bfloat16")),
-            T.handle_add_byte_offset(kv.data, d_nope + (16 if is_v32 else 0)),
+            T.handle_add_byte_offset(extra_kv.data, d_nope + (16 if is_v32 else 0)),
         )
-        kv_rope_tma = T.decl_buffer(
-            (num_blocks * (stride_kv_block // tma_k_stride), 64),
+        extra_kv_rope_tma = T.decl_buffer(
+            (extra_num_blocks * (stride_extra_kv_block // tma_k_stride), 64),
             "bfloat16",
-            data=kv_rope_data,
+            data=extra_kv_rope_data,
             scope="global",
             layout=TileLayout(
                 S[
-                    (num_blocks * (stride_kv_block // tma_k_stride), 64) : (
+                    (extra_num_blocks * (stride_extra_kv_block // tma_k_stride), 64) : (
                         tma_k_stride // BF16_BYTES,
                         1,
                     )
                 ]
             ),
         )
-        if extra_kv_h is not None:
-            extra_kv_nope_tma = T.decl_buffer(
-                (extra_num_blocks * (stride_extra_kv_block // tma_k_stride), d_nope // 8),
-                "int64",
-                data=extra_kv.data,
-                scope="global",
-                layout=TileLayout(
-                    S[
-                        (
-                            extra_num_blocks * (stride_extra_kv_block // tma_k_stride),
-                            d_nope // 8,
-                        ) : (tma_k_stride // 8, 1)
-                    ]
-                ),
-            )
-            extra_kv_rope_data: T.let = T.reinterpret(
-                PointerType(PrimType("bfloat16")),
-                T.handle_add_byte_offset(extra_kv.data, d_nope + (16 if is_v32 else 0)),
-            )
-            extra_kv_rope_tma = T.decl_buffer(
-                (extra_num_blocks * (stride_extra_kv_block // tma_k_stride), 64),
-                "bfloat16",
-                data=extra_kv_rope_data,
-                scope="global",
-                layout=TileLayout(
-                    S[
-                        (extra_num_blocks * (stride_extra_kv_block // tma_k_stride), 64) : (
-                            tma_k_stride // BF16_BYTES,
-                            1,
-                        )
-                    ]
-                ),
-            )
 
-        T.device_entry()
-        T.attr(
-            {
-                "tirx.launch_bounds_min_blocks_per_sm": 1,
-                "tirx.launch_bounds_max_blocks_per_cluster": 1,
-            }
-        )
-        # MODEL_TYPE is the sole implementation specialization.  Keep its
-        # branch selector and exact SharedMemoryPlan size as parser/meta-time
-        # Python values; binding either as an ordinary scalar would turn it
-        # into a TIR expression and destroy the C++ if-constexpr structure.
-        model_is_v32 = T.meta_var(is_v32)
-        source_smem_size = T.meta_var(232192 if model_is_v32 else 218848)
-        q_strided = q.view(
+    T.device_entry()
+    T.attr(
+        {"tirx.launch_bounds_min_blocks_per_sm": 1, "tirx.launch_bounds_max_blocks_per_cluster": 1}
+    )
+    # MODEL_TYPE is the sole implementation specialization.  Keep its
+    # branch selector and exact SharedMemoryPlan size as parser/meta-time
+    # Python values; binding either as an ordinary scalar would turn it
+    # into a TIR expression and destroy the C++ if-constexpr structure.
+    source_smem_size = T.meta_var(232192 if is_v32 else 218848)
+    q_strided = q.view(
+        b,
+        s_q,
+        B_H,
+        d_qk,
+        layout=TileLayout(S[(b, s_q, B_H, d_qk) : (stride_q_b, stride_q_s_q, stride_q_h_q, 1)]),
+    )
+    if is_v32:
+        # Preserve CuTe's single SW64 tail transaction explicitly.  Splitting
+        # d_qk into (18, 32) makes the final two 32-column atoms a rank-5
+        # TensorMap box with CUDA-order shape (32, 64, 2, 1, 1).
+        q_tail_tma = q.view(
             b,
             s_q,
+            d_qk // 32,
             B_H,
-            d_qk,
-            layout=TileLayout(S[(b, s_q, B_H, d_qk) : (stride_q_b, stride_q_s_q, stride_q_h_q, 1)]),
+            32,
+            layout=TileLayout(
+                S[(b, s_q, d_qk // 32, B_H, 32) : (stride_q_b, stride_q_s_q, 32, stride_q_h_q, 1)]
+            ),
         )
-        if is_v32:
-            # Preserve CuTe's single SW64 tail transaction explicitly.  Splitting
-            # d_qk into (18, 32) makes the final two 32-column atoms a rank-5
-            # TensorMap box with CUDA-order shape (32, 64, 2, 1, 1).
-            q_tail_tma = q.view(
-                b,
-                s_q,
-                d_qk // 32,
-                B_H,
-                32,
-                layout=TileLayout(
-                    S[
-                        (b, s_q, d_qk // 32, B_H, 32) : (
-                            stride_q_b,
-                            stride_q_s_q,
-                            32,
-                            stride_q_h_q,
-                            1,
-                        )
-                    ]
-                ),
-            )
-        out_strided = out.view(
-            b,
-            s_q,
-            B_H,
-            D_V,
-            layout=TileLayout(S[(b, s_q, B_H, D_V) : (stride_o_b, stride_o_s_q, stride_o_h_q, 1)]),
+    out_strided = out.view(
+        b,
+        s_q,
+        B_H,
+        D_V,
+        layout=TileLayout(S[(b, s_q, B_H, D_V) : (stride_o_b, stride_o_s_q, stride_o_h_q, 1)]),
+    )
+
+    # kernel.cuh:25-33.  Grid is exactly (s_q, num_sm_parts, 1), with
+    # three 128-thread warpgroups and the same canonical role indices.
+    s_q_idx, partition_idx, _ = T.cta_id([s_q, num_sm_parts, 1])
+    thread_idx = T.thread_id([NUM_THREADS])
+    warpgroup_idx = T.warpgroup_id([3])
+    warp_idx_in_wg = T.warp_id_in_wg([4])
+    lane_idx = T.lane_id([32])
+    idx_in_warpgroup = T.thread_id_in_wg([128])
+    warp_idx: T.let = warpgroup_idx * 4 + warp_idx_in_wg
+
+    # config.h:159-193.  Recreate SharedMemoryPlan's two unions.  V32 stores
+    # each NoPE/RoPE stage contiguously as a 576-column SW128 allocation.
+    # Its RoPE member aliases the final 64 columns with an SW64 view.
+    pool = T.SMEMPool()
+    u_base = T.meta_var(pool.offset)
+    if is_v32:
+        v32_stage_elems = B_TOPK * (D_V + 64)
+        k_union = pool.alloc_tcgen05_mma_AB((NUM_BUFS, B_TOPK, D_V + 64), "bfloat16")
+        k_union_end = T.meta_var(pool.offset)
+        k_full = k_union.sub[:, :, :D_V]
+        pool.move_base_to(u_base + B_TOPK * D_V * BF16_BYTES)
+        k_rope = pool.alloc(
+            (NUM_BUFS, B_TOPK, 64),
+            "bfloat16",
+            align=1024,
+            layout=ComposeLayout(
+                3,
+                2,
+                3,
+                TileLayout(S[(NUM_BUFS, B_TOPK, 2, 32) : (v32_stage_elems, 32, B_TOPK * 32, 1)]),
+            ),
         )
-
-        # kernel.cuh:25-33.  Grid is exactly (s_q, num_sm_parts, 1), with
-        # three 128-thread warpgroups and the same canonical role indices.
-        s_q_idx, partition_idx, _ = T.cta_id([s_q, num_sm_parts, 1])
-        thread_idx = T.thread_id([NUM_THREADS])
-        warpgroup_idx = T.warpgroup_id([3])
-        warp_idx_in_wg = T.warp_id_in_wg([4])
-        lane_idx = T.lane_id([32])
-        idx_in_warpgroup = T.thread_id_in_wg([128])
-        warp_idx: T.let = warpgroup_idx * 4 + warp_idx_in_wg
-
-        # config.h:159-193.  Recreate SharedMemoryPlan's two unions.  V32 is
-        # physically interleaved per stage as nope0/rope0/nope1/rope1; the
-        # custom stage strides keep the source SW128/SW64 address maps while
-        # exposing the same logical ring dimensions to MMA and TMA.
-        pool = T.SMEMPool()
-        u_base = T.meta_var(pool.offset)
-        model_kv_union = T.meta_var(allocate_model_kv_union(pool, u_base))
-        k_full = T.meta_var(model_kv_union[0])
-        k_rope = T.meta_var(model_kv_union[1])
-        # V32's RoPE member has its own interleaved stage layout.  MODEL1's
-        # member aliases the final 64 columns of each 512-column k_full stage;
-        # retain that parent slice so tma_explicit sees the true stage stride.
-        k_rope_tma = T.meta_var(k_rope if is_v32 else k_full.sub[:, :, d_nope : d_nope + 64])
-        raw_nope = pool.alloc((NUM_BUFS, B_TOPK, d_nope // 8), "uint64", align=1024)
-        kv_union_end = T.meta_var(pool.offset)
-
+        pool.move_base_to(k_union_end)
+    else:
+        k_full = pool.alloc_tcgen05_mma_AB((NUM_BUFS, B_TOPK, D_V), "bfloat16")
+        k_union_end = T.meta_var(pool.offset)
+        # MODEL1's RoPE aliases k_full[..., 448:512].
         pool.move_base_to(u_base)
-        q_sw128 = pool.alloc_tcgen05_mma_AB((B_H, 512), "bfloat16")
-        q_sw128_end = T.meta_var(pool.offset)
-        q_sw64 = T.meta_var(allocate_q_sw64_tail(pool, q_sw128_end))
-        o_union_base = T.meta_var(pool.offset)
-        o_smem = pool.alloc_tcgen05_mma_AB((B_H, D_V), "bfloat16")
-        o_bf16_end = T.meta_var(pool.offset)
-        pool.move_base_to(o_union_base)
-        o_accum_storage = pool.alloc(((B_H - 1) * (D_V + 8) + D_V,), "float32", align=1024)
-        o_accum_smem = o_accum_storage.view(
-            B_H, D_V, layout=TileLayout(S[(B_H, D_V) : (D_V + 8, 1)])
+        k_rope = pool.alloc_tcgen05_mma_AB(
+            (NUM_BUFS, B_TOPK, 64), "bfloat16", swizzle_mode=SwizzleMode.SWIZZLE_128B_ATOM
         )
-        qo_union_end = T.meta_var(pool.offset)
-        pool.move_base_to(max(kv_union_end, qo_union_end, o_bf16_end))
+        pool.move_base_to(k_union_end)
+    # V32's RoPE member has its own interleaved stage layout.  MODEL1's
+    # member aliases the final 64 columns of each 512-column k_full stage;
+    # retain that parent slice so tma_explicit sees the true stage stride.
+    k_rope_tma = T.meta_var(k_rope if is_v32 else k_full.sub[:, :, d_nope : d_nope + 64])
+    raw_nope = pool.alloc((NUM_BUFS, B_TOPK, d_nope // 8), "uint64", align=1024)
+    kv_union_end = T.meta_var(pool.offset)
 
-        sp_union_base = T.meta_var(pool.offset)
-        p_exchange = pool.alloc((4, 32 * (B_TOPK // 2)), "float32", align=16)
-        sp_union_end = T.meta_var(pool.offset)
-        pool.move_base_to(sp_union_base)
-        s_smem_gemm = pool.alloc_tcgen05_mma_AB(
-            (B_H, B_TOPK), "bfloat16", swizzle_mode=SwizzleMode.SWIZZLE_NONE
+    pool.move_base_to(u_base)
+    q_sw128 = pool.alloc_tcgen05_mma_AB((B_H, 512), "bfloat16")
+    q_sw128_end = T.meta_var(pool.offset)
+    if is_v32:
+        pool.move_base_to(q_sw128_end)
+        q_sw64 = pool.alloc_tcgen05_mma_AB(
+            (B_H, 64), "bfloat16", swizzle_mode=SwizzleMode.SWIZZLE_64B_ATOM
         )
-        pool.move_base_to(sp_union_end)
+    o_union_base = T.meta_var(pool.offset)
+    o_smem = pool.alloc_tcgen05_mma_AB((B_H, D_V), "bfloat16")
+    o_bf16_end = T.meta_var(pool.offset)
+    pool.move_base_to(o_union_base)
+    o_accum_storage = pool.alloc(((B_H - 1) * (D_V + 8) + D_V,), "float32", align=1024)
+    o_accum_smem = o_accum_storage.view(B_H, D_V, layout=TileLayout(S[(B_H, D_V) : (D_V + 8, 1)]))
+    qo_union_end = T.meta_var(pool.offset)
+    pool.move_base_to(max(kv_union_end, qo_union_end, o_bf16_end))
 
-        rowwise_buf = pool.alloc((128,), "float32", align=16)
-        is_token_valid = pool.alloc((NUM_INDEX_BUFS, B_TOPK // 8), "int8", align=16)
-        tma_coord = pool.alloc((NUM_INDEX_BUFS, B_TOPK), "int32", align=16)
-        scales_e8m0 = pool.alloc((NUM_INDEX_BUFS, B_TOPK * num_scales), "uint8", align=16)
-        # array_aligned<uint32_t,1> occupies a complete 16-byte slot.
-        tmem_start_addr = pool.alloc((4,), "uint32", align=16)
+    sp_union_base = T.meta_var(pool.offset)
+    p_exchange = pool.alloc((4, 32 * (B_TOPK // 2)), "float32", align=16)
+    sp_union_end = T.meta_var(pool.offset)
+    pool.move_base_to(sp_union_base)
+    s_smem_gemm = pool.alloc_tcgen05_mma_AB(
+        (B_H, B_TOPK), "bfloat16", swizzle_mode=SwizzleMode.SWIZZLE_NONE
+    )
+    pool.move_base_to(sp_union_end)
 
-        # kernel.cuh:45-60.  Arrival counts encode the original producer and
-        # consumer roles, including 258 arrivals on valid/coord/scale free.
-        bar_last_store_done = MBarrier(pool, 1)
-        bar_q_tma = TMABar(pool, 1)
-        bar_q_utccp = TCGen05Bar(pool, 1)
-        bar_rope_ready = TMABar(pool, NUM_BUFS)
-        bar_nope_ready = MBarrier(pool, NUM_BUFS)
-        bar_raw_ready = TMABar(pool, NUM_BUFS)
-        bar_raw_free = MBarrier(pool, NUM_BUFS)
-        bar_valid_ready = MBarrier(pool, NUM_INDEX_BUFS)
-        bar_valid_free = MBarrier(pool, NUM_INDEX_BUFS)
-        bar_qk_done = TCGen05Bar(pool, NUM_BUFS)
-        bar_so_ready = MBarrier(pool, NUM_BUFS)
-        bar_sv_done = TCGen05Bar(pool, NUM_BUFS)
-        # sizeof(SharedMemoryPlan), including the final struct-alignment pad.
-        pool.commit(size=source_smem_size)
+    rowwise_buf = pool.alloc((128,), "float32", align=16)
+    is_token_valid = pool.alloc((NUM_INDEX_BUFS, B_TOPK // 8), "int8", align=16)
+    tma_coord = pool.alloc((NUM_INDEX_BUFS, B_TOPK), "int32", align=16)
+    scales_e8m0 = pool.alloc((NUM_INDEX_BUFS, B_TOPK * num_scales), "uint8", align=16)
+    # array_aligned<uint32_t,1> occupies a complete 16-byte slot.
+    tmem_start_addr = pool.alloc((4,), "uint32", align=16)
 
-        # config.h:71-80.  Preserve fixed TMEM columns O=0, Q=256, P=400.
-        tmem_pool = T.TMEMPool(
-            pool, total_cols=512, cta_group=1, tmem_addr=tmem_start_addr, sync_after_alloc=False
-        )
-        o_tmem = tmem_pool.alloc_tcgen05_mma_D(
-            (B_H, D_V), "float32", M=64, cta_group=1, ws=True, group=(2, 2, 128)
-        )
-        o_win = o_tmem.rearrange("h (a b c) -> (b h) (a c)", a=2, b=2, c=128)
-        tmem_pool.move_base_to(256)
-        q_tmem = tmem_pool.alloc_tcgen05_mma_A(
-            (2, B_H, d_qk // 2), "bfloat16", M=64, cta_group=1, ws=True
-        )
-        tmem_pool.move_base_to(400)
-        p_tmem = tmem_pool.alloc_tcgen05_mma_D(
-            (2, B_H, B_TOPK), "float32", M=64, cta_group=1, ws=True
+    # kernel.cuh:45-60.  Arrival counts encode the original producer and
+    # consumer roles, including 258 arrivals on valid/coord/scale free.
+    bar_last_store_done = MBarrier(pool, 1)
+    bar_q_tma = TMABar(pool, 1)
+    bar_q_utccp = TCGen05Bar(pool, 1)
+    bar_rope_ready = TMABar(pool, NUM_BUFS)
+    bar_nope_ready = MBarrier(pool, NUM_BUFS)
+    bar_raw_ready = TMABar(pool, NUM_BUFS)
+    bar_raw_free = MBarrier(pool, NUM_BUFS)
+    bar_valid_ready = MBarrier(pool, NUM_INDEX_BUFS)
+    bar_valid_free = MBarrier(pool, NUM_INDEX_BUFS)
+    bar_qk_done = TCGen05Bar(pool, NUM_BUFS)
+    bar_so_ready = MBarrier(pool, NUM_BUFS)
+    bar_sv_done = TCGen05Bar(pool, NUM_BUFS)
+    # sizeof(SharedMemoryPlan), including the final struct-alignment pad.
+    pool.commit(size=source_smem_size)
+
+    # config.h:71-80.  Preserve fixed TMEM columns O=0, Q=256, P=400.
+    tmem_pool = T.TMEMPool(
+        pool, total_cols=512, cta_group=1, tmem_addr=tmem_start_addr, sync_after_alloc=False
+    )
+    o_tmem = tmem_pool.alloc_tcgen05_mma_D(
+        (B_H, D_V), "float32", M=64, cta_group=1, ws=True, group=(2, 2, 128)
+    )
+    o_win = o_tmem.rearrange("h (a b c) -> (b h) (a c)", a=2, b=2, c=128)
+    tmem_pool.move_base_to(256)
+    q_tmem = tmem_pool.alloc_tcgen05_mma_A(
+        (2, B_H, d_qk // 2), "bfloat16", M=64, cta_group=1, ws=True
+    )
+    tmem_pool.move_base_to(400)
+    p_tmem = tmem_pool.alloc_tcgen05_mma_D((2, B_H, B_TOPK), "float32", M=64, cta_group=1, ws=True)
+
+    @T.inline
+    def load_scheduler_meta(dst):
+        # kernel.cuh:80-88 / KU_LDG_256.  Keep one 32-byte operation,
+        # including its cache operators and L2 prefetch size; the eighth
+        # int32 word is intentionally loaded even though it is reserved.
+        T.ptx.ld_global_nc(
+            tile_scheduler_metadata.view("uint64").ptr_to([partition_idx, 0]),
+            "uint64",
+            "u64",
+            dst=dst.ptr_to([0]),
+            vec="v4",
+            l1_evict="L1::no_allocate",
+            l2_evict="L2::evict_normal",
+            prefetch_size="L2::256B",
         )
 
-        @T.inline
-        def load_scheduler_meta(dst):
-            # kernel.cuh:80-88 / KU_LDG_256.  Keep one 32-byte operation,
-            # including its cache operators and L2 prefetch size; the eighth
-            # int32 word is intentionally loaded even though it is reserved.
-            T.ptx.ld_global_nc(
-                tile_scheduler_metadata.view("uint64").ptr_to([partition_idx, 0]),
-                "uint64",
-                "u64",
-                dst=dst.ptr_to([0]),
-                vec="v4",
-                l1_evict="L1::no_allocate",
-                l2_evict="L2::evict_normal",
-                prefetch_size="L2::256B",
+    # kernel.cuh:35-67.  Each copy site requests the lowering's ordinary
+    # descriptor prefetch.  tma_explicit deduplicates the two normal KV
+    # descriptors and intentionally does not prefetch src_selector
+    # candidates, matching the source's normal-only KV prefetch.
+    if warp_idx == 0:
+        if T.ptx.elect_sync() != T.uint32(0):
+            T.ptx.mbarrier.init(bar_last_store_done.ptr_to([0]), 128)
+            T.ptx.mbarrier.init(bar_q_tma.ptr_to([0]), 1)
+            T.ptx.mbarrier.init(bar_q_utccp.ptr_to([0]), 1)
+            for stage in T.unroll(NUM_BUFS):
+                T.ptx.mbarrier.init(bar_rope_ready.ptr_to([stage]), 1)
+                T.ptx.mbarrier.init(bar_nope_ready.ptr_to([stage]), 128)
+                T.ptx.mbarrier.init(bar_raw_ready.ptr_to([stage]), 1)
+                T.ptx.mbarrier.init(bar_raw_free.ptr_to([stage]), 128)
+                T.ptx.mbarrier.init(bar_qk_done.ptr_to([stage]), 1)
+                T.ptx.mbarrier.init(bar_so_ready.ptr_to([stage]), 128)
+                T.ptx.mbarrier.init(bar_sv_done.ptr_to([stage]), 1)
+            for index_stage in T.unroll(NUM_INDEX_BUFS):
+                T.ptx.mbarrier.init(bar_valid_ready.ptr_to([index_stage]), 32)
+                T.ptx.mbarrier.init(bar_valid_free.ptr_to([index_stage]), 258)
+            T.ptx.fence.mbarrier_init()
+        T.ptx.tcgen05.alloc(T.address_of(tmem_start_addr[0]), n_cols=512, cta_group=1)
+        T.cuda.trap_when_assert_failed(tmem_start_addr[0] == T.uint32(0))
+        T.ptx.tcgen05.relinquish_alloc_permit(cta_group=1)
+    T.cuda.cta_sync()
+
+    if warpgroup_idx == 0:
+        # kernel.cuh:134-150.  Scale/exp warpgroup and its 224-register
+        # allocation.  The output and S register/shared layouts match the
+        # fixed dual-GEMM TMEM datapath used by the CUDA source.
+        T.ptx.setmaxnreg(True, 224)
+        rs_buf = PipelineState(NUM_BUFS, phase=0)
+        rs_index = PipelineState(NUM_INDEX_BUFS, phase=0)
+        p_tmem_win = p_tmem.rearrange("b h t -> (b h) t")
+        s_frag_layout = TileLayout(
+            S[(2, 32, 2, 32) : (1 @ wid_in_wg, 1 @ laneid, 2 @ wid_in_wg, 1)]
+        )
+        o_smem_win = o_smem.rearrange("h (a b c) -> (b h) (a c)", a=2, b=2, c=128)
+        scale_pair: T.let = T.cuda.make_float2(sm_scale_div_log2, sm_scale_div_log2)
+        attn_sink_log2: T.float32 = T.float32(-float("inf"))
+        if attn_sink_h is not None:
+            attn_sink_log2 = (
+                T.cuda.ldg(attn_sink.ptr_to([idx_in_warpgroup % B_H]), "float32") * LOG_2_E
             )
 
-        # kernel.cuh:35-67.  Each copy site requests the lowering's ordinary
-        # descriptor prefetch.  tma_explicit deduplicates the two normal KV
-        # descriptors and intentionally does not prefetch src_selector
-        # candidates, matching the source's normal-only KV prefetch.
-        if warp_idx == 0:
-            if T.ptx.elect_sync() != T.uint32(0):
-                T.ptx.mbarrier.init(bar_last_store_done.ptr_to([0]), 128)
-                T.ptx.mbarrier.init(bar_q_tma.ptr_to([0]), 1)
-                T.ptx.mbarrier.init(bar_q_utccp.ptr_to([0]), 1)
-                for stage in T.unroll(NUM_BUFS):
-                    T.ptx.mbarrier.init(bar_rope_ready.ptr_to([stage]), 1)
-                    T.ptx.mbarrier.init(bar_nope_ready.ptr_to([stage]), 128)
-                    T.ptx.mbarrier.init(bar_raw_ready.ptr_to([stage]), 1)
-                    T.ptx.mbarrier.init(bar_raw_free.ptr_to([stage]), 128)
-                    T.ptx.mbarrier.init(bar_qk_done.ptr_to([stage]), 1)
-                    T.ptx.mbarrier.init(bar_so_ready.ptr_to([stage]), 128)
-                    T.ptx.mbarrier.init(bar_sv_done.ptr_to([stage]), 1)
-                for index_stage in T.unroll(NUM_INDEX_BUFS):
-                    T.ptx.mbarrier.init(bar_valid_ready.ptr_to([index_stage]), 32)
-                    T.ptx.mbarrier.init(bar_valid_free.ptr_to([index_stage]), 258)
-                T.ptx.fence.mbarrier_init()
-            T.ptx.tcgen05.alloc(T.address_of(tmem_start_addr[0]), n_cols=512, cta_group=1)
-            T.cuda.trap_when_assert_failed(tmem_start_addr[0] == T.uint32(0))
-            T.ptx.tcgen05.relinquish_alloc_permit(cta_group=1)
-        T.cuda.cta_sync()
+        # kernel.cuh:77-118 expanded at the role call site to avoid the
+        # register spilling explicitly called out by the CUDA source.
+        sched_words = T.alloc_local((4,), "uint64")
+        load_scheduler_meta(sched_words)
+        sched_i32 = sched_words.view("int32")
+        sched_begin_req: T.let = sched_i32[0]
+        sched_end_req: T.let = sched_i32[1]
+        sched_begin_block: T.let = sched_i32[2]
+        sched_end_block: T.let = sched_i32[3]
+        sched_begin_split: T.let = sched_i32[4]
+        sched_first_split: T.let = sched_i32[5]
+        sched_last_split: T.let = sched_i32[6]
+        batch_bar_phase: T.int32 = 0
 
-        if warpgroup_idx == 0:
-            # kernel.cuh:134-150.  Scale/exp warpgroup and its 224-register
-            # allocation.  The output and S register/shared layouts match the
-            # fixed dual-GEMM TMEM datapath used by the CUDA source.
-            T.ptx.setmaxnreg(True, 224)
-            rs_buf = PipelineState(NUM_BUFS, phase=0)
-            rs_index = PipelineState(NUM_INDEX_BUFS, phase=0)
-            p_tmem_win = p_tmem.rearrange("b h t -> (b h) t")
-            s_frag_layout = TileLayout(
-                S[(2, 32, 2, 32) : (1 @ wid_in_wg, 1 @ laneid, 2 @ wid_in_wg, 1)]
-            )
-            o_smem_win = o_smem.rearrange("h (a b c) -> (b h) (a c)", a=2, b=2, c=128)
-            scale_pair: T.let = T.cuda.make_float2(sm_scale_div_log2, sm_scale_div_log2)
-            attn_sink_log2: T.float32 = T.float32(-float("inf"))
-            if attn_sink_h is not None:
-                attn_sink_log2 = (
-                    T.cuda.ldg(attn_sink.ptr_to([idx_in_warpgroup % B_H]), "float32") * LOG_2_E
+        # The CUDA return exits only the local run_main_loop lambda.  Guard
+        # its body so inactive partitions still reach WG0's TMEM dealloc.
+        if sched_begin_req < b:
+            for batch_idx in T.serial(sched_begin_req, sched_end_req + 1, unroll=False):
+                topk_len: T.int32 = topk
+                if topk_length_h is not None:
+                    topk_len = T.cuda.ldg(topk_length.ptr_to([batch_idx]), "int32")
+                orig_topk_padded: T.let = T.max(
+                    ((topk_len + B_TOPK - 1) // B_TOPK) * B_TOPK, B_TOPK
                 )
-
-            # kernel.cuh:77-118 expanded at the role call site to avoid the
-            # register spilling explicitly called out by the CUDA source.
-            sched_words = T.alloc_local((4,), "uint64")
-            load_scheduler_meta(sched_words)
-            sched_i32 = sched_words.view("int32")
-            sched_begin_req: T.let = sched_i32[0]
-            sched_end_req: T.let = sched_i32[1]
-            sched_begin_block: T.let = sched_i32[2]
-            sched_end_block: T.let = sched_i32[3]
-            sched_begin_split: T.let = sched_i32[4]
-            sched_first_split: T.let = sched_i32[5]
-            sched_last_split: T.let = sched_i32[6]
-            batch_bar_phase: T.int32 = 0
-
-            # The CUDA return exits only the local run_main_loop lambda.  Guard
-            # its body so inactive partitions still reach WG0's TMEM dealloc.
-            if sched_begin_req < b:
-                for batch_idx in T.serial(sched_begin_req, sched_end_req + 1, unroll=False):
-                    topk_len: T.int32 = topk
-                    if topk_length_h is not None:
-                        topk_len = T.cuda.ldg(topk_length.ptr_to([batch_idx]), "int32")
-                    orig_topk_padded: T.let = T.max(
-                        ((topk_len + B_TOPK - 1) // B_TOPK) * B_TOPK, B_TOPK
-                    )
-                    extra_topk_len: T.int32 = extra_topk
-                    if extra_topk_length_h is not None:
-                        extra_topk_len = T.cuda.ldg(extra_topk_length.ptr_to([batch_idx]), "int32")
-                    total_topk_padded: T.let = (
-                        orig_topk_padded + ((extra_topk_len + B_TOPK - 1) // B_TOPK) * B_TOPK
-                    )
-                    start_block: T.let = T.if_then_else(
-                        batch_idx == sched_begin_req, sched_begin_block, 0
-                    )
-                    end_block: T.let = T.if_then_else(
-                        batch_idx == sched_end_req, sched_end_block, total_topk_padded // B_TOPK
-                    )
-                    is_split: T.bool = T.cast(
-                        T.if_then_else(
-                            batch_idx == sched_begin_req,
-                            sched_first_split,
-                            T.if_then_else(batch_idx == sched_end_req, sched_last_split, 0),
-                        ),
-                        "bool",
-                    )
-                    is_no_split: T.bool = not is_split
-                    n_split_idx: T.let = T.if_then_else(
+                extra_topk_len: T.int32 = extra_topk
+                if extra_topk_length_h is not None:
+                    extra_topk_len = T.cuda.ldg(extra_topk_length.ptr_to([batch_idx]), "int32")
+                total_topk_padded: T.let = (
+                    orig_topk_padded + ((extra_topk_len + B_TOPK - 1) // B_TOPK) * B_TOPK
+                )
+                start_block: T.let = T.if_then_else(
+                    batch_idx == sched_begin_req, sched_begin_block, 0
+                )
+                end_block: T.let = T.if_then_else(
+                    batch_idx == sched_end_req, sched_end_block, total_topk_padded // B_TOPK
+                )
+                is_split: T.bool = T.cast(
+                    T.if_then_else(
                         batch_idx == sched_begin_req,
-                        T.cuda.ldg(num_splits.ptr_to([batch_idx]), "int32") + sched_begin_split,
-                        T.cuda.ldg(num_splits.ptr_to([batch_idx]), "int32"),
-                    )
-                    num_orig_blocks: T.let = orig_topk_padded // B_TOPK
-                    is_last_batch: T.bool = batch_idx == sched_end_req
+                        sched_first_split,
+                        T.if_then_else(batch_idx == sched_end_req, sched_last_split, 0),
+                    ),
+                    "bool",
+                )
+                is_no_split: T.bool = not is_split
+                n_split_idx: T.let = T.if_then_else(
+                    batch_idx == sched_begin_req,
+                    T.cuda.ldg(num_splits.ptr_to([batch_idx]), "int32") + sched_begin_split,
+                    T.cuda.ldg(num_splits.ptr_to([batch_idx]), "int32"),
+                )
+                num_orig_blocks: T.let = orig_topk_padded // B_TOPK
+                is_last_batch: T.bool = batch_idx == sched_end_req
 
-                    # kernel.cuh:151-159.  Retire prior TMA stores before the
-                    # aliased Q/O shared region is reused for this batch.
-                    T.ptx.cp_async.bulk.wait_group(0, read=True)
-                    bar_last_store_done.arrive(0)
-                    mi: T.float32 = MAX_INIT_VAL
-                    li: T.float32 = 0.0
-                    real_mi: T.float32 = T.float32(-float("inf"))
+                # kernel.cuh:151-159.  Retire prior TMA stores before the
+                # aliased Q/O shared region is reused for this batch.
+                T.ptx.cp_async.bulk.wait_group(0, read=True)
+                bar_last_store_done.arrive(0)
+                mi: T.float32 = MAX_INIT_VAL
+                li: T.float32 = 0.0
+                real_mi: T.float32 = T.float32(-float("inf"))
 
-                    # kernel.cuh:160-299.  P load, dual-warp exchange, mask,
-                    # online softmax, S staging, and conditional O rescale.
-                    for block_idx in T.serial(start_block, end_block, unroll=False):
-                        T.ptx.bar.sync(BAR_WG0_SYNC, 128)
-                        bar_valid_ready.wait(rs_index.stage, rs_index.phase)
-                        bar_qk_done.wait(rs_buf.stage, rs_buf.phase)
-                        T.ptx.tcgen05.fence.after_thread_sync()
-
-                        p_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, B_TOPK // 2), "float32")
-                        p_peer_frag = T.alloc_tcgen05_ldst_frag(
-                            "32x32b", (128, B_TOPK // 2), "float32"
-                        )
-                        p = p_frag.local()
-                        p_peer = p_peer_frag.local()
-                        if warp_idx < 2:
-                            Tx.wg.copy_async(p_frag[:, :], p_tmem_win.chunk((None, 2))[:, 0])
-                            Tx.wg.copy_async(p_peer_frag[:, :], p_tmem_win.chunk((None, 2))[:, 1])
-                        else:
-                            Tx.wg.copy_async(p_peer_frag[:, :], p_tmem_win.chunk((None, 2))[:, 0])
-                            Tx.wg.copy_async(p_frag[:, :], p_tmem_win.chunk((None, 2))[:, 1])
-                        T.ptx.tcgen05.wait.ld()
-                        T.ptx.tcgen05.fence.before_thread_sync()
-
-                        for exchange_i in T.unroll((B_TOPK // 2) // 4):
-                            exchange_offset: T.let = exchange_i * 32 * 4 + lane_idx * 4
-                            Tx.copy(
-                                p_exchange[warp_idx ^ 2, exchange_offset : exchange_offset + 4],
-                                p_peer[exchange_i * 4 : exchange_i * 4 + 4],
-                                dispatch="vec_128b",
-                            )
-                        T.ptx.bar.sync(BAR_WG0_WARP02 + T.bitwise_and(warp_idx, T.int32(1)), 64)
-                        for exchange_i in T.unroll((B_TOPK // 2) // 4):
-                            exchange_offset: T.let = exchange_i * 32 * 4 + lane_idx * 4
-                            peer_tmp = T.alloc_local((4,), "float32")
-                            Tx.copy(
-                                peer_tmp[0:4],
-                                p_exchange[warp_idx, exchange_offset : exchange_offset + 4],
-                                dispatch="vec_128b",
-                            )
-                            pair0: T.let = _add_f32x2(
-                                T.cuda.make_float2(p[exchange_i * 4], p[exchange_i * 4 + 1]),
-                                T.cuda.make_float2(peer_tmp[0], peer_tmp[1]),
-                            )
-                            pair1: T.let = _add_f32x2(
-                                T.cuda.make_float2(p[exchange_i * 4 + 2], p[exchange_i * 4 + 3]),
-                                T.cuda.make_float2(peer_tmp[2], peer_tmp[3]),
-                            )
-                            p[exchange_i * 4] = T.cuda.float2_x(pair0)
-                            p[exchange_i * 4 + 1] = T.cuda.float2_y(pair0)
-                            p[exchange_i * 4 + 2] = T.cuda.float2_x(pair1)
-                            p[exchange_i * 4 + 3] = T.cuda.float2_y(pair1)
-
-                        valid_word: T.let = is_token_valid.view("uint32")[
-                            rs_index.stage, T.if_then_else(idx_in_warpgroup >= 64, 1, 0)
-                        ]
-                        for p_i in T.unroll(B_TOPK // 2):
-                            if T.bitwise_and(
-                                T.shift_right(valid_word, T.cast(p_i, "uint32")), T.uint32(1)
-                            ) == T.uint32(0):
-                                p[p_i] = T.float32(-float("inf"))
-
-                        cur_pi_max: T.float32 = T.float32(-float("inf"))
-                        for p_i in T.unroll(B_TOPK // 2):
-                            cur_pi_max = T.max(cur_pi_max, p[p_i])
-                        cur_pi_max = cur_pi_max * sm_scale_div_log2
-                        rowwise_buf[idx_in_warpgroup] = cur_pi_max
-                        T.ptx.bar.sync(BAR_WG0_SYNC, 128)
-                        bar_valid_free.arrive(rs_index.stage)
-                        cur_pi_max = T.max(cur_pi_max, rowwise_buf[idx_in_warpgroup ^ 64])
-                        real_mi = T.max(real_mi, cur_pi_max)
-                        should_scale_o: T.let = (
-                            T.ptx.any_sync(T.uint32(0xFFFFFFFF), cur_pi_max - mi > 6.0) != 0
-                        )
-                        new_max: T.float32
-                        scale_for_old: T.float32
-                        if not should_scale_o:
-                            scale_for_old = 1.0
-                            new_max = mi
-                        else:
-                            new_max = T.max(cur_pi_max, mi)
-                            scale_for_old = T.ptx.exp2(mi - new_max)
-                        mi = new_max
-
-                        s_frag = T.alloc_buffer(
-                            (B_H, B_TOPK), "bfloat16", scope="local", layout=s_frag_layout
-                        )
-                        s_pack = s_frag.local().view("uint32")
-                        cur_sum_pair: T.uint64 = T.cuda.make_float2(0.0, 0.0)
-                        neg_max_pair: T.let = T.cuda.make_float2(-new_max, -new_max)
-                        for s_i in T.unroll((B_TOPK // 2) // 2):
-                            p_pair: T.let = T.cuda.make_float2(p[s_i * 2], p[s_i * 2 + 1])
-                            soft_pair: T.let = T.ptx.fma_f32x2(
-                                p_pair, scale_pair, neg_max_pair, dps=False
-                            )
-                            sx: T.let = T.ptx.exp2(T.cuda.float2_x(soft_pair))
-                            sy: T.let = T.ptx.exp2(T.cuda.float2_y(soft_pair))
-                            cur_sum_pair = _add_f32x2(cur_sum_pair, T.cuda.make_float2(sx, sy))
-                            s_pack[s_i] = T.cuda.float22bfloat162_rn(sx, sy)
-                        cur_sum: T.let = T.cuda.float2_x(cur_sum_pair) + T.cuda.float2_y(
-                            cur_sum_pair
-                        )
-                        li_next: T.float32
-                        T.ptx.fma_f32(T.address_of(li_next), li, scale_for_old, cur_sum)
-                        li = li_next
-
-                        Tx.wg.copy(s_smem_gemm[:, :], s_frag[:, :])
-                        if T.And(block_idx != start_block, should_scale_o):
-                            scale_for_old_pair: T.let = T.cuda.make_float2(
-                                scale_for_old, scale_for_old
-                            )
-                            T.ptx.tcgen05.fence.after_thread_sync()
-                            o_rescale_frag = T.alloc_tcgen05_ldst_frag(
-                                "32x32b", (128, 64), "float32"
-                            )
-                            o_rescale = o_rescale_frag.local()
-                            for o_chunk in T.unroll((D_V // 2) // 64):
-                                Tx.wg.copy_async(
-                                    o_rescale_frag[:, :],
-                                    o_win.chunk((None, (D_V // 2) // 64))[:, o_chunk],
-                                )
-                                T.ptx.tcgen05.wait.ld()
-                                for scale_i in T.unroll(64 // 2):
-                                    scaled_pair: T.let = _mul_f32x2(
-                                        T.cuda.make_float2(
-                                            o_rescale[scale_i * 2], o_rescale[scale_i * 2 + 1]
-                                        ),
-                                        scale_for_old_pair,
-                                    )
-                                    o_rescale[scale_i * 2] = T.cuda.float2_x(scaled_pair)
-                                    o_rescale[scale_i * 2 + 1] = T.cuda.float2_y(scaled_pair)
-                                Tx.wg.copy_async(
-                                    o_win.chunk((None, (D_V // 2) // 64))[:, o_chunk],
-                                    o_rescale_frag[:, :],
-                                )
-                                T.ptx.tcgen05.wait.st()
-                            T.ptx.tcgen05.fence.before_thread_sync()
-
-                        T.ptx.fence.proxy_async("shared::cta")
-                        bar_so_ready.arrive(rs_buf.stage)
-                        if block_idx != end_block - 1:
-                            rs_buf.advance()
-                            rs_index.advance()
-
-                    # kernel.cuh:301-333.  Empty-row repair, li exchange, LSE
-                    # store, final SV wait, ring advance, and launch dependency.
-                    if real_mi == T.float32(-float("inf")):
-                        li = 0.0
-                        mi = T.float32(-float("inf"))
-                    rowwise_buf[idx_in_warpgroup] = li
+                # kernel.cuh:160-299.  P load, dual-warp exchange, mask,
+                # online softmax, S staging, and conditional O rescale.
+                for block_idx in T.serial(start_block, end_block, unroll=False):
                     T.ptx.bar.sync(BAR_WG0_SYNC, 128)
-                    li = li + rowwise_buf[idx_in_warpgroup ^ 64]
-                    if idx_in_warpgroup < B_H:
-                        if is_no_split:
-                            cur_lse: T.float32
-                            T.ptx.fma_f32(T.address_of(cur_lse), mi, T.float32(LN_2), T.log(li))
-                            lse[
-                                batch_idx * stride_lse_b
-                                + s_q_idx * stride_lse_s_q
-                                + idx_in_warpgroup
-                            ] = T.if_then_else(
-                                cur_lse == T.float32(-float("inf")),
-                                T.float32(float("inf")),
-                                cur_lse,
-                            )
-                        else:
-                            lse_accum[
-                                n_split_idx * stride_lse_accum_split
-                                + s_q_idx * stride_lse_accum_s_q
-                                + idx_in_warpgroup
-                            ] = T.log2(li) + mi
-                    bar_sv_done.wait(rs_buf.stage, rs_buf.phase)
-                    rs_buf.advance()
-                    rs_index.advance()
+                    bar_valid_ready.wait(rs_index.stage, rs_index.phase)
+                    bar_qk_done.wait(rs_buf.stage, rs_buf.phase)
                     T.ptx.tcgen05.fence.after_thread_sync()
-                    if is_last_batch:
-                        T.ptx.griddepcontrol.launch_dependents()
 
-                    # kernel.cuh:335-421.  Keep no-split TMA output and split
-                    # fp32 bulk output as distinct epilogues; attn_sink is only
-                    # applied here for no-split and is deferred to combine for
-                    # split output exactly as in the CUDA source.
-                    if is_no_split:
-                        output_scale: T.let = T.if_then_else(
-                            li == 0.0,
-                            0.0,
-                            T.cuda.fdividef(1.0, li + T.ptx.exp2(attn_sink_log2 - mi)),
-                        )
-                        output_scale_pair: T.let = T.cuda.make_float2(output_scale, output_scale)
-                        o_epi_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, 64), "float32")
-                        o_epi_bf16_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, 64), "bfloat16")
-                        o_epi = o_epi_frag.local()
-                        emit_no_split_epilogue(
-                            o_epi_frag,
-                            o_epi_bf16_frag,
-                            o_epi,
-                            o_win,
-                            o_smem_win,
-                            o_smem,
-                            out_strided,
-                            output_scale_pair,
-                            warp_idx,
-                            batch_idx,
-                            s_q_idx,
-                        )
-                        T.ptx.cp_async.bulk.commit_group()
+                    p_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, B_TOPK // 2), "float32")
+                    p_peer_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, B_TOPK // 2), "float32")
+                    p = p_frag.local()
+                    p_peer = p_peer_frag.local()
+                    if warp_idx < 2:
+                        Tx.wg.copy_async(p_frag[:, :], p_tmem_win.chunk((None, 2))[:, 0])
+                        Tx.wg.copy_async(p_peer_frag[:, :], p_tmem_win.chunk((None, 2))[:, 1])
                     else:
-                        output_scale: T.let = T.if_then_else(
-                            li == 0.0, 0.0, T.cuda.fdividef(1.0, li)
+                        Tx.wg.copy_async(p_peer_frag[:, :], p_tmem_win.chunk((None, 2))[:, 0])
+                        Tx.wg.copy_async(p_frag[:, :], p_tmem_win.chunk((None, 2))[:, 1])
+                    T.ptx.tcgen05.wait.ld()
+                    T.ptx.tcgen05.fence.before_thread_sync()
+
+                    for exchange_i in T.unroll((B_TOPK // 2) // 4):
+                        exchange_offset: T.let = exchange_i * 32 * 4 + lane_idx * 4
+                        Tx.copy(
+                            p_exchange[warp_idx ^ 2, exchange_offset : exchange_offset + 4],
+                            p_peer[exchange_i * 4 : exchange_i * 4 + 4],
+                            dispatch="vec_128b",
                         )
-                        output_scale_pair: T.let = T.cuda.make_float2(output_scale, output_scale)
-                        split_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, 64), "float32")
-                        split_local = split_frag.local()
-                        for epi_i in T.unroll((D_V // 2) // 64):
+                    T.ptx.bar.sync(BAR_WG0_WARP02 + T.bitwise_and(warp_idx, T.int32(1)), 64)
+                    for exchange_i in T.unroll((B_TOPK // 2) // 4):
+                        exchange_offset: T.let = exchange_i * 32 * 4 + lane_idx * 4
+                        peer_tmp = T.alloc_local((4,), "float32")
+                        Tx.copy(
+                            peer_tmp[0:4],
+                            p_exchange[warp_idx, exchange_offset : exchange_offset + 4],
+                            dispatch="vec_128b",
+                        )
+                        pair0: T.let = _add_f32x2(
+                            T.cuda.make_float2(p[exchange_i * 4], p[exchange_i * 4 + 1]),
+                            T.cuda.make_float2(peer_tmp[0], peer_tmp[1]),
+                        )
+                        pair1: T.let = _add_f32x2(
+                            T.cuda.make_float2(p[exchange_i * 4 + 2], p[exchange_i * 4 + 3]),
+                            T.cuda.make_float2(peer_tmp[2], peer_tmp[3]),
+                        )
+                        p[exchange_i * 4] = T.cuda.float2_x(pair0)
+                        p[exchange_i * 4 + 1] = T.cuda.float2_y(pair0)
+                        p[exchange_i * 4 + 2] = T.cuda.float2_x(pair1)
+                        p[exchange_i * 4 + 3] = T.cuda.float2_y(pair1)
+
+                    valid_word: T.let = is_token_valid.view("uint32")[
+                        rs_index.stage, T.if_then_else(idx_in_warpgroup >= 64, 1, 0)
+                    ]
+                    for p_i in T.unroll(B_TOPK // 2):
+                        if T.bitwise_and(
+                            T.shift_right(valid_word, T.cast(p_i, "uint32")), T.uint32(1)
+                        ) == T.uint32(0):
+                            p[p_i] = T.float32(-float("inf"))
+
+                    cur_pi_max: T.float32 = T.float32(-float("inf"))
+                    for p_i in T.unroll(B_TOPK // 2):
+                        cur_pi_max = T.max(cur_pi_max, p[p_i])
+                    cur_pi_max = cur_pi_max * sm_scale_div_log2
+                    rowwise_buf[idx_in_warpgroup] = cur_pi_max
+                    T.ptx.bar.sync(BAR_WG0_SYNC, 128)
+                    bar_valid_free.arrive(rs_index.stage)
+                    cur_pi_max = T.max(cur_pi_max, rowwise_buf[idx_in_warpgroup ^ 64])
+                    real_mi = T.max(real_mi, cur_pi_max)
+                    should_scale_o: T.let = (
+                        T.ptx.any_sync(T.uint32(0xFFFFFFFF), cur_pi_max - mi > 6.0) != 0
+                    )
+                    new_max: T.float32
+                    scale_for_old: T.float32
+                    if not should_scale_o:
+                        scale_for_old = 1.0
+                        new_max = mi
+                    else:
+                        new_max = T.max(cur_pi_max, mi)
+                        scale_for_old = T.ptx.exp2(mi - new_max)
+                    mi = new_max
+
+                    s_frag = T.alloc_buffer(
+                        (B_H, B_TOPK), "bfloat16", scope="local", layout=s_frag_layout
+                    )
+                    s_pack = s_frag.local().view("uint32")
+                    cur_sum_pair: T.uint64 = T.cuda.make_float2(0.0, 0.0)
+                    neg_max_pair: T.let = T.cuda.make_float2(-new_max, -new_max)
+                    for s_i in T.unroll((B_TOPK // 2) // 2):
+                        p_pair: T.let = T.cuda.make_float2(p[s_i * 2], p[s_i * 2 + 1])
+                        soft_pair: T.let = T.ptx.fma_f32x2(
+                            p_pair, scale_pair, neg_max_pair, dps=False
+                        )
+                        sx: T.let = T.ptx.exp2(T.cuda.float2_x(soft_pair))
+                        sy: T.let = T.ptx.exp2(T.cuda.float2_y(soft_pair))
+                        cur_sum_pair = _add_f32x2(cur_sum_pair, T.cuda.make_float2(sx, sy))
+                        s_pack[s_i] = T.cuda.float22bfloat162_rn(sx, sy)
+                    cur_sum: T.let = T.cuda.float2_x(cur_sum_pair) + T.cuda.float2_y(cur_sum_pair)
+                    li_next: T.float32
+                    T.ptx.fma_f32(T.address_of(li_next), li, scale_for_old, cur_sum)
+                    li = li_next
+
+                    Tx.wg.copy(s_smem_gemm[:, :], s_frag[:, :])
+                    if T.And(block_idx != start_block, should_scale_o):
+                        scale_for_old_pair: T.let = T.cuda.make_float2(scale_for_old, scale_for_old)
+                        T.ptx.tcgen05.fence.after_thread_sync()
+                        o_rescale_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, 64), "float32")
+                        o_rescale = o_rescale_frag.local()
+                        for o_chunk in T.unroll((D_V // 2) // 64):
                             Tx.wg.copy_async(
-                                split_frag[:, :], o_win.chunk((None, (D_V // 2) // 64))[:, epi_i]
+                                o_rescale_frag[:, :],
+                                o_win.chunk((None, (D_V // 2) // 64))[:, o_chunk],
                             )
                             T.ptx.tcgen05.wait.ld()
                             for scale_i in T.unroll(64 // 2):
                                 scaled_pair: T.let = _mul_f32x2(
                                     T.cuda.make_float2(
-                                        split_local[scale_i * 2], split_local[scale_i * 2 + 1]
+                                        o_rescale[scale_i * 2], o_rescale[scale_i * 2 + 1]
                                     ),
-                                    output_scale_pair,
+                                    scale_for_old_pair,
                                 )
-                                split_local[scale_i * 2] = T.cuda.float2_x(scaled_pair)
-                                split_local[scale_i * 2 + 1] = T.cuda.float2_y(scaled_pair)
-                            col_base: T.let = (
-                                (idx_in_warpgroup // 64) * 128
-                                + T.if_then_else(epi_i * 64 >= D_V // 4, D_V // 2, 0)
-                                + (epi_i * 64) % (D_V // 4)
+                                o_rescale[scale_i * 2] = T.cuda.float2_x(scaled_pair)
+                                o_rescale[scale_i * 2 + 1] = T.cuda.float2_y(scaled_pair)
+                            Tx.wg.copy_async(
+                                o_win.chunk((None, (D_V // 2) // 64))[:, o_chunk],
+                                o_rescale_frag[:, :],
                             )
-                            for j in T.unroll(64 // 4):
-                                Tx.copy(
-                                    o_accum_smem[
-                                        idx_in_warpgroup % 64,
-                                        col_base + j * 4 : col_base + j * 4 + 4,
-                                    ],
-                                    split_local[j * 4 : j * 4 + 4],
-                                    dispatch="vec_128b",
-                                )
+                            T.ptx.tcgen05.wait.st()
+                        T.ptx.tcgen05.fence.before_thread_sync()
+
+                    T.ptx.fence.proxy_async("shared::cta")
+                    bar_so_ready.arrive(rs_buf.stage)
+                    if block_idx != end_block - 1:
+                        rs_buf.advance()
+                        rs_index.advance()
+
+                # kernel.cuh:301-333.  Empty-row repair, li exchange, LSE
+                # store, final SV wait, ring advance, and launch dependency.
+                if real_mi == T.float32(-float("inf")):
+                    li = 0.0
+                    mi = T.float32(-float("inf"))
+                rowwise_buf[idx_in_warpgroup] = li
+                T.ptx.bar.sync(BAR_WG0_SYNC, 128)
+                li = li + rowwise_buf[idx_in_warpgroup ^ 64]
+                if idx_in_warpgroup < B_H:
+                    if is_no_split:
+                        cur_lse: T.float32
+                        T.ptx.fma_f32(T.address_of(cur_lse), mi, T.float32(LN_2), T.log(li))
+                        lse[
+                            batch_idx * stride_lse_b + s_q_idx * stride_lse_s_q + idx_in_warpgroup
+                        ] = T.if_then_else(
+                            cur_lse == T.float32(-float("inf")), T.float32(float("inf")), cur_lse
+                        )
+                    else:
+                        lse_accum[
+                            n_split_idx * stride_lse_accum_split
+                            + s_q_idx * stride_lse_accum_s_q
+                            + idx_in_warpgroup
+                        ] = T.log2(li) + mi
+                bar_sv_done.wait(rs_buf.stage, rs_buf.phase)
+                rs_buf.advance()
+                rs_index.advance()
+                T.ptx.tcgen05.fence.after_thread_sync()
+                if is_last_batch:
+                    T.ptx.griddepcontrol.launch_dependents()
+
+                # kernel.cuh:335-421.  Keep no-split TMA output and split
+                # fp32 bulk output as distinct epilogues; attn_sink is only
+                # applied here for no-split and is deferred to combine for
+                # split output exactly as in the CUDA source.
+                if is_no_split:
+                    output_scale: T.let = T.if_then_else(
+                        li == 0.0, 0.0, T.cuda.fdividef(1.0, li + T.ptx.exp2(attn_sink_log2 - mi))
+                    )
+                    output_scale_pair: T.let = T.cuda.make_float2(output_scale, output_scale)
+                    o_epi_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, 64), "float32")
+                    o_epi_bf16_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, 64), "bfloat16")
+                    o_epi = o_epi_frag.local()
+
+                    @T.inline
+                    def emit_no_split_epilogue(epi_i: T.constexpr):
+                        Tx.wg.copy_async(
+                            o_epi_frag[:, :], o_win.chunk((None, (D_V // 2) // 64))[:, epi_i]
+                        )
+                        T.ptx.tcgen05.wait.ld()
+                        for scale_i in T.unroll(64 // 2):
+                            scaled_pair: T.let = _mul_f32x2(
+                                T.cuda.make_float2(o_epi[scale_i * 2], o_epi[scale_i * 2 + 1]),
+                                output_scale_pair,
+                            )
+                            o_epi[scale_i * 2] = T.cuda.float2_x(scaled_pair)
+                            o_epi[scale_i * 2 + 1] = T.cuda.float2_y(scaled_pair)
+                        Tx.wg.cast(o_epi_bf16_frag[:, :], o_epi_frag[:, :])
+                        col_base = T.meta_var(
+                            (D_V // 2 if epi_i * 64 >= D_V // 4 else 0) + (epi_i * 64) % (D_V // 4)
+                        )
+                        Tx.wg.copy(
+                            o_smem_win.chunk((None, (D_V // 2) // 64))[:, epi_i],
+                            o_epi_bf16_frag[:, :],
+                        )
                         T.ptx.fence.proxy_async("shared::cta")
                         T.ptx.bar.sync(BAR_WG0_SYNC, 128)
-                        if T.ptx.elect_sync() != T.uint32(0):
-                            for local_row in T.unroll(B_H // 4):
-                                smem_row: T.let = local_row * 4 + warp_idx
-                                T.ptx.cp_async_bulk_s2g(
-                                    o_accum.ptr_to(
-                                        [
-                                            n_split_idx * stride_o_accum_split
-                                            + s_q_idx * stride_o_accum_s_q
-                                            + smem_row * stride_o_accum_h_q
-                                        ]
-                                    ),
-                                    o_accum_smem.ptr_to([smem_row, 0]),
-                                    T.uint32(D_V * 4),
-                                )
-                            T.ptx.cp_async.bulk.commit_group()
-
-                    # kernel.cuh:116 uses the unaligned spelling because the
-                    # elected WG1 producer lanes reach this named barrier via
-                    # control flow distinct from the empty-role lanes.
-                    T.ptx.barrier.sync(BAR_EVERYONE_SYNC, NUM_THREADS)
-                    batch_bar_phase = batch_bar_phase ^ 1
-
-            if warp_idx == 0:
-                T.ptx.tcgen05.dealloc(T.uint32(0), n_cols=512, cta_group=1)
-
-        elif warpgroup_idx == 1:
-            # kernel.cuh:427-430.  The producer/MMA warpgroup deliberately
-            # gives registers back, then recomputes the synchronized canonical
-            # warp id; retaining the earlier value is known to spill registers.
-            T.ptx.setmaxnreg(False, 72)
-            wg1_warp_idx: T.let = T.tvm_warp_shuffle(
-                T.uint32(0xFFFFFFFF), T.cuda.thread_rank() // 32, 0, 32, 32
-            )
-
-            # kernel.cuh:431-746.  Mirror each CUDA run_main_loop(lambda)
-            # call as a separate parser-time specialization.  This keeps the
-            # scheduler and its registers inside the selected warp role.
-            @T.inline
-            def run_wg1_role(role: T.constexpr):
-                rs_buf = PipelineState(NUM_BUFS, phase=0)
-                rs_index = PipelineState(NUM_INDEX_BUFS, phase=0)
-                q_sw128_tmem = q_tmem.sub[:, :, 0:256]
-                q_sw128_tmem_cp = q_sw128_tmem.rearrange("b h (dc di) -> h dc b di", di=64)
-                k_full_tiled = k_full.rearrange(
-                    "b r (dc h ci) -> b (h r) (dc ci)", dc=4, h=2, ci=64
-                )
-                q_tail_tmem = q_tmem.sub[:, :, q_tail_start : q_tail_start + 32]
-                q_tail_tmem_cp = q_tail_tmem.rearrange("b h k -> h (b k)")
-                k_rope_tiled = k_rope.rearrange("b r (h ci) -> b (h r) ci", h=2, ci=32)
-
-                # kernel.cuh:657-667.  These warp-7 invariants are deliberately
-                # materialized before the scheduler traversal.  Pointer bases are
-                # held as byte addresses so the per-token paths only add offsets.
-                tma_coords_step_per_token: T.int32 = 0
-                tma_coords_step_per_block: T.int32 = 0
-                tma_coords_step_per_extra_block: T.int32 = 0
-                k_scales_ptr_u64: T.uint64 = T.uint64(0)
-                extra_k_scales_ptr_u64: T.uint64 = T.uint64(0)
-                if role == 7:
-                    tma_coords_step_per_token = (656 if model_is_v32 else 576) // tma_k_stride
-                    tma_coords_step_per_block = stride_kv_block // tma_k_stride
-                    tma_coords_step_per_extra_block = stride_extra_kv_block // tma_k_stride
-                    k_scales_ptr_u64 = T.reinterpret(
-                        "uint64",
-                        kv.ptr_to(
-                            [d_nope if model_is_v32 else page_block_size * (d_nope + 2 * 64)]
-                        ),
-                    )
-                    if extra_kv_h is not None:
-                        extra_k_scales_ptr_u64 = T.reinterpret(
-                            "uint64",
-                            extra_kv.ptr_to(
-                                [
-                                    d_nope
-                                    if model_is_v32
-                                    else extra_page_block_size * (d_nope + 2 * 64)
-                                ]
-                            ),
-                        )
-                # kernel.cuh:77-118, expanded once for all WG1 threads.  Non-elected
-                # lanes still execute the empty role and participate in the 384-way
-                # per-batch named barrier, matching the CUDA else branch at 744.
-                sched_words = T.alloc_local((4,), "uint64")
-                load_scheduler_meta(sched_words)
-                sched_i32 = sched_words.view("int32")
-                sched_begin_req: T.let = sched_i32[0]
-                sched_end_req: T.let = sched_i32[1]
-                sched_begin_block: T.let = sched_i32[2]
-                sched_end_block: T.let = sched_i32[3]
-                sched_begin_split: T.let = sched_i32[4]
-                sched_first_split: T.let = sched_i32[5]
-                sched_last_split: T.let = sched_i32[6]
-                batch_bar_phase: T.int32 = 0
-
-                # The CUDA return exits only this role's run_main_loop lambda.
-                if sched_begin_req < b:
-                    for batch_idx in T.serial(sched_begin_req, sched_end_req + 1, unroll=False):
-                        topk_len: T.int32 = topk
-                        if topk_length_h is not None:
-                            topk_len = T.cuda.ldg(topk_length.ptr_to([batch_idx]), "int32")
-                        orig_topk_padded: T.let = T.max(
-                            ((topk_len + B_TOPK - 1) // B_TOPK) * B_TOPK, B_TOPK
-                        )
-                        extra_topk_len: T.int32 = extra_topk
-                        if extra_topk_length_h is not None:
-                            extra_topk_len = T.cuda.ldg(
-                                extra_topk_length.ptr_to([batch_idx]), "int32"
-                            )
-                        total_topk_padded: T.let = (
-                            orig_topk_padded + ((extra_topk_len + B_TOPK - 1) // B_TOPK) * B_TOPK
-                        )
-                        start_block: T.let = T.if_then_else(
-                            batch_idx == sched_begin_req, sched_begin_block, 0
-                        )
-                        end_block: T.let = T.if_then_else(
-                            batch_idx == sched_end_req, sched_end_block, total_topk_padded // B_TOPK
-                        )
-                        is_split: T.bool = T.cast(
-                            T.if_then_else(
-                                batch_idx == sched_begin_req,
-                                sched_first_split,
-                                T.if_then_else(batch_idx == sched_end_req, sched_last_split, 0),
-                            ),
-                            "bool",
-                        )
-                        is_no_split: T.bool = not is_split
-                        num_orig_blocks: T.let = orig_topk_padded // B_TOPK
-                        n_split_idx: T.let = T.if_then_else(
-                            batch_idx == sched_begin_req,
-                            T.cuda.ldg(num_splits.ptr_to([batch_idx]), "int32") + sched_begin_split,
-                            T.cuda.ldg(num_splits.ptr_to([batch_idx]), "int32"),
-                        )
-                        is_last_batch: T.bool = batch_idx == sched_end_req
-
-                        if role == 4:
-                            # kernel.cuh:431-527.  Warp 4 issues both Q TMAs, then
-                            # the same SW128/SW64 UTCCP deposits at TMEM Q=256.
-                            T.cuda.trap_when_assert_failed(start_block < end_block)
-                            # SmemLayoutQ_SW128 is tile_to_shape of a 64x64
-                            # atom.  CuTe therefore partitions the 64x512 Q
-                            # copy into eight source-order TMA boxes instead of
-                            # issuing one monolithic 64 KiB transaction.
-                            for q_tile in T.unroll(512 // 64):
+                        if warp_idx == 0:
+                            if T.ptx.elect_sync() != T.uint32(0):
                                 Tx.copy_async(
-                                    q_sw128[:, q_tile * 64 : (q_tile + 1) * 64],
-                                    q_strided[
-                                        batch_idx, s_q_idx, :, q_tile * 64 : (q_tile + 1) * 64
+                                    out_strided[batch_idx, s_q_idx, :, col_base : col_base + 64],
+                                    o_smem[:, col_base : col_base + 64],
+                                    **tma_config(
+                                        dispatch="tma_explicit", tensormap_l2_promotion="L2::128B"
+                                    ),
+                                )
+                        warp1_col_base = T.meta_var(col_base + D_V // 4)
+                        if warp_idx == 1:
+                            if T.ptx.elect_sync() != T.uint32(0):
+                                Tx.copy_async(
+                                    out_strided[
+                                        batch_idx, s_q_idx, :, warp1_col_base : warp1_col_base + 64
                                     ],
+                                    o_smem[:, warp1_col_base : warp1_col_base + 64],
                                     **tma_config(
-                                        dispatch="tma_explicit",
-                                        mbar=bar_q_tma.ptr_to([0]),
-                                        cta_group=1,
-                                        cache_hint="evict_first",
-                                        tensormap_l2_promotion="L2::128B",
+                                        dispatch="tma_explicit", tensormap_l2_promotion="L2::128B"
                                     ),
                                 )
-                            if model_is_v32:
-                                Tx.copy_async(
-                                    q_sw64.rearrange("h (a c) -> a h c", a=2, c=32)[:, :, :],
-                                    q_tail_tma[batch_idx, s_q_idx, 16:18, :, :],
-                                    **tma_config(
-                                        dispatch="tma_explicit",
-                                        mbar=bar_q_tma.ptr_to([0]),
-                                        cta_group=1,
-                                        cache_hint="evict_first",
-                                        tensormap_l2_promotion="L2::128B",
-                                    ),
-                                )
-                            bar_q_tma.arrive(0, tx_count=B_H * d_qk * BF16_BYTES)
-                            bar_q_tma.wait(0, batch_bar_phase)
-                            T.ptx.tcgen05.fence.after_thread_sync()
-                            Tx.copy_async(
-                                q_sw128_tmem_cp[:, :, :, :],
-                                q_sw128.view(B_H, 4, 2, 64)[:, :, :, :],
-                                shape="128x256b",
-                                cta_group=1,
+
+                    emit_no_split_epilogue(0)
+                    emit_no_split_epilogue(1)
+                    emit_no_split_epilogue(2)
+                    emit_no_split_epilogue(3)
+                    T.ptx.cp_async.bulk.commit_group()
+                else:
+                    output_scale: T.let = T.if_then_else(li == 0.0, 0.0, T.cuda.fdividef(1.0, li))
+                    output_scale_pair: T.let = T.cuda.make_float2(output_scale, output_scale)
+                    split_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, 64), "float32")
+                    split_local = split_frag.local()
+                    for epi_i in T.unroll((D_V // 2) // 64):
+                        Tx.wg.copy_async(
+                            split_frag[:, :], o_win.chunk((None, (D_V // 2) // 64))[:, epi_i]
+                        )
+                        T.ptx.tcgen05.wait.ld()
+                        for scale_i in T.unroll(64 // 2):
+                            scaled_pair: T.let = _mul_f32x2(
+                                T.cuda.make_float2(
+                                    split_local[scale_i * 2], split_local[scale_i * 2 + 1]
+                                ),
+                                output_scale_pair,
                             )
-                            if model_is_v32:
-                                Tx.copy_async(q_tail_tmem_cp[:, :], q_sw64[:, :])
-                            bar_q_utccp.arrive(0)
-                            bar_q_utccp.wait(0, batch_bar_phase)
-                            T.ptx.tcgen05.fence.after_thread_sync()
-
-                            # kernel.cuh:529-584.  MODEL_TYPE only selects how the
-                            # shared K latent is interpreted; both instances issue
-                            # the same dual-head P and SxV pipelines.
-                            for block_idx in T.serial(start_block, end_block, unroll=False):
-                                if model_is_v32:
-                                    bar_rope_ready.wait(rs_buf.stage, rs_buf.phase)
-                                    T.ptx.tcgen05.fence.after_thread_sync()
-                                    Tx.gemm_async(
-                                        p_tmem[:, :, :],
-                                        q_tail_tmem[:, :, :],
-                                        k_rope_tiled[rs_buf.stage, :, :],
-                                        **_mma_config(accum=T.uint32(0)),
-                                    )
-                                    bar_nope_ready.wait(rs_buf.stage, rs_buf.phase)
-                                    T.ptx.tcgen05.fence.after_thread_sync()
-                                    Tx.gemm_async(
-                                        p_tmem[:, :, :],
-                                        q_sw128_tmem[:, :, :],
-                                        k_full_tiled[rs_buf.stage, :, :],
-                                        **_mma_config(accum=T.uint32(1)),
-                                    )
-                                else:
-                                    bar_rope_ready.wait(rs_buf.stage, rs_buf.phase)
-                                    bar_nope_ready.wait(rs_buf.stage, rs_buf.phase)
-                                    T.ptx.tcgen05.fence.after_thread_sync()
-                                    Tx.gemm_async(
-                                        p_tmem[:, :, :],
-                                        q_sw128_tmem[:, :, :],
-                                        k_full_tiled[rs_buf.stage, :, :],
-                                        **_mma_config(accum=T.uint32(0)),
-                                    )
-                                bar_qk_done.arrive(rs_buf.stage)
-
-                                bar_so_ready.wait(rs_buf.stage, rs_buf.phase)
-                                T.ptx.tcgen05.fence.after_thread_sync()
-                                mma_o_accum: T.let = T.if_then_else(
-                                    block_idx == start_block, T.uint32(0), T.uint32(1)
-                                )
-                                Tx.gemm_async(
-                                    o_tmem.sub[:, 0 : D_V // 2],
-                                    s_smem_gemm[:, :],
-                                    k_full[rs_buf.stage, :, 0 : D_V // 2],
-                                    transB=True,
-                                    **_mma_config(accum=mma_o_accum),
-                                )
-                                Tx.gemm_async(
-                                    o_tmem.sub[:, D_V // 2 : D_V],
-                                    s_smem_gemm[:, :],
-                                    k_full[rs_buf.stage, :, D_V // 2 : D_V],
-                                    transB=True,
-                                    **_mma_config(accum=mma_o_accum),
-                                )
-                                bar_sv_done.arrive(rs_buf.stage)
-                                rs_buf.advance()
-                                rs_index.advance()
-
-                        elif role == 5:
-                            # kernel.cuh:586-615.  One gather4 producer loads raw
-                            # fp8 NoPE as int64, retaining the two-stage raw ring.
-                            bar_q_utccp.wait(0, batch_bar_phase)
-                            bar_last_store_done.wait(0, batch_bar_phase)
-                            for block_idx in T.serial(start_block, end_block, unroll=False):
-                                bar_valid_ready.wait(rs_index.stage, rs_index.phase)
-                                bar_raw_free.wait(rs_buf.stage, rs_buf.phase ^ 1)
-                                cur_indices = T.alloc_local((4,), "int32")
-                                next_indices = T.alloc_local((4,), "int32")
-                                Tx.copy(
-                                    cur_indices[0:4],
-                                    tma_coord[rs_index.stage, 0:4],
-                                    dispatch="vec_128b",
-                                )
-                                for row4 in T.unroll(B_TOPK // 4):
-                                    row: T.let = row4 * 4
-                                    if row + 4 < B_TOPK:
-                                        Tx.copy(
-                                            next_indices[0:4],
-                                            tma_coord[rs_index.stage, row + 4 : row + 8],
-                                            dispatch="vec_128b",
-                                        )
-                                    Tx.copy_async(
-                                        raw_nope.sub[rs_buf.stage, :, :][row : row + 4, :],
-                                        kv_nope_tma[0:1, :],
-                                        **_kv_gather_tma(
-                                            mbar=bar_raw_ready.ptr_to([rs_buf.stage]),
-                                            gather4=[cur_indices[j] for j in range(4)],
-                                            src_selector=(
-                                                [(block_idx >= num_orig_blocks, extra_kv_nope_tma)]
-                                                if extra_kv_h is not None
-                                                else None
-                                            ),
-                                        ),
-                                    )
-                                    assign_int4_registers(cur_indices, next_indices)
-                                bar_raw_ready.arrive(rs_buf.stage, tx_count=B_TOPK * d_nope)
-                                bar_valid_free.arrive(rs_index.stage)
-                                rs_buf.advance()
-                                rs_index.advance()
-
-                        elif role == 6:
-                            # kernel.cuh:616-652.  RoPE remains bf16 and uses the
-                            # model-specific SW64 (two 32-col gathers) or SW128
-                            # (one 64-col gather) destination.
-                            bar_q_utccp.wait(0, batch_bar_phase)
-                            bar_last_store_done.wait(0, batch_bar_phase)
-                            for block_idx in T.serial(start_block, end_block, unroll=False):
-                                bar_valid_ready.wait(rs_index.stage, rs_index.phase)
-                                if model_is_v32:
-                                    bar_qk_done.wait(rs_buf.stage, rs_buf.phase ^ 1)
-                                else:
-                                    bar_sv_done.wait(rs_buf.stage, rs_buf.phase ^ 1)
-                                cur_indices = T.alloc_local((4,), "int32")
-                                next_indices = T.alloc_local((4,), "int32")
-                                Tx.copy(
-                                    cur_indices[0:4],
-                                    tma_coord[rs_index.stage, 0:4],
-                                    dispatch="vec_128b",
-                                )
-                                for row4 in T.unroll(B_TOPK // 4):
-                                    row: T.let = row4 * 4
-                                    if row + 4 < B_TOPK:
-                                        Tx.copy(
-                                            next_indices[0:4],
-                                            tma_coord[rs_index.stage, row + 4 : row + 8],
-                                            dispatch="vec_128b",
-                                        )
-                                    for rope_part in T.unroll(64 // rope_tile):
-                                        Tx.copy_async(
-                                            k_rope_tma.sub[rs_buf.stage, :, :][
-                                                row : row + 4,
-                                                rope_part * rope_tile : (rope_part + 1) * rope_tile,
-                                            ],
-                                            kv_rope_tma[
-                                                0:1,
-                                                rope_part * rope_tile : (rope_part + 1) * rope_tile,
-                                            ],
-                                            **_kv_gather_tma(
-                                                mbar=bar_rope_ready.ptr_to([rs_buf.stage]),
-                                                gather4=[cur_indices[j] for j in range(4)],
-                                                src_selector=(
-                                                    [
-                                                        (
-                                                            block_idx >= num_orig_blocks,
-                                                            extra_kv_rope_tma,
-                                                        )
-                                                    ]
-                                                    if extra_kv_h is not None
-                                                    else None
-                                                ),
-                                            ),
-                                        )
-                                    assign_int4_registers(cur_indices, next_indices)
-                                bar_rope_ready.arrive(
-                                    rs_buf.stage, tx_count=B_TOPK * 64 * BF16_BYTES
-                                )
-                                bar_valid_free.arrive(rs_index.stage)
-                                rs_buf.advance()
-                                rs_index.advance()
-
-                        elif role == 7:
-                            # kernel.cuh:653-743.  All 32 lanes transform exactly
-                            # two indices, form TMA coordinates, load/convert the
-                            # model-specific scales, and construct each 8-bit mask.
-                            indices_base: T.let = (
-                                batch_idx * stride_indices_b + s_q_idx * stride_indices_s_q
+                            split_local[scale_i * 2] = T.cuda.float2_x(scaled_pair)
+                            split_local[scale_i * 2 + 1] = T.cuda.float2_y(scaled_pair)
+                        col_base: T.let = (
+                            (idx_in_warpgroup // 64) * 128
+                            + T.if_then_else(epi_i * 64 >= D_V // 4, D_V // 2, 0)
+                            + (epi_i * 64) % (D_V // 4)
+                        )
+                        for j in T.unroll(64 // 4):
+                            Tx.copy(
+                                o_accum_smem[
+                                    idx_in_warpgroup % 64, col_base + j * 4 : col_base + j * 4 + 4
+                                ],
+                                split_local[j * 4 : j * 4 + 4],
+                                dispatch="vec_128b",
                             )
-                            extra_indices_base: T.let = (
-                                batch_idx * stride_extra_indices_b
-                                + s_q_idx * stride_extra_indices_s_q
+                    T.ptx.fence.proxy_async("shared::cta")
+                    T.ptx.bar.sync(BAR_WG0_SYNC, 128)
+                    if T.ptx.elect_sync() != T.uint32(0):
+                        for local_row in T.unroll(B_H // 4):
+                            smem_row: T.let = local_row * 4 + warp_idx
+                            T.ptx.cp_async_bulk_s2g(
+                                o_accum.ptr_to(
+                                    [
+                                        n_split_idx * stride_o_accum_split
+                                        + s_q_idx * stride_o_accum_s_q
+                                        + smem_row * stride_o_accum_h_q
+                                    ]
+                                ),
+                                o_accum_smem.ptr_to([smem_row, 0]),
+                                T.uint32(D_V * 4),
                             )
+                        T.ptx.cp_async.bulk.commit_group()
 
-                            @T.inline
-                            def process_index_block(cur_block, is_extra: T.constexpr):
-                                abs_pos: T.let = T.if_then_else(
-                                    is_extra,
-                                    (cur_block - num_orig_blocks) * B_TOPK + lane_idx * 2,
-                                    cur_block * B_TOPK + lane_idx * 2,
-                                )
-                                cur_page_size: T.let = T.if_then_else(
-                                    is_extra, extra_page_block_size, page_block_size
-                                )
-                                cur_block_stride: T.let = T.if_then_else(
-                                    is_extra, stride_extra_kv_block, stride_kv_block
-                                )
-                                cur_row_stride: T.let = T.if_then_else(
-                                    is_extra, stride_extra_kv_row, stride_kv_row
-                                )
-                                cur_length: T.let = T.if_then_else(
-                                    is_extra, extra_topk_len, topk_len
-                                )
-                                cur_k_scales_ptr_u64: T.let = T.if_then_else(
-                                    is_extra, extra_k_scales_ptr_u64, k_scales_ptr_u64
-                                )
-                                cur_tma_coords_step_per_block: T.let = T.if_then_else(
-                                    is_extra,
-                                    tma_coords_step_per_extra_block,
-                                    tma_coords_step_per_block,
-                                )
+                # kernel.cuh:116 uses the unaligned spelling because the
+                # elected WG1 producer lanes reach this named barrier via
+                # control flow distinct from the empty-role lanes.
+                T.ptx.barrier.sync(BAR_EVERYONE_SYNC, NUM_THREADS)
+                batch_bar_phase = batch_bar_phase ^ 1
 
-                                pair_indices = T.alloc_local((2,), "int32")
-                                if is_extra:
-                                    Tx.copy(
-                                        pair_indices[0:2],
-                                        extra_indices[
-                                            extra_indices_base + abs_pos : extra_indices_base
-                                            + abs_pos
-                                            + 2
-                                        ],
-                                        dispatch="vec_64b",
-                                        cache="nc",
-                                    )
-                                else:
-                                    Tx.copy(
-                                        pair_indices[0:2],
-                                        indices[
-                                            indices_base + abs_pos : indices_base + abs_pos + 2
-                                        ],
-                                        dispatch="vec_64b",
-                                        cache="nc",
-                                    )
-                                bar_valid_free.wait(rs_index.stage, rs_index.phase ^ 1)
-                                coords = T.alloc_local((2,), "int32")
-                                cache_blocks = T.alloc_local((2,), "uint32")
-                                indices_in_block = T.alloc_local((2,), "uint32")
-                                scale_words = T.alloc_local((2,), "uint64")
-                                pair_token_valid = T.alloc_local((2,), "bool")
-                                scale_f32 = T.alloc_local((2, 4), "float32")
-                                scale_byte_offsets = T.alloc_local((2,), "uint64")
-                                valid_mask: T.int8 = T.int8(0)
-                                for pair_i in T.unroll(2):
-                                    index_u32: T.let = T.cast(pair_indices[pair_i], "uint32")
-                                    cache_blocks[pair_i] = index_u32 // T.cast(
-                                        cur_page_size, "uint32"
-                                    )
-                                    indices_in_block[pair_i] = index_u32 % T.cast(
-                                        cur_page_size, "uint32"
-                                    )
-                                    token_valid: T.let = T.And(
-                                        pair_indices[pair_i] != -1, abs_pos + pair_i < cur_length
-                                    )
-                                    pair_token_valid[pair_i] = token_valid
-                                    valid_mask = T.cast(
-                                        T.bitwise_or(
-                                            T.cast(valid_mask, "int32"),
-                                            T.shift_left(
-                                                T.cast(token_valid, "int32"),
-                                                T.cast(pair_i, "int32"),
-                                            ),
-                                        ),
-                                        "int8",
-                                    )
-                                    coords[pair_i] = T.if_then_else(
-                                        pair_token_valid[pair_i],
-                                        T.cast(cache_blocks[pair_i], "int32")
-                                        * cur_tma_coords_step_per_block
-                                        + T.cast(indices_in_block[pair_i], "int32")
-                                        * tma_coords_step_per_token,
-                                        -1,
-                                    )
-                                    if model_is_v32:
-                                        # k_scales_ptr is kv+D_NOPE even for an
-                                        # invalid token; invalid entries therefore
-                                        # load token-0's scale float4 and are zeroed
-                                        # only after conversion, exactly as CUDA.
-                                        scale_byte_offsets[pair_i] = T.if_then_else(
-                                            pair_token_valid[pair_i],
-                                            T.cast(cache_blocks[pair_i], "uint64")
-                                            * T.cast(cur_block_stride, "int64")
-                                            + T.cast(indices_in_block[pair_i], "uint64")
-                                            * T.cast(cur_row_stride, "int64"),
-                                            T.uint64(0),
-                                        )
-                                        # The CUDA loop is source-unrolled.  Issue
-                                        # both token float4 loads before consuming
-                                        # either value in F2FP.E8 so the random
-                                        # scale reads overlap in flight.
-                                        T.cuda.ldg(
-                                            T.reinterpret(
-                                                PointerType(PrimType("float32")),
-                                                cur_k_scales_ptr_u64 + scale_byte_offsets[pair_i],
-                                            ),
-                                            "float32",
-                                            dst=(
-                                                scale_f32.ptr_to([pair_i, 0]),
-                                                scale_f32.ptr_to([pair_i, 1]),
-                                                scale_f32.ptr_to([pair_i, 2]),
-                                                scale_f32.ptr_to([pair_i, 3]),
-                                            ),
-                                            vec="v4",
-                                        )
-                                    else:
-                                        scale_byte_offsets[pair_i] = (
-                                            T.cast(cache_blocks[pair_i], "uint64")
-                                            * T.cast(cur_block_stride, "int64")
-                                            + T.cast(indices_in_block[pair_i], "uint64") * 8
-                                        )
-                                        scale_words[pair_i] = T.if_then_else(
-                                            pair_token_valid[pair_i],
-                                            T.cuda.ldg(
-                                                T.reinterpret(
-                                                    PointerType(PrimType("uint64")),
-                                                    cur_k_scales_ptr_u64
-                                                    + scale_byte_offsets[pair_i],
-                                                ),
-                                                "uint64",
-                                            ),
-                                            T.uint64(0),
-                                        )
+        if warp_idx == 0:
+            T.ptx.tcgen05.dealloc(T.uint32(0), n_cols=512, cta_group=1)
 
-                                if model_is_v32:
-                                    for pair_i in T.unroll(2):
-                                        packed_scale: T.let = _f32x4_to_e8m0x4(
-                                            scale_f32[pair_i, 0],
-                                            scale_f32[pair_i, 1],
-                                            scale_f32[pair_i, 2],
-                                            scale_f32[pair_i, 3],
-                                        )
-                                        scale_words[pair_i] = T.if_then_else(
-                                            pair_token_valid[pair_i],
-                                            T.cast(packed_scale, "uint64"),
-                                            T.uint64(0),
-                                        )
+    elif warpgroup_idx == 1:
+        # kernel.cuh:427-430.  The producer/MMA warpgroup deliberately
+        # gives registers back, then recomputes the synchronized canonical
+        # warp id; retaining the earlier value is known to spill registers.
+        T.ptx.setmaxnreg(False, 72)
+        wg1_warp_idx: T.let = T.tvm_warp_shuffle(
+            T.uint32(0xFFFFFFFF), T.cuda.thread_rank() // 32, 0, 32, 32
+        )
 
-                                valid_mask = T.cast(
-                                    T.shift_left(
-                                        T.cast(valid_mask, "int32"),
-                                        T.cast((lane_idx % 4) * 2, "int32"),
-                                    ),
-                                    "int8",
-                                )
-                                valid_mask = T.cast(
-                                    T.bitwise_or(
-                                        T.cast(valid_mask, "int32"),
-                                        T.cuda.__shfl_xor_sync(
-                                            T.uint32(0xFFFFFFFF), T.cast(valid_mask, "int32"), 1, 32
-                                        ),
-                                    ),
-                                    "int8",
-                                )
-                                valid_mask = T.cast(
-                                    T.bitwise_or(
-                                        T.cast(valid_mask, "int32"),
-                                        T.cuda.__shfl_xor_sync(
-                                            T.uint32(0xFFFFFFFF), T.cast(valid_mask, "int32"), 2, 32
-                                        ),
-                                    ),
-                                    "int8",
-                                )
-                                if model_is_v32:
-                                    scales_e8m0.view("uint64")[rs_index.stage, lane_idx] = (
-                                        T.bitwise_or(
-                                            scale_words[0],
-                                            T.shift_left(scale_words[1], T.uint64(32)),
-                                        )
-                                    )
-                                else:
-                                    Tx.copy(
-                                        scales_e8m0.view("uint64")[
-                                            rs_index.stage, lane_idx * 2 : lane_idx * 2 + 2
-                                        ],
-                                        scale_words[0:2],
-                                        dispatch="vec_128b",
-                                    )
-                                Tx.copy(
-                                    tma_coord[rs_index.stage, lane_idx * 2 : lane_idx * 2 + 2],
-                                    coords[0:2],
-                                    dispatch="vec_64b",
-                                )
-                                if lane_idx % 4 == 0:
-                                    is_token_valid[rs_index.stage, lane_idx // 4] = valid_mask
-                                bar_valid_ready.arrive(rs_index.stage)
-                                rs_buf.advance()
-                                rs_index.advance()
-
-                            for block_idx in T.serial(
-                                start_block, T.min(num_orig_blocks, end_block), unroll=False
-                            ):
-                                process_index_block(block_idx, False)
-                            if extra_kv_h is not None and extra_indices_h is not None:
-                                for block_idx in T.serial(
-                                    T.max(start_block, num_orig_blocks), end_block, unroll=False
-                                ):
-                                    process_index_block(block_idx, True)
-
-                        T.ptx.barrier.sync(BAR_EVERYONE_SYNC, NUM_THREADS)
-                        batch_bar_phase = batch_bar_phase ^ 1
-
-            # kernel.cuh:431/586/616/653/744.  Election is evaluated only in
-            # the matching warp.  Record the selected source branch first so
-            # every non-elected lane reaches the one shared final ``else``
-            # scheduler, rather than cloning that empty scheduler once for
-            # each producer warp.
-            selected_wg1_role: T.int32 = -1
-            if wg1_warp_idx == 4:
-                if T.ptx.elect_sync() != T.uint32(0):
-                    selected_wg1_role = 4
-            elif wg1_warp_idx == 5:
-                if T.ptx.elect_sync() != T.uint32(0):
-                    selected_wg1_role = 5
-            elif wg1_warp_idx == 6:
-                if T.ptx.elect_sync() != T.uint32(0):
-                    selected_wg1_role = 6
-            elif wg1_warp_idx == 7:
-                selected_wg1_role = 7
-
-            if selected_wg1_role == 4:
-                run_wg1_role(4)
-            elif selected_wg1_role == 5:
-                run_wg1_role(5)
-            elif selected_wg1_role == 6:
-                run_wg1_role(6)
-            elif selected_wg1_role == 7:
-                run_wg1_role(7)
-            else:
-                run_wg1_role(-1)
-        else:
-            # kernel.cuh:747-759.  The dequant warpgroup keeps 208 registers
-            # and assigns exactly eight threads per token group.
-            T.ptx.setmaxnreg(True, 208)
+        # kernel.cuh:431-746.  Mirror each CUDA run_main_loop(lambda)
+        # call as a separate parser-time specialization.  This keeps the
+        # scheduler and its registers inside the selected warp role.
+        @T.inline
+        def run_wg1_role(role: T.constexpr):
             rs_buf = PipelineState(NUM_BUFS, phase=0)
             rs_index = PipelineState(NUM_INDEX_BUFS, phase=0)
-            group_idx: T.let = idx_in_warpgroup // 8
-            idx_in_group: T.let = idx_in_warpgroup % 8
+            q_sw128_tmem = q_tmem.sub[:, :, 0:256]
+            q_sw128_tmem_cp = q_sw128_tmem.rearrange("b h (dc di) -> h dc b di", di=64)
+            k_full_tiled = k_full.rearrange("b r (dc h ci) -> b (h r) (dc ci)", dc=4, h=2, ci=64)
+            q_tail_tmem = q_tmem.sub[:, :, q_tail_start : q_tail_start + 32]
+            q_tail_tmem_cp = q_tail_tmem.rearrange("b h k -> h (b k)")
+            k_rope_tiled = k_rope.rearrange("b r (h ci) -> b (h r) ci", h=2, ci=32)
 
-            # kernel.cuh:751-758.  Keep both dequant-stage and raw-stage
-            # per-thread bases live across the scheduler loop.  The source
-            # selects one pointer from each pair once per block.
-            nope0_base_u64: T.let = T.reinterpret(
-                "uint64", k_full.ptr_to([0, group_idx, idx_in_group * 8])
-            )
-            nope1_base_u64: T.let = T.reinterpret(
-                "uint64", k_full.ptr_to([1, group_idx, idx_in_group * 8])
-            )
-            raw_nope0_base_u64: T.let = T.reinterpret(
-                "uint64", raw_nope.ptr_to([0, group_idx, idx_in_group])
-            )
-            raw_nope1_base_u64: T.let = T.reinterpret(
-                "uint64", raw_nope.ptr_to([1, group_idx, idx_in_group])
-            )
-
-            # kernel.cuh:77-118 expanded for WG2, preserving scheduler loads
-            # in this specialization to avoid cross-role register pressure.
+            # kernel.cuh:657-667.  These warp-7 invariants are deliberately
+            # materialized before the scheduler traversal.  Pointer bases are
+            # held as byte addresses so the per-token paths only add offsets.
+            if role == 7:
+                tma_coords_step_per_token: T.let = (656 if is_v32 else 576) // tma_k_stride
+                tma_coords_step_per_block: T.let = stride_kv_block // tma_k_stride
+                tma_coords_step_per_extra_block: T.let = stride_extra_kv_block // tma_k_stride
+                k_scales_ptr_u64: T.let = T.reinterpret(
+                    "uint64", kv.ptr_to([d_nope if is_v32 else page_block_size * (d_nope + 2 * 64)])
+                )
+                extra_k_scales_ptr_u64: T.uint64 = T.uint64(0)
+                if extra_kv_h is not None:
+                    extra_k_scales_ptr_u64 = T.reinterpret(
+                        "uint64",
+                        extra_kv.ptr_to(
+                            [d_nope if is_v32 else extra_page_block_size * (d_nope + 2 * 64)]
+                        ),
+                    )
+            # kernel.cuh:77-118, expanded once for all WG1 threads.  Non-elected
+            # lanes still execute the empty role and participate in the 384-way
+            # per-batch named barrier, matching the CUDA else branch at 744.
             sched_words = T.alloc_local((4,), "uint64")
             load_scheduler_meta(sched_words)
             sched_i32 = sched_words.view("int32")
@@ -2553,117 +1716,633 @@ def _make_sparse_decode_head64_kernel(model_type: ModelType):
                         "bool",
                     )
                     is_no_split: T.bool = not is_split
+                    num_orig_blocks: T.let = orig_topk_padded // B_TOPK
                     n_split_idx: T.let = T.if_then_else(
                         batch_idx == sched_begin_req,
                         T.cuda.ldg(num_splits.ptr_to([batch_idx]), "int32") + sched_begin_split,
                         T.cuda.ldg(num_splits.ptr_to([batch_idx]), "int32"),
                     )
-                    num_orig_blocks: T.let = orig_topk_padded // B_TOPK
                     is_last_batch: T.bool = batch_idx == sched_end_req
 
-                    # kernel.cuh:760-840.  Wait on Q, raw fp8 and the previous
-                    # SxV use, then convert each fp8x8 with the exact ue8m0
-                    # scale and weak shared b128 store from the source.
-                    bar_q_utccp.wait(0, batch_bar_phase)
-                    for block_idx in T.serial(start_block, end_block, unroll=False):
-                        bar_valid_ready.wait(rs_index.stage, rs_index.phase)
-                        bar_raw_ready.wait(rs_buf.stage, rs_buf.phase)
-                        bar_sv_done.wait(rs_buf.stage, rs_buf.phase ^ 1)
-                        cur_nope_base_u64: T.let = T.if_then_else(
-                            rs_buf.stage == 0, nope0_base_u64, nope1_base_u64
+                    if role == 4:
+                        # kernel.cuh:431-527.  Warp 4 issues both Q TMAs, then
+                        # the same SW128/SW64 UTCCP deposits at TMEM Q=256.
+                        T.cuda.trap_when_assert_failed(start_block < end_block)
+                        # SmemLayoutQ_SW128 is tile_to_shape of a 64x64
+                        # atom.  CuTe therefore partitions the 64x512 Q
+                        # copy into eight source-order TMA boxes instead of
+                        # issuing one monolithic 64 KiB transaction.
+                        for q_tile in T.unroll(512 // 64):
+                            Tx.copy_async(
+                                q_sw128[:, q_tile * 64 : (q_tile + 1) * 64],
+                                q_strided[batch_idx, s_q_idx, :, q_tile * 64 : (q_tile + 1) * 64],
+                                **tma_config(
+                                    dispatch="tma_explicit",
+                                    mbar=bar_q_tma.ptr_to([0]),
+                                    cta_group=1,
+                                    cache_hint="evict_first",
+                                    tensormap_l2_promotion="L2::128B",
+                                ),
+                            )
+                        if is_v32:
+                            Tx.copy_async(
+                                q_sw64.rearrange("h (a c) -> a h c", a=2, c=32)[:, :, :],
+                                q_tail_tma[batch_idx, s_q_idx, 16:18, :, :],
+                                **tma_config(
+                                    dispatch="tma_explicit",
+                                    mbar=bar_q_tma.ptr_to([0]),
+                                    cta_group=1,
+                                    cache_hint="evict_first",
+                                    tensormap_l2_promotion="L2::128B",
+                                ),
+                            )
+                        bar_q_tma.arrive(0, tx_count=B_H * d_qk * BF16_BYTES)
+                        bar_q_tma.wait(0, batch_bar_phase)
+                        T.ptx.tcgen05.fence.after_thread_sync()
+                        Tx.copy_async(
+                            q_sw128_tmem_cp[:, :, :, :],
+                            q_sw128.view(B_H, 4, 2, 64)[:, :, :, :],
+                            shape="128x256b",
+                            cta_group=1,
                         )
-                        cur_raw_nope_base_u64: T.let = T.if_then_else(
-                            rs_buf.stage == 0, raw_nope0_base_u64, raw_nope1_base_u64
-                        )
-                        cur_nope_base_uint_addr: T.let = T.cuda.cvta_generic_to_shared(
-                            T.reinterpret(PointerType(PrimType("bfloat16")), cur_nope_base_u64)
-                        )
-                        cur_raw_nope_base_uint_addr: T.let = T.cuda.cvta_generic_to_shared(
-                            T.reinterpret(PointerType(PrimType("uint64")), cur_raw_nope_base_u64)
-                        )
-                        for local_row in T.unroll(rows_per_group):
-                            row_idx: T.let = local_row * (128 // 8) + group_idx
-                            scales_bf16_bits = T.alloc_local((num_scales,), "uint16")
-                            if model_is_v32:
-                                packed_scales: T.let = scales_e8m0.view("uint32")[
-                                    rs_index.stage, row_idx
-                                ]
-                                for scale_pair_idx in T.unroll(2):
-                                    converted_pair: T.let = _e8m0x2_to_bf16x2(
-                                        T.cast(
-                                            T.shift_right(
-                                                packed_scales, T.cast(scale_pair_idx * 16, "uint32")
-                                            ),
-                                            "uint16",
-                                        )
-                                    )
-                                    scales_bf16_bits[scale_pair_idx * 2] = T.cast(
-                                        converted_pair, "uint16"
-                                    )
-                                    scales_bf16_bits[scale_pair_idx * 2 + 1] = T.cast(
-                                        T.shift_right(converted_pair, T.uint32(16)), "uint16"
-                                    )
+                        if is_v32:
+                            Tx.copy_async(q_tail_tmem_cp[:, :], q_sw64[:, :])
+                        bar_q_utccp.arrive(0)
+                        bar_q_utccp.wait(0, batch_bar_phase)
+                        T.ptx.tcgen05.fence.after_thread_sync()
+
+                        # kernel.cuh:529-584.  MODEL_TYPE only selects how the
+                        # shared K latent is interpreted; both instances issue
+                        # the same dual-head P and SxV pipelines.
+                        for block_idx in T.serial(start_block, end_block, unroll=False):
+                            if is_v32:
+                                bar_rope_ready.wait(rs_buf.stage, rs_buf.phase)
+                                T.ptx.tcgen05.fence.after_thread_sync()
+                                Tx.gemm_async(
+                                    p_tmem[:, :, :],
+                                    q_tail_tmem[:, :, :],
+                                    k_rope_tiled[rs_buf.stage, :, :],
+                                    **_mma_config(accum=T.uint32(0)),
+                                )
+                                bar_nope_ready.wait(rs_buf.stage, rs_buf.phase)
+                                T.ptx.tcgen05.fence.after_thread_sync()
+                                Tx.gemm_async(
+                                    p_tmem[:, :, :],
+                                    q_sw128_tmem[:, :, :],
+                                    k_full_tiled[rs_buf.stage, :, :],
+                                    **_mma_config(accum=T.uint32(1)),
+                                )
                             else:
-                                packed_scales: T.let = scales_e8m0.view("uint64")[
-                                    rs_index.stage, row_idx
-                                ]
-                                for scale_pair_idx in T.unroll(4):
-                                    converted_pair: T.let = _e8m0x2_to_bf16x2(
-                                        T.cast(
-                                            T.shift_right(
-                                                packed_scales, T.cast(scale_pair_idx * 16, "uint64")
+                                bar_rope_ready.wait(rs_buf.stage, rs_buf.phase)
+                                bar_nope_ready.wait(rs_buf.stage, rs_buf.phase)
+                                T.ptx.tcgen05.fence.after_thread_sync()
+                                Tx.gemm_async(
+                                    p_tmem[:, :, :],
+                                    q_sw128_tmem[:, :, :],
+                                    k_full_tiled[rs_buf.stage, :, :],
+                                    **_mma_config(accum=T.uint32(0)),
+                                )
+                            bar_qk_done.arrive(rs_buf.stage)
+
+                            bar_so_ready.wait(rs_buf.stage, rs_buf.phase)
+                            T.ptx.tcgen05.fence.after_thread_sync()
+                            mma_o_accum: T.let = T.if_then_else(
+                                block_idx == start_block, T.uint32(0), T.uint32(1)
+                            )
+                            Tx.gemm_async(
+                                o_tmem.sub[:, 0 : D_V // 2],
+                                s_smem_gemm[:, :],
+                                k_full[rs_buf.stage, :, 0 : D_V // 2],
+                                transB=True,
+                                **_mma_config(accum=mma_o_accum),
+                            )
+                            Tx.gemm_async(
+                                o_tmem.sub[:, D_V // 2 : D_V],
+                                s_smem_gemm[:, :],
+                                k_full[rs_buf.stage, :, D_V // 2 : D_V],
+                                transB=True,
+                                **_mma_config(accum=mma_o_accum),
+                            )
+                            bar_sv_done.arrive(rs_buf.stage)
+                            rs_buf.advance()
+                            rs_index.advance()
+
+                    elif role == 5:
+                        # kernel.cuh:586-615.  One gather4 producer loads raw
+                        # fp8 NoPE as int64, retaining the two-stage raw ring.
+                        bar_q_utccp.wait(0, batch_bar_phase)
+                        bar_last_store_done.wait(0, batch_bar_phase)
+                        for block_idx in T.serial(start_block, end_block, unroll=False):
+                            bar_valid_ready.wait(rs_index.stage, rs_index.phase)
+                            bar_raw_free.wait(rs_buf.stage, rs_buf.phase ^ 1)
+                            cur_indices = T.alloc_local((4,), "int32")
+                            next_indices = T.alloc_local((4,), "int32")
+                            Tx.copy(
+                                cur_indices[0:4],
+                                tma_coord[rs_index.stage, 0:4],
+                                dispatch="vec_128b",
+                            )
+                            for row4 in T.unroll(B_TOPK // 4):
+                                row: T.let = row4 * 4
+                                if row + 4 < B_TOPK:
+                                    Tx.copy(
+                                        next_indices[0:4],
+                                        tma_coord[rs_index.stage, row + 4 : row + 8],
+                                        dispatch="vec_128b",
+                                    )
+                                Tx.copy_async(
+                                    raw_nope.sub[rs_buf.stage, :, :][row : row + 4, :],
+                                    kv_nope_tma[0:1, :],
+                                    **_kv_gather_tma(
+                                        mbar=bar_raw_ready.ptr_to([rs_buf.stage]),
+                                        gather4=[cur_indices[j] for j in range(4)],
+                                        src_selector=(
+                                            [(block_idx >= num_orig_blocks, extra_kv_nope_tma)]
+                                            if extra_kv_h is not None
+                                            else None
+                                        ),
+                                    ),
+                                )
+                                cur_indices[0] = next_indices[0]
+                                cur_indices[1] = next_indices[1]
+                                cur_indices[2] = next_indices[2]
+                                cur_indices[3] = next_indices[3]
+                            bar_raw_ready.arrive(rs_buf.stage, tx_count=B_TOPK * d_nope)
+                            bar_valid_free.arrive(rs_index.stage)
+                            rs_buf.advance()
+                            rs_index.advance()
+
+                    elif role == 6:
+                        # kernel.cuh:616-652.  RoPE remains bf16 and uses the
+                        # model-specific SW64 (two 32-col gathers) or SW128
+                        # (one 64-col gather) destination.
+                        bar_q_utccp.wait(0, batch_bar_phase)
+                        bar_last_store_done.wait(0, batch_bar_phase)
+                        for block_idx in T.serial(start_block, end_block, unroll=False):
+                            bar_valid_ready.wait(rs_index.stage, rs_index.phase)
+                            if is_v32:
+                                bar_qk_done.wait(rs_buf.stage, rs_buf.phase ^ 1)
+                            else:
+                                bar_sv_done.wait(rs_buf.stage, rs_buf.phase ^ 1)
+                            cur_indices = T.alloc_local((4,), "int32")
+                            next_indices = T.alloc_local((4,), "int32")
+                            Tx.copy(
+                                cur_indices[0:4],
+                                tma_coord[rs_index.stage, 0:4],
+                                dispatch="vec_128b",
+                            )
+                            for row4 in T.unroll(B_TOPK // 4):
+                                row: T.let = row4 * 4
+                                if row + 4 < B_TOPK:
+                                    Tx.copy(
+                                        next_indices[0:4],
+                                        tma_coord[rs_index.stage, row + 4 : row + 8],
+                                        dispatch="vec_128b",
+                                    )
+                                for rope_part in T.unroll(64 // rope_tile):
+                                    Tx.copy_async(
+                                        k_rope_tma.sub[rs_buf.stage, :, :][
+                                            row : row + 4,
+                                            rope_part * rope_tile : (rope_part + 1) * rope_tile,
+                                        ],
+                                        kv_rope_tma[
+                                            0:1, rope_part * rope_tile : (rope_part + 1) * rope_tile
+                                        ],
+                                        **_kv_gather_tma(
+                                            mbar=bar_rope_ready.ptr_to([rs_buf.stage]),
+                                            gather4=[cur_indices[j] for j in range(4)],
+                                            src_selector=(
+                                                [(block_idx >= num_orig_blocks, extra_kv_rope_tma)]
+                                                if extra_kv_h is not None
+                                                else None
                                             ),
-                                            "uint16",
-                                        )
+                                        ),
                                     )
-                                    scales_bf16_bits[scale_pair_idx * 2] = T.cast(
-                                        converted_pair, "uint16"
+                                cur_indices[0] = next_indices[0]
+                                cur_indices[1] = next_indices[1]
+                                cur_indices[2] = next_indices[2]
+                                cur_indices[3] = next_indices[3]
+                            bar_rope_ready.arrive(rs_buf.stage, tx_count=B_TOPK * 64 * BF16_BYTES)
+                            bar_valid_free.arrive(rs_index.stage)
+                            rs_buf.advance()
+                            rs_index.advance()
+
+                    elif role == 7:
+                        # kernel.cuh:653-743.  All 32 lanes transform exactly
+                        # two indices, form TMA coordinates, load/convert the
+                        # model-specific scales, and construct each 8-bit mask.
+                        indices_base: T.let = (
+                            batch_idx * stride_indices_b + s_q_idx * stride_indices_s_q
+                        )
+                        extra_indices_base: T.let = (
+                            batch_idx * stride_extra_indices_b + s_q_idx * stride_extra_indices_s_q
+                        )
+
+                        @T.inline
+                        def process_index_block(cur_block, is_extra: T.constexpr):
+                            abs_pos: T.let = T.if_then_else(
+                                is_extra,
+                                (cur_block - num_orig_blocks) * B_TOPK + lane_idx * 2,
+                                cur_block * B_TOPK + lane_idx * 2,
+                            )
+                            cur_page_size: T.let = T.if_then_else(
+                                is_extra, extra_page_block_size, page_block_size
+                            )
+                            cur_block_stride: T.let = T.if_then_else(
+                                is_extra, stride_extra_kv_block, stride_kv_block
+                            )
+                            cur_row_stride: T.let = T.if_then_else(
+                                is_extra, stride_extra_kv_row, stride_kv_row
+                            )
+                            cur_length: T.let = T.if_then_else(is_extra, extra_topk_len, topk_len)
+                            cur_k_scales_ptr_u64: T.let = T.if_then_else(
+                                is_extra, extra_k_scales_ptr_u64, k_scales_ptr_u64
+                            )
+                            cur_tma_coords_step_per_block: T.let = T.if_then_else(
+                                is_extra, tma_coords_step_per_extra_block, tma_coords_step_per_block
+                            )
+
+                            pair_indices = T.alloc_local((2,), "int32")
+                            if is_extra:
+                                Tx.copy(
+                                    pair_indices[0:2],
+                                    extra_indices[
+                                        extra_indices_base + abs_pos : extra_indices_base
+                                        + abs_pos
+                                        + 2
+                                    ],
+                                    dispatch="vec_64b",
+                                    cache="nc",
+                                )
+                            else:
+                                Tx.copy(
+                                    pair_indices[0:2],
+                                    indices[indices_base + abs_pos : indices_base + abs_pos + 2],
+                                    dispatch="vec_64b",
+                                    cache="nc",
+                                )
+                            bar_valid_free.wait(rs_index.stage, rs_index.phase ^ 1)
+                            coords = T.alloc_local((2,), "int32")
+                            cache_blocks = T.alloc_local((2,), "uint32")
+                            indices_in_block = T.alloc_local((2,), "uint32")
+                            scale_words = T.alloc_local((2,), "uint64")
+                            pair_token_valid = T.alloc_local((2,), "bool")
+                            scale_f32 = T.alloc_local((2, 4), "float32")
+                            scale_byte_offsets = T.alloc_local((2,), "uint64")
+                            valid_mask: T.int8 = T.int8(0)
+                            for pair_i in T.unroll(2):
+                                index_u32: T.let = T.cast(pair_indices[pair_i], "uint32")
+                                cache_blocks[pair_i] = index_u32 // T.cast(cur_page_size, "uint32")
+                                indices_in_block[pair_i] = index_u32 % T.cast(
+                                    cur_page_size, "uint32"
+                                )
+                                token_valid: T.let = T.And(
+                                    pair_indices[pair_i] != -1, abs_pos + pair_i < cur_length
+                                )
+                                pair_token_valid[pair_i] = token_valid
+                                valid_mask = T.cast(
+                                    T.bitwise_or(
+                                        T.cast(valid_mask, "int32"),
+                                        T.shift_left(
+                                            T.cast(token_valid, "int32"), T.cast(pair_i, "int32")
+                                        ),
+                                    ),
+                                    "int8",
+                                )
+                                coords[pair_i] = T.if_then_else(
+                                    pair_token_valid[pair_i],
+                                    T.cast(cache_blocks[pair_i], "int32")
+                                    * cur_tma_coords_step_per_block
+                                    + T.cast(indices_in_block[pair_i], "int32")
+                                    * tma_coords_step_per_token,
+                                    -1,
+                                )
+                                if is_v32:
+                                    # k_scales_ptr is kv+D_NOPE even for an
+                                    # invalid token; invalid entries therefore
+                                    # load token-0's scale float4 and are zeroed
+                                    # only after conversion, exactly as CUDA.
+                                    scale_byte_offsets[pair_i] = T.if_then_else(
+                                        pair_token_valid[pair_i],
+                                        T.cast(cache_blocks[pair_i], "uint64")
+                                        * T.cast(cur_block_stride, "int64")
+                                        + T.cast(indices_in_block[pair_i], "uint64")
+                                        * T.cast(cur_row_stride, "int64"),
+                                        T.uint64(0),
                                     )
-                                    scales_bf16_bits[scale_pair_idx * 2 + 1] = T.cast(
-                                        T.shift_right(converted_pair, T.uint32(16)), "uint16"
+                                    # The CUDA loop is source-unrolled.  Issue
+                                    # both token float4 loads before consuming
+                                    # either value in F2FP.E8 so the random
+                                    # scale reads overlap in flight.
+                                    T.cuda.ldg(
+                                        T.reinterpret(
+                                            PointerType(PrimType("float32")),
+                                            cur_k_scales_ptr_u64 + scale_byte_offsets[pair_i],
+                                        ),
+                                        "float32",
+                                        dst=(
+                                            scale_f32.ptr_to([pair_i, 0]),
+                                            scale_f32.ptr_to([pair_i, 1]),
+                                            scale_f32.ptr_to([pair_i, 2]),
+                                            scale_f32.ptr_to([pair_i, 3]),
+                                        ),
+                                        vec="v4",
+                                    )
+                                else:
+                                    scale_byte_offsets[pair_i] = (
+                                        T.cast(cache_blocks[pair_i], "uint64")
+                                        * T.cast(cur_block_stride, "int64")
+                                        + T.cast(indices_in_block[pair_i], "uint64") * 8
+                                    )
+                                    scale_words[pair_i] = T.if_then_else(
+                                        pair_token_valid[pair_i],
+                                        T.cuda.ldg(
+                                            T.reinterpret(
+                                                PointerType(PrimType("uint64")),
+                                                cur_k_scales_ptr_u64 + scale_byte_offsets[pair_i],
+                                            ),
+                                            "uint64",
+                                        ),
+                                        T.uint64(0),
                                     )
 
-                            cur_raw_fp8x8: T.uint64 = _ld_shared_u64(
-                                cur_raw_nope_base_uint_addr
-                                + T.cast(local_row * (128 // 8) * d_nope, "uint32")
-                            )
-                            for local_col in T.unroll(cols_per_group):
-                                raw_fp8x8: T.let = cur_raw_fp8x8
-                                if local_col + 1 < cols_per_group:
-                                    cur_raw_fp8x8 = _ld_shared_u64(
-                                        cur_raw_nope_base_uint_addr
-                                        + T.cast(
-                                            local_row * (128 // 8) * d_nope
-                                            + (local_col + 1) * (8 * 8),
-                                            "uint32",
-                                        )
+                            if is_v32:
+                                for pair_i in T.unroll(2):
+                                    packed_scale: T.let = _f32x4_to_e8m0x4(
+                                        scale_f32[pair_i, 0],
+                                        scale_f32[pair_i, 1],
+                                        scale_f32[pair_i, 2],
+                                        scale_f32[pair_i, 3],
                                     )
-                                scale_idx: T.let = (
-                                    local_col // (cols_per_group // 4)
-                                    if model_is_v32
-                                    else local_col
-                                )
-                                _dequant_st128(
-                                    cur_nope_base_uint_addr
-                                    + T.cast(
-                                        BF16_BYTES
-                                        * (local_row * (128 // 8) * 64 + local_col * B_TOPK * 64),
-                                        "uint32",
+                                    scale_words[pair_i] = T.if_then_else(
+                                        pair_token_valid[pair_i],
+                                        T.cast(packed_scale, "uint64"),
+                                        T.uint64(0),
+                                    )
+
+                            valid_mask = T.cast(
+                                T.shift_left(
+                                    T.cast(valid_mask, "int32"), T.cast((lane_idx % 4) * 2, "int32")
+                                ),
+                                "int8",
+                            )
+                            valid_mask = T.cast(
+                                T.bitwise_or(
+                                    T.cast(valid_mask, "int32"),
+                                    T.cuda.__shfl_xor_sync(
+                                        T.uint32(0xFFFFFFFF), T.cast(valid_mask, "int32"), 1, 32
                                     ),
-                                    raw_fp8x8,
-                                    scales_bf16_bits[scale_idx],
+                                ),
+                                "int8",
+                            )
+                            valid_mask = T.cast(
+                                T.bitwise_or(
+                                    T.cast(valid_mask, "int32"),
+                                    T.cuda.__shfl_xor_sync(
+                                        T.uint32(0xFFFFFFFF), T.cast(valid_mask, "int32"), 2, 32
+                                    ),
+                                ),
+                                "int8",
+                            )
+                            if is_v32:
+                                scales_e8m0.view("uint64")[rs_index.stage, lane_idx] = T.bitwise_or(
+                                    scale_words[0], T.shift_left(scale_words[1], T.uint64(32))
                                 )
-                        T.ptx.fence.proxy_async("shared::cta")
-                        bar_nope_ready.arrive(rs_buf.stage)
-                        bar_raw_free.arrive(rs_buf.stage)
-                        bar_valid_free.arrive(rs_index.stage)
-                        rs_buf.advance()
-                        rs_index.advance()
+                            else:
+                                Tx.copy(
+                                    scales_e8m0.view("uint64")[
+                                        rs_index.stage, lane_idx * 2 : lane_idx * 2 + 2
+                                    ],
+                                    scale_words[0:2],
+                                    dispatch="vec_128b",
+                                )
+                            Tx.copy(
+                                tma_coord[rs_index.stage, lane_idx * 2 : lane_idx * 2 + 2],
+                                coords[0:2],
+                                dispatch="vec_64b",
+                            )
+                            if lane_idx % 4 == 0:
+                                is_token_valid[rs_index.stage, lane_idx // 4] = valid_mask
+                            bar_valid_ready.arrive(rs_index.stage)
+                            rs_buf.advance()
+                            rs_index.advance()
+
+                        for block_idx in T.serial(
+                            start_block, T.min(num_orig_blocks, end_block), unroll=False
+                        ):
+                            process_index_block(block_idx, False)
+                        if extra_kv_h is not None and extra_indices_h is not None:
+                            for block_idx in T.serial(
+                                T.max(start_block, num_orig_blocks), end_block, unroll=False
+                            ):
+                                process_index_block(block_idx, True)
 
                     T.ptx.barrier.sync(BAR_EVERYONE_SYNC, NUM_THREADS)
                     batch_bar_phase = batch_bar_phase ^ 1
 
-    return _kernel
+        # kernel.cuh:431/586/616/653/744.  Election is evaluated only in
+        # the matching warp.  Record the selected source branch first so
+        # every non-elected lane reaches the one shared final ``else``
+        # scheduler, rather than cloning that empty scheduler once for
+        # each producer warp.
+        selected_wg1_role: T.int32 = -1
+        if wg1_warp_idx == 4:
+            if T.ptx.elect_sync() != T.uint32(0):
+                selected_wg1_role = 4
+        elif wg1_warp_idx == 5:
+            if T.ptx.elect_sync() != T.uint32(0):
+                selected_wg1_role = 5
+        elif wg1_warp_idx == 6:
+            if T.ptx.elect_sync() != T.uint32(0):
+                selected_wg1_role = 6
+        elif wg1_warp_idx == 7:
+            selected_wg1_role = 7
+
+        if selected_wg1_role == 4:
+            run_wg1_role(4)
+        elif selected_wg1_role == 5:
+            run_wg1_role(5)
+        elif selected_wg1_role == 6:
+            run_wg1_role(6)
+        elif selected_wg1_role == 7:
+            run_wg1_role(7)
+        else:
+            run_wg1_role(-1)
+    else:
+        # kernel.cuh:747-759.  The dequant warpgroup keeps 208 registers
+        # and assigns exactly eight threads per token group.
+        T.ptx.setmaxnreg(True, 208)
+        rs_buf = PipelineState(NUM_BUFS, phase=0)
+        rs_index = PipelineState(NUM_INDEX_BUFS, phase=0)
+        group_idx: T.let = idx_in_warpgroup // 8
+        idx_in_group: T.let = idx_in_warpgroup % 8
+
+        # kernel.cuh:751-758.  Keep both dequant-stage and raw-stage
+        # per-thread bases live across the scheduler loop.  The source
+        # selects one pointer from each pair once per block.
+        nope0_base_u64: T.let = T.reinterpret(
+            "uint64", k_full.ptr_to([0, group_idx, idx_in_group * 8])
+        )
+        nope1_base_u64: T.let = T.reinterpret(
+            "uint64", k_full.ptr_to([1, group_idx, idx_in_group * 8])
+        )
+        raw_nope0_base_u64: T.let = T.reinterpret(
+            "uint64", raw_nope.ptr_to([0, group_idx, idx_in_group])
+        )
+        raw_nope1_base_u64: T.let = T.reinterpret(
+            "uint64", raw_nope.ptr_to([1, group_idx, idx_in_group])
+        )
+
+        # kernel.cuh:77-118 expanded for WG2, preserving scheduler loads
+        # in this specialization to avoid cross-role register pressure.
+        sched_words = T.alloc_local((4,), "uint64")
+        load_scheduler_meta(sched_words)
+        sched_i32 = sched_words.view("int32")
+        sched_begin_req: T.let = sched_i32[0]
+        sched_end_req: T.let = sched_i32[1]
+        sched_begin_block: T.let = sched_i32[2]
+        sched_end_block: T.let = sched_i32[3]
+        sched_begin_split: T.let = sched_i32[4]
+        sched_first_split: T.let = sched_i32[5]
+        sched_last_split: T.let = sched_i32[6]
+        batch_bar_phase: T.int32 = 0
+
+        # The CUDA return exits only this role's run_main_loop lambda.
+        if sched_begin_req < b:
+            for batch_idx in T.serial(sched_begin_req, sched_end_req + 1, unroll=False):
+                topk_len: T.int32 = topk
+                if topk_length_h is not None:
+                    topk_len = T.cuda.ldg(topk_length.ptr_to([batch_idx]), "int32")
+                orig_topk_padded: T.let = T.max(
+                    ((topk_len + B_TOPK - 1) // B_TOPK) * B_TOPK, B_TOPK
+                )
+                extra_topk_len: T.int32 = extra_topk
+                if extra_topk_length_h is not None:
+                    extra_topk_len = T.cuda.ldg(extra_topk_length.ptr_to([batch_idx]), "int32")
+                total_topk_padded: T.let = (
+                    orig_topk_padded + ((extra_topk_len + B_TOPK - 1) // B_TOPK) * B_TOPK
+                )
+                start_block: T.let = T.if_then_else(
+                    batch_idx == sched_begin_req, sched_begin_block, 0
+                )
+                end_block: T.let = T.if_then_else(
+                    batch_idx == sched_end_req, sched_end_block, total_topk_padded // B_TOPK
+                )
+                is_split: T.bool = T.cast(
+                    T.if_then_else(
+                        batch_idx == sched_begin_req,
+                        sched_first_split,
+                        T.if_then_else(batch_idx == sched_end_req, sched_last_split, 0),
+                    ),
+                    "bool",
+                )
+                is_no_split: T.bool = not is_split
+                n_split_idx: T.let = T.if_then_else(
+                    batch_idx == sched_begin_req,
+                    T.cuda.ldg(num_splits.ptr_to([batch_idx]), "int32") + sched_begin_split,
+                    T.cuda.ldg(num_splits.ptr_to([batch_idx]), "int32"),
+                )
+                num_orig_blocks: T.let = orig_topk_padded // B_TOPK
+                is_last_batch: T.bool = batch_idx == sched_end_req
+
+                # kernel.cuh:760-840.  Wait on Q, raw fp8 and the previous
+                # SxV use, then convert each fp8x8 with the exact ue8m0
+                # scale and weak shared b128 store from the source.
+                bar_q_utccp.wait(0, batch_bar_phase)
+                for block_idx in T.serial(start_block, end_block, unroll=False):
+                    bar_valid_ready.wait(rs_index.stage, rs_index.phase)
+                    bar_raw_ready.wait(rs_buf.stage, rs_buf.phase)
+                    bar_sv_done.wait(rs_buf.stage, rs_buf.phase ^ 1)
+                    cur_nope_base_u64: T.let = T.if_then_else(
+                        rs_buf.stage == 0, nope0_base_u64, nope1_base_u64
+                    )
+                    cur_raw_nope_base_u64: T.let = T.if_then_else(
+                        rs_buf.stage == 0, raw_nope0_base_u64, raw_nope1_base_u64
+                    )
+                    cur_nope_base_uint_addr: T.let = T.cuda.cvta_generic_to_shared(
+                        T.reinterpret(PointerType(PrimType("bfloat16")), cur_nope_base_u64)
+                    )
+                    cur_raw_nope_base_uint_addr: T.let = T.cuda.cvta_generic_to_shared(
+                        T.reinterpret(PointerType(PrimType("uint64")), cur_raw_nope_base_u64)
+                    )
+                    for local_row in T.unroll(rows_per_group):
+                        row_idx: T.let = local_row * (128 // 8) + group_idx
+                        scales_bf16_bits = T.alloc_local((num_scales,), "uint16")
+                        if is_v32:
+                            packed_scales: T.let = scales_e8m0.view("uint32")[
+                                rs_index.stage, row_idx
+                            ]
+                            for scale_pair_idx in T.unroll(2):
+                                converted_pair: T.let = _e8m0x2_to_bf16x2(
+                                    T.cast(
+                                        T.shift_right(
+                                            packed_scales, T.cast(scale_pair_idx * 16, "uint32")
+                                        ),
+                                        "uint16",
+                                    )
+                                )
+                                scales_bf16_bits[scale_pair_idx * 2] = T.cast(
+                                    converted_pair, "uint16"
+                                )
+                                scales_bf16_bits[scale_pair_idx * 2 + 1] = T.cast(
+                                    T.shift_right(converted_pair, T.uint32(16)), "uint16"
+                                )
+                        else:
+                            packed_scales: T.let = scales_e8m0.view("uint64")[
+                                rs_index.stage, row_idx
+                            ]
+                            for scale_pair_idx in T.unroll(4):
+                                converted_pair: T.let = _e8m0x2_to_bf16x2(
+                                    T.cast(
+                                        T.shift_right(
+                                            packed_scales, T.cast(scale_pair_idx * 16, "uint64")
+                                        ),
+                                        "uint16",
+                                    )
+                                )
+                                scales_bf16_bits[scale_pair_idx * 2] = T.cast(
+                                    converted_pair, "uint16"
+                                )
+                                scales_bf16_bits[scale_pair_idx * 2 + 1] = T.cast(
+                                    T.shift_right(converted_pair, T.uint32(16)), "uint16"
+                                )
+
+                        cur_raw_fp8x8: T.uint64 = _ld_shared_u64(
+                            cur_raw_nope_base_uint_addr
+                            + T.cast(local_row * (128 // 8) * d_nope, "uint32")
+                        )
+                        for local_col in T.unroll(cols_per_group):
+                            raw_fp8x8: T.let = cur_raw_fp8x8
+                            if local_col + 1 < cols_per_group:
+                                cur_raw_fp8x8 = _ld_shared_u64(
+                                    cur_raw_nope_base_uint_addr
+                                    + T.cast(
+                                        local_row * (128 // 8) * d_nope + (local_col + 1) * (8 * 8),
+                                        "uint32",
+                                    )
+                                )
+                            scale_idx: T.let = (
+                                local_col // (cols_per_group // 4) if is_v32 else local_col
+                            )
+                            _dequant_st128(
+                                cur_nope_base_uint_addr
+                                + T.cast(
+                                    BF16_BYTES
+                                    * (local_row * (128 // 8) * 64 + local_col * B_TOPK * 64),
+                                    "uint32",
+                                ),
+                                raw_fp8x8,
+                                scales_bf16_bits[scale_idx],
+                            )
+                    T.ptx.fence.proxy_async("shared::cta")
+                    bar_nope_ready.arrive(rs_buf.stage)
+                    bar_raw_free.arrive(rs_buf.stage)
+                    bar_valid_free.arrive(rs_index.stage)
+                    rs_buf.advance()
+                    rs_index.advance()
+
+                T.ptx.barrier.sync(BAR_EVERYONE_SYNC, NUM_THREADS)
+                batch_bar_phase = batch_bar_phase ^ 1
 
 
 @T.jit
@@ -2937,10 +2616,8 @@ def _absent_specialization_kwargs(
 @lru_cache(maxsize=64)
 def _specialized_main_kernel(model_type: ModelType, presence: MainPresenceMask):
     specialization = _absent_specialization_kwargs(MAIN_OPTIONAL_BUFFER_PARAMS, presence)
-    return (
-        _make_sparse_decode_head64_kernel(model_type)
-        .specialize(**specialization)
-        .with_attr("tirx.kernel_launch_params", list(LAUNCH_TAGS))
+    return _kernel.specialize(model_type=model_type, **specialization).with_attr(
+        "tirx.kernel_launch_params", list(LAUNCH_TAGS)
     )
 
 
@@ -3420,7 +3097,6 @@ def run_bench(
 
 
 __all__ = [
-    "BENCH_CONFIGS",
     "CONFIGS",
     "KERNEL_META",
     "ModelType",
