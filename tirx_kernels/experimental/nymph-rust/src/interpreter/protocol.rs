@@ -4,6 +4,7 @@ use super::diagnostics::{Diagnostic, IResult};
 use super::mbar_ops::MbarTarget;
 use crate::ir::FenceScope;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExecutionMode {
@@ -290,6 +291,16 @@ pub struct Region {
     pub owner: PoolId,
     pub boxes: RegionBoxes,
     pub tensor_id: u32,
+    /// Per-LANE attribution of the footprint, PRE-coalescing across threads:
+    /// `(lane_id, that lane's byte box)` — a lane may contribute several boxes
+    /// (one per contiguous run of its slice). Filled only for lane-divergent
+    /// cohort accesses to shared-race-target pools (SMEM/TMEM) and for
+    /// single-thread cohorts (attributed to the single lane). `None` means
+    /// "uniform": every executing lane touches the whole region. The checker
+    /// uses this for the intra-warp cross-lane race rule; the union `boxes`
+    /// stays the authority for every other overlap walk. Behind an `Arc` so
+    /// frontier records clone regions without re-allocating the attribution.
+    pub lane_boxes: Option<Arc<Vec<(u8, BoxN)>>>,
 }
 
 impl Region {
@@ -307,6 +318,7 @@ impl Region {
             owner,
             boxes: RegionBoxes::Boxes(boxes),
             tensor_id,
+            lane_boxes: None,
         }
     }
 
@@ -315,6 +327,7 @@ impl Region {
             owner,
             boxes,
             tensor_id,
+            lane_boxes: None,
         }
     }
 

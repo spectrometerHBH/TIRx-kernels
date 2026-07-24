@@ -40,7 +40,9 @@ This pass does not prove prior-write completeness, read-from identity, or write
 consumption. A read without a prior write is not an error by itself. A write that
 is never read is not an error by itself.
 
-The single race diagnostic code is `memory_data_race`.
+The pass reports two race codes: `memory_data_race` for an unordered pair
+across streams, and `intra_warp_cross_lane_race` for an unordered pair
+between two lanes of one warp.
 
 ## Access Model
 
@@ -71,14 +73,16 @@ MemoryRaceFrontier {
 Events are processed in canonical trace order, but cross-stream trace order is
 not an ordering proof.
 
-- `Read`: query overlapping entries in the write frontier. If any overlapping
-  write is unordered both ways, report `memory_data_race`. Then prune older
-  read-frontier entries that are covered by this read and ordered before it, and
-  append the read to the read frontier.
+- `Read`: query overlapping entries in the write frontier. An overlapping write
+  on another stream that is unordered both ways is a `memory_data_race`; one on
+  the same stream that lacks an intra-warp ordering fact (see Ordering Inputs)
+  is an `intra_warp_cross_lane_race`. Then prune older read-frontier entries
+  that are covered by this read and ordered before it, and append the read to
+  the read frontier.
 - `Write`: query overlapping entries in both the write frontier and the read
-  frontier. If any overlapping access is unordered both ways, report
-  `memory_data_race`. Then prune older frontier entries that are fully covered
-  by the new write and ordered before it. Finally append the new write.
+  frontier, applying the same two rules. Then prune older frontier entries that
+  are fully covered by the new write and ordered before it. Finally append the
+  new write.
 
 Reads never split existing writes or define global spatial partitions. A large write followed
 by a partial read performs an overlap/HB query against the large write; it does

@@ -40,6 +40,7 @@ Region {
     owner: PoolId,
     boxes: Vec<BoxN>,
     tensor_id: u32,
+    lane_boxes: Option<Vec<(u8, BoxN)>>,
 }
 
 BoxN {
@@ -55,6 +56,14 @@ PoolId =
 
 `tensor_id` is diagnostic metadata. Alias identity is `owner + boxes`; two
 regions alias only when their `PoolId` values match and their boxes overlap.
+
+`lane_boxes` attributes the footprint to the warp lanes that touched it, before
+`boxes` merges them: one `(lane, box)` entry per contiguous run of each lane's
+slice. It is carried for lane-divergent SMEM/TMEM accesses (offsets that vary
+with `lane_id` / `tid_in_wg` / a per-thread scalar) and for single-lane
+cohorts. `None` means the access is uniform: every executing lane touches the
+whole region. `memory_race_check` reads it to tell a lane's dependency on
+itself from a dependency across lanes.
 
 Region validation rules:
 
@@ -163,6 +172,7 @@ Typical memory event shape:
         "tensor_id": 7,
         "owner": {"kind": "smem", "cta_id": 0},
         "boxes": [{"ranges": [(0, 8192)]}],
+        "lane_boxes": None,
     },
     "scope": {
         "stream_id": 0,

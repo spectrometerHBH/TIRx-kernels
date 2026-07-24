@@ -57,6 +57,11 @@ Region {
     owner: PoolId,
     boxes: Vec<BoxN>,
     tensor_id: u32,
+    // Per-lane attribution of `boxes`, before they are merged across the
+    // warp's lanes. Carried for lane-divergent SMEM/TMEM accesses and for
+    // single-lane cohorts; `None` means every executing lane touches the
+    // whole region.
+    lane_boxes: Option<Vec<(u8, BoxN)>>,
 }
 
 BoxN {
@@ -205,6 +210,17 @@ A.mode == Write || B.mode == Write
 !happens_before(B.event_idx, A.event_idx)
 ```
 
+A conflicting pair on ONE stream is a race between two lanes of that warp
+unless an intra-warp ordering fact covers it:
+
+```text
+A.stmt_kind is warp-collective || B.stmt_kind is warp-collective
+|| A.proxy == async || B.proxy == async
+|| a cooperative-barrier passage or warp-collective event of that stream
+   lies strictly between A and B
+|| every overlapping (A.lane_boxes, B.lane_boxes) pair shares one lane
+```
+
 The pass keeps per-owner read and write frontiers. Reads query only the write
 frontier, may prune older covered reads ordered before the current read, and
 then join the read frontier. Writes query both frontiers, then join the write
@@ -214,7 +230,8 @@ writes or drive global spatial partitioning.
 
 The pass does not prove prior-write completeness, read-from identity, or write
 consumption. A read without a prior write is not an error by itself, and an
-unread write is not an error by itself. Failures use `memory_data_race`.
+unread write is not an error by itself. Failures use `memory_data_race`
+across streams and `intra_warp_cross_lane_race` between lanes of one warp.
 
 ## 8. Pass Notes
 

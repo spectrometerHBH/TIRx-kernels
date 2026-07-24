@@ -711,6 +711,21 @@ fn region_to_py<'py>(py: Python<'py>, region: &Region) -> PyResult<Bound<'py, Py
         boxes.append(boxn_to_py(py, b)?)?;
     }
     out.set_item("boxes", boxes)?;
+    // Per-lane attribution, present only for lane-divergent SMEM/TMEM accesses
+    // (`None` = uniform: every executing lane touches the whole region).
+    match &region.lane_boxes {
+        Some(lane_boxes) => {
+            let lanes = PyList::empty(py);
+            for (lane, b) in lane_boxes.iter() {
+                let entry = PyDict::new(py);
+                entry.set_item("lane", *lane)?;
+                entry.set_item("box", boxn_to_py(py, b)?)?;
+                lanes.append(entry)?;
+            }
+            out.set_item("lane_boxes", lanes)?;
+        }
+        None => out.set_item("lane_boxes", py.None())?,
+    }
     Ok(out)
 }
 

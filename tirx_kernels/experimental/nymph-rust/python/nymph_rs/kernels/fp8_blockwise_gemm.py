@@ -530,6 +530,10 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
                     k.store_scalar(TensorSlice(tensor=sfa_smem, offsets=(s, i), shape=(1, 1)), 0)
                 for i in range(dg_block_n, blk_sfb):
                     k.store_scalar(TensorSlice(tensor=sfb_smem, offsets=(s, i), shape=(1, 1)), 0)
+        # The padding bytes the elected lane wrote are read below by whichever
+        # lane owns that column chunk: on sm_70+ lanes reconverge at an
+        # explicit sync, so the cross-lane handoff needs this one.
+        k.warp_sync()
         with k.for_each_task(task_scheduler) as task:
             local_iter = (task.task_id - task_start) // task_step
             for t in range(k_tiles):

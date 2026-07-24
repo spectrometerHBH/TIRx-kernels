@@ -27,6 +27,8 @@ use std::collections::HashMap;
 pub struct CohortContext<'a, 'k> {
     pub kernel: &'k Kernel,
     pub stream: &'a mut ExecutionStream<'k>,
+    /// The executing lane mask: the active lanes of ONE warp (<= 32), all
+    /// sharing the stream's `(cta_id, warp_id)`.
     pub cohort: ThreadMask,
     pub state: &'a mut InterpreterState,
     pub ids: &'a IdSpace,
@@ -143,12 +145,27 @@ impl<'a, 'k> CohortContext<'a, 'k> {
             );
         }
         let offsets = resolved_offset_rows(resolved);
-        region::tensor_region_from_offsets(
+        let mut region = region::tensor_region_from_offsets(
             &resolved.tensor,
             self.stream.cta_id,
             &offsets,
             &resolved.shape,
-        )
+        )?;
+        // Lane attribution for shared-race-target pools: the checker's
+        // intra-warp cross-lane rule needs to know WHICH lane touched which
+        // bytes when the cohort addresses divergently (offsets referencing
+        // lane_id / tid_in_wg / per-thread scalars). Uniform multi-lane
+        // cohorts stay `None` (every executing lane touches the whole
+        // region); single-thread cohorts attribute the single lane.
+        if matches!(resolved.tensor.space, MemorySpace::Smem | MemorySpace::Tmem)
+            && offsets.len() == self.cohort.len()
+        {
+            let lanes: Vec<u8> = self.cohort.iter().map(|t| t.lane_id as u8).collect();
+            region.lane_boxes =
+                region::lane_attributed_boxes(&resolved.tensor, &offsets, &resolved.shape, &lanes)
+                    .map(std::sync::Arc::new);
+        }
+        Ok(region)
     }
     pub fn tensor_region_with_offsets(
         &mut self,

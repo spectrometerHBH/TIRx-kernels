@@ -144,6 +144,12 @@ struct CheckerCx<'a> {
     event_index: EventIndex<'a>,
     region_audit: TraceRegionAudit,
     ordering: OrderingAnalysis,
+    /// Per-stream sorted event indices that create intra-warp CROSS-LANE
+    /// execution order: cooperative Sync passages (warp/wg/named/cta/cluster)
+    /// and warp-collective statements. Used by the same-stream pair rule in
+    /// the memory race walk — `same_stream_cross_lane_ordered` holds the
+    /// full contract.
+    cross_lane_order_points: HashMap<usize, Vec<usize>>,
     gaps: Vec<TraceGap>,
     diagnostics: Vec<Diagnostic>,
     warnings: Vec<super::protocol::ProtocolWarning>,
@@ -155,6 +161,7 @@ impl<'a> CheckerCx<'a> {
             event_index: EventIndex::new(events),
             region_audit: TraceRegionAudit::new(kernel),
             ordering: OrderingAnalysis::empty(),
+            cross_lane_order_points: cross_lane_order_points(events),
             gaps: Vec::new(),
             diagnostics: Vec::new(),
             warnings: Vec::new(),
@@ -252,29 +259,44 @@ struct MemoryAccessRecord {
     region: Region,
     // cached bounding spans: frontier scans reject on these in O(1)
     bounds: ((usize, usize), (usize, usize)),
+    /// stmt_kind is a warp-collective instruction (all lanes converge on it).
+    collective: bool,
+    /// Access is performed by an async engine (`MemoryProxy::Async`), not by
+    /// the lanes themselves — TMA loads/stores, s2cluster, tcgen05 mma/cp/ld/st.
+    async_proxy: bool,
 }
 
 impl MemoryAccessRecord {
     fn from_shared_event(event_idx: usize, event: &TraceEvent) -> Option<Self> {
         match &event.payload {
-            TraceEventKind::Read { region, scope, .. } if is_shared_race_target(&region.owner) => {
-                Some(Self {
-                    event_idx,
-                    stream_id: scope.stream_id,
-                    mode: MemoryAccessMode::Read,
-                    bounds: super::region::region_bounding_spans(region),
-                    region: region.clone(),
-                })
-            }
-            TraceEventKind::Write { region, scope, .. } if is_shared_race_target(&region.owner) => {
-                Some(Self {
-                    event_idx,
-                    stream_id: scope.stream_id,
-                    mode: MemoryAccessMode::Write,
-                    bounds: super::region::region_bounding_spans(region),
-                    region: region.clone(),
-                })
-            }
+            TraceEventKind::Read {
+                region,
+                scope,
+                proxy,
+                ..
+            } if is_shared_race_target(&region.owner) => Some(Self {
+                event_idx,
+                stream_id: scope.stream_id,
+                mode: MemoryAccessMode::Read,
+                bounds: super::region::region_bounding_spans(region),
+                region: region.clone(),
+                collective: is_warp_collective_stmt(&event.stmt_kind),
+                async_proxy: *proxy == MemoryProxy::Async,
+            }),
+            TraceEventKind::Write {
+                region,
+                scope,
+                proxy,
+                ..
+            } if is_shared_race_target(&region.owner) => Some(Self {
+                event_idx,
+                stream_id: scope.stream_id,
+                mode: MemoryAccessMode::Write,
+                bounds: super::region::region_bounding_spans(region),
+                region: region.clone(),
+                collective: is_warp_collective_stmt(&event.stmt_kind),
+                async_proxy: *proxy == MemoryProxy::Async,
+            }),
             _ => None,
         }
     }
@@ -1453,6 +1475,127 @@ fn is_shared_race_target(owner: &PoolId) -> bool {
     matches!(owner, PoolId::Smem { .. } | PoolId::Tmem { .. })
 }
 
+/// Warp-collective statements: every active lane converges on the
+/// instruction, so everything any lane executed before it completes before
+/// it, and everything after starts after it — a full intra-warp cross-lane
+/// ordering point. The set holds exactly the instructions with that property.
+/// `tcgen05.wait::ld/st` drains the EXECUTING thread's own ld/st (PTX defines
+/// it per-thread), which orders nothing across lanes, so it is not a member.
+fn is_warp_collective_stmt(stmt_kind: &str) -> bool {
+    matches!(
+        stmt_kind,
+        "LdMatrix" | "StMatrix" | "Tcgen05Ld" | "Tcgen05St" | "WarpMma"
+    )
+}
+
+/// Per-stream sorted event indices that order LANES of the stream's warp
+/// against each other: cooperative Sync PASSAGE events (every sync kind —
+/// warp/warpgroup/named/cta/cluster all imply the warp converged) and
+/// warp-collective statements. An intra-warp mbarrier arrive->wait chain is
+/// not an ordering point: a lane-side arrive publishes only the arriving
+/// lane's program order, and crediting the per-lane acquire exactly needs
+/// lane-granular clocks, so such a chain leaves the pair unordered here
+/// (conservative — the pair is reported rather than silently allowed).
+fn cross_lane_order_points(events: &[TraceEvent]) -> HashMap<usize, Vec<usize>> {
+    let mut points: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (idx, event) in events.iter().enumerate() {
+        let is_point = matches!(event.payload, TraceEventKind::Sync { .. })
+            || is_warp_collective_stmt(&event.stmt_kind);
+        if !is_point {
+            continue;
+        }
+        let Some(scope) = event_scope(&event.payload) else {
+            continue;
+        };
+        // Scanned in trace order, so each stream's vec is already sorted.
+        points.entry(scope.stream_id).or_default().push(idx);
+    }
+    points
+}
+
+/// Any cross-lane ordering point of `stream_id` strictly between the two
+/// event indices?
+fn has_order_point_between(cx: &CheckerCx<'_>, stream_id: usize, lo: usize, hi: usize) -> bool {
+    let Some(points) = cx.cross_lane_order_points.get(&stream_id) else {
+        return false;
+    };
+    let first_after_lo = points.partition_point(|&p| p <= lo);
+    points.get(first_after_lo).is_some_and(|&p| p < hi)
+}
+
+/// TRUE iff every overlapping (prior lane, current lane) box pair is the SAME
+/// lane. A side without lane attribution is uniform — every executing lane
+/// touches the whole region — which can never be proven same-lane-only
+/// against an overlapping access (single-thread cohorts are attributed by
+/// the region builders, so `None` here really means multi-lane uniform).
+fn same_lane_only_overlap(prior: &MemoryAccessRecord, current: &MemoryAccessRecord) -> bool {
+    let (Some(prior_lanes), Some(current_lanes)) =
+        (&prior.region.lane_boxes, &current.region.lane_boxes)
+    else {
+        return false;
+    };
+    for (pl, pb) in prior_lanes.iter() {
+        for (cl, cb) in current_lanes.iter() {
+            if pl != cl && boxes_overlap(pb, cb) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Intra-warp cross-lane ordering for a SAME-STREAM overlapping conflict pair.
+///
+/// On Volta+ (Independent Thread Scheduling) the lanes of a warp advance
+/// through their shared instruction stream independently, so program order
+/// within a stream orders each LANE against itself. A memory dependency
+/// between two lanes carries an ordering only from an explicit warp_sync or
+/// a warp-collective instruction. A same-stream pair is ordered iff any of:
+///
+///  (a) either member is a warp-collective statement (converged execution);
+///  (a') either member is an async-ENGINE access (`MemoryProxy::Async`): a
+///       copy/mma engine touches those bytes, not a lane, so lane attribution
+///       carries no information about it and no warp-level sync can order it.
+///       Its hazards are owned by the passes that model the engine's actual
+///       window: `async_group_lifetime` (bulk store source/dest until
+///       `wait_group`), `tcgen05_async_hazard` (tcgen05 mma/cp/ld/st windows
+///       until `tcgen05.commit`/`wait`, plus TMA-load SMEM tiles until an
+///       `mbarrier` wait on the load's cell). Those passes credit no implicit
+///       warp sync, and each waiting lane acquires the completing barrier
+///       individually, so the pattern `elected tma_load -> mbarrier_wait ->
+///       per-lane reads` is ordered by the barrier, not by lane convergence;
+///  (b) a cross-lane ordering point of the stream lies strictly between the
+///      two events (`cross_lane_order_points`);
+///  (c) the overlap is SAME-LANE ONLY: each lane depends only on its own
+///      program order.
+///
+/// `for_prune` is the frontier-prune variant of the predicate: pruning
+/// requires the relation to COMPOSE with a later access W ("prior ordered
+/// w.r.t. current" and "current ordered w.r.t. W" must imply "prior ordered
+/// w.r.t. W" for every rule combination). Every rule composes except
+/// "CURRENT is the async member of (a')" — a generic prior pruned under an
+/// async current would dodge a later generic W (the async exemption of
+/// current-vs-W says nothing about prior-vs-W) — so the prune variant only
+/// credits the PRIOR side of (a').
+fn same_stream_cross_lane_ordered(
+    cx: &CheckerCx<'_>,
+    prior: &MemoryAccessRecord,
+    current: &MemoryAccessRecord,
+    for_prune: bool,
+) -> bool {
+    debug_assert_eq!(prior.stream_id, current.stream_id);
+    if prior.collective || current.collective {
+        return true; // (a)
+    }
+    if prior.async_proxy || (!for_prune && current.async_proxy) {
+        return true; // (a')
+    }
+    if has_order_point_between(cx, current.stream_id, prior.event_idx, current.event_idx) {
+        return true; // (b)
+    }
+    same_lane_only_overlap(prior, current) // (c)
+}
+
 #[derive(Default)]
 struct MemoryRaceFrontier {
     reads: Vec<MemoryAccessRecord>,
@@ -1491,7 +1634,8 @@ fn prune_read_frontier_before_read(
     frontier.retain(|prior| {
         !super::region::bounding_spans_contain(current.bounds, prior.bounds)
             || !region_covers(&current.region, &prior.region)
-            || !(prior.stream_id == current.stream_id
+            || !((prior.stream_id == current.stream_id
+                && same_stream_cross_lane_ordered(cx, prior, current, true))
                 || cx
                     .ordering
                     .happens_before(prior.event_idx, current.event_idx))
@@ -1507,7 +1651,8 @@ fn prune_frontier_before(
     for prior in frontier.drain(..) {
         if super::region::bounding_spans_touch(prior.bounds, current.bounds)
             && regions_overlap(&prior.region, &current.region)
-            && (prior.stream_id == current.stream_id
+            && ((prior.stream_id == current.stream_id
+                && same_stream_cross_lane_ordered(cx, &prior, current, true))
                 || cx
                     .ordering
                     .happens_before(prior.event_idx, current.event_idx))
@@ -1530,7 +1675,12 @@ fn check_memory_conflicts(
     current: &MemoryAccessRecord,
 ) -> CheckResult {
     for prior in frontier {
-        if prior.stream_id == current.stream_id {
+        let same_stream = prior.stream_id == current.stream_id;
+        if same_stream
+            && (prior.collective || current.collective || prior.async_proxy || current.async_proxy)
+        {
+            // Rules (a)/(a') hold whatever the overlap shape, so they settle
+            // the pair before it pays for the overlap tests.
             continue;
         }
         if !super::region::bounding_spans_touch(prior.bounds, current.bounds) {
@@ -1538,6 +1688,16 @@ fn check_memory_conflicts(
         }
         if !regions_overlap(&prior.region, &current.region) {
             continue;
+        }
+        if same_stream {
+            // Same warp, conflicting overlap: program order covers each lane
+            // against ITSELF only — cross-lane needs an explicit intra-warp
+            // ordering (warp_sync / collective / converged barrier).
+            if same_stream_cross_lane_ordered(cx, prior, current, false) {
+                continue;
+            }
+            report_intra_warp_cross_lane_race(cx, prior, current);
+            return Err(ProtocolStatus::Failed);
         }
         if cx
             .ordering
@@ -1585,6 +1745,78 @@ fn report_memory_data_race(
             .insert("left_stmt_kind".into(), event.stmt_kind.clone());
     }
     if let Some(event) = right_event {
+        diagnostic
+            .details
+            .insert("right_stmt_id".into(), event.stmt_id.to_string());
+        diagnostic
+            .details
+            .insert("right_stmt_kind".into(), event.stmt_kind.clone());
+    }
+    cx.diagnostics.push(diagnostic);
+}
+
+/// Report a same-stream (intra-warp) conflicting overlap with no cross-lane
+/// ordering between the members.
+fn report_intra_warp_cross_lane_race(
+    cx: &mut CheckerCx<'_>,
+    prior: &MemoryAccessRecord,
+    current: &MemoryAccessRecord,
+) {
+    let prior_event = cx.event_index.events.get(prior.event_idx);
+    let current_event = cx.event_index.events.get(current.event_idx);
+    // Witness: the first genuinely CROSS-lane overlapping box pair when both
+    // sides are lane-attributed; otherwise the plain region overlap (a
+    // uniform side means every executing lane touches the witness bytes).
+    let (lanes, witness) = match (&prior.region.lane_boxes, &current.region.lane_boxes) {
+        (Some(prior_lanes), Some(current_lanes)) => {
+            let mut found = None;
+            'outer: for (pl, pb) in prior_lanes.iter() {
+                for (cl, cb) in current_lanes.iter() {
+                    if pl != cl && boxes_overlap(pb, cb) {
+                        let ranges = pb
+                            .ranges
+                            .iter()
+                            .zip(&cb.ranges)
+                            .map(|(&(ls, le), &(rs, re))| (ls.max(rs), le.min(re)))
+                            .collect();
+                        found = Some((format!("{pl},{cl}"), box_summary(&BoxN::new(ranges))));
+                        break 'outer;
+                    }
+                }
+            }
+            found.unwrap_or_else(|| ("<unknown>".into(), "<unknown>".into()))
+        }
+        _ => (
+            "all".into(),
+            region_overlap_witness(&prior.region, &current.region)
+                .map(|b| box_summary(&b))
+                .unwrap_or_else(|| "<unknown>".into()),
+        ),
+    };
+    let mut diagnostic = DiagnosticBuilder::new(
+        "intra_warp_cross_lane_race",
+        "cross-lane shared-memory dependency within a warp without an intervening warp-level \
+         sync (lanes execute independently on sm_70+; insert warp_sync or a warp-collective \
+         between them)",
+    )
+    .event(current_event)
+    .detail("left_event_idx", prior.event_idx.to_string())
+    .detail("right_event_idx", current.event_idx.to_string())
+    .detail("left_mode", prior.mode.as_str())
+    .detail("right_mode", current.mode.as_str())
+    .detail("owner", owner_summary(&prior.region.owner))
+    .detail("lanes", lanes)
+    .detail("overlap", witness)
+    .build();
+    if let Some(event) = prior_event {
+        diagnostic
+            .details
+            .insert("left_stmt_id".into(), event.stmt_id.to_string());
+        diagnostic
+            .details
+            .insert("left_stmt_kind".into(), event.stmt_kind.clone());
+    }
+    if let Some(event) = current_event {
         diagnostic
             .details
             .insert("right_stmt_id".into(), event.stmt_id.to_string());
@@ -3141,6 +3373,7 @@ mod tests {
             tensor_id: tensor.id,
             owner: PoolId::Smem { cta_id: 0 },
             boxes: RegionBoxes::Boxes(vec![BoxN::new(vec![(start, start + 16)])]),
+            lane_boxes: None,
         }
     }
 
@@ -3149,6 +3382,7 @@ mod tests {
             tensor_id: 1,
             owner: PoolId::Smem { cta_id },
             boxes: RegionBoxes::Boxes(vec![BoxN::new(vec![(start, end)])]),
+            lane_boxes: None,
         }
     }
 
@@ -3160,6 +3394,7 @@ mod tests {
                 (0, 128),
                 (col_start * 4, (col_start + n_cols) * 4),
             ])]),
+            lane_boxes: None,
         }
     }
 
@@ -3437,6 +3672,9 @@ mod tests {
 
     #[test]
     fn memory_race_check_uses_physical_smem_alias_regions() {
+        // Two DISTINCT tensor ids at the same byte offset: the pass must
+        // compare physical bytes, so the unordered cross-stream pair races.
+        // A tensor-id-keyed comparison would see no overlap and pass.
         let writer = smem_tensor(1, 0);
         let alias = smem_tensor(2, 0);
         let kernel = empty_kernel(
@@ -3466,7 +3704,7 @@ mod tests {
                     region: tensor_region(&alias),
                     proxy: MemoryProxy::Generic,
                     access_kind: MemoryAccessKind::Tensor(TensorAccessKind::Generic),
-                    scope: scope(0),
+                    scope: scope(1),
                 },
             ),
         ];
@@ -3475,11 +3713,8 @@ mod tests {
             ProtocolReport::new(ProtocolStatus::Passed),
             &events,
         );
-        assert_eq!(report.status, ProtocolStatus::Passed);
-        assert_eq!(
-            pass_status(&report, "memory_race_check"),
-            ProtocolStatus::Passed
-        );
+        assert_eq!(report.status, ProtocolStatus::Failed);
+        assert!(diagnostic_codes(&report).contains("memory_data_race"));
     }
 
     #[test]
@@ -3881,11 +4116,13 @@ mod tests {
                 BoxN::new(vec![(0, 16), (0, 64)]),
                 BoxN::new(vec![(32, 48), (0, 64)]),
             ]),
+            lane_boxes: None,
         };
         let gap = Region {
             tensor_id: 9,
             owner: PoolId::Tmem { cta_id: 0 },
             boxes: RegionBoxes::Boxes(vec![BoxN::new(vec![(16, 32), (0, 64)])]),
+            lane_boxes: None,
         };
         let events = vec![
             event(
@@ -3934,6 +4171,294 @@ mod tests {
             ProtocolStatus::Passed
         );
         assert!(!diagnostic_codes(&report).contains("memory_data_race"));
+    }
+
+    /// A kernel whose SMEM pool holds the 32 4-byte lane cells below.
+    fn lane_cells_kernel(name: &str) -> Kernel {
+        let mut kernel = empty_kernel(name, vec![]);
+        kernel.smem_size_bytes = 128;
+        kernel
+    }
+
+    /// One 4-byte cell per lane, `row` = the lane whose cell it is: the
+    /// footprint of `smem[row]` executed by lane `lane`.
+    fn lane_cell_region(lane: u8, row: usize) -> Region {
+        Region {
+            tensor_id: 1,
+            owner: PoolId::Smem { cta_id: 0 },
+            boxes: RegionBoxes::Boxes(vec![BoxN::new(vec![(row * 4, row * 4 + 4)])]),
+            lane_boxes: Some(Arc::new(vec![(
+                lane,
+                BoxN::new(vec![(row * 4, row * 4 + 4)]),
+            )])),
+        }
+    }
+
+    /// A whole-warp access whose lanes address `map(lane)`: the union footprint
+    /// plus the per-lane attribution the region builders emit.
+    fn warp_rows_region(map: impl Fn(u8) -> usize) -> Region {
+        let lane_boxes: Vec<(u8, BoxN)> = (0u8..32)
+            .map(|lane| {
+                let row = map(lane);
+                (lane, BoxN::new(vec![(row * 4, row * 4 + 4)]))
+            })
+            .collect();
+        let mut boxes: Vec<BoxN> = lane_boxes.iter().map(|(_, b)| b.clone()).collect();
+        boxes.sort_by_key(|b| b.ranges[0]);
+        Region {
+            tensor_id: 1,
+            owner: PoolId::Smem { cta_id: 0 },
+            boxes: RegionBoxes::Boxes(boxes),
+            lane_boxes: Some(Arc::new(lane_boxes)),
+        }
+    }
+
+    fn access_event(stmt_id: usize, stmt_kind: &str, region: Region, write: bool) -> TraceEvent {
+        let (proxy, access_kind) = (
+            MemoryProxy::Generic,
+            MemoryAccessKind::Tensor(TensorAccessKind::Generic),
+        );
+        let payload = if write {
+            TraceEventKind::Write {
+                region,
+                proxy,
+                access_kind,
+                scope: scope(0),
+            }
+        } else {
+            TraceEventKind::Read {
+                region,
+                proxy,
+                access_kind,
+                scope: scope(0),
+            }
+        };
+        TraceEvent::new(stmt_id, stmt_kind, payload)
+    }
+
+    fn warp_sync_events(stmt_id: usize) -> Vec<TraceEvent> {
+        vec![
+            TraceEvent::new(
+                stmt_id,
+                "WarpSync",
+                TraceEventKind::SyncArrive {
+                    sync_kind: "warp".into(),
+                    thread_count: 32,
+                    count: 32,
+                    cycle: 0,
+                    bar_id: None,
+                    scope: scope(0),
+                },
+            ),
+            TraceEvent::new(
+                stmt_id,
+                "WarpSync",
+                TraceEventKind::Sync {
+                    sync_kind: "warp".into(),
+                    thread_count: 32,
+                    cycle: 0,
+                    bar_id: None,
+                    scope: scope(0),
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn cross_lane_rejects_lane_rotated_read_after_write_without_warp_sync() {
+        // Each lane writes its own row, then reads lane+1's row: a cross-lane
+        // dependency inside one warp with no intervening warp-level sync.
+        let kernel = lane_cells_kernel("cross_lane_rotate");
+        let events = vec![
+            access_event(1, "RegStore", warp_rows_region(|lane| lane as usize), true),
+            access_event(
+                2,
+                "RegLoad",
+                warp_rows_region(|lane| ((lane + 1) % 32) as usize),
+                false,
+            ),
+        ];
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(report.status, ProtocolStatus::Failed);
+        assert!(diagnostic_codes(&report).contains("intra_warp_cross_lane_race"));
+        let diagnostic = &report.diagnostics[0];
+        assert_eq!(
+            diagnostic.details.get("lanes").map(String::as_str),
+            Some("0,31")
+        );
+        assert_eq!(
+            diagnostic.details.get("left_mode").map(String::as_str),
+            Some("write")
+        );
+        assert_eq!(
+            diagnostic.details.get("right_mode").map(String::as_str),
+            Some("read")
+        );
+    }
+
+    #[test]
+    fn cross_lane_accepts_lane_rotated_read_after_warp_sync() {
+        let kernel = lane_cells_kernel("cross_lane_rotate_synced");
+        let mut events = vec![access_event(
+            1,
+            "RegStore",
+            warp_rows_region(|lane| lane as usize),
+            true,
+        )];
+        events.extend(warp_sync_events(2));
+        events.push(access_event(
+            3,
+            "RegLoad",
+            warp_rows_region(|lane| ((lane + 1) % 32) as usize),
+            false,
+        ));
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(
+            report.status,
+            ProtocolStatus::Passed,
+            "{:?}",
+            report.diagnostics
+        );
+    }
+
+    #[test]
+    fn cross_lane_accepts_same_lane_reuse_without_sync() {
+        // Lane i rewrites and rereads only its own row: program order per lane
+        // is all the ordering hardware needs.
+        let kernel = lane_cells_kernel("cross_lane_same_lane");
+        let events = vec![
+            access_event(1, "RegStore", warp_rows_region(|lane| lane as usize), true),
+            access_event(2, "RegLoad", warp_rows_region(|lane| lane as usize), false),
+            access_event(3, "RegStore", warp_rows_region(|lane| lane as usize), true),
+        ];
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(
+            report.status,
+            ProtocolStatus::Passed,
+            "{:?}",
+            report.diagnostics
+        );
+    }
+
+    #[test]
+    fn cross_lane_accepts_pair_ordered_by_a_warp_collective_member() {
+        // The rotated read is a StMatrix/LdMatrix-class collective: every lane
+        // converges on it, so the pair needs no separate warp sync.
+        let kernel = lane_cells_kernel("cross_lane_collective");
+        let events = vec![
+            access_event(1, "RegStore", warp_rows_region(|lane| lane as usize), true),
+            access_event(
+                2,
+                "LdMatrix",
+                warp_rows_region(|lane| ((lane + 1) % 32) as usize),
+                false,
+            ),
+        ];
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(
+            report.status,
+            ProtocolStatus::Passed,
+            "{:?}",
+            report.diagnostics
+        );
+    }
+
+    #[test]
+    fn cross_lane_accepts_async_engine_member() {
+        // An elected lane's async bulk write (engine-performed, drained by the
+        // async passes) followed by whole-warp lane reads of the tile.
+        let kernel = lane_cells_kernel("cross_lane_async");
+        let tile = Region {
+            tensor_id: 1,
+            owner: PoolId::Smem { cta_id: 0 },
+            boxes: RegionBoxes::Boxes(vec![BoxN::new(vec![(0, 128)])]),
+            lane_boxes: None,
+        };
+        let events = vec![
+            TraceEvent::new(
+                1,
+                "TmaLoad",
+                TraceEventKind::Write {
+                    region: tile,
+                    proxy: MemoryProxy::Async,
+                    access_kind: MemoryAccessKind::Tensor(TensorAccessKind::TmaLoad),
+                    scope: scope(0),
+                },
+            ),
+            access_event(2, "RegLoad", warp_rows_region(|lane| lane as usize), false),
+        ];
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(
+            report.status,
+            ProtocolStatus::Passed,
+            "{:?}",
+            report.diagnostics
+        );
+    }
+
+    #[test]
+    fn cross_lane_reports_single_lane_cohorts_by_lane() {
+        // A single-thread cohort is attributed to its lane, so lane 0's write
+        // followed by lane 3's read of the same cell is cross-lane.
+        let kernel = lane_cells_kernel("cross_lane_single_thread");
+        let events = vec![
+            access_event(1, "StoreScalar", lane_cell_region(0, 2), true),
+            access_event(2, "ScalarDef", lane_cell_region(3, 2), false),
+        ];
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(report.status, ProtocolStatus::Failed);
+        assert!(diagnostic_codes(&report).contains("intra_warp_cross_lane_race"));
+        assert_eq!(
+            report.diagnostics[0]
+                .details
+                .get("lanes")
+                .map(String::as_str),
+            Some("0,3")
+        );
+    }
+
+    #[test]
+    fn cross_lane_accepts_single_lane_reuse_of_its_own_cell() {
+        let kernel = lane_cells_kernel("cross_lane_single_thread_reuse");
+        let events = vec![
+            access_event(1, "StoreScalar", lane_cell_region(0, 2), true),
+            access_event(2, "ScalarDef", lane_cell_region(0, 2), false),
+        ];
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(
+            report.status,
+            ProtocolStatus::Passed,
+            "{:?}",
+            report.diagnostics
+        );
     }
 
     #[test]
