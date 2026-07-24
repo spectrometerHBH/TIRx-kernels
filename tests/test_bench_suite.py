@@ -154,6 +154,46 @@ def test_ratio_report_keeps_grouped_tir_schedulers_out_of_references() -> None:
     assert "| megakernel_moe | moe_a3b_bs1_all | tir_unfused | sglang_full |" in report
 
 
+def test_ratio_report_separates_fp4_fp8_paged_mqa_logits() -> None:
+    kernels = [
+        "ordinary_kernel",
+        "deepgemm_sm100_fp4_paged_mqa_logits",
+        "deepgemm_sm100_fp8_paged_mqa_logits",
+    ]
+    baseline = {
+        "results": [
+            {
+                "kernel": kernel,
+                "label": f"{kernel}_config",
+                "status": "ok",
+                "impls": {"tirx": 10.0, "deepgemm": 12.0},
+            }
+            for kernel in kernels
+        ]
+    }
+    current = {
+        "results": [
+            {
+                "kernel": kernel,
+                "label": f"{kernel}_config",
+                "status": "ok",
+                "impls": {"tirx": 10.0, "deepgemm": 12.0},
+            }
+            for kernel in kernels
+        ]
+    }
+
+    report, regressions = build_report(baseline, current)
+
+    assert regressions == 0
+    main, paged_mqa = report.split("## DeepGEMM paged MQA logits — FP4/FP8 (2)")
+    assert "| ordinary_kernel | ordinary_kernel_config |" in main
+    assert "deepgemm_sm100_fp4_paged_mqa_logits" not in main
+    assert "deepgemm_sm100_fp8_paged_mqa_logits" not in main
+    assert "| deepgemm_sm100_fp4_paged_mqa_logits |" in paged_mqa
+    assert "| deepgemm_sm100_fp8_paged_mqa_logits |" in paged_mqa
+
+
 def test_baseline_view_renders_grouped_implementations_in_one_row() -> None:
     payload = {
         "timestamp": "now",
@@ -325,13 +365,59 @@ def test_gpu_pool_prioritizes_larger_waiting_claims(monkeypatch: pytest.MonkeyPa
     single_thread.join()
 
 
-def test_active_strangers_are_merged_across_assigned_gpus(monkeypatch: pytest.MonkeyPatch) -> None:
-    active = {"0": {101: 1.0}, "2": {101: 4.0, 202: 3.0}}
+def test_resident_strangers_include_idle_compute_contexts(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        run, "_active_strangers", lambda gpu_index, our_pids, sm_threshold: active[gpu_index]
+        run,
+        "_compute_pids_by_gpu_uuid",
+        lambda: {"GPU-0": {101, 999}, "GPU-1": {202}, "GPU-unassigned": {303}},
     )
 
-    assert run._active_strangers_on_gpus(("0", "2"), {999}, 0.0) == {101: 4.0, 202: 3.0}
+    assert run._resident_strangers_on_gpu_uuids(("GPU-0", "GPU-1"), {999}) == {101, 202}
+
+
+def test_monitored_subprocess_requeues_resident_context_before_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(run, "_gpu_uuid_of", lambda gpu_index: f"GPU-{gpu_index}")
+    monkeypatch.setattr(
+        run,
+        "_resident_strangers_on_gpu_uuids",
+        lambda gpu_uuids, our_pids: {123} if gpu_uuids == ("GPU-4",) else set(),
+    )
+    log_path = tmp_path / "subprocess.log"
+
+    result = run._run_subprocess_monitored(
+        [sys.executable, "-c", "raise AssertionError('must not spawn')"],
+        os.environ.copy(),
+        str(tmp_path),
+        log_path,
+        ("4",),
+        0.01,
+        0.0,
+    )
+
+    assert result == (-1, True, [123], False)
+    assert "foreign compute contexts" in log_path.read_text()
+
+
+def test_monitored_subprocess_requeues_when_gpu_uuid_lookup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(run, "_gpu_uuid_of", lambda gpu_index: None)
+    log_path = tmp_path / "subprocess.log"
+
+    result = run._run_subprocess_monitored(
+        [sys.executable, "-c", "raise AssertionError('must not spawn')"],
+        os.environ.copy(),
+        str(tmp_path),
+        log_path,
+        ("4",),
+        0.01,
+        0.0,
+    )
+
+    assert result == (-1, True, [], False)
+    assert "could not resolve every assigned GPU UUID" in log_path.read_text()
 
 
 def test_run_one_passes_multigpu_assignment_to_megamoe(
