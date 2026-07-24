@@ -484,6 +484,7 @@ def _f16_tmem_store_kernel():
         b.tcgen05_st(tmem, frag[0:1], shape="32x32b", num=1, row=0, col=0)
         b.tcgen05_wait_st()
         b.tcgen05_ld(loaded[0:1], tmem, shape="32x32b", num=1, row=0, col=0)
+        b.tcgen05_wait_ld()
         b.reg_store(out[b.tid_in_wg(), 0:2], loaded)
     with b.if_warp(0):
         b.tmem_dealloc(tmem, n_cols=32)
@@ -552,12 +553,14 @@ def _mma_cg2_peer_smem_kernel(synced):
         layout=nr.TmemLayout(nr.TmemLayoutKind.LANE_128, col_start=0),
     )
     ready = b.mbar(kind=nr.MBarKind.THREAD)
+    mma_done = b.mbar(kind=nr.MBarKind.TCGEN05)
     ready_leader = b.mbar_ref(ready, remote_coord=0)  # absolute coord: the leader's cell
     with b.if_warp(0):
         b.tmem_alloc(accum, n_cols=32, cta_group=2)
         # mbarrier.init is per-thread: one thread initializes the cell.
         with b.if_elected():
             b.mbarrier_init(ready, count=1)
+            b.mbarrier_init(mma_done, count=1)
     # Publish each CTA's alloc + mbar cell cluster-wide (the peer arrives the
     # leader's cell remotely).
     b.cluster_sync()
@@ -579,6 +582,10 @@ def _mma_cg2_peer_smem_kernel(synced):
             # Single-thread MMA issue (tcgen05_mma_mask otherwise).
             with b.if_(b.lane_id().eq(0)):
                 b.tcgen05_mma(accum, a_smem, b_smem, m=m, n=n, k=mma_k, accum=False, cta_group=2)
+                # The mma is async; the commit's barrier is where it is observed
+                # to have landed, and the band may not be freed before that.
+                b.tcgen05_commit(mma_done, cta_group=2)
+            b.mbarrier_wait(mma_done, phase=0)
     # Keeps the peer CTA resident for the cluster-collective MMA/dealloc and
     # orders all pipeline work before the dealloc.
     b.cluster_sync()

@@ -313,9 +313,17 @@ def test_protocol_tmem_mma_layout_f_emits_union_boxes():
         b.tmem_alloc(dst, n_cols=32)
     # tcgen05_mma is a single-thread issue instruction now; issue it from warp
     # 0's elected lane so alloc -> mma -> dealloc stay ordered on one stream.
+    done = b.mbar(kind=nr.MBarKind.TCGEN05)
+    with b.if_warp(0), b.if_elected():
+        b.mbarrier_init(done, count=1)
+    b.cta_sync()
     with b.if_warp(0), b.if_elected():
         b.tcgen05_mma(dst, a_s, b_s, m=m, n=n, k=k, accum=False, cta_group=1)
+        # The mma is async: commit hands it to a barrier and the wait is where
+        # it is observed to have landed — a band may not be freed before that.
+        b.tcgen05_commit(done, cta_group=1)
     with b.if_warp(0):
+        b.mbarrier_wait(done, phase=0)
         b.tmem_dealloc(dst, n_cols=32)
 
     report = nr.check_protocol(b.build(), include_events=True)
@@ -336,6 +344,48 @@ def test_protocol_tmem_mma_layout_f_emits_union_boxes():
         {"ranges": [(64, 80), (0, 64)]},
         {"ranges": [(96, 112), (0, 64)]},
     ]
+
+
+def _tmem_teardown_kernel(*, drain: bool):
+    """One warp issues an mma into TMEM; another warp frees the band after a
+    cta_sync. The barrier orders the two instruction streams, but only the
+    commit's barrier says the mma has LANDED.
+    """
+    m, n, k = 64, 16, 16
+    a_bytes, b_bytes = m * k * 2, n * k * 2
+    b = builder("protocol_tmem_teardown", smem_size_bytes=a_bytes + b_bytes)
+    a_s = smem_tensor(b, dtype=nr.DType.F16, shape=(m, k), byte_offset=0)
+    b_s = smem_tensor(b, dtype=nr.DType.F16, shape=(n, k), byte_offset=a_bytes)
+    dst = tmem_tensor(b, dtype=nr.DType.F32, shape=(m, n), col_start=0, lane_align=0)
+    done = b.mbar(kind=nr.MBarKind.TCGEN05)
+    with b.if_warp(0):
+        b.tmem_alloc(dst, n_cols=32)
+        with b.if_elected():
+            b.mbarrier_init(done, count=1)
+    b.cta_sync()
+    with b.if_warp(0), b.if_elected():
+        b.tcgen05_mma(dst, a_s, b_s, m=m, n=n, k=k, accum=False, cta_group=1)
+        b.tcgen05_commit(done, cta_group=1)
+    if drain:
+        with b.if_warp(0):
+            b.mbarrier_wait(done, phase=0)
+    # Every stream's work is ordered before the free — but ordering an ISSUE
+    # is not draining an engine.
+    b.cta_sync()
+    with b.if_warp(0):
+        b.tmem_dealloc(dst, n_cols=32)
+    return b.build()
+
+
+def test_protocol_tmem_free_needs_the_drain_not_just_a_barrier():
+    report = nr.check_protocol(_tmem_teardown_kernel(drain=False))
+    assert report["status"] == "Failed"
+    assert "tmem_lifecycle_use_not_drained" in _diagnostic_codes(report), report["diagnostics"][:2]
+
+
+def test_protocol_tmem_free_after_the_commit_is_awaited_passes():
+    report = nr.check_protocol(_tmem_teardown_kernel(drain=True))
+    assert report["status"] == "Passed", report["diagnostics"][:2]
 
 
 def test_protocol_tmem_async_overlap_fails_before_wait():

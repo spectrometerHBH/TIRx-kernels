@@ -1472,54 +1472,237 @@ fn check_tmem_window_conflicts(
     Ok(())
 }
 
+/// A TMEM access, with the point at which the trace records it as landed.
+struct TmemAccess {
+    event_idx: usize,
+    region: Region,
+    async_kind: TmemAsyncKind,
+    /// The `tcgen05.wait` that retired it, when the trace records one.
+    drain_idx: Option<usize>,
+}
+
+/// One `alloc .. dealloc` interval of a TMEM band.
+struct TmemGeneration {
+    alloc_idx: usize,
+    dealloc_idx: Option<usize>,
+    region: Region,
+}
+
+/// TMEM band lifetimes.
+///
+/// Two halves that need different machinery. The RESOURCE ALGEBRA — a band
+/// may not be allocated over a live one, a dealloc must name a live band —
+/// is about the allocator's own bookkeeping and has no ordering content. The
+/// LIFETIME is pure happens-before: an access must be ordered after the
+/// allocation it uses and before that generation's dealloc, and a band may
+/// only be reallocated after the previous generation's dealloc. Those edges
+/// have to come from real synchronization (an mbarrier, a cta/cluster sync);
+/// trace order proves nothing, since the simulator ran one schedule and a
+/// different one could put the access before the alloc or after the free.
+///
+/// The trace walk below therefore only ENUMERATES generations and accesses.
+/// Which generation an access belongs to is decided by the clock, not by
+/// where the walk happened to be — and because overlapping generations must
+/// themselves be happens-before ordered, that binding is unambiguous.
+///
+/// `tcgen05.alloc/dealloc` and `tcgen05.ld/st` are all `.sync.aligned`, so
+/// both ends of every obligation are warp-converged events and the
+/// whole-event relation is exactly the right one here.
 fn tmem_lifecycle_order_local(cx: &mut CheckerCx<'_>) -> CheckResult {
-    let mut active: HashMap<PoolId, Vec<Region>> = HashMap::new();
-    for event in cx.event_index.events {
+    let mut live: HashMap<PoolId, Vec<usize>> = HashMap::new();
+    let mut generations: Vec<TmemGeneration> = Vec::new();
+    let mut accesses: Vec<TmemAccess> = Vec::new();
+    // Per stream, the `tcgen05.ld`/`st` accesses not yet drained by a
+    // `tcgen05.wait` of their kind.
+    let mut undrained: HashMap<usize, Vec<usize>> = HashMap::new();
+    // Per stream, the `tcgen05.mma`/`cp` accesses not yet observed to
+    // complete, and per mbar cell the accesses some commit handed to it. A
+    // commit makes the barrier track EVERY async op the warp issued before
+    // it, so a later commit covers them again — waiting any one of those
+    // cells proves completion.
+    let mut undrained_async: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut committed: HashMap<MbarKey, Vec<usize>> = HashMap::new();
+    for (event_idx, event) in cx.event_index.events.iter().enumerate() {
         match &event.payload {
             TraceEventKind::TmemAlloc { region, .. } => {
-                let ranges = active.entry(region.owner.clone()).or_default();
-                if ranges.iter().any(|range| regions_overlap(range, region)) {
+                let open = live.entry(region.owner.clone()).or_default();
+                if open
+                    .iter()
+                    .any(|g| regions_overlap(&generations[*g].region, region))
+                {
                     return Err(cx.fail(
                         "tmem_lifecycle_allocation_overlap",
                         "TMEM allocation overlaps an active allocation",
                         Some(event),
                     ));
                 }
-                ranges.push(region.clone());
+                open.push(generations.len());
+                generations.push(TmemGeneration {
+                    alloc_idx: event_idx,
+                    dealloc_idx: None,
+                    region: region.clone(),
+                });
             }
             TraceEventKind::Read {
                 region,
-                access_kind: MemoryAccessKind::Tmem(_),
+                access_kind: MemoryAccessKind::Tmem(async_kind),
+                scope,
                 ..
             }
             | TraceEventKind::Write {
                 region,
-                access_kind: MemoryAccessKind::Tmem(_),
+                access_kind: MemoryAccessKind::Tmem(async_kind),
+                scope,
                 ..
             } => {
-                let covered = active
-                    .get(&region.owner)
-                    .is_some_and(|ranges| ranges.iter().any(|range| region_covers(range, region)));
-                if !covered {
-                    return Err(cx.fail(
-                        "tmem_lifecycle_use_without_allocation",
-                        "TMEM access is not covered by an active allocation",
-                        Some(event),
-                    ));
+                match async_kind {
+                    TmemAsyncKind::Ld | TmemAsyncKind::St => undrained
+                        .entry(scope.stream_id)
+                        .or_default()
+                        .push(accesses.len()),
+                    TmemAsyncKind::Mma | TmemAsyncKind::Cp => undrained_async
+                        .entry(scope.stream_id)
+                        .or_default()
+                        .push(accesses.len()),
+                }
+                accesses.push(TmemAccess {
+                    event_idx,
+                    region: region.clone(),
+                    async_kind: *async_kind,
+                    drain_idx: None,
+                });
+            }
+            // `tcgen05.wait::ld/st` retires the EXECUTING thread's own loads
+            // or stores of that kind — the point at which they are known to
+            // have landed, as opposed to merely issued.
+            TraceEventKind::TmemWait { async_kind, scope } => {
+                if let Some(pending) = undrained.get_mut(&scope.stream_id) {
+                    pending.retain(|a| {
+                        if accesses[*a].async_kind == *async_kind {
+                            accesses[*a].drain_idx = Some(event_idx);
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                }
+            }
+            // `tcgen05.commit` makes an mbarrier track the issuing warp's
+            // prior async work; the completion is OBSERVED when someone waits
+            // that cell, and a parked wait is written into the trace at the
+            // moment it wakes, so its position is the observation point.
+            TraceEventKind::MbarArrive { target, scope, .. }
+                if event.stmt_kind == "Tcgen05Commit" =>
+            {
+                if let Some(pending) = undrained_async.get(&scope.stream_id) {
+                    committed
+                        .entry(MbarKey::from_target(target))
+                        .or_default()
+                        .extend(pending.iter().copied());
+                }
+            }
+            TraceEventKind::MbarWait { target, .. } => {
+                if let Some(tracked) = committed.remove(&MbarKey::from_target(target)) {
+                    for a in &tracked {
+                        if accesses[*a].drain_idx.is_none() {
+                            accesses[*a].drain_idx = Some(event_idx);
+                        }
+                    }
+                    for pending in undrained_async.values_mut() {
+                        pending.retain(|a| accesses[*a].drain_idx.is_none());
+                    }
                 }
             }
             TraceEventKind::TmemDealloc { region, .. } => {
-                let ranges = active.entry(region.owner.clone()).or_default();
-                let Some(pos) = ranges.iter().position(|range| range == region) else {
+                let open = live.entry(region.owner.clone()).or_default();
+                let Some(pos) = open.iter().position(|g| generations[*g].region == *region) else {
                     return Err(cx.fail(
                         "tmem_lifecycle_dealloc_without_allocation",
                         "TMEM deallocation does not match an active allocation",
                         Some(event),
                     ));
                 };
-                ranges.remove(pos);
+                generations[open.remove(pos)].dealloc_idx = Some(event_idx);
             }
             _ => {}
+        }
+    }
+
+    // Reuse of a band must wait for the previous generation to be freed, and
+    // the freeing warp and the re-allocating warp must actually synchronize.
+    for (j, later) in generations.iter().enumerate() {
+        for earlier in &generations[..j] {
+            if !regions_overlap(&earlier.region, &later.region) {
+                continue;
+            }
+            let ordered = earlier
+                .dealloc_idx
+                .is_some_and(|d| cx.ordering.happens_before(d, later.alloc_idx));
+            if !ordered {
+                let event = cx.event_index.events.get(later.alloc_idx);
+                return Err(cx.fail(
+                    "tmem_lifecycle_hb_missing",
+                    "TMEM re-allocation has no happens-before edge from the previous \
+                     generation's deallocation; the freeing warp and the re-allocating warp \
+                     must synchronize, not just land in a favourable interleaving",
+                    event,
+                ));
+            }
+        }
+    }
+
+    // Bind each access to the generation it uses — the one whose band covers
+    // it, whose allocation it is ordered after, and whose free it is not
+    // already past — then require that it retires before that free.
+    for access in &accesses {
+        let (access_idx, region) = (&access.event_idx, &access.region);
+        let generation = generations.iter().find(|g| {
+            g.region.owner == region.owner
+                && region_covers(&g.region, region)
+                && cx.ordering.happens_before(g.alloc_idx, *access_idx)
+                && !g
+                    .dealloc_idx
+                    .is_some_and(|d| cx.ordering.happens_before(d, *access_idx))
+        });
+        let Some(generation) = generation else {
+            let event = cx.event_index.events.get(*access_idx);
+            return Err(cx.fail(
+                "tmem_lifecycle_use_without_allocation",
+                "TMEM access is not covered by an allocation it is ordered after; the \
+                 allocating warp and the accessing warp must synchronize",
+                event,
+            ));
+        };
+        if let Some(dealloc_idx) = generation.dealloc_idx {
+            // Ordering the ISSUE before the free is not enough for an async
+            // access: a barrier orders instruction streams, it does not drain
+            // an engine. The free must be ordered after the COMPLETION
+            // OBSERVATION — `tcgen05.wait::ld/st` for a load or store, the
+            // wait on the mbarrier a `tcgen05.commit` handed the work to for
+            // an mma or cp.
+            let must_precede = access.drain_idx.unwrap_or(*access_idx);
+            if !cx.ordering.happens_before(must_precede, dealloc_idx) {
+                let event = cx.event_index.events.get(dealloc_idx);
+                let message = if access.drain_idx.is_some() {
+                    "TMEM deallocation has no happens-before edge from the drain that retires \
+                     an access of that generation; a barrier orders the issue, it does not \
+                     complete the access"
+                } else {
+                    "TMEM deallocation has no happens-before edge from an access of that \
+                     generation; every accessing warp must be ordered before the free"
+                };
+                return Err(cx.fail("tmem_lifecycle_hb_missing", message, event));
+            }
+            if access.drain_idx.is_none() {
+                let event = cx.event_index.events.get(*access_idx);
+                return Err(cx.fail(
+                    "tmem_lifecycle_use_not_drained",
+                    "TMEM access is never observed to complete — a `tcgen05.wait` of its kind \
+                     for a load or store, an awaited `tcgen05.commit` for an mma or cp — so it \
+                     is not known to have landed before the band is freed",
+                    event,
+                ));
+            }
         }
     }
     Ok(())
@@ -4653,8 +4836,36 @@ mod tests {
                     scope: scope(0),
                 },
             ),
+            // The mma is async: a commit hands it to a barrier and the wait
+            // is where it is observed to have landed, which the band's free
+            // must follow.
             event(
                 4,
+                TraceEventKind::MbarInit {
+                    target: mbar_target(),
+                    count: 1,
+                    scope: scope(0),
+                },
+            ),
+            TraceEvent::new(
+                5,
+                "Tcgen05Commit",
+                TraceEventKind::MbarArrive {
+                    target: mbar_target(),
+                    count: 1,
+                    scope: scope(0),
+                },
+            ),
+            event(
+                6,
+                TraceEventKind::MbarWait {
+                    target: mbar_target(),
+                    phase: 0,
+                    scope: scope(0),
+                },
+            ),
+            event(
+                7,
                 TraceEventKind::TmemDealloc {
                     cta_ids: vec![0],
                     region: alloc,
