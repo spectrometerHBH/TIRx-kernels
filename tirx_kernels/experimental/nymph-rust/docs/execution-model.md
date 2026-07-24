@@ -44,7 +44,13 @@ that fiction is *certified*, not axiomatic (see §3).
    (ordinary ld/st) consumed by the async proxy (TMA / tensormap / tcgen05
    engines) must cross `fence.proxy.*` (`fence.mbarrier_init` likewise for
    mbarrier-object publication). Fence-synchronization is a per-THREAD
-   relation: a fence releases the executing thread's own prior accesses.
+   relation: a fence releases the executing thread's own view — its own
+   prior accesses, plus whatever a convergence point or barrier had already
+   carried into it. This is a SECOND obligation on top of rule 3, not a
+   substitute: an mbarrier may order a store before an engine reads it and
+   the bytes still be unpublished, and a fence may publish bytes that
+   nothing orders. Both are required, and each is checked against the same
+   clocks.
 5. **Async engines: issue ≠ landing; effects land only when a completion
    object is observed** (mbar expect-tx/complete-tx, commit_group /
    wait_group, `tcgen05.wait::ld/st`). Completion objects are themselves the
@@ -94,8 +100,10 @@ that fiction is *certified*, not axiomatic (see §3).
 - **Join points (the complete vocabulary producing happens-before)**:
   warp-collective instructions (convergence), `warp_sync`, mbarrier (by
   `sem`), cooperative barriers (cta / warpgroup / named / cluster
-  rendezvous), semaphore (value-keyed release/acquire), `fence.proxy.*`.
-  Section 5 is the per-op ledger. A new op must pass the exhaustiveness
+  rendezvous), semaphore (value-keyed release/acquire), and — for the
+  cross-proxy obligation of rule 4 — `fence.proxy.*`, which releases the
+  fencing thread's view into the async-proxy engines so that an engine
+  access acquires it like any other release. Section 5 is the per-op ledger. A new op must pass the exhaustiveness
   gate (every `Stmt` variant handled explicitly in validate / interpreter /
   checker / codegen); the vocabulary never drifts silently.
 - The checker judges **every conflicting access pair** by happens-before
@@ -135,6 +143,14 @@ barrier orders each ARRIVING lane's published order into every passer —
 `bar.sync` carries memory-barrier semantics (§9.7.14.15), so a 16-lane
 member of a 32-thread named barrier still receives the other arrivers'
 writes, while lanes absent from the rendezvous are published by nobody.
+
+**Cross-proxy publication** (visibility rule 4): `fence.proxy.async`
+publishes the fencing thread's view into the async-proxy engines at the
+fence's address scope, and every engine access acquires the view published
+for the address space it touches. A thread fencing its own prior stores
+covers those; other lanes' stores ride in only behind a convergence point or
+a barrier. Nothing else crosses the boundary — an ordering edge alone does
+not.
 
 **Releases project their ARRIVING lanes only** (visibility rule 3):
 

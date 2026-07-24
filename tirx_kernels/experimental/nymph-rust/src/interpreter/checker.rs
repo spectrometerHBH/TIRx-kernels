@@ -87,7 +87,6 @@ pub fn run_offline_checkers(
         tmem_lifecycle_order_local,
     );
     run_pass(&mut cx, &mut report, "memory_race_check", memory_race_check);
-    run_pass(&mut cx, &mut report, "proxy_fence", proxy_fence);
     run_pass(
         &mut cx,
         &mut report,
@@ -324,6 +323,15 @@ struct MemoryAccessRecord {
     /// Access is performed by an async engine (`MemoryProxy::Async`), not by
     /// the lanes themselves — TMA loads/stores, s2cluster, tcgen05 mma/cp/ld/st.
     async_proxy: bool,
+}
+
+impl MemoryAccessRecord {
+    /// Is `self` an engine access consuming bytes a LANE stored generically?
+    /// That is the one pair whose ordering lives in the proxy boundary rather
+    /// than in the lane clocks.
+    fn crosses_into_engine(&self, prior: &Self) -> bool {
+        self.async_proxy && !prior.async_proxy && prior.mode == MemoryAccessMode::Write
+    }
 }
 
 impl MemoryAccessRecord {
@@ -1573,6 +1581,55 @@ fn ordered_conflict(
     cx: &CheckerCx<'_>,
     prior: &MemoryAccessRecord,
     current: &MemoryAccessRecord,
+) -> Result<(), ConflictWitness> {
+    lane_slices_ordered(cx, prior, current).map_err(|lanes| ConflictWitness {
+        lanes,
+        unpublished: false,
+    })?;
+    // Ordering is necessary but not sufficient across the proxy boundary: a
+    // lane's store reaches an ENGINE only through `fence.proxy.async`, so an
+    // ordered pair whose bytes were never published is still a bug (and an
+    // unordered one is a bug even if they were).
+    if current.crosses_into_engine(prior) {
+        let write_ordinal = cx.ordering.event_ordinal(prior.event_idx);
+        let unpublished = |pl: u8| {
+            !cx.ordering
+                .engine_sees(prior.stream_id, pl, write_ordinal, current.event_idx)
+        };
+        let offender = match prior.region.lane_boxes.as_deref() {
+            Some(prior_lanes) => prior_lanes
+                .iter()
+                .find(|(pl, pb)| {
+                    super::region::box_overlaps_region(pb, &current.region) && unpublished(*pl)
+                })
+                .map(|(pl, _)| *pl),
+            None => (0..32u8)
+                .filter(|l| prior.mask & (1u32 << l) != 0)
+                .find(|pl| unpublished(*pl)),
+        };
+        if let Some(pl) = offender {
+            return Err(ConflictWitness {
+                lanes: Some((pl, 0)),
+                unpublished: true,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Why a conflicting pair failed, and on which lane slices.
+struct ConflictWitness {
+    lanes: Option<(u8, u8)>,
+    /// The pair is ordered, but the lane's store never crossed the proxy
+    /// boundary into the engine that reads it.
+    unpublished: bool,
+}
+
+/// The ordinary per-lane ordering obligation, with no proxy considerations.
+fn lane_slices_ordered(
+    cx: &CheckerCx<'_>,
+    prior: &MemoryAccessRecord,
+    current: &MemoryAccessRecord,
 ) -> Result<(), Option<(u8, u8)>> {
     let same_stream = prior.stream_id == current.stream_id;
     // The whole-event relation (every slice of one before every slice of the
@@ -1766,12 +1823,16 @@ fn check_memory_conflicts(
 ) -> CheckResult {
     for prior in frontier {
         let same_stream = prior.stream_id == current.stream_id;
-        if same_stream && (prior.async_proxy || current.async_proxy) {
-            // An async-engine access conflicts through the engine's window,
-            // not through lane clocks — lane attribution carries no
-            // information about a copy/mma engine, and the passes that model
-            // the engine's actual window (`async_group_lifetime`,
-            // `tcgen05_async_hazard`) own those hazards.
+        if same_stream
+            && (prior.async_proxy || current.async_proxy)
+            && !current.crosses_into_engine(prior)
+        {
+            // An engine access conflicts through the engine's WINDOW — the
+            // span from issue to the observed drain, which no pair of event
+            // clocks describes — so the passes that model that window
+            // (`async_group_lifetime`, `tcgen05_async_hazard`) own it. The
+            // one exception is a lane's generic store feeding the engine:
+            // that is a proxy-publication question the clock does answer.
             continue;
         }
         if !super::region::bounding_spans_touch(prior.bounds, current.bounds) {
@@ -1780,8 +1841,8 @@ fn check_memory_conflicts(
         if !regions_overlap(&prior.region, &current.region) {
             continue;
         }
-        if let Err(lanes) = ordered_conflict(cx, prior, current) {
-            report_memory_data_race(cx, prior, current, lanes);
+        if let Err(witness) = ordered_conflict(cx, prior, current) {
+            report_memory_data_race(cx, prior, current, witness);
             return Err(ProtocolStatus::Failed);
         }
     }
@@ -1792,8 +1853,9 @@ fn report_memory_data_race(
     cx: &mut CheckerCx<'_>,
     left: &MemoryAccessRecord,
     right: &MemoryAccessRecord,
-    lanes: Option<(u8, u8)>,
+    witness: ConflictWitness,
 ) {
+    let ConflictWitness { lanes, unpublished } = witness;
     let left_event = cx.event_index.events.get(left.event_idx);
     let right_event = cx.event_index.events.get(right.event_idx);
     // Witness bytes: the named lane slices' first overlapping box pair when
@@ -1837,14 +1899,30 @@ fn report_memory_data_race(
                 .unwrap_or_else(|| "<unknown>".into()),
         ),
     };
-    let message = if left.stream_id == right.stream_id {
-        "conflicting lane slices of one warp overlap without a happens-before order (lanes \
-         advance independently on sm_70+; converge with warp_sync or a warp-collective before \
-         the dependent access)"
+    // The proxy boundary gets its own code: the fix is a fence, not a
+    // synchronization edge, and the two are not interchangeable.
+    let (code, message) = if unpublished {
+        (
+            "proxy_fence_missing",
+            "an async-proxy engine reads bytes a lane stored generically, with no \
+             `fence.proxy.async` publishing them across the proxy boundary (the fence must be \
+             executed by a thread that can already see the stores — its own, or others' after a \
+             convergence point or barrier)",
+        )
+    } else if left.stream_id == right.stream_id {
+        (
+            "memory_data_race",
+            "conflicting lane slices of one warp overlap without a happens-before order (lanes \
+             advance independently on sm_70+; converge with warp_sync or a warp-collective \
+             before the dependent access)",
+        )
     } else {
-        "overlapping shared memory accesses conflict without a happens-before order"
+        (
+            "memory_data_race",
+            "overlapping shared memory accesses conflict without a happens-before order",
+        )
     };
-    let mut diagnostic = DiagnosticBuilder::new("memory_data_race", message)
+    let mut diagnostic = DiagnosticBuilder::new(code, message)
         .event(right_event)
         .detail("lanes", lanes_detail)
         .detail("left_event_idx", left.event_idx.to_string())
@@ -1903,84 +1981,6 @@ fn owner_summary(owner: &PoolId) -> String {
         PoolId::Gmem { tensor_id } => format!("gmem:tensor{tensor_id}"),
         PoolId::Reg { cta_id, tensor_id } => format!("reg:cta{cta_id}:tensor{tensor_id}"),
     }
-}
-
-fn proxy_fence(cx: &mut CheckerCx<'_>) -> CheckResult {
-    let mut last_accesses: Vec<ProxyAccess> = Vec::new();
-    for event in cx.event_index.events {
-        match &event.payload {
-            TraceEventKind::Fence {
-                fence_kind: FenceEventKind::ProxyAsync,
-                fence_scope,
-                scope,
-            } => {
-                last_accesses
-                    .retain(|access| !fence_covers_proxy_access(*fence_scope, scope, access));
-            }
-            TraceEventKind::Read {
-                region,
-                proxy,
-                access_kind: _,
-                scope,
-            } => {
-                check_proxy_access(cx, &mut last_accesses, event, region, *proxy, scope, false)?;
-            }
-            TraceEventKind::Write {
-                region,
-                proxy,
-                access_kind: _,
-                scope,
-            } => {
-                check_proxy_access(cx, &mut last_accesses, event, region, *proxy, scope, true)?;
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-fn check_proxy_access(
-    cx: &mut CheckerCx<'_>,
-    last_accesses: &mut Vec<ProxyAccess>,
-    event: &TraceEvent,
-    region: &Region,
-    proxy: MemoryProxy,
-    scope: &super::protocol::AccessScope,
-    is_write: bool,
-) -> CheckResult {
-    if !matches!(region.owner, PoolId::Smem { .. }) {
-        return Ok(());
-    }
-    let current = ProxyAccess {
-        stream_id: scope.stream_id,
-        cluster_id: scope.cluster_id,
-        cta_id: scope.cta_id,
-        proxy,
-        is_write,
-        region: region.clone(),
-    };
-    if current.proxy == MemoryProxy::Async && !current.is_write {
-        for previous in last_accesses
-            .iter()
-            .filter(|access| access.stream_id == current.stream_id)
-        {
-            if previous.proxy != MemoryProxy::Generic || !previous.is_write {
-                continue;
-            }
-            if !previous.overlaps(&current) {
-                continue;
-            }
-            return Err(cx.fail(
-                "proxy_fence_missing",
-                "async proxy read overlaps a prior generic SMEM write without an intervening async proxy fence",
-                Some(event),
-            ));
-        }
-    }
-    if current.proxy == MemoryProxy::Generic && current.is_write {
-        last_accesses.push(current);
-    }
-    Ok(())
 }
 
 fn cluster_peer_consistency(cx: &mut CheckerCx<'_>) -> CheckResult {
@@ -2386,34 +2386,6 @@ struct AsyncSourceWindow {
     /// (cp.reduce.async.bulk), else `None`. (`start_idx` points at the flush-trigger event, not
     /// the store Write, so the reduce kind is captured here at build time.)
     reduce: Option<(ReduceOp, bool)>,
-}
-
-#[derive(Clone, Debug)]
-struct ProxyAccess {
-    stream_id: usize,
-    cluster_id: usize,
-    cta_id: usize,
-    proxy: MemoryProxy,
-    is_write: bool,
-    region: Region,
-}
-
-impl ProxyAccess {
-    fn overlaps(&self, other: &ProxyAccess) -> bool {
-        regions_overlap(&self.region, &other.region)
-    }
-}
-
-fn fence_covers_proxy_access(
-    fence_scope: FenceScope,
-    fence_event_scope: &super::protocol::AccessScope,
-    access: &ProxyAccess,
-) -> bool {
-    match fence_scope {
-        FenceScope::Cta => fence_event_scope.cta_id == access.cta_id,
-        FenceScope::Cluster => fence_event_scope.cluster_id == access.cluster_id,
-        FenceScope::Gpu => true,
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -3164,6 +3136,14 @@ type Clock = Vec<(usize, usize)>;
 // So a full-warp publication is ONE prefix entry, an elected arrive is ONE
 // lane entry, and clocks stay O(streams) with a short lane tail — per-lane
 // precision costs only where divergent publication actually happens.
+//
+// The lanes are not the only things that touch memory. The ASYNC PROXY
+// engines (TMA / tensormap / tcgen05) read and write on their own, and a
+// lane's ordinary stores are invisible to them until some thread executes
+// `fence.proxy.async`. That fence is a RELEASE of the fencing thread's view
+// into the engines (`EngineViews`), and every engine access ACQUIRES it, so
+// cross-proxy visibility is an ordinary comparison against the same clocks —
+// what no thread fenced is simply not in the engines' view.
 const WARP_LANES: usize = 32;
 const STREAM_DIMS: usize = WARP_LANES + 1;
 const FULL_MASK: u32 = u32::MAX;
@@ -3174,6 +3154,78 @@ fn lane_dim(stream_id: usize, lane: usize) -> usize {
 
 fn prefix_dim(stream_id: usize) -> usize {
     stream_id * STREAM_DIMS + WARP_LANES
+}
+
+/// What the async-proxy engines have absorbed, by the address scope a
+/// `fence.proxy.async` publishes into. The engines are CTA-level hardware —
+/// a fence by ANY thread makes that thread's view visible to every engine
+/// access of the same CTA — so the view is keyed by scope, not by stream.
+#[derive(Default)]
+struct EngineViews {
+    cta: HashMap<usize, Clock>,
+    cluster: HashMap<usize, Clock>,
+    gpu: Clock,
+    /// Bumped on every fence; lets an engine access reuse the previous
+    /// snapshot when nothing has been published since.
+    epoch: u64,
+    cache: HashMap<usize, (u64, Arc<Clock>)>,
+}
+
+impl EngineViews {
+    /// Publish a fencing thread's view at the fence's address scope.
+    fn publish(&mut self, fence_scope: FenceScope, cta_id: usize, cluster_id: usize, view: &Clock) {
+        let target = match fence_scope {
+            FenceScope::Cta => self.cta.entry(cta_id).or_default(),
+            FenceScope::Cluster => self.cluster.entry(cluster_id).or_default(),
+            FenceScope::Gpu => &mut self.gpu,
+        };
+        join_clock(target, view);
+        self.epoch += 1;
+        self.cache.clear();
+    }
+
+    /// What an engine access in this CTA can observe: every scope that
+    /// covers it.
+    fn view_for(&mut self, cta_id: usize, cluster_id: usize) -> Arc<Clock> {
+        if let Some((epoch, clock)) = self.cache.get(&cta_id) {
+            if *epoch == self.epoch {
+                return Arc::clone(clock);
+            }
+        }
+        let mut clock = self.gpu.clone();
+        if let Some(c) = self.cluster.get(&cluster_id) {
+            join_clock(&mut clock, c);
+        }
+        if let Some(c) = self.cta.get(&cta_id) {
+            join_clock(&mut clock, c);
+        }
+        let clock = Arc::new(clock);
+        self.cache.insert(cta_id, (self.epoch, Arc::clone(&clock)));
+        clock
+    }
+}
+
+/// If this event's memory access runs on the async proxy (an engine touching
+/// the bytes) rather than on the lanes themselves, the CTA whose shared
+/// address space holds those bytes.
+fn async_proxy_access_owner(event: &TraceEvent) -> Option<usize> {
+    let region = match &event.payload {
+        TraceEventKind::Read {
+            region,
+            proxy: MemoryProxy::Async,
+            ..
+        }
+        | TraceEventKind::Write {
+            region,
+            proxy: MemoryProxy::Async,
+            ..
+        } => region,
+        _ => return None,
+    };
+    match region.owner {
+        PoolId::Smem { cta_id } => Some(cta_id),
+        _ => None,
+    }
 }
 
 /// A warp-collective EVENT: the collective instruction set by statement kind,
@@ -3301,6 +3353,9 @@ struct EventHb {
     shared: Arc<Clock>,
     /// Lane overlays live at this event, for its executing lanes only.
     extras: Vec<(u8, Arc<Clock>)>,
+    /// For an async-proxy access: what the stream's engines had absorbed
+    /// when it was issued. `None` for everything the lanes do themselves.
+    engine: Option<Arc<Clock>>,
 }
 
 impl EventHb {
@@ -3311,6 +3366,7 @@ impl EventHb {
             ordinal: 0,
             shared: Arc::new(Clock::new()),
             extras: Vec::new(),
+            engine: None,
         }
     }
 }
@@ -3335,6 +3391,8 @@ impl OrderingAnalysis {
         let no_scope = EventHb::none();
         let mut states: Vec<StreamClockState> =
             (0..stream_count).map(|_| StreamClockState::new()).collect();
+        // What the async-proxy engines can see (see `EngineViews`).
+        let mut engines = EngineViews::default();
         let mut mbars: HashMap<MbarKey, MbarCycle> = HashMap::new();
         // Release accumulation: each arriving event joins its published
         // (lane-projected) clock as it lands; completion freezes the join as
@@ -3421,18 +3479,44 @@ impl OrderingAnalysis {
                 extras.sort_by_key(|(lane, _)| *lane);
                 extras
             };
+            // An engine access sees what the stream's async-proxy engines
+            // absorbed, NOT what the issuing lane happens to have in its own
+            // view: the bytes are touched by the engine, so only fenced
+            // stores are visible to it.
+            // Keyed by the CTA that OWNS the bytes: `fence.proxy.async`
+            // publishes the fencing thread's accesses to a shared address
+            // space, so an engine reading a peer CTA's SMEM must consult the
+            // view published for THAT address space, not for its own CTA.
+            let engine = async_proxy_access_owner(event)
+                .map(|owner_cta| engines.view_for(owner_cta, scope.cluster_id));
             meta.push(EventHb {
                 stream_id,
                 mask,
                 ordinal,
                 shared: Arc::clone(&states[stream_id].shared),
                 extras,
+                engine,
             });
 
             // A warp-collective instruction's effects are warp-visible once
             // it completes: raise the prefix over the event itself.
             if is_warp_collective_event(event) {
                 states[stream_id].converge(stream_id, ordinal);
+            }
+            // A proxy fence publishes the fencing lanes' view (including this
+            // fence's own position) to the engines, at the fence's address
+            // scope. A lane publishes what IT can see, so a lane fencing its
+            // own prior stores suffices for those; other lanes' stores ride in
+            // only if a convergence point or barrier already carried them into
+            // a fencing lane's view.
+            if let TraceEventKind::Fence {
+                fence_kind: FenceEventKind::ProxyAsync,
+                fence_scope,
+                ..
+            } = &event.payload
+            {
+                let published = states[stream_id].published(stream_id, mask, ordinal);
+                engines.publish(*fence_scope, scope.cta_id, scope.cluster_id, &published);
             }
 
             match &event.payload {
@@ -3572,6 +3656,28 @@ impl OrderingAnalysis {
             }
         }
         false
+    }
+
+    /// Can the ENGINE that performs the async-proxy access `to` observe lane
+    /// `lane` of `stream` at `ordinal`?
+    ///
+    /// This is the second projection of the same clock. The issuing lane's own
+    /// view is deliberately NOT consulted: the bytes are touched by the
+    /// engine, so a store reaches it only by riding a `fence.proxy.async`
+    /// into the stream's engine clock — the fencing lane publishes what IT
+    /// could see, which is its own prior stores plus anything a convergence
+    /// point or barrier had already carried into its view.
+    /// The event's position on its stream's number line.
+    fn event_ordinal(&self, idx: usize) -> usize {
+        self.meta[idx].ordinal
+    }
+
+    fn engine_sees(&self, stream: usize, lane: u8, ordinal: usize, to: usize) -> bool {
+        let Some(engine) = self.meta[to].engine.as_ref() else {
+            return false;
+        };
+        clock_get(engine, prefix_dim(stream)) >= ordinal
+            || clock_get(engine, lane_dim(stream, lane as usize)) >= ordinal
     }
 
     /// Lane-slice happens-before: lane `from_lane`'s clock at `from` is at or

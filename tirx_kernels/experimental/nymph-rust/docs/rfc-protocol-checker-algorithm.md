@@ -174,7 +174,6 @@ The checker is a pass pipeline over `Kernel IR + TraceEvents`:
 - `tmem_async_hazard`: checks overlapping TMEM async windows.
 - `tmem_lifecycle_order`: checks TMEM alloc/use/dealloc coverage.
 - `memory_race_check`: checks SMEM/TMEM data-race freedom.
-- `proxy_fence`: checks generic/async SMEM proxy transitions.
 - `cluster_peer_consistency`, `scheduler_handoff_consistency`,
   `trace_gap_audit`.
 
@@ -195,7 +194,7 @@ region_covers(a, b):
   and every box in b is covered by some box in a
 ```
 
-`async_group_lifetime`, `proxy_fence`, `tmem_async_hazard`, and
+`async_group_lifetime`, `tmem_async_hazard`, and
 `tmem_lifecycle_order` all use these helpers. Barrier and deadlock passes do not
 inspect regions.
 
@@ -273,10 +272,15 @@ Cross-stream conflicting overlaps without ordering are trace gaps.
 Allocation and deallocation regions must match exactly. Every TMEM memory
 access must be covered by an active allocation region using byte-box coverage.
 
-### `proxy_fence`
+### cross-proxy publication (inside `memory_race_check`)
 
-An async-proxy SMEM read that overlaps a prior generic-proxy SMEM write in the
-same stream requires an intervening covering `fence.proxy.async`.
+An engine access that overlaps a generic-proxy SMEM write carries a SECOND
+obligation beyond the ordering one: the write must have been published across
+the proxy boundary. `fence.proxy.async` releases the fencing thread's view
+into the async-proxy engines at the fence's address scope, and the engine
+access acquires the view published for the address space it touches, so both
+obligations are decided against the same clocks. A pair that is ordered but
+unpublished reports `proxy_fence_missing`.
 
 ## 9. Test Matrix
 
@@ -295,5 +299,5 @@ Required coverage includes:
 - TMA and contiguous MMA footprints remain single boxes when physically
   contiguous;
 - `async_group_lifetime`, `tmem_async_hazard`, `tmem_lifecycle_order`,
-  `proxy_fence`, and `memory_race_check` use unified overlap helpers;
+  and `memory_race_check` use unified overlap helpers;
 - value-mode behavior is unchanged.

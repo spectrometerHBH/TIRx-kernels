@@ -365,9 +365,13 @@ def test_protocol_proxy_fence_missing_fails():
         b.store_scalar(source[0], 1)
         b.tma_store(out, source, coords=(0,), shape=(1,))
 
+    # An elected lane's store is ordered before its own tma_store by program
+    # order, yet the ENGINE performing the store never received the bytes:
+    # cross-proxy visibility is a second obligation on top of the ordering,
+    # and the race walk checks both against the same clocks.
     report = nr.check_protocol(b.build())
     assert report["status"] == "Failed"
-    assert _pass_status(report, "proxy_fence") == "Failed"
+    assert _pass_status(report, "memory_race_check") == "Failed"
     assert "proxy_fence_missing" in _diagnostic_codes(report)
 
 
@@ -381,9 +385,68 @@ def test_protocol_proxy_fence_present_passes():
         b.fence(kind=nr.FenceKind.ASYNC_PROXY, scope=nr.FenceScope.CTA)
         b.tma_store(out, source, coords=(0,), shape=(1,))
 
+    # The fencing lane publishes its own prior store into the engines, so the
+    # tma_store it then issues observes the bytes.
     report = nr.check_protocol(b.build())
     assert report["status"] == "Passed"
-    assert _pass_status(report, "proxy_fence") == "Passed"
+    assert _pass_status(report, "memory_race_check") == "Passed"
+
+
+def _cross_warp_proxy_kernel(*, fence: str):
+    """Warp 0 stores to SMEM, a cta_sync orders the two warps, warp 1 issues
+    the tma_store that reads those bytes. `fence` picks who publishes them
+    across the proxy boundary: nobody, the warp that cannot see them, or the
+    issuing warp (which the barrier gave the store to).
+    """
+    b = builder(f"protocol_proxy_cross_warp_{fence}", smem_size_bytes=4)
+    source = smem_tensor(b, shape=(1,), byte_offset=0)
+    out = gmem_arg(b, shape=(1,))
+    with b.if_warp(0), b.if_elected():
+        b.store_scalar(source[0], 1)
+        if fence == "unfenced_writer_only":
+            # Warp 0 does fence, but AFTER the barrier warp 1 rides; see below.
+            pass
+    b.cta_sync()
+    with b.if_warp(1), b.if_elected():
+        if fence == "issuer":
+            b.fence(kind=nr.FenceKind.ASYNC_PROXY, scope=nr.FenceScope.CTA)
+        b.tma_store(out, source, coords=(0,), shape=(1,))
+    return b.build()
+
+
+def test_protocol_proxy_fence_missing_across_warps_fails():
+    # ORDERED but UNPUBLISHED: the cta_sync gives the tma_store a
+    # happens-before edge from warp 0's store, and the engine still cannot see
+    # the bytes because no thread ever fenced. Ordering does not substitute for
+    # crossing the proxy boundary.
+    report = nr.check_protocol(_cross_warp_proxy_kernel(fence="none"))
+    assert report["status"] == "Failed"
+    assert "proxy_fence_missing" in _diagnostic_codes(report), report["diagnostics"][:2]
+
+
+def test_protocol_proxy_fence_by_the_issuing_warp_publishes_a_peer_store():
+    # The cta_sync put warp 0's store into warp 1's view, so warp 1's fence
+    # carries it across for the engine warp 1 then issues to.
+    report = nr.check_protocol(_cross_warp_proxy_kernel(fence="issuer"))
+    assert report["status"] == "Passed", report["diagnostics"][:2]
+
+
+def test_protocol_proxy_fence_by_a_warp_that_never_saw_the_store_fails():
+    # A fence publishes the EXECUTING thread's view. Warp 1 fences with nothing
+    # having carried warp 0's store to it, then warp 0 itself issues the
+    # tma_store: warp 0 is ordered against its own store by program order, but
+    # no fence of its own ever published the bytes.
+    b = builder("protocol_proxy_foreign_fence", smem_size_bytes=4)
+    source = smem_tensor(b, shape=(1,), byte_offset=0)
+    out = gmem_arg(b, shape=(1,))
+    with b.if_warp(1), b.if_elected():
+        b.fence(kind=nr.FenceKind.ASYNC_PROXY, scope=nr.FenceScope.CTA)
+    with b.if_warp(0), b.if_elected():
+        b.store_scalar(source[0], 1)
+        b.tma_store(out, source, coords=(0,), shape=(1,))
+    report = nr.check_protocol(b.build())
+    assert report["status"] == "Failed"
+    assert "proxy_fence_missing" in _diagnostic_codes(report), report["diagnostics"][:2]
 
 
 def test_protocol_trace_emits_proxy_fence_group_and_sync_metadata():
