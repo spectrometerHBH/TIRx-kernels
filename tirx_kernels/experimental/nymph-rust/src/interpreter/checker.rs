@@ -1715,6 +1715,31 @@ fn tmem_lifecycle_order_local(cx: &mut CheckerCx<'_>) -> CheckResult {
             }
         }
     }
+
+    // GENERATION-INTERNAL: the free must also follow its own allocation. For a
+    // generation with accesses this is already implied — binding proves
+    // HB(alloc, access) and the drain rule proves HB(access, dealloc) — but an
+    // access-less band allocated on one warp and freed on another with no
+    // synchronization would otherwise pass on the strength of the sampled
+    // order alone. (Checked LAST: an unsynchronized split usually ALSO strands
+    // an access, and the access-binding diagnostic is the more actionable
+    // one.)
+    for generation in &generations {
+        let Some(dealloc_idx) = generation.dealloc_idx else {
+            continue;
+        };
+        if !cx
+            .ordering()
+            .happens_before(generation.alloc_idx, dealloc_idx)
+        {
+            let event = cx.event_index.events.get(dealloc_idx);
+            return Err(cx.fail(
+                "tmem_lifecycle_hb_missing",
+                "TMEM deallocation has no happens-before edge from its allocation",
+                event,
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -5503,6 +5528,78 @@ mod tests {
         assert_eq!(
             pass_status(&report, "tmem_lifecycle_order"),
             ProtocolStatus::Failed
+        );
+    }
+
+    #[test]
+    fn tmem_lifecycle_rejects_unsynchronized_dealloc() {
+        // Alloc on stream 0, the matching dealloc on stream 1, no
+        // synchronization and no accesses: the sampled order pairs them, but
+        // no happens-before edge carries the allocation to the freeing warp.
+        let kernel = empty_kernel("tmem_lifecycle_unsync_dealloc", vec![]);
+        let region = tmem_region(0, 32);
+        let events = vec![
+            event(
+                1,
+                TraceEventKind::TmemAlloc {
+                    cta_ids: vec![0],
+                    region: region.clone(),
+                    scope: scope(0),
+                },
+            ),
+            event(
+                2,
+                TraceEventKind::TmemDealloc {
+                    cta_ids: vec![0],
+                    region,
+                    scope: scope(1),
+                },
+            ),
+        ];
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(report.status, ProtocolStatus::Failed);
+        assert_eq!(
+            pass_status(&report, "tmem_lifecycle_order"),
+            ProtocolStatus::Failed
+        );
+    }
+
+    #[test]
+    fn tmem_lifecycle_accepts_same_stream_dealloc() {
+        // Same-stream alloc -> dealloc: program order supplies the
+        // generation-internal edge (no accesses to bind or drain).
+        let kernel = empty_kernel("tmem_lifecycle_same_stream", vec![]);
+        let region = tmem_region(0, 32);
+        let events = vec![
+            event(
+                1,
+                TraceEventKind::TmemAlloc {
+                    cta_ids: vec![0],
+                    region: region.clone(),
+                    scope: scope(0),
+                },
+            ),
+            event(
+                2,
+                TraceEventKind::TmemDealloc {
+                    cta_ids: vec![0],
+                    region,
+                    scope: scope(0),
+                },
+            ),
+        ];
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(
+            pass_status(&report, "tmem_lifecycle_order"),
+            ProtocolStatus::Passed
         );
     }
 
