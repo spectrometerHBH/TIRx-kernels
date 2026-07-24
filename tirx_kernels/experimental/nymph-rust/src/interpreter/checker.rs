@@ -14,7 +14,9 @@ use super::region::{boxes_overlap, region_covers, regions_overlap, TMEM_LANE_BYT
 use super::values::indexing::numel;
 use super::values::smem::dtype_size_bytes;
 use super::values::tmem::TMEM_ROWS;
-use crate::ir::{FenceScope, Kernel, Stmt, Tensor, TensorSlice};
+use crate::ir::{
+    static_thread_filter, FenceScope, Kernel, Stmt, Tensor, TensorSlice, ThreadFilter, ThreadSet,
+};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -105,7 +107,69 @@ pub fn run_offline_checkers(
         scheduler_handoff_consistency,
     );
     run_pass(&mut cx, &mut report, "trace_gap_audit", trace_gap_audit);
+    run_pass(
+        &mut cx,
+        &mut report,
+        "unknown_filter_scope_check",
+        unknown_filter_scope_check,
+    );
     report
+}
+
+/// A synchronization scope that depends on a runtime value.
+///
+/// The static thread filter proves which threads reach a branch from
+/// warp/lane coordinates. When a predicate mixes in a runtime value the filter
+/// is `Unknown`, and the shape rules that would bound a sync's scope
+/// (wg_sync covers one warpgroup, cta_sync covers the CTA, ...) stand down —
+/// the runtime rendezvous is the check. A sync reached under such a branch is
+/// legal but its scope is only verified at run time; this warns so a scope bug
+/// there surfaces as more than a bare deadlock.
+fn unknown_filter_scope_check(cx: &mut CheckerCx<'_>) -> CheckResult {
+    fn intersect(outer: &ThreadFilter, branch: &ThreadFilter) -> ThreadFilter {
+        match (outer, branch) {
+            (ThreadFilter::Known(a), ThreadFilter::Known(b)) => ThreadFilter::Known(a.intersect(b)),
+            _ => ThreadFilter::Unknown,
+        }
+    }
+    fn walk(cx: &mut CheckerCx<'_>, body: &[Stmt], filter: &ThreadFilter, num_warps: u32) {
+        let unknown = filter.known().is_none();
+        for stmt in body {
+            match stmt {
+                Stmt::If { cond, then_body } => {
+                    let inner = intersect(filter, &static_thread_filter(cond, num_warps));
+                    walk(cx, then_body, &inner, num_warps);
+                }
+                Stmt::ForLoop { body, .. }
+                | Stmt::ForEachTask { body, .. }
+                | Stmt::SchedulerImpl { body, .. }
+                | Stmt::Loop { body } => walk(cx, body, filter, num_warps),
+                _ if unknown => {
+                    let op = match stmt {
+                        Stmt::CtaSync => "cta_sync",
+                        Stmt::ClusterSync => "cluster_sync",
+                        Stmt::WgSync { .. } => "wg_sync",
+                        Stmt::WarpSync => "warp_sync",
+                        Stmt::NamedBarrier { .. } => "named_barrier",
+                        _ => continue,
+                    };
+                    cx.warn(
+                        "unknown_filter_sync",
+                        format!(
+                            "{op} is reached under a branch on a runtime value; its scope is \
+                             verified at run time, not by the static shape rules"
+                        ),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    let num_warps = cx.kernel.num_warps;
+    let full = ThreadFilter::Known(ThreadSet::full(num_warps));
+    let body = cx.kernel.body.clone();
+    walk(cx, &body, &full, num_warps);
+    Ok(())
 }
 
 fn run_pass(
@@ -147,6 +211,7 @@ fn run_pass(
 }
 
 struct CheckerCx<'a> {
+    kernel: &'a Kernel,
     event_index: EventIndex<'a>,
     region_audit: TraceRegionAudit,
     ordering: OrderingAnalysis,
@@ -164,6 +229,7 @@ struct CheckerCx<'a> {
 impl<'a> CheckerCx<'a> {
     fn new(kernel: &'a Kernel, events: &'a [TraceEvent]) -> Self {
         Self {
+            kernel,
             event_index: EventIndex::new(events),
             region_audit: TraceRegionAudit::new(kernel),
             ordering: OrderingAnalysis::empty(),

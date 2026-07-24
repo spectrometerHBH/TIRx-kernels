@@ -12,7 +12,11 @@
 //! tensor-loaded scalar) or a CTA-coordinate leaf (`CtaId`,
 //! `CtaidInCluster`, `NvshmemMyPe`) makes the affected threads
 //! indeterminate and the whole filter `Unknown` — callers treat Unknown
-//! conservatively: static rules skip, runtime semantics own the check.
+//! conservatively: static rules skip, runtime semantics own the check. For a
+//! synchronization op that means its scope is checked by the runtime
+//! rendezvous rather than the static shape rules; the checker's
+//! `unknown_filter_scope_check` warns at such a site so a scope bug there
+//! surfaces as more than a bare deadlock.
 //!
 //! One refinement keeps mixed predicates useful: absorption. `x & 0 == 0`
 //! and `Select` with a known condition resolve without evaluating the

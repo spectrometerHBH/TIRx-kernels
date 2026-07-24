@@ -464,3 +464,28 @@ def test_oob_tensor_slice_caught_in_value_and_trace():
     report = nr.check_protocol(kernel)
     assert report["status"] == "Failed"
     assert "tensor_value" in {d["code"] for d in report["diagnostics"]}
+
+
+def test_unknown_filter_sync_scope_warns():
+    # A sync reached under a runtime-valued predicate has an Unknown static
+    # filter, so the shape rules stand down and only the runtime rendezvous
+    # verifies its scope. This warning surfaces that. Using v.eq(0) with v == 0
+    # keeps every thread in the branch, so the cta_sync completes (Passed) and
+    # the test isolates the warning rather than a masked deadlock.
+    b = builder("unknown_filter_sync")
+    v = b.scalar(initial=0)
+    with b.if_(v.eq(0)):
+        b.cta_sync()
+    report = nr.check_protocol(b.build())
+    assert report["status"] == "Passed", report["diagnostics"]
+    assert "unknown_filter_sync" in {w["code"] for w in report["warnings"]}
+
+
+def test_static_branch_sync_is_not_flagged():
+    # A statically-resolved branch has a Known filter; the shape rules verify
+    # the scope and no warning is emitted.
+    b = builder("static_branch_sync")
+    with b.if_(1):
+        b.cta_sync()
+    report = nr.check_protocol(b.build())
+    assert "unknown_filter_sync" not in {w["code"] for w in report["warnings"]}
