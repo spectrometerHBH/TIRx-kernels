@@ -87,6 +87,11 @@ pub struct AccessScope {
     pub ctaid_in_cluster: usize,
     pub lane_count: usize,
     pub warp_id: usize,
+    /// Bitmask of the warp's executing lanes (bit `l` set = lane `l` ran this
+    /// event). The happens-before clock is per lane, so every event carries the
+    /// exact lane set it advances — a masked event advances only its lanes, and
+    /// a release publishes only its arriving lanes' order.
+    pub active_lanes: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

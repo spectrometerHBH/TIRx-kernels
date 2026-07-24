@@ -3596,6 +3596,7 @@ mod tests {
             ctaid_in_cluster: 0,
             lane_count: 32,
             warp_id: 0,
+            active_lanes: 0xFFFF_FFFF,
         }
     }
 

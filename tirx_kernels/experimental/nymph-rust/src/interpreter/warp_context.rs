@@ -107,6 +107,10 @@ impl<'a, 'k> WarpContext<'a, 'k> {
         InterpreterError::new("trace_inconclusive", "protocol trace is inconclusive")
     }
     pub fn access_scope(&self) -> AccessScope {
+        let active_lanes = self
+            .lanes
+            .iter()
+            .fold(0u32, |mask, t| mask | (1u32 << t.lane_id));
         AccessScope {
             stream_id: self.stream.stream_id,
             cluster_id: self.stream.cluster_id,
@@ -114,6 +118,7 @@ impl<'a, 'k> WarpContext<'a, 'k> {
             ctaid_in_cluster: self.stream.ctaid_in_cluster,
             lane_count: self.lanes.len(),
             warp_id: self.lanes[0].warp_id,
+            active_lanes,
         }
     }
     pub fn tensor_region(&mut self, resolved: &ResolvedSlice) -> IResult<Region> {
