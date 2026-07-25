@@ -57,3 +57,41 @@ def test_codegen_compiles(name, tmp_path):
     spec.loader.exec_module(emitted)  # parse gate
     mod = tvm.IRModule({"main": emitted.main})
     tvm.compile(mod, tvm.target.Target("cuda"), tir_pipeline="tirx")
+
+
+def test_single_issue_scope_negative():
+    # Zero-inference guard rule: a hardware single-issue op (here: tma_load)
+    # outside an explicit single-lane branch must be rejected at BUILD —
+    # codegen never synthesizes the guard (it once wrapped these in an
+    # inferred elect_sync). The elected form must pass.
+    def build(with_elected: bool):
+        b = nr.IRBuilder(
+            "si_neg", num_warps=4, smem_size_bytes=8192, launch_shape=(1,), cluster_shape=(1,)
+        )
+        src_g = b.arg(space=nr.MemorySpace.GMEM, dtype=nr.DType.BF16, shape=(64, 64))
+        dst_s = b.tensor(
+            space=nr.MemorySpace.SMEM, dtype=nr.DType.BF16, shape=(64, 64), byte_offset=0
+        )
+        mbar = b.mbar(kind=nr.MBarKind.TMA, stages=1)
+        with b.if_warp(0):
+            if with_elected:
+                with b.if_elected():
+                    b.mbarrier_arrive_expect_tx(mbar, bytes=64 * 64 * 2)
+                    b.tma_load(
+                        dst_s, src_g, mbar=mbar, coords=(0, 0), shape=(64, 64), gmem_shape=(64, 64)
+                    )
+            else:
+                b.mbarrier_arrive_expect_tx(mbar, bytes=64 * 64 * 2)
+                b.tma_load(
+                    dst_s, src_g, mbar=mbar, coords=(0, 0), shape=(64, 64), gmem_shape=(64, 64)
+                )
+        return b.build()
+
+    with pytest.raises(Exception, match="single_issue_scope"):
+        build(with_elected=False)
+    k = build(with_elected=True)
+    src = nr.kernel_to_tirx_source(k)
+    # exactly one elect guard in the output — the IR's own if_elected (the
+    # loop-free warp-0 spelling narrows to thread_rank, same single thread).
+    guards = src.count("if T.ptx.elect_sync():") + src.count("if T.cuda.thread_rank() == 0:")
+    assert guards == 1, src

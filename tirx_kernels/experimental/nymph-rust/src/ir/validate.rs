@@ -1811,6 +1811,7 @@ struct BarrierClassUse {
 fn check_context(
     body: &[Stmt],
     filter: &ThreadFilter,
+    single_lane: bool,
     defined: &mut HashSet<Var>,
     num_warps: u32,
     in_scheduler_impl: bool,
@@ -2005,6 +2006,7 @@ fn check_context(
                 check_context(
                     body,
                     filter,
+                    single_lane,
                     defined,
                     num_warps,
                     in_scheduler_impl,
@@ -2017,6 +2019,7 @@ fn check_context(
                 check_context(
                     body,
                     filter,
+                    single_lane,
                     defined,
                     num_warps,
                     in_scheduler_impl,
@@ -2025,7 +2028,16 @@ fn check_context(
                 )?;
             }
             Stmt::SchedulerImpl { body, .. } => {
-                check_context(body, filter, defined, num_warps, true, 0, barriers)?;
+                check_context(
+                    body,
+                    filter,
+                    single_lane,
+                    defined,
+                    num_warps,
+                    true,
+                    0,
+                    barriers,
+                )?;
             }
             Stmt::SchedNext { var, .. } => {
                 if !in_scheduler_impl {
@@ -2049,10 +2061,29 @@ fn check_context(
                 }
                 define_var(*var, defined)?;
             }
+            // ZERO-INFERENCE (user-mandated `single_issue_scope`): hardware
+            // single-issue ops must sit under an EXPLICIT single-lane branch —
+            // codegen never synthesizes a guard, so a bare site would issue
+            // once per lane (32 duplicate TMA/MMA issues, or an mbarrier
+            // double-init). The interpreter's `check_single_thread_issue` is
+            // the runtime backstop for the async-issue ops; this rule rejects
+            // at build. Provable means: the enclosing `If` chain statically
+            // resolves to at most one lane per touched warp (the `if_elected`
+            // sugar, `tid_in_wg == 0`, `thread_rank == 0`, ...).
+            Stmt::MBarrierInit { .. }
+            | Stmt::TmaLoad { .. }
+            | Stmt::TmaStore { .. }
+            | Stmt::CpAsyncBulkS2Cluster { .. }
+            | Stmt::Tcgen05Mma { .. }
+            | Stmt::Tcgen05Cp { .. }
+            | Stmt::Tcgen05Commit { .. } => {
+                require_single_lane_scope(single_lane, stmt)?;
+            }
             Stmt::ClcTryCancel { stage, .. } => {
                 if !in_scheduler_impl {
                     return bail("clc_try_cancel must be inside scheduler_impl");
                 }
+                require_single_lane_scope(single_lane, stmt)?;
                 if let Some(s) = stage {
                     let mut vars = Vec::new();
                     collect_vars(s, &mut vars);
@@ -2066,6 +2097,7 @@ fn check_context(
                 check_context(
                     body,
                     filter,
+                    single_lane,
                     defined,
                     num_warps,
                     in_scheduler_impl,
@@ -2085,13 +2117,25 @@ fn check_context(
                 let mut vars = Vec::new();
                 collect_vars(cond, &mut vars);
                 require_defined(&vars, defined, "if condition")?;
-                let inner = match static_thread_filter(cond, num_warps) {
-                    ThreadFilter::Known(set) => narrow(filter, &set),
+                let branch = static_thread_filter(cond, num_warps);
+                let inner = match &branch {
+                    ThreadFilter::Known(set) => narrow(filter, set),
                     ThreadFilter::Unknown => ThreadFilter::Unknown,
                 };
+                // The single-lane UPPER BOUND is sticky: once an enclosing
+                // branch provably narrows to <=1 lane per warp, any deeper
+                // branch (even a runtime one, e.g. `cta_rank == 0`) only
+                // selects a subset, so a single-issue op still cannot
+                // double-issue. This branch alone proving the bound (an
+                // explicit if_elected) lifts it for its subtree.
+                let inner_single = single_lane
+                    || branch.known().is_some_and(|set| {
+                        !set.is_empty() && set.count() == set.warps_touched().len()
+                    });
                 check_context(
                     then_body,
                     &inner,
+                    inner_single,
                     defined,
                     num_warps,
                     in_scheduler_impl,
@@ -2101,6 +2145,32 @@ fn check_context(
             }
             _ => {}
         }
+    }
+    Ok(())
+}
+
+/// The `single_issue_scope` rule's scope test: the enclosing branch chain must
+/// statically resolve to at most one lane per touched warp — the IR form of
+/// "this op issues once" (the `if_elected` sugar / a one-lane predicate).
+fn require_single_lane_scope(single_lane: bool, stmt: &Stmt) -> R {
+    let op = match stmt {
+        Stmt::MBarrierInit { .. } => "mbarrier_init",
+        Stmt::TmaLoad { .. } => "tma_load",
+        Stmt::TmaStore { .. } => "tma_store",
+        Stmt::CpAsyncBulkS2Cluster { .. } => "cp_async_bulk_s2cluster",
+        Stmt::Tcgen05Mma { .. } => "tcgen05_mma",
+        Stmt::Tcgen05Cp { .. } => "tcgen05_cp",
+        Stmt::Tcgen05Commit { .. } => "tcgen05_commit",
+        Stmt::ClcTryCancel { .. } => "clc_try_cancel",
+        _ => unreachable!("require_single_lane_scope on a non-single-issue op"),
+    };
+    if !single_lane {
+        return bail(format!(
+            "{op} is a hardware single-issue op: it must appear under an explicit \
+             single-lane branch (the if_elected sugar or a provably \
+             one-lane-per-warp predicate) — codegen never infers the guard \
+             (single_issue_scope)"
+        ));
     }
     Ok(())
 }
@@ -2750,6 +2820,7 @@ impl Kernel {
         check_context(
             &self.body,
             &ThreadFilter::Known(ThreadSet::full(self.num_warps)),
+            false,
             &mut defined,
             self.num_warps,
             false,
@@ -2912,13 +2983,19 @@ mod tests {
 
     #[test]
     fn dense_mma_full_k_accepts_multiples_of_16() {
-        assert!(kernel(tmem_body(vec![dense_mma(16, ScalarValue::Int(0))]))
-            .validate()
-            .is_ok());
+        assert!(kernel(tmem_body(vec![elected_if(vec![dense_mma(
+            16,
+            ScalarValue::Int(0)
+        )])]))
+        .validate()
+        .is_ok());
         // full-K: 3 atomic k=16 MMAs accumulated in order, issued as one IR op.
-        assert!(kernel(tmem_body(vec![dense_mma(48, ScalarValue::Int(1))]))
-            .validate()
-            .is_ok());
+        assert!(kernel(tmem_body(vec![elected_if(vec![dense_mma(
+            48,
+            ScalarValue::Int(1)
+        )])]))
+        .validate()
+        .is_ok());
     }
 
     #[test]
@@ -2930,9 +3007,12 @@ mod tests {
         // k=32 dense IS full-K (two k=16 atoms accumulated in order); the f8
         // block-scaled instruction at k=32 is gated by the sfa/sfb rules, not
         // the dense k rule.
-        assert!(kernel(tmem_body(vec![dense_mma(32, ScalarValue::Int(1))]))
-            .validate()
-            .is_ok());
+        assert!(kernel(tmem_body(vec![elected_if(vec![dense_mma(
+            32,
+            ScalarValue::Int(1)
+        )])]))
+        .validate()
+        .is_ok());
     }
 
     #[test]
@@ -2944,7 +3024,7 @@ mod tests {
                 var: acc,
                 initial: ScalarInitial::Value(ScalarValue::Int(0)),
             },
-            dense_mma(48, ScalarValue::Var(acc)),
+            elected_if(vec![dense_mma(48, ScalarValue::Var(acc))]),
         ]);
         assert!(kernel(body).validate().is_ok());
     }
@@ -2976,27 +3056,31 @@ mod tests {
 
     #[test]
     fn block_scaled_f8_k_set_and_sf_byte_rules() {
-        assert!(
-            kernel(tmem_body(vec![block_scaled_mma(128, 256, 32, 1, 0)]))
-                .validate()
-                .is_ok()
-        );
+        assert!(kernel(tmem_body(vec![elected_if(vec![block_scaled_mma(
+            128, 256, 32, 1, 0
+        )])]))
+        .validate()
+        .is_ok());
         // folded k-tile forms are valid only with scale vectors.
-        assert!(
-            kernel(tmem_body(vec![block_scaled_mma(128, 256, 128, 0, 0)]))
-                .validate()
-                .is_ok()
-        );
+        assert!(kernel(tmem_body(vec![elected_if(vec![block_scaled_mma(
+            128, 256, 128, 0, 0
+        )])]))
+        .validate()
+        .is_ok());
         // m=64 cta_group=1 has no block-scaled instruction (PTX mxf8f6f4 cg1
         // exists only at M=128).
-        let e = kernel(tmem_body(vec![block_scaled_mma(64, 256, 32, 0, 0)]))
-            .validate()
-            .unwrap_err();
+        let e = kernel(tmem_body(vec![elected_if(vec![block_scaled_mma(
+            64, 256, 32, 0, 0,
+        )])]))
+        .validate()
+        .unwrap_err();
         assert!(e.message.contains("m=64 cta_group=1"), "{}", e.message);
         // sf_byte addresses one of the 4 packed bytes.
-        let e = kernel(tmem_body(vec![block_scaled_mma(128, 256, 32, 4, 0)]))
-            .validate()
-            .unwrap_err();
+        let e = kernel(tmem_body(vec![elected_if(vec![block_scaled_mma(
+            128, 256, 32, 4, 0,
+        )])]))
+        .validate()
+        .unwrap_err();
         assert!(e.message.contains("sf_byte"), "{}", e.message);
     }
 
@@ -3027,16 +3111,20 @@ mod tests {
 
     #[test]
     fn fp4_mxf4_shape_transpose_cg_rules() {
-        assert!(kernel(tmem_body(vec![fp4_mma(128, 64, false, 1)]))
-            .validate()
-            .is_ok());
+        assert!(kernel(tmem_body(vec![elected_if(vec![fp4_mma(
+            128, 64, false, 1
+        )])]))
+        .validate()
+        .is_ok());
         // fp4 k must be one of the mxf4 instruction widths.
-        let e = kernel(tmem_body(vec![fp4_mma(128, 16, false, 1)]))
-            .validate()
-            .unwrap_err();
+        let e = kernel(tmem_body(vec![elected_if(vec![fp4_mma(
+            128, 16, false, 1,
+        )])]))
+        .validate()
+        .unwrap_err();
         assert!(e.message.contains("fp4 (mxf4) k"), "{}", e.message);
         // the mxf4 shapes have no transposed form.
-        let e = kernel(tmem_body(vec![fp4_mma(128, 64, true, 1)]))
+        let e = kernel(tmem_body(vec![elected_if(vec![fp4_mma(128, 64, true, 1)])]))
             .validate()
             .unwrap_err();
         assert!(
@@ -3045,7 +3133,7 @@ mod tests {
             e.message
         );
         // and exist only as (cg1, m=128) / (cg2, m=256).
-        let e = kernel(tmem_body(vec![fp4_mma(64, 64, false, 1)]))
+        let e = kernel(tmem_body(vec![elected_if(vec![fp4_mma(64, 64, false, 1)])]))
             .validate()
             .unwrap_err();
         assert!(e.message.contains("fp4 requires"), "{}", e.message);
@@ -3054,7 +3142,9 @@ mod tests {
         if let Stmt::Tcgen05Mma { sf_byte, .. } = &mut bad {
             *sf_byte = 1;
         }
-        let e = kernel(tmem_body(vec![bad])).validate().unwrap_err();
+        let e = kernel(tmem_body(vec![elected_if(vec![bad])]))
+            .validate()
+            .unwrap_err();
         assert!(e.message.contains("sf_byte must be 0"), "{}", e.message);
     }
 
@@ -3089,20 +3179,30 @@ mod tests {
         };
         let _ = a;
         // f32 TMEM operand x f16 SMEM operand: the readback mix is legal.
-        assert!(
-            kernel(tmem_body(vec![mma_tmem_a(tmem_op(0, 128, DType::F32))]))
-                .validate()
-                .is_ok()
-        );
+        assert!(kernel(tmem_body(vec![elected_if(vec![mma_tmem_a(tmem_op(
+            0,
+            128,
+            DType::F32
+        ))])]))
+        .validate()
+        .is_ok());
         // a u8 (packed fp4) TMEM operand has no modelled readback semantics.
-        let e = kernel(tmem_body(vec![mma_tmem_a(tmem_op(0, 128, DType::U8))]))
-            .validate()
-            .unwrap_err();
+        let e = kernel(tmem_body(vec![elected_if(vec![mma_tmem_a(tmem_op(
+            0,
+            128,
+            DType::U8,
+        ))])]))
+        .validate()
+        .unwrap_err();
         assert!(e.message.contains("TMEM operand dtype"), "{}", e.message);
         // an f8e4m3 TMEM operand is likewise unmodelled.
-        let e = kernel(tmem_body(vec![mma_tmem_a(tmem_op(0, 128, DType::F8E4M3))]))
-            .validate()
-            .unwrap_err();
+        let e = kernel(tmem_body(vec![elected_if(vec![mma_tmem_a(tmem_op(
+            0,
+            128,
+            DType::F8E4M3,
+        ))])]))
+        .validate()
+        .unwrap_err();
         assert!(e.message.contains("TMEM operand dtype"), "{}", e.message);
     }
 
@@ -3116,13 +3216,17 @@ mod tests {
             *lane_align = 16;
             *mm = 64;
         }
-        assert!(kernel(tmem_body(vec![m])).validate().is_ok());
+        assert!(kernel(tmem_body(vec![elected_if(vec![m])]))
+            .validate()
+            .is_ok());
         // lane_align on a full-datapath (m=128) layout is not a hardware shape.
         let mut m = dense_mma(16, ScalarValue::Int(0));
         if let Stmt::Tcgen05Mma { lane_align, .. } = &mut m {
             *lane_align = 16;
         }
-        let e = kernel(tmem_body(vec![m])).validate().unwrap_err();
+        let e = kernel(tmem_body(vec![elected_if(vec![m])]))
+            .validate()
+            .unwrap_err();
         assert!(
             e.message.contains("lane_align != 0 requires"),
             "{}",
@@ -3238,13 +3342,13 @@ mod tests {
     #[test]
     fn tmem_operand_static_spans_must_land_in_a_live_band() {
         // dst col 400 + 256 columns overruns the 512-column grid's live band.
-        let e = kernel(tmem_body(vec![{
+        let e = kernel(tmem_body(vec![elected_if({
             let mut m = dense_mma(16, ScalarValue::Int(0));
             if let Stmt::Tcgen05Mma { dst, .. } = &mut m {
                 *dst = tmem_op(0, 400, DType::F32);
             }
-            m
-        }]))
+            vec![m]
+        })]))
         .validate()
         .unwrap_err();
         assert!(
@@ -3253,13 +3357,13 @@ mod tests {
             e.message
         );
         // a constant address outside [0, 512) is rejected outright.
-        let e = kernel(tmem_body(vec![{
+        let e = kernel(tmem_body(vec![elected_if({
             let mut m = dense_mma(16, ScalarValue::Int(0));
             if let Stmt::Tcgen05Mma { dst, .. } = &mut m {
                 *dst = tmem_op(0, 512, DType::F32);
             }
-            m
-        }]))
+            vec![m]
+        })]))
         .validate()
         .unwrap_err();
         assert!(e.message.contains("col (TMEM column)"), "{}", e.message);
@@ -3276,25 +3380,35 @@ mod tests {
             cta_group: 1,
         };
         // u32 cells, effectively-1-D src: legal.
-        assert!(
-            kernel(tmem_body(vec![cp(tmem_op(0, 300, DType::U32), &src_u32)]))
-                .validate()
-                .is_ok()
-        );
+        assert!(kernel(tmem_body(vec![elected_if(vec![cp(
+            tmem_op(0, 300, DType::U32),
+            &src_u32
+        )])]))
+        .validate()
+        .is_ok());
         // dst/src dtype must match.
-        let e = kernel(tmem_body(vec![cp(tmem_op(0, 300, DType::U32), &src_f32)]))
-            .validate()
-            .unwrap_err();
+        let e = kernel(tmem_body(vec![elected_if(vec![cp(
+            tmem_op(0, 300, DType::U32),
+            &src_f32,
+        )])]))
+        .validate()
+        .unwrap_err();
         assert!(e.message.contains("dtype must match"), "{}", e.message);
         // a 2-D u32 src is not the single effective vector the copy models.
-        let e = kernel(tmem_body(vec![cp(tmem_op(0, 300, DType::U32), &src_2d)]))
-            .validate()
-            .unwrap_err();
+        let e = kernel(tmem_body(vec![elected_if(vec![cp(
+            tmem_op(0, 300, DType::U32),
+            &src_2d,
+        )])]))
+        .validate()
+        .unwrap_err();
         assert!(e.message.contains("effectively 1-D"), "{}", e.message);
         // only u32 (UE8M0) or e4m3 (nvfp4) scale cells move through cp.
-        let e = kernel(tmem_body(vec![cp(tmem_op(0, 300, DType::F32), &src_f32)]))
-            .validate()
-            .unwrap_err();
+        let e = kernel(tmem_body(vec![elected_if(vec![cp(
+            tmem_op(0, 300, DType::F32),
+            &src_f32,
+        )])]))
+        .validate()
+        .unwrap_err();
         assert!(e.message.contains("scale cells"), "{}", e.message);
     }
 
@@ -3356,14 +3470,14 @@ mod tests {
         // a plain unicast load: legal (bytes derive from the tile).
         assert!(kernel(vec![
             Stmt::MBarDef { mbar: m.clone() },
-            tma_load(&m, vec![64, 64], None, 1),
+            elected_if(vec![tma_load(&m, vec![64, 64], None, 1)]),
         ])
         .validate()
         .is_ok());
         // a zero-extent tile would derive a 0-byte transfer.
         let e = kernel(vec![
             Stmt::MBarDef { mbar: m.clone() },
-            tma_load(&m, vec![0, 64], None, 1),
+            elected_if(vec![tma_load(&m, vec![0, 64], None, 1)]),
         ])
         .validate()
         .unwrap_err();
@@ -3383,7 +3497,7 @@ mod tests {
         if let Stmt::TmaLoad { mbar, .. } = &mut load {
             mbar.remote_coord = Some(ScalarValue::Int(0));
         }
-        k.body.push(load);
+        k.body.push(elected_if(vec![load]));
         let e = k.validate().unwrap_err();
         assert!(
             e.message.contains("multicast with a peer-referenced"),
@@ -3400,19 +3514,23 @@ mod tests {
             count,
             stage: None,
         };
-        assert!(
-            kernel(vec![Stmt::MBarDef { mbar: m.clone() }, init(1 << 20 - 1)])
-                .validate()
-                .is_ok()
-        );
-        let e = kernel(vec![Stmt::MBarDef { mbar: m.clone() }, init(1 << 20)])
-            .validate()
-            .unwrap_err();
+        assert!(kernel(vec![
+            Stmt::MBarDef { mbar: m.clone() },
+            elected_if(vec![init(1 << 20 - 1)]),
+        ])
+        .validate()
+        .is_ok());
+        let e = kernel(vec![
+            Stmt::MBarDef { mbar: m.clone() },
+            elected_if(vec![init(1 << 20)]),
+        ])
+        .validate()
+        .unwrap_err();
         assert!(e.message.contains("2^20"), "{}", e.message);
         // phase is required (the phase-less form diverged sim vs codegen).
         let e = kernel(vec![
             Stmt::MBarDef { mbar: m.clone() },
-            init(1),
+            elected_if(vec![init(1)]),
             Stmt::MBarrierWait {
                 mbar: mbar_ref(&m),
                 stage: None,
@@ -3443,6 +3561,45 @@ mod tests {
         .validate()
         .unwrap_err();
         assert!(e.message.contains("single assignment"), "{}", e.message);
+    }
+
+    /// `single_issue_scope`: hardware single-issue ops must sit under an
+    /// explicit single-lane branch — codegen never infers the guard, so a
+    /// bare site would issue once per lane (double-init, duplicate TMA/MMA).
+    #[test]
+    fn single_issue_scope_rule() {
+        let bar = mbar(7, MBarKind::Thread);
+        let init = || Stmt::MBarrierInit {
+            mbar: mbar_ref(&bar),
+            count: 1,
+            stage: None,
+        };
+        let def = || Stmt::MBarDef { mbar: bar.clone() };
+
+        // bare at function scope -> rejected
+        let e = kernel(vec![def(), init()]).validate().unwrap_err();
+        assert!(e.message.contains("single_issue_scope"), "{}", e.message);
+        // under a full-warp branch (32 lanes) -> rejected
+        let e = kernel(vec![def(), warp_if(0, vec![init()])])
+            .validate()
+            .unwrap_err();
+        assert!(e.message.contains("single_issue_scope"), "{}", e.message);
+        // under warp + if_elected (one lane) -> accepted
+        kernel(vec![def(), warp_if(0, vec![elected_if(vec![init()])])])
+            .validate()
+            .unwrap();
+        // under a provably one-lane predicate (tid_in_wg == 0) -> accepted
+        let tid0 = Stmt::If {
+            cond: ScalarValue::expr(
+                ScalarOp::Eq,
+                vec![
+                    ScalarValue::Scope(ScopeValueKind::TidInWg),
+                    ScalarValue::Int(0),
+                ],
+            ),
+            then_body: vec![init()],
+        };
+        kernel(vec![def(), tid0]).validate().unwrap();
     }
 
     #[test]
@@ -3505,14 +3662,17 @@ mod tests {
         if let Stmt::TmaLoad { mbar, .. } = &mut load {
             mbar.remote_coord = Some(ScalarValue::Int(0));
         }
-        let mut k = kernel(vec![Stmt::MBarDef { mbar: m.clone() }, load]);
+        let mut k = kernel(vec![
+            Stmt::MBarDef { mbar: m.clone() },
+            elected_if(vec![load]),
+        ]);
         k.launch_shape = vec![2];
         k.cluster_shape = vec![2];
         assert!(k.validate().is_ok());
         // without any peer reference the routing has no meaning.
         let k2 = kernel(vec![
             Stmt::MBarDef { mbar: m.clone() },
-            tma_load(&m, vec![64, 64], None, 1),
+            elected_if(vec![tma_load(&m, vec![64, 64], None, 1)]),
         ]);
         let e = k2.validate().unwrap_err();
         assert!(e.message.contains("peer reference"), "{}", e.message);
@@ -3565,9 +3725,11 @@ mod tests {
             }]
         };
         // inside scheduler_impl with a TMA mbar and a 16B handle: legal.
-        assert!(kernel(in_impl(vec![try_cancel(&sched, &handle, &m)]))
-            .validate()
-            .is_ok());
+        assert!(kernel(in_impl(vec![elected_if(vec![try_cancel(
+            &sched, &handle, &m
+        )])]))
+        .validate()
+        .is_ok());
         // outside scheduler_impl.
         let e = kernel(vec![try_cancel(&sched, &handle, &m)])
             .validate()

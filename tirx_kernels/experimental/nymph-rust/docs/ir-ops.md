@@ -50,6 +50,55 @@ commit 76600421 (codegen-side rejections + sf_block validation).
    recipes, abstractions 1/4/5 introduce no observable divergence. (Skipped
    without a CUDA device.)
 
+## Codegen emission guards: the zero-inference rule
+
+**Codegen never synthesizes an emission guard from the statically-computed
+thread scope. Every guard in the emitted source comes from the IR.**
+
+Hardware single-issue ops — `tma_load` / `tma_store` /
+`cp_async_bulk_s2cluster` (the TMA issue family), `tcgen05_mma` /
+`tcgen05_cp` / `tcgen05_commit`, `mbarrier_init` (an unguarded init is a
+double-init error in both models), `clc_try_cancel` (stream-level in the
+interpreter) — are legal ONLY under an explicit single-lane `If` in the IR:
+the `if_elected` sugar (`lane_id == 0`), or any predicate the static thread
+filter proves selects at most one lane per warp (`tid_in_wg == 0`,
+`thread_rank == 0`, ...). The single-lane upper bound is sticky: a deeper
+runtime branch (e.g. `cta_rank == 0`) only selects a subset, so it cannot
+reintroduce double-issue.
+
+- **Validator (`single_issue_scope`)**: a single-issue op outside such a
+  branch fails `Kernel::validate` at build; `emit_single_issue` in codegen
+  hard-errors as the second line of defense. (Before the rule, codegen wrapped
+  these ops in a scope-inferred `elect_sync` / `tid_in_wg == 0` — exactly the
+  inference the rule bans; a kernel that forgot the elected branch compiled
+  fine and issued 32 duplicate TMA/MMAs or double-inited on GPU.)
+- **Per-thread ops emit per-thread**: `mbarrier.arrive` /
+  `expect_tx` / `arrive_expect_tx`, `store_scalar`, and async-proxy fences —
+  the interpreter applies them once per executing lane, so an inferred guard
+  undercounts arrivals/tx-bytes (the gdn `gate_ready` deadlock class) or drops
+  lane-varying stores. Sites that need one arrival/lane write elect it in the
+  IR; the emitted code then matches 1:1.
+- The scope is still *classified* (`static_thread_filter`) for legality checks
+  (CTA-wide `cta_sync` at function scope, warp-collective forms, `Elected`
+  recognition for the single-issue arms) — analysis of explicit IR conditions,
+  never invention of new predicates.
+- The `if_elected` sugar lowers to `if T.ptx.elect_sync():` (canon's guard),
+  narrowed to `if T.cuda.thread_rank() == 0:` when the body is loop-free and
+  provably exactly CTA thread 0 — the same one thread either way (an emission
+  spelling, not a guard change).
+- Negative coverage: `tests/test_compile_gate.py::test_single_issue_scope_negative`
+  (build rejected without an elected branch, passes with one, exactly one
+  `elect_sync` in the output) and
+  `src/ir/validate.rs::tests::single_issue_scope_rule` (function scope /
+  full-warp rejected, `if_elected` and `tid_in_wg == 0` accepted).
+
+Historical note: the pre-rule inferred guards also *coalesced* adjacent
+single-issue ops under one guard (a Blackwell tcgen05-issue-stream
+reconvergence hazard). The shipped kernels already place each whole issue
+burst (init group, TMA stream, MMA burst) under ONE explicit elected branch,
+so the hardware-visible issue pattern is unchanged.
+
+
 ## tcgen05.mma (§9.7.17.10.9, Table 42 §9.7.17.2.1, Tables 45-47, 54-55, 59-60)
 
 Modeled: kind::f16 (cg1 m∈{64,128}, cg2 m∈{128,256}, Layouts A/B/D/F — B200

@@ -73,3 +73,90 @@ the probe's broken write-back loop.
 1. Sentinel-write bisect on the stripped gdn skeleton → stall site.
 2. Fix WarpMma probe dump → confirm/deny mma.sync values vs interpreter.
 3. Then the main ladder: ns1_t64 cosine → 6 shapes → full pytest → bench.
+
+## Resolution wave (commits 2d1448ac, 02b55833, c5da1718, db96f0fe, zero-inference wave)
+
+All issues above are now resolved; final gate numbers at the bottom.
+
+### Root causes found (each with GPU evidence)
+
+1. **mbarrier.arrive undercount → pipeline deadlock** (`2d1448ac`). The
+   codegen emitted `arrive` under an inferred single-issue guard (elect_sync);
+   the interpreter arrives once per executing lane and gdn's barrier counts
+   are sized for exactly that (32/128 arrivals). One arrival never completed
+   a phase: TMA/GATE warps exited, MMA/CG0/CG1/EPI spun in try_wait forever
+   (cuda-gdb backtrace). Fix: arrive emits per-thread; single-arrival sites
+   are elected in the IR already.
+2. **wg-view column-slice offset dropped** (`02b55833`). Sliced reg element
+   ops (`frag[:, 1:2]`, `[r:r+1]`) lost the slice offset through the wg
+   tile view (B200 probe: `fill(frag[:,1:2])` wrote element 0). Fix: sliced
+   reg elementwise ops lower to the per-thread scalar flat form; full-extent
+   ops keep `Tx.wg.*`.
+3. **Aux-view reverse-construction invalid + WarpSync no-op** (`02b55833`).
+   The `alloc_local(W)+view(...)` Apply mapped (tid,j) out of bounds; use
+   `T.wg_reg_tile + .local()` (storage-layout view, thread axis peeled).
+   `WarpSync` lowered to nothing; now emits `T.cuda.warp_sync()`.
+4. **chain_top_level_ifs reorder → TMA-after-wait deadlock** (`c5da1718`).
+   The top-level If-chaining pass ran each group's warpgroup-prefix body
+   BEFORE its warp-level branches regardless of source order: a probe's
+   warp-1 TMA issue (source-order before the consumer warpgroup's
+   `mbarrier_wait`) was emitted AFTER the wait → spin forever. Only the
+   canonical wg-prefix-then-warp-roles order chains now; mixed runs emit
+   flat (source order, always sound). Regression test:
+   `codegen.rs::tests::warp_before_warpgroup_run_stays_flat`.
+5. **WarpMma B fragment transposed in the interpreter** (`db96f0fe`). The
+   interpreter unpacked the mma.sync B operand as bmat[(2t+h)·kk + g]; real
+   sm_100 hardware (pinned by tests/mma_sync_hardware.rs's direct-feed
+   layout B[n=g][k=kt·8+2t+h]) wants bmat[g·kk + kt·8+2t+h]. A non-trans
+   ldmatrix feed therefore computes D = A·tileᵀ on hardware but A·tile in
+   the sim — every warp-mma consumer written against the sim (the whole
+   hierarchical-inverse merge) was wrong on GPU by exactly a B transpose.
+   GPU battery evidence: merge round-1 dcs matched `Q@Cᵀ` (max err 0.0019),
+   not `Q@C` (1.14). Fixed as one atomic pair: interpreter unpack +
+   gdn `_ldB` switches to a trans ldmatrix + `test_warp_mma` feeds B
+   non-trans. The earlier `bisect_warpmma` probe missed it because
+   ones×0.5 is transpose-invariant.
+6. **RegLoad GMEM src silently dropped** (`c5da1718`). A point
+   `reg_load` from a GMEM tensor fell through the codegen arm and emitted
+   NOTHING (a probe's init loop stored uninitialized registers everywhere).
+   Now lowered (raw element assignment) + the arm fails closed on any
+   other unsupported src space.
+
+### Merge-chain verification (probe_merge, standalone replica)
+
+Post-GJ input (unit diag, diag 8×8 blocks inverted, strict lower), the
+kernel's exact `_ldA/_ldB/_store8/_merge` on mode-3 swizzled ainv_s/dcs_s,
+rounds b=8 ×4, b=16 ×2, b=32 ×1 with cross-warp wg_sync: **GPU vs numpy
+replica bit-exact (max diff 0.000000)**, replica vs `np.linalg.inv` max
+abs 0.0347 (bf16 store rounding only).
+
+### Final gate numbers
+
+- cargo test: 162 + 15 passed.
+- pytest battery (warp_mma + gdn value sim + compile gate): **84 passed**.
+- Oracle cosine gate (nymph GPU vs numpy oracle, no flashinfer JIT):
+
+| shape | cos_out | cos_state |
+| --- | --- | --- |
+| ns1_t64 | 0.99999 | 1.00000 |
+| ns1_t512 | 0.99999 | 1.00000 |
+| ns1_t2048 | 0.99999 | 1.00000 |
+| ns20_t192 | 0.99999 | 1.00000 |
+| ns48_t64 | 0.99999 | 1.00000 |
+| v_70_130 | 0.99999 | 1.00000 |
+
+(v_70_130's out buffer is NaN-padded beyond the packed rows by design —
+"padding content is irrelevant; the kernel masks OOB" — the comparison
+crops to the 200 packed rows.)
+
+### Zero-inference guard rule (user-mandated)
+
+Codegen no longer synthesizes ANY emission guard from the thread scope:
+single-issue ops (tma_load/store, cp_async_bulk_s2cluster, tcgen05
+mma/cp/commit, mbarrier.init, clc_try_cancel) are legal only under an
+explicit single-lane If (validator `single_issue_scope`, sticky one-lane
+upper bound through runtime sub-branches); per-thread ops (arrive /
+expect_tx / store_scalar / async-proxy fence) emit per-thread, matching
+the interpreter. Rule + audit table: docs/ir-ops.md §"Codegen emission
+guards". Negative tests: validate.rs `single_issue_scope_rule`,
+tests/test_compile_gate.py `test_single_issue_scope_negative`.

@@ -1,43 +1,52 @@
 //! Rust codegen: lower a nymph `ir::Kernel` to a TVMScript (`tvm.script.tirx`)
 //! source string. Ported from the Role-model codegen (PR #18) onto the
 //! warp-model IR: the `Role`/`KernelInit`/`KernelFinalize` nodes are gone —
-//! thread dispatch is plain `Stmt::If` over scalar predicates — so the
-//! emission decisions are re-derived from the *condition stack* instead of
-//! the node type:
+//! thread dispatch is plain `Stmt::If` over scalar predicates.
 //!
-//! - The thread scope of a body comes from the static evaluation of the
-//!   enclosing `If` conditions (`static_thread_filter`): a full-CTA set is
-//!   `Function` scope (CTA-wide `cta_sync` legal, mbarrier-init guards with
-//!   `T.cuda.thread_rank() == 0`), exactly one full warp is `Warp` scope
-//!   (single-issue guard `T.ptx.elect_sync()`), exactly one full warpgroup is
-//!   `Warpgroup` scope (`tid_in_wg == 0`), and a set with at most one lane per
-//!   warp is `Elected` (single-issue ops emit bare — the guard already elects
-//!   one thread per warp). An unknown (runtime) condition inherits the parent
-//!   scope. This replaces `Scope::issue_guard`'s role-driven split 1:1.
+//! ZERO-INFERENCE guard rule (user-mandated): codegen NEVER synthesizes an
+//! emission guard from the statically-computed thread scope. Every guard in
+//! the output comes from the IR:
 //! - The `if_elected` sugar (`lane_id == 0`) emits as `if T.ptx.elect_sync():`
 //!   (canon's guard), narrowed to `if T.cuda.thread_rank() == 0:` when the
-//!   enclosed thread set is exactly CTA thread 0 (the prologue's
-//!   warp-0-elected form — canon's grouped-init block). A leading
-//!   `ClusterBarrierWait` inside an elect-form `If` is peeled out of the elect
-//!   (warp-collective; the elected-lane wait deadlocks on hardware).
+//!   enclosed thread set is provably exactly CTA thread 0 AND the body is
+//!   loop-free (canon's prologue form — the same one thread, an emission
+//!   spelling change only). A leading `ClusterBarrierWait` inside an
+//!   elect-form `If` is peeled out of the elect (warp-collective; the
+//!   elected-lane wait deadlocks on hardware).
+//! - Hardware single-issue ops (TmaLoad/TmaStore/CpAsyncBulkS2Cluster,
+//!   Tcgen05Mma/Tcgen05Cp/Tcgen05Commit, MBarrierInit, ClcTryCancel) are
+//!   legal ONLY under an explicit single-lane `If` — the validator's
+//!   `single_issue_scope` rule rejects anything else at build, and
+//!   `emit_single_issue` hard-errors as the codegen-side defense. (Before
+//!   this rule codegen wrapped them in a scope-inferred `elect_sync` /
+//!   `tid_in_wg == 0` — exactly the inference the rule bans.)
+//! - Per-thread ops (mbarrier arrive / expect_tx / arrive_expect_tx,
+//!   store_scalar, async-proxy fences) emit PER-THREAD, matching the
+//!   interpreter (one application per executing lane) — an inferred guard
+//!   undercounts arrivals / tx bytes / drops lane-varying stores (the gdn
+//!   gate_ready deadlock class).
+//! - The thread scope of a body is still CLASSIFIED from the enclosing `If`
+//!   conditions (`static_thread_filter`) — but only for legality checks
+//!   (CTA-wide `cta_sync` at function scope, warp-collective forms) and for
+//!   the `Elected` recognition above, never to invent a guard.
 //! - Role dispatch chaining (`chain_top_level_ifs`): a run of >=2 ADJACENT
 //!   TOP-LEVEL `If`s whose conditions are warp/warpgroup equalities re-nests
 //!   into canon's if/else decision tree, partitioned by warpgroup exactly like
 //!   #18's `chain_top_level_roles` (a warpgroup-equality `If` is its group's
 //!   prefix; warp-equality `If`s chain behind it; duplicate conditions merge
-//!   bodies — all flat-equivalent). The R2UR-sensitive fp16 dispatch shape
-//!   depends on this (docs/perf-methodology.md §5).
+//!   bodies). Only order-preserving runs chain: a group mixing a warp-level
+//!   `If` BEFORE its warpgroup-level `If` stays flat — chaining would reorder
+//!   independent statements (the TMA-after-wait deadlock probe). The
+//!   R2UR-sensitive fp16 dispatch shape depends on the canonical form
+//!   (docs/perf-methodology.md §5).
 //! - `KernelInit`'s two side duties survive as structural rules: the single
 //!   TMEM view buffer (`tmem`) + SF views are declared at function scope right
-//!   after the top-level statement containing the first `TmemAlloc`, and the
-//!   prologue mbarrier-init group merges under one
-//!   `if T.cuda.thread_rank() == 0:` (the guard merge is annotation-driven,
-//!   never text-driven).
+//!   after the top-level statement containing the first `TmemAlloc`.
 //!
 //! Everything else is the #18 pass unchanged: full-K `gemm_async` at the IR's
 //! own granularity, runtime `accum` scalar, TmemOperand/SfView TMEM views,
 //! leader-routed TMA barriers (peer `try_wait` is illegal and skipped), the
-//! structured emitter (guard merge + `fill_empty_blocks`), the pow2/trunc
+//! structured emitter (`fill_empty_blocks`), the pow2/trunc
 //! strength reduction gated on the provable-nonneg analysis, and fail-closed
 //! exhaustiveness: every `Stmt` variant either has a lowering arm below or an
 //! explicit `Err` — no `..` catch-all, never a silent different-semantics
@@ -193,18 +202,6 @@ impl Scope {
     /// True at function scope: all CTA threads converge, so `cta_sync` is legal.
     fn is_function(self) -> bool {
         self == Scope::Function
-    }
-    /// The predicate electing the single thread that issues a single-issue async
-    /// op. Warp / function scope elect ONE lane PER WARP via the hardware
-    /// `elect.sync` (canon's exact guard — no `% 32` recompute per site).
-    /// Warpgroup scope MUST stay `tid_in_wg == 0` (see the enum note).
-    fn issue_guard(self) -> &'static str {
-        match self {
-            Scope::Warpgroup => "tid_in_wg == 0",
-            Scope::Warp | Scope::Function => "T.ptx.elect_sync()",
-            // Already single-threaded; `emit_guarded` skips the guard here.
-            Scope::Elected => "True",
-        }
     }
 }
 
@@ -452,9 +449,6 @@ impl Ctx {
         }
         let base = self.mbar_names.get(&id)?;
         Some(format!("{base}_cta0"))
-    }
-    fn is_tma_leader_mbar(&self, id: u32) -> bool {
-        self.tma_leader_mbars.contains(&id)
     }
 }
 
@@ -1002,7 +996,7 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
         );
     }
 
-    Ok(render_lines(fill_empty_blocks(merge_guards(out.finish()))))
+    Ok(render_lines(fill_empty_blocks(out.finish())))
 }
 
 /// Declare the single TMEM view buffer (+ the NVFP4 SF views) at function scope.
@@ -1132,7 +1126,6 @@ fn fill_empty_blocks(lines: Vec<Line>) -> Vec<Line> {
             out.push(Line {
                 indent: line.indent + 1,
                 text: "pass".into(),
-                guard: None,
             });
         }
     }
@@ -1342,13 +1335,10 @@ fn chain_top_level_ifs(body: &[Stmt]) -> Vec<TopUnit> {
 /// leading pad, and an optional single-issue-guard annotation. The annotation
 /// is set at the emission site when the line opens a `if tid_in_wg == 0:` /
 /// `if T.ptx.elect_sync():` single-issue guard block — it is what the guard
-/// merge keys on, so a textually identical line from an IR `If` (or any other
-/// construct) is never mistaken for a single-issue guard.
 #[derive(Clone, PartialEq, Eq)]
 struct Line {
     indent: usize,
     text: String,
-    guard: Option<&'static str>,
 }
 
 /// The emission sink: accumulates the source as STRUCTURED lines (not one flat
@@ -1396,15 +1386,7 @@ impl Emitter {
         self.lines.push(Line {
             indent,
             text: text.trim_start().to_string(),
-            guard: None,
         });
-    }
-
-    /// Annotate the line just completed as a single-issue guard head.
-    fn mark_guard(&mut self, guard: &'static str) {
-        if let Some(last) = self.lines.last_mut() {
-            last.guard = Some(guard);
-        }
     }
 
     fn finish(mut self) -> Vec<Line> {
@@ -1417,51 +1399,6 @@ impl Emitter {
 
 /// Merge ADJACENT identical single-issue guard blocks (the annotated
 /// `if tid_in_wg == 0:` / `if T.ptx.elect_sync():` lines) into one block.
-/// Canon writes the epilogue trio as `if tid%128==0: fence; store; commit`
-/// under ONE guard; emitting each op with its own guard costs a BSSY/BSYNC
-/// reconvergence pair per block in SASS. Both guard predicates are invariant
-/// across adjacent blocks (tid constant; elect.sync re-elects the same leader
-/// with no divergence in between), so folding is semantics-preserving.
-/// Conservative: only exactly-adjacent lines (no blank/other line between).
-/// Structured: the merge keys on the emission-site guard annotation and the
-/// numeric indent, never on the line text, so a non-guard line that merely
-/// reads the same is untouched.
-fn merge_guards(lines: Vec<Line>) -> Vec<Line> {
-    let mut out: Vec<Line> = Vec::new();
-    let mut i = 0usize;
-    while i < lines.len() {
-        let line = &lines[i];
-        if let Some(guard) = line.guard {
-            let indent = line.indent;
-            out.push(line.clone());
-            i += 1;
-            loop {
-                // copy the guard's body: lines strictly deeper than the guard
-                while i < lines.len() {
-                    let l = &lines[i];
-                    if l.text.is_empty() || l.indent <= indent {
-                        break;
-                    }
-                    out.push(l.clone());
-                    i += 1;
-                }
-                // absorb an immediately-following identical guard at the same depth
-                let dup =
-                    i < lines.len() && lines[i].guard == Some(guard) && lines[i].indent == indent;
-                if dup {
-                    i += 1; // drop the duplicate guard line; keep copying its body
-                } else {
-                    break;
-                }
-            }
-        } else {
-            out.push(line.clone());
-            i += 1;
-        }
-    }
-    out
-}
-
 /// Render the structured lines back to source text: re-pad each line from its
 /// numeric indent, join with newlines, terminate the final line.
 fn render_lines(lines: Vec<Line>) -> String {
@@ -2064,14 +2001,15 @@ fn collect_reg_aux_views(
                     note_atom_shape(v, dst.tensor.id, shape)?;
                 }
             }
-            Stmt::Tcgen05St { dst, src, shape, .. } => {
+            Stmt::Tcgen05St {
+                dst, src, shape, ..
+            } => {
                 if *shape != LdStShape::B32x32 {
                     let v = views.entry(src.tensor.id).or_default();
                     v.flat = true;
                     note_atom_shape(v, src.tensor.id, shape)?;
                 }
-                if matches!(dst.dtype, DType::F16 | DType::Bf16) && !tmem_16.contains(&dst.dtype)
-                {
+                if matches!(dst.dtype, DType::F16 | DType::Bf16) && !tmem_16.contains(&dst.dtype) {
                     tmem_16.push(dst.dtype);
                 }
             }
@@ -2380,7 +2318,9 @@ fn reg_slice_parts(s: &TensorSlice) -> Result<(&Arc<Tensor>, &ScalarValue, usize
 /// interpreter's `literal_array`).
 fn typed_scalar(dtype: DType, l: RegLiteral) -> Result<String, String> {
     match dtype {
-        DType::F16 | DType::Bf16 | DType::F32 => Ok(format!("T.{}({})", dtype_str(dtype), l.as_f32())),
+        DType::F16 | DType::Bf16 | DType::F32 => {
+            Ok(format!("T.{}({})", dtype_str(dtype), l.as_f32()))
+        }
         DType::I8
         | DType::U8
         | DType::I16
@@ -3232,7 +3172,7 @@ fn emit_top_unit(
     scope: &ScopeInfo,
 ) -> Result<(), String> {
     match unit {
-        TopUnit::Stmt(s) => emit_stmt(out, s, indent, ctx, scope, false),
+        TopUnit::Stmt(s) => emit_stmt(out, s, indent, ctx, scope),
         TopUnit::Chain(c) => emit_if_chain(out, c, indent, ctx, scope),
     }
 }
@@ -3331,80 +3271,39 @@ fn emit_body(
             i = j;
             continue;
         }
-        // Single-issue guard coalescing: a maximal run of adjacent stmts that
-        // each emit as `if {guard}: <body>` under the SAME single-issue guard is
-        // emitted under ONE `if {guard}:` block, with every body indented inside
-        // it. The prologue mbarrier inits are ~18 such adjacent stmts; one shared
-        // guard collapses 18 `elect.sync` + 18 predicated branches into 1. This
-        // is a generic peephole keyed ONLY on guard-string identity (a structural
-        // property of the emitted stream), not on any kernel/shape/op.
-        if let Some(guard) = single_issue_guard(&stmts[i], scope, ctx) {
-            let mut j = i;
-            while j < stmts.len() && single_issue_guard(&stmts[j], scope, ctx) == Some(guard) {
-                j += 1;
-            }
-            if j - i >= 2 {
-                out.push_str(&format!("{p}if {guard}:\n"));
-                out.mark_guard(guard);
-                for s in &stmts[i..j] {
-                    emit_stmt(out, s, indent + 1, ctx, scope, true)?;
-                }
-                i = j;
-                continue;
-            }
-        }
-        emit_stmt(out, &stmts[i], indent, ctx, scope, false)?;
+        emit_stmt(out, &stmts[i], indent, ctx, scope)?;
         i += 1;
     }
     Ok(())
 }
 
-/// The single-issue guard string for a stmt that emits as `if {guard}: <one body>` under
-/// `scope`, or `None` if the stmt is not a coalescable single-issue op (already
-/// single-threaded under `Elected`, or not a single-issue op at all). Drives the
-/// run coalescing in `emit_body`. The leader-routed `arrive.expect_tx` (extra
-/// `cbx == 0` nesting) and warpgroup-collective stores are NOT coalescable here
-/// (they return `None`), so they keep their own emission path. Generic: the
-/// guard comes from `scope.issue_guard`, the same string every single-issue op uses.
-fn single_issue_guard(stmt: &Stmt, scope: &ScopeInfo, ctx: &Ctx) -> Option<&'static str> {
-    use Stmt::*;
+/// ZERO-INFERENCE guard rule (user-mandated): codegen NEVER synthesizes a
+/// single-issue guard from the statically-computed thread scope. Hardware
+/// single-issue ops — TmaLoad/TmaStore/CpAsyncBulkS2Cluster (the TMA issue
+/// family), Tcgen05Mma/Tcgen05Cp/Tcgen05Commit, MBarrierInit (an unguarded
+/// init is a double-init error in both models), ClcTryCancel (stream-level in
+/// the interpreter) — are legal ONLY under an explicit single-lane `If` in
+/// the IR (the `if_elected` sugar or a provably one-lane-per-warp predicate);
+/// the validator enforces that at build (`single_issue_scope`), and this
+/// helper is the codegen-side defense: bare under `Elected`, a hard error
+/// anywhere else. Per-thread ops (mbarrier arrive/expect_tx, store_scalar)
+/// emit per-thread — the interpreter applies them once per executing lane.
+fn emit_single_issue(
+    out: &mut Emitter,
+    p: &str,
+    scope: &ScopeInfo,
+    op: &str,
+    body: &str,
+) -> Result<(), String> {
     if scope.scope == Scope::Elected {
-        return None;
-    }
-    match stmt {
-        // The leader expect_tx nests under `cbx == 0` first — not a plain single guard.
-        MBarrierArriveExpectTx {
-            mbar,
-            bytes: _,
-            stage: _,
-        } if ctx.is_tma_leader_mbar(mbar.mbar.id) => None,
-        // mbarrier.init at FUNCTION scope (the prologue): guard with
-        // `T.cuda.thread_rank() == 0` — canon's exact prologue form (a CTA-thread-0
-        // predicate, no elect.sync). The run coalescing below then folds a whole
-        // contiguous init group into ONE guarded block (canon's grouped inits), instead
-        // of one `elect.sync` + branch per barrier. Only at function scope: inside a
-        // warp/warpgroup branch the CTA thread 0 may not be in the branch's mask, so
-        // the scope guard stays.
-        MBarrierInit { .. } if scope.is_function() => Some("T.cuda.thread_rank() == 0"),
-        MBarrierInit { .. }
-        | MBarrierArriveExpectTx { .. }
-        | MBarrierExpectTx { .. }
-        | StoreScalar { .. }
-        | TmaLoad { .. }
-        // Tcgen05Cp MUST coalesce with the adjacent Tcgen05Mma/Commit under ONE elect
-        // block: each tcgen05 op (cp SFA, cp SFB, gemm, commit) in its OWN `if elect_sync()`
-        // forces a warp reconvergence between them, which on Blackwell breaks the tcgen05
-        // async issue stream and STALLS the block-scaled MMA (a GPU deadlock — the nvfp4
-        // cluster gemm never retires, so tmem_full is never committed). Coalescing all the
-        // consecutive same-guard tcgen05 ops into one elect (canon's `if elect_sync(): cp;
-        // cp; gemm`) keeps the single issuing lane converged across the whole issue burst.
-        | Tcgen05Cp { .. }
-        | Tcgen05Mma { .. }
-        | Tcgen05Commit { .. } => Some(scope.scope.issue_guard()),
-        // MBarrierArrive is per-thread (see its arm): NO single-issue guard — the
-        // interpreter arrives once per executing lane and the barrier counts are
-        // sized for exactly that (an elect here undercounts and deadlocks).
-        _ => None,
+        out.push_str(&format!("{p}{body}\n"));
+        Ok(())
+    } else {
+        Err(format!(
+            "codegen: {op} is a hardware single-issue op but its scope is not \
+             single-lane — wrap it in an explicit elected `If` (the validator's \
+             single_issue_scope rule rejects this at build)"
+        ))
     }
 }
 
@@ -3414,31 +3313,9 @@ fn emit_stmt(
     indent: usize,
     ctx: &Ctx,
     scope: &ScopeInfo,
-    // When true, the caller already opened the single-issue `if {guard}:` block
-    // (run coalescing) and `indent` is the inner level: the single-issue
-    // guarded arms emit ONLY their inner body, skipping their own `if {guard}:`.
-    // False = standalone emission (each guarded arm opens its own guard).
-    bare: bool,
 ) -> Result<(), String> {
     use Stmt::*;
     let p = pad(indent);
-    // Emit a single-issue guarded op's body. Standalone (`bare == false`): open the
-    // `if {guard}:` here and indent the body once. Coalesced (`bare == true`): the caller
-    // already opened the shared guard at `indent - 1`, so emit the body at `indent` with no
-    // guard. `body` is the inner line(s) WITHOUT leading indent or trailing newline.
-    let emit_guarded = |out: &mut Emitter, body: &str| {
-        if bare || scope.scope == Scope::Elected {
-            // Coalesced under a shared guard, or the branch is already
-            // single-threaded — emit the single-issue body directly with no
-            // per-op `if guard:`.
-            out.push_str(&format!("{p}{body}\n"));
-        } else {
-            let guard = scope.scope.issue_guard();
-            out.push_str(&format!("{p}if {guard}:\n"));
-            out.mark_guard(guard);
-            out.push_str(&format!("{p}    {body}\n"));
-        }
-    };
     match stmt {
         // ---- REG fragments: emit INLINE at the TensorDef site (canon's loop-local
         // `T.wg_reg_tile(...)`), NOT hoisted to function scope. A function-scope register
@@ -3495,7 +3372,10 @@ fn emit_stmt(
                             p = pad(indent),
                             dt = dtype_str(tensor.dtype),
                         ));
-                        out.push_str(&format!("{p}{name}_flat = {name}.local()\n", p = pad(indent)));
+                        out.push_str(&format!(
+                            "{p}{name}_flat = {name}.local()\n",
+                            p = pad(indent)
+                        ));
                         if let Some(shape) = aux.atom_shape {
                             let k_cols = atom_frag_cols(shape, width, tensor.dtype)?;
                             out.push_str(&format!(
@@ -3814,12 +3694,15 @@ fn emit_stmt(
                 .map(|s| emit_scalar(s, ctx))
                 .transpose()?
                 .unwrap_or_else(|| "0".to_string());
-            emit_guarded(
+            emit_single_issue(
                 out,
+                &p,
+                scope,
+                "clc_try_cancel",
                 &format!(
                     "T.ptx.clc_try_cancel(T.address_of({handle_name}[0]), T.address_of({mbar_name}[{slot}]))"
                 ),
-            );
+            )?;
             Ok(())
         }
         // CLC handle decode: 1:1 to `clusterlaunchcontrol.query_cancel`, DEFINING the
@@ -3873,39 +3756,38 @@ fn emit_stmt(
             ));
             Ok(())
         }
-        // Mailbox write: `task_smem[stage, field] = <scalar>`. Single-issue (one
-        // elected thread of the enclosing branch) — the value is uniform, so one
-        // writer suffices and avoids 32 redundant STS to the same address.
+        // Mailbox write: `task_smem[stage, field] = <scalar>`. PER-THREAD (the
+        // interpreter writes once per executing lane); a uniform value makes the
+        // redundant STS harmless, and a lane-varying value is exactly what the
+        // IR asked for — no single-issue guard may be inferred.
         StoreScalar { dst, value } => {
             let dst_s = emit_scalar_addr(dst, ctx)?;
-            emit_guarded(out, &format!("{dst_s} = {}", emit_scalar(value, ctx)?));
+            out.push_str(&format!("{p}{dst_s} = {}\n", emit_scalar(value, ctx)?));
             Ok(())
         }
 
         // ---- mbarrier (every op carries an optional `stage` -> slot index) ----
+        // init is effectively single-issue: an unguarded init is a double-init
+        // error in the interpreter AND on hardware, so it must sit under an
+        // explicit single-lane `If` (validator `single_issue_scope`) — codegen
+        // emits bare there and fails closed everywhere else (zero-inference).
         MBarrierInit { mbar, count, stage } => {
             let slot_ptr = mbar_slot_ptr(mbar, stage, ctx)?;
-            if scope.is_function() && !bare {
-                // Function scope (the prologue): canon's grouped-init form —
-                // `if T.cuda.thread_rank() == 0:` (a CTA-thread-0 predicate, no
-                // elect.sync). The coalesced run (bare) shares this same guard string
-                // via `single_issue_guard`.
-                let guard = "T.cuda.thread_rank() == 0";
-                out.push_str(&format!("{p}if {guard}:\n"));
-                out.mark_guard(guard);
-                out.push_str(&format!(
-                    "{p}    T.ptx.mbarrier.init({slot_ptr}, {count})\n"
-                ));
-            } else {
-                emit_guarded(out, &format!("T.ptx.mbarrier.init({slot_ptr}, {count})"));
-            }
-            Ok(())
+            emit_single_issue(
+                out,
+                &p,
+                scope,
+                "mbarrier.init",
+                &format!("T.ptx.mbarrier.init({slot_ptr}, {count})"),
+            )
         }
         MBarrierArriveExpectTx { mbar, bytes, stage } => {
             // Cluster TMA barrier (leader-routed): issue ONE expect_tx on the leader's
             // (CTA-0) barrier for the FULL cluster byte count (both CTAs' loads land
             // here), and only on the leader CTA (cbx==0) so it is counted once. The IR's
-            // `bytes` is the per-CTA byte count, so multiply by cta_group.
+            // `bytes` is the per-CTA byte count, so multiply by cta_group. The `cbx == 0`
+            // selection is IR-driven (the mbar's `leader_routed` flag), not inferred;
+            // the single-lane issue itself must come from an explicit elected `If`.
             if let Some(view) = ctx.tma_leader_view_for(mbar.mbar.id) {
                 let slot = stage
                     .as_ref()
@@ -3913,39 +3795,33 @@ fn emit_stmt(
                     .transpose()?
                     .unwrap_or_else(|| "0".to_string());
                 let total_bytes = *bytes as u64 * ctx.cta_group as u64;
-                // Nest the CTA selector and the single-issue guard as separate `if`s
-                // rather than `(cbx == 0) and (guard)`: the warp/function guard is now
-                // `T.ptx.elect_sync()`, which returns a uint32 (not bool), and `tirx.And`
-                // requires both operands be bool. `cbx == 0` is warp-uniform, so nesting
-                // is equivalent (all lanes take the same branch, then elect one).
                 out.push_str(&format!("{p}if cbx == 0:\n"));
-                if scope.scope == Scope::Elected {
-                    out.push_str(&format!(
-                        "{p}    T.ptx.mbarrier.arrive.expect_tx({view}.ptr_to([{slot}]), {total_bytes})\n"
-                    ));
-                } else {
-                    let guard = scope.scope.issue_guard();
-                    out.push_str(&format!("{p}    if {guard}:\n"));
-                    out.mark_guard(guard);
-                    out.push_str(&format!(
-                        "{p}        T.ptx.mbarrier.arrive.expect_tx({view}.ptr_to([{slot}]), {total_bytes})\n"
-                    ));
-                }
-                return Ok(());
+                return emit_single_issue(
+                    out,
+                    &format!("{p}    "),
+                    scope,
+                    "mbarrier.arrive.expect_tx (leader-routed)",
+                    &format!(
+                        "T.ptx.mbarrier.arrive.expect_tx({view}.ptr_to([{slot}]), {total_bytes})"
+                    ),
+                );
             }
+            // Local (non-leader) expect_tx is PER-THREAD (the interpreter arrives
+            // and adds tx once per executing lane; the gdn kernel elects one lane
+            // explicitly). No guard may be inferred.
             let slot_ptr = mbar_slot_ptr(mbar, stage, ctx)?;
-            emit_guarded(
-                out,
-                &format!("T.ptx.mbarrier.arrive.expect_tx({slot_ptr}, {bytes})"),
-            );
+            out.push_str(&format!(
+                "{p}T.ptx.mbarrier.arrive.expect_tx({slot_ptr}, {bytes})\n"
+            ));
             Ok(())
         }
+        // expect_tx is PER-THREAD like arrive (the interpreter applies it once
+        // per executing lane) — emit per-thread, no inferred guard.
         MBarrierExpectTx { mbar, bytes, stage } => {
             let slot_ptr = mbar_slot_ptr(mbar, stage, ctx)?;
-            emit_guarded(
-                out,
-                &format!("T.ptx.mbarrier.expect_tx({slot_ptr}, {bytes})"),
-            );
+            out.push_str(&format!(
+                "{p}T.ptx.mbarrier.expect_tx({slot_ptr}, {bytes})\n"
+            ));
             Ok(())
         }
         MBarrierArrive { mbar, count, stage } => {
@@ -4094,13 +3970,16 @@ fn emit_stmt(
             } else {
                 ""
             };
-            emit_guarded(
+            emit_single_issue(
                 out,
+                &p,
+                scope,
+                "tma_load",
                 &format!(
                     "Tx.copy_async({dst_s}, {src_s}, dispatch=\"tma_auto\", mbar={mbar_name}.ptr_to([{mbar_slot}]), cta_group={cg}{cta_mask}{cache_hint_kw}{prefetch_kw})",
                     cg = ctx.cta_group,
                 ),
-            );
+            )?;
             Ok(())
         }
 
@@ -4146,11 +4025,9 @@ fn emit_stmt(
             // readback bands) is unrealizable — the kernel must stage those
             // tiles through SMEM instead (fail closed, never silently reroute).
             if matches!(b, MmaOperand::Tmem(_)) {
-                return Err(
-                    "codegen: Tcgen05Mma with a TMEM B operand has no lowering \
+                return Err("codegen: Tcgen05Mma with a TMEM B operand has no lowering \
                      (tcgen05.mma reads B from SMEM only; stage the tile through SMEM)"
-                        .to_string(),
-                );
+                    .to_string());
             }
             // The accumulator views are row-0 anchored (the m=64 datapath-F
             // scatter and the m=128 full datapath both base at lane 0); a
@@ -4220,8 +4097,7 @@ fn emit_stmt(
                         let row_hi = add_bound(&t.row, &ScalarValue::Int(row_ext), ctx)?;
                         match t.dtype {
                             DType::F32 => {
-                                let col_hi =
-                                    add_bound(&t.col, &ScalarValue::Int(cell_dim), ctx)?;
+                                let col_hi = add_bound(&t.col, &ScalarValue::Int(cell_dim), ctx)?;
                                 Ok(format!("tmem[{row_s}:{row_hi}, {col_s}:{col_hi}]"))
                             }
                             DType::F16 | DType::Bf16 => {
@@ -4319,21 +4195,27 @@ fn emit_stmt(
                 };
                 let sfa_s = sf_slice(sfa)?;
                 let sfb_s = sf_slice(sfb)?;
-                emit_guarded(
+                emit_single_issue(
                     out,
+                    &p,
+                    scope,
+                    "tcgen05_mma",
                     &format!(
                         "Tx.gemm_async({dst_s}, {a_s}, {b_s}, SFA={sfa_s}, SFB={sfb_s}, accum={accum_s}, dispatch=\"tcgen05\", cta_group={cg}{trans_a_kw}{trans_b_kw})",
                         cg = ctx.cta_group,
                     ),
-                );
+                )?;
             } else {
-                emit_guarded(
+                emit_single_issue(
                     out,
+                    &p,
+                    scope,
+                    "tcgen05_mma",
                     &format!(
                         "Tx.gemm_async({dst_s}, {a_s}, {b_s}, accum={accum_s}, dispatch=\"tcgen05\", cta_group={cg}{trans_a_kw}{trans_b_kw})",
                         cg = ctx.cta_group,
                     ),
-                );
+                )?;
             }
             Ok(())
         }
@@ -4370,15 +4252,18 @@ fn emit_stmt(
             ) else {
                 return Err("codegen: tcgen05_cp src shape must be static".to_string());
             };
-            emit_guarded(
+            emit_single_issue(
                 out,
+                &p,
+                scope,
+                "tcgen05_cp",
                 &format!(
                     "Tx.copy_async({name}[0:{rows}, 0:{cols}], {src_name}[{stage}, 0:{r}, 0:{c}], cta_group={cta_group})",
                     name = view.name,
                     rows = view.logical_rows,
                     cols = view.logical_cols,
                 ),
-            );
+            )?;
             Ok(())
         }
         Tcgen05Commit {
@@ -4395,13 +4280,16 @@ fn emit_stmt(
             }
             let slot_ptr = mbar_slot_ptr(mbar, stage, ctx)?;
             let mask = multicast_cta_mask.unwrap_or(0);
-            emit_guarded(
+            emit_single_issue(
                 out,
+                &p,
+                scope,
+                "tcgen05_commit",
                 &format!(
                     "T.ptx.tcgen05.commit({slot_ptr}, cta_group={cg}, cta_mask={mask})",
                     cg = ctx.cta_group,
                 ),
-            );
+            )?;
             Ok(())
         }
 
@@ -4811,12 +4699,15 @@ fn emit_stmt(
             } else {
                 ""
             };
-            emit_guarded(
+            emit_single_issue(
                 out,
+                &p,
+                scope,
+                "tma_store",
                 &format!(
                     "Tx.copy_async({dst_s}, {src_s}, dispatch=\"tma_auto\"{cache_hint_kw}{prefetch_kw})"
                 ),
-            );
+            )?;
             Ok(())
         }
         CpAsyncBulkCommitGroup => {
@@ -4876,13 +4767,11 @@ fn emit_stmt(
                         FenceScope::Cluster => "shared::cluster",
                         FenceScope::Gpu => "",
                     };
-                    if scope.is_function() || scope.scope == Scope::Elected {
-                        out.push_str(&format!("{p}T.ptx.fence.proxy_async(\"{space}\")\n"));
-                    } else {
-                        out.push_str(&format!("{p}if tid_in_wg == 0:\n"));
-                        out.mark_guard("tid_in_wg == 0");
-                        out.push_str(&format!("{p}    T.ptx.fence.proxy_async(\"{space}\")\n"));
-                    }
+                    // PER-THREAD: a proxy fence orders only the EXECUTING lane's
+                    // prior writes — guarding it to one lane would leave every
+                    // other lane's writes unordered (zero-inference; hardware
+                    // fence is a per-thread instruction, so this is exact).
+                    out.push_str(&format!("{p}T.ptx.fence.proxy_async(\"{space}\")\n"));
                 }
                 // Memory/View fences are sim-only ordering markers — the interpreter
                 // folds them into trace `Generic` events and there is no TIRx
@@ -5438,7 +5327,10 @@ fn emit_stmt(
                 ));
             }
             let src_op = RegOperand::Slice(src.clone());
-            if wg_elem_ok(scope) && *op != RegUnaryOp::Log2 && reg_op_slices_full(dst, &[&src_op], ctx)? {
+            if wg_elem_ok(scope)
+                && *op != RegUnaryOp::Log2
+                && reg_op_slices_full(dst, &[&src_op], ctx)?
+            {
                 let dst_s = emit_reg_view_slice(out, &p, t, off, w, ctx)?;
                 let src_s = emit_reg_view_slice(out, &p, st, soff, sw, ctx)?;
                 match op {
@@ -5848,69 +5740,6 @@ mod tests {
         assert!(!src.contains("s0 ="), "{src}");
     }
 
-    /// The structured guard merge keys on the emission-site annotation, not the
-    /// line text: adjacent single-issue guards coalesce, but an IR `If` whose
-    /// condition happens to read like a guard (`tid_in_wg == 0`) is NOT merged
-    /// into them — the old text peephole could not tell the two apart.
-    #[test]
-    fn guard_merge_uses_the_annotation_not_the_text() {
-        use super::super::dtype::MBarKind;
-        use super::super::mbar::{MBar, MBarRef};
-        let mbar = Arc::new(MBar {
-            id: 5,
-            kind: MBarKind::Thread,
-            stages: 1,
-            arrive_count: None,
-            leader_routed: false,
-        });
-        let init = || Stmt::MBarrierInit {
-            mbar: MBarRef {
-                mbar: mbar.clone(),
-                remote_coord: None,
-            },
-            count: 1,
-            stage: None,
-        };
-        // wg branch body: single-issue init, then an IR If with a guard-looking
-        // condition, then another single-issue init. (8 warps: warpgroup 0 is a
-        // proper subset of the CTA, so the scope is Warpgroup, not Function.)
-        let body = vec![
-            init(),
-            Stmt::If {
-                cond: ScalarValue::expr(
-                    ScalarOp::Eq,
-                    vec![
-                        ScalarValue::Scope(ScopeValueKind::TidInWg),
-                        ScalarValue::Int(0),
-                    ],
-                ),
-                then_body: vec![Stmt::WgSync { barrier_id: 0 }],
-            },
-            init(),
-        ];
-        let src = kernel_to_tirx_source(&kernel_n(
-            vec![Stmt::MBarDef { mbar: mbar.clone() }, wg_if(0, body)],
-            8,
-        ))
-        .unwrap();
-        // Two annotated single-issue guard blocks (the If splits the run) —
-        // the merge must NOT fold the If into them, so `if tid_in_wg == 0:`
-        // appears exactly 3 times: two guards + the IR If.
-        let count = src.matches("if tid_in_wg == 0:").count();
-        assert_eq!(count, 3, "{src}");
-        // And the two adjacent inits inside ONE guard when the If is absent.
-        let src2 = kernel_to_tirx_source(&kernel_n(
-            vec![
-                Stmt::MBarDef { mbar: mbar.clone() },
-                wg_if(0, vec![init(), init()]),
-            ],
-            8,
-        ))
-        .unwrap();
-        assert_eq!(src2.matches("if tid_in_wg == 0:").count(), 1, "{src2}");
-        assert_eq!(src2.matches("mbarrier.init").count(), 2, "{src2}");
-    }
-
     /// Adjacent top-level warp/warpgroup-equality `If`s re-nest into the if/else
     /// dispatch tree (canon's role dispatch), partitioned by warpgroup: warp
     /// branches chain inside their warpgroup branch, groups chain in
@@ -6204,7 +6033,10 @@ mod tests {
             DType::F32,
         )))
         .unwrap();
-        assert!(ok.contains("Tx.wg.copy_async(accum_frag[:, :], tmem[:, 0:0 + 8])"), "{ok}");
+        assert!(
+            ok.contains("Tx.wg.copy_async(accum_frag[:, :], tmem[:, 0:0 + 8])"),
+            "{ok}"
+        );
 
         // 16x256b M=64 f32: lowered through the atom view (num=8 -> 32 regs).
         let atom_ld = Stmt::Tcgen05Ld {
@@ -6221,8 +6053,8 @@ mod tests {
             shape: LdStShape::B16x256,
             num: 8,
         };
-        let ok = kernel_to_tirx_source(&epilogue_kernel_t(atom_ld, reg_frag_tensor_w(7, 32)))
-            .unwrap();
+        let ok =
+            kernel_to_tirx_source(&epilogue_kernel_t(atom_ld, reg_frag_tensor_w(7, 32))).unwrap();
         assert!(
             ok.contains("Tx.wg.copy_async(accum_frag_atom[:, :], tmem[0:64, 0:0 + 64])"),
             "{ok}"
@@ -6330,7 +6162,10 @@ mod tests {
             8,
         )))
         .unwrap();
-        assert!(ok.contains("Tx.wg.copy_async(tmem[:, 8:8 + 8], accum_frag[:, :])"), "{ok}");
+        assert!(
+            ok.contains("Tx.wg.copy_async(tmem[:, 8:8 + 8], accum_frag[:, :])"),
+            "{ok}"
+        );
 
         // dst width != num: the slice must span exactly the atom's registers.
         let err = kernel_to_tirx_source(&epilogue_kernel(tcgen05_st(
@@ -6413,9 +6248,14 @@ mod tests {
         let src = kernel_to_tirx_source(&kernel(body)).unwrap();
         // The packed view is declared over the whole band (2 elems per cell) and
         // the st window doubles the cell column.
-        assert!(src.contains("tmem_bf16 = T.decl_buffer((128, 1024), \"bfloat16\""), "{src}");
         assert!(
-            src.contains("Tx.wg.copy_async(tmem_bf16[:, (128) * 2:(128) * 2 + 16], out_frag[:, :])"),
+            src.contains("tmem_bf16 = T.decl_buffer((128, 1024), \"bfloat16\""),
+            "{src}"
+        );
+        assert!(
+            src.contains(
+                "Tx.wg.copy_async(tmem_bf16[:, (128) * 2:(128) * 2 + 16], out_frag[:, :])"
+            ),
             "{src}"
         );
         assert!(src.contains("T.ptx.tcgen05.wait.st()"), "{src}");
@@ -6457,9 +6297,7 @@ mod tests {
             ],
         );
         let body = vec![
-            Stmt::TensorDef {
-                tensor: sm.clone(),
-            },
+            Stmt::TensorDef { tensor: sm.clone() },
             Stmt::TensorDef {
                 tensor: imm_a.clone(),
             },
@@ -6504,9 +6342,7 @@ mod tests {
 
         // dst width must equal num (b32 words).
         let err = kernel_to_tirx_source(&kernel(vec![
-            Stmt::TensorDef {
-                tensor: sm.clone(),
-            },
+            Stmt::TensorDef { tensor: sm.clone() },
             Stmt::TensorDef {
                 tensor: imm_a.clone(),
             },
@@ -6684,7 +6520,10 @@ mod tests {
             ),
         ]))
         .unwrap();
-        assert!(src.contains("T.ptx.mbarrier.arrive(smem_full.ptr_to([0]))"), "{src}");
+        assert!(
+            src.contains("T.ptx.mbarrier.arrive(smem_full.ptr_to([0]))"),
+            "{src}"
+        );
         assert!(!src.contains("if T.ptx.elect_sync():"), "{src}");
         assert!(!src.contains("if tid_in_wg == 0:"), "{src}");
     }
@@ -6705,12 +6544,8 @@ mod tests {
         });
         let tid_row = ScalarValue::Scope(ScopeValueKind::TidInWg);
         let body = vec![
-            Stmt::TensorDef {
-                tensor: sm.clone(),
-            },
-            Stmt::TensorDef {
-                tensor: r1.clone(),
-            },
+            Stmt::TensorDef { tensor: sm.clone() },
+            Stmt::TensorDef { tensor: r1.clone() },
             Stmt::TensorDef {
                 tensor: frag.clone(),
             },
@@ -6763,11 +6598,20 @@ mod tests {
             ),
         ];
         let src = kernel_to_tirx_source(&kernel(body)).unwrap();
-        assert!(src.contains("accum_frag_flat[0] = d_smem0[tid_in_wg, 3]"), "{src}");
-        assert!(src.contains("d_smem0[tid_in_wg, 5] = accum_frag_flat[0]"), "{src}");
+        assert!(
+            src.contains("accum_frag_flat[0] = d_smem0[tid_in_wg, 3]"),
+            "{src}"
+        );
+        assert!(
+            src.contains("d_smem0[tid_in_wg, 5] = accum_frag_flat[0]"),
+            "{src}"
+        );
         // REG->REG copy: the flat scalar form (the wg.copy scalar fallback's
         // raw thread-axis BufferLoad is rejected by LowerTIRxCleanup).
-        assert!(src.contains("out_frag_flat[1 + _i] = out_frag_flat[0]"), "{src}");
+        assert!(
+            src.contains("out_frag_flat[1 + _i] = out_frag_flat[0]"),
+            "{src}"
+        );
         assert!(src.contains("for _i in range(4):"), "{src}");
         assert!(
             src.contains("A[1, 2, tid_in_wg, 16 + _i] = out_frag_flat[_i]"),
@@ -6805,15 +6649,9 @@ mod tests {
         let r2 = reg_tensor(11, DType::F32, 1);
         let rb = reg_tensor(12, DType::Bf16, 2);
         let body = vec![
-            Stmt::TensorDef {
-                tensor: r1.clone(),
-            },
-            Stmt::TensorDef {
-                tensor: r2.clone(),
-            },
-            Stmt::TensorDef {
-                tensor: rb.clone(),
-            },
+            Stmt::TensorDef { tensor: r1.clone() },
+            Stmt::TensorDef { tensor: r2.clone() },
+            Stmt::TensorDef { tensor: rb.clone() },
             wg_if(
                 0,
                 vec![
@@ -6873,7 +6711,10 @@ mod tests {
             ),
         ];
         let src = kernel_to_tirx_source(&reg_kernel(body)).unwrap();
-        assert!(src.contains("Tx.wg.fill(accum_frag[:, :], T.float32(0))"), "{src}");
+        assert!(
+            src.contains("Tx.wg.fill(accum_frag[:, :], T.float32(0))"),
+            "{src}"
+        );
         assert!(
             src.contains("Tx.wg.add(accum_frag[:, :], accum_frag[:, :], out_frag[:, :])"),
             "{src}"
@@ -6888,7 +6729,10 @@ mod tests {
             ),
             "{src}"
         );
-        assert!(src.contains("Tx.wg.exp2(accum_frag[:, :], out_frag[:, :])"), "{src}");
+        assert!(
+            src.contains("Tx.wg.exp2(accum_frag[:, :], out_frag[:, :])"),
+            "{src}"
+        );
         assert!(
             src.contains("Tx.wg.reciprocal(accum_frag[:, :], out_frag[:, :])"),
             "{src}"
@@ -6898,7 +6742,10 @@ mod tests {
             "{src}"
         );
         // log2: no tile op — per-thread scalar loop on the flat views.
-        assert!(src.contains("accum_frag_flat = accum_frag.local()"), "{src}");
+        assert!(
+            src.contains("accum_frag_flat = accum_frag.local()"),
+            "{src}"
+        );
         assert!(src.contains("for _i in range(1):"), "{src}");
         // (width-1 src broadcasts — the interpreter's one-element-per-thread rule)
         assert!(
@@ -6906,8 +6753,14 @@ mod tests {
             "{src}"
         );
         // bf16 fill/add: literal takes the dst dtype.
-        assert!(src.contains("Tx.wg.fill(reg2[:, :], T.bfloat16(1))"), "{src}");
-        assert!(src.contains("Tx.wg.add(reg2[:, :], reg2[:, :], reg2[:, :])"), "{src}");
+        assert!(
+            src.contains("Tx.wg.fill(reg2[:, :], T.bfloat16(1))"),
+            "{src}"
+        );
+        assert!(
+            src.contains("Tx.wg.add(reg2[:, :], reg2[:, :], reg2[:, :])"),
+            "{src}"
+        );
     }
 
     #[test]
@@ -6916,12 +6769,8 @@ mod tests {
         let ri = reg_tensor(11, DType::I32, 1);
         let mk = |stmts: Vec<Stmt>| {
             let mut body = vec![
-                Stmt::TensorDef {
-                    tensor: r1.clone(),
-                },
-                Stmt::TensorDef {
-                    tensor: ri.clone(),
-                },
+                Stmt::TensorDef { tensor: r1.clone() },
+                Stmt::TensorDef { tensor: ri.clone() },
             ];
             body.push(wg_if(0, stmts));
             kernel_to_tirx_source(&reg_kernel(body))
@@ -6948,9 +6797,7 @@ mod tests {
         // TIRx 16-bit elementwise path would compute in 16 bits.
         let rb = reg_tensor(12, DType::Bf16, 1);
         let err = kernel_to_tirx_source(&reg_kernel(vec![
-            Stmt::TensorDef {
-                tensor: rb.clone(),
-            },
+            Stmt::TensorDef { tensor: rb.clone() },
             wg_if(
                 0,
                 vec![Stmt::RegUnary {
