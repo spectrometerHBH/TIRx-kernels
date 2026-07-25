@@ -20,6 +20,12 @@ pub struct Kernel {
     pub launch_shape: Vec<usize>,
     /// Same-rank tile over the grid.
     pub cluster_shape: Vec<usize>,
+    /// Codegen-only allocation form: when true, SMEM data buffers + mbar cells
+    /// are emitted as canon's dynamic `T.SMEMPool()` (one `shared.dyn` window at
+    /// the IR's own `byte_offset`s) instead of static `T.alloc_buffer`s. The
+    /// value model and protocol checker are allocation-form-agnostic (they read
+    /// `byte_offset` either way), so this never reaches the interpreter.
+    pub smem_pool: bool,
 }
 
 impl Kernel {

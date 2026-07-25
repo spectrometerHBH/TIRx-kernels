@@ -34,21 +34,12 @@ def _round_bf16(x: np.ndarray) -> np.ndarray:
     return u.view(np.float32)
 
 
-def _e4m3_pow2_byte(p: np.ndarray) -> np.ndarray:
-    """e4m3 encoding of 2^p for normal exponents: bias 7, zero mantissa."""
-    return ((p + 7) << 3).astype(np.uint8)
-
-
-def _pack_sf_cells(scale_p: np.ndarray) -> np.ndarray:
-    """(R, K//16) power-of-two exponents -> the kernel's packed-u32 scale-cell
-    layout (k_tiles * SF_CELLS, R): cell (t * SF_CELLS + c, r) packs the e4m3
-    bytes of blocks 4c..4c+4 of k-tile t, little-endian byte per block."""
-    rows, nblk = scale_p.shape
-    cells = _e4m3_pow2_byte(scale_p).reshape(rows, nblk // 4, 4).astype(np.uint32)
-    packed = (
-        cells[:, :, 0] | (cells[:, :, 1] << 8) | (cells[:, :, 2] << 16) | (cells[:, :, 3] << 24)
-    )
-    return np.ascontiguousarray(packed.T)
+def _pack_sf(scale_p: np.ndarray) -> np.ndarray:
+    """(R, K//16) power-of-two exponents -> the kernel's ``f8e4m3`` (R, K//16)
+    args, passed as the exact POWER-OF-TWO f32 values (the interpreter coerces
+    an f8e4m3 arg from float32 and rounds to e4m3, so a power of two round-trips
+    bit-exactly)."""
+    return (2.0**scale_p).astype(np.float32)
 
 
 def _prepare(m: int, n: int, k: int, alpha: float, seed: int):
@@ -75,7 +66,7 @@ def _prepare(m: int, n: int, k: int, alpha: float, seed: int):
     a_s = (a.reshape(m, nblk, SF_BLOCK) * (2.0**a_p)[:, :, None]).reshape(m, k)
     b_s = (b.reshape(n, nblk, SF_BLOCK) * (2.0**b_p)[:, :, None]).reshape(n, k)
     ref = _round_bf16(alpha * (a_s.astype(np.float32) @ b_s.astype(np.float32).T))
-    return _pack_fp4(a_codes), _pack_fp4(b_codes), _pack_sf_cells(a_p), _pack_sf_cells(b_p), ref
+    return _pack_fp4(a_codes), _pack_fp4(b_codes), _pack_sf(a_p), _pack_sf(b_p), ref
 
 
 @pytest.mark.parametrize(

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from ..builder import IRBuilder
+from ..builder import IRBuilder, TmemBand
 from ..nymph_rs import (
     DType,
     FenceKind,
@@ -17,8 +17,6 @@ from ..nymph_rs import (
     SmemSwizzleLayout,
     Swizzle,
     TensorSlice,
-    TmemLayout,
-    TmemLayoutKind,
 )
 
 _ELEMENT_BYTES = {DType.F16: 2, DType.BF16: 2}
@@ -103,13 +101,10 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
     # Layout A (m=256, cta_group=2): each consumer's whole (256, mma_n) result is
     # split across the CTA pair by M (128 rows per CTA), so the per-CTA accumulator
     # is (block_m=128 lanes, NUM_CONSUMER * mma_n cols) — consumer c occupies the
-    # mma_n-wide column band [c*mma_n, (c+1)*mma_n).
-    accum = k.tensor(
-        space=MemorySpace.TMEM,
-        dtype=DType.F32,
-        shape=(config.block_m, 2 * config.mma_n),
-        layout=TmemLayout(TmemLayoutKind.LANE_128, col_start=0),
-    )
+    # mma_n-wide column band [c*mma_n, (c+1)*mma_n). TMEM is not a tensor: the band
+    # is a pure-Python descriptor, addressed by absolute physical (lane, col).
+    accum = TmemBand(col0=0, dtype=DType.F32)
+    accum_n_cols = 2 * config.mma_n
     accum_frag = k.tensor(space=MemorySpace.REG, dtype=DType.F32, shape=(8,))
     out_frag = k.tensor(space=MemorySpace.REG, dtype=config.dtype, shape=(8,))
 
@@ -152,7 +147,7 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
     with k.if_warp(0):
         # tmem_alloc is warp-collective (full warp 0); mbarrier.init is
         # per-thread, so exactly one thread runs the inits.
-        k.tmem_alloc(accum, n_cols=2 * config.mma_n, cta_group=config.cta_group)
+        k.tmem_alloc(0, accum_n_cols, config.cta_group)
         with k.if_elected():
             for a_full in a_full_tiles:
                 k.mbarrier_init(a_full, count=1)
@@ -199,9 +194,9 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
                         a_smem_tiles[consumer],
                         a_gmem,
                         mbar=a_full_tiles[consumer],
-                        bytes=a_bytes,
                         coords=(m_coord, k_coord),
                         shape=(config.block_m, config.block_k),
+                        cta_group=config.cta_group,
                     )
                 k.mbarrier_wait(b_empty, phase=empty_phase)
                 k.mbarrier_arrive_expect_tx(b_full, bytes=b_bytes)
@@ -209,9 +204,9 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
                     b_smem,
                     b_gmem,
                     mbar=b_full,
-                    bytes=b_bytes,
                     coords=((n_tile * config.cta_group + cta_local_id) * config.block_n, k_coord),
                     shape=(config.block_n, config.block_k),
+                    cta_group=config.cta_group,
                 )
 
     for mma_warp, a_smem in enumerate(a_smem_tiles):
@@ -241,7 +236,7 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
                         k_offset = k_group * config.mma_k
                         n_offset = mma_warp * config.mma_n
                         k.tcgen05_mma(
-                            accum[:, n_offset : n_offset + config.mma_n],
+                            accum.at(0, n_offset),
                             a_smem[:, k_offset : k_offset + config.mma_k],
                             b_smem[:, k_offset : k_offset + config.mma_k],
                             m=config.mma_m,
@@ -304,7 +299,7 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
                     # One warp-collective ld spreads the 128 accumulator rows across
                     # the warpgroup's 128 threads (row=0 is the taddr-base corner):
                     # thread tid_in_wg loads row tid_in_wg, columns tmem_col..+7.
-                    k.tcgen05_ld(accum_frag, accum, num=8, row=0, col=tmem_col)
+                    k.tcgen05_ld(accum_frag, accum.at(0, tmem_col), num=8)
                     k.tcgen05_wait_ld()
                     k.reg_cvt(out_frag, accum_frag)
                     k.reg_store(
@@ -344,7 +339,8 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
     else:
         k.cta_sync()
     with k.if_warp(0):
-        k.tmem_dealloc(accum, n_cols=2 * config.mma_n, cta_group=config.cta_group)
+        k.tmem_relinquish(config.cta_group)
+        k.tmem_dealloc(0, accum_n_cols, config.cta_group)
 
     return k.build()
 

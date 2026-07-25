@@ -134,6 +134,15 @@ fn run_failure_message(prefix: &str, result: &interpreter::RunResult) -> String 
     out
 }
 
+/// Lower a kernel to a TVMScript (`tvm.script.tirx`) source string — the
+/// codegen entry point. A kernel with no lowering for one of its ops (or with
+/// an IR field value the emitted forms cannot represent) fails closed with a
+/// `ValueError` carrying the codegen's reason.
+#[pyfunction]
+fn kernel_to_tirx_source(kernel: &PyKernel) -> PyResult<String> {
+    ir::codegen::kernel_to_tirx_source(&kernel.0).map_err(PyValueError::new_err)
+}
+
 #[pyfunction]
 #[pyo3(signature = (kernel, inputs = None, include_events = false, clc_oracle_offset = 0))]
 fn check_protocol(
@@ -2691,7 +2700,7 @@ pub struct PyKernel(pub ir::Kernel);
 #[pymethods]
 impl PyKernel {
     #[new]
-    #[pyo3(signature = (name, args = None, body = None, num_warps = 12, smem_size_bytes = 0, launch_shape = None, cluster_shape = None))]
+    #[pyo3(signature = (name, args = None, body = None, num_warps = 12, smem_size_bytes = 0, launch_shape = None, cluster_shape = None, smem_pool = false))]
     fn new(
         name: String,
         args: Option<Bound<'_, PyAny>>,
@@ -2700,6 +2709,7 @@ impl PyKernel {
         smem_size_bytes: usize,
         launch_shape: Option<Vec<usize>>,
         cluster_shape: Option<Vec<usize>>,
+        smem_pool: bool,
     ) -> PyResult<Self> {
         let kernel = ir::Kernel {
             name,
@@ -2712,6 +2722,7 @@ impl PyKernel {
             smem_size_bytes,
             launch_shape: launch_shape.unwrap_or_else(|| vec![1]),
             cluster_shape: cluster_shape.unwrap_or_else(|| vec![1]),
+            smem_pool,
         };
         kernel
             .validate()
@@ -2872,6 +2883,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(interpret, m)?)?;
     m.add_function(wrap_pyfunction!(trace, m)?)?;
     m.add_function(wrap_pyfunction!(check_protocol, m)?)?;
+    m.add_function(wrap_pyfunction!(kernel_to_tirx_source, m)?)?;
 
     // chunk 7 — builder compatibility: the GMEM-scalar dtype map (used at runtime
     // by scalar_def) and the names the builder imports but only uses in lazy
