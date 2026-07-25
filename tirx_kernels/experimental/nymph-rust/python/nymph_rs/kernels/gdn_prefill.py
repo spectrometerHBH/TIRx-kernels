@@ -111,35 +111,41 @@ def gdn_prefill_task_config(num_seqs: int, seqlen: int) -> GdnPrefillConfig:
     return GdnPrefillConfig(num_seqs=num_seqs, seqlen=seqlen)
 
 
-# Fixed-length workload coverage: chunk counts 1/2/4/8/16/32 (seqlen = BT·n_chunks)
-# crossed with batch sizes, including num_work = num_seqs·HV > SM_COUNT so the
+# Bench-suite perf configs (the CONFIGS contract, bench/nymph_bench_guide.md):
+# the 6 core regression shapes (BENCH_CONFIGS mirrors these for the wave1 dev
+# loop, default 4q8v heads) + the flashinfer official-bench representative
+# subset: its 8 head configs (h_qk, h_v) from benchmarks/bench_gdn_prefill.py
+# (Qwen3.5-family TP variants + symmetric heads, d=128) crossed with 5 seqlen
+# shapes (1x2048 / 1x8192 / 1x65536 / 8192x8 / 2048+6144 varlen mix).
+# (num_q_heads, num_v_heads) = (h_qk, h_v); num_k_heads = min is derived.
+_FI_HEADS = [(2, 8), (4, 16), (8, 32), (16, 64), (16, 32), (16, 48), (16, 16), (32, 32)]
+_FI_SEQ_SHAPES = [
+    ({"num_seqs": 1, "seqlen": 2048}, "1x2048"),
+    ({"num_seqs": 1, "seqlen": 8192}, "1x8192"),
+    ({"num_seqs": 1, "seqlen": 65536}, "1x65536"),
+    ({"seqlens": [8192] * 8}, "8192x8"),
+    ({"seqlens": [2048, 6144]}, "2048+6144"),
+]
+CONFIGS = [
+    {"num_seqs": 1, "seqlen": 64, "label": "ns1_t64"},
+    {"num_seqs": 1, "seqlen": 512, "label": "ns1_t512"},
+    {"num_seqs": 1, "seqlen": 2048, "label": "ns1_t2048"},
+    {"num_seqs": 20, "seqlen": 192, "label": "ns20_t192"},
+    {"num_seqs": 48, "seqlen": 64, "label": "ns48_t64"},
+    {"seqlens": [70, 130], "label": "v_70_130"},
+] + [
+    {**seq, "num_q_heads": q, "num_v_heads": v, "label": f"h{q}q{v}v_{sl}"}
+    for q, v in _FI_HEADS
+    for seq, sl in _FI_SEQ_SHAPES
+]
+
+# Build + protocol-check coverage lives in the tests (CONFIGS_SUPPORTED /
+# HEAD_CONFIGS / VARLEN_CONFIGS below) — fixed-length chunk counts 1/2/4/8/16/32
+# crossed with batch sizes, including num_work = num_seqs·NEFF > SM_COUNT so the
 # persistent grid-stride runs MULTIPLE tiles per CTA. The per-chunk barriers/buffers
 # carry across tiles via cumulative pipeline-state counters (gc / gc_pos = CUTLASS
 # PipelineState, never per-tile reset), with the chunk_free handoff spanning tile
-# boundaries. Every shape builds + protocol-checks; the value sweep (CONFIGS_SUPPORTED)
-# runs the cheaper subset cell-exact (incl. multi-tile/CTA with odd chunks/tile).
-CONFIGS = [
-    {"num_seqs": ns, "seqlen": T, "label": f"ns{ns}_t{T}"}
-    for ns, T in [
-        (1, 64),
-        (1, 128),
-        (1, 192),
-        (1, 256),
-        (1, 512),
-        (1, 1024),
-        (1, 2048),
-        (2, 128),
-        (2, 256),
-        (2, 512),
-        (4, 128),
-        (4, 256),
-        (8, 64),
-        (20, 64),
-        (20, 192),
-        (32, 128),
-        (48, 64),  # num_work > SM_COUNT: multi-tile/CTA
-    ]
-]
+# boundaries.
 
 # Cheaper fixed-length shapes for the cell-exact value sweep: 1–4 chunks, small batch,
 # plus multi-tile/CTA (num_work > SM_COUNT) with odd chunks/tile (the phase-carry case).
@@ -1305,49 +1311,59 @@ def _bench_seqlens(num_seqs, seqlen, seqlens) -> list[int]:
     return [int(seqlen)] * int(num_seqs)
 
 
-def _bench_inputs(seq_lens: list[int], io_dtype: str = "bfloat16", seed: int = 0) -> dict:
+def _bench_inputs(
+    seq_lens: list[int],
+    io_dtype: str = "bfloat16",
+    seed: int = 0,
+    num_q_heads: int = HQK,
+    num_v_heads: int = HV,
+) -> dict:
     """One input set shared by BOTH impls, on GPU, in the sim tests' distributions.
 
     q/k/v ~ N(0, 0.2^2) cast to the io dtype; the RAW gate exp(g) in (0,1) —
     both kernels apply log2 to it internally (flashinfer parity, see the module
     docstring) — and beta = sigmoid(.) stay f32; cu_seqlens is i32. Layouts are
-    the shared flashinfer/nymph ones: q/k (T, HQK, D), v (T, HV, D),
-    gate/beta (T, HV), with HQK=num_k_heads=min(num_q,num_v) for the default
-    (4q, 8v) GVA head config.
+    the shared flashinfer/nymph ones: q (T, num_q_heads, D), k (T, num_k_heads, D)
+    with num_k_heads=min(num_q,num_v), v (T, num_v_heads, D), and gate/beta
+    (T, NEFF) per effective head NEFF=max(num_q,num_v) — the default (4q, 8v)
+    GVA head config gives the historical (T, 4) / (T, 8) shapes.
     """
     import torch
 
     dt = {"bfloat16": torch.bfloat16, "float16": torch.float16}[io_dtype]
     gen = torch.Generator(device="cuda").manual_seed(seed)
     total = sum(seq_lens)
+    h_k = min(num_q_heads, num_v_heads)
+    neff = max(num_q_heads, num_v_heads)
 
     def randn(*shape):
         return torch.randn(*shape, generator=gen, device="cuda", dtype=torch.float32)
 
-    q = (randn(total, HQK, K_DIM) * 0.2).to(dt)
-    k = (randn(total, HQK, K_DIM) * 0.2).to(dt)
-    v = (randn(total, HV, K_DIM) * 0.2).to(dt)
-    gate = torch.exp(torch.nn.functional.softplus(randn(total, HV)) * -0.3)
-    beta = torch.sigmoid(randn(total, HV))
+    q = (randn(total, num_q_heads, K_DIM) * 0.2).to(dt)
+    k = (randn(total, h_k, K_DIM) * 0.2).to(dt)
+    v = (randn(total, num_v_heads, K_DIM) * 0.2).to(dt)
+    gate = torch.exp(torch.nn.functional.softplus(randn(total, neff)) * -0.3)
+    beta = torch.sigmoid(randn(total, neff))
     cu = torch.tensor([0, *itertools.accumulate(seq_lens)], dtype=torch.int32, device="cuda")
     return {"q": q, "k": k, "v": v, "gate": gate, "beta": beta, "cu": cu, "total": total}
 
 
-def _flashinfer_callable(data: dict, num_seqs: int):
+def _flashinfer_callable(data: dict, num_seqs: int, neff: int = HV):
     """The flashinfer CuTeDSL baseline as a pure-launch closure + its outputs.
 
     First call compiles the CuTeDSL kernel (flashinfer caches it per static
     config); that call happens HERE, outside any timed region. use_cp=False
     pins the SM100 chunked path (the one being ported). Outputs are NaN-filled
-    so a silently-unwritten region trips the cosine gate.
+    so a silently-unwritten region trips the cosine gate. out/state are per
+    effective head (neff = max(num_q_heads, num_v_heads)).
     """
     import torch
     from flashinfer.gdn_prefill import chunk_gated_delta_rule
 
     io_dt = data["q"].dtype
-    out = torch.full((data["total"], HV, K_DIM), float("nan"), dtype=io_dt, device="cuda")
+    out = torch.full((data["total"], neff, K_DIM), float("nan"), dtype=io_dt, device="cuda")
     state = torch.full(
-        (num_seqs, HV, K_DIM, K_DIM), float("nan"), dtype=torch.float32, device="cuda"
+        (num_seqs, neff, K_DIM, K_DIM), float("nan"), dtype=torch.float32, device="cuda"
     )
     scale = GdnPrefillConfig().scale
 
@@ -1363,11 +1379,18 @@ def _flashinfer_callable(data: dict, num_seqs: int):
     return run, out, state
 
 
-def _compile_nymph(seq_lens: list[int], io_dtype: str = "bfloat16"):
+def _compile_nymph(
+    seq_lens: list[int],
+    io_dtype: str = "bfloat16",
+    num_q_heads: int = HQK,
+    num_v_heads: int = HV,
+):
     """kernel_to_tirx_source -> tvm.compile, mirroring nvfp4's _compile_nymph.
 
     Uniform BT-multiple lengths build the fixed-length kernel; anything else
-    builds the varlen (cu_seqlens) kernel sized by max length.
+    builds the varlen (cu_seqlens) kernel sized by max length. Head config
+    (num_q_heads, num_v_heads) is forwarded to GdnPrefillConfig (num_k_heads
+    = min, NEFF = max derived inside).
 
     Raises whatever the codegen/compile pipeline raises. TODAY this fails
     closed inside kernel_to_tirx_source: the gdn IR uses flash/gdn-datapath
@@ -1384,10 +1407,21 @@ def _compile_nymph(seq_lens: list[int], io_dtype: str = "bfloat16"):
     from ..nymph_rs import kernel_to_tirx_source
 
     if seq_lens == [seq_lens[0]] * len(seq_lens) and seq_lens[0] % BT == 0:
-        config = GdnPrefillConfig(num_seqs=len(seq_lens), seqlen=seq_lens[0], io_dtype=io_dtype)
+        config = GdnPrefillConfig(
+            num_seqs=len(seq_lens),
+            seqlen=seq_lens[0],
+            io_dtype=io_dtype,
+            num_q_heads=num_q_heads,
+            num_v_heads=num_v_heads,
+        )
     else:
         config = GdnPrefillConfig(
-            num_seqs=len(seq_lens), seqlen=max(seq_lens), varlen=True, io_dtype=io_dtype
+            num_seqs=len(seq_lens),
+            seqlen=max(seq_lens),
+            varlen=True,
+            io_dtype=io_dtype,
+            num_q_heads=num_q_heads,
+            num_v_heads=num_v_heads,
         )
     src = kernel_to_tirx_source(build_gdn_prefill(config))
     p = os.path.join(tempfile.mkdtemp(prefix="nymph_gdn_"), "g.py")
@@ -1414,27 +1448,28 @@ def _nymph_callable(ex, config: GdnPrefillConfig, data: dict, seq_lens: list[int
 
     io_dt = data["q"].dtype
     num_seqs = len(seq_lens)
+    neff = max(config.num_q_heads, config.num_v_heads)  # out/state/gate/beta heads
     state = torch.full(
-        (num_seqs, HV, K_DIM, K_DIM), float("nan"), dtype=torch.float32, device="cuda"
+        (num_seqs, neff, K_DIM, K_DIM), float("nan"), dtype=torch.float32, device="cuda"
     )
     if config.varlen:
         pad = num_seqs * config.seqlen
         q = torch.zeros((pad, *data["q"].shape[1:]), dtype=io_dt, device="cuda")
         k = torch.zeros_like(q)
         v = torch.zeros((pad, *data["v"].shape[1:]), dtype=io_dt, device="cuda")
-        gate = torch.zeros((pad, HV), dtype=torch.float32, device="cuda")
+        gate = torch.zeros((pad, neff), dtype=torch.float32, device="cuda")
         beta = torch.zeros_like(gate)
         cu = data["cu"].tolist()
         for a, b in itertools.pairwise(cu):
             q[a:b], k[a:b], v[a:b] = data["q"][a:b], data["k"][a:b], data["v"][a:b]
             gate[a:b], beta[a:b] = data["gate"][a:b], data["beta"][a:b]
-        out = torch.full((pad, HV, K_DIM), float("nan"), dtype=io_dt, device="cuda")
+        out = torch.full((pad, neff, K_DIM), float("nan"), dtype=io_dt, device="cuda")
 
         def run():
             ex(q, k, v, gate, beta, out, state, data["cu"])
 
     else:
-        out = torch.full((data["total"], HV, K_DIM), float("nan"), dtype=io_dt, device="cuda")
+        out = torch.full((data["total"], neff, K_DIM), float("nan"), dtype=io_dt, device="cuda")
 
         def run():
             ex(data["q"], data["k"], data["v"], data["gate"], data["beta"], out, state)
@@ -1451,7 +1486,16 @@ def _cosine(a, b) -> float:
 
 
 def run_bench(
-    num_seqs=None, seqlen=None, seqlens=None, *, warmup=None, repeat=None, timer=None, **kwargs
+    num_seqs=None,
+    seqlen=None,
+    seqlens=None,
+    num_q_heads=HQK,
+    num_v_heads=HV,
+    *,
+    warmup=None,
+    repeat=None,
+    timer=None,
+    **kwargs,
 ):
     """Bench the flashinfer CuTeDSL baseline vs nymph with the bench-suite's
     exact methodology — correctness gate BEFORE timing.
@@ -1459,18 +1503,24 @@ def run_bench(
     Both impls see the identical input tensors; nymph must match the
     flashinfer output at cosine >= 0.999 (out AND state, state compared in
     flashinfer's [N,H,V,K] layout) or this raises AssertionError. flashinfer
-    is passed as a ``references`` entry (external baseline), nymph as the
-    sole ``funcs`` impl ("tirx"), so both are timed by the one bench() call.
+    ("tir") and nymph ("tirx") are both ``funcs`` impls — the nymph GEMM
+    kernels' form, so the bench-suite reports the tir/tirx ratio per config.
+    Head config (num_q_heads, num_v_heads) matches the flashinfer bench's
+    (h_qk, h_v) parametrization (num_k_heads = min, NEFF = max derived).
     """
     import torch
 
     from tvm.tirx.bench import bench
 
     seq_lens = _bench_seqlens(num_seqs, seqlen, seqlens)
-    ex, config = _compile_nymph(seq_lens)  # raises today: the codegen gap above
-    data = _bench_inputs(seq_lens, config.io_dtype)
+    ex, config = _compile_nymph(seq_lens, num_q_heads=num_q_heads, num_v_heads=num_v_heads)
+    data = _bench_inputs(
+        seq_lens, config.io_dtype, num_q_heads=num_q_heads, num_v_heads=num_v_heads
+    )
     nymph_run, n_out, n_state = _nymph_callable(ex, config, data, seq_lens)
-    fi_run, f_out, f_state = _flashinfer_callable(data, len(seq_lens))
+    fi_run, f_out, f_state = _flashinfer_callable(
+        data, len(seq_lens), max(num_q_heads, num_v_heads)
+    )
 
     nymph_run()
     fi_run()
@@ -1484,11 +1534,10 @@ def run_bench(
             f"(cos_out={cos_o:.4f} cos_state={cos_s:.4f}, need >= {_CORRECTNESS_COSINE})"
         )
     return bench(
-        {"tirx": nymph_run},
+        {"tir": fi_run, "tirx": nymph_run},
         warmup=warmup,
         repeat=repeat,
         timer=timer,
-        references={"flashinfer": lambda: fi_run},
         **kwargs,
     )
 

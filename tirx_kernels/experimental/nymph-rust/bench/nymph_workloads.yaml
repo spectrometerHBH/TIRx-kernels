@@ -21,3 +21,52 @@ workloads:
   - {kernel: nymph_fp16_bf16_gemm, config: bf16_4096x4096x4096}
   - {kernel: nymph_fp16_bf16_gemm, config: bf16_8192x8192x8192}
   - {kernel: nymph_fp16_bf16_gemm, config: bf16_16384x16384x16384}
+  # gdn_prefill vs the flashinfer CuTeDSL baseline ("tir"), cosine>=0.999 gate
+  # inside run_bench. 6 core shapes + the flashinfer official-bench
+  # representative subset (8 head configs x 5 seqlen shapes).
+  - {kernel: nymph_gdn_prefill, config: ns1_t64}
+  - {kernel: nymph_gdn_prefill, config: ns1_t512}
+  - {kernel: nymph_gdn_prefill, config: ns1_t2048}
+  - {kernel: nymph_gdn_prefill, config: ns20_t192}
+  - {kernel: nymph_gdn_prefill, config: ns48_t64}
+  - {kernel: nymph_gdn_prefill, config: v_70_130}
+  - {kernel: nymph_gdn_prefill, config: h2q8v_1x2048}
+  - {kernel: nymph_gdn_prefill, config: h2q8v_1x8192}
+  - {kernel: nymph_gdn_prefill, config: h2q8v_1x65536}
+  - {kernel: nymph_gdn_prefill, config: h2q8v_8192x8}
+  - {kernel: nymph_gdn_prefill, config: "h2q8v_2048+6144"}
+  - {kernel: nymph_gdn_prefill, config: h4q16v_1x2048}
+  - {kernel: nymph_gdn_prefill, config: h4q16v_1x8192}
+  - {kernel: nymph_gdn_prefill, config: h4q16v_1x65536}
+  - {kernel: nymph_gdn_prefill, config: h4q16v_8192x8}
+  - {kernel: nymph_gdn_prefill, config: "h4q16v_2048+6144"}
+  - {kernel: nymph_gdn_prefill, config: h8q32v_1x2048}
+  - {kernel: nymph_gdn_prefill, config: h8q32v_1x8192}
+  - {kernel: nymph_gdn_prefill, config: h8q32v_1x65536}
+  - {kernel: nymph_gdn_prefill, config: h8q32v_8192x8}
+  - {kernel: nymph_gdn_prefill, config: "h8q32v_2048+6144"}
+  - {kernel: nymph_gdn_prefill, config: h16q64v_1x2048}
+  - {kernel: nymph_gdn_prefill, config: h16q64v_1x8192}
+  - {kernel: nymph_gdn_prefill, config: h16q64v_1x65536}
+  - {kernel: nymph_gdn_prefill, config: h16q64v_8192x8}
+  - {kernel: nymph_gdn_prefill, config: "h16q64v_2048+6144"}
+  - {kernel: nymph_gdn_prefill, config: h16q32v_1x2048}
+  - {kernel: nymph_gdn_prefill, config: h16q32v_1x8192}
+  - {kernel: nymph_gdn_prefill, config: h16q32v_1x65536}
+  - {kernel: nymph_gdn_prefill, config: h16q32v_8192x8}
+  - {kernel: nymph_gdn_prefill, config: "h16q32v_2048+6144"}
+  - {kernel: nymph_gdn_prefill, config: h16q48v_1x2048}
+  - {kernel: nymph_gdn_prefill, config: h16q48v_1x8192}
+  - {kernel: nymph_gdn_prefill, config: h16q48v_1x65536}
+  - {kernel: nymph_gdn_prefill, config: h16q48v_8192x8}
+  - {kernel: nymph_gdn_prefill, config: "h16q48v_2048+6144"}
+  - {kernel: nymph_gdn_prefill, config: h16q16v_1x2048}
+  - {kernel: nymph_gdn_prefill, config: h16q16v_1x8192}
+  - {kernel: nymph_gdn_prefill, config: h16q16v_1x65536}
+  - {kernel: nymph_gdn_prefill, config: h16q16v_8192x8}
+  - {kernel: nymph_gdn_prefill, config: "h16q16v_2048+6144"}
+  - {kernel: nymph_gdn_prefill, config: h32q32v_1x2048}
+  - {kernel: nymph_gdn_prefill, config: h32q32v_1x8192}
+  - {kernel: nymph_gdn_prefill, config: h32q32v_1x65536}
+  - {kernel: nymph_gdn_prefill, config: h32q32v_8192x8}
+  - {kernel: nymph_gdn_prefill, config: "h32q32v_2048+6144"}

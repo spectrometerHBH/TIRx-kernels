@@ -128,7 +128,7 @@ def main() -> None:
         try:
             if gate_err is None:
                 res = gdn.run_bench(**kw, rounds=args.rounds)
-                row["fi_us"] = res["impls"]["flashinfer"]
+                row["fi_us"] = res["impls"]["tir"]
                 row["nymph_us"] = res["impls"]["tirx"]
             else:
                 res = gdn.run_flashinfer_bench(**kw, rounds=args.rounds)
