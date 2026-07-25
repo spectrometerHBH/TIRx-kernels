@@ -160,3 +160,21 @@ expect_tx / store_scalar / async-proxy fence) emit per-thread, matching
 the interpreter. Rule + audit table: docs/ir-ops.md §"Codegen emission
 guards". Negative tests: validate.rs `single_issue_scope_rule`,
 tests/test_compile_gate.py `test_single_issue_scope_negative`.
+
+### Zero-inference follow-up (8689f62a) + final gates
+
+- `single_issue_scope` v1 rejected flash_bwd_sm100's s2cluster site (57
+  tests): guard `(~kept) & (tid == 0)` hides the one-lane predicate behind
+  a runtime And operand. `proves_single_lane_per_warp` proves the bound
+  through And/Mul chains (intersection only narrows) — no kernel edit.
+- Full pytest round 1 after the zero-inference wave: 418 passed / 61
+  failed (57 flash_bwd + 4 stale fixtures) → all fixed; round 2: see below.
+- bench/bench_gdn_wave1.py `--rounds 5` (GPU 1): all 6 shapes compile gate
+  PASS, oracle-cos out=1.0000 state=1.0000. Timing (us, fi/nymph):
+  ns1_t64 16.6/27.4 (0.61), ns1_t512 33.6/149.3 (0.23),
+  ns1_t2048 92.7/512.0 (0.18), ns20_t192 42.5/118.1 (0.36),
+  ns48_t64 50.0/80.9 (0.62), v_70_130 22.2/80.7 (0.28).
+- v_70_130's earlier cos_out=nan was a probe artifact: `_nymph_callable`
+  pads the varlen out buffer with NaN by contract ("padding content is
+  irrelevant; the kernel masks OOB"); cropping to the 200 packed rows
+  gives 0.99999/1.00000. No kernel bug.
