@@ -2,8 +2,8 @@
 
 - Timestamp: `2`
 - Label:     `691feec4-dirty`
-- Git:       `{'tir': '8777f744-dirty', 'tirx-kernels': '691feec4-dirty', 'tirx-bench-ci': None}`
-- Workloads: 113 ok, 0 failed
+- Git:       `{'tir': 'e905776a', 'tirx-kernels': 'b0a0df4e-dirty', 'tirx-bench-ci': None}`
+- Workloads: 128 ok, 0 failed
 
 Grouped workloads show one row per config and one timing column per implementation. Single-TIR workloads show ref/ours against the fastest reference implementation.
 
@@ -172,6 +172,26 @@ Grouped workloads show one row per config and one timing column per implementati
 | `2048x2048x2048` | tir | 8.5714 | cublaslt_nvfp4 | 7.4747 | 0.872 | flashinfer=7.5224 |
 | `4096x4096x4096` | tir | 29.6264 | cublaslt_nvfp4 | 28.6867 | 0.968 | flashinfer=30.7572 |
 | `8192x8192x8192` | tir | 185.8869 | flashinfer | 177.4658 | 0.955 | cublaslt_nvfp4=183.9112 |
+
+## sparse_flashmla_decode_head64
+
+| config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
+|---|---|---:|---|---:|---:|---|
+| `deepseek_v4_v32_b128_sq2_sk32768_topk2048_p64` | tirx | 138.8959 | flashmla | 143.6941 | 1.035 | — |
+| `model1_b128_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen` | tirx | 70.4264 | flashmla | 73.6416 | 1.046 | — |
+| `model1_b128_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64` | tirx | 58.1189 | flashmla | 58.5720 | 1.008 | — |
+| `model1_b148_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen` | tirx | 75.9245 | flashmla | 79.2599 | 1.044 | — |
+| `model1_b148_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64` | tirx | 60.1992 | flashmla | 60.4661 | 1.004 | — |
+| `model1_b148_sq2_sk32768_topk16384_p64` | tirx | 904.0643 | flashmla | 907.7006 | 1.004 | — |
+| `model1_b256_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen` | tirx | 111.6659 | flashmla | 115.0202 | 1.030 | — |
+| `model1_b256_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64` | tirx | 105.7925 | flashmla | 108.6594 | 1.027 | — |
+| `model1_b2_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen` | tirx | 18.9377 | flashmla | 22.9930 | 1.214 | — |
+| `model1_b2_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64` | tirx | 16.9030 | flashmla | 21.1933 | 1.254 | — |
+| `model1_b64_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen` | tirx | 43.4416 | flashmla | 47.3502 | 1.090 | — |
+| `model1_b64_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64` | tirx | 31.7378 | flashmla | 32.4080 | 1.021 | — |
+| `model1_b74_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen` | tirx | 49.6371 | flashmla | 53.0040 | 1.068 | — |
+| `model1_b74_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64` | tirx | 34.3509 | flashmla | 34.5908 | 1.007 | — |
+| `v32_b148_sq2_sk32768_topk16384_p64` | tirx | 957.4198 | flashmla | 957.6634 | 1.000 | — |
 
 ## sparse_flashmla_prefill_head128_phase1
 

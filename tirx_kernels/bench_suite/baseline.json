@@ -2,13 +2,13 @@
   "timestamp": "2",
   "label": "691feec4-dirty",
   "git": {
-    "tir": "8777f744-dirty",
-    "tirx-kernels": "691feec4-dirty",
+    "tir": "e905776a",
+    "tirx-kernels": "b0a0df4e-dirty",
     "tirx-bench-ci": null
   },
   "kernel_tree": {
-    "tir:python/tvm/tirx": "7e0e555b403a27365d5fddccf3d2e68d55dd9aad",
-    "tirx-kernels:tirx_kernels": "0af5247128a47c9b3b0034bbc0f5232848774b2c"
+    "tir:python/tvm/tirx": "e6aad21cda04435b411c32e0f43703d7abf2be9f",
+    "tirx-kernels:tirx_kernels": "fb9a2c010588b8e9fcc3264762ce22b25f0dbb16"
   },
   "baselines": {
     "torch": {
@@ -41,21 +41,18 @@
       "importable": true,
       "source_dir": "/home/bohanhou/flash-attention/flash_attn/cute",
       "dist": "flash-attn-4",
-      "version": "4.0.0b15.dev2+g3da76cd",
+      "version": "4.0.0b22.dev8+g00756db.d20260725",
       "editable": true,
       "git_dir": "/home/bohanhou/flash-attention",
-      "git_sha": "3da76cdb"
+      "git_sha": "00756db9"
     },
     "sglang": {
-      "importable": false,
-      "source_dir": "/home/bohanhou/kernel-libs/sglang/python/sglang",
-      "git_dir": "/home/bohanhou/kernel-libs/sglang",
-      "git_sha": "96a04cb1"
+      "installed": false
     },
     "cutlass": {
       "importable": true,
-      "source_dir": "/home/bohanhou/my/lib/python3.11/site-packages/nvidia_cutlass_dsl/python_packages/cutlass",
-      "version": "4.5.2"
+      "source_dir": "/home/bohanhou/my/lib/python3.11/site-packages/nvidia_cutlass_dsl/dsl_packages/cutlass",
+      "version": "4.6.0"
     }
   },
   "probe": {
@@ -1460,6 +1457,216 @@
         "tir": 185.88687925456713,
         "flashinfer": 177.46575606658948,
         "cublaslt_nvfp4": 183.91122769561886
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "deepseek_v4_v32_b128_sq2_sk32768_topk2048_p64",
+      "label": "deepseek_v4_v32_b128_sq2_sk32768_topk2048_p64",
+      "status": "ok",
+      "impls": {
+        "tirx": 138.89585443418977,
+        "flashmla": 143.69408165829387
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "model1_b128_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
+      "label": "model1_b128_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
+      "status": "ok",
+      "impls": {
+        "tirx": 70.42642365456874,
+        "flashmla": 73.64159739370717
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "model1_b128_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
+      "label": "model1_b128_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
+      "status": "ok",
+      "impls": {
+        "tirx": 58.11889219090162,
+        "flashmla": 58.571993848415275
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "model1_b148_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
+      "label": "model1_b148_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
+      "status": "ok",
+      "impls": {
+        "tirx": 75.9245063162444,
+        "flashmla": 79.25990299075035
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "model1_b148_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
+      "label": "model1_b148_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
+      "status": "ok",
+      "impls": {
+        "tirx": 60.19923107122913,
+        "flashmla": 60.466119751015825
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "model1_b148_sq2_sk32768_topk16384_p64",
+      "label": "model1_b148_sq2_sk32768_topk16384_p64",
+      "status": "ok",
+      "impls": {
+        "tirx": 904.0642537920032,
+        "flashmla": 907.700637694704
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "model1_b256_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
+      "label": "model1_b256_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
+      "status": "ok",
+      "impls": {
+        "tirx": 111.6658646233601,
+        "flashmla": 115.02019432395288
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "model1_b256_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
+      "label": "model1_b256_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
+      "status": "ok",
+      "impls": {
+        "tirx": 105.79250112572844,
+        "flashmla": 108.65942720146387
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "model1_b2_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
+      "label": "model1_b2_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
+      "status": "ok",
+      "impls": {
+        "tirx": 18.937680252932513,
+        "flashmla": 22.992968963977287
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "model1_b2_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
+      "label": "model1_b2_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
+      "status": "ok",
+      "impls": {
+        "tirx": 16.903021013792767,
+        "flashmla": 21.19331191654604
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "model1_b64_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
+      "label": "model1_b64_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
+      "status": "ok",
+      "impls": {
+        "tirx": 43.44156813507092,
+        "flashmla": 47.350232262756336
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "model1_b64_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
+      "label": "model1_b64_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
+      "status": "ok",
+      "impls": {
+        "tirx": 31.737775642548122,
+        "flashmla": 32.408008278660375
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "model1_b74_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
+      "label": "model1_b74_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
+      "status": "ok",
+      "impls": {
+        "tirx": 49.63706636021892,
+        "flashmla": 53.00396142934257
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "model1_b74_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
+      "label": "model1_b74_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
+      "status": "ok",
+      "impls": {
+        "tirx": 34.35094040501502,
+        "flashmla": 34.5908106103018
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "v32_b148_sq2_sk32768_topk16384_p64",
+      "label": "v32_b148_sq2_sk32768_topk16384_p64",
+      "status": "ok",
+      "impls": {
+        "tirx": 957.419848781937,
+        "flashmla": 957.6633707991039
       },
       "aggregated": {
         "rounds": 5,
