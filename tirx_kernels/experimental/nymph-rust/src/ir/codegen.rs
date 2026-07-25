@@ -1177,7 +1177,11 @@ enum TopUnit {
 /// plus the warp-equality `If`s chained behind it in source order; groups
 /// chain in first-occurrence order. Duplicate conditions merge their bodies
 /// (same threads, same order — flat-equivalent). A run containing any other
-/// statement stays flat.
+/// statement stays flat — and so does a run whose group mixes a warp-level
+/// `If` BEFORE its warpgroup-level `If`: chaining would run the warpgroup
+/// body first, REORDERING independent statements (observed miscompile: a
+/// warp-1 TMA issue moved after the warpgroup's mbarrier wait → GPU
+/// deadlock). Only the canonical wg-prefix-then-warp-roles order chains.
 fn chain_top_level_ifs(body: &[Stmt]) -> Vec<TopUnit> {
     struct IfParts<'a> {
         cond: &'a ScalarValue,
@@ -1211,8 +1215,12 @@ fn chain_top_level_ifs(body: &[Stmt]) -> Vec<TopUnit> {
     }
 
     fn chain_if_run(run: &[Stmt]) -> Option<IfChain> {
-        let mut groups: Vec<(i64, Vec<IfParts<'_>>)> = Vec::new();
-        for s in run {
+        struct Numbered<'a> {
+            parts: IfParts<'a>,
+            index: usize,
+        }
+        let mut groups: Vec<(i64, Vec<Numbered<'_>>)> = Vec::new();
+        for (index, s) in run.iter().enumerate() {
             let Stmt::If { cond, then_body } = s else {
                 return None;
             };
@@ -1227,13 +1235,38 @@ fn chain_top_level_ifs(body: &[Stmt]) -> Vec<TopUnit> {
                 warp,
             };
             if let Some((_, members)) = groups.iter_mut().find(|(g, _)| *g == group) {
-                members.push(parts);
+                members.push(Numbered { parts, index });
             } else {
-                groups.push((group, vec![parts]));
+                groups.push((group, vec![Numbered { parts, index }]));
+            }
+        }
+        // Soundness: the chained tree runs each group's warpgroup-level prefix
+        // BEFORE its warp-level branches. That is only the source order when
+        // every warpgroup-level `If` of a group precedes all its warp-level
+        // `If`s — otherwise chaining REORDERS independent statements (a TMA
+        // issue before a warpgroup wait was moved after it → deadlock). Decline
+        // to chain in that case; the run emits flat (source order, always
+        // sound).
+        for (_, members) in &groups {
+            let wg_last = members
+                .iter()
+                .filter(|m| m.parts.warp.is_none())
+                .map(|m| m.index)
+                .max();
+            let warp_first = members
+                .iter()
+                .filter(|m| m.parts.warp.is_some())
+                .map(|m| m.index)
+                .min();
+            if let (Some(wg), Some(w)) = (wg_last, warp_first) {
+                if wg > w {
+                    return None;
+                }
             }
         }
         let mut else_: Option<Box<IfChain>> = None;
         for (g, members) in groups.into_iter().rev() {
+            let members: Vec<IfParts<'_>> = members.into_iter().map(|m| m.parts).collect();
             let refs: Vec<&IfParts<'_>> = members.iter().collect();
             let (wg_ifs, warp_ifs): (Vec<&IfParts<'_>>, Vec<&IfParts<'_>>) =
                 refs.into_iter().partition(|m| m.warp.is_none());
@@ -2120,7 +2153,9 @@ fn collect_reg_aux_views(
             // Per-thread point transfers lower to raw element assignments on
             // the flat view (see the RegLoad/RegStore arms).
             Stmt::RegLoad { dst, src } => {
-                if src.tensor.space == MemorySpace::Smem && slice_all_size1(src) {
+                if matches!(src.tensor.space, MemorySpace::Smem | MemorySpace::Gmem)
+                    && slice_all_size1(src)
+                {
                     views.entry(dst.tensor.id).or_default().flat = true;
                 }
             }
@@ -4561,36 +4596,51 @@ fn emit_stmt(
         // reads) lowers to a raw element assignment on the flat view — the tile-op
         // anchor cannot express "each thread reads its own address".
         RegLoad { dst, src } => {
-            if src.tensor.space == MemorySpace::Smem {
-                if slice_all_size1(src) {
-                    let (dt, doff, dw) = reg_slice_parts(dst)?;
-                    if dt.dtype != src.tensor.dtype {
-                        return Err(format!(
-                            "codegen: RegLoad point src dtype {:?} != dst dtype {:?} — \
-                             the interpreter coerces; use an explicit RegCvt",
-                            src.tensor.dtype, dt.dtype
-                        ));
-                    }
-                    if dw != 1 {
-                        return Err(format!(
-                            "codegen: RegLoad point src loads one element per thread \
-                             (dst width {dw} != 1)"
-                        ));
-                    }
-                    let dflat = flat_name(dt, ctx)?;
-                    let doff_s = emit_scalar(doff, ctx)?;
-                    let addr = emit_scalar_addr(src, ctx)?;
-                    out.push_str(&format!("{p}{dflat}[{doff_s}] = {addr}\n"));
-                    return Ok(());
+            // A per-thread POINT src (every dim size-1) lowers to a raw element
+            // assignment on the flat view, for SMEM and GMEM alike — anything
+            // else used to fall through and emit NOTHING (a silent miscompile:
+            // the interpreter transfers values for every src space).
+            if slice_all_size1(src)
+                && matches!(src.tensor.space, MemorySpace::Smem | MemorySpace::Gmem)
+            {
+                let (dt, doff, dw) = reg_slice_parts(dst)?;
+                if dt.dtype != src.tensor.dtype {
+                    return Err(format!(
+                        "codegen: RegLoad point src dtype {:?} != dst dtype {:?} — \
+                         the interpreter coerces; use an explicit RegCvt",
+                        src.tensor.dtype, dt.dtype
+                    ));
                 }
+                if dw != 1 {
+                    return Err(format!(
+                        "codegen: RegLoad point src loads one element per thread \
+                         (dst width {dw} != 1)"
+                    ));
+                }
+                let dflat = flat_name(dt, ctx)?;
+                let doff_s = emit_scalar(doff, ctx)?;
+                let addr = emit_scalar_addr(src, ctx)?;
+                out.push_str(&format!("{p}{dflat}[{doff_s}] = {addr}\n"));
+                return Ok(());
+            }
+            if src.tensor.space == MemorySpace::Smem {
                 let src_s = emit_smem_wg_store_tile(src, ctx)?;
                 let zero = ScalarValue::Int(0);
                 let dst_off = dst.offsets.first().unwrap_or(&zero);
                 let width = dst.shape.first().and_then(as_int).unwrap_or(0).max(0) as usize;
                 let dst_s = emit_reg_view_slice(out, &p, &dst.tensor, dst_off, width, ctx)?;
                 out.push_str(&format!("{p}Tx.wg.copy({dst_s}, {src_s})\n"));
+                return Ok(());
             }
-            Ok(())
+            // REG src: a structural no-op (see the comment above the arm).
+            if src.tensor.space == MemorySpace::Reg {
+                return Ok(());
+            }
+            Err(format!(
+                "codegen: RegLoad src space {:?} shape {:?} has no lowering (SMEM point/tile \
+                 loads and GMEM point loads only)",
+                src.tensor.space, src.shape
+            ))
         }
         RegStore { dst, src } => {
             // REG -> REG per-thread copy (gdn's m16 A-broadcast): the
@@ -5917,6 +5967,23 @@ mod tests {
         let src = kernel_to_tirx_source(&kernel(body)).unwrap();
         assert!(src.contains("if warp_id == 0:"), "{src}");
         assert!(src.contains("if warp_id == 1:"), "{src}");
+        assert!(!src.contains("else:"), "{src}");
+    }
+
+    /// A run whose group mixes a warp-level `If` BEFORE its warpgroup-level
+    /// `If` must NOT chain — chaining would reorder the warpgroup body ahead
+    /// of the warp body (observed: TMA issue moved after the mbarrier wait →
+    /// deadlock). The run emits flat, preserving source order.
+    #[test]
+    fn warp_before_warpgroup_run_stays_flat() {
+        let body = vec![
+            warp_if(1, vec![Stmt::WarpSync]),
+            wg_if(0, vec![Stmt::WgSync { barrier_id: 3 }]),
+        ];
+        let src = kernel_to_tirx_source(&kernel_n(body, 8)).unwrap();
+        let warp_pos = src.find("if warp_id == 1:").unwrap();
+        let wg_pos = src.find("if wg_id == 0:").unwrap();
+        assert!(warp_pos < wg_pos, "{src}");
         assert!(!src.contains("else:"), "{src}");
     }
 
