@@ -352,6 +352,15 @@ def build_gdn_prefill(config: GdnPrefillConfig = GdnPrefillConfig()) -> Kernel:
     sttile = reg(iod, (2,))  # one m8n8 tile (2 bf16 = 1 stmatrix word) for reg->SMEM staging
     sttile2 = reg(iod, (2,))  # second tile (vnew gated/ungated emit two stmatrix tiles)
     sinp_reg = reg(iod, (64,))  # bf16 cvt slots for the s_s state staging (one half at a time)
+    # Per-chunk gating fragments (Wave-3 C1: compute exp2 ONCE per chunk, not per
+    # epilogue). t_frag = CG0's T-pairwise row (32 els, reused by kk_epi AND qk_epi);
+    # t_row/t_beta = its 2 row values; dexp2/kgate2 = CG1's per-row gate factors
+    # (delta/ointer consume dexp2, vnew consumes kgate2).
+    t_frag = reg(DType.F32, (32,))
+    t_row = reg(DType.F32, (2,))
+    t_beta = reg(DType.F32, (2,))
+    dexp2 = reg(DType.F32, (2,))
+    kgate2 = reg(DType.F32, (2,))
 
     # mbarrier.arrive is PER-THREAD: each producer thread arrives once after its
     # own rows/reads land, so a completed phase proves every arriving lane finished
@@ -445,6 +454,11 @@ def build_gdn_prefill(config: GdnPrefillConfig = GdnPrefillConfig()) -> Kernel:
             sttile,
             sttile2,
             sinp_reg,
+            t_frag,
+            t_row,
+            t_beta,
+            dexp2,
+            kgate2,
         ),
         bars,
     )
@@ -481,6 +495,11 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
         sttile,
         sttile2,
         sinp_reg,
+        t_frag,
+        t_row,
+        t_beta,
+        dexp2,
+        kgate2,
     ) = rg
     scale = config.scale
 
@@ -502,8 +521,8 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
         # TMEM operands (flat physical addresses): the per-issue element offsets
         # fold into the band's `elem` address. B operands are SMEM-only (tcgen05.mma).
         for g in range(kk // 16):
-            a_off, a_sh = (((g * 16, 0), (16, m)) if trans_a else ((0, g * 16), (m, 16)))
-            b_off, b_sh = (((g * 16, 0), (16, n)) if trans_b else ((0, g * 16), (n, 16)))
+            a_off, a_sh = ((g * 16, 0), (16, m)) if trans_a else ((0, g * 16), (m, 16))
+            b_off, b_sh = ((g * 16, 0), (16, n)) if trans_b else ((0, g * 16), (n, 16))
             a_op = (
                 a.elem(*a_off)
                 if isinstance(a, TmemBand)
@@ -534,6 +553,8 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
     def rss(dst_s, fac_neg_beta, mask_strict, tid, lane, warp, dst_bf16=False, acc=None):
         # kk_epi / qk_epi (CG0): read M=64 acc via tcgen05.ld.16x256b, scale by the
         # T-pairwise factor exp2(gcs[i]-gcs[j]) and (-beta[i] | scale), mask, store.
+        # Wave-3 C1: T and -beta come from the per-chunk fragments built once before
+        # kk_epi (t_frag/t_beta) — no per-element gcs/beta SMEM reads or exp2 here.
         k.tcgen05_ld(
             frag, (acc if acc is not None else acc_tmem).at(0, 0), shape="16x256b", num=LD_NUM
         )
@@ -544,15 +565,9 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                 for v0p in range(2):
                     r = v0p + 2 * va + 4 * vb
                     col = v0p + 2 * (lane % 4) + 8 * vb
-                    k.reg_load(r1, _sl(gcs_s, (row, eh), (1, 1)))
-                    k.reg_load(r2, _sl(gcs_s, (col, eh), (1, 1)))
-                    k.reg_sub(r1, r1, r2)
-                    k.reg_unary(r1, r1, op="exp2")  # T=exp2(gcs[i]-gcs[j]) (log2-units)
-                    k.reg_mul(r1, r1, _sl(frag, (r,), (1,)))
+                    k.reg_mul(r1, _sl(t_frag, (r,), (1,)), _sl(frag, (r,), (1,)))
                     if fac_neg_beta:
-                        k.reg_load(r2, _sl(beta_s, (row, eh), (1, 1)))
-                        k.reg_mul(r2, r2, -1.0)
-                        k.reg_mul(r1, r1, r2)
+                        k.reg_mul(r1, r1, _sl(t_beta, (va,), (1,)))
                     else:
                         k.reg_mul(r1, r1, float(scale))
                     if dst_bf16:
@@ -722,23 +737,13 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                 )  # GEMM1 W_kk -> stage 0
                 k.mbarrier_wait(bars["f_kk"], phase=ph(gc))
                 k.mbarrier_wait(bars["tq"], phase=ph(gc))
-                issue(
-                    acc_s1, q_s, k_s, BT, BT, K_DIM, "d_qk", b_stg=kstg
-                )  # GEMM2 W_qk -> stage 1
+                issue(acc_s1, q_s, k_s, BT, BT, K_DIM, "d_qk", b_stg=kstg)  # GEMM2 W_qk -> stage 1
                 k.mbarrier_wait(bars["f_qk"], phase=ph(gc))
                 with k.if_(c > 0):  # chunk 0: S_prev=0, skip GEMM3/4 (flashinfer is_first_chunk)
                     # GEMM3/4 read the fp16 s_s (SMEM) as B=Sᵀ (trans_b); GEMM4 → q_state.
                     k.mbarrier_wait(bars["sT_ready"], phase=ph(gc_pos))
                     issue(
-                        acc_tmem,
-                        k_s,
-                        s_s,
-                        BT,
-                        V_DIM,
-                        K_DIM,
-                        "d_ks",
-                        trans_b=True,
-                        a_stg=kstg,
+                        acc_tmem, k_s, s_s, BT, V_DIM, K_DIM, "d_ks", trans_b=True, a_stg=kstg
                     )  # GEMM3 K@S
                     k.mbarrier_wait(bars["f_ks"], phase=ph(gc_pos))
                     issue(
@@ -793,6 +798,23 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                 with k.if_(gc > 0):
                     k.mbarrier_wait(bars["chunk_free"], phase=ph(gc - 1))
                 k.mbarrier_wait(bars["gate_ready0"], phase=ph(gc))
+                # Wave-3 C1: build the per-chunk gating fragments ONCE — kk_epi and
+                # qk_epi both consume them (the old rss recomputed T per call):
+                # t_frag[r] = exp2(gcs[row]-gcs[col]) (T-pairwise), t_beta = -beta[row].
+                for va in range(2):
+                    row = (lane // 4) + 8 * va + 16 * warp
+                    k.reg_load(r2, _sl(beta_s, (row, eh), (1, 1)))
+                    k.reg_mul(_sl(t_beta, (va,), (1,)), r2, -1.0)
+                    k.reg_load(_sl(t_row, (va,), (1,)), _sl(gcs_s, (row, eh), (1, 1)))
+                for vb in range(8):
+                    for v0p in range(2):
+                        col = v0p + 2 * (lane % 4) + 8 * vb
+                        k.reg_load(r2, _sl(gcs_s, (col, eh), (1, 1)))
+                        for va in range(2):
+                            r = v0p + 2 * va + 4 * vb
+                            k.reg_sub(r1, _sl(t_row, (va,), (1,)), r2)
+                            k.reg_unary(r1, r1, op="exp2")
+                            k.reg_store(_sl(t_frag, (r,), (1,)), r1)
                 # kk_epi: W_kk -> M_kk
                 k.mbarrier_wait(bars["d_kk"], phase=ph(gc))
                 rss(m_s, True, True, tid, lane, warp, acc=acc_s0)
@@ -935,6 +957,15 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                 k.mbarrier_wait(bars["gate_ready1"], phase=ph(gc))
                 k.mbarrier_wait(bars["tv"], phase=ph(gc))  # CG1 reads v_s (delta)
                 k.reg_load(glast, _sl(gcs_s, (BT - 1, eh), (1, 1)))
+                # Wave-3 C1: per-row gate factors ONCE per chunk (delta/ointer consume
+                # dexp2 = exp2(gcs[row]); vnew consumes kgate2 = exp2(glast-gcs[row])) —
+                # the helpers no longer re-load gcs and re-exp2 per element.
+                for va in range(2):
+                    row = (lane // 4) + 8 * va + 16 * warp
+                    k.reg_load(r2, _sl(gcs_s, (row, eh), (1, 1)))
+                    k.reg_unary(_sl(dexp2, (va,), (1,)), r2, op="exp2")
+                    k.reg_sub(r1, glast, r2)
+                    k.reg_unary(_sl(kgate2, (va,), (1,)), r1, op="exp2")
                 # delta operand (deltaT -> tmpt_s) + o_inter (-> out_s)
                 with k.if_(c > 0):
                     # s_s = fp16 SMEM copy of the UNDECAYED S_prev, the GEMM3/4 B
@@ -947,15 +978,13 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                     for half in range(2):
                         k.tcgen05_ld(frag32, s_tmem.at(0, half * 64), shape="32x32b", num=64)
                         k.tcgen05_wait_ld()
-                        for cc in range(64):
-                            k.reg_cvt(
-                                _sl(sinp_reg, (cc,), (1,)), _sl(frag32, (cc,), (1,))
-                            )
-                            k.reg_mul(_sl(frag32, (cc,), (1,)), _sl(frag32, (cc,), (1,)), r1)
-                            k.reg_store(
-                                _sl(s_s, (tid, half * 64 + cc), (1, 1)),
-                                _sl(sinp_reg, (cc,), (1,)),
-                            )  # undecayed fp16 S_prev[k=tid, half*64+cc]
+                        # Wave-3 C1: whole-row tile ops instead of the 64-iteration
+                        # per-element cvt+store (same values, same cvt-before-decay order).
+                        k.reg_cvt(_sl(sinp_reg, (0,), (64,)), _sl(frag32, (0,), (64,)))
+                        k.reg_store(
+                            _sl(s_s, (tid, half * 64), (1, 64)), _sl(sinp_reg, (0,), (64,))
+                        )  # undecayed fp16 S_prev[k=tid, half*64:+64] (warpgroup row store)
+                        k.reg_mul(_sl(frag32, (0,), (64,)), _sl(frag32, (0,), (64,)), r1)
                         k.tcgen05_st(s_tmem.at(0, half * 64), frag32, num=64)  # decayed main state
                     k.tcgen05_wait_st()
                     # publish the generic s_s stores to the MMA's async proxy
@@ -965,13 +994,26 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                     k.mbarrier_arrive(bars["sT_ready"])  # s_s ready for GEMM3/4
                     k.mbarrier_wait(bars["d_ks"], phase=ph(gc_pos))
                     _read128_delta(
-                        k, acc_tmem, tmpt_s, v_s, gcs_s, frag, rb16, rb16b, sttile, r1, lane, warp, eh
+                        k,
+                        acc_tmem,
+                        tmpt_s,
+                        v_s,
+                        gcs_s,
+                        frag,
+                        rb16,
+                        rb16b,
+                        sttile,
+                        r1,
+                        lane,
+                        warp,
+                        eh,
+                        dexp2,
                     )
                     k.wg_sync(barrier_id=11)
                     k.mbarrier_arrive(bars["f_ks"])
                     k.mbarrier_wait(bars["d_qs"], phase=ph(gc_pos))
                     _read128_ointer(
-                        k, qstate_tmem, out_s, gcs_s, scale, frag, r1, sttile, lane, warp, eh
+                        k, qstate_tmem, out_s, gcs_s, scale, frag, r1, sttile, lane, warp, eh, dexp2
                     )
                     k.wg_sync(barrier_id=11)
                     k.mbarrier_arrive(bars["f_qs"])
@@ -1001,6 +1043,7 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                     lane,
                     warp,
                     eh,
+                    kgate2,
                 )
                 k.wg_sync(barrier_id=11)
                 k.mbarrier_arrive(bars["f_nv"])
@@ -1114,15 +1157,16 @@ def _read128_store_out(k, acc, dst_s, frag, rb16, sttile, lane, warp):
             _stm(k, dst_s, 8 * va + 16 * warp, blk * 64 + 8 * vb, sttile, lane, trans=False)
 
 
-def _read128_delta(k, acc, tmpt_s, v_s, gcs_s, frag, rb16, rb16b, sttile, r1, lane, warp, eh):
+def _read128_delta(
+    k, acc, tmpt_s, v_s, gcs_s, frag, rb16, rb16b, sttile, r1, lane, warp, eh, dexp2
+):
     # delta[i,dv] = v[i,dv] - exp2(gcs[i])·KH[i,dv]; store deltaᵀ → tmpt_s[dv,i] (stmatrix.trans).
+    # dexp[i] comes from the per-chunk dexp2 fragment (Wave-3 C1), not per-element exp2.
     for blk, va, vb, v0p in _read128(k, acc, frag):
         r = v0p + 2 * va + 4 * vb
         row = (lane // 4) + 8 * va + 16 * warp  # i
         col = blk * 64 + v0p + 2 * (lane % 4) + 8 * vb  # dv
-        k.reg_load(r1, _sl(gcs_s, (row, eh), (1, 1)))
-        k.reg_unary(r1, r1, op="exp2")  # dexp[i] (gcs log2-units)
-        k.reg_mul(r1, r1, _sl(frag, (r,), (1,)))  # dexp·KH (f32)
+        k.reg_mul(r1, _sl(dexp2, (va,), (1,)), _sl(frag, (r,), (1,)))  # dexp·KH (f32)
         k.reg_cvt(rb16b, r1)  # → bf16
         k.reg_load(rb16, _sl(v_s, (row, col), (1, 1)))  # v (bf16)
         k.reg_sub(_sl(sttile, (v0p,), (1,)), rb16, rb16b)  # delta = v - dexp·KH (bf16)
@@ -1130,32 +1174,30 @@ def _read128_delta(k, acc, tmpt_s, v_s, gcs_s, frag, rb16, rb16b, sttile, r1, la
             _stm(k, tmpt_s, 8 * va + 16 * warp, blk * 64 + 8 * vb, sttile, lane, trans=True)
 
 
-def _read128_ointer(k, acc, out_s, gcs_s, scale, frag, r1, sttile, lane, warp, eh):
+def _read128_ointer(k, acc, out_s, gcs_s, scale, frag, r1, sttile, lane, warp, eh, dexp2):
     # o_inter[i,dv] = exp2(gcs[i])·scale·QS[i,dv]; pre-stage into out_s (bf16) via stmatrix.
+    # dexp[i] comes from the per-chunk dexp2 fragment (Wave-3 C1), not per-element exp2.
     for blk, va, vb, v0p in _read128(k, acc, frag):
         r = v0p + 2 * va + 4 * vb
         row = (lane // 4) + 8 * va + 16 * warp
         col = blk * 64 + v0p + 2 * (lane % 4) + 8 * vb
-        k.reg_load(r1, _sl(gcs_s, (row, eh), (1, 1)))
-        k.reg_unary(r1, r1, op="exp2")  # dexp[i] (gcs log2-units)
-        k.reg_mul(r1, r1, _sl(frag, (r,), (1,)))
+        k.reg_mul(r1, _sl(dexp2, (va,), (1,)), _sl(frag, (r,), (1,)))
         k.reg_mul(r1, r1, float(scale))
         k.reg_cvt(_sl(sttile, (v0p,), (1,)), r1)
         if v0p == 1:
             _stm(k, out_s, 8 * va + 16 * warp, blk * 64 + 8 * vb, sttile, lane, trans=False)
 
 
-def _read128_vnew(k, acc, vnewt_s, vng_s, gcs_s, glast, frag, sttile, sttile2, r1, lane, warp, eh):
+def _read128_vnew(
+    k, acc, vnewt_s, vng_s, gcs_s, glast, frag, sttile, sttile2, r1, lane, warp, eh, kgate2
+):
     # VNEW readback → vnewt_s[dv,i]=vnew (ungated, GEMM6) AND vng_s[dv,i]=vnew·exp2(glast-gcs[i])
     # (gated, GEMM7); both transposed → stmatrix.trans (one m8n8 tile per (va,vb)).
+    # kgate[i] comes from the per-chunk kgate2 fragment (Wave-3 C1), not per-element exp2.
     for blk, va, vb, v0p in _read128(k, acc, frag):
         r = v0p + 2 * va + 4 * vb
         k.reg_cvt(_sl(sttile, (v0p,), (1,)), _sl(frag, (r,), (1,)))  # ungated
-        row = (lane // 4) + 8 * va + 16 * warp  # i (token)
-        k.reg_load(r1, _sl(gcs_s, (row, eh), (1, 1)))  # gcs[i]
-        k.reg_sub(r1, glast, r1)  # glast - gcs[i]   (glast is REG)
-        k.reg_unary(r1, r1, op="exp2")  # kgate[i] (gcs log2-units)
-        k.reg_mul(r1, r1, _sl(frag, (r,), (1,)))  # · vnew
+        k.reg_mul(r1, _sl(kgate2, (va,), (1,)), _sl(frag, (r,), (1,)))  # · vnew
         k.reg_cvt(_sl(sttile2, (v0p,), (1,)), r1)  # gated
         if v0p == 1:
             rb = 8 * va + 16 * warp

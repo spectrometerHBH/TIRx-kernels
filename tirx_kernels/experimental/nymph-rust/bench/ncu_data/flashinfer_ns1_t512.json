@@ -5,27 +5,27 @@
     "kernel_cutlass_kernel_flashinfergdn_kernelsblackwellgated_delta_net_chunkedGatedDeltaNetChunkedKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK6_0"
   ],
   "ncu_report": "flashinfer_ns1_t512.ncu-rep",
-  "collected_at": "2026-07-25 03:25:10",
-  "inst_total": 513096.0,
+  "collected_at": "2026-07-25 15:29:51",
+  "inst_total": 513994.0,
   "inst_csv": "flashinfer_ns1_t512.inst.csv",
   "mem_csv": "flashinfer_ns1_t512.mem.csv",
   "mem": [
     {
       "kernel": "kernel_cutlass_kernel_flashinfergdn_kernelsblackwellgated_delta_net_chunkedGatedDeltaNetChunkedKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK6_0",
       "metric": "l1tex__data_pipe_lsu_wavefronts_mem_shared.sum",
-      "value": 107028,
+      "value": 106932,
       "unit": ""
     },
     {
       "kernel": "kernel_cutlass_kernel_flashinfergdn_kernelsblackwellgated_delta_net_chunkedGatedDeltaNetChunkedKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK6_0",
       "metric": "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum",
-      "value": 18266,
+      "value": 19209,
       "unit": ""
     },
     {
       "kernel": "kernel_cutlass_kernel_flashinfergdn_kernelsblackwellgated_delta_net_chunkedGatedDeltaNetChunkedKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK6_0",
       "metric": "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum",
-      "value": 11499,
+      "value": 9489,
       "unit": ""
     },
     {
@@ -37,19 +37,19 @@
     {
       "kernel": "kernel_cutlass_kernel_flashinfergdn_kernelsblackwellgated_delta_net_chunkedGatedDeltaNetChunkedKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK6_0",
       "metric": "l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum",
-      "value": 131589,
+      "value": 131574,
       "unit": "sector"
     },
     {
       "kernel": "kernel_cutlass_kernel_flashinfergdn_kernelsblackwellgated_delta_net_chunkedGatedDeltaNetChunkedKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK6_0",
       "metric": "lts__t_sectors.sum",
-      "value": 417688,
+      "value": 422638,
       "unit": "sector"
     },
     {
       "kernel": "kernel_cutlass_kernel_flashinfergdn_kernelsblackwellgated_delta_net_chunkedGatedDeltaNetChunkedKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK6_0",
       "metric": "dram__sectors_read.sum",
-      "value": 69040,
+      "value": 70416,
       "unit": "sector"
     },
     {
@@ -61,7 +61,7 @@
     {
       "kernel": "kernel_cutlass_kernel_flashinfergdn_kernelsblackwellgated_delta_net_chunkedGatedDeltaNetChunkedKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK6_0",
       "metric": "smsp__inst_executed.sum",
-      "value": 410018,
+      "value": 406627,
       "unit": "inst"
     },
     {

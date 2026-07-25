@@ -41,3 +41,33 @@ fi 3 — nymph's choice is fine, NOT a gap).
   target ≥0.99. One theme per commit; re-profile between themes.
 - fi-side SASS for reference dumps: `/tmp/fi_t2048_sass.csv`,
   `/tmp/nymph_t2048_sass.csv` (regenerate: `ncu --import <rep> --page source --csv`).
+
+## Progress log
+
+**Cut 1 (C1 tile-op emission form, 2026-07-25, kernel body only) — DONE.**
+Changes: (a) s_s state cvt+store → wide `Tx.wg.cast` + `Tx.wg.copy` row
+stores (STS.128); (b) per-chunk gating fragments — CG0 `t_frag`/`t_beta`
+(kk_epi AND qk_epi share the one T-pairwise build) and CG1 `dexp2`/`kgate2`
+(delta/ointer/vnew consume, no per-element exp2); (c) skipped: v_s/o_inter
+ldmatrix (blocked — IR has no u32→bf16 element reinterpret for the arith),
+(64,*)-row SMEM wide stores (emitter's TidInWg→128-row expansion mismatches
+(BT,*) shapes — ainv_s/out_s stay per-element this cut). TRAP FOUND+FIXED:
+`RegLoad` from a REG tensor is a codegen no-op (alias copies dropped) —
+fragment reads must go through slice OPERANDS of the arith op, never
+`reg_load(dst, reg_frag[i])` (value sim is blind to this; only the GPU
+cosine gate catches it).
+A/B (t2048 compute region, spin excluded): LDL 112,680→13,088 (-88%),
+MUFU 163,296→38,304 (-77%), LDS -33%, STS -13%, FADD -28%, PRMT -43%,
+F2FP -9%; IMAD-family +270K (fragment-build point loads + wg.copy tile
+address overhead — TIRx lowering quality, next target); FMUL2 still 0
+(packing needs full-fragment tile ops = queue #1 residue); total -3.8%.
+Bench fi/nymph (rounds=5, all 6, cos 1.0000): ns1_t64 0.605→0.684, t512
+0.225→0.257, t2048 0.181→0.206, ns20_t192 0.360→0.439, ns48_t64
+0.618→0.665, v_70_130 0.275→0.294. Gates: value sim 67 + compile + GPU
+cosine ≥0.999 all green.
+D5 orientation recommendation (for queue #2): DON'T flip — keep agent-31's
+s_s (SMEM state) form; the remaining gap is emission quality, not dataflow.
+Next cuts in order: (i) IR u32→bf16 reg reinterpret → v_s/o_inter ldmatrix
+(the last big per-element loops, ~200K); (ii) TIRx wg.copy/tile-view index
+quality (the +270K); (iii) (64,*) capped-wg store lowering; (iv) sync
+reduction (re-measure after i/ii).

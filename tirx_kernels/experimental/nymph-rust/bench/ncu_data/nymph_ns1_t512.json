@@ -1,0 +1,80 @@
+{
+  "impl": "nymph",
+  "shape": "ns1_t512",
+  "kernels": [
+    "main_kernel"
+  ],
+  "ncu_report": "nymph_ns1_t512.ncu-rep",
+  "collected_at": "2026-07-25 16:24:37",
+  "inst_total": 1306400.0,
+  "inst_csv": "nymph_ns1_t512.inst.csv",
+  "mem_csv": "nymph_ns1_t512.mem.csv",
+  "mem": [
+    {
+      "kernel": "main_kernel",
+      "metric": "l1tex__data_pipe_lsu_wavefronts_mem_shared.sum",
+      "value": 353747,
+      "unit": ""
+    },
+    {
+      "kernel": "main_kernel",
+      "metric": "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum",
+      "value": 62563,
+      "unit": ""
+    },
+    {
+      "kernel": "main_kernel",
+      "metric": "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum",
+      "value": 86312,
+      "unit": ""
+    },
+    {
+      "kernel": "main_kernel",
+      "metric": "l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum",
+      "value": 0,
+      "unit": "sector"
+    },
+    {
+      "kernel": "main_kernel",
+      "metric": "l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum",
+      "value": 131122,
+      "unit": "sector"
+    },
+    {
+      "kernel": "main_kernel",
+      "metric": "lts__t_sectors.sum",
+      "value": 402545,
+      "unit": "sector"
+    },
+    {
+      "kernel": "main_kernel",
+      "metric": "dram__sectors_read.sum",
+      "value": 71832,
+      "unit": "sector"
+    },
+    {
+      "kernel": "main_kernel",
+      "metric": "dram__sectors_write.sum",
+      "value": 0,
+      "unit": "sector"
+    },
+    {
+      "kernel": "main_kernel",
+      "metric": "smsp__inst_executed.sum",
+      "value": 1022711,
+      "unit": "inst"
+    },
+    {
+      "kernel": "main_kernel",
+      "metric": "launch__registers_per_thread",
+      "value": 168,
+      "unit": "register/thread"
+    },
+    {
+      "kernel": "main_kernel",
+      "metric": "launch__occupancy_limit_registers",
+      "value": 1,
+      "unit": "block"
+    }
+  ]
+}

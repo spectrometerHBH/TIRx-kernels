@@ -79,6 +79,15 @@ def _shape_to_kwargs(gdn, shape: str) -> dict:
 
 def _worker(impl: str, shape: str) -> int:
     """Compile + warm, then launch the kernel ONCE inside the NVTX range."""
+    # Stale editable-tvm finder repair INSIDE the worker (ncu strips the env
+    # in a way that kills the txdev startup sitecustomize; the stale
+    # `_apache_tvm_editable` meta-path finder then shadows the PYTHONPATH
+    # worktree tvm — mirrors bench/sitecustomize.py, unconditional).
+    sys.meta_path[:] = [
+        f
+        for f in sys.meta_path
+        if getattr(getattr(f, "__class__", None), "__module__", "") != "_apache_tvm_editable"
+    ]
     for _p in (os.path.join(_NYMPH_RUST, "python"), _REPO):
         if _p not in sys.path:
             sys.path.insert(0, _p)

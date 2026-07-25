@@ -1,0 +1,12 @@
+kernel,metric,value,unit
+main_kernel,l1tex__data_pipe_lsu_wavefronts_mem_shared.sum,1475929,
+main_kernel,l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum,261412,
+main_kernel,l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum,343629,
+main_kernel,l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum,0,sector
+main_kernel,l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum,131114,sector
+main_kernel,lts__t_sectors.sum,873435,sector
+main_kernel,dram__sectors_read.sum,271104,sector
+main_kernel,dram__sectors_write.sum,0,sector
+main_kernel,smsp__inst_executed.sum,4227774,inst
+main_kernel,launch__registers_per_thread,168,register/thread
+main_kernel,launch__occupancy_limit_registers,1,block
