@@ -3322,7 +3322,6 @@ fn single_issue_guard(stmt: &Stmt, scope: &ScopeInfo, ctx: &Ctx) -> Option<&'sta
         MBarrierInit { .. }
         | MBarrierArriveExpectTx { .. }
         | MBarrierExpectTx { .. }
-        | MBarrierArrive { .. }
         | StoreScalar { .. }
         | TmaLoad { .. }
         // Tcgen05Cp MUST coalesce with the adjacent Tcgen05Mma/Commit under ONE elect
@@ -3335,6 +3334,9 @@ fn single_issue_guard(stmt: &Stmt, scope: &ScopeInfo, ctx: &Ctx) -> Option<&'sta
         | Tcgen05Cp { .. }
         | Tcgen05Mma { .. }
         | Tcgen05Commit { .. } => Some(scope.scope.issue_guard()),
+        // MBarrierArrive is per-thread (see its arm): NO single-issue guard — the
+        // interpreter arrives once per executing lane and the barrier counts are
+        // sized for exactly that (an elect here undercounts and deadlocks).
         _ => None,
     }
 }
@@ -3890,11 +3892,17 @@ fn emit_stmt(
             //     This is NOT the map_shared_rank peer view; the cluster arrive remaps
             //     to CTA c internally, so we use the local mbar name + cta_id.
             //
-            // The guard elects ONE issuing thread of the enclosing branch. A warpgroup
-            // branch MUST elect `tid_in_wg == 0` (not one lane per warp, which is 4
-            // threads across the group's 4 warps): 4× over-arrival corrupts the
-            // barrier phase. It is latent on a single task (the reused slot is never
-            // re-waited) but deadlocks the moment a slot is reused across tasks.
+            // `mbarrier.arrive` is a PER-THREAD instruction: the interpreter
+            // arrives once per executing lane, and the barrier's expected count
+            // equals the number of lanes reaching the site (gdn's 128/32-lane
+            // thread barriers, canon's 256 all-thread arrivals). Emitting it
+            // under a single-issue guard (elect/tid_in_wg==0) UNDERCOUNTS —
+            // one arrival on a count-32/128/256 barrier never completes a
+            // phase (the gdn gate_ready deadlock). Sites needing a single
+            // arrival are single-thread in the IR already (an elected/single-
+            // thread If narrows the executing lanes); the checker rejects any
+            // over-arrival, so an unguarded per-thread emission cannot exceed
+            // the validated count.
             let body = if let Some(remote) = &mbar.remote_coord {
                 // Use the LOCAL barrier name (not the peer reinterpret view).
                 let local_name = ctx
@@ -3923,7 +3931,7 @@ fn emit_stmt(
                     format!("T.ptx.mbarrier.arrive({slot_ptr}, remote=cbx, pred=True, count={cnt})")
                 }
             };
-            emit_guarded(out, &body);
+            out.push_str(&format!("{p}{body}\n"));
             Ok(())
         }
         MBarrierWait { mbar, phase, stage } => {
@@ -6535,6 +6543,42 @@ mod tests {
         }))
         .unwrap_err();
         assert!(err.contains("m8n8k8"), "{err}");
+    }
+
+    #[test]
+    fn mbarrier_arrive_emits_bare_per_thread() {
+        use super::super::dtype::MBarKind;
+        use super::super::mbar::{MBar, MBarRef};
+        let mbar = Arc::new(MBar {
+            id: 3,
+            kind: MBarKind::Thread,
+            stages: 1,
+            arrive_count: None,
+            leader_routed: false,
+        });
+        let mref = || MBarRef {
+            mbar: mbar.clone(),
+            remote_coord: None,
+        };
+        // wg scope: bare per-thread arrive (no `if elect_sync():` guard) — the
+        // interpreter arrives once per executing lane and the barrier count is
+        // sized for exactly that (an elect undercounts and deadlocks — the gdn
+        // gate_ready bug).
+        let src = kernel_to_tirx_source(&kernel(vec![
+            Stmt::MBarDef { mbar: mbar.clone() },
+            wg_if(
+                0,
+                vec![Stmt::MBarrierArrive {
+                    mbar: mref(),
+                    count: None,
+                    stage: None,
+                }],
+            ),
+        ]))
+        .unwrap();
+        assert!(src.contains("T.ptx.mbarrier.arrive(mbar3.ptr_to([0]))"), "{src}");
+        assert!(!src.contains("if T.ptx.elect_sync():"), "{src}");
+        assert!(!src.contains("if tid_in_wg == 0:"), "{src}");
     }
 
     #[test]
