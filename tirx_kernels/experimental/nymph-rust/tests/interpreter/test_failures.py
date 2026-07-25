@@ -17,10 +17,11 @@ def test_tma_and_reg_runtime_failures_expose_runtime_codes():
     smem = smem_tensor(b, shape=(4,), byte_offset=0)
     with b.if_warp(0):
         b.tma_store(out, smem, coords=(b.lane_id(),), shape=(4,))
-    # Divergent TMA operands need >1 executing thread, which the single-thread
-    # issue gate now rejects first: the reachable code is tma_store_mask.
-    with expect_runtime_error("tma_store_mask"):
-        run(b.build())
+    # Divergent TMA operands need >1 executing thread — now rejected at BUILD
+    # by the validator's single_issue_scope rule (before the interpreter's
+    # tma_store_mask gate could ever run).
+    with pytest.raises(ValueError, match="single_issue_scope"):
+        b.build()
 
     b = builder("reg_load_oob_source")
     short = gmem_arg(b, shape=(8,))

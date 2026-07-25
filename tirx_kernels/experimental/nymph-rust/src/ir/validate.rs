@@ -2127,11 +2127,10 @@ fn check_context(
                 // branch (even a runtime one, e.g. `cta_rank == 0`) only
                 // selects a subset, so a single-issue op still cannot
                 // double-issue. This branch alone proving the bound (an
-                // explicit if_elected) lifts it for its subtree.
-                let inner_single = single_lane
-                    || branch.known().is_some_and(|set| {
-                        !set.is_empty() && set.count() == set.warps_touched().len()
-                    });
+                // explicit if_elected, or an And-chain with a one-lane
+                // operand like `(~kept) & (tid == 0)`) lifts it for its
+                // subtree.
+                let inner_single = single_lane || proves_single_lane_per_warp(cond, num_warps);
                 check_context(
                     then_body,
                     &inner,

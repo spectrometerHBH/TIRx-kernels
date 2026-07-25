@@ -60,11 +60,13 @@ Hardware single-issue ops — `tma_load` / `tma_store` /
 `tcgen05_cp` / `tcgen05_commit`, `mbarrier_init` (an unguarded init is a
 double-init error in both models), `clc_try_cancel` (stream-level in the
 interpreter) — are legal ONLY under an explicit single-lane `If` in the IR:
-the `if_elected` sugar (`lane_id == 0`), or any predicate the static thread
-filter proves selects at most one lane per warp (`tid_in_wg == 0`,
-`thread_rank == 0`, ...). The single-lane upper bound is sticky: a deeper
-runtime branch (e.g. `cta_rank == 0`) only selects a subset, so it cannot
-reintroduce double-issue.
+the `if_elected` sugar (`lane_id == 0`), or any predicate PROVABLY selecting
+at most one lane per warp (`tid_in_wg == 0`, `thread_rank == 0`, or an
+`And`/`Mul` chain with at least one such operand — the runtime operands only
+narrow the set, e.g. flash_bwd's `(~kept) & (tid == 0)`; see
+`thread_filter.rs::proves_single_lane_per_warp`). The single-lane upper
+bound is sticky: a deeper runtime branch (e.g. `cta_rank == 0`) only selects
+a subset, so it cannot reintroduce double-issue.
 
 - **Validator (`single_issue_scope`)**: a single-issue op outside such a
   branch fails `Kernel::validate` at build; `emit_single_issue` in codegen

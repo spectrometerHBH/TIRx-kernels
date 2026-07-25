@@ -3,16 +3,18 @@
 1. Cross-warp accesses inside one warpgroup are race-checked: staging writes
    by all four warps followed by a single-thread bulk store need the wg_sync
    between them, and the checker reports the race when it is missing.
-2. PTX execution-thread rules hold: single-thread issue ops reject
-   multi-lane masks, and mbarrier arrives are per-thread (one full-warp
-   arrive(1) fills a count=32 barrier).
+2. PTX execution-thread rules hold: single-thread issue ops are rejected at
+   BUILD by the validator's single_issue_scope rule when not under an
+   explicit single-lane branch, and mbarrier arrives are per-thread (one
+   full-warp arrive(1) fills a count=32 barrier).
 3. Warps interleave freely, so a consumer that precedes its producer in
    source order still completes.
 """
 
 import numpy as np
 import nymph_rs as nr
-from helpers import builder, expect_runtime_error, gmem_arg, run
+import pytest
+from helpers import builder, gmem_arg, run
 
 
 def _epilogue_kernel(with_wg_sync: bool):
@@ -47,16 +49,18 @@ def test_wg_sync_between_staging_and_store_passes():
 
 
 def test_single_thread_issue_ops_reject_multi_lane_masks():
-    # tma_store from a full warp: PTX says single-thread issue.
+    # tma_store from a full warp: rejected at BUILD by the validator's
+    # single_issue_scope rule (hardware single-issue ops need an explicit
+    # single-lane branch) — before the interpreter's mask gate could run.
     b = builder("gate_tma", num_warps=4, smem_size_bytes=64)
     out = gmem_arg(b, shape=(4,))
     smem = b.tensor(space=nr.MemorySpace.SMEM, dtype=nr.DType.U32, shape=[4], byte_offset=0)
     with b.if_warp(0):
         b.tma_store(out, smem[0:4], coords=(0,), shape=(4,))
-    with expect_runtime_error("tma_store_mask"):
-        run(b.build())
+    with pytest.raises(ValueError, match="single_issue_scope"):
+        b.build()
 
-    # tcgen05_mma from a full warp (the OLD model REQUIRED the full warp).
+    # tcgen05_mma from a full warp: same build-time rejection.
     b = builder("gate_mma", num_warps=4, smem_size_bytes=8192)
     acc = nr.TmemOperand(0, 0, nr.DType.F32)
     a = b.tensor(space=nr.MemorySpace.SMEM, dtype=nr.DType.F16, shape=(128, 16), byte_offset=0)
@@ -64,8 +68,8 @@ def test_single_thread_issue_ops_reject_multi_lane_masks():
     with b.if_warp(0):
         b.tmem_alloc(0, 32)
         b.tcgen05_mma(acc, a, bb, m=128, n=16, k=16)
-    with expect_runtime_error("tcgen05_mma_mask"):
-        run(b.build())
+    with pytest.raises(ValueError, match="single_issue_scope"):
+        b.build()
 
 
 def test_mbarrier_arrive_is_per_thread():

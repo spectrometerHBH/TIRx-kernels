@@ -49,6 +49,12 @@ def warp0(*body):
     return n.If(cond=n.ScopeValue(kind="warp_id").eq(0), then_body=tuple(body))
 
 
+def elected0(*body):
+    """The explicit single-lane branch (lane 0) the single_issue_scope rule
+    requires around hardware single-issue ops (tcgen05_mma/cp/commit, TMA)."""
+    return n.If(cond=n.ScopeValue(kind="lane_id").eq(0), then_body=tuple(body))
+
+
 def mma_operands():
     """A valid cta_group=1 MMA's (dst, a, b) operands — m=128, n=256, k=16."""
     return tmem_op(), smem([128, 16])[:, :], smem([256, 16])[:, :]
@@ -110,7 +116,7 @@ def test_accepts_mma_tmem_operand():
     # accumulator's [0, 256) span — both inside one 512-column allocation.
     a = tmem_op(col=256, dtype=n.DType.F16)
     make(
-        [warp0(n.TmemAlloc(0, 512), n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=256, k=16))],
+        [warp0(n.TmemAlloc(0, 512), elected0(n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=256, k=16)))],
         launch=(1,),
         cluster=(1,),
     )
@@ -177,7 +183,7 @@ def test_accepts_block_scaled_f8_and_nvfp4_mma():
         [
             warp0(
                 n.TmemAlloc(0, 512),
-                n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=32, k=32, sfa=sfa, sfb=sfb),
+                elected0(n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=32, k=32, sfa=sfa, sfb=sfb)),
             )
         ],
         launch=(1,),
@@ -188,7 +194,7 @@ def test_accepts_block_scaled_f8_and_nvfp4_mma():
         [
             warp0(
                 n.TmemAlloc(0, 512, cta_group=2),
-                n.Tcgen05Mma(dst=dst, a=a, b=b, sfa=sfa, sfb=sfb, **fp4_kwargs()),
+                elected0(n.Tcgen05Mma(dst=dst, a=a, b=b, sfa=sfa, sfb=sfb, **fp4_kwargs())),
             )
         ],
         launch=(2,),
