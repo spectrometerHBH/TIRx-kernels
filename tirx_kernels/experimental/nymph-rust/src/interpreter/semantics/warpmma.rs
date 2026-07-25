@@ -11,7 +11,13 @@
 //!     (mt=ru%2, kt=ru/2); the two b16 halves h∈{0,1} hold
 //!     A[mt*8 + g][kt*8 + 2t + h].
 //!   B (N×K, bf16): `n*k/64` u32 regs/lane. reg ru → k-tile (kt=ru); halves hold
-//!     B[2t + h][kt*8 + g]   (the `.col` / transposed operand).
+//!     B[g][kt*8 + 2t + h]  — the raw PTX `.col` direct-feed layout
+//!     (B[n=g][k=kt*8+2t+h], verified against sm_100 hardware by
+//!     `tests/mma_sync_hardware.rs`). ldmatrix composition (word contents):
+//!     a NON-trans load has word = tile[g][2t+h], so B := tile and
+//!     D = A·tileᵀ; a trans load has word = tile[2t+h][g], so B := tileᵀ and
+//!     D = A·tile. (The earlier `B[2t+h][kt*8+g]` indexing swapped the two —
+//!     it made non-trans compute A·tile, the transpose of real hardware.)
 //!   C,D (M×N, f32): `m*n/32` f32 regs/lane. reg ri holds
 //!     [(ri/2)*8 + g][2t + ri%2].
 
@@ -155,7 +161,7 @@ fn execute_warp_mma<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IR
                 let kt = ru;
                 let halves = unpack_b16x2(b_w[[ai, ru]]);
                 for (h, &bits) in halves.iter().enumerate() {
-                    bmat[(2 * t + h) * kk + (kt * 8 + g)] = decode_half(bits, ab_dtype);
+                    bmat[g * kk + (kt * 8 + 2 * t + h)] = decode_half(bits, ab_dtype);
                 }
             }
             for ri in 0..len_cd {

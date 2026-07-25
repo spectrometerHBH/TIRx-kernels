@@ -847,7 +847,11 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                     k.reg_store(_sl(imm_a, (1,), (1,)), _sl(imm_a, (0,), (1,)))
 
                 def _ldB(src, R, C):
-                    k.ldmatrix(imm_b, _sl(src, (R + lane % 8, C), (1, 8)), num=1, trans=False)
+                    # trans=True: the mma's B operand must hold B[k][n] = tile[k][n]
+                    # in the raw PTX .col layout (word = tile[2t+h][g]); a trans
+                    # ldmatrix delivers exactly that, so the mma computes A@tile.
+                    # (non-trans yields B := tile in the N×K fragment → A@tileᵀ.)
+                    k.ldmatrix(imm_b, _sl(src, (R + lane % 8, C), (1, 8)), num=1, trans=True)
 
                 def _store8(dst, R, C, neg):
                     # The accumulator's top 8×8 (ri 0,1) IS one m8n8 tile in the mma

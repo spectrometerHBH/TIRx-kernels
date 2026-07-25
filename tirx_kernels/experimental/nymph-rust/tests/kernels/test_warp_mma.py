@@ -67,7 +67,10 @@ def test_warp_mma_matches_reference(K, dt):
                 k.reg_store(_sl(bsm, (tid, c), (1, 1)), rb)
         k.warp_sync()
         k.ldmatrix(af, _sl(asm, (tid, 0), (1, 8)), num=n_a, trans=False)
-        k.ldmatrix(bfr, _sl(bsm, (tid, 0), (1, 8)), num=n_b, trans=True)
+        # B fed NON-trans: the word then holds tile[g][2t+h] = B_NK[n=g][k=2t+h],
+        # the raw PTX .col direct-feed — the mma computes D = A·Bᵀ (hardware-true;
+        # a trans feed would give D = A·B).
+        k.ldmatrix(bfr, _sl(bsm, (tid, 0), (1, 8)), num=n_b, trans=False)
         k.reg_fill(cf, 0.0)
         k.mma_sync(df, af, bfr, cf, m=M, n=N, k=K, ab_dtype=dt)
         for ri in range(4):
