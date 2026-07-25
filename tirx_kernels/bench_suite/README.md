@@ -73,11 +73,33 @@ and CuTe JIT compilation happen outside the timed region. Runs are written under
 `tirx`, `deepgemm`, and `sglang_cutedsl`. Do not promote this exploratory sweep to
 the pinned baseline until its shape set and winning regions have been reviewed.
 
+### Sparse FlashMLA decode matrices
+
+The compact matrix contains the 14 public-h_q=64 upstream `gen_testcase()`
+performance cases, plus the h_q=64 DeepSeek-V4 primary:
+
+```bash
+export FLASH_MLA_PATH=/path/to/FlashMLA
+python -m tirx_kernels.bench_suite \
+  --workloads tirx_kernels/bench_suite/workloads_sparse_flashmla_decode.yaml
+```
+
+The workload has exactly 15 rows: all 14 upstream public-h_q=64 cases whose
+`num_runs` is nonzero, followed by the task-required coverage of the h_q=64
+DeepSeek-V4 shape (listed first for discoverability). The 2,358 upstream
+h_q=64 correctness/corner cases explicitly set `num_runs=0` and are not
+benchmark shapes. All public h_q=128 cases are outside this benchmark scope.
+
+This compares the complete TIRx main-plus-combine launch against FlashMLA's
+public SM100 sparse-FP8 decode dispatch. Scheduler construction and allocation
+are outside both timed closures. For this port, only the results emitted by
+`tirx_kernels.bench_suite` are accepted as performance evidence.
+
 ## Directory layout
 
 | Kind | Files |
 |------|--------|
-| **Run** | `run.py`, `workloads.yaml`, `workloads_sglang_fp8_paged_mqa.yaml` |
+| **Run** | `run.py`, `workloads.yaml`, dedicated `workloads_*.yaml` matrices |
 | **Pinned baseline (git)** | `baseline.json`, `baseline.md` |
 | **Promote / report** | `promote_baseline.py`, `ratio_diff.py`, `baseline_view.py` |
 

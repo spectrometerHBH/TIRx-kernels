@@ -33,3 +33,36 @@ def run_flashmla_sparse_prefill(case: dict[str, Any]):
 def flashmla_reference_builder(case: dict[str, Any]) -> Callable[[], Any]:
     _import_flash_mla()
     return lambda: run_flashmla_sparse_prefill(case)
+
+
+def run_flashmla_sparse_decode(case: dict[str, Any], sched_meta):
+    """Run the exact public sparse-decode dispatch used by the CUDA source."""
+
+    flash_mla = _import_flash_mla()
+    cfg = case["config"]
+    return flash_mla.flash_mla_with_kvcache(
+        case["q"],
+        case["kv"],
+        None,
+        None,
+        cfg.d_v,
+        sched_meta,
+        None,
+        case["sm_scale"],
+        False,
+        True,
+        case["indices"],
+        case["attn_sink"] if cfg.have_attn_sink else None,
+        case["extra_kv"] if cfg.extra_topk else None,
+        case["extra_indices"] if cfg.extra_topk else None,
+        case["topk_length"] if cfg.have_topk_length else None,
+        case["extra_topk_length"] if cfg.have_extra_topk_length else None,
+    )
+
+
+def flashmla_decode_reference_builder(case: dict[str, Any]) -> Callable[[], Any]:
+    flash_mla = _import_flash_mla()
+    sched_meta, _ = flash_mla.get_mla_metadata()
+    # Build and cache FlashMLA's scheduler metadata outside the timed closure.
+    run_flashmla_sparse_decode(case, sched_meta)
+    return lambda: run_flashmla_sparse_decode(case, sched_meta)
