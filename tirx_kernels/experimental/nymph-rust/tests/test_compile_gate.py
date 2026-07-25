@@ -14,6 +14,8 @@ from nymph_rs.kernels import build_bootstrap_gemm, build_fp16_bf16_gemm, build_n
 
 tvm = pytest.importorskip("tvm", reason="tvm not importable in this environment")
 
+pytestmark = pytest.mark.codegen
+
 BUILDERS = {
     "bootstrap_gemm": build_bootstrap_gemm,
     "fp16_bf16_gemm": build_fp16_bf16_gemm,

@@ -247,6 +247,91 @@ codegen-fail-loud (single-lane cluster wait deadlocks on HW — sim does not
 expose this); WarpSync not emitted by codegen (warp lockstep assumption);
 CLC handle's 16B async-proxy write not modeled (race checker can't see it).
 
+## Happens-before join points (per-op strength)
+
+The only constructs that produce cross-lane or cross-warp happens-before,
+each with its modeled strength and PTX basis. Anything not listed orders
+nothing beyond per-lane program order. A new op adds its entry when it
+joins. The contract these serve is `docs/execution-model.md`.
+
+**Warp CONVERGENCE points** — fold all 32 lanes into the warp-shared
+prefix; the op's own effects become warp-visible once it completes
+(visibility rule 1):
+
+- `ldmatrix` / `stmatrix` — `.sync.aligned` (§9.7.13.4.15-16).
+- `tcgen05.ld` / `tcgen05.st` — `.sync.aligned` (§9.7.17.8).
+- warp MMA — `mma.sync.aligned` (§9.7.13).
+- TMEM alloc / dealloc — `tcgen05.alloc/dealloc.sync.aligned` (§9.7.17.7),
+  keyed on the trace event itself whatever statement emitted it.
+- full-warp cooperative arrivals / passages — `bar{.arrive}` / `barrier`
+  execute per-warp aligned (§9.7.14.15), so a passage whose mask covers the
+  warp converges it. A PARTIAL-mask rendezvous converges nothing.
+
+**Rendezvous edges** (release/acquire, no convergence): every cooperative
+barrier orders each ARRIVING lane's published order into every passer —
+`bar.sync` carries memory-barrier semantics (§9.7.14.15), so a 16-lane
+member of a 32-thread named barrier still receives the other arrivers'
+writes, while lanes absent from the rendezvous are published by nobody.
+
+**Cross-proxy publication** (visibility rule 4): `fence.proxy.async`
+publishes the fencing thread's view into the async-proxy engines at the
+fence's address scope, and every engine access acquires the view published
+for the address space it touches. A thread fencing its own prior stores
+covers those; other lanes' stores ride in only behind a convergence point or
+a barrier. Nothing else crosses the boundary — an ordering edge alone does
+not.
+
+**Releases project their ARRIVING lanes only** (visibility rule 3):
+
+- `mbarrier.arrive` / complete-tx — per-thread (§9.7.14.16, no `.aligned`):
+  a full-warp arrive publishes all 32 lanes (each lane arrived itself); an
+  elected arrive publishes one lane's order. Phase completion freezes the
+  accumulated join for the waiters.
+- semaphore release (`gmem_atomic_add` order=release) — value-keyed;
+  relaxed publishes nothing (control order only).
+
+Acquires join into the ACQUIRING lanes only: a masked wait delivers the
+release to its lanes alone until a convergence point spreads it.
+
+**Completion observation** (visibility rule 5): an engine access is ordered
+by its completion object, not by its issue. A barrier that orders two
+instruction streams says nothing about whether the engine has drained, so
+anything that depends on an async access having LANDED — most sharply, freeing
+the TMEM band it touches — must be ordered after the observation point:
+`tcgen05.wait::ld/st` for a load or store, and for an mma or cp the wait on a
+barrier some `tcgen05.commit` handed the work to. A commit tracks every async
+op the warp issued before it, so a later commit covers the same work again and
+waiting any one of those barriers suffices.
+
+**Modeled WEAK** (over-report direction, by the ledger discipline):
+
+- `elect` — no IR op; `if_elected` lowers to a plain `If`. Hardware
+  `elect.sync` synchronizes its membermask, but no convergence is credited
+  (a kernel needing the ordering writes `warp_sync`).
+- `tcgen05.wait::ld/st` — drains the EXECUTING thread's own loads/stores
+  (§9.7.17.8.5, per-thread); orders nothing across lanes.
+- `tcgen05.commit` / `tcgen05.mma` — single-thread issues; no convergence.
+
+**Seams to keep in view**:
+
+- `WarpSync` is checker/simulator vocabulary that codegen does not lower to
+  `bar.warp.sync`, so a proof leaning on it compiles to code that relies on
+  the warp launching converged.
+- The value simulator lands async-engine effects at issue, which is why the
+  engine's real timing envelope is owned entirely by the checker's
+  async-window passes (`async_group_lifetime`, `tcgen05_async_hazard`)
+  rather than by the values.
+- **`fence.mbarrier_init` seals, but nothing requires it.** The op exists
+  (`FenceKind::MbarrierInit`) and the checker treats it as a release-side
+  fence: it seals its executing lanes so a later relaxed cluster-barrier
+  arrive by those lanes publishes. What is NOT checked is the obligation
+  itself — a kernel that initializes barrier cells and lets a peer use them
+  with no such fence is accepted, because `MbarInit` is an ordinary event on
+  its stream and no pass demands publication of the barrier OBJECT (as
+  opposed to the data a barrier hands over).
+- **A new trace event kind orders nothing by default.** The scan that builds
+  the clock decides acquires and releases with `match` arms that end in a
+
 ## CLC (§9.7.14.18-19)
 
 Modeled: try_cancel → per-cluster slot + 16B complete-tx to cta_group CTAs

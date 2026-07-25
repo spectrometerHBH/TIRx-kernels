@@ -41,7 +41,24 @@ def _inputs(T, seed=0):
     return q, k, v, g, beta
 
 
-@pytest.mark.parametrize("cfg", CONFIGS_SUPPORTED, ids=[c["label"] for c in CONFIGS_SUPPORTED])
+def _tier(configs):
+    """Mark the shapes whose simulation is measured in minutes: cost tracks
+    TOTAL TOKENS, not the number of shapes. Fixed-length configs carry
+    num_seqs/seqlen; varlen ones carry the per-sequence list."""
+
+    def tokens(c):
+        if "seqlens" in c:
+            return sum(c["seqlens"])
+        return c["num_seqs"] * c["seqlen"]
+
+    return [
+        pytest.param(c, marks=pytest.mark.slow) if tokens(c) >= 2048 else c for c in configs
+    ]
+
+
+@pytest.mark.parametrize(
+    "cfg", _tier(CONFIGS_SUPPORTED), ids=[c["label"] for c in CONFIGS_SUPPORTED]
+)
 def test_gdn_prefill_builds_and_validates(cfg):
     kernel = build_gdn_prefill(GdnPrefillConfig(num_seqs=cfg["num_seqs"], seqlen=cfg["seqlen"]))
     kernel.validate()
@@ -102,7 +119,7 @@ def test_gdn_prefill_heads(hc):
         assert (np.abs(state[0, eh] - s_ref) <= 1e-2 + 0.3 * np.abs(s_ref)).mean() >= 0.9
 
 
-@pytest.mark.parametrize("cfg", CONFIGS, ids=[c["label"] for c in CONFIGS])
+@pytest.mark.parametrize("cfg", _tier(CONFIGS), ids=[c["label"] for c in CONFIGS])
 def test_gdn_prefill_build_protocol(cfg):
     """Every fixed-length workload shape (1..32 chunks, batch 1..48) builds + protocol-checks."""
     kernel = build_gdn_prefill(GdnPrefillConfig(num_seqs=cfg["num_seqs"], seqlen=cfg["seqlen"]))
@@ -110,7 +127,9 @@ def test_gdn_prefill_build_protocol(cfg):
     assert nr.check_protocol(kernel)["status"] == "Passed"
 
 
-@pytest.mark.parametrize("cfg", VARLEN_CONFIGS, ids=[c["label"] for c in VARLEN_CONFIGS])
+@pytest.mark.parametrize(
+    "cfg", _tier(VARLEN_CONFIGS), ids=[c["label"] for c in VARLEN_CONFIGS]
+)
 def test_gdn_prefill_varlen(cfg):
     """Varlen: per-tile runtime chunk count from cu_seqlens (incl. non-BT-multiple tails)."""
     seqlens = cfg["seqlens"]
@@ -154,7 +173,9 @@ def test_gdn_prefill_varlen(cfg):
 
 
 @pytest.mark.parametrize("io_dtype", ["bfloat16", "float16"])
-@pytest.mark.parametrize("cfg", CONFIGS_SUPPORTED, ids=[c["label"] for c in CONFIGS_SUPPORTED])
+@pytest.mark.parametrize(
+    "cfg", _tier(CONFIGS_SUPPORTED), ids=[c["label"] for c in CONFIGS_SUPPORTED]
+)
 def test_gdn_prefill_value(cfg, io_dtype):
     num_seqs, seqlen = cfg["num_seqs"], cfg["seqlen"]
     cfg = GdnPrefillConfig(num_seqs=num_seqs, seqlen=seqlen, io_dtype=io_dtype)

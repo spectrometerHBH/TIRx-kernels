@@ -33,7 +33,15 @@ _PROTOCOL_TIER = [c for c in CONFIGS if c["seq_len"] <= 2048] + [
 ]
 
 
-@pytest.mark.parametrize("entry", _PROTOCOL_TIER, ids=[c["label"] for c in _PROTOCOL_TIER])
+# The s4096 representative is minutes on its own; the rest of the tier is
+# seconds, so only it carries `slow`.
+_TIER_PARAMS = [
+    pytest.param(c, marks=pytest.mark.slow) if c["seq_len"] >= 4096 else c
+    for c in _PROTOCOL_TIER
+]
+
+
+@pytest.mark.parametrize("entry", _TIER_PARAMS, ids=[c["label"] for c in _PROTOCOL_TIER])
 def test_flash_attention4_protocol_resident_tier(entry):
     kernel = build_flash_attention4(_cfg(entry, launch_shape=(1,)))
     report = nr.check_protocol(kernel)
