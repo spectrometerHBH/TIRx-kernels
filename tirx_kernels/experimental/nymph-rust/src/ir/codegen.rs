@@ -2398,6 +2398,38 @@ fn wg_elem_ok(scope: &ScopeInfo) -> bool {
         .is_some_and(|s| s.is_full_cta() || s.is_exactly_one_full_warpgroup().is_some())
 }
 
+/// True when the slice spans the whole wg view (offset 0, width == the view's
+/// full width). `Tx.wg.*` elementwise ops DROP the column offset of sliced
+/// operands/dsts (B200-verified: `fill(frag[:, 1:2])` writes element 0; the
+/// plain and dual-view forms differ in src-slice behavior), so anything
+/// narrower than a full-extent slice must take the per-thread scalar form on
+/// the flat views, which addresses elements exactly.
+fn slice_is_full(t: &Arc<Tensor>, off: &ScalarValue, w: usize, ctx: &Ctx) -> bool {
+    as_int(off) == Some(0) && w == reg_view_width(t, ctx)
+}
+
+/// True when every slice of a reg elementwise op (dst + slice operands) is
+/// full-extent — the only case `Tx.wg.*` honors.
+fn reg_op_slices_full(
+    dst: &TensorSlice,
+    operands: &[&RegOperand],
+    ctx: &Ctx,
+) -> Result<bool, String> {
+    let (dt, doff, dw) = reg_slice_parts(dst)?;
+    if !slice_is_full(dt, doff, dw, ctx) {
+        return Ok(false);
+    }
+    for op in operands {
+        if let RegOperand::Slice(s) = op {
+            let (t, off, w) = reg_slice_parts(s)?;
+            if !slice_is_full(t, off, w, ctx) {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
 /// One element's index into a flat view: `off + _i` (simplified for a base-0
 /// slice or a constant read).
 fn flat_elem_idx(off: &ScalarValue, i: &str, ctx: &Ctx) -> Result<String, String> {
@@ -2556,7 +2588,7 @@ fn emit_reg_binary(
             t.dtype
         ));
     }
-    if wg_elem_ok(scope) {
+    if wg_elem_ok(scope) && reg_op_slices_full(dst, &[lhs, rhs], ctx)? {
         let dst_s = emit_reg_view_slice(out, p, t, off, w, ctx)?;
         let lhs_s = emit_wg_reg_operand(lhs, t.dtype, out, p, ctx)?;
         let rhs_s = emit_wg_reg_operand(rhs, t.dtype, out, p, ctx)?;
@@ -3415,20 +3447,20 @@ fn emit_stmt(
                     }
                 },
                 None => {
-                    // Auxiliary-view form (see `RegAuxViews`): the raw per-thread
-                    // storage is `{name}_flat`; `{name}` becomes a (128, W) wg
-                    // VIEW over it so `Tx.wg.*` tile ops keep working unchanged.
+                    // Auxiliary-view form (see `RegAuxViews`): the plain wg tile for
+                    // full-extent `Tx.wg.*` ops, plus `{name}.local()` — the
+                    // TIRx-sanctioned per-thread storage view (mem-only layout, raw
+                    // element access legal) for the warp-matrix intrinsics, atom
+                    // fragments, and the scalar elementwise forms. (The inverted
+                    // `alloc_local + view(128, W, wg_layout)` form is physically
+                    // inconsistent: its Apply maps (tid, j) to flat[tid + j].)
                     if let Some(aux) = ctx.reg_aux_views.get(&tensor.id).filter(|a| a.flat) {
                         out.push_str(&format!(
-                            "{p}{name}_flat = T.alloc_local(({width},), \"{dt}\")\n",
+                            "{p}{name} = T.wg_reg_tile({width}, dtype=\"{dt}\")\n",
                             p = pad(indent),
                             dt = dtype_str(tensor.dtype),
                         ));
-                        out.push_str(&format!(
-                            "{p}{name} = {name}_flat.view({wg_threads}, {width}, layout=TileLayout(S[({wg_threads}, {width}) : (1 @ axis_tid_in_wg, 1)]))\n",
-                            p = pad(indent),
-                            wg_threads = WG_THREADS,
-                        ));
+                        out.push_str(&format!("{p}{name}_flat = {name}.local()\n", p = pad(indent)));
                         if let Some(shape) = aux.atom_shape {
                             let k_cols = atom_frag_cols(shape, width, tensor.dtype)?;
                             out.push_str(&format!(
@@ -4478,7 +4510,8 @@ fn emit_stmt(
             // must touch both sides (and validate) at once.
             rounding: _,
         } => {
-            if !wg_elem_ok(scope) {
+            let src_op = RegOperand::Slice(src.clone());
+            if !(wg_elem_ok(scope) && reg_op_slices_full(dst, &[&src_op], ctx)?) {
                 // Per-thread scalar cast (the interpreter's per-thread
                 // convert): `dst_flat[i] = T.<dst dtype>(src_flat[i])`. The
                 // dtype conversion IS the op here (unlike the elementwise
@@ -4857,7 +4890,15 @@ fn emit_stmt(
             ));
             Ok(())
         }
-        WarpSync => Ok(()),
+        // `bar.warp.sync` — full warp execution + memory-order barrier (the
+        // gate warp's SMEM cumsum and the WY-inverse merges read lanes' SMEM
+        // writes from the previous phase; dropping it lets lanes read stale
+        // cells — the cumsum/gateway corruption. The checker validates the
+        // site is warp-converged; emit it bare everywhere it appears.
+        WarpSync => {
+            out.push_str(&format!("{p}T.cuda.warp_sync()\n"));
+            Ok(())
+        }
         WgSync { barrier_id } => {
             out.push_str(&format!("{p}T.cuda.warpgroup_sync({barrier_id})\n"));
             Ok(())
@@ -4981,7 +5022,7 @@ fn emit_stmt(
         // gdn predicated epilogues) the wg dispatch rejects the intra — fall
         // to the per-thread scalar form.
         RegMul { dst, lhs, rhs } => {
-            if !wg_elem_ok(scope) {
+            if !(wg_elem_ok(scope) && reg_op_slices_full(dst, &[lhs, rhs], ctx)?) {
                 let (t, _, _) = reg_slice_parts(dst)?;
                 if !matches!(t.dtype, DType::F16 | DType::Bf16 | DType::F32) {
                     return Err(format!(
@@ -5227,7 +5268,7 @@ fn emit_stmt(
         // two legal widths). `Tx.wg.*` when the scope is provably
         // warpgroup-full, else the per-thread scalar form.
         RegFill { dst, value } => {
-            if wg_elem_ok(scope) {
+            if wg_elem_ok(scope) && reg_op_slices_full(dst, &[value], ctx)? {
                 let (t, off, w) = reg_slice_parts(dst)?;
                 let dst_s = emit_reg_view_slice(out, &p, t, off, w, ctx)?;
                 match value {
@@ -5281,7 +5322,7 @@ fn emit_stmt(
                     t.dtype
                 ));
             }
-            if wg_elem_ok(scope) {
+            if wg_elem_ok(scope) && reg_op_slices_full(dst, &[a, b, c], ctx)? {
                 let dst_s = emit_reg_view_slice(out, &p, t, off, w, ctx)?;
                 let a_s = emit_wg_reg_operand(a, t.dtype, out, &p, ctx)?;
                 let b_s = emit_wg_reg_operand(b, t.dtype, out, &p, ctx)?;
@@ -5320,7 +5361,7 @@ fn emit_stmt(
                 (RegOperand::Slice(_), _) => None,
             };
             if let Some(v) = folded {
-                if wg_elem_ok(scope) {
+                if wg_elem_ok(scope) && slice_is_full(t, off, w, ctx) {
                     let dst_s = emit_reg_view_slice(out, &p, t, off, w, ctx)?;
                     out.push_str(&format!("{p}Tx.wg.fill({dst_s}, T.float32({v}))\n"));
                     return Ok(());
@@ -5347,7 +5388,7 @@ fn emit_stmt(
                 ));
             }
             let src_op = RegOperand::Slice(src.clone());
-            if wg_elem_ok(scope) && *op != RegUnaryOp::Log2 {
+            if wg_elem_ok(scope) && *op != RegUnaryOp::Log2 && reg_op_slices_full(dst, &[&src_op], ctx)? {
                 let dst_s = emit_reg_view_slice(out, &p, t, off, w, ctx)?;
                 let src_s = emit_reg_view_slice(out, &p, st, soff, sw, ctx)?;
                 match op {
@@ -5837,13 +5878,13 @@ mod tests {
         let expected = "\
     if wg_id == 1:
         if warp_id == 5:
-            pass
+            T.cuda.warp_sync()
         else:
             if warp_id == 4:
-                pass
+                T.cuda.warp_sync()
     else:
         if wg_id == 0:
-            pass
+            T.cuda.warp_sync()
 ";
         assert!(src.contains(expected), "{src}");
 
@@ -6570,13 +6611,13 @@ mod tests {
                 0,
                 vec![Stmt::MBarrierArrive {
                     mbar: mref(),
-                    count: None,
+                    count: ScalarValue::Int(1),
                     stage: None,
                 }],
             ),
         ]))
         .unwrap();
-        assert!(src.contains("T.ptx.mbarrier.arrive(mbar3.ptr_to([0]))"), "{src}");
+        assert!(src.contains("T.ptx.mbarrier.arrive(smem_full.ptr_to([0]))"), "{src}");
         assert!(!src.contains("if T.ptx.elect_sync():"), "{src}");
         assert!(!src.contains("if tid_in_wg == 0:"), "{src}");
     }
@@ -6790,10 +6831,7 @@ mod tests {
             "{src}"
         );
         // log2: no tile op — per-thread scalar loop on the flat views.
-        assert!(
-            src.contains("accum_frag_flat = T.alloc_local((1,), \"float32\")"),
-            "{src}"
-        );
+        assert!(src.contains("accum_frag_flat = accum_frag.local()"), "{src}");
         assert!(src.contains("for _i in range(1):"), "{src}");
         // (width-1 src broadcasts — the interpreter's one-element-per-thread rule)
         assert!(
