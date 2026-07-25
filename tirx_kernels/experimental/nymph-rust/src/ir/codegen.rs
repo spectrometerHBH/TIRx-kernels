@@ -355,6 +355,11 @@ struct Ctx {
     /// fragments, and per-thread scalar transfers address the raw per-thread
     /// storage, which the default `(128, W)` thread-axis tile cannot express.
     reg_aux_views: HashMap<u32, RegAuxViews>,
+    /// 16-bit TMEM cell dtypes used by tcgen05 st (packed halves, two elements
+    /// per 32-bit cell) — each gets a `tmem_f16`/`tmem_bf16` decl_buffer over
+    /// the same allocated band as the f32 view (dense-packed convention, the
+    /// TIRx 16-bit `.32x32b` datapath).
+    tmem_16_views: Vec<DType>,
     /// mbar ids of the TMA-load completion barriers (`smem_full`, `sf_full`, ...)
     /// flagged `leader_routed` by the IR. In cluster mode the canonical pattern
     /// routes BOTH CTAs' TMA completions to the LEADER CTA's barrier (a
@@ -984,6 +989,26 @@ fn emit_tmem_view_decls(out: &mut Emitter, ind: usize, ctx: &Ctx) {
         p = pad(ind),
         wg_threads = WG_THREADS,
     ));
+    // 16-bit packed-half views over the same band (dense: two elements per
+    // 32-bit cell) for the tcgen05.st fp16/bf16 datapath — the TIRx
+    // `.32x32b` local2tmem path requires the TMEM buffer dtype to equal the
+    // fragment dtype.
+    for dt in &ctx.tmem_16_views {
+        let (name, dt_s) = match dt {
+            DType::F16 => ("tmem_f16", "float16"),
+            DType::Bf16 => ("tmem_bf16", "bfloat16"),
+            other => {
+                debug_assert!(false, "unexpected 16-bit tmem view dtype {other:?}");
+                continue;
+            }
+        };
+        let elems = cols * 2;
+        out.push_str(&format!(
+            "{p}{name} = T.decl_buffer(({wg_threads}, {elems}), \"{dt_s}\", scope=\"tmem\", allocated_addr=0, layout=TileLayout(S[({wg_threads}, {elems}) : (1 @ TLane, 1 @ TCol)]))\n",
+            p = pad(ind),
+            wg_threads = WG_THREADS,
+        ));
+    }
     // NVFP4 e4m3 scale-factor TMEM views (canon's tmem_pool.alloc_sf(...,
     // sf_per_mma=4)). The TileLayout follows `sf_tmem_layout(rows, SF_K,
     // sf_per_mma=4)`: S[(M, 32, 4, 4) : (4 @ TCol, 1 @ TLane, M*4 @ TCol,
@@ -1791,14 +1816,33 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
             match s {
                 Stmt::Tcgen05Ld {
                     dst,
-                    src: _,
-                    shape: _,
+                    src,
+                    shape,
                     num,
                 } => {
                     if dst.tensor.space == MemorySpace::Reg {
                         let off = dst.offsets.first().and_then(as_int).unwrap_or(0).max(0) as usize;
                         let e = widths.entry(dst.tensor.id).or_insert(0);
-                        *e = (*e).max(off + *num as usize);
+                        *e = (*e).max(off + tcgen05_frag_regs(shape, *num as usize, src.dtype));
+                    }
+                }
+                Stmt::Tcgen05St {
+                    dst,
+                    src,
+                    shape: _,
+                    num,
+                } => {
+                    if src.tensor.space == MemorySpace::Reg {
+                        let off = src.offsets.first().and_then(as_int).unwrap_or(0).max(0) as usize;
+                        // The IR slice counts b32 registers; a packed-half st
+                        // reads two elements per register.
+                        let e32 = if matches!(dst.dtype, DType::F16 | DType::Bf16) {
+                            2
+                        } else {
+                            1
+                        };
+                        let e = widths.entry(src.tensor.id).or_insert(0);
+                        *e = (*e).max(off + *num as usize * e32);
                     }
                 }
                 Stmt::RegCvt {
@@ -1822,7 +1866,8 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
     // Auxiliary REG-tensor views (flat storage / atom tcgen05 frags / dtype
     // reinterprets) required by the warp-matrix and per-thread scalar uses.
     let mut reg_aux_views: HashMap<u32, RegAuxViews> = HashMap::new();
-    collect_reg_aux_views(&k.body, &mut reg_aux_views)?;
+    let mut tmem_16_views: Vec<DType> = Vec::new();
+    collect_reg_aux_views(&k.body, &mut reg_aux_views, &mut tmem_16_views)?;
 
     // Scalar var names. Every `ScalarDef` introduces an SSA register var
     // (`NAME: T.int32 = init`, read as `NAME`). Var ids are globally unique, so
@@ -1869,6 +1914,7 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
         tmem_view_cols,
         reg_widths,
         reg_aux_views,
+        tmem_16_views,
         tma_leader_mbars,
         num_clusters: (k.launch_cta_count() / (cta_group as usize).max(1)).max(1),
         sf_views,
@@ -1882,6 +1928,7 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
 fn collect_reg_aux_views(
     stmts: &[Stmt],
     views: &mut HashMap<u32, RegAuxViews>,
+    tmem_16: &mut Vec<DType>,
 ) -> Result<(), String> {
     for s in stmts {
         match s {
@@ -1892,11 +1939,27 @@ fn collect_reg_aux_views(
                     note_atom_shape(v, dst.tensor.id, shape)?;
                 }
             }
-            Stmt::Tcgen05St { src, shape, .. } => {
+            Stmt::Tcgen05St { dst, src, shape, .. } => {
                 if *shape != LdStShape::B32x32 {
                     let v = views.entry(src.tensor.id).or_default();
                     v.flat = true;
                     note_atom_shape(v, src.tensor.id, shape)?;
+                }
+                if matches!(dst.dtype, DType::F16 | DType::Bf16) && !tmem_16.contains(&dst.dtype)
+                {
+                    tmem_16.push(dst.dtype);
+                }
+            }
+            Stmt::Tcgen05Mma { a, b, .. } => {
+                // 16-bit TMEM MMA operands read through the packed views.
+                for op in [a, b] {
+                    if let MmaOperand::Tmem(t) = op {
+                        if matches!(t.dtype, DType::F16 | DType::Bf16)
+                            && !tmem_16.contains(&t.dtype)
+                        {
+                            tmem_16.push(t.dtype);
+                        }
+                    }
                 }
             }
             Stmt::WarpMma {
@@ -1947,7 +2010,7 @@ fn collect_reg_aux_views(
             _ => {}
         }
         for body in s.child_bodies() {
-            collect_reg_aux_views(body, views)?;
+            collect_reg_aux_views(body, views, tmem_16)?;
         }
     }
     Ok(())
@@ -2237,6 +2300,28 @@ fn emit_reg_binary(
     let rhs_s = emit_wg_reg_operand(rhs, t.dtype, out, p, ctx)?;
     out.push_str(&format!("{p}Tx.wg.{op}({dst_s}, {lhs_s}, {rhs_s})\n"));
     Ok(())
+}
+
+/// Per-thread register count (in dtype ELEMENTS) of one tcgen05 ld/st atom
+/// issue: `.32x32b`/`.16x64b` hold `num` b32 regs per thread, `.16x128b`
+/// `2*num`, `.16x256b` `4*num`; 16-bit dtypes pack two elements per b32 reg.
+/// (PTX ISA Table 49; M=64 slab only — the M=128 `.16x*b` two-issue form is
+/// rejected by the lowering.)
+fn tcgen05_frag_regs(shape: &LdStShape, num: usize, dtype: DType) -> usize {
+    let b32 = match shape {
+        LdStShape::B32x32 | LdStShape::B16x64 => num,
+        LdStShape::B16x128 => 2 * num,
+        LdStShape::B16x256 => 4 * num,
+        // No codegen lowering (rejected at the op site); sized so the width
+        // walk stays total.
+        LdStShape::B16x32Bx2 => num,
+    };
+    let e32 = if matches!(dtype, DType::F16 | DType::Bf16) {
+        2
+    } else {
+        1
+    };
+    b32 * e32
 }
 
 /// The `.16x*b` atom view's column count for a per-thread width-W fragment:
@@ -3699,9 +3784,14 @@ fn emit_stmt(
             // and value model honor these fields, so dropping one here would run a
             // different semantics than was verified. (`m/n/k` vs the operand slice
             // shapes is already enforced by the validator, incl. the trans variants.)
-            if *trans_a || *trans_b {
+            // transA/transB pass through to gemm_async (TIRx computes the MN-major
+            // SMEM descriptor / TMEM window): the transposed IR slice is already the
+            // (K, M) / (K, N) tile. A TMEM A cannot transpose (a TIRx/hardware rule).
+            if *trans_a && matches!(a, MmaOperand::Tmem(_)) {
                 return Err(
-                    "codegen: Tcgen05Mma trans_a/trans_b have no gemm_async lowering".to_string(),
+                    "codegen: Tcgen05Mma trans_a on a TMEM A operand has no lowering \
+                     (tcgen05 requires transA=False from TMEM)"
+                        .to_string(),
                 );
             }
             if *lane_align != 0 {
@@ -3745,27 +3835,58 @@ fn emit_stmt(
             // the operand is the 2D `(M, K)` / `(N, K)` MMA tile (canonical
             // `Asmem[stage, warp_id]` / `Bsmem[stage]`). A TMEM operand (the GDN
             // accumulator-readback) is an absolute (lane, col) slice of the single
-            // `tmem` view.
-            let emit_ab = |op: &MmaOperand, rows: u32| -> Result<String, String> {
+            // `tmem` view — or of the `tmem_f16`/`tmem_bf16` packed view for a
+            // 16-bit band. `trans` swaps the (rows, cols) window: a non-transposed
+            // operand spans `rows` lanes x `k` cells, a transposed one (the GDN
+            // S^T readback) spans `k` lanes x `rows` cells.
+            let emit_ab = |op: &MmaOperand, rows: u32, trans: bool| -> Result<String, String> {
                 match op {
                     MmaOperand::Slice(s) => emit_smem_tile(s, ctx),
                     MmaOperand::Tmem(t) => {
+                        let (row_ext, cell_dim) = if trans {
+                            (i64::from(*k), i64::from(rows))
+                        } else {
+                            (i64::from(rows), i64::from(*k))
+                        };
                         let row_s = emit_scalar(&t.row, ctx)?;
                         let col_s = emit_scalar(&t.col, ctx)?;
-                        let row_hi = add_bound(&t.row, &ScalarValue::Int(i64::from(rows)), ctx)?;
-                        let cells = match t.dtype {
-                            DType::F16 | DType::Bf16 => *k as i64 / 2,
-                            _ => i64::from(*k),
-                        };
-                        let col_hi = add_bound(&t.col, &ScalarValue::Int(cells), ctx)?;
-                        Ok(format!("tmem[{row_s}:{row_hi}, {col_s}:{col_hi}]"))
+                        let row_hi = add_bound(&t.row, &ScalarValue::Int(row_ext), ctx)?;
+                        match t.dtype {
+                            DType::F32 => {
+                                let col_hi =
+                                    add_bound(&t.col, &ScalarValue::Int(cell_dim), ctx)?;
+                                Ok(format!("tmem[{row_s}:{row_hi}, {col_s}:{col_hi}]"))
+                            }
+                            DType::F16 | DType::Bf16 => {
+                                let view = if t.dtype == DType::F16 {
+                                    "tmem_f16"
+                                } else {
+                                    "tmem_bf16"
+                                };
+                                if cell_dim % 2 != 0 {
+                                    return Err(format!(
+                                        "codegen: Tcgen05Mma 16-bit TMEM operand cell-span \
+                                         {cell_dim} is odd (packed halves come in pairs)"
+                                    ));
+                                }
+                                // Packed halves: the element window doubles the
+                                // cell column.
+                                Ok(format!(
+                                    "{view}[{row_s}:{row_hi}, ({col_s}) * 2:({col_s}) * 2 + {cell_dim}]"
+                                ))
+                            }
+                            other => Err(format!(
+                                "codegen: Tcgen05Mma TMEM operand dtype {other:?} has no \
+                                 lowering (f32 or packed f16/bf16 only)"
+                            )),
+                        }
                     }
                 }
             };
             let a_rows = if *cta_group == 1 { *m } else { *m / 2 };
             let b_rows = if *cta_group == 1 { *n } else { *n / 2 };
-            let mut a_s = emit_ab(a, a_rows)?;
-            let mut b_s = emit_ab(b, b_rows)?;
+            let mut a_s = emit_ab(a, a_rows, *trans_a)?;
+            let mut b_s = emit_ab(b, b_rows, *trans_b)?;
             // Runtime accum flag: literal 0/1 keep the old True/False form (every
             // existing kernel); a real scalar expr (canon's loop-carried accum cell)
             // emits as-is — `Tx.gemm_async` takes a runtime accum predicate.
@@ -3774,6 +3895,17 @@ fn emit_stmt(
                 ScalarValue::Int(1) => "True".to_string(),
                 other => emit_scalar(other, ctx)?,
             };
+            // Transposed operands (the GDN S^T / K^T reads): emit the flags only
+            // when set, keeping the untransposed emission byte-identical.
+            let trans_kw = |t: bool, name: &str| {
+                if t {
+                    format!(", {name}=True")
+                } else {
+                    String::new()
+                }
+            };
+            let trans_a_kw = trans_kw(*trans_a, "transA");
+            let trans_b_kw = trans_kw(*trans_b, "transB");
             if let (Some(sfa), Some(sfb)) = (sfa.as_ref(), sfb.as_ref()) {
                 // NVFP4 block-scaled: view the packed-u8 operand BUFFER as e2m1 fp4 (the
                 // last dim doubles: bytes -> fp4 elems), then slice — `.view` is on the
@@ -3823,7 +3955,7 @@ fn emit_stmt(
                 emit_guarded(
                     out,
                     &format!(
-                        "Tx.gemm_async({dst_s}, {a_s}, {b_s}, SFA={sfa_s}, SFB={sfb_s}, accum={accum_s}, dispatch=\"tcgen05\", cta_group={cg})",
+                        "Tx.gemm_async({dst_s}, {a_s}, {b_s}, SFA={sfa_s}, SFB={sfb_s}, accum={accum_s}, dispatch=\"tcgen05\", cta_group={cg}{trans_a_kw}{trans_b_kw})",
                         cg = ctx.cta_group,
                     ),
                 );
@@ -3831,7 +3963,7 @@ fn emit_stmt(
                 emit_guarded(
                     out,
                     &format!(
-                        "Tx.gemm_async({dst_s}, {a_s}, {b_s}, accum={accum_s}, dispatch=\"tcgen05\", cta_group={cg})",
+                        "Tx.gemm_async({dst_s}, {a_s}, {b_s}, accum={accum_s}, dispatch=\"tcgen05\", cta_group={cg}{trans_a_kw}{trans_b_kw})",
                         cg = ctx.cta_group,
                     ),
                 );
@@ -3918,9 +4050,9 @@ fn emit_stmt(
             // `Tx.wg.copy_async` below reads the single base-0 (128, cols) f32
             // `tmem` view, so:
             //   * shape: only .32x32b addresses exactly the (all-128-lanes,
-            //     num-col) window the emission encodes. A .16x*b atom reads
-            //     col_factor*num columns from a 16-lane half-slab — emitting the
-            //     SAME text for it would validate one semantics and run another.
+            //     num-col) window the wg-view emission encodes. A .16x*b atom
+            //     reads col_factor*num columns from a 16-lane half-slab — it
+            //     lowers through the `{name}_atom` atom-layout view instead.
             //   * dtype: the tmem view is f32 and TIRx requires the fragment
             //     dtype to equal it.
             //   * row: the lane base of the read. The view always starts at
@@ -3928,10 +4060,80 @@ fn emit_stmt(
             //     each warp's whole 32-lane subpartition) — anything else reads
             //     different lanes in the interpreter than on silicon.
             if *shape != LdStShape::B32x32 {
-                return Err(format!(
-                    "codegen: Tcgen05Ld shape={} has no lowering (only 32x32b)",
-                    shape.as_str()
+                // `.16x*b` M=64 atom read into the dual-view fragment
+                // (`{name}_atom`, declared at the TensorDef). The M=128
+                // two-issue form (a second ld at row=16) has no lowering.
+                if src.dtype != DType::F32 {
+                    return Err(format!(
+                        "codegen: Tcgen05Ld shape={} dtype {:?} has no lowering \
+                         (the 16-bit TMEM read path is st-only; f32 only)",
+                        shape.as_str(),
+                        src.dtype
+                    ));
+                }
+                if as_int(&src.row) != Some(0) {
+                    return Err(format!(
+                        "codegen: Tcgen05Ld shape={} row must be a static 0 (the M=64 \
+                         atom frag; row=16 is the M=128 second issue — no lowering)",
+                        shape.as_str()
+                    ));
+                }
+                let (t, off, w) = reg_slice_parts(dst)?;
+                if t.dtype != src.dtype {
+                    return Err(format!(
+                        "codegen: Tcgen05Ld REG dtype {:?} != TMEM dtype {:?} \
+                         (the interpreter requires them equal)",
+                        t.dtype, src.dtype
+                    ));
+                }
+                let k_cols = atom_frag_cols(shape.as_str(), w, t.dtype)?;
+                let implied = k_cols
+                    / (match shape.as_str() {
+                        "16x64b" => 2,
+                        "16x128b" => 4,
+                        "16x256b" => 8,
+                        _ => unreachable!("note_atom_shape gates the shapes"),
+                    });
+                if implied != *num as usize {
+                    return Err(format!(
+                        "codegen: Tcgen05Ld num={num} disagrees with the fragment width \
+                         ({w} per-thread elements is .x{implied} for {})",
+                        shape.as_str()
+                    ));
+                }
+                let full = reg_view_width(t, ctx);
+                if as_int(off) != Some(0) || w != full {
+                    return Err(format!(
+                        "codegen: Tcgen05Ld shape={} dst must span the whole fragment \
+                         (the atom fills all {full} per-thread registers; got off={off:?}, width {w})",
+                        shape.as_str()
+                    ));
+                }
+                let aux = ctx
+                    .reg_aux_views
+                    .get(&t.id)
+                    .and_then(|a| a.atom_shape)
+                    .ok_or_else(|| {
+                        format!(
+                            "codegen: Tcgen05Ld shape={} dst tensor {} was not declared \
+                             as an atom fragment (internal view-collection bug)",
+                            shape.as_str(),
+                            t.id
+                        )
+                    })?;
+                if aux != shape.as_str() {
+                    return Err(format!(
+                        "codegen: Tcgen05Ld shape={} mismatches the tensor's {} atom view",
+                        shape.as_str(),
+                        aux
+                    ));
+                }
+                let col_s = emit_scalar(&src.col, ctx)?;
+                let name = ctx.tensor_name(t.id)?;
+                out.push_str(&format!(
+                    "{p}Tx.wg.copy_async({name}_atom[:, :], tmem[0:64, {col_s}:{col_s} + {k_cols}])\n"
                 ));
+                return Ok(());
             }
             if src.dtype != DType::F32 {
                 return Err(format!(
@@ -4284,15 +4486,80 @@ fn emit_stmt(
         // and never a silent different-semantics emission. The flash-attention /
         // flash-bwd datapath set has no GEMM-codegen lowering yet.
         SchedNext { .. } => Err("codegen: SchedNext not yet supported".to_string()),
-        // sim-only (the flash/gdn datapaths write TMEM from REG fragments); a
-        // future lowering must honor dst's (row, col, dtype) like Tcgen05Ld does.
+        // tcgen05.st — REG fragment -> TMEM, the mirror of Tcgen05Ld: same
+        // validations (row/shape/dtype), same `.32x32b` wg-view path. The
+        // `.16x*b` atoms would need an atom-layout src fragment — no gdn use,
+        // fail closed. For fp16/bf16 dsts the TMEM band is DENSE-PACKED (two
+        // elements per 32-bit cell): the IR slice counts b32 registers (num),
+        // the interpreter reads 2*num elements, and the emission goes through
+        // the `tmem_f16`/`tmem_bf16` packed views at twice the element window.
         Tcgen05St {
-            dst: _,
-            src: _,
-            shape: _,
-            num: _,
-        } => Err("codegen: Tcgen05St not yet supported".to_string()),
-        Tcgen05WaitSt => Err("codegen: Tcgen05WaitSt not yet supported".to_string()),
+            dst,
+            src,
+            shape,
+            num,
+        } => {
+            if *shape != LdStShape::B32x32 {
+                return Err(format!(
+                    "codegen: Tcgen05St shape={} has no lowering (only 32x32b; \
+                     the 16x*b atoms need an atom-layout src fragment)",
+                    shape.as_str()
+                ));
+            }
+            if as_int(&dst.row) != Some(0) {
+                return Err(
+                    "codegen: Tcgen05St row must be a static 0 (the TMEM view bases at lane 0)"
+                        .to_string(),
+                );
+            }
+            let (t, off, w) = reg_slice_parts(src)?;
+            if t.dtype != dst.dtype {
+                return Err(format!(
+                    "codegen: Tcgen05St REG dtype {:?} != TMEM dtype {:?} \
+                     (the interpreter requires them equal)",
+                    t.dtype, dst.dtype
+                ));
+            }
+            if w != *num as usize {
+                return Err(format!(
+                    "codegen: Tcgen05St src width {w} != num {num} (the register \
+                     slice must span exactly the atom's b32 registers)"
+                ));
+            }
+            match dst.dtype {
+                DType::F32 => {
+                    let col_s = emit_scalar(&dst.col, ctx)?;
+                    let frag_s = emit_reg_view_slice(out, &p, t, off, w, ctx)?;
+                    out.push_str(&format!(
+                        "{p}Tx.wg.copy_async(tmem[:, {col_s}:{col_s} + {w}], {frag_s})\n"
+                    ));
+                }
+                DType::F16 | DType::Bf16 => {
+                    let view = if dst.dtype == DType::F16 {
+                        "tmem_f16"
+                    } else {
+                        "tmem_bf16"
+                    };
+                    let col_s = emit_scalar(&dst.col, ctx)?;
+                    let frag_s = emit_reg_view_slice(out, &p, t, off, 2 * w, ctx)?;
+                    out.push_str(&format!(
+                        "{p}Tx.wg.copy_async({view}[:, ({col_s}) * 2:({col_s}) * 2 + {}], {frag_s})\n",
+                        2 * w
+                    ));
+                }
+                other => {
+                    return Err(format!(
+                        "codegen: Tcgen05St dtype {other:?} has no lowering \
+                         (f32 or packed f16/bf16 TMEM cells only)"
+                    ))
+                }
+            }
+            Ok(())
+        }
+        Tcgen05WaitSt => {
+            out.push_str(&format!("{p}T.ptx.tcgen05.wait.st()\n"));
+            Ok(())
+        }
         LdMatrix { .. } => Err("codegen: LdMatrix not yet supported".to_string()),
         StMatrix { .. } => Err("codegen: StMatrix not yet supported".to_string()),
         // Per-thread elementwise fill. Literal: `Tx.wg.fill` with a dst-typed
@@ -5101,11 +5368,15 @@ mod tests {
     }
 
     fn reg_frag_tensor(id: u32) -> Arc<Tensor> {
+        reg_frag_tensor_w(id, 8)
+    }
+
+    fn reg_frag_tensor_w(id: u32, w: usize) -> Arc<Tensor> {
         Arc::new(Tensor {
             id,
             space: MemorySpace::Reg,
             dtype: DType::F32,
-            shape: vec![8],
+            shape: vec![w],
             layout: None,
             byte_offset: None,
             reg_frag: None,
@@ -5130,10 +5401,12 @@ mod tests {
     }
 
     fn epilogue_kernel(ld: Stmt) -> Kernel {
+        epilogue_kernel_t(ld, reg_frag_tensor(7))
+    }
+
+    fn epilogue_kernel_t(ld: Stmt, tensor: Arc<Tensor>) -> Kernel {
         let mut body = vec![warp_if(0, vec![tmem_alloc(0, 512, 2)])];
-        body.push(Stmt::TensorDef {
-            tensor: reg_frag_tensor(7),
-        });
+        body.push(Stmt::TensorDef { tensor });
         body.push(wg_if(0, vec![ld]));
         body.push(warp_if(
             0,
@@ -5156,7 +5429,47 @@ mod tests {
             DType::F32,
         )))
         .unwrap();
-        assert!(ok.contains("Tx.wg.copy_async"), "{ok}");
+        assert!(ok.contains("Tx.wg.copy_async(accum_frag[:, :], tmem[:, 0:0 + 8])"), "{ok}");
+
+        // 16x256b M=64 f32: lowered through the atom view (num=8 -> 32 regs).
+        let atom_ld = Stmt::Tcgen05Ld {
+            dst: TensorSlice {
+                tensor: reg_frag_tensor_w(7, 32),
+                offsets: vec![ScalarValue::Int(0)],
+                shape: vec![ScalarValue::Int(32)],
+            },
+            src: TmemOperand {
+                row: ScalarValue::Int(0),
+                col: ScalarValue::Int(0),
+                dtype: DType::F32,
+            },
+            shape: LdStShape::B16x256,
+            num: 8,
+        };
+        let ok = kernel_to_tirx_source(&epilogue_kernel_t(atom_ld, reg_frag_tensor_w(7, 32)))
+            .unwrap();
+        assert!(
+            ok.contains("Tx.wg.copy_async(accum_frag_atom[:, :], tmem[0:64, 0:0 + 64])"),
+            "{ok}"
+        );
+
+        // num must agree with the fragment width (num=8 needs 32 f32 regs).
+        let bad_num = Stmt::Tcgen05Ld {
+            dst: TensorSlice {
+                tensor: reg_frag_tensor_w(7, 8),
+                offsets: vec![ScalarValue::Int(0)],
+                shape: vec![ScalarValue::Int(8)],
+            },
+            src: TmemOperand {
+                row: ScalarValue::Int(0),
+                col: ScalarValue::Int(0),
+                dtype: DType::F32,
+            },
+            shape: LdStShape::B16x256,
+            num: 8,
+        };
+        let err = kernel_to_tirx_source(&epilogue_kernel(bad_num)).unwrap_err();
+        assert!(err.contains("num"), "{err}");
 
         let err = kernel_to_tirx_source(&epilogue_kernel(tcgen05_ld(
             16,
@@ -5164,6 +5477,25 @@ mod tests {
             DType::F32,
         )))
         .unwrap_err();
+        assert!(err.contains("row"), "{err}");
+
+        // row=16 is the M=128 second issue — no lowering.
+        let atom_ld16 = Stmt::Tcgen05Ld {
+            dst: TensorSlice {
+                tensor: reg_frag_tensor_w(7, 32),
+                offsets: vec![ScalarValue::Int(0)],
+                shape: vec![ScalarValue::Int(32)],
+            },
+            src: TmemOperand {
+                row: ScalarValue::Int(16),
+                col: ScalarValue::Int(0),
+                dtype: DType::F32,
+            },
+            shape: LdStShape::B16x256,
+            num: 8,
+        };
+        let err = kernel_to_tirx_source(&epilogue_kernel_t(atom_ld16, reg_frag_tensor_w(7, 32)))
+            .unwrap_err();
         assert!(err.contains("row"), "{err}");
 
         let err = kernel_to_tirx_source(&epilogue_kernel(tcgen05_ld(
@@ -5181,6 +5513,137 @@ mod tests {
         )))
         .unwrap_err();
         assert!(err.contains("dtype"), "{err}");
+
+        // A 16-bit atom read has no lowering (the packed TMEM datapath is st-only).
+        let err = kernel_to_tirx_source(&epilogue_kernel(tcgen05_ld(
+            0,
+            LdStShape::B16x256,
+            DType::Bf16,
+        )))
+        .unwrap_err();
+        assert!(err.contains("dtype"), "{err}");
+    }
+
+    fn tcgen05_st(dst: TmemOperand, shape: LdStShape, src_w: i64, num: u32) -> Stmt {
+        Stmt::Tcgen05St {
+            dst,
+            src: TensorSlice {
+                tensor: reg_frag_tensor(7),
+                offsets: vec![ScalarValue::Int(0)],
+                shape: vec![ScalarValue::Int(src_w)],
+            },
+            shape,
+            num,
+        }
+    }
+
+    fn tmem_op(row: i64, col: i64, dtype: DType) -> TmemOperand {
+        TmemOperand {
+            row: ScalarValue::Int(row),
+            col: ScalarValue::Int(col),
+            dtype,
+        }
+    }
+
+    #[test]
+    fn tcgen05_st_lowering_and_rejects() {
+        // f32 32x32b: tmem[:, c:c+w] <- frag wg view.
+        let ok = kernel_to_tirx_source(&epilogue_kernel(tcgen05_st(
+            tmem_op(0, 8, DType::F32),
+            LdStShape::B32x32,
+            8,
+            8,
+        )))
+        .unwrap();
+        assert!(ok.contains("Tx.wg.copy_async(tmem[:, 8:8 + 8], accum_frag[:, :])"), "{ok}");
+
+        // dst width != num: the slice must span exactly the atom's registers.
+        let err = kernel_to_tirx_source(&epilogue_kernel(tcgen05_st(
+            tmem_op(0, 0, DType::F32),
+            LdStShape::B32x32,
+            4,
+            8,
+        )))
+        .unwrap_err();
+        assert!(err.contains("num"), "{err}");
+        // non-32x32b atom: no st lowering (would need an atom-layout src frag).
+        let err = kernel_to_tirx_source(&epilogue_kernel(tcgen05_st(
+            tmem_op(0, 0, DType::F32),
+            LdStShape::B16x256,
+            8,
+            8,
+        )))
+        .unwrap_err();
+        assert!(err.contains("32x32b"), "{err}");
+        // row != 0: the TMEM view bases at lane 0.
+        let err = kernel_to_tirx_source(&epilogue_kernel(tcgen05_st(
+            tmem_op(16, 0, DType::F32),
+            LdStShape::B32x32,
+            8,
+            8,
+        )))
+        .unwrap_err();
+        assert!(err.contains("row"), "{err}");
+        // dtype mismatch REG vs TMEM: the interpreter requires them equal.
+        let err = kernel_to_tirx_source(&epilogue_kernel(tcgen05_st(
+            tmem_op(0, 0, DType::Bf16),
+            LdStShape::B32x32,
+            8,
+            8,
+        )))
+        .unwrap_err();
+        assert!(err.contains("dtype"), "{err}");
+    }
+
+    #[test]
+    fn tcgen05_st_packed_half_and_wait() {
+        let bf = Arc::new(Tensor {
+            id: 8,
+            space: MemorySpace::Reg,
+            dtype: DType::Bf16,
+            shape: vec![16],
+            layout: None,
+            byte_offset: None,
+            reg_frag: None,
+        });
+        let mut body = vec![warp_if(0, vec![tmem_alloc(0, 512, 2)])];
+        body.push(Stmt::TensorDef {
+            tensor: reg_frag_tensor(7),
+        });
+        body.push(Stmt::TensorDef { tensor: bf.clone() });
+        body.push(wg_if(
+            0,
+            vec![
+                Stmt::Tcgen05St {
+                    dst: tmem_op(0, 128, DType::Bf16),
+                    src: TensorSlice {
+                        tensor: bf,
+                        offsets: vec![ScalarValue::Int(0)],
+                        shape: vec![ScalarValue::Int(8)],
+                    },
+                    shape: LdStShape::B32x32,
+                    num: 8,
+                },
+                Stmt::Tcgen05WaitSt,
+            ],
+        ));
+        body.push(warp_if(
+            0,
+            vec![Stmt::TmemDealloc {
+                base_col: 0,
+                n_cols: 512,
+                cta_group: 2,
+            }],
+        ));
+        let src = kernel_to_tirx_source(&kernel(body)).unwrap();
+        // The packed view is declared over the whole band (2 elems per cell) and
+        // the st window doubles the cell column.
+        assert!(src.contains("tmem_bf16 = T.decl_buffer((128, 1024), \"bfloat16\""), "{src}");
+        assert!(
+            src.contains("Tx.wg.copy_async(tmem_bf16[:, (128) * 2:(128) * 2 + 16], out_frag[:, :])"),
+            "{src}"
+        );
+        assert!(src.contains("T.ptx.tcgen05.wait.st()"), "{src}");
     }
 
     fn reg_tensor(id: u32, dtype: DType, width: i64) -> Arc<Tensor> {
