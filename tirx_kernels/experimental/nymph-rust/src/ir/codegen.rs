@@ -46,7 +46,7 @@
 use super::dtype::{DType, MemorySpace, ScalarOp, ScopeValueKind, Swizzle, VarBinding};
 use super::kernel::Kernel;
 use super::scalar::{ScalarExpr, ScalarInitial, ScalarValue, Var};
-use super::stmt::{LdStShape, RegOperand, Stmt};
+use super::stmt::{LdStShape, RegLiteral, RegOperand, RegUnaryOp, Rounding, Stmt};
 use super::tensor::{Layout, MmaOperand, Tensor, TensorSlice, TmemOperand};
 use super::thread_filter::{static_thread_filter, ThreadSet};
 use std::collections::{HashMap, HashSet};
@@ -59,6 +59,7 @@ from tvm.ir.type import PointerType, PrimType
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.layout import ComposeLayout, R, S, TCol, TileLayout, TLane
+from tvm.tirx.layout import tcgen05_atom_layout
 from tvm.tirx.layout import tid_in_wg as axis_tid_in_wg
 ";
 
@@ -349,6 +350,11 @@ struct Ctx {
     /// in the nymph IR (instruction granularity); the wide read/cast/store band
     /// needs it sized to the full column band. id -> width.
     reg_widths: HashMap<u32, usize>,
+    /// Per-REG-tensor auxiliary view needs (see `RegAuxViews` /
+    /// `collect_reg_aux_views`): warp-matrix ops, `.16x*b` tcgen05 atom
+    /// fragments, and per-thread scalar transfers address the raw per-thread
+    /// storage, which the default `(128, W)` thread-axis tile cannot express.
+    reg_aux_views: HashMap<u32, RegAuxViews>,
     /// mbar ids of the TMA-load completion barriers (`smem_full`, `sf_full`, ...)
     /// flagged `leader_routed` by the IR. In cluster mode the canonical pattern
     /// routes BOTH CTAs' TMA completions to the LEADER CTA's barrier (a
@@ -394,6 +400,29 @@ struct SfView {
     logical_rows: usize,
     /// Logical cols: the per-row scale-block count (nvfp4 `k/16`).
     logical_cols: usize,
+}
+
+/// Auxiliary physical views a REG tensor needs beyond the bare
+/// `T.wg_reg_tile` (collected by `collect_reg_aux_views`). The default wg tile
+/// is a `(128, W)` thread-axis layout — right for `Tx.wg.*` tile ops, but
+/// warp-matrix ops (`ldmatrix`/`stmatrix`/`mma.sync`), `.16x*b` tcgen05 atom
+/// fragments, and per-thread scalar transfers must address the RAW per-thread
+/// storage: LowerTIRxCleanup rejects direct element access on thread-axis
+/// layouts ("unable to verify that the coordinate matches the current
+/// thread"). With `flat` set, the TensorDef declares
+/// `{name}_flat = T.alloc_local((W,), dt)` (the raw per-thread storage) and
+/// turns `{name}` into a `(128, W)` wg VIEW over it, so both addressing forms
+/// share one register file.
+#[derive(Clone, Default)]
+struct RegAuxViews {
+    /// Declare `{name}_flat` and make `{name}` a view of it.
+    flat: bool,
+    /// `.16x*b` tcgen05 ld/st atom view `{name}_atom` (the PTX instr shape).
+    atom_shape: Option<&'static str>,
+    /// `uint32` reinterpret `{name}_flat_u32` (stmatrix's packed b16x2 words).
+    flat_u32: bool,
+    /// bf16/f16 reinterpret `{name}_flat_ab` (WarpMma A/B operand elements).
+    flat_ab: Option<DType>,
 }
 
 impl Ctx {
@@ -1790,6 +1819,11 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
     }
     walk_reg_widths(&k.body, &mut reg_widths);
 
+    // Auxiliary REG-tensor views (flat storage / atom tcgen05 frags / dtype
+    // reinterprets) required by the warp-matrix and per-thread scalar uses.
+    let mut reg_aux_views: HashMap<u32, RegAuxViews> = HashMap::new();
+    collect_reg_aux_views(&k.body, &mut reg_aux_views)?;
+
     // Scalar var names. Every `ScalarDef` introduces an SSA register var
     // (`NAME: T.int32 = init`, read as `NAME`). Var ids are globally unique, so
     // a per-id name (`s{id}`) is stable and collision-free.
@@ -1834,12 +1868,130 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
         num_warps: k.num_warps,
         tmem_view_cols,
         reg_widths,
+        reg_aux_views,
         tma_leader_mbars,
         num_clusters: (k.launch_cta_count() / (cta_group as usize).max(1)).max(1),
         sf_views,
         sf,
         nonneg_vars: collect_nonneg_vars(k),
     })
+}
+
+/// Walk the body once and record, per REG tensor, the auxiliary views its
+/// uses require (see `RegAuxViews`).
+fn collect_reg_aux_views(
+    stmts: &[Stmt],
+    views: &mut HashMap<u32, RegAuxViews>,
+) -> Result<(), String> {
+    for s in stmts {
+        match s {
+            Stmt::Tcgen05Ld { dst, shape, .. } => {
+                if *shape != LdStShape::B32x32 {
+                    let v = views.entry(dst.tensor.id).or_default();
+                    v.flat = true;
+                    note_atom_shape(v, dst.tensor.id, shape)?;
+                }
+            }
+            Stmt::Tcgen05St { src, shape, .. } => {
+                if *shape != LdStShape::B32x32 {
+                    let v = views.entry(src.tensor.id).or_default();
+                    v.flat = true;
+                    note_atom_shape(v, src.tensor.id, shape)?;
+                }
+            }
+            Stmt::WarpMma {
+                d,
+                a,
+                b,
+                c,
+                ab_dtype,
+                ..
+            } => {
+                for sl in [d, a, b, c] {
+                    views.entry(sl.tensor.id).or_default().flat = true;
+                }
+                views.entry(a.tensor.id).or_default().flat_ab = Some(*ab_dtype);
+                views.entry(b.tensor.id).or_default().flat_ab = Some(*ab_dtype);
+            }
+            Stmt::LdMatrix { dst, .. } => {
+                views.entry(dst.tensor.id).or_default().flat = true;
+            }
+            Stmt::StMatrix { src, .. } => {
+                let v = views.entry(src.tensor.id).or_default();
+                v.flat = true;
+                if matches!(src.tensor.dtype, DType::F16 | DType::Bf16) {
+                    v.flat_u32 = true;
+                }
+            }
+            Stmt::RegUnary { dst, src, op } if *op == RegUnaryOp::Log2 => {
+                views.entry(dst.tensor.id).or_default().flat = true;
+                if let RegOperand::Slice(src) = src {
+                    views.entry(src.tensor.id).or_default().flat = true;
+                }
+            }
+            // Per-thread point transfers lower to raw element assignments on
+            // the flat view (see the RegLoad/RegStore arms).
+            Stmt::RegLoad { dst, src } => {
+                if src.tensor.space == MemorySpace::Smem && slice_all_size1(src) {
+                    views.entry(dst.tensor.id).or_default().flat = true;
+                }
+            }
+            Stmt::RegStore { dst, src } => {
+                if src.tensor.space == MemorySpace::Reg
+                    && dst.tensor.space != MemorySpace::Reg
+                    && (slice_all_size1(dst) || gmem_row_run(dst))
+                {
+                    views.entry(src.tensor.id).or_default().flat = true;
+                }
+            }
+            _ => {}
+        }
+        for body in s.child_bodies() {
+            collect_reg_aux_views(body, views)?;
+        }
+    }
+    Ok(())
+}
+
+fn note_atom_shape(v: &mut RegAuxViews, id: u32, shape: &LdStShape) -> Result<(), String> {
+    match shape {
+        LdStShape::B16x64 | LdStShape::B16x128 | LdStShape::B16x256 => {}
+        other => {
+            return Err(format!(
+                "codegen: tcgen05 shape {} has no atom-fragment lowering \
+                 (only 16x64b/16x128b/16x256b)",
+                other.as_str()
+            ))
+        }
+    }
+    if let Some(prev) = v.atom_shape {
+        if prev != shape.as_str() {
+            return Err(format!(
+                "codegen: REG tensor {id} is used as both a {prev} and a {} \
+                 tcgen05 fragment (one atom view per tensor)",
+                shape.as_str()
+            ));
+        }
+    }
+    v.atom_shape = Some(shape.as_str());
+    Ok(())
+}
+
+/// Every slice dim is a static size-1 — a per-thread point transfer.
+fn slice_all_size1(s: &TensorSlice) -> bool {
+    !s.shape.is_empty() && s.shape.iter().all(|d| as_int(d) == Some(1))
+}
+
+/// A per-thread GMEM row run: rank >= 3, leading dims all size-1, trailing dim
+/// > 1 (e.g. the gdn final-state store `state_g[seq, eh, tid, c0:c0+64]`).
+/// Rank-2 `(1, w)` row stores keep the existing wg-band lowering.
+fn gmem_row_run(s: &TensorSlice) -> bool {
+    s.tensor.space == MemorySpace::Gmem
+        && s.shape.len() >= 3
+        && s.shape[..s.shape.len() - 1]
+            .iter()
+            .all(|d| as_int(d) == Some(1))
+        && s.shape.last().and_then(as_int).is_some_and(|w| w > 1)
 }
 
 /// Register one SF view per physical base column, in first-use order
@@ -1974,6 +2126,154 @@ fn emit_reg_view_slice(
         let off_s = emit_scalar(off, ctx)?;
         Ok(format!("{name}[:, {off_s}:{off_s} + {width}]"))
     }
+}
+
+/// A rank-1 REG slice decomposed for view emission: (tensor, offset, static
+/// width). Every nymph REG tensor is a per-thread 1-D vector — anything else
+/// has no lowering.
+fn reg_slice_parts(s: &TensorSlice) -> Result<(&Arc<Tensor>, &ScalarValue, usize), String> {
+    if s.offsets.len() != 1 || s.shape.len() != 1 {
+        return Err(format!(
+            "codegen: REG slice of tensor {} must be rank-1 (got {} offsets, {} shape dims)",
+            s.tensor.id,
+            s.offsets.len(),
+            s.shape.len()
+        ));
+    }
+    let w = match as_int(&s.shape[0]) {
+        Some(w) if w > 0 => w as usize,
+        other => {
+            return Err(format!(
+                "codegen: REG slice of tensor {} needs a static positive width (got {other:?})",
+                s.tensor.id
+            ))
+        }
+    };
+    Ok((&s.tensor, &s.offsets[0], w))
+}
+
+/// A `T.<dtype>(value)` scalar literal for `Tx.wg.*` operands (a bare number
+/// has no dtype; the literal takes the DST tensor's dtype, exactly the
+/// interpreter's `literal_array`).
+fn typed_scalar(dtype: DType, l: RegLiteral) -> Result<String, String> {
+    match dtype {
+        DType::F16 | DType::Bf16 | DType::F32 => Ok(format!("T.{}({})", dtype_str(dtype), l.as_f32())),
+        DType::I8
+        | DType::U8
+        | DType::I16
+        | DType::U16
+        | DType::I32
+        | DType::U32
+        | DType::I64
+        | DType::U64 => Ok(format!("T.{}({})", dtype_str(dtype), l.as_i64())),
+        other => Err(format!(
+            "codegen: no typed scalar literal for dtype {other:?}"
+        )),
+    }
+}
+
+/// One operand arm of a `Tx.wg.*` elementwise call: a wg-view slice, or a typed
+/// scalar for a literal. Slice operands must share the dst dtype — the
+/// interpreter coerces per-op, so a genuinely mixed-dtype op must say so with
+/// an explicit RegCvt instead of being silently coerced here.
+fn emit_wg_reg_operand(
+    op: &RegOperand,
+    dst_dtype: DType,
+    out: &mut Emitter,
+    p: &str,
+    ctx: &Ctx,
+) -> Result<String, String> {
+    match op {
+        RegOperand::Slice(s) => {
+            let (t, off, w) = reg_slice_parts(s)?;
+            if t.dtype != dst_dtype {
+                return Err(format!(
+                    "codegen: reg operand dtype {:?} != dst dtype {dst_dtype:?} — \
+                     the interpreter coerces operands per-op; use an explicit RegCvt",
+                    t.dtype
+                ));
+            }
+            emit_reg_view_slice(out, p, t, off, w, ctx)
+        }
+        RegOperand::Literal(l) => typed_scalar(dst_dtype, *l),
+    }
+}
+
+/// The `{name}_flat` raw per-thread storage name for a REG tensor declared
+/// with auxiliary views (see `RegAuxViews`).
+fn flat_name(t: &Arc<Tensor>, ctx: &Ctx) -> Result<String, String> {
+    Ok(format!("{}_flat", ctx.tensor_name(t.id)?))
+}
+
+/// Shared lowering for `RegAdd`/`RegSub`: `Tx.wg.{op}(dst, lhs, rhs)` over the
+/// wg views. `rounding=rm` (the interpreter's post-op floor) has no TIRx
+/// elementwise form — fail closed rather than silently skip the floor.
+#[allow(clippy::too_many_arguments)]
+fn emit_reg_binary(
+    out: &mut Emitter,
+    p: &str,
+    dst: &TensorSlice,
+    lhs: &RegOperand,
+    rhs: &RegOperand,
+    rounding: Rounding,
+    op: &str,
+    ctx: &Ctx,
+) -> Result<(), String> {
+    if rounding != Rounding::Rn {
+        return Err(format!(
+            "codegen: Reg{op} rounding=rm has no TIRx lowering (the elementwise \
+             ops carry no post-op floor; rn only)"
+        ));
+    }
+    let (t, off, w) = reg_slice_parts(dst)?;
+    if !matches!(t.dtype, DType::F16 | DType::Bf16 | DType::F32) {
+        return Err(format!(
+            "codegen: Reg{op} dst dtype {:?} has no lowering (float dsts only)",
+            t.dtype
+        ));
+    }
+    let dst_s = emit_reg_view_slice(out, p, t, off, w, ctx)?;
+    let lhs_s = emit_wg_reg_operand(lhs, t.dtype, out, p, ctx)?;
+    let rhs_s = emit_wg_reg_operand(rhs, t.dtype, out, p, ctx)?;
+    out.push_str(&format!("{p}Tx.wg.{op}({dst_s}, {lhs_s}, {rhs_s})\n"));
+    Ok(())
+}
+
+/// The `.16x*b` atom view's column count for a per-thread width-W fragment:
+/// the M=64 warpgroup frag is `(64, K)` with `64*K/128 = W` per-thread
+/// elements, so `K = 2W`; the implied `.xN` rep is `K / (col_factor *
+/// elems_per_b32)` and must be integral.
+fn atom_frag_cols(shape: &str, width: usize, dtype: DType) -> Result<usize, String> {
+    let factor = match shape {
+        "16x64b" => 2usize,
+        "16x128b" => 4,
+        "16x256b" => 8,
+        other => {
+            return Err(format!(
+                "codegen: tcgen05 shape {other} has no atom-fragment view \
+                 (only 16x64b/16x128b/16x256b)"
+            ))
+        }
+    };
+    let e32 = match dtype {
+        DType::F32 => 1usize,
+        DType::F16 | DType::Bf16 => 2,
+        other => {
+            return Err(format!(
+                "codegen: tcgen05 {shape} fragment dtype {other:?} has no lowering \
+                 (only f32/f16/bf16)"
+            ))
+        }
+    };
+    let k = 2 * width;
+    if k % (factor * e32) != 0 {
+        return Err(format!(
+            "codegen: tcgen05 {shape} fragment of {width} per-thread {dtype:?} elements \
+             has no integral .xN rep (K = {k} cols is not a multiple of {})",
+            factor * e32
+        ));
+    }
+    Ok(k)
 }
 
 /// Every MBarRef a statement names (for peer discovery).
@@ -2756,6 +3056,43 @@ fn emit_stmt(
                     }
                 },
                 None => {
+                    // Auxiliary-view form (see `RegAuxViews`): the raw per-thread
+                    // storage is `{name}_flat`; `{name}` becomes a (128, W) wg
+                    // VIEW over it so `Tx.wg.*` tile ops keep working unchanged.
+                    if let Some(aux) = ctx.reg_aux_views.get(&tensor.id).filter(|a| a.flat) {
+                        out.push_str(&format!(
+                            "{p}{name}_flat = T.alloc_local(({width},), \"{dt}\")\n",
+                            p = pad(indent),
+                            dt = dtype_str(tensor.dtype),
+                        ));
+                        out.push_str(&format!(
+                            "{p}{name} = {name}_flat.view({wg_threads}, {width}, layout=TileLayout(S[({wg_threads}, {width}) : (1 @ axis_tid_in_wg, 1)]))\n",
+                            p = pad(indent),
+                            wg_threads = WG_THREADS,
+                        ));
+                        if let Some(shape) = aux.atom_shape {
+                            let k_cols = atom_frag_cols(shape, width, tensor.dtype)?;
+                            out.push_str(&format!(
+                                "{p}{name}_atom = {name}_flat.view(64, {k_cols}, layout=tcgen05_atom_layout(\"{shape}\", (64, {k_cols}), \"{dt}\"))\n",
+                                p = pad(indent),
+                                dt = dtype_str(tensor.dtype),
+                            ));
+                        }
+                        if aux.flat_u32 {
+                            out.push_str(&format!(
+                                "{p}{name}_flat_u32 = {name}_flat.view(\"uint32\")\n",
+                                p = pad(indent),
+                            ));
+                        }
+                        if let Some(ab) = aux.flat_ab {
+                            out.push_str(&format!(
+                                "{p}{name}_flat_ab = {name}_flat.view(\"{ab_dt}\")\n",
+                                p = pad(indent),
+                                ab_dt = dtype_str(ab),
+                            ));
+                        }
+                        return Ok(());
+                    }
                     out.push_str(&format!(
                         "{p}{name} = T.wg_reg_tile({width}, dtype=\"{dt}\")\n",
                         p = pad(indent),
@@ -3917,9 +4254,6 @@ fn emit_stmt(
         CpAsyncBulkS2Cluster { .. } => {
             Err("codegen: CpAsyncBulkS2Cluster not yet supported".to_string())
         }
-        // Carries the `Log2`/`Exp2`/`Rcp`/`Neg` RegUnaryOp; applied over flash
-        // reg fragments (no GEMM-codegen reg-view path).
-        RegUnary { .. } => Err("codegen: RegUnary not yet supported".to_string()),
 
         // NVFP4 epilogue alpha rescale: Tx.wg.mul(frag, frag, alpha). lhs is a reg slice,
         // rhs the alpha literal (or vice versa).
@@ -3961,10 +4295,148 @@ fn emit_stmt(
         Tcgen05WaitSt => Err("codegen: Tcgen05WaitSt not yet supported".to_string()),
         LdMatrix { .. } => Err("codegen: LdMatrix not yet supported".to_string()),
         StMatrix { .. } => Err("codegen: StMatrix not yet supported".to_string()),
-        RegFill { .. } => Err("codegen: RegFill not yet supported".to_string()),
-        RegAdd { .. } => Err("codegen: RegAdd not yet supported".to_string()),
-        RegSub { .. } => Err("codegen: RegSub not yet supported".to_string()),
-        RegFma { .. } => Err("codegen: RegFma not yet supported".to_string()),
+        // Per-thread elementwise fill. Literal: `Tx.wg.fill` with a dst-typed
+        // scalar (the interpreter's literal_array). Slice: a wg-copy (the
+        // interpreter broadcasts a one-element-per-thread src, which the
+        // copy's broadcast rules honor — validate the two legal widths).
+        RegFill { dst, value } => {
+            let (t, off, w) = reg_slice_parts(dst)?;
+            let dst_s = emit_reg_view_slice(out, &p, t, off, w, ctx)?;
+            match value {
+                RegOperand::Literal(l) => {
+                    let v = typed_scalar(t.dtype, *l)?;
+                    out.push_str(&format!("{p}Tx.wg.fill({dst_s}, {v})\n"));
+                }
+                RegOperand::Slice(src) => {
+                    let (st, soff, sw) = reg_slice_parts(src)?;
+                    if st.dtype != t.dtype {
+                        return Err(format!(
+                            "codegen: RegFill src dtype {:?} != dst dtype {:?} — \
+                             the interpreter coerces per-op; use an explicit RegCvt",
+                            st.dtype, t.dtype
+                        ));
+                    }
+                    if sw != 1 && sw != w {
+                        return Err(format!(
+                            "codegen: RegFill src width {sw} must be 1 or the dst width {w} \
+                             (the interpreter matches the dst or broadcasts one element per thread)"
+                        ));
+                    }
+                    let src_s = emit_reg_view_slice(out, &p, st, soff, sw, ctx)?;
+                    out.push_str(&format!("{p}Tx.wg.copy({dst_s}, {src_s})\n"));
+                }
+            }
+            Ok(())
+        }
+        RegAdd {
+            dst,
+            lhs,
+            rhs,
+            rounding,
+        } => emit_reg_binary(out, &p, dst, lhs, rhs, *rounding, "add", ctx),
+        RegSub {
+            dst,
+            lhs,
+            rhs,
+            rounding,
+        } => emit_reg_binary(out, &p, dst, lhs, rhs, *rounding, "sub", ctx),
+        // dst = a * b + c elementwise (the interpreter's unfused f32 mul+add;
+        // the TIRx fma may fuse — a 1-ulp difference the GPU gates tolerate).
+        RegFma { dst, a, b, c } => {
+            let (t, off, w) = reg_slice_parts(dst)?;
+            if !matches!(t.dtype, DType::F16 | DType::Bf16 | DType::F32) {
+                return Err(format!(
+                    "codegen: RegFma dst dtype {:?} has no lowering (float dsts only)",
+                    t.dtype
+                ));
+            }
+            let dst_s = emit_reg_view_slice(out, &p, t, off, w, ctx)?;
+            let a_s = emit_wg_reg_operand(a, t.dtype, out, &p, ctx)?;
+            let b_s = emit_wg_reg_operand(b, t.dtype, out, &p, ctx)?;
+            let c_s = emit_wg_reg_operand(c, t.dtype, out, &p, ctx)?;
+            out.push_str(&format!("{p}Tx.wg.fma({dst_s}, {a_s}, {b_s}, {c_s})\n"));
+            Ok(())
+        }
+        // Elementwise unary over an f32 fragment. exp2/rcp map to the TIRx
+        // unary tile ops (rcp lowers to a true `1.0 / x` division, matching
+        // the interpreter); neg is a multiply by -1 (an exact sign flip).
+        // log2 has NO tile op — it lowers to a per-thread scalar loop on the
+        // flat views. A literal src folds at codegen time: the interpreter
+        // applies the same rust f32 math, so the fold is bit-identical.
+        RegUnary { dst, src, op } => {
+            let (t, off, w) = reg_slice_parts(dst)?;
+            if t.dtype != DType::F32 {
+                return Err(format!(
+                    "codegen: RegUnary {} dst dtype {:?} has no lowering — the \
+                     interpreter computes unary ops in f32 and rounds; the TIRx \
+                     16-bit elementwise path computes in 16 bits (f32 dst only)",
+                    op.as_str(),
+                    t.dtype
+                ));
+            }
+            let folded = match (src, op) {
+                (RegOperand::Literal(l), RegUnaryOp::Exp2) => Some(l.as_f32().exp2()),
+                (RegOperand::Literal(l), RegUnaryOp::Log2) => Some(l.as_f32().log2()),
+                (RegOperand::Literal(l), RegUnaryOp::Rcp) => Some(1.0 / l.as_f32()),
+                (RegOperand::Literal(l), RegUnaryOp::Neg) => Some(-l.as_f32()),
+                (RegOperand::Slice(_), _) => None,
+            };
+            if let Some(v) = folded {
+                let dst_s = emit_reg_view_slice(out, &p, t, off, w, ctx)?;
+                out.push_str(&format!("{p}Tx.wg.fill({dst_s}, T.float32({v}))\n"));
+                return Ok(());
+            }
+            let RegOperand::Slice(src) = src else {
+                return Err("codegen: RegUnary src must be a slice or literal".to_string());
+            };
+            let (st, soff, sw) = reg_slice_parts(src)?;
+            if st.dtype != DType::F32 {
+                return Err(format!(
+                    "codegen: RegUnary {} src dtype {:?} has no lowering (f32 only)",
+                    op.as_str(),
+                    st.dtype
+                ));
+            }
+            if sw != 1 && sw != w {
+                return Err(format!(
+                    "codegen: RegUnary src width {sw} must be 1 or the dst width {w} \
+                     (the interpreter matches the dst or broadcasts one element per thread)"
+                ));
+            }
+            let dst_s = emit_reg_view_slice(out, &p, t, off, w, ctx)?;
+            let src_s = emit_reg_view_slice(out, &p, st, soff, sw, ctx)?;
+            match op {
+                RegUnaryOp::Exp2 => {
+                    out.push_str(&format!("{p}Tx.wg.exp2({dst_s}, {src_s})\n"));
+                }
+                RegUnaryOp::Rcp => {
+                    out.push_str(&format!("{p}Tx.wg.reciprocal({dst_s}, {src_s})\n"));
+                }
+                RegUnaryOp::Neg => {
+                    out.push_str(&format!("{p}Tx.wg.mul({dst_s}, {src_s}, T.float32(-1))\n"));
+                }
+                RegUnaryOp::Log2 => {
+                    // No `Tx.wg.log2` tile op exists; lower per-thread on the
+                    // flat views (raw per-thread storage — thread-axis-free).
+                    let dflat = flat_name(t, ctx)?;
+                    let sflat = flat_name(st, ctx)?;
+                    let elem = |off: &ScalarValue, i: &str| -> Result<String, String> {
+                        Ok(match as_int(off) {
+                            Some(0) => i.to_string(),
+                            Some(b) => format!("{b} + {i}"),
+                            None => format!("{} + {i}", emit_scalar(off, ctx)?),
+                        })
+                    };
+                    let d_idx = elem(off, "_i")?;
+                    // A width-1 src broadcasts (the interpreter's
+                    // one-element-per-thread rule); the dst walks off..off+w.
+                    let s_idx = if sw == 1 { elem(soff, "0")? } else { elem(soff, "_i")? };
+                    out.push_str(&format!("{p}for _i in range({w}):\n"));
+                    out.push_str(&format!("{p}    {dflat}[{d_idx}] = T.log2({sflat}[{s_idx}])\n"));
+                }
+            }
+            Ok(())
+        }
         RegMax { .. } => Err("codegen: RegMax not yet supported".to_string()),
         RegMin { .. } => Err("codegen: RegMin not yet supported".to_string()),
         RegBitwise { .. } => Err("codegen: RegBitwise not yet supported".to_string()),
@@ -4696,11 +5168,11 @@ mod tests {
 
         let err = kernel_to_tirx_source(&epilogue_kernel(tcgen05_ld(
             0,
-            LdStShape::B16x256,
+            LdStShape::B16x32Bx2,
             DType::F32,
         )))
         .unwrap_err();
-        assert!(err.contains("32x32b"), "{err}");
+        assert!(err.contains("16x32bx2"), "{err}");
 
         let err = kernel_to_tirx_source(&epilogue_kernel(tcgen05_ld(
             0,
@@ -4709,6 +5181,207 @@ mod tests {
         )))
         .unwrap_err();
         assert!(err.contains("dtype"), "{err}");
+    }
+
+    fn reg_tensor(id: u32, dtype: DType, width: i64) -> Arc<Tensor> {
+        Arc::new(Tensor {
+            id,
+            space: MemorySpace::Reg,
+            dtype,
+            shape: vec![width as usize],
+            layout: None,
+            byte_offset: None,
+            reg_frag: None,
+        })
+    }
+
+    fn reg_slice(t: &Arc<Tensor>, off: i64, w: i64) -> TensorSlice {
+        TensorSlice {
+            tensor: t.clone(),
+            offsets: vec![ScalarValue::Int(off)],
+            shape: vec![ScalarValue::Int(w)],
+        }
+    }
+
+    fn reg_kernel(body: Vec<Stmt>) -> Kernel {
+        kernel(body)
+    }
+
+    #[test]
+    fn reg_elementwise_family_lowering() {
+        let r1 = reg_tensor(10, DType::F32, 1);
+        let r2 = reg_tensor(11, DType::F32, 1);
+        let rb = reg_tensor(12, DType::Bf16, 2);
+        let body = vec![
+            Stmt::TensorDef {
+                tensor: r1.clone(),
+            },
+            Stmt::TensorDef {
+                tensor: r2.clone(),
+            },
+            Stmt::TensorDef {
+                tensor: rb.clone(),
+            },
+            wg_if(
+                0,
+                vec![
+                    Stmt::RegFill {
+                        dst: reg_slice(&r1, 0, 1),
+                        value: RegOperand::Literal(RegLiteral::Int(0)),
+                    },
+                    Stmt::RegAdd {
+                        dst: reg_slice(&r1, 0, 1),
+                        lhs: RegOperand::Slice(reg_slice(&r1, 0, 1)),
+                        rhs: RegOperand::Slice(reg_slice(&r2, 0, 1)),
+                        rounding: Rounding::Rn,
+                    },
+                    Stmt::RegSub {
+                        dst: reg_slice(&r1, 0, 1),
+                        lhs: RegOperand::Slice(reg_slice(&r1, 0, 1)),
+                        rhs: RegOperand::Literal(RegLiteral::Int(-1)),
+                        rounding: Rounding::Rn,
+                    },
+                    Stmt::RegFma {
+                        dst: reg_slice(&r1, 0, 1),
+                        a: RegOperand::Slice(reg_slice(&r1, 0, 1)),
+                        b: RegOperand::Slice(reg_slice(&r2, 0, 1)),
+                        c: RegOperand::Slice(reg_slice(&r1, 0, 1)),
+                    },
+                    Stmt::RegUnary {
+                        dst: reg_slice(&r1, 0, 1),
+                        src: RegOperand::Slice(reg_slice(&r2, 0, 1)),
+                        op: RegUnaryOp::Exp2,
+                    },
+                    Stmt::RegUnary {
+                        dst: reg_slice(&r1, 0, 1),
+                        src: RegOperand::Slice(reg_slice(&r2, 0, 1)),
+                        op: RegUnaryOp::Rcp,
+                    },
+                    Stmt::RegUnary {
+                        dst: reg_slice(&r1, 0, 1),
+                        src: RegOperand::Slice(reg_slice(&r2, 0, 1)),
+                        op: RegUnaryOp::Neg,
+                    },
+                    Stmt::RegUnary {
+                        dst: reg_slice(&r1, 0, 1),
+                        src: RegOperand::Slice(reg_slice(&r2, 0, 1)),
+                        op: RegUnaryOp::Log2,
+                    },
+                    Stmt::RegFill {
+                        dst: reg_slice(&rb, 0, 2),
+                        value: RegOperand::Literal(RegLiteral::Int(1)),
+                    },
+                    Stmt::RegAdd {
+                        dst: reg_slice(&rb, 0, 2),
+                        lhs: RegOperand::Slice(reg_slice(&rb, 0, 2)),
+                        rhs: RegOperand::Slice(reg_slice(&rb, 0, 2)),
+                        rounding: Rounding::Rn,
+                    },
+                ],
+            ),
+        ];
+        let src = kernel_to_tirx_source(&reg_kernel(body)).unwrap();
+        assert!(src.contains("Tx.wg.fill(accum_frag[:, :], T.float32(0))"), "{src}");
+        assert!(
+            src.contains("Tx.wg.add(accum_frag[:, :], accum_frag[:, :], out_frag[:, :])"),
+            "{src}"
+        );
+        assert!(
+            src.contains("Tx.wg.sub(accum_frag[:, :], accum_frag[:, :], T.float32(-1))"),
+            "{src}"
+        );
+        assert!(
+            src.contains(
+                "Tx.wg.fma(accum_frag[:, :], accum_frag[:, :], out_frag[:, :], accum_frag[:, :])"
+            ),
+            "{src}"
+        );
+        assert!(src.contains("Tx.wg.exp2(accum_frag[:, :], out_frag[:, :])"), "{src}");
+        assert!(
+            src.contains("Tx.wg.reciprocal(accum_frag[:, :], out_frag[:, :])"),
+            "{src}"
+        );
+        assert!(
+            src.contains("Tx.wg.mul(accum_frag[:, :], out_frag[:, :], T.float32(-1))"),
+            "{src}"
+        );
+        // log2: no tile op — per-thread scalar loop on the flat views.
+        assert!(
+            src.contains("accum_frag_flat = T.alloc_local((1,), \"float32\")"),
+            "{src}"
+        );
+        assert!(src.contains("for _i in range(1):"), "{src}");
+        // (width-1 src broadcasts — the interpreter's one-element-per-thread rule)
+        assert!(
+            src.contains("accum_frag_flat[_i] = T.log2(out_frag_flat[0])"),
+            "{src}"
+        );
+        // bf16 fill/add: literal takes the dst dtype.
+        assert!(src.contains("Tx.wg.fill(reg2[:, :], T.bfloat16(1))"), "{src}");
+        assert!(src.contains("Tx.wg.add(reg2[:, :], reg2[:, :], reg2[:, :])"), "{src}");
+    }
+
+    #[test]
+    fn reg_elementwise_dropped_fields_are_rejected() {
+        let r1 = reg_tensor(10, DType::F32, 1);
+        let ri = reg_tensor(11, DType::I32, 1);
+        let mk = |stmts: Vec<Stmt>| {
+            let mut body = vec![
+                Stmt::TensorDef {
+                    tensor: r1.clone(),
+                },
+                Stmt::TensorDef {
+                    tensor: ri.clone(),
+                },
+            ];
+            body.push(wg_if(0, stmts));
+            kernel_to_tirx_source(&reg_kernel(body))
+        };
+        // rounding=rm has no lowering (the elementwise ops carry no floor).
+        let err = mk(vec![Stmt::RegAdd {
+            dst: reg_slice(&r1, 0, 1),
+            lhs: RegOperand::Literal(RegLiteral::Int(1)),
+            rhs: RegOperand::Literal(RegLiteral::Int(2)),
+            rounding: Rounding::Rm,
+        }])
+        .unwrap_err();
+        assert!(err.contains("rm"), "{err}");
+        // int dst for the binary family: no lowering.
+        let err = mk(vec![Stmt::RegSub {
+            dst: reg_slice(&ri, 0, 1),
+            lhs: RegOperand::Literal(RegLiteral::Int(1)),
+            rhs: RegOperand::Literal(RegLiteral::Int(2)),
+            rounding: Rounding::Rn,
+        }])
+        .unwrap_err();
+        assert!(err.contains("dtype"), "{err}");
+        // 16-bit unary dst: the interpreter computes in f32 and rounds; the
+        // TIRx 16-bit elementwise path would compute in 16 bits.
+        let rb = reg_tensor(12, DType::Bf16, 1);
+        let err = kernel_to_tirx_source(&reg_kernel(vec![
+            Stmt::TensorDef {
+                tensor: rb.clone(),
+            },
+            wg_if(
+                0,
+                vec![Stmt::RegUnary {
+                    dst: reg_slice(&rb, 0, 1),
+                    src: RegOperand::Slice(reg_slice(&rb, 0, 1)),
+                    op: RegUnaryOp::Exp2,
+                }],
+            ),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("dtype"), "{err}");
+        // a mixed-dtype operand is NOT silently coerced.
+        let err = mk(vec![Stmt::RegAdd {
+            dst: reg_slice(&r1, 0, 1),
+            lhs: RegOperand::Slice(reg_slice(&ri, 0, 1)),
+            rhs: RegOperand::Literal(RegLiteral::Int(2)),
+            rounding: Rounding::Rn,
+        }])
+        .unwrap_err();
+        assert!(err.contains("RegCvt"), "{err}");
     }
 
     #[test]
