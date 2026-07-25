@@ -10,7 +10,10 @@ registry path.
 
 The interfaces (KERNEL_META / CONFIGS / run_bench) live IN the kernel modules
 (``python/nymph_rs/kernels/``); this hook just makes them importable and calls
-their ``register_bench_interface()``.
+their ``register_bench_interface()``. It also prepends the cu13 cutlass-dsl
+overlay (``_cutlass_dsl_overlay.py``, the NVIDIA/cutlass#3259 repair) so the
+flashinfer baseline the gdn bench imports later resolves to the cu13 tree —
+this runs at interpreter startup, safely before any ``import cutlass``.
 """
 
 import os
@@ -22,6 +25,10 @@ if os.environ.get("NYMPH_BENCH_SUITE") == "1":
         sys.path.insert(0, _PY)
 
     try:
+        import _cutlass_dsl_overlay
+
+        _cutlass_dsl_overlay.ensure_cutlass_dsl_cu13()
+
         from nymph_rs.kernels import fp16_bf16_gemm, gdn_prefill, nvfp4_gemm
 
         nvfp4_gemm.register_bench_interface()

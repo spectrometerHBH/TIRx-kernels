@@ -12,22 +12,23 @@ For each representative shape (``kernels/gdn_prefill.py::BENCH_CONFIGS``):
    baseline-only ``run_flashinfer_bench`` fallback, so the flashinfer table
    exists from day one.
 
-   CURRENT BASELINE BLOCKER (Wave-1 finding): the flashinfer CuTeDSL kernel
-   itself does not compile in this environment — flashinfer 0.6.15 (repo
-   517cca9c) + nvidia-cutlass-dsl 4.5.2 ICE at cute.compile
-   (``tcgen05.make_tmem_copy`` over ``tmem_load<f32, 32 DP, 32 bit, x32>``:
-   "failed to legalize unresolved materialization"), reproduced by
-   flashinfer's own tests/gdn/test_prefill_delta_rule.py on the unmodified
-   repo. ROOT CAUSE (confirmed read-only): NVIDIA/cutlass#3259 — the
-   nvidia-cutlass-dsl-libs-base and -libs-cu13 4.5.2 wheels both own
-   nvidia_cutlass_dsl/lib/libcute_dsl_runtime.so with different content, and
-   the BASE variant won the install race here (on-disk size 37,288,696 B =
-   base's RECORD, cu13's is 39,855,488 B); the base runtime lacks the CUDA-13
-   MLIR bytecode tcgen05.make_tmem_copy needs. The repair is to re-extract the
-   cu13 wheel last (e.g. ``pip install --force-reinstall --no-deps
-   nvidia-cutlass-dsl-libs-cu13==4.5.2``) — an environment fix, deliberately
-   NOT applied here: the goal's stop rule says record-and-stop, never patch
-   the baseline or mutate the shared env from this wave.
+   BASELINE ENV REPAIR (landed): the flashinfer CuTeDSL kernel originally
+   ICE-d in this environment — flashinfer 0.6.15 + nvidia-cutlass-dsl 4.5.2
+   at cute.compile (``tcgen05.make_tmem_copy`` over
+   ``tmem_load<f32, 32 DP, 32 bit, x32>``: "failed to legalize unresolved
+   materialization"), reproduced by flashinfer's own
+   tests/gdn/test_prefill_delta_rule.py on the unmodified repo. Root cause is
+   NVIDIA/cutlass#3259: the nvidia-cutlass-dsl-libs-base and -libs-cu13 4.5.2
+   wheels collide on the whole ``nvidia_cutlass_dsl/`` tree and the BASE
+   variant (no CUDA-13 MLIR bytecode) won the install race here. The fix —
+   landed by the main session — is a full-tree cu13 OVERLAY at
+   ``<workspace>/.txdev-shell/cutlass-dsl-cu13/nvidia_cutlass_dsl/``
+   (python_packages + lib + include), wired into sys.path by
+   ``_cutlass_dsl_overlay.py`` (called below at startup, and by the bench
+   autoreg; see that module for the one-command rebuild). The FULL tree is
+   required: #3259's collision also covers the ``_cutlass_ir`` MLIR extension
+   and the dialect files — a single-.so CUTE_DSL_LIBS override was tried and
+   does NOT fix the ICE.
 3. baseline sanity — flashinfer output vs the numpy oracle
    (``tests/kernels/_gdn_oracle.py``, the FLA chunked reference the value sim
    is validated against) on the SAME inputs: cosine per shape. This exercises
@@ -56,6 +57,13 @@ for _p in (
 ):
     if _p not in sys.path:
         sys.path.insert(0, _p)
+
+# The cu13 cutlass-dsl overlay (NVIDIA/cutlass#3259 repair) must be on sys.path
+# before the first `import cutlass` (which the flashinfer baseline triggers).
+# _HERE is already sys.path[0] (script dir), so this import is repo-local.
+import _cutlass_dsl_overlay  # noqa: E402
+
+_cutlass_dsl_overlay.ensure_cutlass_dsl_cu13()
 
 
 def _oracle_cosines(gdn, data, seq_lens, f_out, f_state):
