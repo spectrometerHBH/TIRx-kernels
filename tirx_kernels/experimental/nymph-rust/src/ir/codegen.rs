@@ -2143,6 +2143,27 @@ fn slice_all_size1(s: &TensorSlice) -> bool {
     !s.shape.is_empty() && s.shape.iter().all(|d| as_int(d) == Some(1))
 }
 
+/// A per-thread narrow contiguous SMEM run: rank >= 2, leading dims all
+/// size-1 (offsets arbitrary), trailing dim a static width 2..=8. Returns the
+/// run width. (Rank-2 `(1, w)` with a TidInWg leading offset could also take
+/// the wg.collective tile form, but the raw per-thread form is at least as
+/// good at these widths, and arithmetic rows REQUIRE it.)
+fn narrow_smem_run(s: &TensorSlice) -> Option<usize> {
+    if s.tensor.space != MemorySpace::Smem || s.shape.len() < 2 {
+        return None;
+    }
+    if !s.shape[..s.shape.len() - 1]
+        .iter()
+        .all(|d| as_int(d) == Some(1))
+    {
+        return None;
+    }
+    match s.shape.last().and_then(as_int) {
+        Some(w) if (2..=8).contains(&w) => Some(w as usize),
+        _ => None,
+    }
+}
+
 /// A per-thread GMEM row run: rank >= 3, leading dims all size-1, trailing dim
 /// > 1 (e.g. the gdn final-state store `state_g[seq, eh, tid, c0:c0+64]`).
 /// Rank-2 `(1, w)` row stores keep the existing wg-band lowering.
@@ -4509,6 +4530,53 @@ fn emit_stmt(
                 let doff_s = emit_scalar(doff, ctx)?;
                 let addr = emit_scalar_addr(src, ctx)?;
                 out.push_str(&format!("{p}{dflat}[{doff_s}] = {addr}\n"));
+                return Ok(());
+            }
+            // A per-thread narrow contiguous SMEM run: leading dims all size-1
+            // (arbitrary per-thread offsets), trailing dim a static width 2..=8
+            // (gdn's v_s value pairs). The wg.collective copy needs a
+            // TidInWg-leading (128-row) source tile, which an arithmetic
+            // per-thread row is not — lower narrow runs to raw per-thread
+            // element assigns so one swizzled row-base computation is shared
+            // by the run's immediate-offset element addresses.
+            if src.tensor.space == MemorySpace::Smem && narrow_smem_run(src).is_some() {
+                let w = narrow_smem_run(src).unwrap();
+                let (dt, doff, dw) = reg_slice_parts(dst)?;
+                if dt.dtype != src.tensor.dtype {
+                    return Err(format!(
+                        "codegen: RegLoad narrow-run src dtype {:?} != dst dtype {:?} — \
+                         the interpreter coerces; use an explicit RegCvt",
+                        src.tensor.dtype, dt.dtype
+                    ));
+                }
+                if dw != w {
+                    return Err(format!(
+                        "codegen: RegLoad narrow-run width {w} != dst width {dw}"
+                    ));
+                }
+                let dflat = flat_name(dt, ctx)?;
+                let doff_s = emit_scalar(doff, ctx)?;
+                let name = ctx.tensor_name(src.tensor.id)?;
+                let n = src.offsets.len();
+                let lead = src.offsets[..n - 1]
+                    .iter()
+                    .map(|o| emit_scalar(o, ctx))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join(", ");
+                let c0 = emit_scalar(&src.offsets[n - 1], ctx)?;
+                let elem = |off_s: &str| {
+                    if off_s == "0" {
+                        "_i".to_string()
+                    } else {
+                        format!("{off_s} + _i")
+                    }
+                };
+                out.push_str(&format!("{p}for _i in range({w}):\n"));
+                out.push_str(&format!(
+                    "{p}    {dflat}[{}] = {name}[{lead}, {}]\n",
+                    elem(&doff_s),
+                    elem(&c0)
+                ));
                 return Ok(());
             }
             if src.tensor.space == MemorySpace::Smem {

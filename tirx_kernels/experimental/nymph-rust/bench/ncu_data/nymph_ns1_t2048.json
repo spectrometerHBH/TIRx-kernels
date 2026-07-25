@@ -5,27 +5,27 @@
     "main_kernel"
   ],
   "ncu_report": "nymph_ns1_t2048.ncu-rep",
-  "collected_at": "2026-07-25 16:08:19",
-  "inst_total": 5526944.0,
+  "collected_at": "2026-07-25 16:51:23",
+  "inst_total": 5131131.0,
   "inst_csv": "nymph_ns1_t2048.inst.csv",
   "mem_csv": "nymph_ns1_t2048.mem.csv",
   "mem": [
     {
       "kernel": "main_kernel",
       "metric": "l1tex__data_pipe_lsu_wavefronts_mem_shared.sum",
-      "value": 1475929,
+      "value": 1359623,
       "unit": ""
     },
     {
       "kernel": "main_kernel",
       "metric": "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum",
-      "value": 261412,
+      "value": 258422,
       "unit": ""
     },
     {
       "kernel": "main_kernel",
       "metric": "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum",
-      "value": 343629,
+      "value": 343966,
       "unit": ""
     },
     {
@@ -37,19 +37,19 @@
     {
       "kernel": "main_kernel",
       "metric": "l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum",
-      "value": 131114,
+      "value": 131112,
       "unit": "sector"
     },
     {
       "kernel": "main_kernel",
       "metric": "lts__t_sectors.sum",
-      "value": 873435,
+      "value": 868476,
       "unit": "sector"
     },
     {
       "kernel": "main_kernel",
       "metric": "dram__sectors_read.sum",
-      "value": 271104,
+      "value": 270920,
       "unit": "sector"
     },
     {
@@ -61,7 +61,7 @@
     {
       "kernel": "main_kernel",
       "metric": "smsp__inst_executed.sum",
-      "value": 4227774,
+      "value": 3914511,
       "unit": "inst"
     },
     {

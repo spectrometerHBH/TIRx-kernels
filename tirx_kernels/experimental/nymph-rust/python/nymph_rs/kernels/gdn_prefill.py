@@ -1013,17 +1013,27 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                     k.mbarrier_arrive(bars["f_ks"])
                     k.mbarrier_wait(bars["d_qs"], phase=ph(gc_pos))
                     _read128_ointer(
-                        k, qstate_tmem, out_s, gcs_s, scale, frag, r1, sttile, lane, warp, eh, dexp2
+                        k,
+                        qstate_tmem,
+                        out_s,
+                        gcs_s,
+                        scale,
+                        frag,
+                        r1,
+                        sttile,
+                        lane,
+                        warp,
+                        eh,
+                        dexp2,
+                        frag32,
                     )
                     k.wg_sync(barrier_id=11)
                     k.mbarrier_arrive(bars["f_qs"])
                 with k.if_(c.eq(0)):
-                    # chunk 0: S=0 → o_inter=0 (zero out_s); GEMM5 reads v_s directly
+                    # chunk 0: S=0 → o_inter=0 (the o_frag register fragment, Wave-3
+                    # C2 — was an out_s SMEM zero-fill); GEMM5 reads v_s directly
                     # (delta=v), so no v transpose needed here.
-                    with k.if_(tid < BT):
-                        for dv in range(V_DIM):
-                            k.reg_fill(rb16, 0.0)
-                            k.reg_store(_sl(out_s, (tid, dv), (1, 1)), rb16)
+                    k.reg_fill(_sl(frag32, (0,), (64,)), 0.0)
                     k.wg_sync(barrier_id=11)
                 fence_pub(11)
                 k.mbarrier_arrive(bars["delta_ready"])
@@ -1056,7 +1066,7 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                 k.mbarrier_arrive(bars["ktvng_ready"])
                 # qkv_epilogue: O_intra -> o = o_inter + O_intra -> out_s
                 k.mbarrier_wait(bars["d_oi"], phase=ph(gc))
-                _read128_store_out(k, acc_tmem, out_s, frag, rb16, sttile, lane, warp)
+                _read128_store_out(k, acc_tmem, out_s, frag, rb16, sttile, lane, warp, frag32)
                 k.wg_sync(barrier_id=11)
                 k.mbarrier_arrive(bars["f_oi"])
                 fence_pub(11)
@@ -1143,15 +1153,14 @@ def _stm(k, dst, row_base, col_base, sttile, lane, trans):
         k.stmatrix(_sl(dst, (row_base + lane % 8, col_base), (1, 8)), sttile, num=1, trans=False)
 
 
-def _read128_store_out(k, acc, dst_s, frag, rb16, sttile, lane, warp):
-    # o[row,col] = O_intra[row,col] + o_inter (pre-staged in dst_s by GEMM4). bf16 add,
-    # then stmatrix the tile back (STSM). o_inter is read per-element (data dep).
+def _read128_store_out(k, acc, dst_s, frag, rb16, sttile, lane, warp, o_frag):
+    # o[row,col] = O_intra[row,col] + o_inter (in the o_frag register fragment,
+    # Wave-3 C2 — was an out_s SMEM round trip). bf16 add, then stmatrix the
+    # tile back (STSM).
     for blk, va, vb, v0p in _read128(k, acc, frag):
         r = v0p + 2 * va + 4 * vb
-        row = (lane // 4) + 8 * va + 16 * warp
-        col = blk * 64 + v0p + 2 * (lane % 4) + 8 * vb
         k.reg_cvt(rb16, _sl(frag, (r,), (1,)))  # O_intra → bf16
-        k.reg_load(_sl(sttile, (v0p,), (1,)), _sl(dst_s, (row, col), (1, 1)))  # o_inter
+        k.reg_cvt(_sl(sttile, (v0p,), (1,)), _sl(o_frag, (32 * blk + r,), (1,)))  # o_inter → bf16
         k.reg_add(_sl(sttile, (v0p,), (1,)), _sl(sttile, (v0p,), (1,)), rb16)
         if v0p == 1:
             _stm(k, dst_s, 8 * va + 16 * warp, blk * 64 + 8 * vb, sttile, lane, trans=False)
@@ -1162,30 +1171,34 @@ def _read128_delta(
 ):
     # delta[i,dv] = v[i,dv] - exp2(gcs[i])·KH[i,dv]; store deltaᵀ → tmpt_s[dv,i] (stmatrix.trans).
     # dexp[i] comes from the per-chunk dexp2 fragment (Wave-3 C1), not per-element exp2.
+    # Wave-3 C2: v is loaded as (v0p, v0p+1) PAIRS via a per-thread narrow-run
+    # wg.copy (was 2 point loads with full per-element address recompute).
     for blk, va, vb, v0p in _read128(k, acc, frag):
         r = v0p + 2 * va + 4 * vb
-        row = (lane // 4) + 8 * va + 16 * warp  # i
-        col = blk * 64 + v0p + 2 * (lane % 4) + 8 * vb  # dv
+        if v0p == 0:
+            row = (lane // 4) + 8 * va + 16 * warp  # i
+            col8 = blk * 64 + 2 * (lane % 4) + 8 * vb  # dv pair base
+            k.reg_load(_sl(sttile, (0,), (2,)), _sl(v_s, (row, col8), (1, 2)))  # v pair
         k.reg_mul(r1, _sl(dexp2, (va,), (1,)), _sl(frag, (r,), (1,)))  # dexp·KH (f32)
         k.reg_cvt(rb16b, r1)  # → bf16
-        k.reg_load(rb16, _sl(v_s, (row, col), (1, 1)))  # v (bf16)
-        k.reg_sub(_sl(sttile, (v0p,), (1,)), rb16, rb16b)  # delta = v - dexp·KH (bf16)
+        k.reg_sub(
+            _sl(sttile, (v0p,), (1,)), _sl(sttile, (v0p,), (1,)), rb16b
+        )  # delta = v - dexp·KH (bf16)
         if v0p == 1:
             _stm(k, tmpt_s, 8 * va + 16 * warp, blk * 64 + 8 * vb, sttile, lane, trans=True)
 
 
-def _read128_ointer(k, acc, out_s, gcs_s, scale, frag, r1, sttile, lane, warp, eh, dexp2):
-    # o_inter[i,dv] = exp2(gcs[i])·scale·QS[i,dv]; pre-stage into out_s (bf16) via stmatrix.
-    # dexp[i] comes from the per-chunk dexp2 fragment (Wave-3 C1), not per-element exp2.
+def _read128_ointer(k, acc, out_s, gcs_s, scale, frag, r1, sttile, lane, warp, eh, dexp2, o_frag):
+    # o_inter[i,dv] = exp2(gcs[i])·scale·QS[i,dv]; dexp[i] from the dexp2 fragment.
+    # Wave-3 C2: keep o_inter in the (chunk-top-dead) frag32 register fragment
+    # (o_frag) instead of staging through out_s SMEM — store_out then adds it
+    # register-side, eliminating the whole o_inter SMEM round trip (ointer's
+    # 32 _stm + store_out's 64 per-element loads per chunk).
     for blk, va, vb, v0p in _read128(k, acc, frag):
         r = v0p + 2 * va + 4 * vb
-        row = (lane // 4) + 8 * va + 16 * warp
-        col = blk * 64 + v0p + 2 * (lane % 4) + 8 * vb
         k.reg_mul(r1, _sl(dexp2, (va,), (1,)), _sl(frag, (r,), (1,)))
         k.reg_mul(r1, r1, float(scale))
-        k.reg_cvt(_sl(sttile, (v0p,), (1,)), r1)
-        if v0p == 1:
-            _stm(k, out_s, 8 * va + 16 * warp, blk * 64 + 8 * vb, sttile, lane, trans=False)
+        k.reg_store(_sl(o_frag, (32 * blk + r,), (1,)), r1)  # o_inter (f32) -> fragment
 
 
 def _read128_vnew(

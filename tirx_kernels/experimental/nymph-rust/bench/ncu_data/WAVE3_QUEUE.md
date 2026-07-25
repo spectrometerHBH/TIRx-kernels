@@ -71,3 +71,29 @@ Next cuts in order: (i) IR u32→bf16 reg reinterpret → v_s/o_inter ldmatrix
 (the last big per-element loops, ~200K); (ii) TIRx wg.copy/tile-view index
 quality (the +270K); (iii) (64,*) capped-wg store lowering; (iv) sync
 reduction (re-measure after i/ii).
+
+**Cut 2 (C2 fragment residency, 2026-07-25, kernel body + one codegen
+lowering) — DONE.** Changes: (a) o_inter now lives in the (chunk-top-dead)
+frag32 register fragment — `_read128_ointer` writes it register-side and
+`_read128_store_out` adds it register-side, eliminating the whole o_inter
+SMEM round trip (ointer's 32 _stm + store_out's 64 per-element loads per
+chunk); chunk-0 zero-init is one `reg_fill` on the fragment (was an out_s
+SMEM zero-fill); (b) delta's v reads load (v0p, v0p+1) PAIRS via the new
+per-thread narrow-run lowering (codegen `narrow_smem_run`: rank≥2 SMEM
+slice, leading dims size-1, trailing static width 2..=8 → raw per-thread
+element assigns sharing one swizzled row-base computation — the
+wg.collective tile form requires a TidInWg-leading 128-row tile, which an
+arithmetic per-thread row is not).
+A/B (t2048 total inst_executed): 5,526,944 → 5,131,131 (−7.16%), fi ratio
+2.79x → 2.59x. LOP3 −120K, IMAD −119K, LDS −69.5K, STSM −32K, F2FP −32K,
+LEA −28K, VIADD −14K, S2R −13K, LDL 13,088→5,952; F2F +65.5K (the
+register-side bf16 cvt path the SMEM round trip used to hide), PRMT +4K.
+SYNCS/NANOSLEEP barely moved (−10K/−5K) — confirms spin is downstream,
+not here. Bench fi/nymph (rounds=5, all 6, oracle-cos 1.0000): ns1_t64
+0.664, t512 0.261, t2048 0.209, ns20_t192 0.415, ns48_t64 0.666,
+v_70_130 0.330 (vs cut-1 0.684/0.257/0.206/0.439/0.665/0.294 — long-seq
+and varlen up, small-shape wobble within noise). Gates: cargo 164+15,
+pytest 481, GPU cosine ≥0.999 all 6 — all green.
+Next cuts in order (unchanged): (i) IR u32→bf16 reg reinterpret →
+v_s/o_inter ldmatrix; (ii) TIRx wg.copy/tile-view index quality;
+(iii) (64,*) capped-wg store lowering; (iv) sync reduction.
