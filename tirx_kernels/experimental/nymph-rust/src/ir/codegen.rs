@@ -6528,6 +6528,80 @@ mod tests {
         assert!(!src.contains("if tid_in_wg == 0:"), "{src}");
     }
 
+    /// The per-thread emission INVARIANT, pinned for the whole per-thread op
+    /// family: expect_tx / arrive_expect_tx / store_scalar / async-proxy fence
+    /// at warpgroup scope emit BARE (one application per executing lane,
+    /// matching the interpreter) — any guard codegen might synthesize would
+    /// undercount arrivals/tx bytes or drop lane-varying stores.
+    #[test]
+    fn per_thread_ops_emit_bare_at_warpgroup_scope() {
+        use super::super::dtype::{FenceKind, FenceScope, MBarKind};
+        use super::super::mbar::{MBar, MBarRef};
+        let mbar = Arc::new(MBar {
+            id: 4,
+            kind: MBarKind::Tma,
+            stages: 1,
+            arrive_count: None,
+            leader_routed: false,
+        });
+        let mref = || MBarRef {
+            mbar: mbar.clone(),
+            remote_coord: None,
+        };
+        let g = Arc::new(Tensor {
+            id: 0,
+            space: MemorySpace::Gmem,
+            dtype: DType::I32,
+            shape: vec![4],
+            layout: None,
+            byte_offset: None,
+            reg_frag: None,
+        });
+        let point = |v: i64| TensorSlice {
+            tensor: g.clone(),
+            offsets: vec![ScalarValue::Int(v)],
+            shape: vec![ScalarValue::Int(1)],
+        };
+        let src = kernel_to_tirx_source(&kernel(vec![
+            Stmt::MBarDef { mbar: mbar.clone() },
+            wg_if(
+                0,
+                vec![
+                    Stmt::MBarrierExpectTx {
+                        mbar: mref(),
+                        bytes: 64,
+                        stage: None,
+                    },
+                    Stmt::MBarrierArriveExpectTx {
+                        mbar: mref(),
+                        bytes: 64,
+                        stage: None,
+                    },
+                    Stmt::StoreScalar {
+                        dst: point(0),
+                        value: ScalarValue::Int(7),
+                    },
+                    Stmt::Fence {
+                        kind: FenceKind::AsyncProxy,
+                        scope: FenceScope::Cta,
+                    },
+                ],
+            ),
+        ]))
+        .unwrap();
+        for line in [
+            "T.ptx.mbarrier.expect_tx(smem_full.ptr_to([0]), 64)",
+            "T.ptx.mbarrier.arrive.expect_tx(smem_full.ptr_to([0]), 64)",
+            "T.ptx.fence.proxy_async(\"shared::cta\")",
+        ] {
+            assert!(src.contains(line), "{line} missing from {src}");
+        }
+        // no synthesized guard anywhere around them
+        assert!(!src.contains("if T.ptx.elect_sync():"), "{src}");
+        assert!(!src.contains("if tid_in_wg == 0:"), "{src}");
+        assert!(!src.contains("if T.cuda.thread_rank() == 0:"), "{src}");
+    }
+
     #[test]
     fn reg_transfer_forms_lowering() {
         let r1 = reg_tensor(10, DType::F32, 1);

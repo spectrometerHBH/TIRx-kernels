@@ -1739,6 +1739,111 @@ pub struct PyStmt(pub ir::Stmt);
 // its fields" structure tests, not the full dataclass introspection surface.
 #[pymethods]
 impl PyStmt {
+    /// The statement variant name (snake_case, e.g. "mbarrier_arrive",
+    /// "wg_sync", "reg_load") — the discriminator the IR-pass tooling
+    /// (tests/tools/smidiff.py) matches injection sites on.
+    #[getter]
+    fn kind(&self) -> &'static str {
+        match &self.0 {
+            ir::Stmt::TensorDef { .. } => "tensor_def",
+            ir::Stmt::MBarDef { .. } => "mbar_def",
+            ir::Stmt::TmemAlloc { .. } => "tmem_alloc",
+            ir::Stmt::TmemDealloc { .. } => "tmem_dealloc",
+            ir::Stmt::TmemRelinquish { .. } => "tmem_relinquish",
+            ir::Stmt::ScalarDef { .. } => "scalar_def",
+            ir::Stmt::ScalarStore { .. } => "scalar_store",
+            ir::Stmt::ScalarLet { .. } => "scalar_let",
+            ir::Stmt::StoreScalar { .. } => "store_scalar",
+            ir::Stmt::RegFill { .. } => "reg_fill",
+            ir::Stmt::RegLoad { .. } => "reg_load",
+            ir::Stmt::RegStore { .. } => "reg_store",
+            ir::Stmt::RegAdd { .. } => "reg_add",
+            ir::Stmt::RegSub { .. } => "reg_sub",
+            ir::Stmt::RegMul { .. } => "reg_mul",
+            ir::Stmt::RegFma { .. } => "reg_fma",
+            ir::Stmt::RegMax { .. } => "reg_max",
+            ir::Stmt::RegMin { .. } => "reg_min",
+            ir::Stmt::RegBitwise { .. } => "reg_bitwise",
+            ir::Stmt::RegReduce { .. } => "reg_reduce",
+            ir::Stmt::RegCondRescale { .. } => "reg_cond_rescale",
+            ir::Stmt::RegSoftmaxRescale { .. } => "reg_softmax_rescale",
+            ir::Stmt::RegCausalMask { .. } => "reg_causal_mask",
+            ir::Stmt::RegCombineIntFracEx2 { .. } => "reg_combine_int_frac_ex2",
+            ir::Stmt::RegCvt { .. } => "reg_cvt",
+            ir::Stmt::RegUnary { .. } => "reg_unary",
+            ir::Stmt::ShuffleSync { .. } => "shuffle_sync",
+            ir::Stmt::MBarrierInit { .. } => "mbarrier_init",
+            ir::Stmt::MBarrierArrive { .. } => "mbarrier_arrive",
+            ir::Stmt::MBarrierExpectTx { .. } => "mbarrier_expect_tx",
+            ir::Stmt::MBarrierArriveExpectTx { .. } => "mbarrier_arrive_expect_tx",
+            ir::Stmt::MBarrierWait { .. } => "mbarrier_wait",
+            ir::Stmt::TmaLoad { .. } => "tma_load",
+            ir::Stmt::TmaStore { .. } => "tma_store",
+            ir::Stmt::CpAsyncBulkS2Cluster { .. } => "cp_async_bulk_s2cluster",
+            ir::Stmt::CpAsyncBulkCommitGroup => "cp_async_bulk_commit_group",
+            ir::Stmt::CpAsyncBulkWaitGroupRead { .. } => "cp_async_bulk_wait_group_read",
+            ir::Stmt::GmemAtomicAdd { .. } => "gmem_atomic_add",
+            ir::Stmt::GmemWaitEq { .. } => "gmem_wait_eq",
+            ir::Stmt::Tcgen05Mma { .. } => "tcgen05_mma",
+            ir::Stmt::Tcgen05Cp { .. } => "tcgen05_cp",
+            ir::Stmt::Tcgen05Commit { .. } => "tcgen05_commit",
+            ir::Stmt::Tcgen05Ld { .. } => "tcgen05_ld",
+            ir::Stmt::Tcgen05St { .. } => "tcgen05_st",
+            ir::Stmt::Tcgen05WaitLd { .. } => "tcgen05_wait_ld",
+            ir::Stmt::Tcgen05WaitSt { .. } => "tcgen05_wait_st",
+            ir::Stmt::LdMatrix { .. } => "ld_matrix",
+            ir::Stmt::StMatrix { .. } => "st_matrix",
+            ir::Stmt::WarpMma { .. } => "warp_mma",
+            ir::Stmt::CtaSync => "cta_sync",
+            ir::Stmt::WgSync { .. } => "wg_sync",
+            ir::Stmt::WarpSync => "warp_sync",
+            ir::Stmt::NamedBarrier { .. } => "named_barrier",
+            ir::Stmt::ClusterSync => "cluster_sync",
+            ir::Stmt::ClusterBarrierArrive { .. } => "cluster_barrier_arrive",
+            ir::Stmt::ClusterBarrierWait => "cluster_barrier_wait",
+            ir::Stmt::Fence { .. } => "fence",
+            ir::Stmt::SetMaxNReg { .. } => "set_max_nreg",
+            ir::Stmt::If { .. } => "if",
+            ir::Stmt::ForLoop { .. } => "for_loop",
+            ir::Stmt::ForEachTask { .. } => "for_each_task",
+            ir::Stmt::Loop { .. } => "loop",
+            ir::Stmt::BreakIf { .. } => "break_if",
+            ir::Stmt::SchedulerImpl { .. } => "scheduler_impl",
+            ir::Stmt::SchedNext { .. } => "sched_next",
+            ir::Stmt::ClcTryCancel { .. } => "clc_try_cancel",
+            ir::Stmt::ClcQueryCancel { .. } => "clc_query_cancel",
+        }
+    }
+    /// The barrier id of a wg_sync / named_barrier statement.
+    #[getter]
+    fn barrier_id(&self) -> PyResult<u32> {
+        match &self.0 {
+            ir::Stmt::WgSync { barrier_id } | ir::Stmt::NamedBarrier { barrier_id, .. } => {
+                Ok((*barrier_id).into())
+            }
+            _ => Err(PyAttributeError::new_err("barrier_id")),
+        }
+    }
+    /// The mbar id of an mbarrier statement (init/arrive/expect_tx/wait).
+    #[getter]
+    fn mbar_id(&self) -> PyResult<u32> {
+        match &self.0 {
+            ir::Stmt::MBarrierInit { mbar, .. }
+            | ir::Stmt::MBarrierArrive { mbar, .. }
+            | ir::Stmt::MBarrierExpectTx { mbar, .. }
+            | ir::Stmt::MBarrierArriveExpectTx { mbar, .. }
+            | ir::Stmt::MBarrierWait { mbar, .. } => Ok(mbar.mbar.id),
+            _ => Err(PyAttributeError::new_err("mbar_id")),
+        }
+    }
+    /// The tensor of a tensor_def statement.
+    #[getter]
+    fn tensor(&self) -> PyResult<PyTensor> {
+        match &self.0 {
+            ir::Stmt::TensorDef { tensor } => Ok(PyTensor(tensor.clone())),
+            _ => Err(PyAttributeError::new_err("tensor")),
+        }
+    }
     #[getter]
     fn m(&self) -> PyResult<u32> {
         match &self.0 {
@@ -1853,6 +1958,13 @@ impl PyStmt {
         match &self.0 {
             ir::Stmt::ForLoop { step, .. } => scalar_to_py(py, step),
             _ => Err(PyAttributeError::new_err("step")),
+        }
+    }
+    #[getter]
+    fn unroll(&self) -> PyResult<bool> {
+        match &self.0 {
+            ir::Stmt::ForLoop { unroll, .. } => Ok(*unroll),
+            _ => Err(PyAttributeError::new_err("unroll")),
         }
     }
     #[getter]
@@ -2788,6 +2900,10 @@ impl PyKernel {
     #[getter]
     fn cluster_shape(&self) -> Vec<usize> {
         self.0.cluster_shape.clone()
+    }
+    #[getter]
+    fn smem_pool(&self) -> bool {
+        self.0.smem_pool
     }
     fn launch_cta_count(&self) -> usize {
         self.0.launch_cta_count()

@@ -178,3 +178,40 @@ tests/test_compile_gate.py `test_single_issue_scope_negative`.
   pads the varlen out buffer with NaN by contract ("padding content is
   irrelevant; the kernel masks OOB"); cropping to the 200 packed rows
   gives 0.99999/1.00000. No kernel bug.
+
+### Wave-2 hardening landed: intermediate sim⇄GPU diff harness
+
+`tests/tools/smidiff.py` + `tests/gpu/test_gpu_sim_diff.py` productize the
+/tmp/gdn_debug.py + /tmp/probe_merge.py discovery flow as the standard
+bring-up equipment:
+
+- INJECTION is an optional IR pass over a BUILT kernel (no kernel-body
+  edits): per DumpSpec it appends one GMEM dump arg and inserts per-thread
+  point-store dump blocks at structural sites (after/before a predicate on
+  statement kind + fields — e.g. `arrive_on(f_kk_id)`), with a chunk slot
+  from the enclosing for_loop var and an optional task dimension from the
+  enclosing for_each_task var (`task_mod` — REQUIRED for persistent
+  launches; without it, all (seq, eh) tasks race onto the same dump slots —
+  measured: bogus 0.89 "divergence" on m_s).
+- The SAME instrumented kernel runs through `nr.interpret` (the reference)
+  and the tirx GPU codegen; dumps are diffed point-wise, first divergence
+  reported as (cell, sim, gpu). Default tolerance bit-exact; calibrated
+  per-tensor tolerances in the shell.
+- gdn shell (ns1_t64 + v_70_130): m_s / attn / A_inv(post-fold) dumps —
+  sim⇄GPU max_abs 1.1e-06 / 1.2e-04 / 9.5e-07, tolerances pinned at
+  1e-4 / 3e-3 / 1e-4. Sites: after f_kk / after f_qk arrives, and BEFORE
+  the ainv_ready arrive (ainv_s aliases vnewt_s — after the release the
+  region may already hold NV staging: a real race in BOTH backends, found
+  by this harness on its first run).
+- New IR-introspection surface for the pass (py.rs): PyStmt.kind /
+  barrier_id / mbar_id / tensor / unroll, PyKernel.cluster_shape /
+  smem_pool.
+
+### Emission invariants — status after zero-inference
+
+| Invariant | Status | Coverage |
+| --- | --- | --- |
+| mbarrier arrive count == arriving lanes | STRUCTURAL: arrive emits per-thread, no guard can be synthesized (zero-inference); count-vs-lanes consistency is a value property enforced by the interpreter's mbarrier accounting + the protocol checker's phase completion in every sim test | codegen test `mbarrier_arrive_emits_bare_per_thread` |
+| per-thread ops (expect_tx / arrive_expect_tx / store_scalar / async-proxy fence) emit per-lane | STRUCTURAL (same reasoning) | codegen test `per_thread_ops_emit_bare_at_warpgroup_scope` |
+| hardware single-issue ops only under explicit single-lane branch | validator `single_issue_scope` + codegen `emit_single_issue` hard error | validate.rs `single_issue_scope_rule`, compile-gate `test_single_issue_scope_negative`, interpreter mask tests now assert build-time rejection |
+| single-lane proof holds through And-chains with runtime operands | `proves_single_lane_per_warp` (intersection only narrows) | thread_filter.rs `single_lane_proof_through_and_chains` |
