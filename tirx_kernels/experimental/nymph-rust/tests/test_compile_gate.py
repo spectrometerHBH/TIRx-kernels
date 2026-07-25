@@ -11,6 +11,7 @@ import importlib.util
 import nymph_rs as nr
 import pytest
 from nymph_rs.kernels import build_bootstrap_gemm, build_fp16_bf16_gemm, build_nvfp4_gemm
+from nymph_rs.kernels.gdn_prefill import GdnPrefillConfig, build_gdn_prefill
 
 tvm = pytest.importorskip("tvm", reason="tvm not importable in this environment")
 
@@ -20,6 +21,7 @@ BUILDERS = {
     "bootstrap_gemm": build_bootstrap_gemm,
     "fp16_bf16_gemm": build_fp16_bf16_gemm,
     "nvfp4_gemm": build_nvfp4_gemm,
+    "gdn_prefill": lambda: build_gdn_prefill(GdnPrefillConfig(num_seqs=1, seqlen=128)),
 }
 
 

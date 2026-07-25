@@ -61,7 +61,7 @@ from tvm.ir.type import PointerType, PrimType
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.layout import ComposeLayout, R, S, TCol, TileLayout, TLane
-from tvm.tirx.layout import tcgen05_atom_layout
+from tvm.tirx.layout import tcgen05_atom_layout, tmem_datapath_layout
 from tvm.tirx.layout import tid_in_wg as axis_tid_in_wg
 ";
 
@@ -362,6 +362,17 @@ struct Ctx {
     /// the same allocated band as the f32 view (dense-packed convention, the
     /// TIRx 16-bit `.32x32b` datapath).
     tmem_16_views: Vec<DType>,
+    /// An M=64 `Tcgen05Mma` exists (gdn's BT=64 accumulators): the dst
+    /// accumulator is the M=64 non-ws datapath F (64 rows scattered
+    /// 16-per-warp), so a `tmem_f` decl_buffer with
+    /// `tmem_datapath_layout("F", 64, cols)` joins the f32 view.
+    needs_tmem_f: bool,
+    /// SMEM tensors partially sliced by a TMA load/store (a slice extent
+    /// strictly inside the tensor extent — e.g. gdn's row-half K double
+    /// buffer). A swizzle atom tiles the FULL row band, so the partial slice
+    /// breaks the tma_auto shared-chain stride rule; these take swizzle
+    /// mode 0 (a plain 16B-atom tile the chain slices cleanly).
+    tma_partial_smem: std::collections::HashSet<u32>,
     /// mbar ids of the TMA-load completion barriers (`smem_full`, `sf_full`, ...)
     /// flagged `leader_routed` by the IR. In cluster mode the canonical pattern
     /// routes BOTH CTAs' TMA completions to the LEADER CTA's barrier (a
@@ -620,6 +631,13 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
             Some(Layout::Swizzle(sw)) => swizzle_mode(sw.swizzle).min(row_mode),
             _ => row_mode,
         };
+        // A partially-TMA-sliced buffer breaks the swizzle chain (see
+        // `tma_partial_smem`) — fall to the no-swizzle 16B atom.
+        let mode = if ctx.tma_partial_smem.contains(&t.id) {
+            0
+        } else {
+            mode
+        };
         out.push_str(&format!(
             "{name}_layout = mma_shared_layout(\"{dt}\", {mode}, ({shape_tuple}))\n",
             name = name,
@@ -703,10 +721,18 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
             "codegen: cluster_shape dims must be positive (got [{cx}, {cy}])"
         ));
     }
-    out.push_str(&format!(
-        "{p}cbx, cby = T.cta_id_in_cluster([{cx}, {cy}], preferred=[{cx}, {cy}])\n",
-        p = pad(ind)
-    ));
+    if cx == 1 && cy == 1 {
+        // A cluster-1 kernel (gdn): a (1, 1) `cta_id_in_cluster` bind collapses
+        // to a constant and the scope resolver cannot find `clusterCtaIdx.x`
+        // downstream — emit the constants directly (semantically exact for a
+        // single-CTA cluster).
+        out.push_str(&format!("{p}cbx, cby = 0, 0\n", p = pad(ind)));
+    } else {
+        out.push_str(&format!(
+            "{p}cbx, cby = T.cta_id_in_cluster([{cx}, {cy}], preferred=[{cx}, {cy}])\n",
+            p = pad(ind)
+        ));
+    }
     // The kernel→cta axis extent is the TOTAL launched CTA count, NOT the cluster
     // group size. The persistent grid launches `num_clusters * cta_group` CTAs; a
     // hardcoded `[2]` declares only 2 CTAs, so a multi-cluster launch (e.g. 4 CTAs)
@@ -996,6 +1022,14 @@ fn emit_tmem_view_decls(out: &mut Emitter, ind: usize, ctx: &Ctx) {
         p = pad(ind),
         wg_threads = WG_THREADS,
     ));
+    // The M=64 datapath-F accumulator view (gdn's BT=64 GEMM dsts): 64
+    // logical rows scattered 16-per-warp over the 128 lanes.
+    if ctx.needs_tmem_f {
+        out.push_str(&format!(
+            "{p}tmem_f = T.decl_buffer((64, {cols}), \"float32\", scope=\"tmem\", allocated_addr=0, layout=tmem_datapath_layout(\"F\", 64, {cols}))\n",
+            p = pad(ind),
+        ));
+    }
     // 16-bit packed-half views over the same band (dense: two elements per
     // 32-bit cell) for the tcgen05.st fp16/bf16 datapath — the TIRx
     // `.32x32b` local2tmem path requires the TMEM buffer dtype to equal the
@@ -1876,6 +1910,55 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
     let mut tmem_16_views: Vec<DType> = Vec::new();
     collect_reg_aux_views(&k.body, &mut reg_aux_views, &mut tmem_16_views)?;
 
+    // An M=64 tcgen05 MMA needs the datapath-F accumulator view.
+    let mut needs_tmem_f = false;
+    fn find_m64_mma(stmts: &[Stmt], out: &mut bool) {
+        for s in stmts {
+            if let Stmt::Tcgen05Mma { m, .. } = s {
+                if *m == 64 {
+                    *out = true;
+                }
+            }
+            for body in s.child_bodies() {
+                find_m64_mma(body, out);
+            }
+        }
+    }
+    find_m64_mma(&k.body, &mut needs_tmem_f);
+
+    // SMEM tensors partially sliced by TMA (see `tma_partial_smem`).
+    let mut tma_partial_smem: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    fn find_tma_partial(stmts: &[Stmt], out: &mut std::collections::HashSet<u32>) {
+        fn note_slice(s: &TensorSlice, out: &mut std::collections::HashSet<u32>) {
+            if s.tensor.space != MemorySpace::Smem || s.shape.len() != s.tensor.shape.len() {
+                return;
+            }
+            // A leading stage-dim slice (extent 1) collapses to an outer index
+            // and leaves the tiled (M, K) box whole — only a partial slice of a
+            // TILED dim (extent > 1, strictly inside the tensor) breaks the
+            // shared-chain stride rule.
+            let partial = s
+                .shape
+                .iter()
+                .zip(s.tensor.shape.iter())
+                .any(|(e, full)| as_int(e).is_some_and(|e| e > 1 && (e as usize) < *full));
+            if partial {
+                out.insert(s.tensor.id);
+            }
+        }
+        for s in stmts {
+            match s {
+                Stmt::TmaLoad { dst, .. } => note_slice(dst, out),
+                Stmt::TmaStore { src, .. } => note_slice(src, out),
+                _ => {}
+            }
+            for body in s.child_bodies() {
+                find_tma_partial(body, out);
+            }
+        }
+    }
+    find_tma_partial(&k.body, &mut tma_partial_smem);
+
     // Scalar var names. Every `ScalarDef` introduces an SSA register var
     // (`NAME: T.int32 = init`, read as `NAME`). Var ids are globally unique, so
     // a per-id name (`s{id}`) is stable and collision-free.
@@ -1922,6 +2005,8 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
         reg_widths,
         reg_aux_views,
         tmem_16_views,
+        needs_tmem_f,
+        tma_partial_smem,
         tma_leader_mbars,
         num_clusters: (k.launch_cta_count() / (cta_group as usize).max(1)).max(1),
         sf_views,
@@ -1993,11 +2078,44 @@ fn collect_reg_aux_views(
                     v.flat_u32 = true;
                 }
             }
-            Stmt::RegUnary { dst, src, op } if *op == RegUnaryOp::Log2 => {
+            // Every elementwise-touched tensor may need the flat view: the
+            // `Tx.wg.*` elementwise dispatches require the full launch intra
+            // (whole warpgroup), so an op under a narrowed warp/lane branch
+            // lowers to the per-thread scalar form on the flat views instead
+            // (the emit side picks per site via `wg_elem_ok`).
+            Stmt::RegFill { dst, value } => {
                 views.entry(dst.tensor.id).or_default().flat = true;
-                if let RegOperand::Slice(src) = src {
-                    views.entry(src.tensor.id).or_default().flat = true;
+                if let RegOperand::Slice(s) = value {
+                    views.entry(s.tensor.id).or_default().flat = true;
                 }
+            }
+            Stmt::RegAdd { dst, lhs, rhs, .. }
+            | Stmt::RegSub { dst, lhs, rhs, .. }
+            | Stmt::RegMul { dst, lhs, rhs } => {
+                views.entry(dst.tensor.id).or_default().flat = true;
+                for op in [lhs, rhs] {
+                    if let RegOperand::Slice(s) = op {
+                        views.entry(s.tensor.id).or_default().flat = true;
+                    }
+                }
+            }
+            Stmt::RegFma { dst, a, b, c } => {
+                views.entry(dst.tensor.id).or_default().flat = true;
+                for op in [a, b, c] {
+                    if let RegOperand::Slice(s) = op {
+                        views.entry(s.tensor.id).or_default().flat = true;
+                    }
+                }
+            }
+            Stmt::RegUnary { dst, src, .. } => {
+                views.entry(dst.tensor.id).or_default().flat = true;
+                if let RegOperand::Slice(s) = src {
+                    views.entry(s.tensor.id).or_default().flat = true;
+                }
+            }
+            Stmt::RegCvt { dst, src, .. } => {
+                views.entry(dst.tensor.id).or_default().flat = true;
+                views.entry(src.tensor.id).or_default().flat = true;
             }
             // Per-thread point transfers lower to raw element assignments on
             // the flat view (see the RegLoad/RegStore arms).
@@ -2269,6 +2387,95 @@ fn emit_wg_reg_operand(
     }
 }
 
+/// True when the enclosing scope provably covers a whole warpgroup: the
+/// `Tx.wg.*` elementwise dispatches require the full launch intra (all 32
+/// lanes of all four warps), so anything narrower (a lone warp, a
+/// lane/warp-predicated branch) must take the per-thread scalar form.
+fn wg_elem_ok(scope: &ScopeInfo) -> bool {
+    scope
+        .set
+        .as_ref()
+        .is_some_and(|s| s.is_full_cta() || s.is_exactly_one_full_warpgroup().is_some())
+}
+
+/// One element's index into a flat view: `off + _i` (simplified for a base-0
+/// slice or a constant read).
+fn flat_elem_idx(off: &ScalarValue, i: &str, ctx: &Ctx) -> Result<String, String> {
+    Ok(match (as_int(off), i) {
+        (Some(0), _) => i.to_string(),
+        (Some(b), "0") => b.to_string(),
+        (Some(b), _) => format!("{b} + {i}"),
+        (None, "0") => emit_scalar(off, ctx)?,
+        (None, _) => format!("{} + {i}", emit_scalar(off, ctx)?),
+    })
+}
+
+/// The per-thread scalar form of a reg elementwise op:
+/// `for _i in range(w): <dst>_flat[d] = <expr>`. With `convert`, a 16-bit dst
+/// follows the interpreter's f32-compute-then-round: operands upcast to f32,
+/// the result cast back at the write (literals are rounded to the dst dtype
+/// FIRST, exactly `literal_array`). Slice operands of width 1 read their base
+/// element (the one-element-per-thread broadcast).
+fn emit_scalar_elem(
+    out: &mut Emitter,
+    p: &str,
+    ctx: &Ctx,
+    dst: &TensorSlice,
+    operands: &[&RegOperand],
+    convert: bool,
+    expr: impl Fn(&[&str]) -> String,
+) -> Result<(), String> {
+    let (dt, doff, w) = reg_slice_parts(dst)?;
+    let dflat = flat_name(dt, ctx)?;
+    let convert = convert && matches!(dt.dtype, DType::F16 | DType::Bf16);
+    let mut elems: Vec<String> = Vec::with_capacity(operands.len());
+    for op in operands {
+        elems.push(match op {
+            RegOperand::Literal(l) => {
+                let t = typed_scalar(dt.dtype, *l)?;
+                if convert {
+                    format!("T.float32({t})")
+                } else {
+                    t
+                }
+            }
+            RegOperand::Slice(s) => {
+                let (t, off, sw) = reg_slice_parts(s)?;
+                if t.dtype != dt.dtype {
+                    return Err(format!(
+                        "codegen: reg operand dtype {:?} != dst dtype {:?} — \
+                         the interpreter coerces operands per-op; use an explicit RegCvt",
+                        t.dtype, dt.dtype
+                    ));
+                }
+                if sw != 1 && sw != w {
+                    return Err(format!(
+                        "codegen: reg operand width {sw} must be 1 or the dst width {w} \
+                         (the interpreter matches the dst or broadcasts one element per thread)"
+                    ));
+                }
+                let idx = flat_elem_idx(off, if sw == 1 { "0" } else { "_i" }, ctx)?;
+                let e = format!("{}[{idx}]", flat_name(t, ctx)?);
+                if convert {
+                    format!("T.float32({e})")
+                } else {
+                    e
+                }
+            }
+        });
+    }
+    let body = expr(&elems.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+    let body = if convert {
+        format!("T.{}({body})", dtype_str(dt.dtype))
+    } else {
+        body
+    };
+    let d_idx = flat_elem_idx(doff, "_i", ctx)?;
+    out.push_str(&format!("{p}for _i in range({w}):\n"));
+    out.push_str(&format!("{p}    {dflat}[{d_idx}] = {body}\n"));
+    Ok(())
+}
+
 /// The `{name}_flat` raw per-thread storage name for a REG tensor declared
 /// with auxiliary views (see `RegAuxViews`).
 fn flat_name(t: &Arc<Tensor>, ctx: &Ctx) -> Result<String, String> {
@@ -2319,8 +2526,11 @@ fn check_matrix_smem_row(s: &TensorSlice, label: &str) -> Result<(), String> {
 }
 
 /// Shared lowering for `RegAdd`/`RegSub`: `Tx.wg.{op}(dst, lhs, rhs)` over the
-/// wg views. `rounding=rm` (the interpreter's post-op floor) has no TIRx
-/// elementwise form — fail closed rather than silently skip the floor.
+/// wg views when the scope is provably warpgroup-full, else the per-thread
+/// scalar form (the elementwise dispatches reject a narrowed intra; the
+/// scalar form IS the interpreter's per-thread semantics).
+/// `rounding=rm` (the interpreter's post-op floor) has no TIRx elementwise
+/// form — fail closed rather than silently skip the floor.
 #[allow(clippy::too_many_arguments)]
 fn emit_reg_binary(
     out: &mut Emitter,
@@ -2331,6 +2541,7 @@ fn emit_reg_binary(
     rounding: Rounding,
     op: &str,
     ctx: &Ctx,
+    scope: &ScopeInfo,
 ) -> Result<(), String> {
     if rounding != Rounding::Rn {
         return Err(format!(
@@ -2345,11 +2556,18 @@ fn emit_reg_binary(
             t.dtype
         ));
     }
-    let dst_s = emit_reg_view_slice(out, p, t, off, w, ctx)?;
-    let lhs_s = emit_wg_reg_operand(lhs, t.dtype, out, p, ctx)?;
-    let rhs_s = emit_wg_reg_operand(rhs, t.dtype, out, p, ctx)?;
-    out.push_str(&format!("{p}Tx.wg.{op}({dst_s}, {lhs_s}, {rhs_s})\n"));
-    Ok(())
+    if wg_elem_ok(scope) {
+        let dst_s = emit_reg_view_slice(out, p, t, off, w, ctx)?;
+        let lhs_s = emit_wg_reg_operand(lhs, t.dtype, out, p, ctx)?;
+        let rhs_s = emit_wg_reg_operand(rhs, t.dtype, out, p, ctx)?;
+        out.push_str(&format!("{p}Tx.wg.{op}({dst_s}, {lhs_s}, {rhs_s})\n"));
+        Ok(())
+    } else {
+        let sym = if op == "add" { "+" } else { "-" };
+        emit_scalar_elem(out, p, ctx, dst, &[lhs, rhs], true, |e| {
+            format!("{} {sym} {}", e[0], e[1])
+        })
+    }
 }
 
 /// Per-thread register count (in dtype ELEMENTS) of one tcgen05 ld/st atom
@@ -2923,10 +3141,14 @@ fn emit_scalar_load(s: &TensorSlice, ctx: &Ctx) -> Result<String, String> {
 /// The MMA accumulator dst: an absolute column slice of the single `tmem`
 /// view — `tmem[:, col:col+n]`. The accumulator is lane-anchored at row 0, so
 /// the lane axis spans all 128 lanes; the column band is the operand's
-/// absolute physical base plus the MMA's n.
-fn emit_tmem_dst(op: &TmemOperand, n: u32, ctx: &Ctx) -> Result<String, String> {
+/// absolute physical base plus the MMA's n. An M=64 accumulator (gdn's BT=64
+/// GEMMs) is the non-ws datapath F — the `tmem_f` view's scattered-row layout.
+fn emit_tmem_dst(op: &TmemOperand, n: u32, m: u32, ctx: &Ctx) -> Result<String, String> {
     let col_s = emit_scalar(&op.col, ctx)?;
     let hi = add_bound(&op.col, &ScalarValue::Int(i64::from(n)), ctx)?;
+    if m == 64 {
+        return Ok(format!("tmem_f[:, {col_s}:{hi}]"));
+    }
     Ok(format!("tmem[:, {col_s}:{hi}]"))
 }
 
@@ -3844,6 +4066,26 @@ fn emit_stmt(
                         .to_string(),
                 );
             }
+            // PTX + the TIRx tcgen05 schedule: the B operand comes from SMEM
+            // ONLY (A may be TMEM or SMEM). A TMEM B (the GDN S^T/delta/NV
+            // readback bands) is unrealizable — the kernel must stage those
+            // tiles through SMEM instead (fail closed, never silently reroute).
+            if matches!(b, MmaOperand::Tmem(_)) {
+                return Err(
+                    "codegen: Tcgen05Mma with a TMEM B operand has no lowering \
+                     (tcgen05.mma reads B from SMEM only; stage the tile through SMEM)"
+                        .to_string(),
+                );
+            }
+            // The accumulator views are row-0 anchored (the m=64 datapath-F
+            // scatter and the m=128 full datapath both base at lane 0); a
+            // nonzero dst lane base would write different cells than emitted.
+            if as_int(&dst.row) != Some(0) {
+                return Err(
+                    "codegen: Tcgen05Mma dst row must be a static 0 (the TMEM views base at lane 0)"
+                        .to_string(),
+                );
+            }
             if *lane_align != 0 {
                 return Err(
                     "codegen: Tcgen05Mma lane_align != 0 (m=64 Layout F) not supported".to_string(),
@@ -3880,7 +4122,7 @@ fn emit_stmt(
                     return Err("codegen: Tcgen05Mma sfa/sfb must be set together".to_string());
                 }
             }
-            let dst_s = emit_tmem_dst(dst, *n, ctx)?;
+            let dst_s = emit_tmem_dst(dst, *n, *m, ctx)?;
             // The A/B operands are staged SMEM tiles: drop the leading ring index so
             // the operand is the 2D `(M, K)` / `(N, K)` MMA tile (canonical
             // `Asmem[stage, warp_id]` / `Bsmem[stage]`). A TMEM operand (the GDN
@@ -4228,6 +4470,32 @@ fn emit_stmt(
             // must touch both sides (and validate) at once.
             rounding: _,
         } => {
+            if !wg_elem_ok(scope) {
+                // Per-thread scalar cast (the interpreter's per-thread
+                // convert): `dst_flat[i] = T.<dst dtype>(src_flat[i])`. The
+                // dtype conversion IS the op here (unlike the elementwise
+                // arithmetic ops, which require a shared dtype).
+                let (dt, doff, w) = reg_slice_parts(dst)?;
+                let (st, soff, sw) = reg_slice_parts(src)?;
+                if sw != 1 && sw != w {
+                    return Err(format!(
+                        "codegen: RegCvt src width {sw} must be 1 or the dst width {w} \
+                         (the interpreter matches the dst or broadcasts one element per thread)"
+                    ));
+                }
+                let dflat = flat_name(dt, ctx)?;
+                let sflat = flat_name(st, ctx)?;
+                let d_idx = flat_elem_idx(doff, "_i", ctx)?;
+                let s_idx = flat_elem_idx(soff, if sw == 1 { "0" } else { "_i" }, ctx)?;
+                let body = if dt.dtype == st.dtype {
+                    format!("{sflat}[{s_idx}]")
+                } else {
+                    format!("T.{}({sflat}[{s_idx}])", dtype_str(dt.dtype))
+                };
+                out.push_str(&format!("{p}for _i in range({w}):\n"));
+                out.push_str(&format!("{p}    {dflat}[{d_idx}] = {body}\n"));
+                return Ok(());
+            }
             // Cast a band of the f32 read fragment to the matching band of the wide
             // output reg. Both bands are sliced by their (offset, width) so a capped
             // (≤128-col) drain group writes the right slice of the 256-wide output reg.
@@ -4285,7 +4553,9 @@ fn emit_stmt(
         }
         RegStore { dst, src } => {
             // REG -> REG per-thread copy (gdn's m16 A-broadcast): the
-            // interpreter copies values elementwise; emit the wg-view copy.
+            // interpreter copies values elementwise. A `Tx.wg.copy` on the wg
+            // views falls to the scalar copy fallback, whose raw thread-axis
+            // BufferLoad LowerTIRxCleanup rejects — emit the flat scalar form.
             if dst.tensor.space == MemorySpace::Reg {
                 if src.tensor.space != MemorySpace::Reg {
                     return Err(format!(
@@ -4293,8 +4563,8 @@ fn emit_stmt(
                         src.tensor.space
                     ));
                 }
-                let (dt, doff, dw) = reg_slice_parts(dst)?;
-                let (st, soff, sw) = reg_slice_parts(src)?;
+                let (dt, _, _) = reg_slice_parts(dst)?;
+                let (st, _, _) = reg_slice_parts(src)?;
                 if st.dtype != dt.dtype {
                     return Err(format!(
                         "codegen: RegStore REG->REG src dtype {:?} != dst dtype {:?} — \
@@ -4302,17 +4572,8 @@ fn emit_stmt(
                         st.dtype, dt.dtype
                     ));
                 }
-                if sw != dw && sw != 1 {
-                    return Err(format!(
-                        "codegen: RegStore REG->REG src width {sw} must be 1 or the dst \
-                         width {dw} (the interpreter matches the dst or broadcasts one \
-                         element per thread)"
-                    ));
-                }
-                let dst_s = emit_reg_view_slice(out, &p, dt, doff, dw, ctx)?;
-                let src_s = emit_reg_view_slice(out, &p, st, soff, sw, ctx)?;
-                out.push_str(&format!("{p}Tx.wg.copy({dst_s}, {src_s})\n"));
-                return Ok(());
+                let s_op = RegOperand::Slice(src.clone());
+                return emit_scalar_elem(out, &p, ctx, dst, &[&s_op], false, |e| e[0].to_string());
             }
             // Per-thread point store (every dim size-1, e.g. gdn's
             // `m_s[row, col] = r1` epilogue cells): a raw element assignment on
@@ -4708,8 +4969,22 @@ fn emit_stmt(
         }
 
         // NVFP4 epilogue alpha rescale: Tx.wg.mul(frag, frag, alpha). lhs is a reg slice,
-        // rhs the alpha literal (or vice versa).
+        // rhs the alpha literal (or vice versa). Under a narrowed branch (the
+        // gdn predicated epilogues) the wg dispatch rejects the intra — fall
+        // to the per-thread scalar form.
         RegMul { dst, lhs, rhs } => {
+            if !wg_elem_ok(scope) {
+                let (t, _, _) = reg_slice_parts(dst)?;
+                if !matches!(t.dtype, DType::F16 | DType::Bf16 | DType::F32) {
+                    return Err(format!(
+                        "codegen: RegMul dst dtype {:?} has no lowering (float dsts only)",
+                        t.dtype
+                    ));
+                }
+                return emit_scalar_elem(out, &p, ctx, dst, &[lhs, rhs], true, |e| {
+                    format!("{} * {}", e[0], e[1])
+                });
+            }
             let zero = ScalarValue::Int(0);
             let reg_op = |op: &RegOperand, out: &mut Emitter| -> Result<String, String> {
                 match op {
@@ -4855,7 +5130,7 @@ fn emit_stmt(
             let col_s = emit_scalar(&src.offsets[1], ctx)?;
             let src_name = ctx.tensor_name(src.tensor.id)?;
             out.push_str(&format!(
-                "{p}T.ptx.ldmatrix({}, {num}, \"b16\", {src_name}.ptr_to([{row_s}, {col_s}]), {handles})\n",
+                "{p}T.ptx.ldmatrix({}, {num}, \".b16\", {src_name}.ptr_to([{row_s}, {col_s}]), {handles})\n",
                 py_bool(*trans),
             ));
             Ok(())
@@ -4933,56 +5208,61 @@ fn emit_stmt(
             let col_s = emit_scalar(&dst.offsets[1], ctx)?;
             let dst_name = ctx.tensor_name(dst.tensor.id)?;
             out.push_str(&format!(
-                "{p}T.ptx.stmatrix({}, {num}, \"b16\", {dst_name}.ptr_to([{row_s}, {col_s}]), {handles})\n",
+                "{p}T.ptx.stmatrix({}, {num}, \".b16\", {dst_name}.ptr_to([{row_s}, {col_s}]), {handles})\n",
                 py_bool(*trans),
             ));
             Ok(())
         }
-        // Per-thread elementwise fill. Literal: `Tx.wg.fill` with a dst-typed
-        // scalar (the interpreter's literal_array). Slice: a wg-copy (the
-        // interpreter broadcasts a one-element-per-thread src, which the
-        // copy's broadcast rules honor — validate the two legal widths).
+        // Per-thread elementwise fill. Literal: dst-typed scalar (the
+        // interpreter's literal_array). Slice: elementwise copy (the
+        // interpreter broadcasts a one-element-per-thread src — validate the
+        // two legal widths). `Tx.wg.*` when the scope is provably
+        // warpgroup-full, else the per-thread scalar form.
         RegFill { dst, value } => {
-            let (t, off, w) = reg_slice_parts(dst)?;
-            let dst_s = emit_reg_view_slice(out, &p, t, off, w, ctx)?;
-            match value {
-                RegOperand::Literal(l) => {
-                    let v = typed_scalar(t.dtype, *l)?;
-                    out.push_str(&format!("{p}Tx.wg.fill({dst_s}, {v})\n"));
-                }
-                RegOperand::Slice(src) => {
-                    let (st, soff, sw) = reg_slice_parts(src)?;
-                    if st.dtype != t.dtype {
-                        return Err(format!(
-                            "codegen: RegFill src dtype {:?} != dst dtype {:?} — \
-                             the interpreter coerces per-op; use an explicit RegCvt",
-                            st.dtype, t.dtype
-                        ));
+            if wg_elem_ok(scope) {
+                let (t, off, w) = reg_slice_parts(dst)?;
+                let dst_s = emit_reg_view_slice(out, &p, t, off, w, ctx)?;
+                match value {
+                    RegOperand::Literal(l) => {
+                        let v = typed_scalar(t.dtype, *l)?;
+                        out.push_str(&format!("{p}Tx.wg.fill({dst_s}, {v})\n"));
                     }
-                    if sw != 1 && sw != w {
-                        return Err(format!(
-                            "codegen: RegFill src width {sw} must be 1 or the dst width {w} \
-                             (the interpreter matches the dst or broadcasts one element per thread)"
-                        ));
+                    RegOperand::Slice(src) => {
+                        let (st, soff, sw) = reg_slice_parts(src)?;
+                        if st.dtype != t.dtype {
+                            return Err(format!(
+                                "codegen: RegFill src dtype {:?} != dst dtype {:?} — \
+                                 the interpreter coerces per-op; use an explicit RegCvt",
+                                st.dtype, t.dtype
+                            ));
+                        }
+                        if sw != 1 && sw != w {
+                            return Err(format!(
+                                "codegen: RegFill src width {sw} must be 1 or the dst width {w} \
+                                 (the interpreter matches the dst or broadcasts one element per thread)"
+                            ));
+                        }
+                        let src_s = emit_reg_view_slice(out, &p, st, soff, sw, ctx)?;
+                        out.push_str(&format!("{p}Tx.wg.copy({dst_s}, {src_s})\n"));
                     }
-                    let src_s = emit_reg_view_slice(out, &p, st, soff, sw, ctx)?;
-                    out.push_str(&format!("{p}Tx.wg.copy({dst_s}, {src_s})\n"));
                 }
+                Ok(())
+            } else {
+                emit_scalar_elem(out, &p, ctx, dst, &[value], false, |e| e[0].to_string())
             }
-            Ok(())
         }
         RegAdd {
             dst,
             lhs,
             rhs,
             rounding,
-        } => emit_reg_binary(out, &p, dst, lhs, rhs, *rounding, "add", ctx),
+        } => emit_reg_binary(out, &p, dst, lhs, rhs, *rounding, "add", ctx, scope),
         RegSub {
             dst,
             lhs,
             rhs,
             rounding,
-        } => emit_reg_binary(out, &p, dst, lhs, rhs, *rounding, "sub", ctx),
+        } => emit_reg_binary(out, &p, dst, lhs, rhs, *rounding, "sub", ctx, scope),
         // dst = a * b + c elementwise (the interpreter's unfused f32 mul+add;
         // the TIRx fma may fuse — a 1-ulp difference the GPU gates tolerate).
         RegFma { dst, a, b, c } => {
@@ -4993,19 +5273,26 @@ fn emit_stmt(
                     t.dtype
                 ));
             }
-            let dst_s = emit_reg_view_slice(out, &p, t, off, w, ctx)?;
-            let a_s = emit_wg_reg_operand(a, t.dtype, out, &p, ctx)?;
-            let b_s = emit_wg_reg_operand(b, t.dtype, out, &p, ctx)?;
-            let c_s = emit_wg_reg_operand(c, t.dtype, out, &p, ctx)?;
-            out.push_str(&format!("{p}Tx.wg.fma({dst_s}, {a_s}, {b_s}, {c_s})\n"));
-            Ok(())
+            if wg_elem_ok(scope) {
+                let dst_s = emit_reg_view_slice(out, &p, t, off, w, ctx)?;
+                let a_s = emit_wg_reg_operand(a, t.dtype, out, &p, ctx)?;
+                let b_s = emit_wg_reg_operand(b, t.dtype, out, &p, ctx)?;
+                let c_s = emit_wg_reg_operand(c, t.dtype, out, &p, ctx)?;
+                out.push_str(&format!("{p}Tx.wg.fma({dst_s}, {a_s}, {b_s}, {c_s})\n"));
+                Ok(())
+            } else {
+                emit_scalar_elem(out, &p, ctx, dst, &[a, b, c], true, |e| {
+                    format!("{} * {} + {}", e[0], e[1], e[2])
+                })
+            }
         }
-        // Elementwise unary over an f32 fragment. exp2/rcp map to the TIRx
-        // unary tile ops (rcp lowers to a true `1.0 / x` division, matching
-        // the interpreter); neg is a multiply by -1 (an exact sign flip).
-        // log2 has NO tile op — it lowers to a per-thread scalar loop on the
-        // flat views. A literal src folds at codegen time: the interpreter
-        // applies the same rust f32 math, so the fold is bit-identical.
+        // Elementwise unary over an f32 fragment. exp2/rcp/neg map to the TIRx
+        // unary tile ops at warpgroup-full scope (rcp lowers to a true `1.0 /
+        // x` division, matching the interpreter; neg is an exact sign flip);
+        // log2 has NO tile op and always takes the per-thread scalar form.
+        // Anything under a narrowed branch takes the scalar form. A literal
+        // src folds at codegen time: the interpreter applies the same rust f32
+        // math, so the fold is bit-identical.
         RegUnary { dst, src, op } => {
             let (t, off, w) = reg_slice_parts(dst)?;
             if t.dtype != DType::F32 {
@@ -5025,9 +5312,14 @@ fn emit_stmt(
                 (RegOperand::Slice(_), _) => None,
             };
             if let Some(v) = folded {
-                let dst_s = emit_reg_view_slice(out, &p, t, off, w, ctx)?;
-                out.push_str(&format!("{p}Tx.wg.fill({dst_s}, T.float32({v}))\n"));
-                return Ok(());
+                if wg_elem_ok(scope) {
+                    let dst_s = emit_reg_view_slice(out, &p, t, off, w, ctx)?;
+                    out.push_str(&format!("{p}Tx.wg.fill({dst_s}, T.float32({v}))\n"));
+                    return Ok(());
+                }
+                return emit_scalar_elem(out, &p, ctx, dst, &[], false, |_| {
+                    format!("T.float32({v})")
+                });
             }
             let RegOperand::Slice(src) = src else {
                 return Err("codegen: RegUnary src must be a slice or literal".to_string());
@@ -5046,39 +5338,31 @@ fn emit_stmt(
                      (the interpreter matches the dst or broadcasts one element per thread)"
                 ));
             }
-            let dst_s = emit_reg_view_slice(out, &p, t, off, w, ctx)?;
-            let src_s = emit_reg_view_slice(out, &p, st, soff, sw, ctx)?;
-            match op {
-                RegUnaryOp::Exp2 => {
-                    out.push_str(&format!("{p}Tx.wg.exp2({dst_s}, {src_s})\n"));
+            let src_op = RegOperand::Slice(src.clone());
+            if wg_elem_ok(scope) && *op != RegUnaryOp::Log2 {
+                let dst_s = emit_reg_view_slice(out, &p, t, off, w, ctx)?;
+                let src_s = emit_reg_view_slice(out, &p, st, soff, sw, ctx)?;
+                match op {
+                    RegUnaryOp::Exp2 => {
+                        out.push_str(&format!("{p}Tx.wg.exp2({dst_s}, {src_s})\n"));
+                    }
+                    RegUnaryOp::Rcp => {
+                        out.push_str(&format!("{p}Tx.wg.reciprocal({dst_s}, {src_s})\n"));
+                    }
+                    RegUnaryOp::Neg => {
+                        out.push_str(&format!("{p}Tx.wg.mul({dst_s}, {src_s}, T.float32(-1))\n"));
+                    }
+                    RegUnaryOp::Log2 => unreachable!("log2 takes the scalar form"),
                 }
-                RegUnaryOp::Rcp => {
-                    out.push_str(&format!("{p}Tx.wg.reciprocal({dst_s}, {src_s})\n"));
-                }
-                RegUnaryOp::Neg => {
-                    out.push_str(&format!("{p}Tx.wg.mul({dst_s}, {src_s}, T.float32(-1))\n"));
-                }
-                RegUnaryOp::Log2 => {
-                    // No `Tx.wg.log2` tile op exists; lower per-thread on the
-                    // flat views (raw per-thread storage — thread-axis-free).
-                    let dflat = flat_name(t, ctx)?;
-                    let sflat = flat_name(st, ctx)?;
-                    let elem = |off: &ScalarValue, i: &str| -> Result<String, String> {
-                        Ok(match as_int(off) {
-                            Some(0) => i.to_string(),
-                            Some(b) => format!("{b} + {i}"),
-                            None => format!("{} + {i}", emit_scalar(off, ctx)?),
-                        })
-                    };
-                    let d_idx = elem(off, "_i")?;
-                    // A width-1 src broadcasts (the interpreter's
-                    // one-element-per-thread rule); the dst walks off..off+w.
-                    let s_idx = if sw == 1 { elem(soff, "0")? } else { elem(soff, "_i")? };
-                    out.push_str(&format!("{p}for _i in range({w}):\n"));
-                    out.push_str(&format!("{p}    {dflat}[{d_idx}] = T.log2({sflat}[{s_idx}])\n"));
-                }
+                Ok(())
+            } else {
+                emit_scalar_elem(out, &p, ctx, dst, &[&src_op], false, |e| match op {
+                    RegUnaryOp::Exp2 => format!("T.exp2({})", e[0]),
+                    RegUnaryOp::Log2 => format!("T.log2({})", e[0]),
+                    RegUnaryOp::Rcp => format!("1.0 / ({})", e[0]),
+                    RegUnaryOp::Neg => format!("-({})", e[0]),
+                })
             }
-            Ok(())
         }
         RegMax { .. } => Err("codegen: RegMax not yet supported".to_string()),
         RegMin { .. } => Err("codegen: RegMin not yet supported".to_string()),
@@ -5344,16 +5628,15 @@ mod tests {
 
     /// The cluster-scope ids derive from the kernel's `cluster_shape` (a 1-D
     /// (n,) is the x extent with y=1); a rank>2 cluster has no emission form
-    /// and fails closed.
+    /// and fails closed. A cluster-1 kernel gets constants: the (1, 1) axis
+    /// bind collapses and the scope resolver loses `clusterCtaIdx.x`.
     #[test]
     fn cluster_ids_derive_from_cluster_shape() {
         let mut k = kernel(vec![]);
         k.cluster_shape = vec![1];
         let src = kernel_to_tirx_source(&k).unwrap();
-        assert!(
-            src.contains("cbx, cby = T.cta_id_in_cluster([1, 1], preferred=[1, 1])"),
-            "{src}"
-        );
+        assert!(src.contains("cbx, cby = 0, 0"), "{src}");
+        assert!(!src.contains("cta_id_in_cluster"), "{src}");
 
         k.cluster_shape = vec![2, 2];
         let src = kernel_to_tirx_source(&k).unwrap();
@@ -6092,13 +6375,13 @@ mod tests {
         let src = kernel_to_tirx_source(&kernel(body)).unwrap();
         assert!(
             src.contains(
-                "T.ptx.ldmatrix(False, 1, \"b16\", d_smem0.ptr_to([8 + ((lane_id) & 7), 16]), accum_frag_flat.ptr_to([0]))"
+                "T.ptx.ldmatrix(False, 1, \".b16\", d_smem0.ptr_to([8 + ((lane_id) & 7), 16]), accum_frag_flat.ptr_to([0]))"
             ),
             "{src}"
         );
         assert!(
             src.contains(
-                "T.ptx.stmatrix(True, 1, \"b16\", d_smem0.ptr_to([8 + ((lane_id) & 7), 32]), out_frag_flat_u32.ptr_to([0]))"
+                "T.ptx.stmatrix(True, 1, \".b16\", d_smem0.ptr_to([8 + ((lane_id) & 7), 32]), out_frag_flat_u32.ptr_to([0]))"
             ),
             "{src}"
         );
@@ -6330,10 +6613,9 @@ mod tests {
         let src = kernel_to_tirx_source(&kernel(body)).unwrap();
         assert!(src.contains("accum_frag_flat[0] = d_smem0[tid_in_wg, 3]"), "{src}");
         assert!(src.contains("d_smem0[tid_in_wg, 5] = accum_frag_flat[0]"), "{src}");
-        assert!(
-            src.contains("Tx.wg.copy(out_frag[:, 1:1 + 1], out_frag[:, 0:0 + 1])"),
-            "{src}"
-        );
+        // REG->REG copy: the flat scalar form (the wg.copy scalar fallback's
+        // raw thread-axis BufferLoad is rejected by LowerTIRxCleanup).
+        assert!(src.contains("out_frag_flat[1 + _i] = out_frag_flat[0]"), "{src}");
         assert!(src.contains("for _i in range(4):"), "{src}");
         assert!(
             src.contains("A[1, 2, tid_in_wg, 16 + _i] = out_frag_flat[_i]"),
