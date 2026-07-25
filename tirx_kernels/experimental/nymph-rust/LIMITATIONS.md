@@ -14,10 +14,14 @@ Per-op detail lives in `docs/ir-ops.md`; this file is the short trust boundary.
 - **expect-tx / complete-tx race**: sim requires expect-tx before complete-tx;
   HW tolerates the opposite order and the CLC multicast tx can outrun the
   expect_tx on GPU (codegen.rs comment). Sim cannot reproduce this race.
-- **Value-at-issue**: TMA/CLC/tcgen05 writes land at issue in sim. A read
-  between issue and wait sees NEW data in sim but OLD data on HW. Only the
-  trace-mode checker catches that bug class — always run the protocol checker,
-  not just the value sim.
+- **Value-at-issue — and the division of labor it forces**: TMA/CLC/tcgen05
+  writes land at issue in the value sim, so a read between issue and wait sees
+  NEW data in sim but OLD data on HW. The engine's real timing envelope is
+  therefore owned ENTIRELY by the checker's async-window passes
+  (`async_group_lifetime`, `tcgen05_async_hazard`: source immutable and
+  destination unread from issue to the observed drain), never by the values.
+  Always run the protocol checker, not just the value sim — sim values are
+  trustworthy only where those windows verify.
 
 ## Modeled-differently-than-hardware
 
@@ -56,6 +60,19 @@ Per-op detail lives in `docs/ir-ops.md`; this file is the short trust boundary.
 - **CLC round-robin oracle**: query_cancel returns canonical round-robin
   tasks. Only "each task exactly once + termination" holds for arbitrary
   orders; value regressions are only checked under round-robin.
+- **`elect` is not a convergence point in the model**: hardware `elect.sync`
+  synchronizes its membermask, but `if_elected` lowers to a plain `If` and the
+  checker credits no convergence — a handoff relying on the election's
+  implicit sync must write `warp_sync`. Over-report direction; see the
+  join-point ledger in `docs/ir-ops.md`.
+- **`WarpSync` is sim/checker vocabulary**: codegen does not emit
+  `bar.warp.sync` for it, so a proof that leans on `warp_sync` compiles to
+  code relying on the warp launching converged.
+- **`fence.mbarrier_init` seals but is not required**: the checker treats it
+  as a release-side fence (it seals its executing lanes for a later relaxed
+  cluster-barrier arrive), but no pass demands that a kernel publish its
+  mbarrier OBJECTS with one — barrier cells initialized and handed to a peer
+  without it are accepted.
 
 ## HW-illegal but sim-accepts (do not use; rejection pending kernel rework)
 
