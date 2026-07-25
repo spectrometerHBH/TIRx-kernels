@@ -135,12 +135,13 @@ fn run_failure_message(prefix: &str, result: &interpreter::RunResult) -> String 
 }
 
 #[pyfunction]
-#[pyo3(signature = (kernel, inputs = None, include_events = false))]
+#[pyo3(signature = (kernel, inputs = None, include_events = false, clc_oracle_offset = 0))]
 fn check_protocol(
     py: Python<'_>,
     kernel: &PyKernel,
     inputs: Option<&Bound<'_, PyDict>>,
     include_events: bool,
+    clc_oracle_offset: usize,
 ) -> PyResult<Py<PyDict>> {
     let rust_inputs = match inputs {
         Some(inputs) => coerce_py_inputs(py, inputs)?.0,
@@ -151,6 +152,7 @@ fn check_protocol(
         rust_inputs,
         RunOptions {
             mode: ExecutionMode::Trace,
+            clc_oracle_offset,
             ..Default::default()
         },
     );
@@ -664,6 +666,22 @@ fn event_to_py<'py>(py: Python<'py>, event: &TraceEvent) -> PyResult<Bound<'py, 
             out.set_item("value", value)?;
             out.set_item("scope", scope_to_py(py, scope)?)?;
         }
+        TraceEventKind::ClusterBarrierArrive {
+            thread_count,
+            count,
+            sem,
+            scope,
+        } => {
+            out.set_item("kind", "cluster_barrier_arrive")?;
+            out.set_item("thread_count", thread_count)?;
+            out.set_item("count", count)?;
+            out.set_item("sem", sem.as_str())?;
+            out.set_item("scope", scope_to_py(py, scope)?)?;
+        }
+        TraceEventKind::ClusterBarrierWait { scope } => {
+            out.set_item("kind", "cluster_barrier_wait")?;
+            out.set_item("scope", scope_to_py(py, scope)?)?;
+        }
         TraceEventKind::TmemAlloc {
             cta_ids,
             region,
@@ -843,15 +861,11 @@ py_enum!(PyDType = "DType" => DType {
 py_enum!(PySwizzle = "Swizzle" => Swizzle {
     NONE => None, B32 => B32, B64 => B64, B128 => B128,
 });
-py_enum!(PyTmemLayoutKind = "TmemLayoutKind" => TmemLayoutKind {
-    LANE_128 => Lane128, LANE_64_UPPER => Lane64Upper, LANE_64_LOWER => Lane64Lower,
-    SCALE_VEC_1X => ScaleVec1x, SCALE_VEC_2X => ScaleVec2x, SCALE_VEC_4X => ScaleVec4x,
-});
 py_enum!(PyMBarKind = "MBarKind" => MBarKind {
     TMA => Tma, TCGEN05 => Tcgen05, THREAD => Thread,
 });
 py_enum!(PyFenceKind = "FenceKind" => FenceKind {
-    MEMORY => Memory, ASYNC_PROXY => AsyncProxy, VIEW => View,
+    MEMORY => Memory, ASYNC_PROXY => AsyncProxy, VIEW => View, MBARRIER_INIT => MbarrierInit,
 });
 py_enum!(PyFenceScope = "FenceScope" => FenceScope {
     CTA => Cta, CLUSTER => Cluster, GPU => Gpu,
@@ -1215,44 +1229,13 @@ impl PySmemSwizzleLayout {
     }
 }
 
-/// `TmemLayout`.
-#[pyclass(name = "TmemLayout")]
-#[derive(Clone)]
-pub struct PyTmemLayout(pub ir::TmemLayout);
-#[pymethods]
-impl PyTmemLayout {
-    #[new]
-    #[pyo3(signature = (kind = PyTmemLayoutKind::LANE_128, col_start = 0, lane_align = 0))]
-    fn new(kind: PyTmemLayoutKind, col_start: usize, lane_align: u8) -> Self {
-        PyTmemLayout(ir::TmemLayout {
-            kind: kind.into(),
-            col_start,
-            lane_align,
-        })
-    }
-    #[getter]
-    fn kind(&self) -> PyTmemLayoutKind {
-        self.0.kind.into()
-    }
-    #[getter]
-    fn col_start(&self) -> usize {
-        self.0.col_start
-    }
-    #[getter]
-    fn lane_align(&self) -> u8 {
-        self.0.lane_align
-    }
-}
-
+/// TMEM is no longer a tensor: the only remaining layout is the SMEM swizzle.
 fn coerce_layout(obj: &Bound<'_, PyAny>) -> PyResult<ir::Layout> {
-    if let Ok(l) = obj.extract::<PyTmemLayout>() {
-        return Ok(ir::Layout::Tmem(l.0));
-    }
     if let Ok(l) = obj.extract::<PySmemSwizzleLayout>() {
         return Ok(ir::Layout::Swizzle(l.0));
     }
     Err(PyTypeError::new_err(
-        "expected a Layout (TmemLayout or SmemSwizzleLayout)",
+        "expected a Layout (SmemSwizzleLayout)",
     ))
 }
 
@@ -1343,6 +1326,70 @@ impl PyTensorSlice {
     #[getter]
     fn shape(&self, py: Python<'_>) -> PyResult<Vec<PyObject>> {
         self.0.shape.iter().map(|s| scalar_to_py(py, s)).collect()
+    }
+}
+
+/// `TmemOperand` — an absolute physical TMEM (lane, col) address + the dtype
+/// the addressed cells are (un)packed as. TMEM is not a tensor: no layout, no
+/// shape — the extent is implied by the op the operand feeds.
+#[pyclass(name = "TmemOperand")]
+#[derive(Clone)]
+pub struct PyTmemOperand(pub ir::TmemOperand);
+#[pymethods]
+impl PyTmemOperand {
+    #[new]
+    #[pyo3(signature = (row, col, dtype))]
+    fn new(row: Bound<'_, PyAny>, col: Bound<'_, PyAny>, dtype: PyDType) -> PyResult<Self> {
+        Ok(PyTmemOperand(ir::TmemOperand {
+            row: coerce_scalar(&row)?,
+            col: coerce_scalar(&col)?,
+            dtype: dtype.into(),
+        }))
+    }
+    #[getter]
+    fn row(&self, py: Python<'_>) -> PyResult<PyObject> {
+        scalar_to_py(py, &self.0.row)
+    }
+    #[getter]
+    fn col(&self, py: Python<'_>) -> PyResult<PyObject> {
+        scalar_to_py(py, &self.0.col)
+    }
+    #[getter]
+    fn dtype(&self) -> PyDType {
+        self.0.dtype.into()
+    }
+}
+
+/// Accept a `TmemOperand` or a `(row, col, dtype)` tuple.
+fn coerce_tmem_operand(obj: &Bound<'_, PyAny>) -> PyResult<ir::TmemOperand> {
+    if let Ok(op) = obj.extract::<PyTmemOperand>() {
+        return Ok(op.0);
+    }
+    if let Ok((row, col, dtype)) = obj.extract::<(Bound<'_, PyAny>, Bound<'_, PyAny>, PyDType)>() {
+        return Ok(ir::TmemOperand {
+            row: coerce_scalar(&row)?,
+            col: coerce_scalar(&col)?,
+            dtype: dtype.into(),
+        });
+    }
+    Err(PyTypeError::new_err(
+        "expected a TmemOperand or a (row, col, dtype) tuple",
+    ))
+}
+
+/// An MMA A/B operand: an SMEM `TensorSlice`, or a `TmemOperand` for the
+/// TMEM-resident (accumulator-readback) form.
+fn coerce_mma_operand(obj: &Bound<'_, PyAny>) -> PyResult<ir::MmaOperand> {
+    if let Ok(s) = obj.extract::<PyTensorSlice>() {
+        return Ok(ir::MmaOperand::Slice(s.0));
+    }
+    Ok(ir::MmaOperand::Tmem(coerce_tmem_operand(obj)?))
+}
+
+fn mma_operand_to_py(py: Python<'_>, op: &ir::MmaOperand) -> PyResult<PyObject> {
+    match op {
+        ir::MmaOperand::Slice(s) => Ok(Py::new(py, PyTensorSlice(s.clone()))?.into_any()),
+        ir::MmaOperand::Tmem(t) => Ok(Py::new(py, PyTmemOperand(t.clone()))?.into_any()),
     }
 }
 
@@ -1496,8 +1543,13 @@ pub struct PyMBar(pub Arc<ir::MBar>);
 #[pymethods]
 impl PyMBar {
     #[new]
-    #[pyo3(signature = (kind, stages = 1, arrive_count = None))]
-    fn new(kind: PyMBarKind, stages: u32, arrive_count: Option<u32>) -> PyResult<Self> {
+    #[pyo3(signature = (kind, stages = 1, arrive_count = None, leader_routed = false))]
+    fn new(
+        kind: PyMBarKind,
+        stages: u32,
+        arrive_count: Option<u32>,
+        leader_routed: bool,
+    ) -> PyResult<Self> {
         // Validate eagerly, like Python's MBar.__post_init__.
         if stages < 1 {
             return Err(PyValueError::new_err(
@@ -1516,6 +1568,7 @@ impl PyMBar {
             kind: kind.into(),
             stages,
             arrive_count,
+            leader_routed,
         })))
     }
     #[getter]
@@ -1529,6 +1582,10 @@ impl PyMBar {
     #[getter]
     fn arrive_count(&self) -> Option<u32> {
         self.0.arrive_count
+    }
+    #[getter]
+    fn leader_routed(&self) -> bool {
+        self.0.leader_routed
     }
     #[getter]
     fn id(&self) -> u32 {
@@ -1677,9 +1734,9 @@ impl PyStmt {
         }
     }
     #[getter]
-    fn accum(&self) -> PyResult<bool> {
+    fn accum(&self, py: Python<'_>) -> PyResult<PyObject> {
         match &self.0 {
-            ir::Stmt::Tcgen05Mma { accum, .. } => Ok(*accum),
+            ir::Stmt::Tcgen05Mma { accum, .. } => scalar_to_py(py, accum),
             _ => Err(PyAttributeError::new_err("accum")),
         }
     }
@@ -1695,25 +1752,28 @@ impl PyStmt {
         }
     }
     #[getter]
-    fn dst(&self) -> PyResult<PyTensorSlice> {
+    fn dst(&self, py: Python<'_>) -> PyResult<PyObject> {
         match &self.0 {
-            ir::Stmt::Tcgen05Mma { dst, .. } | ir::Stmt::StoreScalar { dst, .. } => {
-                Ok(PyTensorSlice(dst.clone()))
+            ir::Stmt::Tcgen05Mma { dst, .. } => {
+                Ok(Py::new(py, PyTmemOperand(dst.clone()))?.into_any())
+            }
+            ir::Stmt::StoreScalar { dst, .. } => {
+                Ok(Py::new(py, PyTensorSlice(dst.clone()))?.into_any())
             }
             _ => Err(PyAttributeError::new_err("dst")),
         }
     }
     #[getter]
-    fn a(&self) -> PyResult<PyTensorSlice> {
+    fn a(&self, py: Python<'_>) -> PyResult<PyObject> {
         match &self.0 {
-            ir::Stmt::Tcgen05Mma { a, .. } => Ok(PyTensorSlice(a.clone())),
+            ir::Stmt::Tcgen05Mma { a, .. } => mma_operand_to_py(py, a),
             _ => Err(PyAttributeError::new_err("a")),
         }
     }
     #[getter]
-    fn b(&self) -> PyResult<PyTensorSlice> {
+    fn b(&self, py: Python<'_>) -> PyResult<PyObject> {
         match &self.0 {
-            ir::Stmt::Tcgen05Mma { b, .. } => Ok(PyTensorSlice(b.clone())),
+            ir::Stmt::Tcgen05Mma { b, .. } => mma_operand_to_py(py, b),
             _ => Err(PyAttributeError::new_err("b")),
         }
     }
@@ -1724,7 +1784,10 @@ impl PyStmt {
             | ir::Stmt::ForEachTask { var, .. }
             | ir::Stmt::SchedNext { var, .. }
             | ir::Stmt::ScalarDef { var, .. }
-            | ir::Stmt::ScalarStore { var, .. } => Ok(PyVar(*var)),
+            | ir::Stmt::ScalarStore { var, .. }
+            | ir::Stmt::ScalarLet { var, .. }
+            | ir::Stmt::ShuffleSync { var, .. }
+            | ir::Stmt::ClcQueryCancel { var, .. } => Ok(PyVar(*var)),
             _ => Err(PyAttributeError::new_err("var")),
         }
     }
@@ -1800,22 +1863,27 @@ fn tensor_def(tensor: PyTensor) -> PyStmt {
     PyStmt(ir::Stmt::TensorDef { tensor: tensor.0 })
 }
 #[pyfunction]
-#[pyo3(name = "TmemAlloc", signature = (tensor, n_cols, cta_group = 1))]
-fn tmem_alloc(tensor: PyTensor, n_cols: u32, cta_group: u8) -> PyStmt {
+#[pyo3(name = "TmemAlloc", signature = (base_col, n_cols, cta_group = 1))]
+fn tmem_alloc(base_col: u32, n_cols: u32, cta_group: u8) -> PyStmt {
     PyStmt(ir::Stmt::TmemAlloc {
-        tensor: tensor.0,
+        base_col,
         n_cols,
         cta_group,
     })
 }
 #[pyfunction]
-#[pyo3(name = "TmemDealloc", signature = (tensor, n_cols, cta_group = 1))]
-fn tmem_dealloc(tensor: PyTensor, n_cols: u32, cta_group: u8) -> PyStmt {
+#[pyo3(name = "TmemDealloc", signature = (base_col, n_cols, cta_group = 1))]
+fn tmem_dealloc(base_col: u32, n_cols: u32, cta_group: u8) -> PyStmt {
     PyStmt(ir::Stmt::TmemDealloc {
-        tensor: tensor.0,
+        base_col,
         n_cols,
         cta_group,
     })
+}
+#[pyfunction]
+#[pyo3(name = "TmemRelinquish", signature = (cta_group = 1))]
+fn tmem_relinquish(cta_group: u8) -> PyStmt {
+    PyStmt(ir::Stmt::TmemRelinquish { cta_group })
 }
 #[pyfunction]
 #[pyo3(name = "ScalarDef", signature = (var, initial = None))]
@@ -1841,6 +1909,23 @@ fn scalar_store(var: PyVar, value: Bound<'_, PyAny>) -> PyResult<PyStmt> {
     }))
 }
 #[pyfunction]
+#[pyo3(name = "ScalarLet")]
+fn scalar_let(var: PyVar, value: Bound<'_, PyAny>) -> PyResult<PyStmt> {
+    Ok(PyStmt(ir::Stmt::ScalarLet {
+        var: var.0,
+        value: coerce_scalar(&value)?,
+    }))
+}
+#[pyfunction]
+#[pyo3(name = "ShuffleSync")]
+fn shuffle_sync(var: PyVar, src: Bound<'_, PyAny>, src_lane: Bound<'_, PyAny>) -> PyResult<PyStmt> {
+    Ok(PyStmt(ir::Stmt::ShuffleSync {
+        var: var.0,
+        src: coerce_scalar(&src)?,
+        src_lane: coerce_scalar(&src_lane)?,
+    }))
+}
+#[pyfunction]
 #[pyo3(name = "StoreScalar")]
 fn store_scalar(dst: Bound<'_, PyAny>, value: Bound<'_, PyAny>) -> PyResult<PyStmt> {
     Ok(PyStmt(ir::Stmt::StoreScalar {
@@ -1854,13 +1939,14 @@ fn mbar_def(mbar: PyMBar) -> PyStmt {
     PyStmt(ir::Stmt::MBarDef { mbar: mbar.0 })
 }
 #[pyfunction]
-#[pyo3(name = "ForLoop", signature = (var, start = None, stop = None, step = None, body = None))]
+#[pyo3(name = "ForLoop", signature = (var, start = None, stop = None, step = None, body = None, unroll = true))]
 fn for_loop(
     var: PyVar,
     start: Option<Bound<'_, PyAny>>,
     stop: Option<Bound<'_, PyAny>>,
     step: Option<Bound<'_, PyAny>>,
     body: Option<Bound<'_, PyAny>>,
+    unroll: bool,
 ) -> PyResult<PyStmt> {
     Ok(PyStmt(ir::Stmt::ForLoop {
         var: var.0,
@@ -1868,6 +1954,7 @@ fn for_loop(
         stop: opt_scalar_or(stop, 0)?,
         step: opt_scalar_or(step, 1)?,
         body: opt_body(body)?,
+        unroll,
     }))
 }
 #[pyfunction]
@@ -1897,6 +1984,32 @@ fn sched_next(scheduler: PyScheduler, var: PyVar) -> PyStmt {
     PyStmt(ir::Stmt::SchedNext {
         scheduler: scheduler.0,
         var: var.0,
+    })
+}
+#[pyfunction]
+#[pyo3(name = "ClcTryCancel", signature = (scheduler, handle, mbar, stage = None, cta_group = 2))]
+fn clc_try_cancel(
+    scheduler: PyScheduler,
+    handle: PyTensor,
+    mbar: Bound<'_, PyAny>,
+    stage: Option<Bound<'_, PyAny>>,
+    cta_group: u8,
+) -> PyResult<PyStmt> {
+    Ok(PyStmt(ir::Stmt::ClcTryCancel {
+        scheduler: scheduler.0,
+        handle: handle.0,
+        mbar: coerce_mbar_ref(&mbar)?,
+        stage: coerce_opt_scalar(stage)?,
+        cta_group,
+    }))
+}
+#[pyfunction]
+#[pyo3(name = "ClcQueryCancel")]
+fn clc_query_cancel(scheduler: PyScheduler, var: PyVar, handle: PyTensor) -> PyStmt {
+    PyStmt(ir::Stmt::ClcQueryCancel {
+        scheduler: scheduler.0,
+        var: var.0,
+        handle: handle.0,
     })
 }
 #[pyfunction]
@@ -1992,13 +2105,12 @@ fn mbarrier_arrive_expect_tx(
     }))
 }
 #[pyfunction]
-#[pyo3(name = "TmaLoad", signature = (dst, src, mbar, bytes, coords, shape, gmem_shape = None, mbar_stage = None, multicast_cta_mask = None, cta_group = 1))]
+#[pyo3(name = "TmaLoad", signature = (dst, src, mbar, coords, shape, gmem_shape = None, mbar_stage = None, multicast_cta_mask = None, cta_group = 1))]
 #[allow(clippy::too_many_arguments)]
 fn tma_load(
     dst: Bound<'_, PyAny>,
     src: PyTensor,
     mbar: Bound<'_, PyAny>,
-    bytes: Bound<'_, PyAny>,
     coords: Bound<'_, PyAny>,
     shape: Vec<usize>,
     gmem_shape: Option<Vec<usize>>,
@@ -2010,7 +2122,6 @@ fn tma_load(
         dst: coerce_slice(&dst)?,
         src: src.0,
         mbar: coerce_mbar_ref(&mbar)?,
-        bytes: coerce_scalar(&bytes)?,
         coords: coerce_scalar_seq(&coords)?,
         shape,
         gmem_shape,
@@ -2097,7 +2208,7 @@ fn cp_async_bulk_wait_group_read(n: u8) -> PyStmt {
     PyStmt(ir::Stmt::CpAsyncBulkWaitGroupRead { n })
 }
 #[pyfunction]
-#[pyo3(name = "Tcgen05Mma", signature = (dst, a, b, m, n, k = 16, accum = false, trans_a = false, trans_b = false, cta_group = 1, sfa = None, sfb = None, sf_byte = 0, sf_e4m3 = false, sf_block = 0, a_fp4 = false, b_fp4 = false))]
+#[pyo3(name = "Tcgen05Mma", signature = (dst, a, b, m, n, k = 16, accum = None, trans_a = false, trans_b = false, cta_group = 1, sfa = None, sfb = None, sf_byte = 0, sf_e4m3 = false, sf_block = 0, a_fp4 = false, b_fp4 = false, lane_align = 0))]
 #[allow(clippy::too_many_arguments)]
 fn tcgen05_mma(
     dst: Bound<'_, PyAny>,
@@ -2106,7 +2217,7 @@ fn tcgen05_mma(
     m: u32,
     n: u32,
     k: u32,
-    accum: bool,
+    accum: Option<Bound<'_, PyAny>>,
     trans_a: bool,
     trans_b: bool,
     cta_group: u8,
@@ -2117,32 +2228,34 @@ fn tcgen05_mma(
     sf_block: u32,
     a_fp4: bool,
     b_fp4: bool,
+    lane_align: u8,
 ) -> PyResult<PyStmt> {
     Ok(PyStmt(ir::Stmt::Tcgen05Mma {
-        dst: coerce_slice(&dst)?,
-        a: coerce_slice(&a)?,
-        b: coerce_slice(&b)?,
+        dst: coerce_tmem_operand(&dst)?,
+        a: coerce_mma_operand(&a)?,
+        b: coerce_mma_operand(&b)?,
         m,
         n,
         k,
-        accum,
+        accum: opt_scalar_or(accum, 0)?,
         trans_a,
         trans_b,
         cta_group,
-        sfa: sfa.map(|v| coerce_slice(&v)).transpose()?,
-        sfb: sfb.map(|v| coerce_slice(&v)).transpose()?,
+        sfa: sfa.map(|v| coerce_tmem_operand(&v)).transpose()?,
+        sfb: sfb.map(|v| coerce_tmem_operand(&v)).transpose()?,
         sf_byte,
         sf_e4m3,
         sf_block,
         a_fp4,
         b_fp4,
+        lane_align,
     }))
 }
 #[pyfunction]
 #[pyo3(name = "Tcgen05Cp", signature = (dst, src, cta_group = 1))]
 fn tcgen05_cp(dst: Bound<'_, PyAny>, src: Bound<'_, PyAny>, cta_group: u8) -> PyResult<PyStmt> {
     Ok(PyStmt(ir::Stmt::Tcgen05Cp {
-        dst: coerce_slice(&dst)?,
+        dst: coerce_tmem_operand(&dst)?,
         src: coerce_slice(&src)?,
         cta_group,
     }))
@@ -2163,24 +2276,20 @@ fn tcgen05_commit(
     }))
 }
 #[pyfunction]
-#[pyo3(name = "Tcgen05Ld", signature = (dst, src, shape = "32x32b", num = 1, row = None, col = None))]
+#[pyo3(name = "Tcgen05Ld", signature = (dst, src, shape = "32x32b", num = 1))]
 fn tcgen05_ld(
     dst: Bound<'_, PyAny>,
-    src: PyTensor,
+    src: Bound<'_, PyAny>,
     shape: &str,
     num: u32,
-    row: Option<Bound<'_, PyAny>>,
-    col: Option<Bound<'_, PyAny>>,
 ) -> PyResult<PyStmt> {
     let shape = ir::LdStShape::parse(shape)
         .ok_or_else(|| PyValueError::new_err("tcgen05_ld shape is unsupported"))?;
     Ok(PyStmt(ir::Stmt::Tcgen05Ld {
         dst: coerce_slice(&dst)?,
-        src: src.0,
+        src: coerce_tmem_operand(&src)?,
         shape,
         num,
-        row: opt_scalar_or(row, 0)?,
-        col: opt_scalar_or(col, 0)?,
     }))
 }
 #[pyfunction]
@@ -2189,24 +2298,20 @@ fn tcgen05_wait_ld() -> PyStmt {
     PyStmt(ir::Stmt::Tcgen05WaitLd)
 }
 #[pyfunction]
-#[pyo3(name = "Tcgen05St", signature = (dst, src, shape = "32x32b", num = 1, row = None, col = None))]
+#[pyo3(name = "Tcgen05St", signature = (dst, src, shape = "32x32b", num = 1))]
 fn tcgen05_st(
-    dst: PyTensor,
+    dst: Bound<'_, PyAny>,
     src: Bound<'_, PyAny>,
     shape: &str,
     num: u32,
-    row: Option<Bound<'_, PyAny>>,
-    col: Option<Bound<'_, PyAny>>,
 ) -> PyResult<PyStmt> {
     let shape = ir::LdStShape::parse(shape)
         .ok_or_else(|| PyValueError::new_err("tcgen05_st shape is unsupported"))?;
     Ok(PyStmt(ir::Stmt::Tcgen05St {
-        dst: dst.0,
+        dst: coerce_tmem_operand(&dst)?,
         src: coerce_slice(&src)?,
         shape,
         num,
-        row: opt_scalar_or(row, 0)?,
-        col: opt_scalar_or(col, 0)?,
     }))
 }
 #[pyfunction]
@@ -2551,6 +2656,21 @@ fn cluster_sync() -> PyStmt {
     PyStmt(ir::Stmt::ClusterSync)
 }
 
+#[pyfunction]
+#[pyo3(name = "ClusterBarrierArrive", signature = (sem = "relaxed"))]
+fn cluster_barrier_arrive(sem: &str) -> PyResult<PyStmt> {
+    let sem = ir::ClusterBarrierSem::parse(sem).ok_or_else(|| {
+        PyRuntimeError::new_err("cluster_barrier_arrive sem must be 'relaxed' or 'release'")
+    })?;
+    Ok(PyStmt(ir::Stmt::ClusterBarrierArrive { sem }))
+}
+
+#[pyfunction]
+#[pyo3(name = "ClusterBarrierWait")]
+fn cluster_barrier_wait() -> PyStmt {
+    PyStmt(ir::Stmt::ClusterBarrierWait)
+}
+
 // ===========================================================================
 // chunk 7 — Kernel
 // ===========================================================================
@@ -2646,7 +2766,6 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMemorySpace>()?;
     m.add_class::<PyDType>()?;
     m.add_class::<PySwizzle>()?;
-    m.add_class::<PyTmemLayoutKind>()?;
     m.add_class::<PyMBarKind>()?;
     m.add_class::<PyFenceKind>()?;
     m.add_class::<PyFenceScope>()?;
@@ -2665,7 +2784,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(scalar_not, m)?)?;
     // chunk 3 — tensors / slices / layouts
     m.add_class::<PySmemSwizzleLayout>()?;
-    m.add_class::<PyTmemLayout>()?;
+    m.add_class::<PyTmemOperand>()?;
     m.add_class::<PyTensor>()?;
     m.add_class::<PyTensorSlice>()?;
     // chunk 4 — mbarriers
@@ -2680,14 +2799,19 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(tensor_def, m)?,
         wrap_pyfunction!(tmem_alloc, m)?,
         wrap_pyfunction!(tmem_dealloc, m)?,
+        wrap_pyfunction!(tmem_relinquish, m)?,
         wrap_pyfunction!(scalar_def, m)?,
         wrap_pyfunction!(scalar_store, m)?,
+        wrap_pyfunction!(scalar_let, m)?,
+        wrap_pyfunction!(shuffle_sync, m)?,
         wrap_pyfunction!(store_scalar, m)?,
         wrap_pyfunction!(mbar_def, m)?,
         wrap_pyfunction!(for_loop, m)?,
         wrap_pyfunction!(for_each_task, m)?,
         wrap_pyfunction!(scheduler_impl, m)?,
         wrap_pyfunction!(sched_next, m)?,
+        wrap_pyfunction!(clc_try_cancel, m)?,
+        wrap_pyfunction!(clc_query_cancel, m)?,
         wrap_pyfunction!(loop_stmt, m)?,
         wrap_pyfunction!(break_if, m)?,
         wrap_pyfunction!(if_stmt, m)?,
@@ -2737,6 +2861,8 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(named_barrier, m)?,
         wrap_pyfunction!(warp_sync, m)?,
         wrap_pyfunction!(cluster_sync, m)?,
+        wrap_pyfunction!(cluster_barrier_arrive, m)?,
+        wrap_pyfunction!(cluster_barrier_wait, m)?,
     ] {
         m.add_function(f)?;
     }

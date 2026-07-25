@@ -16,8 +16,16 @@ pub struct InterpreterState {
     pub tmem_allocations: HashMap<TmemAllocationKey, TmemAllocation>,
     pub tmem_last_alloc_cols: HashMap<usize, usize>,
     pub tmem_collectives: HashMap<TmemCollectiveKey, TmemCollective>,
+    /// CTAs that gave up their `tcgen05.alloc` permit
+    /// (`tcgen05.relinquish_alloc_permit`, PTX §9.7.17.7.1 — a later alloc on
+    /// the CTA is illegal for the rest of the kernel).
+    pub tmem_relinquished: std::collections::HashSet<usize>,
     pub cp_async_bulk_groups: HashMap<usize, i64>,
     pub scheduler_next_cursors: HashMap<(u32, usize), usize>,
+    /// CLC handle slot: `clc_try_cancel` (the canonical oracle) writes the next work
+    /// id here, keyed by `(scheduler_id, cluster_id)`; `clc_query_cancel` reads it, so
+    /// every consumer of one handle observes the same id.
+    pub clc_handle_values: HashMap<(u32, usize), i64>,
 }
 
 impl InterpreterState {
@@ -41,6 +49,11 @@ pub struct RunOptions {
     pub max_executed_stmts: Option<usize>,
     pub mode: ExecutionMode,
     pub check_protocol: bool,
+    /// Rotation of the CLC round-robin steal order within each cluster's residue
+    /// class (0 = the canonical order; see `execute_clc_try_cancel`). Any offset
+    /// still hands every task out exactly once — it only perturbs the ORDER, so a
+    /// protocol-correct kernel stays green under every rotation.
+    pub clc_oracle_offset: usize,
 }
 
 impl Default for RunOptions {
@@ -50,6 +63,7 @@ impl Default for RunOptions {
             max_executed_stmts: None,
             mode: ExecutionMode::Trace,
             check_protocol: true,
+            clc_oracle_offset: 0,
         }
     }
 }

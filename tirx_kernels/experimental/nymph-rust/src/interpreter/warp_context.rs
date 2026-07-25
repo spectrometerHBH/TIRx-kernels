@@ -291,7 +291,11 @@ impl<'a, 'k> WarpContext<'a, 'k> {
         self.ids.stmt_id(stmt)
     }
     /// PTX single-thread issue instructions (tcgen05.mma/cp/commit, TMA bulk
-    /// copies): exactly one executing thread, or the op would issue N times.
+    /// copies): exactly one executing thread, or the op would issue N times
+    /// (an MMA issued by 32 lanes accumulates 32 times — a wrong value, not
+    /// just a perf bug). Hardware has no "the instruction elects lane 0
+    /// itself" semantics, so canon/CUTLASS always wrap these in
+    /// `if elect_sync():`; the sim enforces the same strictly.
     pub fn check_single_thread_issue(&self, code: &str, op: &str) -> IResult<()> {
         if self.lanes.len() != 1 {
             return Err(InterpreterError::new(

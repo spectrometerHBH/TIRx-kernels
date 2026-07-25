@@ -23,21 +23,6 @@ fn var(id: u32, binding: VarBinding) -> Var {
     }
 }
 
-fn tmem_tensor(id: u32, col_start: usize) -> Arc<Tensor> {
-    Arc::new(Tensor {
-        id,
-        space: MemorySpace::Tmem,
-        dtype: DType::F32,
-        shape: vec![128, 128],
-        layout: Some(Layout::Tmem(TmemLayout {
-            kind: TmemLayoutKind::Lane128,
-            col_start,
-            lane_align: 0,
-        })),
-        byte_offset: None,
-    })
-}
-
 fn reg_tensor(id: u32, dtype: DType, shape: Vec<usize>) -> Arc<Tensor> {
     Arc::new(Tensor {
         id,
@@ -244,7 +229,6 @@ fn failed_runs_do_not_expose_partial_values() {
 
 #[test]
 fn tmem_cta_group2_collective_success_populates_peer_scratchpads() {
-    let paired = tmem_tensor(20, 0);
     let kernel = Kernel {
         name: "tmem_cta_group2_success".into(),
         args: vec![],
@@ -253,13 +237,13 @@ fn tmem_cta_group2_collective_success_populates_peer_scratchpads() {
             warp_stmts(
                 0,
                 vec![Stmt::TmemAlloc {
-                    tensor: paired.clone(),
+                    base_col: 0,
                     n_cols: 128,
                     cta_group: 2,
                 }],
             ),
             kernel_finalize(vec![Stmt::TmemDealloc {
-                tensor: paired,
+                base_col: 0,
                 n_cols: 128,
                 cta_group: 2,
             }]),
@@ -314,6 +298,7 @@ fn tma_roundtrip_mbar_cell_parity_is_rust_internal() {
         kind: MBarKind::Tma,
         stages: 1,
         arrive_count: None,
+        leader_routed: false,
     });
     let kernel = Kernel {
         name: "tma_roundtrip".into(),
@@ -337,7 +322,6 @@ fn tma_roundtrip_mbar_cell_parity_is_rust_internal() {
                         dst: full_slice(smem.clone()),
                         src: source.clone(),
                         mbar: mbar_ref(&mbar),
-                        bytes: ScalarValue::Int(16),
                         coords: vec![ScalarValue::Int(0)],
                         shape: vec![4],
                         gmem_shape: None,
@@ -382,11 +366,8 @@ fn tma_multicast_group2_mbar_targets_are_deduplicated() {
         kind: MBarKind::Tma,
         stages: 1,
         arrive_count: None,
+        leader_routed: false,
     });
-    let even_mbar = MBarRef {
-        mbar: mbar.clone(),
-        remote_coord: Some(ScalarValue::Int(0)),
-    };
     let kernel = Kernel {
         name: "tma_multicast_cta_group2".into(),
         args: vec![source.clone()],
@@ -413,8 +394,7 @@ fn tma_multicast_group2_mbar_targets_are_deduplicated() {
                         then_body: vec![Stmt::TmaLoad {
                             dst: full_slice(smem),
                             src: source.clone(),
-                            mbar: even_mbar,
-                            bytes: ScalarValue::Int(16),
+                            mbar: mbar_ref(&mbar),
                             coords: vec![ScalarValue::Int(0)],
                             shape: vec![4],
                             gmem_shape: None,
@@ -447,6 +427,7 @@ fn mbarrier_wait_success_and_blocked_frontier_are_rust_internal() {
         kind: MBarKind::Tma,
         stages: 1,
         arrive_count: None,
+        leader_routed: false,
     });
     let kernel = Kernel {
         name: "mbar_wait_wake".into(),
@@ -483,7 +464,6 @@ fn mbarrier_wait_success_and_blocked_frontier_are_rust_internal() {
                         dst: full_slice(smem),
                         src: source.clone(),
                         mbar: mbar_ref(&mbar),
-                        bytes: ScalarValue::Int(16),
                         coords: vec![ScalarValue::Int(0)],
                         shape: vec![4],
                         gmem_shape: None,
@@ -509,6 +489,7 @@ fn mbarrier_wait_success_and_blocked_frontier_are_rust_internal() {
         kind: MBarKind::Tma,
         stages: 1,
         arrive_count: None,
+        leader_routed: false,
     });
     let expect_tx_kernel = Kernel {
         name: "mbarrier_expect_tx_deadlock".into(),
@@ -538,7 +519,7 @@ fn mbarrier_wait_success_and_blocked_frontier_are_rust_internal() {
                     Stmt::MBarrierWait {
                         mbar: mbar_ref(&expect_tx),
                         stage: None,
-                        phase: None,
+                        phase: Some(ScalarValue::Int(0)),
                     },
                 ],
             ),
@@ -559,6 +540,7 @@ fn mbarrier_wait_success_and_blocked_frontier_are_rust_internal() {
         kind: MBarKind::Tma,
         stages: 1,
         arrive_count: None,
+        leader_routed: false,
     });
     let remote_success_kernel = Kernel {
         name: "mbar_remote_arrive_success".into(),
@@ -836,6 +818,7 @@ fn tcgen05_commit_success_paths_update_rust_internal_mbar_cells() {
         kind: MBarKind::Tcgen05,
         stages: 1,
         arrive_count: None,
+        leader_routed: false,
     });
     let group2_kernel = Kernel {
         name: "tcgen05_commit_group2".into(),
@@ -876,6 +859,7 @@ fn tcgen05_commit_success_paths_update_rust_internal_mbar_cells() {
         kind: MBarKind::Tcgen05,
         stages: 1,
         arrive_count: None,
+        leader_routed: false,
     });
     let multicast_kernel = Kernel {
         name: "tcgen05_commit_multicast_direct_mask".into(),
@@ -919,4 +903,220 @@ fn tcgen05_commit_success_paths_update_rust_internal_mbar_cells() {
     assert_eq!(trace_status(&multicast_result), ProtocolStatus::Passed);
     assert!(!has_mbar_arrive_for_cta(&multicast_result, 0));
     assert!(has_mbar_arrive_for_cta(&multicast_result, 1));
+}
+
+#[test]
+fn clc_try_query_cancel_oracle_round_robin_and_offset() {
+    // One cluster of 2 CTAs, 4 tasks total (launch [2] / cluster [2] => cc=1):
+    // the leader CTA's single try serves task 1 (cursor starts at 1: the
+    // cluster's own launch tile is task 0), completing-tx 16B on BOTH CTAs'
+    // mbar cells (the multicast handle); the query reads the same slot.
+    let handle = smem_tensor(400, DType::U32, vec![4], 0);
+    let mbar = Arc::new(MBar {
+        id: 400,
+        kind: MBarKind::Tma,
+        stages: 1,
+        arrive_count: None,
+        leader_routed: false,
+    });
+    let space = Arc::new(TaskSpace {
+        id: 0,
+        grid: vec![4],
+        fields: vec!["t".into()],
+    });
+    let sched = Arc::new(Scheduler {
+        id: 7,
+        space,
+        policy: SchedulerPolicy::Custom,
+        scope: SchedulerScope::Cluster,
+    });
+    let qvar = var(40, VarBinding::Scalar);
+    let kernel = Kernel {
+        name: "clc_oracle".into(),
+        args: vec![],
+        body: vec![
+            Stmt::MBarDef { mbar: mbar.clone() },
+            kernel_init(vec![Stmt::MBarrierInit {
+                mbar: mbar_ref(&mbar),
+                count: 1,
+                stage: Some(ScalarValue::Int(0)),
+            }]),
+            Stmt::SchedulerImpl {
+                scheduler: sched.clone(),
+                body: vec![single_thread_of_warp(
+                    0,
+                    vec![
+                        Stmt::MBarrierArriveExpectTx {
+                            mbar: mbar_ref(&mbar),
+                            bytes: 16,
+                            stage: Some(ScalarValue::Int(0)),
+                        },
+                        // Only the cluster leader issues the try (its 16B handle
+                        // multicast completes BOTH CTAs' cells).
+                        if_stmt(
+                            cta_eq(0),
+                            vec![Stmt::ClcTryCancel {
+                                scheduler: sched.clone(),
+                                handle: handle.clone(),
+                                mbar: mbar_ref(&mbar),
+                                stage: Some(ScalarValue::Int(0)),
+                                cta_group: 2,
+                            }],
+                        ),
+                        Stmt::MBarrierWait {
+                            mbar: mbar_ref(&mbar),
+                            stage: Some(ScalarValue::Int(0)),
+                            phase: Some(ScalarValue::Int(0)),
+                        },
+                        // The wait passing proves the try landed, so the slot
+                        // read below observes the same id on both CTAs.
+                        Stmt::ClcQueryCancel {
+                            scheduler: sched.clone(),
+                            var: qvar,
+                            handle: handle.clone(),
+                        },
+                    ],
+                )],
+            },
+        ],
+        num_warps: 4,
+        smem_size_bytes: 64,
+        launch_shape: vec![2],
+        cluster_shape: vec![2],
+    };
+    assert!(kernel.validate().is_ok(), "{:?}", kernel.validate());
+    let result = interpret(
+        &kernel,
+        HashMap::new(),
+        RunOptions {
+            mode: ExecutionMode::Trace,
+            ..Default::default()
+        },
+    );
+    assert!(result.completed, "failed: {:?}", result.failure_reason);
+    assert_eq!(trace_status(&result), ProtocolStatus::Passed);
+    // The single steal serves task cluster_id + 1*cc = 1 (cc=1: one cluster).
+    let task_ids: Vec<i64> = trace_events(&result)
+        .iter()
+        .filter_map(|event| match &event.payload {
+            TraceEventKind::SchedulerNext { task_id, .. } => Some(*task_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(task_ids, vec![1], "one try from the leader CTA");
+    // Both CTAs' mbar cells complete-tx the 16B handle (the multicast).
+    assert!(has_mbar_complete_for_cta(&result, 0));
+    assert!(has_mbar_complete_for_cta(&result, 1));
+
+    // Offset rotation: with one stealable task the rotation is a no-op; the
+    // kernel stays green under clc_oracle_offset=1.
+    let rotated = interpret(
+        &kernel,
+        HashMap::new(),
+        RunOptions {
+            mode: ExecutionMode::Trace,
+            clc_oracle_offset: 1,
+            ..Default::default()
+        },
+    );
+    assert!(rotated.completed, "failed: {:?}", rotated.failure_reason);
+    assert_eq!(trace_status(&rotated), ProtocolStatus::Passed);
+}
+
+#[test]
+fn clc_query_before_try_fails_closed() {
+    let handle = smem_tensor(401, DType::U32, vec![4], 0);
+    let space = Arc::new(TaskSpace {
+        id: 1,
+        grid: vec![4],
+        fields: vec!["t".into()],
+    });
+    let sched = Arc::new(Scheduler {
+        id: 8,
+        space,
+        policy: SchedulerPolicy::Custom,
+        scope: SchedulerScope::Cluster,
+    });
+    let kernel = Kernel {
+        name: "clc_query_early".into(),
+        args: vec![],
+        body: vec![Stmt::SchedulerImpl {
+            scheduler: sched.clone(),
+            body: vec![Stmt::ClcQueryCancel {
+                scheduler: sched.clone(),
+                var: var(41, VarBinding::Scalar),
+                handle: handle.clone(),
+            }],
+        }],
+        num_warps: 4,
+        smem_size_bytes: 64,
+        launch_shape: vec![2],
+        cluster_shape: vec![2],
+    };
+    let result = run_value_kernel(&kernel, HashMap::new());
+    assert!(!result.completed);
+    assert_eq!(
+        result.failure_reason.as_deref(),
+        Some("clc_query_before_try")
+    );
+}
+
+#[test]
+fn split_cluster_barrier_arrive_then_wait_completes() {
+    // Every warp arrives (CTA-scope), then warp 1's wait passes once the whole
+    // cluster's arrival set is in — the relaxed arrive unblocks the wait.
+    let kernel = Kernel {
+        name: "cluster_barrier".into(),
+        args: vec![],
+        body: vec![
+            Stmt::ClusterBarrierArrive {
+                sem: ClusterBarrierSem::Relaxed,
+            },
+            warp_stmts(1, vec![Stmt::ClusterBarrierWait]),
+            warp_stmts(2, vec![Stmt::ClusterBarrierWait]),
+        ],
+        num_warps: 4,
+        smem_size_bytes: 0,
+        launch_shape: vec![2],
+        cluster_shape: vec![2],
+    };
+    assert!(kernel.validate().is_ok(), "{:?}", kernel.validate());
+    let result = run_trace_kernel(&kernel, HashMap::new());
+    assert!(result.completed, "failed: {:?}", result.failure_reason);
+    assert_eq!(trace_status(&result), ProtocolStatus::Passed);
+    // the waits emitted the acquire witness events
+    let waits = trace_events(&result)
+        .iter()
+        .filter(|event| matches!(&event.payload, TraceEventKind::ClusterBarrierWait { .. }))
+        .count();
+    assert_eq!(waits, 4, "warps 1 and 2 of both CTAs pass the wait");
+}
+
+#[test]
+fn tmem_relinquish_then_alloc_fails_at_runtime() {
+    // PTX §9.7.17.7.1: no tcgen05.alloc after relinquish_alloc_permit. Validate
+    // rejects the static shape, and the interpreter fails closed on the same
+    // rule for the runtime path (here: relinquish then alloc on the same CTA).
+    let kernel = Kernel {
+        name: "tmem_relinquish_alloc".into(),
+        args: vec![],
+        body: vec![
+            warp_stmts(0, vec![Stmt::TmemRelinquish { cta_group: 1 }]),
+            warp_stmts(
+                0,
+                vec![Stmt::TmemAlloc {
+                    base_col: 0,
+                    n_cols: 64,
+                    cta_group: 1,
+                }],
+            ),
+        ],
+        num_warps: 4,
+        smem_size_bytes: 0,
+        launch_shape: vec![1],
+        cluster_shape: vec![1],
+    };
+    // validate catches it first (the walk's relinquish -> alloc rule).
+    let e = kernel.validate().unwrap_err();
+    assert!(e.message.contains("after tmem_relinquish"), "{}", e.message);
 }

@@ -455,6 +455,19 @@ fn trace_schema_audit(cx: &mut CheckerCx<'_>) -> CheckResult {
                     ));
                 }
             }
+            TraceEventKind::ClusterBarrierArrive {
+                thread_count,
+                count,
+                ..
+            } => {
+                if *thread_count == 0 || *count == 0 || count > thread_count {
+                    return Err(cx.fail(
+                        "trace_schema_invalid_cluster_barrier_arrive",
+                        "ClusterBarrierArrive count must be in 1..=thread_count",
+                        Some(event),
+                    ));
+                }
+            }
             TraceEventKind::Sync { thread_count, .. } if *thread_count == 0 => {
                 return Err(cx.fail(
                     "trace_schema_invalid_sync",
@@ -508,6 +521,7 @@ fn trace_region_audit(cx: &mut CheckerCx<'_>) -> CheckResult {
 fn barrier_cycle_audit(cx: &mut CheckerCx<'_>) -> CheckResult {
     let mut mbars: HashMap<MbarKey, MbarCycle> = HashMap::new();
     let mut sync_counts: HashMap<SyncKey, usize> = HashMap::new();
+    let mut cb_counts: HashMap<usize, (usize, usize)> = HashMap::new();
     for event in cx.event_index.events {
         match &event.payload {
             TraceEventKind::MbarInit { target, count, .. } => {
@@ -630,6 +644,25 @@ fn barrier_cycle_audit(cx: &mut CheckerCx<'_>) -> CheckResult {
                     return Err(cx.fail(
                         "barrier_cycle_sync_without_full_arrival",
                         "sync completion has no full SyncArrive witness",
+                        Some(event),
+                    ));
+                }
+            }
+            TraceEventKind::ClusterBarrierArrive {
+                thread_count,
+                count,
+                scope,
+                ..
+            } => {
+                cb_counts.insert(scope.cluster_id, (*thread_count, *count));
+            }
+            TraceEventKind::ClusterBarrierWait { scope } => {
+                let (thread_count, count) =
+                    cb_counts.get(&scope.cluster_id).copied().unwrap_or((0, 0));
+                if thread_count == 0 || count < thread_count {
+                    return Err(cx.fail(
+                        "barrier_cycle_cluster_barrier_wait_without_full_arrival",
+                        "cluster barrier wait has no full cluster arrive witness",
                         Some(event),
                     ));
                 }
@@ -1487,8 +1520,17 @@ struct TmemAccess {
     event_idx: usize,
     region: Region,
     async_kind: TmemAsyncKind,
-    /// The `tcgen05.wait` that retired it, when the trace records one.
-    drain_idx: Option<usize>,
+    /// Completion observations, FIRST per waiting stream: the
+    /// `tcgen05.wait::ld/st` that retired a load/store, or an mbar wait
+    /// whose cell a covering `tcgen05.commit` handed the access to (a commit
+    /// tracks EVERY async op the warp issued before it, so every later
+    /// commit covers the access again and any one of those cells' waits is
+    /// a valid observation). Only the first witness per stream is kept: a
+    /// stream's events are program-ordered, so its earliest witness is the
+    /// easiest for any happens-before query to cover — keeping more from
+    /// the same stream cannot change the answer, and a long mainloop would
+    /// otherwise pile one witness per tile onto every access.
+    drains: Vec<(usize, usize)>,
 }
 
 /// One `alloc .. dealloc` interval of a TMEM band.
@@ -1532,6 +1574,13 @@ fn tmem_lifecycle_order_local(cx: &mut CheckerCx<'_>) -> CheckResult {
     // cells proves completion.
     let mut undrained_async: HashMap<usize, Vec<usize>> = HashMap::new();
     let mut committed: HashMap<MbarKey, Vec<usize>> = HashMap::new();
+    // Per (cell, committing stream): how many of the stream's pending
+    // accesses were already handed to the cell. `undrained_async` is
+    // append-only, so re-extending from the watermark hands each access to
+    // each cell at most once — without it a commit per tile re-copies the
+    // whole pending set into the cell and the structure grows quadratically
+    // in the tile count.
+    let mut handed: HashMap<(MbarKey, usize), usize> = HashMap::new();
     for (event_idx, event) in cx.event_index.events.iter().enumerate() {
         match &event.payload {
             TraceEventKind::TmemAlloc { region, .. } => {
@@ -1579,7 +1628,7 @@ fn tmem_lifecycle_order_local(cx: &mut CheckerCx<'_>) -> CheckResult {
                     event_idx,
                     region: region.clone(),
                     async_kind: *async_kind,
-                    drain_idx: None,
+                    drains: Vec::new(),
                 });
             }
             // `tcgen05.wait::ld/st` retires the EXECUTING thread's own loads
@@ -1589,7 +1638,10 @@ fn tmem_lifecycle_order_local(cx: &mut CheckerCx<'_>) -> CheckResult {
                 if let Some(pending) = undrained.get_mut(&scope.stream_id) {
                     pending.retain(|a| {
                         if accesses[*a].async_kind == *async_kind {
-                            accesses[*a].drain_idx = Some(event_idx);
+                            let drains = &mut accesses[*a].drains;
+                            if !drains.iter().any(|(s, _)| *s == scope.stream_id) {
+                                drains.push((scope.stream_id, event_idx));
+                            }
                             false
                         } else {
                             true
@@ -1605,22 +1657,38 @@ fn tmem_lifecycle_order_local(cx: &mut CheckerCx<'_>) -> CheckResult {
                 if event.stmt_kind == "Tcgen05Commit" =>
             {
                 if let Some(pending) = undrained_async.get(&scope.stream_id) {
-                    committed
-                        .entry(MbarKey::from_target(target))
-                        .or_default()
-                        .extend(pending.iter().copied());
+                    let key = MbarKey::from_target(target);
+                    let watermark = handed.entry((key.clone(), scope.stream_id)).or_insert(0);
+                    if *watermark < pending.len() {
+                        committed
+                            .entry(key)
+                            .or_default()
+                            .extend(pending[*watermark..].iter().copied());
+                        *watermark = pending.len();
+                    }
                 }
             }
-            TraceEventKind::MbarWait { target, .. } => {
-                if let Some(tracked) = committed.remove(&MbarKey::from_target(target)) {
+            TraceEventKind::MbarWait { target, scope, .. } => {
+                let key = MbarKey::from_target(target);
+                if let Some(tracked) = committed.remove(&key) {
                     for a in &tracked {
-                        if accesses[*a].drain_idx.is_none() {
-                            accesses[*a].drain_idx = Some(event_idx);
+                        let drains = &mut accesses[*a].drains;
+                        if !drains.iter().any(|(s, _)| *s == scope.stream_id) {
+                            drains.push((scope.stream_id, event_idx));
                         }
                     }
-                    for pending in undrained_async.values_mut() {
-                        pending.retain(|a| accesses[*a].drain_idx.is_none());
-                    }
+                    // The wait consumed this generation of the cell: later
+                    // commits start a new one, and every prior async access is
+                    // handed to it again (a commit covers EVERY async op the
+                    // warp issued before it) — reset the watermarks so the
+                    // next wait is an equally valid observation of them. The
+                    // accesses also stay in `undrained_async` (never purged):
+                    // the first wait's stream may simply never synchronize
+                    // with the band's freeing warp (a pacing wait on a
+                    // commit-multicast SMEM-ring cell is not the observer the
+                    // teardown orders against; the epilogue's tmem_full wait
+                    // is).
+                    handed.retain(|(cell, _), _| *cell != key);
                 }
             }
             TraceEventKind::TmemDealloc { region, .. } => {
@@ -1686,33 +1754,65 @@ fn tmem_lifecycle_order_local(cx: &mut CheckerCx<'_>) -> CheckResult {
         if let Some(dealloc_idx) = generation.dealloc_idx {
             // Ordering the ISSUE before the free is not enough for an async
             // access: a barrier orders instruction streams, it does not drain
-            // an engine. The free must be ordered after the COMPLETION
+            // an engine. The free must be ordered after a COMPLETION
             // OBSERVATION — `tcgen05.wait::ld/st` for a load or store, the
-            // wait on the mbarrier a `tcgen05.commit` handed the work to for
-            // an mma or cp.
-            let must_precede = access.drain_idx.unwrap_or(*access_idx);
-            if !cx.ordering().happens_before(must_precede, dealloc_idx) {
-                let event = cx.event_index.events.get(dealloc_idx);
-                let message = if access.drain_idx.is_some() {
-                    "TMEM deallocation has no happens-before edge from the drain that retires \
-                     an access of that generation; a barrier orders the issue, it does not \
-                     complete the access"
-                } else {
+            // wait on an mbarrier a `tcgen05.commit` handed the work to for
+            // an mma or cp. Any covering commit's cell yields a valid
+            // observation (the commit tracks every prior async op of the
+            // warp), so the free needs a happens-before edge from ONE
+            // recorded drain, not from a particular one.
+            let observed_before_free = access
+                .drains
+                .iter()
+                .any(|(_, d)| cx.ordering().happens_before(*d, dealloc_idx));
+            if !observed_before_free {
+                if access.drains.is_empty()
+                    && cx.ordering().happens_before(*access_idx, dealloc_idx)
+                {
+                    return Err(cx.fail(
+                        "tmem_lifecycle_use_not_drained",
+                        "TMEM access is never observed to complete — a `tcgen05.wait` of its \
+                         kind for a load or store, an awaited `tcgen05.commit` for an mma or \
+                         cp — so it is not known to have landed before the band is freed",
+                        cx.event_index.events.get(*access_idx),
+                    ));
+                }
+                let message = if access.drains.is_empty() {
                     "TMEM deallocation has no happens-before edge from an access of that \
                      generation; every accessing warp must be ordered before the free"
+                } else {
+                    "TMEM deallocation has no happens-before edge from any drain that retires \
+                     an access of that generation; a barrier orders the issue, it does not \
+                     complete the access"
                 };
+                let event = cx.event_index.events.get(dealloc_idx);
                 return Err(cx.fail("tmem_lifecycle_hb_missing", message, event));
             }
-            if access.drain_idx.is_none() {
-                let event = cx.event_index.events.get(*access_idx);
-                return Err(cx.fail(
-                    "tmem_lifecycle_use_not_drained",
-                    "TMEM access is never observed to complete — a `tcgen05.wait` of its kind \
-                     for a load or store, an awaited `tcgen05.commit` for an mma or cp — so it \
-                     is not known to have landed before the band is freed",
-                    event,
-                ));
-            }
+        }
+    }
+
+    // GENERATION-INTERNAL: the free must also follow its own allocation. For a
+    // generation with accesses this is already implied — binding proves
+    // HB(alloc, access) and the drain rule proves HB(access, dealloc) — but an
+    // access-less band allocated on one warp and freed on another with no
+    // synchronization would otherwise pass on the strength of the sampled
+    // order alone. (Checked LAST: an unsynchronized split usually ALSO strands
+    // an access, and the access-binding diagnostic is the more actionable
+    // one.)
+    for generation in &generations {
+        let Some(dealloc_idx) = generation.dealloc_idx else {
+            continue;
+        };
+        if !cx
+            .ordering()
+            .happens_before(generation.alloc_idx, dealloc_idx)
+        {
+            let event = cx.event_index.events.get(dealloc_idx);
+            return Err(cx.fail(
+                "tmem_lifecycle_hb_missing",
+                "TMEM deallocation has no happens-before edge from its allocation",
+                event,
+            ));
         }
     }
     Ok(())
@@ -2454,9 +2554,7 @@ fn record_reg_operand(tensors: &mut HashMap<u32, TensorInfo>, operand: &crate::i
 fn walk_tensors(body: &[Stmt], tensors: &mut HashMap<u32, TensorInfo>) {
     for stmt in body {
         match stmt {
-            Stmt::TensorDef { tensor }
-            | Stmt::TmemAlloc { tensor, .. }
-            | Stmt::TmemDealloc { tensor, .. } => record_tensor(tensors, tensor),
+            Stmt::TensorDef { tensor } => record_tensor(tensors, tensor),
             Stmt::StoreScalar { dst, .. } => record_slice(tensors, dst),
             Stmt::TmaLoad { dst, src, .. } => {
                 record_slice(tensors, dst);
@@ -2476,17 +2574,28 @@ fn walk_tensors(body: &[Stmt], tensors: &mut HashMap<u32, TensorInfo>) {
             Stmt::GmemAtomicAdd { sem, .. } | Stmt::GmemWaitEq { sem, .. } => {
                 record_slice(tensors, sem);
             }
-            Stmt::Tcgen05Mma { dst, a, b, .. } => {
-                record_slice(tensors, dst);
-                record_slice(tensors, a);
-                record_slice(tensors, b);
+            Stmt::Tcgen05Mma { a, b, .. } => {
+                // TMEM operands (dst/sfa/sfb, and a/b in TmemOperand form) carry
+                // no tensor — the checker's TMEM windows key on physical boxes.
+                for op in [a, b] {
+                    if let crate::ir::MmaOperand::Slice(s) = op {
+                        record_slice(tensors, s);
+                    }
+                }
             }
-            Stmt::Tcgen05Ld { dst, src, .. } => {
-                record_slice(tensors, dst);
-                record_tensor(tensors, src);
+            Stmt::Tcgen05Cp { src, .. } => {
+                record_slice(tensors, src);
             }
-            Stmt::Tcgen05St { dst, src, .. } => {
-                record_tensor(tensors, dst);
+            Stmt::ClcTryCancel { handle, .. } => {
+                record_tensor(tensors, handle);
+            }
+            Stmt::ClcQueryCancel { handle, .. } => {
+                record_tensor(tensors, handle);
+            }
+            Stmt::Tcgen05Ld { dst, .. } => {
+                record_slice(tensors, dst);
+            }
+            Stmt::Tcgen05St { src, .. } => {
                 record_slice(tensors, src);
             }
             Stmt::LdMatrix { dst, src, .. }
@@ -2820,6 +2929,7 @@ impl BlockingGraph {
         let mut nodes = Vec::new();
         collect_mbar_blockers(events, &mut nodes)?;
         collect_sync_blockers(events, &mut nodes)?;
+        collect_cluster_barrier_blockers(events, &mut nodes)?;
         collect_wait_group_blockers(events, &mut nodes)?;
         collect_tmem_wait_blockers(events, &mut nodes)?;
         // Edges feed only `find_cycle`, which is disabled (see DETECT_WAIT_FOR_CYCLES).
@@ -3149,6 +3259,57 @@ fn collect_sync_blockers(
     Ok(())
 }
 
+fn collect_cluster_barrier_blockers(
+    events: &[TraceEvent],
+    nodes: &mut Vec<BlockingNode>,
+) -> Result<(), DeadlockGraphError> {
+    // The split cluster barrier: a passing wait must have the full cluster
+    // arrival set as its release witness (the wait blocks until then at runtime;
+    // on a completed trace the witness must be present).
+    let mut arrivals: HashMap<usize, (usize, usize, Vec<usize>)> = HashMap::new();
+    for (idx, event) in events.iter().enumerate() {
+        if let TraceEventKind::ClusterBarrierArrive {
+            thread_count,
+            count,
+            scope,
+            ..
+        } = &event.payload
+        {
+            let entry = arrivals.entry(scope.cluster_id).or_default();
+            entry.0 = *thread_count;
+            entry.1 = *count;
+            entry.2.push(idx);
+        }
+    }
+    for (idx, event) in events.iter().enumerate() {
+        let TraceEventKind::ClusterBarrierWait { scope } = &event.payload else {
+            continue;
+        };
+        let Some((thread_count, count, arrives)) = arrivals.get(&scope.cluster_id) else {
+            return Err(DeadlockGraphError::failed(
+                "deadlock_freedom_missing_release_witness",
+                "cluster barrier wait has no arrive release witness",
+                idx,
+                format!("cluster_barrier:cluster{}", scope.cluster_id),
+            ));
+        };
+        if count < thread_count {
+            return Err(DeadlockGraphError::failed(
+                "deadlock_freedom_missing_release_witness",
+                "cluster barrier wait does not have enough arrivals to release it",
+                idx,
+                format!("cluster_barrier:cluster{}", scope.cluster_id),
+            ));
+        }
+        nodes.push(BlockingNode {
+            event_idx: idx,
+            resource_key: format!("cluster_barrier:cluster{}", scope.cluster_id),
+            release_events: arrives.clone(),
+        });
+    }
+    Ok(())
+}
+
 fn collect_wait_group_blockers(
     events: &[TraceEvent],
     nodes: &mut Vec<BlockingNode>,
@@ -3281,6 +3442,8 @@ fn event_kind_name(payload: &TraceEventKind) -> &'static str {
         TraceEventKind::SemAcquire { .. } => "sem_acquire",
         TraceEventKind::TmemAlloc { .. } => "tmem_alloc",
         TraceEventKind::TmemDealloc { .. } => "tmem_dealloc",
+        TraceEventKind::ClusterBarrierArrive { .. } => "cluster_barrier_arrive",
+        TraceEventKind::ClusterBarrierWait { .. } => "cluster_barrier_wait",
         TraceEventKind::SchedulerNext { .. } => "scheduler_next",
     }
 }
@@ -3304,6 +3467,8 @@ fn event_scope(payload: &TraceEventKind) -> Option<&super::protocol::AccessScope
         | TraceEventKind::SemAcquire { scope, .. }
         | TraceEventKind::TmemAlloc { scope, .. }
         | TraceEventKind::TmemDealloc { scope, .. }
+        | TraceEventKind::ClusterBarrierArrive { scope, .. }
+        | TraceEventKind::ClusterBarrierWait { scope, .. }
         | TraceEventKind::SchedulerNext { scope, .. } => Some(scope),
     }
 }
@@ -3606,6 +3771,35 @@ impl OrderingAnalysis {
         // cross-stream HB(producer-of-value.add, waiter.post-wait): stream t's reduce-add +
         // drain happens-before stream t+1's acquire happens-before stream t+1's reduce-add.
         let mut sem_releases: HashMap<(SemKey, i64), Clock> = HashMap::new();
+        // Split cluster barrier (ClusterBarrierArrive + per-warp waits). The
+        // arrive's memory semantics come from the trace event's `sem`: a
+        // `.relaxed` arrival (canon's emission) carries NO release ordering of
+        // its own (PTX §9.7.14.3) — it unblocks the per-warp waits (CONTROL
+        // order, witnessed by the deadlock graph's arrival-set check) but
+        // publishes no clock here. A `.release` arrival publishes its clock
+        // into `cb_arrival`; once every cluster thread has arrived the join
+        // becomes `cb_release`, which each passing ClusterBarrierWait acquires.
+        //
+        // FENCE-SEALED relaxed arrive (canon's actual memory-order mechanism):
+        // the prologue emits `fence.proxy_async` and `fence.mbarrier_init` (a
+        // cluster-scope release fence, PTX `fence.mbarrier_init.release.cluster`)
+        // BEFORE the relaxed arrive — fence-synchronization (release-side
+        // fence, the relaxed atomic arrive on the barrier state, the wait's
+        // built-in acquire) DOES establish memory HB. So a relaxed arrival
+        // whose stream executed a release-side fence (ProxyAsync / MbarrierInit)
+        // publishes exactly like a release one; an unfenced relaxed arrival
+        // publishes nothing. (hb_control vs hb_memory: the deadlock/wait
+        // witnesses in `DeadlockGraph` are event-presence based — the control
+        // relation — while every `happens_before` consumer below is a MEMORY
+        // check: races, async windows, TMEM lifetime. So the single clock
+        // relation is exactly hb_memory.)
+        let mut cb_arrival: HashMap<usize, Clock> = HashMap::new();
+        let mut cb_release: HashMap<usize, Clock> = HashMap::new();
+        // Streams that executed a release-side fence (fence.proxy_async /
+        // fence.mbarrier_init) so far in trace order. A stream is one (cta,
+        // warp) chain for the whole kernel, so the seal is per-stream — the
+        // warp-model form of #18's per-(cta, warp) fenced chains.
+        let mut fenced_streams: HashSet<usize> = HashSet::new();
         for event in events.iter() {
             let Some(scope) = event_scope(&event.payload) else {
                 meta.push(no_scope.clone());
@@ -3650,6 +3844,15 @@ impl OrderingAnalysis {
                 TraceEventKind::SemAcquire { key, value, .. } => {
                     if let Some(release_clock) = sem_releases.get(&(*key, *value)) {
                         states[stream_id].acquire(mask, release_clock);
+                    }
+                }
+                // acquire: the split cluster barrier's wait joins the cluster's full
+                // arrival clock — published only by `.release` (or fence-sealed
+                // relaxed) arrivals (a bare relaxed barrier publishes nothing, so
+                // the wait acquires nothing either).
+                TraceEventKind::ClusterBarrierWait { .. } => {
+                    if let Some(rel) = cb_release.get(&scope.cluster_id) {
+                        states[stream_id].acquire(mask, rel);
                     }
                 }
                 _ => {}
@@ -3781,6 +3984,46 @@ impl OrderingAnalysis {
                         (*key, *new_value),
                         states[stream_id].published(stream_id, mask, ordinal),
                     );
+                }
+                // split cluster barrier arrive: a `.release` arrival publishes this
+                // stream's clock into the cluster accumulator; once every cluster
+                // thread has arrived the join becomes the release the per-warp
+                // waits acquire. A `.relaxed` arrival publishes ONLY when its
+                // stream is fence-sealed (canon's prologue fence.proxy_async /
+                // fence.mbarrier_init — the release-side fence of the
+                // fence-synchronization pattern); a bare relaxed arrival publishes
+                // NOTHING (PTX §9.7.14.3: no visibility guarantee for pre-arrive
+                // accesses) — the wait still unblocks (control order,
+                // deadlock-witnessed) but no memory happens-before edge forms.
+                TraceEventKind::ClusterBarrierArrive {
+                    thread_count,
+                    count,
+                    sem,
+                    ..
+                } => {
+                    let publishes = *sem == super::protocol::ClusterBarrierSemEvent::Release
+                        || fenced_streams.contains(&stream_id);
+                    if publishes {
+                        let published = states[stream_id].published(stream_id, mask, ordinal);
+                        let acc = cb_arrival.entry(scope.cluster_id).or_default();
+                        join_clock(acc, &published);
+                        if count >= thread_count {
+                            cb_release.insert(scope.cluster_id, acc.clone());
+                        }
+                    }
+                }
+                // release-side fence (fence.proxy_async / fence.mbarrier_init):
+                // seal the executing stream — a later RELAXED cluster-barrier
+                // arrive from this stream fence-synchronizes (publishes its
+                // clock). The sim-only Generic markers seal nothing.
+                TraceEventKind::Fence { fence_kind, .. }
+                    if matches!(
+                        fence_kind,
+                        super::protocol::FenceEventKind::ProxyAsync
+                            | super::protocol::FenceEventKind::MbarrierInit
+                    ) =>
+                {
+                    fenced_streams.insert(stream_id);
                 }
                 _ => {}
             }
@@ -5497,6 +5740,78 @@ mod tests {
     }
 
     #[test]
+    fn tmem_lifecycle_rejects_unsynchronized_dealloc() {
+        // Alloc on stream 0, the matching dealloc on stream 1, no
+        // synchronization and no accesses: the sampled order pairs them, but
+        // no happens-before edge carries the allocation to the freeing warp.
+        let kernel = empty_kernel("tmem_lifecycle_unsync_dealloc", vec![]);
+        let region = tmem_region(0, 32);
+        let events = vec![
+            event(
+                1,
+                TraceEventKind::TmemAlloc {
+                    cta_ids: vec![0],
+                    region: region.clone(),
+                    scope: scope(0),
+                },
+            ),
+            event(
+                2,
+                TraceEventKind::TmemDealloc {
+                    cta_ids: vec![0],
+                    region,
+                    scope: scope(1),
+                },
+            ),
+        ];
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(report.status, ProtocolStatus::Failed);
+        assert_eq!(
+            pass_status(&report, "tmem_lifecycle_order"),
+            ProtocolStatus::Failed
+        );
+    }
+
+    #[test]
+    fn tmem_lifecycle_accepts_same_stream_dealloc() {
+        // Same-stream alloc -> dealloc: program order supplies the
+        // generation-internal edge (no accesses to bind or drain).
+        let kernel = empty_kernel("tmem_lifecycle_same_stream", vec![]);
+        let region = tmem_region(0, 32);
+        let events = vec![
+            event(
+                1,
+                TraceEventKind::TmemAlloc {
+                    cta_ids: vec![0],
+                    region: region.clone(),
+                    scope: scope(0),
+                },
+            ),
+            event(
+                2,
+                TraceEventKind::TmemDealloc {
+                    cta_ids: vec![0],
+                    region,
+                    scope: scope(0),
+                },
+            ),
+        ];
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(
+            pass_status(&report, "tmem_lifecycle_order"),
+            ProtocolStatus::Passed
+        );
+    }
+
+    #[test]
     fn tmem_async_hazard_rejects_same_stream_overlap_before_wait() {
         let kernel = empty_kernel("tmem_async_overlap", vec![]);
         let region = tmem_region(0, 32);
@@ -5667,5 +5982,694 @@ mod tests {
             ProtocolStatus::Passed
         );
         assert!(diagnostic_codes(&report).contains("memory_data_race"));
+    }
+
+    // ===================== TMEM lifecycle HB (generation intervals) =====================
+
+    fn scope_cta(
+        stream_id: usize,
+        cta_id: usize,
+        cluster_id: usize,
+    ) -> super::super::protocol::AccessScope {
+        super::super::protocol::AccessScope {
+            stream_id,
+            cluster_id,
+            cta_id,
+            ctaid_in_cluster: cta_id,
+            lane_count: 32,
+            warp_id: 0,
+            active_lanes: 0xFFFF_FFFF,
+        }
+    }
+
+    fn tmem_ld(stream: usize) -> TraceEvent {
+        event(
+            7,
+            TraceEventKind::Read {
+                region: tmem_region(0, 32),
+                proxy: MemoryProxy::Async,
+                access_kind: MemoryAccessKind::Tmem(TmemAsyncKind::Ld),
+                scope: scope(stream),
+            },
+        )
+    }
+
+    fn tmem_alloc_event(stream: usize) -> TraceEvent {
+        event(
+            1,
+            TraceEventKind::TmemAlloc {
+                cta_ids: vec![0],
+                region: tmem_region(0, 32),
+                scope: scope(stream),
+            },
+        )
+    }
+
+    fn tmem_dealloc_event(stream: usize) -> TraceEvent {
+        event(
+            2,
+            TraceEventKind::TmemDealloc {
+                cta_ids: vec![0],
+                region: tmem_region(0, 32),
+                scope: scope(stream),
+            },
+        )
+    }
+
+    /// One CTA barrier passage for `stream` (stmt id 10 for both halves — the
+    /// interpreter anchors a barrier's SyncArrive and Sync to the SAME
+    /// statement, and the HB release key carries it): arrive at full count,
+    /// then pass. The completing arrival freezes the generation join; every
+    /// Sync acquires it.
+    fn cta_sync_events(stream: usize, thread_count: usize, cycle: u64) -> Vec<TraceEvent> {
+        vec![
+            event(
+                10,
+                TraceEventKind::SyncArrive {
+                    sync_kind: "cta".into(),
+                    thread_count,
+                    count: thread_count,
+                    cycle,
+                    bar_id: None,
+                    scope: scope(stream),
+                },
+            ),
+            event(
+                10,
+                TraceEventKind::Sync {
+                    sync_kind: "cta".into(),
+                    thread_count,
+                    cycle,
+                    bar_id: None,
+                    scope: scope(stream),
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn tmem_lifecycle_rejects_unsynchronized_cross_warp_order() {
+        // The motivating case: three mutually-unsynchronized warps alloc / ld /
+        // dealloc one TMEM band. The SAMPLED order (alloc -> ld -> dealloc)
+        // covers the access, so the old sampled-order check passed it — but a
+        // legal hardware interleaving runs the ld (or the dealloc) first. The
+        // HB-based check must reject: the ld binds to NO generation (no alloc is
+        // happens-before it) -> use-without-allocation.
+        let kernel = empty_kernel("tmem_lifecycle_hb", vec![]);
+        let events = vec![tmem_alloc_event(0), tmem_ld(1), tmem_dealloc_event(2)];
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(report.status, ProtocolStatus::Failed);
+        assert_eq!(
+            pass_status(&report, "tmem_lifecycle_order"),
+            ProtocolStatus::Failed
+        );
+        assert!(diagnostic_codes(&report).contains("tmem_lifecycle_use_without_allocation"));
+    }
+
+    #[test]
+    fn tmem_lifecycle_rejects_dealloc_without_access_edge() {
+        // alloc and ld are ordered (both before the same barrier), but the
+        // dealloc runs on a warp with no edge from the ld.
+        let kernel = empty_kernel("tmem_lifecycle_hb_dealloc", vec![]);
+        let mut events = vec![tmem_alloc_event(0)];
+        events.extend(cta_sync_events(0, 64, 0));
+        events.extend(cta_sync_events(1, 64, 0));
+        events.push(tmem_ld(1));
+        events.push(tmem_dealloc_event(2));
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(report.status, ProtocolStatus::Failed);
+        assert_eq!(
+            pass_status(&report, "tmem_lifecycle_order"),
+            ProtocolStatus::Failed
+        );
+        assert!(diagnostic_codes(&report).contains("tmem_lifecycle_hb_missing"));
+    }
+
+    // ===================== split cluster barrier (sem + fence seal) =====================
+
+    fn cluster_arrive(
+        stream: usize,
+        count: usize,
+        sem: super::super::protocol::ClusterBarrierSemEvent,
+    ) -> TraceEvent {
+        event(
+            12,
+            TraceEventKind::ClusterBarrierArrive {
+                thread_count: 96,
+                count,
+                sem,
+                scope: scope(stream),
+            },
+        )
+    }
+
+    fn cluster_wait(stream: usize) -> TraceEvent {
+        event(
+            13,
+            TraceEventKind::ClusterBarrierWait {
+                scope: scope(stream),
+            },
+        )
+    }
+
+    /// The prologue shape: every warp arrives (sem), the consumer warps wait,
+    /// then touch TMEM. alloc on warp 0, ld on warp 1. The split cluster
+    /// barrier is ONE-SHOT (the interpreter rejects re-entry), so its HB role
+    /// is the prologue alloc -> consumer-access edge; the teardown dealloc
+    /// edge is the mbar pipeline's / fused barrier's job (the sibling tests).
+    fn split_barrier_tmem_events(
+        sem: super::super::protocol::ClusterBarrierSemEvent,
+    ) -> Vec<TraceEvent> {
+        vec![
+            tmem_alloc_event(0),
+            cluster_arrive(0, 32, sem),
+            cluster_arrive(1, 64, sem),
+            cluster_arrive(2, 96, sem),
+            cluster_wait(1),
+            tmem_ld(1),
+            cluster_wait(2),
+        ]
+    }
+
+    #[test]
+    fn tmem_lifecycle_accepts_split_cluster_barrier_order() {
+        // The overlap prologue shape: a split cluster barrier with RELEASE
+        // arrivals orders the init alloc before the consumer's access (the
+        // band is never freed here — nothing more to prove).
+        let kernel = empty_kernel("tmem_lifecycle_hb_cluster_barrier", vec![]);
+        let events =
+            split_barrier_tmem_events(super::super::protocol::ClusterBarrierSemEvent::Release);
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(
+            report.status,
+            ProtocolStatus::Passed,
+            "{:?}",
+            report.diagnostics
+        );
+        assert_eq!(
+            pass_status(&report, "tmem_lifecycle_order"),
+            ProtocolStatus::Passed
+        );
+    }
+
+    #[test]
+    fn tmem_lifecycle_rejects_relaxed_cluster_barrier_order() {
+        // The relaxed twin: same barrier shape, but `.relaxed` arrivals carry no
+        // memory HB, so the lifecycle proof MUST fail — canon's relaxed barrier
+        // is never what orders TMEM lifetime (the mbarrier pipeline is).
+        let kernel = empty_kernel("tmem_lifecycle_hb_cluster_barrier_relaxed", vec![]);
+        let events =
+            split_barrier_tmem_events(super::super::protocol::ClusterBarrierSemEvent::Relaxed);
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(
+            pass_status(&report, "tmem_lifecycle_order"),
+            ProtocolStatus::Failed
+        );
+        // relaxed arrivals give no HB(alloc, ld) — the ld binds to no generation.
+        assert!(diagnostic_codes(&report).contains("tmem_lifecycle_use_without_allocation"));
+        // ...while the control-order witness (deadlock) still passes.
+        assert_eq!(
+            pass_status(&report, "deadlock_freedom"),
+            ProtocolStatus::Passed
+        );
+    }
+
+    #[test]
+    fn tmem_lifecycle_rejects_split_cluster_barrier_without_wait() {
+        // Arrives alone do not order a consumer that never waits: the access
+        // can run before the barrier completes — it binds to NO generation.
+        let kernel = empty_kernel("tmem_lifecycle_hb_cluster_barrier_neg", vec![]);
+        let events = vec![
+            tmem_alloc_event(0),
+            cluster_arrive(
+                0,
+                32,
+                super::super::protocol::ClusterBarrierSemEvent::Release,
+            ),
+            cluster_arrive(
+                1,
+                64,
+                super::super::protocol::ClusterBarrierSemEvent::Release,
+            ),
+            cluster_arrive(
+                2,
+                96,
+                super::super::protocol::ClusterBarrierSemEvent::Release,
+            ),
+            tmem_ld(1),
+            tmem_dealloc_event(2),
+        ];
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(
+            pass_status(&report, "tmem_lifecycle_order"),
+            ProtocolStatus::Failed
+        );
+        assert!(diagnostic_codes(&report).contains("tmem_lifecycle_use_without_allocation"));
+    }
+
+    /// One cluster of two CTAs, one warp each: CTA0's warp writes the peer's
+    /// SMEM (DSMEM), both CTAs arrive (with `sem`), CTA1's warp waits then reads
+    /// its own SMEM. idx: write=0, arrive0=1, arrive1=2, wait=3, read=4.
+    fn cluster_barrier_peer_smem_events(
+        sem: super::super::protocol::ClusterBarrierSemEvent,
+    ) -> Vec<TraceEvent> {
+        vec![
+            event(
+                10,
+                TraceEventKind::Write {
+                    region: smem_region(1, 0, 64),
+                    proxy: MemoryProxy::Generic,
+                    access_kind: MemoryAccessKind::Tensor(TensorAccessKind::Generic),
+                    scope: scope_cta(0, 0, 0),
+                },
+            ),
+            event(
+                11,
+                TraceEventKind::ClusterBarrierArrive {
+                    thread_count: 64,
+                    count: 32,
+                    sem,
+                    scope: scope_cta(0, 0, 0),
+                },
+            ),
+            event(
+                11,
+                TraceEventKind::ClusterBarrierArrive {
+                    thread_count: 64,
+                    count: 64,
+                    sem,
+                    scope: scope_cta(1, 1, 0),
+                },
+            ),
+            event(
+                12,
+                TraceEventKind::ClusterBarrierWait {
+                    scope: scope_cta(1, 1, 0),
+                },
+            ),
+            event(
+                13,
+                TraceEventKind::Read {
+                    region: smem_region(1, 0, 64),
+                    proxy: MemoryProxy::Generic,
+                    access_kind: MemoryAccessKind::Tensor(TensorAccessKind::Generic),
+                    scope: scope_cta(1, 1, 0),
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn relaxed_cluster_barrier_arrive_creates_no_memory_hb() {
+        // NEGATIVE (race): the relaxed arrive unblocks CTA1's wait, but no memory
+        // HB closes the cross-CTA write->read — the race check MUST still fire.
+        let kernel = empty_kernel("cluster_barrier_relaxed_race", vec![]);
+        let events = cluster_barrier_peer_smem_events(
+            super::super::protocol::ClusterBarrierSemEvent::Relaxed,
+        );
+        let ordering = OrderingAnalysis::new(&events);
+        assert!(!ordering.happens_before(0, 4));
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(
+            pass_status(&report, "memory_race_check"),
+            ProtocolStatus::Failed
+        );
+        assert!(diagnostic_codes(&report).contains("memory_data_race"));
+        // POSITIVE (control): the relaxed arrivals still witness the wait — the
+        // deadlock pass is control-order based and must keep passing.
+        assert_eq!(
+            pass_status(&report, "deadlock_freedom"),
+            ProtocolStatus::Passed
+        );
+    }
+
+    #[test]
+    fn release_cluster_barrier_arrive_creates_memory_hb() {
+        // POSITIVE: a `.release` arrival publishes the stream's clock, so the
+        // wait acquires it and the cross-CTA write->read is ordered — no race.
+        let kernel = empty_kernel("cluster_barrier_release_ordered", vec![]);
+        let events = cluster_barrier_peer_smem_events(
+            super::super::protocol::ClusterBarrierSemEvent::Release,
+        );
+        let ordering = OrderingAnalysis::new(&events);
+        assert!(ordering.happens_before(0, 4));
+        assert!(!ordering.happens_before(4, 0));
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(
+            pass_status(&report, "memory_race_check"),
+            ProtocolStatus::Passed
+        );
+        assert_eq!(
+            pass_status(&report, "deadlock_freedom"),
+            ProtocolStatus::Passed
+        );
+    }
+
+    /// canon's prologue seal: `fence.mbarrier_init` (a cluster-scope release
+    /// fence) executed by the arriving warps before the relaxed arrive.
+    fn seal_fence(stream: usize, cta: usize) -> TraceEvent {
+        event(
+            9,
+            TraceEventKind::Fence {
+                fence_kind: super::super::protocol::FenceEventKind::MbarrierInit,
+                fence_scope: FenceScope::Cta,
+                scope: scope_cta(stream, cta, 0),
+            },
+        )
+    }
+
+    #[test]
+    fn fenced_relaxed_cluster_barrier_arrive_creates_memory_hb() {
+        // POSITIVE (canon's prologue shape): BOTH CTAs fence before their relaxed
+        // arrivals — fence-synchronization (release-side fence + relaxed atomic
+        // arrive + the wait's acquire) publishes the stream clocks, so the
+        // cross-CTA write->read is ordered. idx: fences=0,1 write=2 arrives=3,4
+        // wait=5 read=6.
+        let kernel = empty_kernel("cluster_barrier_fenced_relaxed", vec![]);
+        let mut events = vec![seal_fence(0, 0), seal_fence(1, 1)];
+        events.extend(cluster_barrier_peer_smem_events(
+            super::super::protocol::ClusterBarrierSemEvent::Relaxed,
+        ));
+        let ordering = OrderingAnalysis::new(&events);
+        assert!(ordering.happens_before(2, 6));
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(
+            pass_status(&report, "memory_race_check"),
+            ProtocolStatus::Passed
+        );
+    }
+
+    #[test]
+    fn partially_fenced_relaxed_arrive_publishes_nothing() {
+        // NEGATIVE: only CTA0 fenced — CTA1's bare relaxed arrival publishes
+        // nothing, the release never completes, and the race check still fires
+        // (fail closed on a partial fence seal).
+        let kernel = empty_kernel("cluster_barrier_partial_fence", vec![]);
+        let mut events = vec![seal_fence(0, 0)];
+        events.extend(cluster_barrier_peer_smem_events(
+            super::super::protocol::ClusterBarrierSemEvent::Relaxed,
+        ));
+        let ordering = OrderingAnalysis::new(&events);
+        assert!(!ordering.happens_before(1, 5));
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(
+            pass_status(&report, "memory_race_check"),
+            ProtocolStatus::Failed
+        );
+        assert!(diagnostic_codes(&report).contains("memory_data_race"));
+    }
+
+    // ===================== TMEM generation intervals =====================
+
+    #[test]
+    fn tmem_lifecycle_rejects_unsynchronized_realloc() {
+        // NEGATIVE: warp0 deallocs, warp1 RE-allocates the same band with NO
+        // synchronization. The sampled pairing alone accepted this; the
+        // cross-generation edge (dealloc_0 HB alloc_1) must reject it.
+        let kernel = empty_kernel("tmem_lifecycle_realloc", vec![]);
+        let events = vec![
+            tmem_alloc_event(0),
+            tmem_dealloc_event(0),
+            tmem_alloc_event(1), // re-alloc on warp1, no sync with warp0's dealloc
+            tmem_ld(1),
+            tmem_dealloc_event(1),
+        ];
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(report.status, ProtocolStatus::Failed);
+        assert_eq!(
+            pass_status(&report, "tmem_lifecycle_order"),
+            ProtocolStatus::Failed
+        );
+        assert!(diagnostic_codes(&report).contains("tmem_lifecycle_hb_missing"));
+    }
+
+    #[test]
+    fn tmem_lifecycle_accepts_same_warp_regeneration() {
+        // POSITIVE: one warp's legal alloc/dealloc/alloc/access/dealloc —
+        // program order supplies every edge, and the tcgen05.wait::ld retires
+        // the load before its band is freed. Binding (NOT HB(dealloc_0,
+        // access)) assigns the access to generation 1.
+        let kernel = empty_kernel("tmem_lifecycle_regen", vec![]);
+        let events = vec![
+            tmem_alloc_event(0),
+            tmem_dealloc_event(0),
+            tmem_alloc_event(0),
+            tmem_ld(0),
+            event(
+                8,
+                TraceEventKind::TmemWait {
+                    async_kind: TmemAsyncKind::Ld,
+                    scope: scope(0),
+                },
+            ),
+            tmem_dealloc_event(0),
+        ];
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(
+            report.status,
+            ProtocolStatus::Passed,
+            "{:?}",
+            report.diagnostics
+        );
+        assert_eq!(
+            pass_status(&report, "tmem_lifecycle_order"),
+            ProtocolStatus::Passed
+        );
+    }
+
+    #[test]
+    fn tmem_lifecycle_rejects_undrained_unordered_dealloc() {
+        // The consumer's tcgen05.ld is never drained and no sync carries it to
+        // the freeing warp either: the free has no edge from the access.
+        let kernel = empty_kernel("tmem_lifecycle_undrained", vec![]);
+        let mut events = vec![tmem_alloc_event(0)];
+        events.extend(cta_sync_events(0, 64, 0));
+        events.extend(cta_sync_events(1, 64, 0));
+        events.push(tmem_ld(1));
+        events.push(tmem_dealloc_event(0));
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(report.status, ProtocolStatus::Failed);
+        assert_eq!(
+            pass_status(&report, "tmem_lifecycle_order"),
+            ProtocolStatus::Failed
+        );
+        assert!(diagnostic_codes(&report).contains("tmem_lifecycle_hb_missing"));
+    }
+
+    #[test]
+    fn tmem_lifecycle_rejects_dealloc_when_drain_not_ordered() {
+        // Drained on its own stream, but the drain itself has no
+        // happens-before edge to the freeing warp: a drain proves COMPLETION,
+        // the free still needs the completion OBSERVED before it runs.
+        let kernel = empty_kernel("tmem_lifecycle_drain_unordered", vec![]);
+        let mut events = vec![tmem_alloc_event(0)];
+        events.extend(cta_sync_events(0, 64, 0));
+        events.extend(cta_sync_events(1, 64, 0));
+        events.push(tmem_ld(1));
+        events.push(event(
+            8,
+            TraceEventKind::TmemWait {
+                async_kind: TmemAsyncKind::Ld,
+                scope: scope(1),
+            },
+        ));
+        events.push(tmem_dealloc_event(0));
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(report.status, ProtocolStatus::Failed);
+        assert_eq!(
+            pass_status(&report, "tmem_lifecycle_order"),
+            ProtocolStatus::Failed
+        );
+        assert!(diagnostic_codes(&report).contains("tmem_lifecycle_hb_missing"));
+    }
+
+    /// A `tcgen05.cp` + two commits: the first cell's wait is a pacing wait on
+    /// a warp that never synchronizes with the freeing warp; the second
+    /// commit covers the cp again (a commit tracks EVERY prior async op of
+    /// the warp) and the epilogue-side wait on ITS cell is the ordered
+    /// observation the free needs. mbar ids: 0 = pacing cell, 1 = epilogue
+    /// cell.
+    fn two_commit_cp_events(second_commit: bool) -> Vec<TraceEvent> {
+        let cell_a = super::super::protocol::MbarTargetEvent {
+            mbar_id: 0,
+            ..mbar_target()
+        };
+        let cell_b = super::super::protocol::MbarTargetEvent {
+            mbar_id: 1,
+            ..mbar_target()
+        };
+        let mut events = vec![
+            event(
+                0,
+                TraceEventKind::MbarInit {
+                    target: cell_a.clone(),
+                    count: 1,
+                    scope: scope(0),
+                },
+            ),
+            event(
+                0,
+                TraceEventKind::MbarInit {
+                    target: cell_b.clone(),
+                    count: 1,
+                    scope: scope(0),
+                },
+            ),
+            tmem_alloc_event(0),
+            event(
+                7,
+                TraceEventKind::Write {
+                    region: tmem_region(0, 32),
+                    proxy: MemoryProxy::Async,
+                    access_kind: MemoryAccessKind::Tmem(TmemAsyncKind::Cp),
+                    scope: scope(0),
+                },
+            ),
+            TraceEvent::new(
+                20,
+                "Tcgen05Commit",
+                TraceEventKind::MbarArrive {
+                    target: cell_a,
+                    count: 1,
+                    scope: scope(0),
+                },
+            ),
+            // The pacing wait: a valid observation of the cp's completion,
+            // but stream 1 has no edge to the freeing warp below.
+            event(
+                21,
+                TraceEventKind::MbarWait {
+                    target: super::super::protocol::MbarTargetEvent {
+                        mbar_id: 0,
+                        ..mbar_target()
+                    },
+                    phase: 0,
+                    scope: scope(1),
+                },
+            ),
+        ];
+        if second_commit {
+            events.push(TraceEvent::new(
+                22,
+                "Tcgen05Commit",
+                TraceEventKind::MbarArrive {
+                    target: cell_b,
+                    count: 1,
+                    scope: scope(0),
+                },
+            ));
+            // The epilogue-side wait on the second commit's cell — ordered
+            // with the free by program order on stream 2.
+            events.push(event(
+                23,
+                TraceEventKind::MbarWait {
+                    target: super::super::protocol::MbarTargetEvent {
+                        mbar_id: 1,
+                        ..mbar_target()
+                    },
+                    phase: 0,
+                    scope: scope(2),
+                },
+            ));
+        }
+        events.push(tmem_dealloc_event(2));
+        events
+    }
+
+    #[test]
+    fn tmem_lifecycle_accepts_dealloc_when_any_covering_drain_is_ordered() {
+        // POSITIVE (canon's SMEM-ring pacing shape): the cp's completion is
+        // observed by BOTH a pacing wait (unordered with the free) and the
+        // epilogue-side wait on a LATER covering commit's cell (ordered by
+        // program order). One ordered observation suffices.
+        let kernel = empty_kernel("tmem_lifecycle_covering_commit", vec![]);
+        let events = two_commit_cp_events(true);
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(
+            report.status,
+            ProtocolStatus::Passed,
+            "{:?}",
+            report.diagnostics
+        );
+        assert_eq!(
+            pass_status(&report, "tmem_lifecycle_order"),
+            ProtocolStatus::Passed
+        );
+    }
+
+    #[test]
+    fn tmem_lifecycle_rejects_dealloc_when_no_covering_drain_is_ordered() {
+        // NEGATIVE twin: only the unordered pacing wait observed the cp — no
+        // later commit re-covers it into an ordered cell, so the free has no
+        // ordered observation and must fail.
+        let kernel = empty_kernel("tmem_lifecycle_no_covering_commit", vec![]);
+        let events = two_commit_cp_events(false);
+        let report = run_offline_checkers(
+            &kernel,
+            ProtocolReport::new(ProtocolStatus::Passed),
+            &events,
+        );
+        assert_eq!(report.status, ProtocolStatus::Failed);
+        assert_eq!(
+            pass_status(&report, "tmem_lifecycle_order"),
+            ProtocolStatus::Failed
+        );
+        assert!(diagnostic_codes(&report).contains("tmem_lifecycle_hb_missing"));
     }
 }

@@ -27,4 +27,4 @@ pub use smem::{dtype_size_bytes, tensor_byte_extent, SmemScratchpad, SmemValues}
 pub use tensors::{
     tensor_instance_key, DenseTensorValue, TensorInstanceKey, TensorOwner, TensorValues,
 };
-pub use tmem::{tmem_layout_for, tmem_physical_range, TmemScratchpad, TmemValues};
+pub use tmem::{TmemScratchpad, TmemValues};

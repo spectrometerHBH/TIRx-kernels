@@ -27,6 +27,148 @@ pub fn register(reg: &mut StmtExecutorRegistry) {
     reg.register(StmtKind::NamedBarrier, execute_sync);
     reg.register(StmtKind::WarpSync, execute_sync);
     reg.register(StmtKind::ClusterSync, execute_sync);
+    reg.register(
+        StmtKind::ClusterBarrierArrive,
+        execute_cluster_barrier_arrive,
+    );
+    reg.register(StmtKind::ClusterBarrierWait, execute_cluster_barrier_wait);
+}
+
+/// Split cluster barrier key — one hardware cluster barrier per cluster, used
+/// once in the prologue (a non-blocking collective arrive + per-warp waits).
+/// Keyed by cluster with a sentinel stmt id, so the CTA-scope arrive and the
+/// per-warp waits (different stmt_ids) reference the SAME arrival set.
+const CLUSTER_BARRIER_STMT_SENTINEL: usize = usize::MAX - 1;
+
+fn cluster_barrier_key(first: &ThreadId) -> SyncKey {
+    SyncKey {
+        stmt_id: CLUSTER_BARRIER_STMT_SENTINEL,
+        domain: (first.cluster_id, 0),
+    }
+}
+
+/// `barrier.cluster.arrive` (aligned): every cluster thread records its arrival
+/// and CONTINUES — non-blocking, unlike the fused `ClusterSync` rendezvous. The
+/// matching per-warp `ClusterBarrierWait`s block until the set is complete.
+/// Modeled as a one-shot collective (the prologue issues it exactly once before
+/// the warp branches diverge). The arrive emits a `ClusterBarrierArrive` trace
+/// event carrying the stmt's memory `sem`: canon's `.relaxed` carries NO
+/// release ordering (PTX §9.7.14.3), so the checker's ordering analysis only
+/// publishes a memory happens-before edge for `.release` (or a fence-sealed
+/// relaxed arrive); the deadlock graph witnesses the waits against the arrival
+/// set either way (control order).
+fn execute_cluster_barrier_arrive<'a, 'k>(
+    ctx: &mut WarpContext<'a, 'k>,
+    stmt: &'k Stmt,
+) -> IResult<StepStatus> {
+    let sem = match stmt {
+        Stmt::ClusterBarrierArrive { sem } => *sem,
+        _ => unreachable!(),
+    };
+    let first = ctx.lanes[0].clone();
+    let expected_ctas = cluster_cta_ids(ctx, &first);
+    let expected_count = expected_ctas.len() * ctx.kernel.num_warps as usize * 32;
+    let key = cluster_barrier_key(&first);
+    let stream_id = ctx.stream.stream_id;
+    let n = ctx.lanes.len();
+    {
+        let rec = ctx
+            .state
+            .values
+            .cooperative
+            .syncs
+            .entry(key)
+            .or_insert_with(SyncRecord::default);
+        if rec.expected_count == 0 {
+            rec.expected_count = expected_count;
+            rec.expected_ctas = expected_ctas;
+        }
+        if rec.arrived_streams.contains_key(&stream_id) {
+            return Err(InterpreterError::new(
+                "cluster_barrier_reentry",
+                "stream re-entered the one-shot cluster barrier arrive",
+            ));
+        }
+        if rec.arrived_count + n > rec.expected_count {
+            return Err(InterpreterError::new(
+                "cooperative_sync_mismatch",
+                "cluster barrier arrival set exceeds the cluster scope",
+            ));
+        }
+        rec.arrived_streams.insert(stream_id, n);
+        rec.arrived_count += n;
+        *rec.arrived_per_cta.entry(first.cta_id).or_insert(0) += n;
+    }
+    let count = ctx.state.values.cooperative.syncs[&key].arrived_count;
+    if ctx.trace_mode() {
+        ctx.emit(TraceEventKind::ClusterBarrierArrive {
+            thread_count: expected_count,
+            count,
+            sem: sem.into(),
+            scope: ctx.access_scope(),
+        })?;
+    }
+    Ok(StepStatus::advance())
+}
+
+/// `barrier.cluster.wait` (per warp): block until ALL cluster threads have
+/// executed `ClusterBarrierArrive`. A peer CTA that exits/goes missing without
+/// arriving makes the wait unsatisfiable — surfaced as a peer-liveness error
+/// (as for `ClusterSync`). The passing wait emits the ACQUIRE witness (hardware
+/// `barrier.cluster.wait` is `.acquire`): the checker joins the cluster's
+/// published arrival clock.
+fn execute_cluster_barrier_wait<'a, 'k>(
+    ctx: &mut WarpContext<'a, 'k>,
+    _stmt: &'k Stmt,
+) -> IResult<StepStatus> {
+    let first = ctx.lanes[0].clone();
+    let key = cluster_barrier_key(&first);
+    let complete = ctx
+        .state
+        .values
+        .cooperative
+        .syncs
+        .get(&key)
+        .is_some_and(SyncRecord::complete);
+    if complete {
+        if ctx.trace_mode() {
+            ctx.emit(TraceEventKind::ClusterBarrierWait {
+                scope: ctx.access_scope(),
+            })?;
+        }
+        return Ok(StepStatus::advance());
+    }
+    // Not complete: peer-liveness check before parking (a peer that will never
+    // arrive is an error, not a deadlock).
+    let expected_ctas = cluster_cta_ids(ctx, &first);
+    for cta_id in expected_ctas {
+        let arrived = ctx
+            .state
+            .values
+            .cooperative
+            .syncs
+            .get(&key)
+            .is_some_and(|rec| rec.arrived_per_cta.contains_key(&cta_id));
+        if arrived {
+            continue;
+        }
+        match ctx.cta_activity(cta_id) {
+            CtaActivityStatus::Missing => {
+                return Err(InterpreterError::new(
+                    "cluster_sync_peer_missing",
+                    "cluster sync peer CTA is missing",
+                ))
+            }
+            CtaActivityStatus::Exited => {
+                return Err(InterpreterError::new(
+                    "cluster_sync_peer_exited",
+                    "cluster sync peer CTA has exited",
+                ))
+            }
+            _ => {}
+        }
+    }
+    Ok(StepStatus::block(WakeCondition::Polled))
 }
 
 /// Named barriers rendezvous ACROSS statements: warpgroup A's `named_barrier(1)`
