@@ -531,6 +531,16 @@ pub enum Stmt {
         gmem_shape: Option<Vec<usize>>,
         mbar_stage: Option<ScalarValue>,
         multicast_cta_mask: Option<u16>,
+        /// L2 cache-eviction policy hint (canon's `cache_hint` on its g2c loads). `None`
+        /// = no hint; `Some(hint)` emits `cache_hint="<hint>"` (e.g. `"evict_normal"` —
+        /// a tile read once per k-tile should not pin an L2 line the next tile evicts
+        /// anyway). Codegen passes the string through; no value/protocol semantics.
+        cache_hint: Option<String>,
+        /// Prefetch the source tensormap at kernel entry (canon's config flag on its
+        /// g2c loads — hides the first descriptor fetch behind the prologue). A pure
+        /// HW hint with no value/protocol semantics, but IR-carried so the same IR
+        /// always produces the same code shape.
+        prefetch_tensormap: bool,
         cta_group: u8,
     },
     TmaStore {
@@ -552,6 +562,12 @@ pub enum Stmt {
         /// REJECTS a float reduce-add unless the kernel author sets this flag. With the
         /// flag set, the checker keeps its warning.
         allow_nondet_reduce: bool,
+        /// L2 eviction policy for the store (canon's epilogue store carries
+        /// `"evict_first"`: the output band is write-once, never re-read — dead lines
+        /// must not pack L2 and evict live operand tiles / tensormaps). `None` = no hint.
+        cache_hint: Option<String>,
+        /// Prefetch the destination tensormap, matching the canonical epilogue store.
+        prefetch_tensormap: bool,
     },
     /// `cp.async.bulk.shared::cluster.shared::cta` — async bulk copy from this CTA's
     /// SMEM (`src`) to a PEER CTA's SMEM (`dst`, the peer instance), signalling the

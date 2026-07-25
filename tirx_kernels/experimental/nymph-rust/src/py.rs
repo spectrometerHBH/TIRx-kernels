@@ -1255,13 +1255,14 @@ pub struct PyTensor(pub Arc<ir::Tensor>);
 #[pymethods]
 impl PyTensor {
     #[new]
-    #[pyo3(signature = (space, dtype, shape, layout = None, byte_offset = None))]
+    #[pyo3(signature = (space, dtype, shape, layout = None, byte_offset = None, reg_frag = None))]
     fn new(
         space: PyMemorySpace,
         dtype: PyDType,
         shape: Vec<usize>,
         layout: Option<Bound<'_, PyAny>>,
         byte_offset: Option<usize>,
+        reg_frag: Option<(String, Option<u32>)>,
     ) -> PyResult<Self> {
         let rust_space: ir::MemorySpace = space.into();
         if rust_space == ir::MemorySpace::Smem && byte_offset.is_none() {
@@ -1276,6 +1277,22 @@ impl PyTensor {
             Some(l) => Some(coerce_layout(&l)?),
             None => None,
         };
+        // `reg_frag=(instr_shape, cast_of)` — the stmatrix-atom fragment marker
+        // (codegen-only). `cast_of` is the read frag's tensor id.
+        let reg_frag = match reg_frag {
+            Some((instr_shape, cast_of)) => {
+                if rust_space != ir::MemorySpace::Reg {
+                    return Err(PyValueError::new_err(
+                        "reg_frag is only valid for REG tensors",
+                    ));
+                }
+                Some(ir::RegFrag::Stmatrix {
+                    instr_shape,
+                    cast_of,
+                })
+            }
+            None => None,
+        };
         Ok(PyTensor(Arc::new(ir::Tensor {
             id: fresh_tensor_id(),
             space: rust_space,
@@ -1283,6 +1300,7 @@ impl PyTensor {
             shape,
             layout,
             byte_offset,
+            reg_frag,
         })))
     }
     #[getter]
@@ -2114,7 +2132,7 @@ fn mbarrier_arrive_expect_tx(
     }))
 }
 #[pyfunction]
-#[pyo3(name = "TmaLoad", signature = (dst, src, mbar, coords, shape, gmem_shape = None, mbar_stage = None, multicast_cta_mask = None, cta_group = 1))]
+#[pyo3(name = "TmaLoad", signature = (dst, src, mbar, coords, shape, gmem_shape = None, mbar_stage = None, multicast_cta_mask = None, cache_hint = None, prefetch_tensormap = false, cta_group = 1))]
 #[allow(clippy::too_many_arguments)]
 fn tma_load(
     dst: Bound<'_, PyAny>,
@@ -2125,6 +2143,8 @@ fn tma_load(
     gmem_shape: Option<Vec<usize>>,
     mbar_stage: Option<Bound<'_, PyAny>>,
     multicast_cta_mask: Option<u16>,
+    cache_hint: Option<String>,
+    prefetch_tensormap: bool,
     cta_group: u8,
 ) -> PyResult<PyStmt> {
     Ok(PyStmt(ir::Stmt::TmaLoad {
@@ -2136,11 +2156,14 @@ fn tma_load(
         gmem_shape,
         mbar_stage: coerce_opt_scalar(mbar_stage)?,
         multicast_cta_mask,
+        cache_hint,
+        prefetch_tensormap,
         cta_group,
     }))
 }
 #[pyfunction]
-#[pyo3(name = "TmaStore", signature = (dst, src, coords, shape, gmem_shape = None, reduce_add = false, allow_nondet_reduce = false))]
+#[pyo3(name = "TmaStore", signature = (dst, src, coords, shape, gmem_shape = None, reduce_add = false, allow_nondet_reduce = false, cache_hint = None, prefetch_tensormap = false))]
+#[allow(clippy::too_many_arguments)]
 fn tma_store(
     dst: PyTensor,
     src: Bound<'_, PyAny>,
@@ -2149,6 +2172,8 @@ fn tma_store(
     gmem_shape: Option<Vec<usize>>,
     reduce_add: bool,
     allow_nondet_reduce: bool,
+    cache_hint: Option<String>,
+    prefetch_tensormap: bool,
 ) -> PyResult<PyStmt> {
     Ok(PyStmt(ir::Stmt::TmaStore {
         dst: dst.0,
@@ -2158,6 +2183,8 @@ fn tma_store(
         gmem_shape,
         reduce_add,
         allow_nondet_reduce,
+        cache_hint,
+        prefetch_tensormap,
     }))
 }
 #[pyfunction]

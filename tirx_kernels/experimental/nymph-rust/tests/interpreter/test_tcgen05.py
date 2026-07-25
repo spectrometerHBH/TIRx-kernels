@@ -1,5 +1,6 @@
 import numpy as np
 import nymph_rs as nr
+import pytest
 from helpers import (
     builder,
     expect_runtime_error,
@@ -8,7 +9,7 @@ from helpers import (
     reg_tensor,
     run,
     smem_tensor,
-    tmem_tensor,
+    tmem_band,
     u32,
 )
 
@@ -122,16 +123,21 @@ def u32_sentinels(rows, cols):
 
 def _tcgen05_role_failure_kernel(op, *, row=0, col=0, elected=False):
     b = builder("tcgen05_datapath_failure")
-    src = tmem_tensor(b, dtype=nr.DType.F32, shape=(128, 128), col_start=0)
+    band = tmem_band(dtype=nr.DType.F32)
     dst = reg_tensor(b, dtype=nr.DType.F32, shape=(1,))
+    # The (row, col) base rides runtime scalars so the out-of-range cases reach
+    # the interpreter's fail-closed checks instead of the static TmemOperand
+    # range validation at build time.
+    row_v = b.scalar(initial=row, dtype=nr.ScalarDType.I32)
+    col_v = b.scalar(initial=col, dtype=nr.ScalarDType.I32)
     with b.if_warp(0):
-        b.tmem_alloc(src, n_cols=64)
+        b.tmem_alloc(0, 64)
 
     def emit():
         if op == "ld":
-            b.tcgen05_ld(dst, src, row=row, col=col)
+            b.tcgen05_ld(dst, band.at(row_v, col_v))
         else:
-            b.tcgen05_st(src, dst, row=row, col=col)
+            b.tcgen05_st(band.at(row_v, col_v), dst)
 
     if elected:
         # A single-lane mask: ld/st are warp-collective, so this is the
@@ -162,7 +168,7 @@ def _reg_row_cols(b, tensor, col, cols):
 def _tcgen05_datapath_kernel(shape, num, mode):
     reg_size = register_count(shape, num)
     b = builder(f"tcgen05_{mode}_datapath")
-    tmem = tmem_tensor(b, dtype=nr.DType.U32, shape=(128, 256), col_start=0)
+    tmem = tmem_band(dtype=nr.DType.U32)
     seed_g = gmem_arg(b, shape=(128, 256))
     source_g = gmem_arg(b, shape=(128, reg_size))
     out = gmem_arg(b, shape=(128, 256 if mode == "st" else reg_size))
@@ -172,25 +178,25 @@ def _tcgen05_datapath_kernel(shape, num, mode):
     chunk_reg = reg_tensor(b, shape=(128,))
 
     with b.if_warp(0):
-        b.tmem_alloc(tmem, n_cols=256)
+        b.tmem_alloc(0, 256)
 
     with b.if_warpgroup(0):
         for col in [0, 128]:
             b.reg_load(seed_reg, _reg_row_cols(b, seed_g, col, 128))
-            b.tcgen05_st(tmem, seed_reg, shape="32x32b", num=128, row=0, col=col)
+            b.tcgen05_st(tmem.at(0, col), seed_reg, shape="32x32b", num=128)
 
         if mode == "st":
             b.reg_load(source_reg, _reg_row_cols(b, source_g, 0, reg_size))
-            b.tcgen05_st(tmem, source_reg, shape=shape, num=num, row=0, col=0)
+            b.tcgen05_st(tmem.at(0, 0), source_reg, shape=shape, num=num)
             for col in [0, 128]:
-                b.tcgen05_ld(chunk_reg, tmem, shape="32x32b", num=128, row=0, col=col)
+                b.tcgen05_ld(chunk_reg, tmem.at(0, col), shape="32x32b", num=128)
                 b.reg_store(_reg_row_cols(b, out, col, 128), chunk_reg)
         else:
-            b.tcgen05_ld(out_reg, tmem, shape=shape, num=num, row=0, col=0)
+            b.tcgen05_ld(out_reg, tmem.at(0, 0), shape=shape, num=num)
             b.reg_store(_reg_row_cols(b, out, 0, reg_size), out_reg)
 
     with b.if_warp(0):
-        b.tmem_dealloc(tmem, n_cols=256)
+        b.tmem_dealloc(0, 256)
 
     return b.build(), seed_g, source_g, out
 
@@ -250,14 +256,14 @@ def _mma64_kernel(dtype, lane_align, accum, trans_a, trans_b):
     out = gmem_arg(b, dtype=nr.DType.F32, shape=(128, n))
     a_s = smem_tensor(b, dtype=dtype, shape=a_shape, byte_offset=0)
     b_s = smem_tensor(b, dtype=dtype, shape=b_shape, byte_offset=a_bytes)
-    dst = tmem_tensor(b, dtype=nr.DType.F32, shape=(m, n), col_start=0, lane_align=lane_align)
+    dst = tmem_band(dtype=nr.DType.F32)
     frag = reg_tensor(b, dtype=nr.DType.F32, shape=(n,))
     ma = b.mbar(kind=nr.MBarKind.TMA)
     mb = b.mbar(kind=nr.MBarKind.TMA)
     mc = b.mbar(kind=nr.MBarKind.TCGEN05)
 
     with b.if_warp(0):
-        b.tmem_alloc(dst, n_cols=32)
+        b.tmem_alloc(0, 32)
         # mbarrier.init is per-thread: exactly one thread initializes each cell.
         with b.if_elected():
             b.mbarrier_init(ma, count=1)
@@ -269,7 +275,7 @@ def _mma64_kernel(dtype, lane_align, accum, trans_a, trans_b):
 
     with b.if_warpgroup(0):
         b.reg_load(frag, zero_g[b.tid_in_wg(), 0:n])
-        b.tcgen05_st(dst, frag, shape="32x32b", num=n, row=0, col=0)
+        b.tcgen05_st(dst.at(0, 0), frag, shape="32x32b", num=n)
         b.tcgen05_wait_st()
         # All four warps' seed stores must land before the single-thread MMA issue.
         b.wg_sync(barrier_id=1)
@@ -277,29 +283,47 @@ def _mma64_kernel(dtype, lane_align, accum, trans_a, trans_b):
         # issue — all in its own program order (single-thread instructions).
         with b.if_(b.tid_in_wg().eq(0)):
             b.mbarrier_arrive_expect_tx(ma, bytes=a_bytes)
-            b.tma_load(a_s, a_g, mbar=ma, bytes=a_bytes, coords=(0, 0), shape=a_shape)
+            b.tma_load(a_s, a_g, mbar=ma, coords=(0, 0), shape=a_shape)
             b.mbarrier_arrive_expect_tx(mb, bytes=b_bytes)
-            b.tma_load(b_s, b_g, mbar=mb, bytes=b_bytes, coords=(0, 0), shape=b_shape)
+            b.tma_load(b_s, b_g, mbar=mb, coords=(0, 0), shape=b_shape)
             b.mbarrier_wait(ma, phase=0)
             b.mbarrier_wait(mb, phase=0)
             b.tcgen05_mma(
-                dst, a_s, b_s, m=m, n=n, k=k, accum=False, trans_a=trans_a, trans_b=trans_b
+                dst.at(0, 0),
+                a_s,
+                b_s,
+                m=m,
+                n=n,
+                k=k,
+                accum=False,
+                trans_a=trans_a,
+                trans_b=trans_b,
+                lane_align=lane_align,
             )
             if accum:
                 b.tcgen05_mma(
-                    dst, a_s, b_s, m=m, n=n, k=k, accum=True, trans_a=trans_a, trans_b=trans_b
+                    dst.at(0, 0),
+                    a_s,
+                    b_s,
+                    m=m,
+                    n=n,
+                    k=k,
+                    accum=True,
+                    trans_a=trans_a,
+                    trans_b=trans_b,
+                    lane_align=lane_align,
                 )
             b.tcgen05_commit(mc)
         # Accumulator reads are released by the commit, not the issue.
         b.mbarrier_wait(mc, phase=0)
-        b.tcgen05_ld(frag, dst, shape="32x32b", num=n, row=0, col=0)
+        b.tcgen05_ld(frag, dst.at(0, 0), shape="32x32b", num=n)
         b.tcgen05_wait_ld()
         b.reg_store(out[b.tid_in_wg(), 0:n], frag)
 
     # Every warp's loads retire before the dealloc.
     b.cta_sync()
     with b.if_warp(0):
-        b.tmem_dealloc(dst, n_cols=32)
+        b.tmem_dealloc(0, 32)
 
     return b.build(), a_g, b_g, zero_g, out
 
@@ -345,40 +369,38 @@ def test_tcgen05_mma_m64_layout_f_transpose_accum_and_dtype():
                         assert got == expected
 
 
-def _build_mma_failure(
-    *,
-    dst_shape=(128, 16),
-    col_start=0,
-    lane_align=0,
-    a_shape=(128, 16),
-    dst_slice=None,
-    allocate=True,
-):
+def _build_mma_failure(*, a_shape=(128, 16), dst_row=0, dst_col=0, lane_align=0, allocate=True):
     b = builder("mma_failure", smem_size_bytes=1 << 16)
-    dst = tmem_tensor(
-        b, dtype=nr.DType.F32, shape=dst_shape, col_start=col_start, lane_align=lane_align
-    )
     a = smem_tensor(b, dtype=nr.DType.F16, shape=a_shape, byte_offset=0)
     b_s = smem_tensor(b, dtype=nr.DType.F16, shape=(16, 16), byte_offset=4096)
+    # The dst base rides runtime scalars so the offset/bounds/scratchpad cases
+    # reach the interpreter's fail-closed checks instead of the static
+    # TmemOperand / live-band validation at build time.
+    row_v = b.scalar(initial=dst_row, dtype=nr.ScalarDType.I32)
+    col_v = b.scalar(initial=dst_col, dtype=nr.ScalarDType.I32)
+    dst = nr.TmemOperand(row_v, col_v, nr.DType.F32)
     if allocate:
         with b.if_warp(0):
-            b.tmem_alloc(dst, n_cols=32)
+            b.tmem_alloc(0, 32)
     # tcgen05_mma is a single-thread instruction now; issue it from an elected
     # thread so each pinned validation code is reached (not tcgen05_mma_mask).
     with b.if_warp(0), b.if_elected():
-        b.tcgen05_mma(dst if dst_slice is None else dst_slice(dst), a, b_s, m=128, n=16, k=16)
+        b.tcgen05_mma(dst, a, b_s, m=128, n=16, k=16, lane_align=lane_align)
     return b.build()
 
 
 def test_tcgen05_mma_fail_closed_before_panics_or_wrong_writes():
-    with expect_runtime_error("tcgen05_mma_lane_align"):
-        run(_build_mma_failure(lane_align=16))
+    # lane_align lives on the MMA itself now; the validator rejects it for any
+    # non-(cta_group=1, m=64) layout at build time (no valid kernel can carry
+    # the shape the old runtime tcgen05_mma_lane_align check rejected).
+    with pytest.raises(ValueError, match=r"lane_align != 0 requires cta_group=1 and m=64"):
+        _build_mma_failure(lane_align=16)
 
     with expect_runtime_error("tcgen05_mma_dst_offset"):
-        run(_build_mma_failure(dst_shape=(129, 16), dst_slice=lambda dst: dst[1:129, :]))
+        run(_build_mma_failure(dst_row=1))
 
     with expect_runtime_error("tcgen05_mma_out_of_range"):
-        run(_build_mma_failure(col_start=500))
+        run(_build_mma_failure(dst_col=500))
 
     with expect_runtime_error("tcgen05_mma_shape"):
         run(_build_mma_failure(a_shape=(129, 16)))
@@ -393,8 +415,12 @@ def _tmem_operand_mma_kernel():
     p_g = gmem_arg(b, dtype=nr.DType.F16, shape=(128, k))
     b_g = gmem_arg(b, dtype=nr.DType.F16, shape=(n, k))
     out = gmem_arg(b, dtype=nr.DType.F32, shape=(128, n))
-    p = tmem_tensor(b, dtype=nr.DType.F16, shape=(m, k), col_start=0)
-    dst = tmem_tensor(b, dtype=nr.DType.F32, shape=(m, n), col_start=32)
+    # Two bands inside ONE 64-column allocation (the IR's lifecycle allows a
+    # single live base-0 band): the f16 A operand at col 0, the f32
+    # accumulator at col 32 — the same physical layout the old two-alloc form
+    # described.
+    p = tmem_band(dtype=nr.DType.F16, col0=0)
+    dst = tmem_band(dtype=nr.DType.F32, col0=32)
     b_s = smem_tensor(b, dtype=nr.DType.F16, shape=(n, k), byte_offset=0)
     p_frag = reg_tensor(b, dtype=nr.DType.F16, shape=(k,))
     out_frag = reg_tensor(b, dtype=nr.DType.F32, shape=(n,))
@@ -402,20 +428,19 @@ def _tmem_operand_mma_kernel():
     mc = b.mbar(kind=nr.MBarKind.TCGEN05)
 
     with b.if_warp(0):
-        b.tmem_alloc(p, n_cols=32)
-        b.tmem_alloc(dst, n_cols=32)
+        b.tmem_alloc(0, 64)
         # mbarrier.init is per-thread: one thread initializes each cell.
         with b.if_elected():
             b.mbarrier_init(mb, count=1)
             b.mbarrier_init(mc, count=1)
-    # Publish allocs + mbar cells to every warp stream.
+    # Publish alloc + mbar cells to every warp stream.
     b.cta_sync()
     with b.if_warpgroup(0):
         b.reg_fill(out_frag, 0.0)
-        b.tcgen05_st(dst, out_frag, shape="32x32b", num=n, row=0, col=0)
+        b.tcgen05_st(dst.at(0, 0), out_frag, shape="32x32b", num=n)
         b.tcgen05_wait_st()
         b.reg_load(p_frag, p_g[b.tid_in_wg(), 0:k])
-        b.tcgen05_st(p, p_frag[0 : k // 2], shape="32x32b", num=k // 2, row=0, col=0)
+        b.tcgen05_st(p.at(0, 0), p_frag[0 : k // 2], shape="32x32b", num=k // 2)
         b.tcgen05_wait_st()
         # All warps' TMEM operand/zero stores land before the MMA issue.
         b.wg_sync(barrier_id=1)
@@ -423,20 +448,19 @@ def _tmem_operand_mma_kernel():
         # issue + commit, in its own program order.
         with b.if_(b.tid_in_wg().eq(0)):
             b.mbarrier_arrive_expect_tx(mb, bytes=n * k * 2)
-            b.tma_load(b_s, b_g, mbar=mb, bytes=n * k * 2, coords=(0, 0), shape=(n, k))
+            b.tma_load(b_s, b_g, mbar=mb, coords=(0, 0), shape=(n, k))
             b.mbarrier_wait(mb, phase=0)
-            b.tcgen05_mma(dst, p, b_s, m=m, n=n, k=k)
+            b.tcgen05_mma(dst.at(0, 0), p.at(0, 0), b_s, m=m, n=n, k=k)
             b.tcgen05_commit(mc)
         # Accumulator reads release on the commit, not the issue.
         b.mbarrier_wait(mc, phase=0)
-        b.tcgen05_ld(out_frag, dst, shape="32x32b", num=n, row=0, col=0)
+        b.tcgen05_ld(out_frag, dst.at(0, 0), shape="32x32b", num=n)
         b.tcgen05_wait_ld()
         b.reg_store(out[b.tid_in_wg(), 0:n], out_frag)
-    # Every warp's loads retire before the deallocs.
+    # Every warp's loads retire before the dealloc.
     b.cta_sync()
     with b.if_warp(0):
-        b.tmem_dealloc(dst, n_cols=32)
-        b.tmem_dealloc(p, n_cols=32)
+        b.tmem_dealloc(0, 64)
 
     return b.build(), p_g, b_g, out
 
@@ -473,21 +497,21 @@ def test_tcgen05_mma_value_mode_accepts_tmem_operand():
 def _f16_tmem_store_kernel():
     b = builder("f16_tmem_store")
     out = gmem_arg(b, dtype=nr.DType.F16, shape=(32, 2))
-    tmem = tmem_tensor(b, dtype=nr.DType.F16, shape=(128, 32), col_start=0)
+    tmem = tmem_band(dtype=nr.DType.F16)
     frag = reg_tensor(b, dtype=nr.DType.F16, shape=(2,))
     loaded = reg_tensor(b, dtype=nr.DType.F16, shape=(2,))
     with b.if_warp(0):
-        b.tmem_alloc(tmem, n_cols=32)
+        b.tmem_alloc(0, 32)
     with b.if_warp(0):
         b.reg_fill(frag[0], 1.0)
         b.reg_fill(frag[1], 2.0)
-        b.tcgen05_st(tmem, frag[0:1], shape="32x32b", num=1, row=0, col=0)
+        b.tcgen05_st(tmem.at(0, 0), frag[0:1], shape="32x32b", num=1)
         b.tcgen05_wait_st()
-        b.tcgen05_ld(loaded[0:1], tmem, shape="32x32b", num=1, row=0, col=0)
+        b.tcgen05_ld(loaded[0:1], tmem.at(0, 0), shape="32x32b", num=1)
         b.tcgen05_wait_ld()
         b.reg_store(out[b.tid_in_wg(), 0:2], loaded)
     with b.if_warp(0):
-        b.tmem_dealloc(tmem, n_cols=32)
+        b.tmem_dealloc(0, 32)
     return b.build(), out
 
 
@@ -546,17 +570,12 @@ def _mma_cg2_peer_smem_kernel(synced):
     )
     a_smem = smem_tensor(b, dtype=nr.DType.F16, shape=(128, mma_k), byte_offset=0)
     b_smem = smem_tensor(b, dtype=nr.DType.F16, shape=(n // 2, mma_k), byte_offset=a_bytes)
-    accum = b.tensor(
-        space=nr.MemorySpace.TMEM,
-        dtype=nr.DType.F32,
-        shape=(128, n),
-        layout=nr.TmemLayout(nr.TmemLayoutKind.LANE_128, col_start=0),
-    )
+    accum = tmem_band(dtype=nr.DType.F32)
     ready = b.mbar(kind=nr.MBarKind.THREAD)
     mma_done = b.mbar(kind=nr.MBarKind.TCGEN05)
     ready_leader = b.mbar_ref(ready, remote_coord=0)  # absolute coord: the leader's cell
     with b.if_warp(0):
-        b.tmem_alloc(accum, n_cols=32, cta_group=2)
+        b.tmem_alloc(0, 32, cta_group=2)
         # mbarrier.init is per-thread: one thread initializes the cell.
         with b.if_elected():
             b.mbarrier_init(ready, count=1)
@@ -581,7 +600,9 @@ def _mma_cg2_peer_smem_kernel(synced):
                 b.mbarrier_wait(ready, phase=0)
             # Single-thread MMA issue (tcgen05_mma_mask otherwise).
             with b.if_(b.lane_id().eq(0)):
-                b.tcgen05_mma(accum, a_smem, b_smem, m=m, n=n, k=mma_k, accum=False, cta_group=2)
+                b.tcgen05_mma(
+                    accum.at(0, 0), a_smem, b_smem, m=m, n=n, k=mma_k, accum=False, cta_group=2
+                )
                 # The mma is async; the commit's barrier is where it is observed
                 # to have landed, and the band may not be freed before that.
                 b.tcgen05_commit(mma_done, cta_group=2)
@@ -590,7 +611,7 @@ def _mma_cg2_peer_smem_kernel(synced):
     # orders all pipeline work before the dealloc.
     b.cluster_sync()
     with b.if_warp(0):
-        b.tmem_dealloc(accum, n_cols=32, cta_group=2)
+        b.tmem_dealloc(0, 32, cta_group=2)
     return b.build()
 
 
@@ -622,15 +643,10 @@ def _mma_operand_overwrite_kernel(drain):
     )
     a = smem_tensor(b, dtype=nr.DType.F16, shape=(128, 16), byte_offset=0)
     bb = smem_tensor(b, dtype=nr.DType.F16, shape=(16, 16), byte_offset=128 * 16 * 2)
-    acc = b.tensor(
-        space=nr.MemorySpace.TMEM,
-        dtype=nr.DType.F32,
-        shape=(128, 16),
-        layout=nr.TmemLayout(nr.TmemLayoutKind.LANE_128, col_start=0),
-    )
+    acc = tmem_band(dtype=nr.DType.F32)
     done = b.mbar(kind=nr.MBarKind.TCGEN05)
     with b.if_warp(0):
-        b.tmem_alloc(acc, n_cols=32, cta_group=1)
+        b.tmem_alloc(0, 32, cta_group=1)
         # mbarrier.init is per-thread: one thread initializes the cell.
         with b.if_elected():
             b.mbarrier_init(done, count=1)
@@ -643,7 +659,7 @@ def _mma_operand_overwrite_kernel(drain):
         # same lane-0 thread, so issue -> (commit -> wait) -> overwrite is one
         # thread's program order — exactly the shape under test.
         with b.if_elected():
-            b.tcgen05_mma(acc, a, bb, m=128, n=16, k=16, accum=False, cta_group=1)
+            b.tcgen05_mma(acc.at(0, 0), a, bb, m=128, n=16, k=16, accum=False, cta_group=1)
             if drain:
                 b.tcgen05_commit(done, cta_group=1)
         if drain:
@@ -651,7 +667,7 @@ def _mma_operand_overwrite_kernel(drain):
         with b.if_(b.lane_id().eq(0)):
             b.store_scalar(nr.TensorSlice(tensor=a, offsets=(0, 0), shape=(1, 1)), 1)
     with b.if_warp(0):
-        b.tmem_dealloc(acc, n_cols=32, cta_group=1)
+        b.tmem_dealloc(0, 32, cta_group=1)
     return b.build()
 
 
@@ -676,16 +692,11 @@ def _mma_acc_read_release_kernel(commit_release):
     )
     a = smem_tensor(b, dtype=nr.DType.F16, shape=(128, 16), byte_offset=0)
     bb = smem_tensor(b, dtype=nr.DType.F16, shape=(16, 16), byte_offset=128 * 16 * 2)
-    acc = b.tensor(
-        space=nr.MemorySpace.TMEM,
-        dtype=nr.DType.F32,
-        shape=(128, 16),
-        layout=nr.TmemLayout(nr.TmemLayoutKind.LANE_128, col_start=0),
-    )
+    acc = tmem_band(dtype=nr.DType.F32)
     frag = reg_tensor(b, dtype=nr.DType.F32, shape=(16,))
     done = b.mbar(kind=nr.MBarKind.TCGEN05 if commit_release else nr.MBarKind.THREAD)
     with b.if_warp(0):
-        b.tmem_alloc(acc, n_cols=32, cta_group=1)
+        b.tmem_alloc(0, 32, cta_group=1)
         # mbarrier.init is per-thread: one thread initializes the cell.
         with b.if_elected():
             b.mbarrier_init(done, count=1)
@@ -699,19 +710,19 @@ def _mma_acc_read_release_kernel(commit_release):
         # Single-thread MMA issue; the release (commit or the fake thread
         # arrive) comes from the same lane-0 thread's program order.
         with b.if_elected():
-            b.tcgen05_mma(acc, a, bb, m=128, n=16, k=16, accum=False, cta_group=1)
+            b.tcgen05_mma(acc.at(0, 0), a, bb, m=128, n=16, k=16, accum=False, cta_group=1)
             if commit_release:
                 b.tcgen05_commit(done, cta_group=1)
             else:
                 b.mbarrier_arrive(done)
     with b.if_warp(4):
         b.mbarrier_wait(done, phase=0)
-        b.tcgen05_ld(frag, acc, num=16, row=0, col=0)
+        b.tcgen05_ld(frag, acc.at(0, 0), num=16)
         b.tcgen05_wait_ld()
     # Warp 4's accumulator read retires before the dealloc.
     b.cta_sync()
     with b.if_warp(0):
-        b.tmem_dealloc(acc, n_cols=32, cta_group=1)
+        b.tmem_dealloc(0, 32, cta_group=1)
     return b.build()
 
 

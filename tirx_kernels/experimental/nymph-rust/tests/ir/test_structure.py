@@ -16,23 +16,19 @@ def smem(shape, dtype=n.DType.F16):
     return n.Tensor(space=n.MemorySpace.SMEM, dtype=dtype, shape=shape, byte_offset=0)
 
 
-def tmem(shape, dtype=n.DType.F32):
-    return n.Tensor(space=n.MemorySpace.TMEM, dtype=dtype, shape=shape)
-
-
 def test_mma_constructor_roundtrips_fields():
-    # m=128, n=256, k=16; dst is TMEM/f32, operands SMEM/f16 — confirm nothing got
-    # swapped between dst/a/b or m/n/k.
-    dst = tmem([128, 256])[:, :]
+    # m=128, n=256, k=16; dst is a TMEM f32 operand, operands SMEM/f16 — confirm
+    # nothing got swapped between dst/a/b or m/n/k.
+    dst = n.TmemOperand(0, 0, n.DType.F32)
     a = smem([128, 16])[:, :]
     b = smem([256, 16])[:, :]
-    mma = n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=256, k=16, accum=True)
+    mma = n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=256, k=16, accum=1)
     assert mma.m == 128
     assert mma.n == 256
     assert mma.k == 16
-    assert mma.accum is True
+    assert mma.accum == 1
     assert mma.cta_group == 1
-    assert mma.dst.tensor.dtype == n.DType.F32
+    assert mma.dst.dtype == n.DType.F32
     assert mma.a.tensor.dtype == n.DType.F16
     assert mma.b.tensor.dtype == n.DType.F16
     assert mma.a.tensor.shape == [128, 16]

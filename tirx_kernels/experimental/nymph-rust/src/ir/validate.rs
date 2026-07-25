@@ -752,6 +752,8 @@ fn validate_stmt(s: &Stmt) -> R {
             gmem_shape,
             mbar_stage,
             multicast_cta_mask,
+            cache_hint: _,
+            prefetch_tensormap: _,
             cta_group,
         } => {
             validate_slice(dst, "tma_load dst")?;
@@ -812,6 +814,8 @@ fn validate_stmt(s: &Stmt) -> R {
             gmem_shape,
             reduce_add,
             allow_nondet_reduce,
+            cache_hint: _,
+            prefetch_tensormap: _,
         } => {
             validate_slice(src, "tma_store src")?;
             validate_tensor(dst)?;
@@ -2785,6 +2789,7 @@ mod tests {
             shape,
             layout: None,
             byte_offset: (space == MemorySpace::Smem).then_some(0),
+            reg_frag: None,
         })
     }
 
@@ -3339,6 +3344,8 @@ mod tests {
             gmem_shape: None,
             mbar_stage: None,
             multicast_cta_mask: multicast,
+            cache_hint: None,
+            prefetch_tensormap: false,
             cta_group: cg,
         }
     }

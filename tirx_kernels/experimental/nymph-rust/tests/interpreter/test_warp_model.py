@@ -58,16 +58,11 @@ def test_single_thread_issue_ops_reject_multi_lane_masks():
 
     # tcgen05_mma from a full warp (the OLD model REQUIRED the full warp).
     b = builder("gate_mma", num_warps=4, smem_size_bytes=8192)
-    acc = b.tensor(
-        space=nr.MemorySpace.TMEM,
-        dtype=nr.DType.F32,
-        shape=(128, 16),
-        layout=nr.TmemLayout(nr.TmemLayoutKind.LANE_128, col_start=0),
-    )
+    acc = nr.TmemOperand(0, 0, nr.DType.F32)
     a = b.tensor(space=nr.MemorySpace.SMEM, dtype=nr.DType.F16, shape=(128, 16), byte_offset=0)
     bb = b.tensor(space=nr.MemorySpace.SMEM, dtype=nr.DType.F16, shape=(16, 16), byte_offset=4096)
     with b.if_warp(0):
-        b.tmem_alloc(acc, n_cols=32)
+        b.tmem_alloc(0, 32)
         b.tcgen05_mma(acc, a, bb, m=128, n=16, k=16)
     with expect_runtime_error("tcgen05_mma_mask"):
         run(b.build())

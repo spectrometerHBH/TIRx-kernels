@@ -262,9 +262,15 @@ class IRBuilder:
         shape: Shape,
         layout: Layout | None = None,
         byte_offset: int | None = None,
+        reg_frag: tuple[str, int | None] | None = None,
     ) -> Tensor:
         tensor = Tensor(
-            space=space, dtype=dtype, shape=shape, layout=layout, byte_offset=byte_offset
+            space=space,
+            dtype=dtype,
+            shape=shape,
+            layout=layout,
+            byte_offset=byte_offset,
+            reg_frag=reg_frag,
         )
         self._append(TensorDef(tensor))
         return tensor
@@ -426,12 +432,19 @@ class IRBuilder:
         gmem_shape: Shape | None = None,
         mbar_stage: ScalarValue | None = None,
         multicast_cta_mask: int | None = None,
+        cache_hint: str | None = None,
+        prefetch_tensormap: bool = True,
         cta_group: int = 1,
     ) -> None:
         """TMA bulk async GMEM->SMEM copy. The transfer's byte size is DERIVED,
         never stated: the sim's mbar tx accounting computes
         ``numel(shape) x dtype_bytes`` from the tile (exactly what TIRx derives
-        from the box extents), so the size exists in precisely one place."""
+        from the box extents), so the size exists in precisely one place.
+        ``cache_hint``: the per-load L2 eviction policy (e.g. ``"evict_normal"``
+        — canon's hint on its g2c loads); ``None`` = no hint.
+        ``prefetch_tensormap`` (default True, canon's policy) prefetches the
+        source tensormap at kernel entry. Both are IR-carried HW hints with no
+        value/protocol semantics."""
         if isinstance(dst, Tensor):
             dst = dst[...]
         stmt = TmaLoad(
@@ -443,6 +456,8 @@ class IRBuilder:
             gmem_shape=gmem_shape,
             mbar_stage=mbar_stage,
             multicast_cta_mask=multicast_cta_mask,
+            cache_hint=cache_hint,
+            prefetch_tensormap=prefetch_tensormap,
             cta_group=cta_group,
         )
         self._append(stmt)
@@ -455,10 +470,25 @@ class IRBuilder:
         coords: tuple[ScalarValue, ...],
         shape: Shape,
         gmem_shape: Shape | None = None,
+        cache_hint: str | None = "evict_first",
+        prefetch_tensormap: bool = True,
     ) -> None:
+        """``cache_hint``/``prefetch_tensormap`` are IR-carried HW hints (no
+        value/protocol semantics). The defaults are the canonical epilogue
+        store's policy: ``evict_first`` (the output band is write-once — dead
+        lines must not pack L2 and evict live operand tiles / tensormaps) and a
+        destination-tensormap prefetch. Pass ``cache_hint=None`` to opt out."""
         if isinstance(src, Tensor):
             src = src[...]
-        stmt = TmaStore(dst=dst, src=src, coords=coords, shape=shape, gmem_shape=gmem_shape)
+        stmt = TmaStore(
+            dst=dst,
+            src=src,
+            coords=coords,
+            shape=shape,
+            gmem_shape=gmem_shape,
+            cache_hint=cache_hint,
+            prefetch_tensormap=prefetch_tensormap,
+        )
         self._append(stmt)
 
     def tma_reduce_add(
@@ -469,12 +499,15 @@ class IRBuilder:
         coords: tuple[ScalarValue, ...],
         shape: Shape,
         gmem_shape: Shape | None = None,
+        cache_hint: str | None = "evict_first",
+        prefetch_tensormap: bool = True,
         allow_nondet_reduce: bool = False,
     ) -> None:
         """TMA reduce-add (``cp.reduce.async.bulk...add.f32``): atomically accumulate
         ``dst += src`` (SMEM->GMEM, f32). Same bulk-async path as ``tma_store`` (commit
         with ``cp_async_bulk_commit_group`` / wait with ``cp_async_bulk_wait_group_read``);
         value-mode accumulates instead of overwriting. dst must be an f32 GMEM tensor.
+        ``cache_hint``/``prefetch_tensormap`` as in ``tma_store``.
 
         A float reduction is not associative: cross-CTA reduce-adds into one location
         are race-free (hardware-atomic, commutative) but ORDER-DEPENDENT — the result is
@@ -492,6 +525,8 @@ class IRBuilder:
             gmem_shape=gmem_shape,
             reduce_add=True,
             allow_nondet_reduce=allow_nondet_reduce,
+            cache_hint=cache_hint,
+            prefetch_tensormap=prefetch_tensormap,
         )
         self._append(stmt)
 

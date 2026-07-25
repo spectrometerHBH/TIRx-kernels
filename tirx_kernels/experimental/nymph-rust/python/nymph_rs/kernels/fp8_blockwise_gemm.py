@@ -38,7 +38,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from ..builder import IRBuilder
+from ..builder import IRBuilder, SfTmemBand, TmemBand
 from ..nymph_rs import (
     DType,
     FenceKind,
@@ -48,8 +48,6 @@ from ..nymph_rs import (
     MBarKind,
     MemorySpace,
     TensorSlice,
-    TmemLayout,
-    TmemLayoutKind,
 )
 
 BLK_K = 128
@@ -354,34 +352,16 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
     )
 
     # TMEM: one 512-column allocation; the accumulator and the scale vectors are
-    # column-banded views (the DeepGEMM heuristic's `2*umma_n + sf cols <= 512`
+    # column bands within it (the DeepGEMM heuristic's `2*umma_n + sf cols <= 512`
     # budget guarantees the fit). (m=256, cta_group=2) accumulator layout: each
     # CTA holds its OWN m tile's 128 rows x the full MMA_N band per stage.
-    tmem_base = k.tensor(
-        space=MemorySpace.TMEM,
-        dtype=DType.F32,
-        shape=(128, N_COLS_TMEM),
-        layout=TmemLayout(TmemLayoutKind.LANE_128, col_start=0),
-    )
-    accum = k.tensor(
-        space=MemorySpace.TMEM,
-        dtype=DType.F32,
-        shape=(128, TMEM_DEPTH * mma_n),
-        layout=TmemLayout(TmemLayoutKind.LANE_128, col_start=0),
-    )
-    sfa_tmem = k.tensor(
-        space=MemorySpace.TMEM,
-        dtype=DType.U32,
-        shape=(128, TMEM_DEPTH * sfa_cols),
-        layout=TmemLayout(TmemLayoutKind.LANE_128, col_start=TMEM_DEPTH * mma_n),
-    )
-    sfb_tmem = k.tensor(
-        space=MemorySpace.TMEM,
-        dtype=DType.U32,
-        shape=(128, TMEM_DEPTH * sfb_cols),
-        layout=TmemLayout(
-            TmemLayoutKind.LANE_128, col_start=TMEM_DEPTH * mma_n + TMEM_DEPTH * sfa_cols
-        ),
+    accum = TmemBand(col0=0, dtype=DType.F32)
+    # SF bands: TMEM_DEPTH stages of the folded scale cells — one packed u32
+    # scale cell per row (nblocks=1), row r -> lane r % 128, col base + r // 128
+    # (the SfTmemBand rule); stage s sits at column offset s * <a/b>_cols.
+    sfa_tmem = SfTmemBand(col0=TMEM_DEPTH * mma_n, rows=blk_sfa, nblocks=1, dtype=DType.U32)
+    sfb_tmem = SfTmemBand(
+        col0=TMEM_DEPTH * mma_n + TMEM_DEPTH * sfa_cols, rows=blk_sfb, nblocks=1, dtype=DType.U32
     )
 
     accum_frag = k.tensor(space=MemorySpace.REG, dtype=DType.F32, shape=(TMEM_LD_SIZE,))
@@ -434,7 +414,7 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
     with k.if_warp(0):
         # tmem_alloc is warp-collective (full warp 0); mbarrier.init is
         # per-thread, so exactly one elected thread runs the inits.
-        k.tmem_alloc(tmem_base, n_cols=N_COLS_TMEM, cta_group=cta_group)
+        k.tmem_alloc(0, N_COLS_TMEM, cta_group)
         with k.if_elected():
             for s in range(smem_depth):
                 k.mbarrier_init(smem_full, count=1, stage=s)
@@ -479,40 +459,40 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
                     TensorSlice(tensor=a_smem, offsets=(stage, 0, 0), shape=(1, blk_m, BLK_K)),
                     a_gmem,
                     mbar=smem_full,
-                    bytes=a_tile_bytes,
                     coords=(a_m, kc),
                     shape=(1, blk_m, BLK_K),
                     gmem_shape=(blk_m, BLK_K),
                     mbar_stage=stage,
+                    cta_group=cta_group,
                 )
                 k.tma_load(
                     TensorSlice(tensor=b_smem, offsets=(stage, 0, 0), shape=(1, blk_n, BLK_K)),
                     b_gmem,
                     mbar=smem_full,
-                    bytes=b_tile_bytes,
                     coords=(b_n, kc),
                     shape=(1, blk_n, BLK_K),
                     gmem_shape=(blk_n, BLK_K),
                     mbar_stage=stage,
+                    cta_group=cta_group,
                 )
                 if t % SF_PACK == 0:
                     k.tma_load(
                         TensorSlice(tensor=sfa_smem, offsets=(stage, 0), shape=(1, dg_block_m)),
                         sfa_gmem,
                         mbar=smem_full,
-                        bytes=dg_block_m * U32_BYTES,
                         coords=(t // SF_PACK, sf_m),
                         shape=(1, dg_block_m),
                         mbar_stage=stage,
+                        cta_group=cta_group,
                     )
                     k.tma_load(
                         TensorSlice(tensor=sfb_smem, offsets=(stage, 0), shape=(1, dg_block_n)),
                         sfb_gmem,
                         mbar=smem_full,
-                        bytes=dg_block_n * U32_BYTES,
                         coords=(t // SF_PACK, sf_n),
                         shape=(1, dg_block_n),
                         mbar_stage=stage,
+                        cta_group=cta_group,
                     )
 
     # ---- scale-factor permute (TIRx wg0/warp2) ----
@@ -583,15 +563,9 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
                 k.mbarrier_wait(
                     tmem_empty, stage=tmem_idx, phase=(local_iter // TMEM_DEPTH + 1) % 2
                 )
-                acc_slice = TensorSlice(
-                    tensor=accum, offsets=(0, tmem_idx * mma_n), shape=(128, mma_n)
-                )
-                sfa_stage = TensorSlice(
-                    tensor=sfa_tmem, offsets=(0, tmem_idx * sfa_cols), shape=(128, sfa_cols)
-                )
-                sfb_stage = TensorSlice(
-                    tensor=sfb_tmem, offsets=(0, tmem_idx * sfb_cols), shape=(128, sfb_cols)
-                )
+                acc_op = accum.at(0, tmem_idx * mma_n)
+                sfa_op = sfa_tmem.at(tmem_idx * sfa_cols)
+                sfb_op = sfb_tmem.at(tmem_idx * sfb_cols)
                 for t in range(k_tiles):
                     seq = local_iter * k_tiles + t
                     stage = seq % smem_depth
@@ -599,12 +573,12 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
                     k.mbarrier_wait(trans_done, stage=stage, phase=occ % 2)
                     if t % SF_PACK == 0:
                         k.tcgen05_cp(
-                            sfa_stage,
+                            sfa_op,
                             TensorSlice(tensor=sfa_smem, offsets=(stage, 0), shape=(1, blk_sfa)),
                             cta_group=cta_group,
                         )
                         k.tcgen05_cp(
-                            sfb_stage,
+                            sfb_op,
                             TensorSlice(tensor=sfb_smem, offsets=(stage, 0), shape=(1, blk_sfb)),
                             cta_group=cta_group,
                         )
@@ -619,7 +593,7 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
                         # swap_ab computes the transposed C tile: the UMMA-A side
                         # is B (with B's scales) and the UMMA-B side is A.
                         k.tcgen05_mma(
-                            acc_slice,
+                            acc_op,
                             b_op if swap_ab else a_op,
                             a_op if swap_ab else b_op,
                             m=mma_m,
@@ -627,8 +601,8 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
                             k=MMA_K,
                             accum=(t > 0 or ki > 0),
                             cta_group=cta_group,
-                            sfa=sfb_stage if swap_ab else sfa_stage,
-                            sfb=sfa_stage if swap_ab else sfb_stage,
+                            sfa=sfb_op if swap_ab else sfa_op,
+                            sfb=sfa_op if swap_ab else sfb_op,
                             sf_byte=t % SF_PACK,
                         )
                     # Release the SMEM stage to the producer in both CTAs once
@@ -682,19 +656,15 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
                         col = tmem_idx * mma_n + ot * epi_tile + atom_m * TMEM_LD_SIZE
                         k.tcgen05_ld(
                             TensorSlice(tensor=accum_frag, offsets=(0,), shape=(4,)),
-                            accum,
+                            accum.at(0, col),
                             shape="16x256b",
                             num=1,
-                            row=0,
-                            col=col,
                         )
                         k.tcgen05_ld(
                             TensorSlice(tensor=accum_frag, offsets=(4,), shape=(4,)),
-                            accum,
+                            accum.at(16, col),
                             shape="16x256b",
                             num=1,
-                            row=16,
-                            col=col,
                         )
                         k.tcgen05_wait_ld()
                         k.reg_cvt(out_frag, accum_frag)
@@ -715,7 +685,7 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
                 else:
                     for ki in range(epi_tile // TMEM_LD_SIZE):
                         col = tmem_idx * mma_n + ot * epi_tile + ki * TMEM_LD_SIZE
-                        k.tcgen05_ld(accum_frag, accum, num=TMEM_LD_SIZE, row=0, col=col)
+                        k.tcgen05_ld(accum_frag, accum.at(0, col), num=TMEM_LD_SIZE)
                         k.tcgen05_wait_ld()
                         k.reg_cvt(out_frag, accum_frag)
                         k.reg_store(
@@ -769,7 +739,8 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
     # Teardown: every stream's pipeline work happens-before the dealloc.
     k.cluster_sync()
     with k.if_warp(0):
-        k.tmem_dealloc(tmem_base, n_cols=N_COLS_TMEM, cta_group=cta_group)
+        k.tmem_relinquish(cta_group)
+        k.tmem_dealloc(0, N_COLS_TMEM, cta_group)
 
     return k.build()
 
