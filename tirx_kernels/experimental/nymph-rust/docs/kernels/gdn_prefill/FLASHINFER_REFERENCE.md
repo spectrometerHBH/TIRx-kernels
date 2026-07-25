@@ -212,13 +212,15 @@ ld/st.32x32b.x32 = 32 f32, st.32x32b.x16 = 32 bf16, st.16x128b.x8 = 64 bf16).
 Every TMEM store is followed by `fence_view_async_tmem_store` before the
 pipeline commit (CK:3388, 3403, 3466, 3492, 3519, 3540, 3005).
 
-Alignment note (verify against the port): flashinfer uses **16x256b.x8 for
-ALL (64,64) and (128,64) f32 accumulator readbacks** and reserves 32x32b.x32
-for the (128,128) f32 state only. A port that lowers M=128 readbacks to
-32x32b diverges here (nymph's kernel docstring currently says "M=64 →
-16x256b, M=128 → 32x32b" — Wave 3 must check this against the actual nymph
-readback sites; the shared/q_state accs are M=128 tensors read with 16x256b
-in flashinfer).
+Alignment note (RESOLVED 2026-07-25, see §2d-supp): flashinfer uses
+**16x256b.x8 for ALL (64,64) and (128,64) f32 accumulator readbacks** and
+reserves 32x32b.x32 for the (128,128) f32 state only. The suspected
+divergence (nymph docstring "M=64 → 16x256b, M=128 → 32x32b") does NOT
+exist at the readback sites: nymph has no M=128 (128,64) accs at all — its
+GEMM 3-6 accs are (BT=64, DV=128), i.e. flashinfer's accs TRANSPOSED, read
+with the same 16x256b atom. The real divergences live elsewhere (staging
+atom 32x32b-vs-16x128b, SMEM round-trips, x1-vs-x4 matrix ops, mma.sync
+k-shape) — full audit in §2d-supp.
 
 **HARD**: atom shape + repetition per site (these are the SASS
 `tcgen05.ld/st` opcodes ncu will show), the bf16 TMEM staging stores, the
@@ -250,6 +252,102 @@ C/A 4 + stage-4 C/A 16 = 52; x1 = stage-2 D 4 plain + C/A 8 trans).
 **HARD**: x4 vs x1 matrix counts and transpose flags per site (STSM/LDSM
 opcodes + `.trans` in SASS), the epilogue staging via stmatrix (not plain
 STS). **FREE**: none significant — this is a datapath-shape requirement.
+
+### 2d-supp. nymph-side atom audit (2026-07-25)
+
+Audit of the nymph kernel's tcgen05.ld/st call sites against §2c, read-only.
+nymph side at dev `e1a01f75` (+ uncommitted Wave-2 codegen work in `src/`,
+which does not touch the kernel body); nymph file refs are
+`python/nymph_rs/kernels/gdn_prefill.py:N`. The interpreter models each
+atom's exact TMEM cell map per shape (`src/interpreter/semantics/tcgen05.rs`
+`datapath_index_arrays_cached(shape, num)`, B200-verified alignment rules),
+and the builder's `tcgen05_ld/st` DEFAULT shape is `32x32b`
+(`builder.py:847-879`) — every nymph call below without an explicit `shape=`
+is 32x32b. Reg formula (codegen.rs:2294): `.32x32b` = num b32/thread,
+`.16x128b` = 2·num, `.16x256b` = 4·num.
+
+#### Verdict table (per call site)
+
+| nymph site | use | nymph atom | flashinfer atom (§2c) | verdict |
+|---|---|---|---|---|
+| `rss()` L524-527 | CG0 kk/qk epi readback, (64,64) f32 acc | `16x256b` num=8, 1 call/acc | `Ld16x256bOp(8)`, 2-sub loop | **MATCH** (atom + orientation); loop split is FREE |
+| `_read128` L1080 | CG1 acc readbacks (delta/ointer/vnew/store_out), (64,128) f32 | `16x256b` num=8 ×2 col-blocks | `Ld16x256bOp(8)` | **MATCH atom** — but nymph acc is (BT,DV) M=64, flashinfer's is (DV,BT) M=128 (see D5) |
+| L926, L1029 | state read `s_tmem` (128,128) f32 (chunk-top decay; tile-end final store) | `32x32b` num=64 ×2 halves | `Ld32x32bOp(32)` ×4 subs | **MATCH** (128 f32/thread both) |
+| L933 | state decay writeback (Φ·S) | `32x32b` num=64 ×2 | `St32x32bOp(32)` ×4 | **MATCH** |
+| L934-936 | `state_inp` staging, (128,128) 16-bit | `32x32b` (default) num=64 ×1 | `St32x32bOp(16)` ×4 subs | **MATCH** (same 32x32b family; 64 vs 4×16 reg grouping is FREE) |
+| L910 | per-tile state zero-fill `s_tmem` | `32x32b` num=128 ×1 | — (none: flashinfer zero-inits via GEMM 7 ACCUMULATE=false) | EXTRA (1/tile; nymph GEMM 7 also uses accum0 — belt-and-braces, harmless) |
+| L957-958, L996, L999-1000 | `shared_inp`/`shared_inp_b` staging, (128,64) bf16 | `32x32b` (default) num=32 | **`St16x128bOp(8)`** | **DIVERGE D1 — staging atom shape** (see below) |
+
+#### Divergences found (recorded for Wave 3 / agent-31; NOT fixed here)
+
+**D1 — shared_inp staging atom: `St.32x32b` vs `St.16x128b`.** nymph stages
+all (128,64) bf16 TMEM operands (deltaᵀ, NV, gated-NV) with the default
+32x32b datapath; flashinfer uses 16x128b.x8 (CK:3259). Same element volume
+(64 bf16/thread), different lane/datapath pattern → the STTM per-copy factor
+differs from the flashinfer dataset's ≈×4 coefficient; a nymph-side
+LDTM/STTM diff here is expected until this is matched.
+
+**D2 — NV/vks/decay_v go through an extra SMEM round-trip.** flashinfer:
+acc → regs → `St16x128b` straight into TMEM. nymph: acc → regs →
+`stmatrix.trans` → SMEM (`_read128_delta` L1125, `_read128_vnew` L1155-1159)
+→ per-element `reg_load` (L956, L994-998) → `tcgen05_st` → TMEM
+(L957, L996, L999). Cost per steady chunk: +3×32 warp-ops STSM.x1.trans
+(delta, vnewt, vnew-gated), +~128 LDS/thread, plus the STTM store that
+flashinfer also has. Root cause is D5's orientation: the transposed GEMM
+operand cannot flow from the 16x256b readback fragment straight into the
+TMEM operand layout, so it is transposed through SMEM.
+
+**D3 — QS scaling bounces through SMEM instead of TMEM in-place.**
+flashinfer: QS scaled in TMEM (`Ld16x256b` 2 + `St16x256b` 2, CK:3478-3490),
+GEMM 6 accumulates on top, one final O readback. nymph: QS readback → scale
+→ `stmatrix` to `out_s` SMEM (`_read128_ointer` L1128-1140), then O_intra
+readback + SMEM add + `stmatrix` again (`_read128_store_out` L1098-1109).
+nymph has NO `St16x256b` counterpart anywhere; +2×32 warp-ops STSM/chunk and
+two acc readbacks where flashinfer scales in place.
+
+**D4 — stmatrix/ldmatrix are `num=1` (x1) everywhere in nymph.** `_stm`
+(L1088-1095) and the inverse `_store8`/`_ldA`/`_ldB` (L824-849) issue one
+m8n8 tile per instruction; flashinfer packs 4 (`StMatrix8x8x16bOp(4)`,
+§2d). Same bytes moved, ≈4× the STSM/LDSM instruction count for the same
+volume — expect a large STSM/LDSM opcode diff that is count-level, not
+layout-level (flashinfer's own x1 usage is confined to inverse stage 2).
+
+**D5 — acc orientation (the root structural difference).** nymph computes
+GEMMs 3-6 as (M=64, N=128) non-transposed accs (`issue(...)` L716-745:
+`m=BT=64, n=V_DIM=128`); flashinfer computes the transposed (M=128, N=64)
+accs. UTCHMMA count is unchanged (m64n128k16 vs m128n64k16, same kphases,
+44/chunk steady both). Consequences: (a) the (64,128) readbacks use the
+M=64 16x256b scatter layout (nymph kernel comment L316-317) — atom matches
+flashinfer's, lane pattern does not; (b) D2/D3's SMEM bounces; (c) nymph's
+GEMM 3/4/5/6 put the TMEM operand on the **B side** (`state_inp` /
+`shared_inp` with `trans_b`, L716-745) where flashinfer puts it on the A
+side (`OperandSourceA=TMEM`) — hardware note for the codegen: tcgen05.mma
+takes A from TMEM or SMEM but B from SMEM only, so the TMEM-B form has no
+direct PTX lowering (agent-31's call); (d) state rows are K in nymph vs V
+in flashinfer (square tensor; gmem layouts already differ accordingly —
+handled by the wave-1 bench transpose).
+
+**D6 — mma.sync chain shape (adjacent finding, beyond tcgen05 scope).**
+nymph's inverse merge (`_merge` L851-875) uses `mma_sync(m=16,n=8,k=8)` for
+ALL stages: per chunk stage2 4 blocks×2 = 8, stage3 2×16 = 32, stage4
+1×128 = 128 → **168× m16n8k8**, vs flashinfer's 8× m16n8k8 + 40× m16n8k16
+(§2e). Same merge math (newC = −Qinv·C·Pinv), different instruction mix —
+the ncu HMMA anchor will split differently (all HMMA.882). Also: nymph's
+stage-1 GJ inversion is an SMEM-load + FFMA chain (L790-812), NOT
+flashinfer's shuffle-broadcast chain (SHFL anchor will differ too). FLOP
+equality per stage was spot-checked structurally, not proven — Wave 3
+should keep an eye on the stage-4 block (nymph's per-block mma count grows
+as (b/8)³).
+
+#### Docstring-vs-implementation check
+
+nymph kernel docstring "M=64 read-backs to 16x256b … M=128 to .32x32b" is
+CONSISTENT with the implementation: nymph's accs are all M=64 (16x256b ✓),
+only the (128,128) state is M=128 (32x32b ✓). The §2c suspicion of a
+32x32b-on-(128,64)-acc divergence is hereby closed: no such site exists.
+The docstring's "GEMM3/4 read S directly from TMEM as the B operand … f32
+TMEM operand" is imprecise on one point: the GEMM operand is the 16-bit
+`state_inp` copy, not the f32 `s_tmem` (L934 comment "fp16 copy" is right).
 
 ### 2e. mma.sync (SM80 HMMA) — the WY inverse, CG0 only
 
@@ -436,8 +534,10 @@ Hard alignment points, in the order ncu diffs should be eliminated:
 4. tcgen05.ld/st atoms per site: 16x256b.x8 for every (64,64)/(128,64) f32
    acc readback (incl. q_state writeback St16x256b.x8), 32x32b.x32 for the
    (128,128) f32 state, St32x32b.x16 for (128,128) bf16 state_inp,
-   St16x128b.x8 for (128,64) bf16 shared_inp. (Watch the nymph-side
-   "M=128 → 32x32b" docstring claim — suspect divergence, §2c.)
+   St16x128b.x8 for (128,64) bf16 shared_inp. (The nymph-side
+   "M=128 → 32x32b" suspicion is RESOLVED — no such divergence at the
+   readbacks; the real gaps are §2d-supp D1-D6, above all the orientation
+   flip D5 and the shared_inp staging atom D1.)
 5. mma.sync inverse chain: 8× m16n8k8 + 40× m16n8k16 per chunk, f32 acc,
    ldmatrix x1/x4 (+trans on C/A), stmatrix x1/x4, shuffle-only stage 1.
 6. stmatrix epilogue staging: GEMM-operand SMEM writes go through stmatrix,
