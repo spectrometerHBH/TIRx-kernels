@@ -17,7 +17,7 @@ from tvm.ir import PointerType, PrimType
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.lang.pipeline import MBarrier, PipelineState, TCGen05Bar, TMABar
-from tvm.tirx.layout import ComposeLayout, S, TileLayout, laneid, wid_in_wg
+from tvm.tirx.layout import S, TileLayout, laneid, wid_in_wg
 
 B_H = 64
 B_TOPK = 64
@@ -45,7 +45,8 @@ LAUNCH_TAGS = (
     "threadIdx.x",
     "tirx.use_dyn_shared_memory",
 )
-COMBINE_LAUNCH_TAGS = (
+COMBINE_LAUNCH_TAGS = ("blockIdx.x", "blockIdx.y", "blockIdx.z", "threadIdx.x")
+COMBINE_PDL_LAUNCH_TAGS = (
     "blockIdx.x",
     "blockIdx.y",
     "blockIdx.z",
@@ -73,162 +74,6 @@ _kv_gather_tma = partial(
     mbarrier_addr=True,
     tensormap_l2_promotion="L2::128B",
 )
-
-
-# CUDA kerutils/device/sm100/intrinsics.cuh:54-76.  TIRx's ordinary vector
-# elementwise lowering requests rounding/FTZ spellings that are observably
-# different from these two source instructions, so keep the exact packed PTX
-# locally at the four source call classes (peer add, sum add, and O scaling).
-_ADD_F32X2_SRC = r"""
-__device__ __forceinline__ unsigned long long tirx_flashmla_add_f32x2(
-    unsigned long long a, unsigned long long b) {
-  unsigned long long out;
-  asm volatile("add.f32x2 %0, %1, %2;" : "=l"(out) : "l"(a), "l"(b));
-  return out;
-}
-"""
-
-_MUL_F32X2_SRC = r"""
-__device__ __forceinline__ unsigned long long tirx_flashmla_mul_f32x2(
-    unsigned long long a, unsigned long long b) {
-  unsigned long long out;
-  asm volatile("mul.f32x2 %0, %1, %2;" : "=l"(out) : "l"(a), "l"(b));
-  return out;
-}
-"""
-
-
-def _add_f32x2(a, b):
-    return T.cuda.func_call(
-        "tirx_flashmla_add_f32x2", a, b, source_code=_ADD_F32X2_SRC, return_type="uint64"
-    )
-
-
-def _mul_f32x2(a, b):
-    return T.cuda.func_call(
-        "tirx_flashmla_mul_f32x2", a, b, source_code=_MUL_F32X2_SRC, return_type="uint64"
-    )
-
-
-# CUDA kernel.cuh:704-710.  CUDA exposes the float2->e8m0x2 conversion only
-# through a CUDA intrinsic; keep the exact no-saturation/round-zero operation
-# in a minimal local helper instead of replacing it with exponent arithmetic.
-_F32X4_TO_E8M0X4_SRC = r"""
-#include <cuda_fp8.h>
-__device__ __forceinline__ unsigned int tirx_flashmla_f32x4_to_e8m0x4(
-    float x, float y, float z, float w) {
-  unsigned int out;
-  unsigned short lo = __nv_cvt_float2_to_e8m0x2(
-      make_float2(x, y), __NV_NOSAT, cudaRoundZero);
-  unsigned short hi = __nv_cvt_float2_to_e8m0x2(
-      make_float2(z, w), __NV_NOSAT, cudaRoundZero);
-  out = static_cast<unsigned int>(lo) |
-        (static_cast<unsigned int>(hi) << 16);
-  return out;
-}
-"""
-
-
-def _f32x4_to_e8m0x4(x, y, z, w):
-    return T.cuda.func_call(
-        "tirx_flashmla_f32x4_to_e8m0x4",
-        x,
-        y,
-        z,
-        w,
-        source_code=_F32X4_TO_E8M0X4_SRC,
-        return_type="uint32",
-    )
-
-
-# CUDA kernel.cuh:785-789/811-817.  One source intrinsic converts one packed
-# e8m0 pair into two bf16 register values; WG2 invokes it exactly two times for
-# V32 and four times for MODEL1, once per row and outside the column loop.
-_E8M0X2_TO_BF16X2_SRC = r"""
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
-__device__ __forceinline__ unsigned int tirx_flashmla_e8m0x2_to_bf16x2(
-    unsigned short packed) {
-  __nv_bfloat162_raw out = __nv_cvt_e8m0x2_to_bf162raw(packed);
-  return static_cast<unsigned int>(out.x) |
-         (static_cast<unsigned int>(out.y) << 16);
-}
-"""
-
-
-def _e8m0x2_to_bf16x2(packed):
-    return T.cuda.func_call(
-        "tirx_flashmla_e8m0x2_to_bf16x2",
-        packed,
-        source_code=_E8M0X2_TO_BF16X2_SRC,
-        return_type="uint32",
-    )
-
-
-# CUDA kernel.cuh:777-779.  The source retains one 32-bit shared base after
-# selecting the raw KV stage, then ptxas encodes every unrolled byte offset in
-# LDS.64.  Taking the shared address directly avoids rebuilding a generic
-# 64-bit pointer and repeating cvta.to.shared for each prefetched fp8x8 value.
-_LD_SHARED_U64_SRC = r"""
-__device__ __forceinline__ unsigned long long tirx_flashmla_ld_shared_u64(
-    unsigned int smem_addr) {
-  unsigned long long value;
-  asm volatile("ld.shared.u64 %0, [%1];"
-               : "=l"(value)
-               : "r"(smem_addr));
-  return value;
-}
-"""
-
-
-def _ld_shared_u64(smem_addr):
-    return T.cuda.func_call(
-        "tirx_flashmla_ld_shared_u64",
-        smem_addr,
-        source_code=_LD_SHARED_U64_SRC,
-        return_type="uint64",
-    )
-
-
-# CUDA helpers.h:25-32 and kernel.cuh:769-775/791-832.  Scale conversion is
-# deliberately not folded into this helper: the source keeps all converted
-# scales live and reusable.  The selected shared base is already a uint32 and
-# is converted once per block.  The weak store has no memory clobber, matching
-# the source inline-asm contract exactly.
-_DEQUANT_ST128_SRC = r"""
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
-__device__ __forceinline__ void tirx_flashmla_dequant_st128(
-    unsigned int smem_addr, unsigned long long raw, unsigned short scale_bits) {
-  __nv_bfloat16 scale;
-  *reinterpret_cast<unsigned short*>(&scale) = scale_bits;
-  unsigned int packed[4];
-#pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    __nv_fp8x2_e4m3 data;
-    data.__x = static_cast<__nv_fp8x2_storage_t>((raw >> (i * 16)) & 0xffffull);
-    float2 value = static_cast<float2>(data);
-    __nv_bfloat162 rounded = __float22bfloat162_rn(value);
-    __nv_bfloat162 scaled{rounded.x * scale, rounded.y * scale};
-    packed[i] = *reinterpret_cast<unsigned int*>(&scaled);
-  }
-  unsigned __int128 packed128 = *reinterpret_cast<unsigned __int128*>(packed);
-  asm volatile("st.weak.shared::cta.b128 [%0], %1;"
-               :: "r"(smem_addr), "q"(packed128));
-}
-"""
-
-
-def _dequant_st128(smem_addr, raw, scale_bits):
-    T.evaluate(
-        T.cuda.func_call(
-            "tirx_flashmla_dequant_st128",
-            smem_addr,
-            raw,
-            scale_bits,
-            source_code=_DEQUANT_ST128_SRC,
-        )
-    )
 
 
 class ModelType(str, Enum):
@@ -575,6 +420,7 @@ def _kernel(
     num_sm_parts: T.int32,
     *,
     model_type: T.constexpr,
+    use_pdl: T.constexpr,
 ):
     is_v32 = T.meta_var(model_type is ModelType.V32)
     d_qk = T.meta_var(576 if is_v32 else 512)
@@ -705,22 +551,13 @@ def _kernel(
     pool = T.SMEMPool()
     u_base = T.meta_var(pool.offset)
     if is_v32:
-        v32_stage_elems = B_TOPK * (D_V + 64)
         k_union = pool.alloc_tcgen05_mma_AB((NUM_BUFS, B_TOPK, D_V + 64), "bfloat16")
         k_union_end = T.meta_var(pool.offset)
         k_full = k_union.sub[:, :, :D_V]
-        pool.move_base_to(u_base + B_TOPK * D_V * BF16_BYTES)
-        k_rope = pool.alloc(
-            (NUM_BUFS, B_TOPK, 64),
-            "bfloat16",
-            align=1024,
-            layout=ComposeLayout(
-                3,
-                2,
-                3,
-                TileLayout(S[(NUM_BUFS, B_TOPK, 2, 32) : (v32_stage_elems, 32, B_TOPK * 32, 1)]),
-            ),
-        )
+        pool.move_base_to(u_base)
+        k_rope = pool.alloc_tcgen05_mma_AB(
+            (NUM_BUFS, B_TOPK, D_V + 64), "bfloat16", swizzle_mode=SwizzleMode.SWIZZLE_64B_ATOM
+        ).sub[:, :, D_V : D_V + 64]
         pool.move_base_to(k_union_end)
     else:
         k_full = pool.alloc_tcgen05_mma_AB((NUM_BUFS, B_TOPK, D_V), "bfloat16")
@@ -818,6 +655,20 @@ def _kernel(
             l2_evict="L2::evict_normal",
             prefetch_size="L2::256B",
         )
+
+    @T.inline
+    def dequant_st128(smem_addr, raw, scale_bits):
+        scale: T.let = T.reinterpret("bfloat16", scale_bits)
+        packed = T.alloc_local((4,), "uint32")
+        for pair_i in T.unroll(4):
+            raw_pair: T.let = T.cast(T.shift_right(raw, T.cast(pair_i * 16, "uint64")), "uint16")
+            value: T.let = T.cuda.fp8x2_e4m3_to_float2(raw_pair)
+            rounded_bits: T.let = T.cuda.float22bfloat162_rn_from_float2(value)
+            rounded: T.let = T.reinterpret("bfloat16x2", rounded_bits)
+            scaled_lo: T.let = T.Shuffle([rounded], [0]) * scale
+            scaled_hi: T.let = T.Shuffle([rounded], [1]) * scale
+            packed[pair_i] = T.reinterpret("uint32", T.Shuffle([scaled_lo, scaled_hi], [0, 1]))
+        T.ptx.st(smem_addr, src=packed.ptr_to([0]), weak=True, space="shared::cta", ptx_type="b128")
 
     # kernel.cuh:35-67.  Each copy site requests the lowering's ordinary
     # descriptor prefetch.  tma_explicit deduplicates the two normal KV
@@ -962,13 +813,17 @@ def _kernel(
                             p_exchange[warp_idx, exchange_offset : exchange_offset + 4],
                             dispatch="vec_128b",
                         )
-                        pair0: T.let = _add_f32x2(
+                        pair0: T.let = T.ptx.add_f32x2(
                             T.cuda.make_float2(p[exchange_i * 4], p[exchange_i * 4 + 1]),
                             T.cuda.make_float2(peer_tmp[0], peer_tmp[1]),
+                            rounding="",
+                            dps=False,
                         )
-                        pair1: T.let = _add_f32x2(
+                        pair1: T.let = T.ptx.add_f32x2(
                             T.cuda.make_float2(p[exchange_i * 4 + 2], p[exchange_i * 4 + 3]),
                             T.cuda.make_float2(peer_tmp[2], peer_tmp[3]),
+                            rounding="",
+                            dps=False,
                         )
                         p[exchange_i * 4] = T.cuda.float2_x(pair0)
                         p[exchange_i * 4 + 1] = T.cuda.float2_y(pair0)
@@ -1019,7 +874,9 @@ def _kernel(
                         )
                         sx: T.let = T.ptx.exp2(T.cuda.float2_x(soft_pair))
                         sy: T.let = T.ptx.exp2(T.cuda.float2_y(soft_pair))
-                        cur_sum_pair = _add_f32x2(cur_sum_pair, T.cuda.make_float2(sx, sy))
+                        cur_sum_pair = T.ptx.add_f32x2(
+                            cur_sum_pair, T.cuda.make_float2(sx, sy), rounding="", dps=False
+                        )
                         s_pack[s_i] = T.cuda.float22bfloat162_rn(sx, sy)
                     cur_sum: T.let = T.cuda.float2_x(cur_sum_pair) + T.cuda.float2_y(cur_sum_pair)
                     li_next: T.float32
@@ -1039,11 +896,12 @@ def _kernel(
                             )
                             T.ptx.tcgen05.wait.ld()
                             for scale_i in T.unroll(64 // 2):
-                                scaled_pair: T.let = _mul_f32x2(
+                                scaled_pair: T.let = T.ptx.mul_f32x2(
                                     T.cuda.make_float2(
                                         o_rescale[scale_i * 2], o_rescale[scale_i * 2 + 1]
                                     ),
                                     scale_for_old_pair,
+                                    dps=False,
                                 )
                                 o_rescale[scale_i * 2] = T.cuda.float2_x(scaled_pair)
                                 o_rescale[scale_i * 2 + 1] = T.cuda.float2_y(scaled_pair)
@@ -1061,7 +919,7 @@ def _kernel(
                         rs_index.advance()
 
                 # kernel.cuh:301-333.  Empty-row repair, li exchange, LSE
-                # store, final SV wait, ring advance, and launch dependency.
+                # store, final SV wait, and ring advance.
                 if real_mi == T.float32(-float("inf")):
                     li = 0.0
                     mi = T.float32(-float("inf"))
@@ -1087,7 +945,7 @@ def _kernel(
                 rs_buf.advance()
                 rs_index.advance()
                 T.ptx.tcgen05.fence.after_thread_sync()
-                if is_last_batch:
+                if use_pdl and is_last_batch:
                     T.ptx.griddepcontrol.launch_dependents()
 
                 # kernel.cuh:335-421.  Keep no-split TMA output and split
@@ -1110,9 +968,10 @@ def _kernel(
                         )
                         T.ptx.tcgen05.wait.ld()
                         for scale_i in T.unroll(64 // 2):
-                            scaled_pair: T.let = _mul_f32x2(
+                            scaled_pair: T.let = T.ptx.mul_f32x2(
                                 T.cuda.make_float2(o_epi[scale_i * 2], o_epi[scale_i * 2 + 1]),
                                 output_scale_pair,
+                                dps=False,
                             )
                             o_epi[scale_i * 2] = T.cuda.float2_x(scaled_pair)
                             o_epi[scale_i * 2 + 1] = T.cuda.float2_y(scaled_pair)
@@ -1164,11 +1023,12 @@ def _kernel(
                         )
                         T.ptx.tcgen05.wait.ld()
                         for scale_i in T.unroll(64 // 2):
-                            scaled_pair: T.let = _mul_f32x2(
+                            scaled_pair: T.let = T.ptx.mul_f32x2(
                                 T.cuda.make_float2(
                                     split_local[scale_i * 2], split_local[scale_i * 2 + 1]
                                 ),
                                 output_scale_pair,
+                                dps=False,
                             )
                             split_local[scale_i * 2] = T.cuda.float2_x(scaled_pair)
                             split_local[scale_i * 2 + 1] = T.cuda.float2_y(scaled_pair)
@@ -1578,6 +1438,63 @@ def _kernel(
                             pair_token_valid = T.alloc_local((2,), "bool")
                             scale_f32 = T.alloc_local((2, 4), "float32")
                             scale_byte_offsets = T.alloc_local((2,), "uint64")
+
+                            @T.inline
+                            def load_token_scales(
+                                pair_i: T.constexpr,
+                                token_valid,
+                                cache_block,
+                                index_in_block,
+                                block_stride,
+                                row_stride,
+                                scales_ptr_u64,
+                                byte_offsets,
+                                words,
+                                values,
+                            ):
+                                if is_v32:
+                                    # Invalid V32 entries still issue token-0's
+                                    # float4 load, then zero the converted word.
+                                    byte_offsets[pair_i] = T.if_then_else(
+                                        token_valid,
+                                        T.cast(cache_block, "uint64")
+                                        * T.cast(block_stride, "int64")
+                                        + T.cast(index_in_block, "uint64")
+                                        * T.cast(row_stride, "int64"),
+                                        T.uint64(0),
+                                    )
+                                    T.cuda.ldg(
+                                        T.reinterpret(
+                                            PointerType(PrimType("float32")),
+                                            scales_ptr_u64 + byte_offsets[pair_i],
+                                        ),
+                                        "float32",
+                                        dst=(
+                                            values.ptr_to([pair_i, 0]),
+                                            values.ptr_to([pair_i, 1]),
+                                            values.ptr_to([pair_i, 2]),
+                                            values.ptr_to([pair_i, 3]),
+                                        ),
+                                        vec="v4",
+                                    )
+                                else:
+                                    byte_offsets[pair_i] = (
+                                        T.cast(cache_block, "uint64")
+                                        * T.cast(block_stride, "int64")
+                                        + T.cast(index_in_block, "uint64") * 8
+                                    )
+                                    words[pair_i] = T.if_then_else(
+                                        token_valid,
+                                        T.cuda.ldg(
+                                            T.reinterpret(
+                                                PointerType(PrimType("uint64")),
+                                                scales_ptr_u64 + byte_offsets[pair_i],
+                                            ),
+                                            "uint64",
+                                        ),
+                                        T.uint64(0),
+                                    )
+
                             valid_mask: T.int8 = T.int8(0)
                             for pair_i in T.unroll(2):
                                 index_u32: T.let = T.cast(pair_indices[pair_i], "uint32")
@@ -1606,62 +1523,36 @@ def _kernel(
                                     * tma_coords_step_per_token,
                                     -1,
                                 )
-                                if is_v32:
-                                    # k_scales_ptr is kv+D_NOPE even for an
-                                    # invalid token; invalid entries therefore
-                                    # load token-0's scale float4 and are zeroed
-                                    # only after conversion, exactly as CUDA.
-                                    scale_byte_offsets[pair_i] = T.if_then_else(
-                                        pair_token_valid[pair_i],
-                                        T.cast(cache_blocks[pair_i], "uint64")
-                                        * T.cast(cur_block_stride, "int64")
-                                        + T.cast(indices_in_block[pair_i], "uint64")
-                                        * T.cast(cur_row_stride, "int64"),
-                                        T.uint64(0),
-                                    )
-                                    # The CUDA loop is source-unrolled.  Issue
-                                    # both token float4 loads before consuming
-                                    # either value in F2FP.E8 so the random
-                                    # scale reads overlap in flight.
-                                    T.cuda.ldg(
-                                        T.reinterpret(
-                                            PointerType(PrimType("float32")),
-                                            cur_k_scales_ptr_u64 + scale_byte_offsets[pair_i],
-                                        ),
-                                        "float32",
-                                        dst=(
-                                            scale_f32.ptr_to([pair_i, 0]),
-                                            scale_f32.ptr_to([pair_i, 1]),
-                                            scale_f32.ptr_to([pair_i, 2]),
-                                            scale_f32.ptr_to([pair_i, 3]),
-                                        ),
-                                        vec="v4",
-                                    )
-                                else:
-                                    scale_byte_offsets[pair_i] = (
-                                        T.cast(cache_blocks[pair_i], "uint64")
-                                        * T.cast(cur_block_stride, "int64")
-                                        + T.cast(indices_in_block[pair_i], "uint64") * 8
-                                    )
-                                    scale_words[pair_i] = T.if_then_else(
-                                        pair_token_valid[pair_i],
-                                        T.cuda.ldg(
-                                            T.reinterpret(
-                                                PointerType(PrimType("uint64")),
-                                                cur_k_scales_ptr_u64 + scale_byte_offsets[pair_i],
-                                            ),
-                                            "uint64",
-                                        ),
-                                        T.uint64(0),
-                                    )
+                                # The source-unrolled loop issues both random
+                                # scale loads before either V32 conversion.
+                                load_token_scales(
+                                    pair_i,
+                                    pair_token_valid[pair_i],
+                                    cache_blocks[pair_i],
+                                    indices_in_block[pair_i],
+                                    cur_block_stride,
+                                    cur_row_stride,
+                                    cur_k_scales_ptr_u64,
+                                    scale_byte_offsets,
+                                    scale_words,
+                                    scale_f32,
+                                )
 
                             if is_v32:
                                 for pair_i in T.unroll(2):
-                                    packed_scale: T.let = _f32x4_to_e8m0x4(
-                                        scale_f32[pair_i, 0],
-                                        scale_f32[pair_i, 1],
-                                        scale_f32[pair_i, 2],
-                                        scale_f32[pair_i, 3],
+                                    lo: T.let = T.cuda.cvt_float2_to_e8m0x2(
+                                        T.cuda.make_float2(
+                                            scale_f32[pair_i, 0], scale_f32[pair_i, 1]
+                                        )
+                                    )
+                                    hi: T.let = T.cuda.cvt_float2_to_e8m0x2(
+                                        T.cuda.make_float2(
+                                            scale_f32[pair_i, 2], scale_f32[pair_i, 3]
+                                        )
+                                    )
+                                    packed_scale: T.let = T.bitwise_or(
+                                        T.cast(lo, "uint32"),
+                                        T.shift_left(T.cast(hi, "uint32"), T.uint32(16)),
                                     )
                                     scale_words[pair_i] = T.if_then_else(
                                         pair_token_valid[pair_i],
@@ -1862,7 +1753,7 @@ def _kernel(
                                 rs_index.stage, row_idx
                             ]
                             for scale_pair_idx in T.unroll(2):
-                                converted_pair: T.let = _e8m0x2_to_bf16x2(
+                                converted_pair: T.let = T.cuda.cvt_e8m0x2_to_bf162raw(
                                     T.cast(
                                         T.shift_right(
                                             packed_scales, T.cast(scale_pair_idx * 16, "uint32")
@@ -1881,7 +1772,7 @@ def _kernel(
                                 rs_index.stage, row_idx
                             ]
                             for scale_pair_idx in T.unroll(4):
-                                converted_pair: T.let = _e8m0x2_to_bf16x2(
+                                converted_pair: T.let = T.cuda.cvt_e8m0x2_to_bf162raw(
                                     T.cast(
                                         T.shift_right(
                                             packed_scales, T.cast(scale_pair_idx * 16, "uint64")
@@ -1896,24 +1787,30 @@ def _kernel(
                                     T.shift_right(converted_pair, T.uint32(16)), "uint16"
                                 )
 
-                        cur_raw_fp8x8: T.uint64 = _ld_shared_u64(
+                        cur_raw_fp8x8: T.uint64 = T.ptx.ld(
                             cur_raw_nope_base_uint_addr
-                            + T.cast(local_row * (128 // 8) * d_nope, "uint32")
+                            + T.cast(local_row * (128 // 8) * d_nope, "uint32"),
+                            "uint64",
+                            "u64",
+                            space="shared",
                         )
                         for local_col in T.unroll(cols_per_group):
                             raw_fp8x8: T.let = cur_raw_fp8x8
                             if local_col + 1 < cols_per_group:
-                                cur_raw_fp8x8 = _ld_shared_u64(
+                                cur_raw_fp8x8 = T.ptx.ld(
                                     cur_raw_nope_base_uint_addr
                                     + T.cast(
                                         local_row * (128 // 8) * d_nope + (local_col + 1) * (8 * 8),
                                         "uint32",
-                                    )
+                                    ),
+                                    "uint64",
+                                    "u64",
+                                    space="shared",
                                 )
                             scale_idx: T.let = (
                                 local_col // (cols_per_group // 4) if is_v32 else local_col
                             )
-                            _dequant_st128(
+                            dequant_st128(
                                 cur_nope_base_uint_addr
                                 + T.cast(
                                     BF16_BYTES
@@ -1959,6 +1856,7 @@ def _sparse_decode_head64_combine_kernel(
     num_sm_parts: T.int32,
     *,
     max_splits: T.constexpr,
+    use_pdl: T.constexpr,
 ):
     lse = T.match_buffer(lse_h, (b * s_q * h_q,), "float32", scope="global")
     out = T.match_buffer(out_h, (b * s_q * h_q * d_v,), "bfloat16", scope="global")
@@ -2021,7 +1919,8 @@ def _sparse_decode_head64_combine_kernel(
 
     # combine.cu:58-69.  The PDL consumer wait remains after both early
     # returns, followed by the same four float4 prefetches per lane.
-    T.evaluate(T.ptx.griddepcontrol.wait())
+    if use_pdl:
+        T.evaluate(T.ptx.griddepcontrol.wait())
     oaccum_offset: T.int32 = (
         start_split * stride_o_accum_split
         + query_idx * stride_o_accum_s_q
@@ -2213,27 +2112,39 @@ def _absent_specialization_kwargs(
 
 
 @lru_cache(maxsize=64)
-def _specialized_main_kernel(model_type: ModelType, presence: MainPresenceMask):
+def _specialized_main_kernel(
+    model_type: ModelType, presence: MainPresenceMask, use_pdl: bool = False
+):
     specialization = _absent_specialization_kwargs(MAIN_OPTIONAL_BUFFER_PARAMS, presence)
-    return _kernel.specialize(model_type=model_type, **specialization).with_attr(
+    return _kernel.specialize(model_type=model_type, use_pdl=use_pdl, **specialization).with_attr(
         "tirx.kernel_launch_params", list(LAUNCH_TAGS)
     )
 
 
-@lru_cache(maxsize=10)
-def _specialized_combine_kernel(max_splits: int, have_attn_sink: bool):
+@lru_cache(maxsize=20)
+def _specialized_combine_kernel(max_splits: int, have_attn_sink: bool, use_pdl: bool = False):
     specialization = _absent_specialization_kwargs(
         COMBINE_OPTIONAL_BUFFER_PARAMS, (have_attn_sink,)
     )
     return _sparse_decode_head64_combine_kernel.specialize(
-        max_splits=max_splits, **specialization
-    ).with_attr("tirx.kernel_launch_params", list(COMBINE_LAUNCH_TAGS))
+        max_splits=max_splits, use_pdl=use_pdl, **specialization
+    ).with_attr(
+        "tirx.kernel_launch_params",
+        list(COMBINE_PDL_LAUNCH_TAGS if use_pdl else COMBINE_LAUNCH_TAGS),
+    )
 
 
-def _specialized_decode_kernels(model_type: ModelType, max_splits: int, presence: MainPresenceMask):
+def _specialized_decode_kernels(
+    model_type: ModelType, max_splits: int, presence: MainPresenceMask, use_pdl: bool = False
+):
+    if not use_pdl:
+        return (
+            _specialized_main_kernel(model_type, presence),
+            _specialized_combine_kernel(max_splits, presence[1]),
+        )
     return (
-        _specialized_main_kernel(model_type, presence),
-        _specialized_combine_kernel(max_splits, presence[1]),
+        _specialized_main_kernel(model_type, presence, True),
+        _specialized_combine_kernel(max_splits, presence[1], True),
     )
 
 
@@ -2245,7 +2156,7 @@ def get_kernel(**kwargs: Any):
     shape = _kernel_shape_params(cfg, device)
     return list(
         _specialized_decode_kernels(
-            cfg.normalized_model_type, shape["max_splits"], _main_presence_mask(cfg)
+            cfg.normalized_model_type, shape["max_splits"], _main_presence_mask(cfg), cfg.b == 2
         )
     )
 
@@ -2837,18 +2748,18 @@ def _tirx_combine_args(case: dict[str, Any]) -> tuple[Any, ...]:
     return _present_runtime_args(args, COMBINE_OPTIONAL_ARG_INDICES, presence)
 
 
-@lru_cache(maxsize=64)
-def _compile_main_kernel_cached(model_type: ModelType, presence: MainPresenceMask):
+@lru_cache(maxsize=128)
+def _compile_main_kernel_cached(model_type: ModelType, presence: MainPresenceMask, use_pdl: bool):
     from tirx_kernels.runner import compile_kernel
 
-    return compile_kernel(_specialized_main_kernel(model_type, presence))
+    return compile_kernel(_specialized_main_kernel(model_type, presence, use_pdl))
 
 
-@lru_cache(maxsize=10)
-def _compile_combine_kernel_cached(max_splits: int, have_attn_sink: bool):
+@lru_cache(maxsize=20)
+def _compile_combine_kernel_cached(max_splits: int, have_attn_sink: bool, use_pdl: bool):
     from tirx_kernels.runner import compile_kernel
 
-    return compile_kernel(_specialized_combine_kernel(max_splits, have_attn_sink))
+    return compile_kernel(_specialized_combine_kernel(max_splits, have_attn_sink, use_pdl))
 
 
 def _compile_decode_kernels(**kwargs: Any):
@@ -2856,9 +2767,10 @@ def _compile_decode_kernels(**kwargs: Any):
     device = kwargs.get("device", "cuda")
     shape = _kernel_shape_params(cfg, device)
     presence = _main_presence_mask(cfg)
+    use_pdl = cfg.b == 2
     return (
-        _compile_main_kernel_cached(cfg.normalized_model_type, presence),
-        _compile_combine_kernel_cached(shape["max_splits"], presence[1]),
+        _compile_main_kernel_cached(cfg.normalized_model_type, presence, use_pdl),
+        _compile_combine_kernel_cached(shape["max_splits"], presence[1], use_pdl),
     )
 
 
