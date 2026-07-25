@@ -954,6 +954,9 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                             )  # undecayed fp16 S_prev[k=tid, half*64+cc]
                         k.tcgen05_st(s_tmem.at(0, half * 64), frag32, num=64)  # decayed main state
                     k.tcgen05_wait_st()
+                    # publish the generic s_s stores to the MMA's async proxy
+                    # (the tcgen05.st state_inp staging needed no such fence).
+                    k.fence(kind=FenceKind.ASYNC_PROXY, scope=FenceScope.CTA)
                     k.wg_sync(barrier_id=11)
                     k.mbarrier_arrive(bars["sT_ready"])  # s_s ready for GEMM3/4
                     k.mbarrier_wait(bars["d_ks"], phase=ph(gc_pos))
