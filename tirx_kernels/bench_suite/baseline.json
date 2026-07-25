@@ -2,13 +2,13 @@
   "timestamp": "2",
   "label": "691feec4-dirty",
   "git": {
-    "tir": "e905776a",
-    "tirx-kernels": "b0a0df4e-dirty",
+    "tir": "57a23172-dirty",
+    "tirx-kernels": "1e4e55a3-dirty",
     "tirx-bench-ci": null
   },
   "kernel_tree": {
     "tir:python/tvm/tirx": "e6aad21cda04435b411c32e0f43703d7abf2be9f",
-    "tirx-kernels:tirx_kernels": "fb9a2c010588b8e9fcc3264762ce22b25f0dbb16"
+    "tirx-kernels:tirx_kernels": "b127c933d6109965b37d59638db7f58b7afaeee3"
   },
   "baselines": {
     "torch": {
@@ -1469,8 +1469,8 @@
       "label": "deepseek_v4_v32_b128_sq2_sk32768_topk2048_p64",
       "status": "ok",
       "impls": {
-        "tirx": 138.89585443418977,
-        "flashmla": 143.69408165829387
+        "tirx": 136.4365728514894,
+        "flashmla": 144.20800841970976
       },
       "aggregated": {
         "rounds": 5,
@@ -1483,8 +1483,8 @@
       "label": "model1_b128_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
       "status": "ok",
       "impls": {
-        "tirx": 70.42642365456874,
-        "flashmla": 73.64159739370717
+        "tirx": 69.89760983326683,
+        "flashmla": 73.66456556026317
       },
       "aggregated": {
         "rounds": 5,
@@ -1497,8 +1497,8 @@
       "label": "model1_b128_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
       "status": "ok",
       "impls": {
-        "tirx": 58.11889219090162,
-        "flashmla": 58.571993848415275
+        "tirx": 57.396923633775735,
+        "flashmla": 58.372638461473535
       },
       "aggregated": {
         "rounds": 5,
@@ -1511,8 +1511,8 @@
       "label": "model1_b148_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
       "status": "ok",
       "impls": {
-        "tirx": 75.9245063162444,
-        "flashmla": 79.25990299075035
+        "tirx": 74.84392928880082,
+        "flashmla": 78.91613235454159
       },
       "aggregated": {
         "rounds": 5,
@@ -1525,8 +1525,8 @@
       "label": "model1_b148_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
       "status": "ok",
       "impls": {
-        "tirx": 60.19923107122913,
-        "flashmla": 60.466119751015825
+        "tirx": 59.68172933503848,
+        "flashmla": 60.5584310011009
       },
       "aggregated": {
         "rounds": 5,
@@ -1539,8 +1539,8 @@
       "label": "model1_b148_sq2_sk32768_topk16384_p64",
       "status": "ok",
       "impls": {
-        "tirx": 904.0642537920032,
-        "flashmla": 907.700637694704
+        "tirx": 858.6105296013303,
+        "flashmla": 894.2940364593952
       },
       "aggregated": {
         "rounds": 5,
@@ -1553,8 +1553,8 @@
       "label": "model1_b256_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
       "status": "ok",
       "impls": {
-        "tirx": 111.6658646233601,
-        "flashmla": 115.02019432395288
+        "tirx": 109.84525880923906,
+        "flashmla": 114.20952181815778
       },
       "aggregated": {
         "rounds": 5,
@@ -1567,8 +1567,8 @@
       "label": "model1_b256_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
       "status": "ok",
       "impls": {
-        "tirx": 105.79250112572844,
-        "flashmla": 108.65942720146387
+        "tirx": 104.15933805661521,
+        "flashmla": 108.59189584685015
       },
       "aggregated": {
         "rounds": 5,
@@ -1581,8 +1581,8 @@
       "label": "model1_b2_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
       "status": "ok",
       "impls": {
-        "tirx": 18.937680252932513,
-        "flashmla": 22.992968963977287
+        "tirx": 19.12346268823308,
+        "flashmla": 23.287803039633538
       },
       "aggregated": {
         "rounds": 5,
@@ -1595,8 +1595,8 @@
       "label": "model1_b2_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
       "status": "ok",
       "impls": {
-        "tirx": 16.903021013792767,
-        "flashmla": 21.19331191654604
+        "tirx": 16.559105725229504,
+        "flashmla": 21.21172935159576
       },
       "aggregated": {
         "rounds": 5,
@@ -1609,8 +1609,8 @@
       "label": "model1_b64_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
       "status": "ok",
       "impls": {
-        "tirx": 43.44156813507092,
-        "flashmla": 47.350232262756336
+        "tirx": 42.98451184017294,
+        "flashmla": 47.33039397712244
       },
       "aggregated": {
         "rounds": 5,
@@ -1623,8 +1623,8 @@
       "label": "model1_b64_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
       "status": "ok",
       "impls": {
-        "tirx": 31.737775642548122,
-        "flashmla": 32.408008278660375
+        "tirx": 31.495693770476763,
+        "flashmla": 32.54445549891241
       },
       "aggregated": {
         "rounds": 5,
@@ -1637,8 +1637,8 @@
       "label": "model1_b74_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
       "status": "ok",
       "impls": {
-        "tirx": 49.63706636021892,
-        "flashmla": 53.00396142934257
+        "tirx": 49.72953504814571,
+        "flashmla": 53.49196019666756
       },
       "aggregated": {
         "rounds": 5,
@@ -1651,8 +1651,8 @@
       "label": "model1_b74_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
       "status": "ok",
       "impls": {
-        "tirx": 34.35094040501502,
-        "flashmla": 34.5908106103018
+        "tirx": 33.63601485366053,
+        "flashmla": 34.285473406397024
       },
       "aggregated": {
         "rounds": 5,
@@ -1665,8 +1665,8 @@
       "label": "v32_b148_sq2_sk32768_topk16384_p64",
       "status": "ok",
       "impls": {
-        "tirx": 957.419848781937,
-        "flashmla": 957.6633707991039
+        "tirx": 918.9302976367751,
+        "flashmla": 955.5961613704256
       },
       "aggregated": {
         "rounds": 5,
