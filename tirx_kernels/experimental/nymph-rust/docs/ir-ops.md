@@ -241,7 +241,10 @@ The interpreter models all five shapes. The CODEGEN lowers:
 
 The warp-matrix and reg-ALU families lower too (the GDN datapath):
 `LdMatrix`/`StMatrix` (m8n8.xN.b16 → `T.ptx.ldmatrix/stmatrix` with
-per-thread SMEM row addresses and flat-view register handles), `WarpMma`
+per-thread SMEM row addresses and flat-view register handles — the dst/src
+fragment is either num u32/i32 packed words or a 2·num f16/bf16 fragment
+whose consecutive pairs ARE the words; the b16 form rides the `_flat_u32`
+reinterpret view, bit-exact in the interpreter via the same pack/decode), `WarpMma`
 (m16n8k8/m16n8k16 → `T.ptx.mma.legacy`, accumulator reused as C/D), and the
 reg elementwise family (`RegFill/RegAdd/RegSub/RegMul/RegFma/RegUnary/
 RegCvt`) — `Tx.wg.*` tile ops at warpgroup-full scope, per-thread scalar

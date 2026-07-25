@@ -351,6 +351,7 @@ def build_gdn_prefill(config: GdnPrefillConfig = GdnPrefillConfig()) -> Kernel:
     imm_accb = reg(iod, (4,))  # accumulator -> bf16 (store / next-A)
     sttile = reg(iod, (2,))  # one m8n8 tile (2 bf16 = 1 stmatrix word) for reg->SMEM staging
     sttile2 = reg(iod, (2,))  # second tile (vnew gated/ungated emit two stmatrix tiles)
+    v_frag = reg(iod, (64,))  # delta's ldmatrix v fragment (2 blk × 16 packed b16x2 words)
     sinp_reg = reg(iod, (64,))  # bf16 cvt slots for the s_s state staging (one half at a time)
     # Per-chunk gating fragments (Wave-3 C1: compute exp2 ONCE per chunk, not per
     # epilogue). t_frag = CG0's T-pairwise row (32 els, reused by kk_epi AND qk_epi);
@@ -459,6 +460,7 @@ def build_gdn_prefill(config: GdnPrefillConfig = GdnPrefillConfig()) -> Kernel:
             t_beta,
             dexp2,
             kgate2,
+            v_frag,
         ),
         bars,
     )
@@ -500,6 +502,7 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
         t_beta,
         dexp2,
         kgate2,
+        v_frag,
     ) = rg
     scale = config.scale
 
@@ -1000,7 +1003,6 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                         v_s,
                         gcs_s,
                         frag,
-                        rb16,
                         rb16b,
                         sttile,
                         r1,
@@ -1008,6 +1010,7 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                         warp,
                         eh,
                         dexp2,
+                        v_frag,
                     )
                     k.wg_sync(barrier_id=11)
                     k.mbarrier_arrive(bars["f_ks"])
@@ -1167,22 +1170,38 @@ def _read128_store_out(k, acc, dst_s, frag, rb16, sttile, lane, warp, o_frag):
 
 
 def _read128_delta(
-    k, acc, tmpt_s, v_s, gcs_s, frag, rb16, rb16b, sttile, r1, lane, warp, eh, dexp2
+    k, acc, tmpt_s, v_s, gcs_s, frag, rb16b, sttile, r1, lane, warp, eh, dexp2, v_frag
 ):
     # delta[i,dv] = v[i,dv] - exp2(gcs[i])·KH[i,dv]; store deltaᵀ → tmpt_s[dv,i] (stmatrix.trans).
     # dexp[i] comes from the per-chunk dexp2 fragment (Wave-3 C1), not per-element exp2.
-    # Wave-3 C2: v is loaded as (v0p, v0p+1) PAIRS via a per-thread narrow-run
-    # wg.copy (was 2 point loads with full per-element address recompute).
+    # Wave-3 (i): v is ldmatrix-loaded ONCE per (blk, va) as packed b16x2 fragments
+    # (was per-element SMEM pair loads). The non-trans fragment coordinate
+    # (row=lane//4, col=2*(lane%4)+v0p) IS the epilogue tile coordinate, so
+    # v_frag[32*blk + 16*va + 2*vb + v0p] holds v[i,dv] — consecutive pairs ARE
+    # the x4 words (each x4 group covers vb tiles 4*half..4*half+3).
     for blk, va, vb, v0p in _read128(k, acc, frag):
         r = v0p + 2 * va + 4 * vb
-        if v0p == 0:
-            row = (lane // 4) + 8 * va + 16 * warp  # i
-            col8 = blk * 64 + 2 * (lane % 4) + 8 * vb  # dv pair base
-            k.reg_load(_sl(sttile, (0,), (2,)), _sl(v_s, (row, col8), (1, 2)))  # v pair
+        if vb == 0 and v0p == 0:
+            for half in range(2):
+                k.ldmatrix(
+                    _sl(v_frag, (32 * blk + 16 * va + 8 * half,), (8,)),
+                    _sl(
+                        v_s,
+                        (
+                            16 * warp + 8 * va + lane % 8,
+                            blk * 64 + 32 * half + 8 * (lane // 8),
+                        ),
+                        (1, 8),
+                    ),
+                    num=4,
+                    trans=False,
+                )
         k.reg_mul(r1, _sl(dexp2, (va,), (1,)), _sl(frag, (r,), (1,)))  # dexp·KH (f32)
         k.reg_cvt(rb16b, r1)  # → bf16
         k.reg_sub(
-            _sl(sttile, (v0p,), (1,)), _sl(sttile, (v0p,), (1,)), rb16b
+            _sl(sttile, (v0p,), (1,)),
+            _sl(v_frag, (32 * blk + 16 * va + 2 * vb + v0p,), (1,)),
+            rb16b,
         )  # delta = v - dexp·KH (bf16)
         if v0p == 1:
             _stm(k, tmpt_s, 8 * va + 16 * warp, blk * 64 + 8 * vb, sttile, lane, trans=True)

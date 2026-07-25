@@ -1330,15 +1330,19 @@ fn validate_stmt(s: &Stmt) -> R {
             if src.tensor.space != MemorySpace::Smem {
                 return bail("ldmatrix src must be SMEM");
             }
-            if !is_b32_reg_dtype(dst.tensor.dtype) {
-                return bail("ldmatrix dst dtype must be i32 or u32");
+            let b16_dst = matches!(dst.tensor.dtype, DType::F16 | DType::Bf16);
+            if !b16_dst && !is_b32_reg_dtype(dst.tensor.dtype) {
+                return bail("ldmatrix dst dtype must be i32/u32 or an f16/bf16 fragment");
             }
             if !is_b16_dtype(src.tensor.dtype) {
                 return bail("ldmatrix src dtype must be f16, bf16, i16, or u16");
             }
             if let Some(n) = static_shape_numel(&dst.shape) {
-                if n != *num as usize {
-                    return bail("ldmatrix dst slice must contain num b32 registers");
+                let want = if b16_dst { 2 * *num as usize } else { *num as usize };
+                if n != want {
+                    return bail(
+                        "ldmatrix dst slice must contain num b32 registers (2*num b16 elements)",
+                    );
                 }
             }
             if let Some(n) = static_shape_numel(&src.shape) {

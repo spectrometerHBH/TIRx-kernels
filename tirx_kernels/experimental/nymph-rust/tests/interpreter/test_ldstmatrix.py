@@ -61,6 +61,47 @@ def test_ldmatrix_m8n8_b16_matches_ptx_fragment_mapping():
             np.testing.assert_array_equal(result, expected, err_msg=f"x{num} trans={trans}")
 
 
+def _ldmatrix_b16_dst_kernel(num, trans):
+    rows = 8 * num
+    nbytes = rows * 8 * 2
+    b = builder(f"ldmatrix_b16dst_x{num}_{'t' if trans else 'n'}", smem_size_bytes=nbytes)
+    source = gmem_arg(b, dtype=nr.DType.U16, shape=(rows, 8))
+    out = gmem_arg(b, dtype=nr.DType.BF16, shape=(32, 2 * num))
+    smem = smem_tensor(b, dtype=nr.DType.U16, shape=(rows, 8), byte_offset=0)
+    frag = reg_tensor(b, dtype=nr.DType.BF16, shape=(2 * num,))
+    mbar = b.mbar(kind=nr.MBarKind.TMA)
+
+    with b.if_warp(0), b.if_elected():
+        b.mbarrier_init(mbar, count=1)
+    with b.if_warp(0):
+        with b.if_elected():
+            b.mbarrier_arrive_expect_tx(mbar, bytes=nbytes)
+            b.tma_load(smem, source, mbar=mbar, coords=(0, 0), shape=(rows, 8))
+        b.mbarrier_wait(mbar, phase=0)
+        # b16 fragment dst: the xN words land as 2*num bf16 elements whose
+        # consecutive pairs ARE the packed b32 registers (bit reinterpret).
+        b.ldmatrix(frag, smem[b.lane_id() % rows, 0:8], num=num, trans=trans)
+        b.reg_store(out[b.lane_id(), 0 : 2 * num], frag)
+    return b.build(), source, out
+
+
+def test_ldmatrix_m8n8_b16_fragment_dst_decodes_pairs():
+    for num in [1, 2, 4]:
+        for trans in [False, True]:
+            kernel, source, out = _ldmatrix_b16_dst_kernel(num, trans)
+            result = output(run(kernel, {source: _source_values(num)}), out)
+            expected = np.zeros((32, 2 * num), dtype=np.float32)
+            for lane in range(32):
+                for matrix_id in range(num):
+                    for half in range(2):
+                        row, col = _coord(lane, half, trans)
+                        bits = np.array(
+                            [(matrix_id * 8 + row) << 8 | col], dtype=np.uint16
+                        ).astype(np.uint32)
+                        expected[lane, 2 * matrix_id + half] = (bits << 16).view(np.float32)[0]
+            np.testing.assert_array_equal(result, expected, err_msg=f"x{num} trans={trans}")
+
+
 def _stmatrix_kernel(num, trans):
     rows = 8 * num
     nbytes = rows * 8 * 2

@@ -2040,7 +2040,11 @@ fn collect_reg_aux_views(
                 views.entry(b.tensor.id).or_default().flat_ab = Some(*ab_dtype);
             }
             Stmt::LdMatrix { dst, .. } => {
-                views.entry(dst.tensor.id).or_default().flat = true;
+                let v = views.entry(dst.tensor.id).or_default();
+                v.flat = true;
+                if matches!(dst.tensor.dtype, DType::F16 | DType::Bf16) {
+                    v.flat_u32 = true;
+                }
             }
             Stmt::StMatrix { src, .. } => {
                 let v = views.entry(src.tensor.id).or_default();
@@ -5162,26 +5166,60 @@ fn emit_stmt(
                 );
             }
             let (dt, doff, dw) = reg_slice_parts(dst)?;
-            if !matches!(dt.dtype, DType::U32 | DType::I32) {
-                return Err(format!(
-                    "codegen: LdMatrix dst dtype {:?} has no lowering (u32/i32 packed \
-                     words only; a b16 fragment dst fails in the interpreter too)",
-                    dt.dtype
-                ));
-            }
-            if dw != *num as usize {
-                return Err(format!(
-                    "codegen: LdMatrix dst width {dw} != num {num} (the dst spans num b32 \
-                     registers)"
-                ));
-            }
             check_matrix_smem_row(src, "LdMatrix")?;
-            let dflat = flat_name(dt, ctx)?;
             let doff_s = emit_scalar(doff, ctx)?;
-            let handles = (0..*num as usize)
-                .map(|i| format!("{dflat}.ptr_to([{}])", flat_add(&doff_s, i)))
-                .collect::<Vec<_>>()
-                .join(", ");
+            let handles: String = match dt.dtype {
+                DType::U32 | DType::I32 => {
+                    if dw != *num as usize {
+                        return Err(format!(
+                            "codegen: LdMatrix dst width {dw} != num {num} (the dst spans \
+                             num b32 registers)"
+                        ));
+                    }
+                    let dflat = flat_name(dt, ctx)?;
+                    (0..*num as usize)
+                        .map(|i| format!("{dflat}.ptr_to([{}])", flat_add(&doff_s, i)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+                // A b16 fragment dst: the xN words are written through the
+                // `_flat_u32` reinterpret — consecutive b16 pairs ARE the b32
+                // registers (the mirror of the StMatrix b16 src form).
+                DType::F16 | DType::Bf16 => {
+                    if dw != 2 * *num as usize {
+                        return Err(format!(
+                            "codegen: LdMatrix b16 dst width {dw} != 2*num {} (the dst \
+                             spans num packed b16x2 registers)",
+                            2 * *num as usize
+                        ));
+                    }
+                    let Some(word_off) = as_int(doff) else {
+                        return Err(
+                            "codegen: LdMatrix b16 dst offset must be static (the u32 word \
+                             index is offset/2)"
+                                .to_string(),
+                        );
+                    };
+                    if word_off % 2 != 0 {
+                        return Err(format!(
+                            "codegen: LdMatrix b16 dst offset {word_off} is odd (a packed \
+                             b16x2 register starts at an even element)"
+                        ));
+                    }
+                    let name = ctx.tensor_name(dt.id)?;
+                    (0..*num as usize)
+                        .map(|i| format!("{name}_flat_u32.ptr_to([{}])", word_off / 2 + i as i64))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+                _ => {
+                    return Err(format!(
+                        "codegen: LdMatrix dst dtype {:?} has no lowering (u32/i32 packed \
+                         words or an f16/bf16 fragment)",
+                        dt.dtype
+                    ))
+                }
+            };
             let row_s = emit_scalar(&src.offsets[0], ctx)?;
             let col_s = emit_scalar(&src.offsets[1], ctx)?;
             let src_name = ctx.tensor_name(src.tensor.id)?;

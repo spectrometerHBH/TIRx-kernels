@@ -297,14 +297,33 @@ fn write_reg_words(
     let values = match resolved.tensor.dtype {
         DType::U32 => ValueArray2::U32(words),
         DType::I32 => ValueArray2::I32(words.mapv(|x| x as i32)),
+        // A b16 fragment dst: decode each word's halves into the pair slots —
+        // consecutive b16 elements ARE the b32 word (the inverse of the pack in
+        // read_reg_words; ldmatrix moves bits, not values).
+        DType::F16 | DType::Bf16 => {
+            let dtype = resolved.tensor.dtype;
+            let (lanes, num) = words.dim();
+            let out = Array2::from_shape_fn((lanes, 2 * num), |(t, e)| {
+                decode_b16(dtype, ((words[[t, e / 2]] >> (16 * (e % 2))) & 0xffff) as u16)
+            });
+            ValueArray2::from_f32_compute(out, dtype)
+        }
         _ => {
             return Err(InterpreterError::new(
                 "ldstmatrix_dtype",
-                "register fragment must have dtype u32 or i32",
+                "register fragment must have dtype u32/i32 or f16/bf16",
             ))
         }
     };
     ctx.registers_write(resolved, &values)
+}
+
+fn decode_b16(dtype: DType, bits: u16) -> f32 {
+    match dtype {
+        DType::F16 => half::f16::from_bits(bits).to_f32(),
+        DType::Bf16 => f32::from_bits(u32::from(bits) << 16),
+        _ => unreachable!("checked b16 fragment dtype"),
+    }
 }
 
 fn emit_matrix_tensor_read(

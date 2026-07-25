@@ -97,3 +97,40 @@ pytest 481, GPU cosine ≥0.999 all 6 — all green.
 Next cuts in order (unchanged): (i) IR u32→bf16 reg reinterpret →
 v_s/o_inter ldmatrix; (ii) TIRx wg.copy/tile-view index quality;
 (iii) (64,*) capped-wg store lowering; (iv) sync reduction.
+
+**Cut 3 (theme (i): ldmatrix b16-fragment dst + v_s ldmatrix, 2026-07-25)
+— DONE.** Three layers: `LdMatrix` now accepts an f16/bf16 fragment dst
+(2·num elements whose consecutive pairs ARE the xN b32 words — the mirror
+of the existing StMatrix b16 src form): validate relaxes the b32-only rule
+(2·num numel), the interpreter decodes words → halves (bit-exact, the
+inverse of `read_reg_words`' pack), codegen writes the xN dst handles
+through the `_flat_u32` reinterpret (static even offsets only). Kernel:
+delta's v reads are now ONE ldmatrix.x4 pair per (blk, va) into `v_frag`
+(packed b16x2; the non-trans fragment coordinate IS the epilogue tile
+coordinate) — the per-element SMEM pair loads and their address math are
+gone. (The o_inter half of the item was already killed by cut 2 — a
+register fragment beats an ldmatrix.) New test:
+`test_ldmatrix_m8n8_b16_fragment_dst_decodes_pairs`.
+A/B (t2048 total inst_executed): 5,131,131 → 4,972,128 (−3.10%), fi ratio
+2.59x → 2.51x. IMAD −100.5K, LOP3 −91K, LDS −59.5K, LEA −21.7K (the
+per-element v-load address math, as designed); LDSM +7,936 = 31 chunks ×
+8 x4-loads × 4 warps × 8 CTAs EXACT (chunk-0 delta skip = fi's
+first-chunk V-read skip). Regressions — emission quality, theme (ii)
+targets: LDL +21.4K (5,952→27,368 — x4 dst-handle address arrays spilling
+to local), PRMT +27.8K, MOV +13.7K, BRA +15.4K, SYNCS +30.3K. Anchors:
+UTCHMMA exact-equal (11,136), HMMA/STSM/LDGSTS unchanged.
+Bench fi/nymph (rounds=5, all 6, oracle-cos 1.0000): ns1_t64 0.665, t512
+0.258, t2048 0.211, ns20_t192 0.412, ns48_t64 0.666, v_70_130 0.327 —
+flat vs cut 2 (the emission regressions offset the count win; time follows
+once (ii) lands). Gates: cargo 164+15, pytest 482, GPU cosine ≥0.999 all
+6 — green.
+WORKFLOW TRAP (hit here): the bench/worker flows import `nymph_rs` from
+the SOURCE package (`python/` ahead of `_pybuild`), and
+`python/nymph_rs/nymph_rs.abi3.so` is a MANUAL COPY of the wheel .so —
+after ANY Rust rebuild it goes stale (the bench then validates with the
+OLD validator: "ldmatrix dst dtype must be i32 or u32"). Refresh:
+`cp _pybuild/nymph_rs/nymph_rs.abi3.so python/nymph_rs/ && cp -r
+_pybuild/nymph_rs.libs/. python/nymph_rs.libs/`.
+Next cuts in order: (ii) TIRx wg.copy/tile-view/ldmatrix-handle index
+quality (LDL/PRMT/MOV/IMAD emission); (iii) (64,*) capped-wg store
+lowering; (iv) sync reduction.
