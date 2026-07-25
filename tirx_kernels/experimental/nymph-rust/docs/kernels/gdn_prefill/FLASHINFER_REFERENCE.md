@@ -12,11 +12,12 @@ and **FREE** (allowed to differ; do not chase). Numbers labeled *derived* are
 computed from the tilers/layouts, not literally printed in the source — confirm
 against the ncu dump before acting on them.
 
-Environment note: the flashinfer kernel compiles and runs on this host only
-with the cu13 cutlass-dsl overlay (`bench/_cutlass_dsl_overlay.py`,
-NVIDIA/cutlass#3259). All SMEM cosizes/swizzles quoted here were produced by
-tracing the exact `sm100_utils.make_smem_layout_*` calls (CK:594-621) with the
-installed cutlass-dsl 4.5.2, not estimated.
+Environment note: this host originally needed a cu13 overlay for the
+flashinfer kernel (NVIDIA/cutlass#3259, 4.5.2 base/cu13 collision); the
+environment has since been repaired (nvidia-cutlass-dsl[cu13] 4.6.0) and no
+workaround is used anymore. All SMEM cosizes/swizzles quoted here were
+produced by tracing the exact `sm100_utils.make_smem_layout_*` calls
+(CK:594-621) with the installed cutlass-dsl, not estimated.
 
 ## 0. Algorithm and GEMM semantics map (per chunk, BT=64)
 

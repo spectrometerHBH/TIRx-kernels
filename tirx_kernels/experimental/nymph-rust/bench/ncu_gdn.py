@@ -82,9 +82,6 @@ def _worker(impl: str, shape: str) -> int:
     for _p in (os.path.join(_NYMPH_RUST, "python"), _REPO):
         if _p not in sys.path:
             sys.path.insert(0, _p)
-    import _cutlass_dsl_overlay
-
-    _cutlass_dsl_overlay.ensure_cutlass_dsl_cu13()
 
     import torch
     from nymph_rs.kernels import gdn_prefill as gdn
