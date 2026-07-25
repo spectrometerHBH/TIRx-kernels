@@ -171,15 +171,34 @@ observed completion fails `tmem_lifecycle_use_not_drained`.
 
 ## tcgen05.ld / tcgen05.st codegen support set
 
-The interpreter models all five shapes; the CODEGEN lowers only
-`tcgen05.ld` with **shape=32x32b, row=static 0, dtype=f32** — the single
-(128, cols) f32 base-0 view window `Tx.wg.copy_async` encodes (a `.16x*b`
-atom reads col_factor×num columns from a 16-lane half-slab; the dropped
-`..` used to emit the 32x32b text for it anyway). Anything else fails
-closed at codegen (**fixed in audit batch**). `tcgen05.st` and
-`tcgen05.wait::st` stay sim-only (codegen `Err`). The `.16x*b` atoms DO
-still reach silicon — via a REG fragment declared `reg_frag`, whose TIRx
-dispatch is driven by the fragment layout, not by this IR field.
+The interpreter models all five shapes. The CODEGEN lowers:
+
+- `tcgen05.ld` with **shape=32x32b, row=static 0, dtype=f32** — the single
+  (128, cols) f32 base-0 view window `Tx.wg.copy_async` encodes.
+- `tcgen05.ld` with **shape=16x64b/16x128b/16x256b, row=static 0, dtype=f32**
+  — the M=64 atom path: the dst fragment is declared as a flat local plus a
+  `(64, K)` `tcgen05_atom_layout` view (`{name}_atom`), and the read emits
+  `Tx.wg.copy_async(frag_atom[:, :], tmem[0:64, col:col+K])`. `num` must
+  match the fragment width (4·num f32 regs for 16x256b); row=16 (the M=128
+  second issue) and 16-bit reads stay fail-closed.
+- `tcgen05.st` with **shape=32x32b, row=static 0**, dtype f32 or packed
+  f16/bf16 — `Tx.wg.copy_async(tmem window, frag)`. The 16-bit dsts ride the
+  `tmem_f16`/`tmem_bf16` dense-packed views (two elements per 32-bit cell;
+  the element window doubles the cell column). The `.16x*b` st atoms stay
+  fail-closed (no atom-layout src fragment).
+- `tcgen05.wait::st` — `T.ptx.tcgen05.wait.st()`.
+
+The warp-matrix and reg-ALU families lower too (the GDN datapath):
+`LdMatrix`/`StMatrix` (m8n8.xN.b16 → `T.ptx.ldmatrix/stmatrix` with
+per-thread SMEM row addresses and flat-view register handles), `WarpMma`
+(m16n8k8/m16n8k16 → `T.ptx.mma.legacy`, accumulator reused as C/D), and the
+reg elementwise family (`RegFill/RegAdd/RegSub/RegMul/RegFma/RegUnary/
+RegCvt`) — `Tx.wg.*` tile ops at warpgroup-full scope, per-thread scalar
+form on the flat views under narrowed branches (the `Tx.wg.*` dispatches
+require the full launch intra). Fail-closed: rm rounding, int arith dtypes,
+non-f32 unary dsts, mixed-dtype operands (use RegCvt), RegUnary on 16-bit
+dsts. A `tcgen05.mma` with a TMEM B operand also fails closed (PTX + the
+TIRx schedule read B from SMEM only).
 
 ## mbarrier (§9.7.14.16)
 
