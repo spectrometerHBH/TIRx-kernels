@@ -1,0 +1,80 @@
+{
+  "impl": "flashinfer",
+  "shape": "ns1_t2048",
+  "kernels": [
+    "kernel_cutlass_kernel_flashinfergdn_kernelsblackwellgated_delta_net_chunkedGatedDeltaNetChunkedKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK6_0"
+  ],
+  "ncu_report": "flashinfer_ns1_t2048.ncu-rep",
+  "collected_at": "2026-07-25 03:25:10",
+  "inst_total": 1977960.0,
+  "inst_csv": "flashinfer_ns1_t2048.inst.csv",
+  "mem_csv": "flashinfer_ns1_t2048.mem.csv",
+  "mem": [
+    {
+      "kernel": "kernel_cutlass_kernel_flashinfergdn_kernelsblackwellgated_delta_net_chunkedGatedDeltaNetChunkedKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK6_0",
+      "metric": "l1tex__data_pipe_lsu_wavefronts_mem_shared.sum",
+      "value": 440852,
+      "unit": ""
+    },
+    {
+      "kernel": "kernel_cutlass_kernel_flashinfergdn_kernelsblackwellgated_delta_net_chunkedGatedDeltaNetChunkedKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK6_0",
+      "metric": "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum",
+      "value": 76071,
+      "unit": ""
+    },
+    {
+      "kernel": "kernel_cutlass_kernel_flashinfergdn_kernelsblackwellgated_delta_net_chunkedGatedDeltaNetChunkedKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK6_0",
+      "metric": "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum",
+      "value": 48996,
+      "unit": ""
+    },
+    {
+      "kernel": "kernel_cutlass_kernel_flashinfergdn_kernelsblackwellgated_delta_net_chunkedGatedDeltaNetChunkedKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK6_0",
+      "metric": "l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum",
+      "value": 33088,
+      "unit": "sector"
+    },
+    {
+      "kernel": "kernel_cutlass_kernel_flashinfergdn_kernelsblackwellgated_delta_net_chunkedGatedDeltaNetChunkedKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK6_0",
+      "metric": "l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum",
+      "value": 131574,
+      "unit": "sector"
+    },
+    {
+      "kernel": "kernel_cutlass_kernel_flashinfergdn_kernelsblackwellgated_delta_net_chunkedGatedDeltaNetChunkedKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK6_0",
+      "metric": "lts__t_sectors.sum",
+      "value": 1001271,
+      "unit": "sector"
+    },
+    {
+      "kernel": "kernel_cutlass_kernel_flashinfergdn_kernelsblackwellgated_delta_net_chunkedGatedDeltaNetChunkedKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK6_0",
+      "metric": "dram__sectors_read.sum",
+      "value": 268720,
+      "unit": "sector"
+    },
+    {
+      "kernel": "kernel_cutlass_kernel_flashinfergdn_kernelsblackwellgated_delta_net_chunkedGatedDeltaNetChunkedKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK6_0",
+      "metric": "dram__sectors_write.sum",
+      "value": 0,
+      "unit": "sector"
+    },
+    {
+      "kernel": "kernel_cutlass_kernel_flashinfergdn_kernelsblackwellgated_delta_net_chunkedGatedDeltaNetChunkedKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK6_0",
+      "metric": "smsp__inst_executed.sum",
+      "value": 1545944,
+      "unit": "inst"
+    },
+    {
+      "kernel": "kernel_cutlass_kernel_flashinfergdn_kernelsblackwellgated_delta_net_chunkedGatedDeltaNetChunkedKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK6_0",
+      "metric": "launch__registers_per_thread",
+      "value": 168,
+      "unit": "register/thread"
+    },
+    {
+      "kernel": "kernel_cutlass_kernel_flashinfergdn_kernelsblackwellgated_delta_net_chunkedGatedDeltaNetChunkedKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK6_0",
+      "metric": "launch__occupancy_limit_registers",
+      "value": 1,
+      "unit": "block"
+    }
+  ]
+}

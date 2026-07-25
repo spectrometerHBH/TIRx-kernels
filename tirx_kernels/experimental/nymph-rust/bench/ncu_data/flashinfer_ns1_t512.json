@@ -1,0 +1,80 @@
+{
+  "impl": "flashinfer",
+  "shape": "ns1_t512",
+  "kernels": [
+    "kernel_cutlass_kernel_flashinfergdn_kernelsblackwellgated_delta_net_chunkedGatedDeltaNetChunkedKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK6_0"
+  ],
+  "ncu_report": "flashinfer_ns1_t512.ncu-rep",
+  "collected_at": "2026-07-25 03:25:10",
+  "inst_total": 513096.0,
+  "inst_csv": "flashinfer_ns1_t512.inst.csv",
+  "mem_csv": "flashinfer_ns1_t512.mem.csv",
+  "mem": [
+    {
+      "kernel": "kernel_cutlass_kernel_flashinfergdn_kernelsblackwellgated_delta_net_chunkedGatedDeltaNetChunkedKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK6_0",
+      "metric": "l1tex__data_pipe_lsu_wavefronts_mem_shared.sum",
+      "value": 107028,
+      "unit": ""
+    },
+    {
+      "kernel": "kernel_cutlass_kernel_flashinfergdn_kernelsblackwellgated_delta_net_chunkedGatedDeltaNetChunkedKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK6_0",
+      "metric": "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum",
+      "value": 18266,
+      "unit": ""
+    },
+    {
+      "kernel": "kernel_cutlass_kernel_flashinfergdn_kernelsblackwellgated_delta_net_chunkedGatedDeltaNetChunkedKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK6_0",
+      "metric": "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum",
+      "value": 11499,
+      "unit": ""
+    },
+    {
+      "kernel": "kernel_cutlass_kernel_flashinfergdn_kernelsblackwellgated_delta_net_chunkedGatedDeltaNetChunkedKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK6_0",
+      "metric": "l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum",
+      "value": 8512,
+      "unit": "sector"
+    },
+    {
+      "kernel": "kernel_cutlass_kernel_flashinfergdn_kernelsblackwellgated_delta_net_chunkedGatedDeltaNetChunkedKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK6_0",
+      "metric": "l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum",
+      "value": 131589,
+      "unit": "sector"
+    },
+    {
+      "kernel": "kernel_cutlass_kernel_flashinfergdn_kernelsblackwellgated_delta_net_chunkedGatedDeltaNetChunkedKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK6_0",
+      "metric": "lts__t_sectors.sum",
+      "value": 417688,
+      "unit": "sector"
+    },
+    {
+      "kernel": "kernel_cutlass_kernel_flashinfergdn_kernelsblackwellgated_delta_net_chunkedGatedDeltaNetChunkedKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK6_0",
+      "metric": "dram__sectors_read.sum",
+      "value": 69040,
+      "unit": "sector"
+    },
+    {
+      "kernel": "kernel_cutlass_kernel_flashinfergdn_kernelsblackwellgated_delta_net_chunkedGatedDeltaNetChunkedKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK6_0",
+      "metric": "dram__sectors_write.sum",
+      "value": 0,
+      "unit": "sector"
+    },
+    {
+      "kernel": "kernel_cutlass_kernel_flashinfergdn_kernelsblackwellgated_delta_net_chunkedGatedDeltaNetChunkedKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK6_0",
+      "metric": "smsp__inst_executed.sum",
+      "value": 410018,
+      "unit": "inst"
+    },
+    {
+      "kernel": "kernel_cutlass_kernel_flashinfergdn_kernelsblackwellgated_delta_net_chunkedGatedDeltaNetChunkedKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK6_0",
+      "metric": "launch__registers_per_thread",
+      "value": 168,
+      "unit": "register/thread"
+    },
+    {
+      "kernel": "kernel_cutlass_kernel_flashinfergdn_kernelsblackwellgated_delta_net_chunkedGatedDeltaNetChunkedKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK6_0",
+      "metric": "launch__occupancy_limit_registers",
+      "value": 1,
+      "unit": "block"
+    }
+  ]
+}
