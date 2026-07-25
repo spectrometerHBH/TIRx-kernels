@@ -22,9 +22,10 @@ if os.environ.get("NYMPH_BENCH_SUITE") == "1":
         sys.path.insert(0, _PY)
 
     try:
-        from nymph_rs.kernels import fp16_bf16_gemm, nvfp4_gemm
+        from nymph_rs.kernels import fp16_bf16_gemm, gdn_prefill, nvfp4_gemm
 
         nvfp4_gemm.register_bench_interface()
         fp16_bf16_gemm.register_bench_interface()
+        gdn_prefill.register_bench_interface()
     except Exception as e:  # never break an unrelated python
         sys.stderr.write(f"[nymph autoreg] skipped: {e}\n")
