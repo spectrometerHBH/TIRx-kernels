@@ -3328,7 +3328,7 @@ fn emit_stmt(
             emit_guarded(
                 out,
                 &format!(
-                    "Tx.copy_async({dst_s}, {src_s}, dispatch=\"tma\", mbar={mbar_name}.ptr_to([{mbar_slot}]), cta_group={cg}{cta_mask}{cache_hint_kw}{prefetch_kw})",
+                    "Tx.copy_async({dst_s}, {src_s}, dispatch=\"tma_auto\", mbar={mbar_name}.ptr_to([{mbar_slot}]), cta_group={cg}{cta_mask}{cache_hint_kw}{prefetch_kw})",
                     cg = ctx.cta_group,
                 ),
             );
@@ -3751,7 +3751,7 @@ fn emit_stmt(
             emit_guarded(
                 out,
                 &format!(
-                    "Tx.copy_async({dst_s}, {src_s}, dispatch=\"tma\"{cache_hint_kw}{prefetch_kw})"
+                    "Tx.copy_async({dst_s}, {src_s}, dispatch=\"tma_auto\"{cache_hint_kw}{prefetch_kw})"
                 ),
             );
             Ok(())
