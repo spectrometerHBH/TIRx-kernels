@@ -244,8 +244,8 @@ def build_gdn_prefill(config: GdnPrefillConfig = GdnPrefillConfig()) -> Kernel:
         tmpt=V_DIM * BT * 2,
         out=BT * V_DIM * 2,
         m=BT * BT * 4,
-        gcs=BT * HV * 4,
-        beta=BT * HV * 4,
+        gcs=BT * NEFF * 4,
+        beta=BT * NEFF * 4,
         state=K_DIM * V_DIM * 2,  # fp16 SMEM S_prev copy (GEMM3/4's B operand)
         dcs=BT * BT * 2,  # DC scratch for the hierarchical-inverse merges (mma.sync)
     )
@@ -311,8 +311,8 @@ def build_gdn_prefill(config: GdnPrefillConfig = GdnPrefillConfig()) -> Kernel:
     out_s = sm("out", iod, (BT, V_DIM))
     m_s = sm("m", DType.F32, (BT, BT))
     dcs_s = sm("dcs", iod, (BT, BT))  # hierarchical-inverse DC scratch
-    gcs_s = sm("gcs", DType.F32, (BT, HV))
-    beta_s = sm("beta", DType.F32, (BT, HV))
+    gcs_s = sm("gcs", DType.F32, (BT, NEFF))
+    beta_s = sm("beta", DType.F32, (BT, NEFF))
     s_s = sm("state", iod, (K_DIM, V_DIM))  # fp16 SMEM S_prev copy (GEMM3/4 B)
 
     # TMEM column plan matching flashinfer's separate allocations (gated_delta_net_chunked.py
@@ -636,23 +636,23 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                     # Full (BT, HV) tile: a per-head column slice is not a legal
                     # TMA box (a strided f32 column fails the 16B inner-box
                     # rule) — load the whole tile, read column `eh` out of it.
-                    k.mbarrier_arrive_expect_tx(bars["tg"], bytes=BT * HV * 4)
+                    k.mbarrier_arrive_expect_tx(bars["tg"], bytes=BT * NEFF * 4)
                     k.tma_load(
                         gcs_s,
                         gate_g,
                         mbar=bars["tg"],
                         coords=(gtok, 0),
-                        shape=(BT, HV),
-                        gmem_shape=(BT, HV),
+                        shape=(BT, NEFF),
+                        gmem_shape=(BT, NEFF),
                     )
-                    k.mbarrier_arrive_expect_tx(bars["tb"], bytes=BT * HV * 4)
+                    k.mbarrier_arrive_expect_tx(bars["tb"], bytes=BT * NEFF * 4)
                     k.tma_load(
                         beta_s,
                         beta_g,
                         mbar=bars["tb"],
                         coords=(gtok, 0),
-                        shape=(BT, HV),
-                        gmem_shape=(BT, HV),
+                        shape=(BT, NEFF),
+                        gmem_shape=(BT, NEFF),
                     )
                 k.mbarrier_wait(bars["tg"], phase=ph(gc))
                 if (
