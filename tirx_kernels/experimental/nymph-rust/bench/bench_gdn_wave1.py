@@ -18,8 +18,16 @@ For each representative shape (``kernels/gdn_prefill.py::BENCH_CONFIGS``):
    (``tcgen05.make_tmem_copy`` over ``tmem_load<f32, 32 DP, 32 bit, x32>``:
    "failed to legalize unresolved materialization"), reproduced by
    flashinfer's own tests/gdn/test_prefill_delta_rule.py on the unmodified
-   repo. 4.5.2 satisfies flashinfer's declared >=4.5.0 constraint. Per the
-   goal's stop rule the baseline is recorded-broken, not patched.
+   repo. ROOT CAUSE (confirmed read-only): NVIDIA/cutlass#3259 — the
+   nvidia-cutlass-dsl-libs-base and -libs-cu13 4.5.2 wheels both own
+   nvidia_cutlass_dsl/lib/libcute_dsl_runtime.so with different content, and
+   the BASE variant won the install race here (on-disk size 37,288,696 B =
+   base's RECORD, cu13's is 39,855,488 B); the base runtime lacks the CUDA-13
+   MLIR bytecode tcgen05.make_tmem_copy needs. The repair is to re-extract the
+   cu13 wheel last (e.g. ``pip install --force-reinstall --no-deps
+   nvidia-cutlass-dsl-libs-cu13==4.5.2``) — an environment fix, deliberately
+   NOT applied here: the goal's stop rule says record-and-stop, never patch
+   the baseline or mutate the shared env from this wave.
 3. baseline sanity — flashinfer output vs the numpy oracle
    (``tests/kernels/_gdn_oracle.py``, the FLA chunked reference the value sim
    is validated against) on the SAME inputs: cosine per shape. This exercises
