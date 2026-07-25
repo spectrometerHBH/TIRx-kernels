@@ -14,3 +14,19 @@ features = ["python"]
 # Mixed Rust/Python: the compiled extension lands inside the `nymph_rs` package
 # next to the Python builder + kernels under python/.
 python-source = "python"
+
+[tool.pytest.ini_options]
+# Two tiers, one suite. The default run is everything (no filter, so a gate
+# cannot silently lose coverage); the inner loop excludes the tiers that need
+# a toolchain or a device:
+#
+#   pytest tests -q -n 16 -m "not codegen and not gpu and not slow"
+#
+# `codegen` needs a tvm able to lower TIRx, `gpu` needs a CUDA device, and
+# `slow` is the big-shape protocol/value work whose runtime is dominated by
+# one or two shapes rather than by breadth.
+markers = [
+    "codegen: lowers IR through tvm.compile — needs a TIRx-capable tvm",
+    "gpu: runs on a real CUDA device and compares against it",
+    "slow: minutes of simulation on the largest shapes",
+]

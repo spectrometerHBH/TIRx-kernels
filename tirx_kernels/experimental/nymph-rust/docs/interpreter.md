@@ -227,3 +227,20 @@ cargo test --features python --lib
 cargo test --features python --test interpreter_runner
 ./run_python_tests.sh
 ```
+
+The Python suite is tiered by marker, so the inner loop does not wait on a
+toolchain or a device:
+
+```bash
+# inner loop — everything that needs neither tvm nor a GPU nor minutes of
+# simulation on the largest shapes
+pytest tests -q -n 16 -m "not codegen and not gpu and not slow"
+
+# the gate — no filter, so coverage cannot be lost by forgetting one
+pytest tests -q -n 16
+```
+
+`codegen` lowers through `tvm.compile`, `gpu` runs on a real device, and
+`slow` is the handful of largest-shape protocol/value shapes. Everything else
+is seconds. Note that these are wall-clock-sensitive: this is a shared
+machine, and a concurrent suite easily doubles the numbers.

@@ -84,6 +84,7 @@ def test_fp8_blockwise_gemm_builds_supported_configs():
         assert len(kernel.args) == 5
 
 
+@pytest.mark.slow
 def test_fp8_blockwise_gemm_protocol_bench_shapes_resident_tier():
     # Resident protocol tier for the TIRx bench shapes beyond the SUPPORTED
     # list: 4096^3 (~6 s) and 8192^3 (~25 s). 16384^3 protocol-checks Passed

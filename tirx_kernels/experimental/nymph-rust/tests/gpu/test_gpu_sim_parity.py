@@ -46,7 +46,10 @@ from nymph_rs.kernels.nvfp4_gemm import NvFp4GemmConfig  # noqa: E402
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "kernels")))
 from test_nvfp4_gemm import _prepare as _nvfp4_prepare  # noqa: E402
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
+pytestmark = [
+    pytest.mark.gpu,
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU"),
+]
 
 
 def _compile_tirx(kernel, prefix):
