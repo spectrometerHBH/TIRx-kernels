@@ -4622,7 +4622,85 @@ fn emit_stmt(
         // semaphore, or DSMEM cluster-copy lowering machinery, and no smoke-test kernel
         // (nvfp4 / fp16) exercises them. Fail closed with `Err` (a PyValueError through
         // the wrapper) like every other unsupported node — never panic. ----
-        WarpMma { .. } => Err("codegen: WarpMma not yet supported".to_string()),
+        // `mma.sync.aligned.m16n8k{8,16}.row.col.f32.{ab}.{ab}.f32` — warp-level
+        // SM80 HMMA via the legacy WMMA-fragment intrinsic: one flat local
+        // buffer + base offset per operand, the accumulator reused as both C
+        // and D (the intrinsic's single accumulator slot), exactly the
+        // interpreter's D = A·Bᵀ + C over the standard warp fragment layout
+        // (the layout LdMatrix produces — A/B ride the `{name}_flat_ab`
+        // bf16/f16 reinterpret of their packed u32 words).
+        WarpMma {
+            d,
+            a,
+            b,
+            c,
+            m,
+            n,
+            k,
+            ab_dtype,
+        } => {
+            if !matches!((*m, *n, *k), (16, 8, 8) | (16, 8, 16)) {
+                return Err(format!(
+                    "codegen: WarpMma m{m}n{n}k{k} has no lowering (only m16n8k8/m16n8k16)"
+                ));
+            }
+            if !matches!(ab_dtype, DType::F16 | DType::Bf16) {
+                return Err(format!(
+                    "codegen: WarpMma ab_dtype {ab_dtype:?} has no lowering (bf16/f16 only)"
+                ));
+            }
+            // d == c: the legacy intrinsic reuses the one accumulator buffer as
+            // both input and output — distinct C/D slices would need a second
+            // fragment (no lowering; gdn always accumulates in place).
+            if d != c {
+                return Err(
+                    "codegen: WarpMma d and c must be the same fragment (the mma.sync \
+                     accumulator is read-modify-write)"
+                        .to_string(),
+                );
+            }
+            let (dt, doff, dw) = reg_slice_parts(d)?;
+            let (at, aoff, aw) = reg_slice_parts(a)?;
+            let (bt, boff, bw) = reg_slice_parts(b)?;
+            if dt.dtype != DType::F32 {
+                return Err(format!(
+                    "codegen: WarpMma C/D dtype {:?} must be f32 (the PTX accumulator)",
+                    dt.dtype
+                ));
+            }
+            if !matches!(at.dtype, DType::U32 | DType::I32)
+                || !matches!(bt.dtype, DType::U32 | DType::I32)
+            {
+                return Err(
+                    "codegen: WarpMma A/B fragments must be u32/i32 packed words \
+                     (ldmatrix output; the bf16/f16 element form has no lowering)"
+                        .to_string(),
+                );
+            }
+            let len_a = (*m * *k / 64) as usize;
+            let len_b = (*n * *k / 64) as usize;
+            let len_cd = (*m * *n / 32) as usize;
+            for (off, w, want, label) in [
+                (doff, dw, len_cd, "C/D"),
+                (aoff, aw, len_a, "A"),
+                (boff, bw, len_b, "B"),
+            ] {
+                if as_int(off) != Some(0) || w != want {
+                    return Err(format!(
+                        "codegen: WarpMma {label} fragment must span exactly {want} b32 \
+                         registers from offset 0 (got off={off:?}, width {w})"
+                    ));
+                }
+            }
+            let a_name = ctx.tensor_name(at.id)?;
+            let b_name = ctx.tensor_name(bt.id)?;
+            let d_name = ctx.tensor_name(dt.id)?;
+            let ab_s = dtype_str(*ab_dtype);
+            out.push_str(&format!(
+                "{p}T.ptx.mma.legacy(\"m{m}n{n}k{k}\", \"row\", \"col\", \"{ab_s}\", \"{ab_s}\", \"float32\", {a_name}_flat_ab.data, 0, {b_name}_flat_ab.data, 0, {d_name}_flat.data, 0, False, dtype=\"float32\")\n"
+            ));
+            Ok(())
+        }
         GmemAtomicAdd { .. } => Err("codegen: GmemAtomicAdd not yet supported".to_string()),
         GmemWaitEq { .. } => Err("codegen: GmemWaitEq not yet supported".to_string()),
         CpAsyncBulkS2Cluster { .. } => {
@@ -6074,6 +6152,106 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(err.contains("dtype"), "{err}");
+    }
+
+    #[test]
+    fn warp_mma_lowering_and_rejects() {
+        let imm_a = reg_tensor(10, DType::U32, 2);
+        let imm_b = reg_tensor(11, DType::U32, 1);
+        let acc = reg_tensor(12, DType::F32, 4);
+        let defs = vec![
+            Stmt::TensorDef {
+                tensor: imm_a.clone(),
+            },
+            Stmt::TensorDef {
+                tensor: imm_b.clone(),
+            },
+            Stmt::TensorDef {
+                tensor: acc.clone(),
+            },
+        ];
+        let mma = |d: TensorSlice, c: TensorSlice| Stmt::WarpMma {
+            d,
+            a: reg_slice(&imm_a, 0, 2),
+            b: reg_slice(&imm_b, 0, 1),
+            c,
+            m: 16,
+            n: 8,
+            k: 8,
+            ab_dtype: DType::Bf16,
+        };
+        let body = {
+            let mut b = defs.clone();
+            b.push(wg_if(
+                0,
+                vec![mma(reg_slice(&acc, 0, 4), reg_slice(&acc, 0, 4))],
+            ));
+            b
+        };
+        let src = kernel_to_tirx_source(&kernel(body)).unwrap();
+        assert!(
+            src.contains(
+                "T.ptx.mma.legacy(\"m16n8k8\", \"row\", \"col\", \"bfloat16\", \"bfloat16\", \"float32\", accum_frag_flat_ab.data, 0, out_frag_flat_ab.data, 0, reg2_flat.data, 0, False, dtype=\"float32\")"
+            ),
+            "{src}"
+        );
+
+        // d != c: the accumulator is read-modify-write.
+        let err = kernel_to_tirx_source(&kernel({
+            let mut b = defs.clone();
+            b.push(wg_if(
+                0,
+                vec![mma(reg_slice(&acc, 0, 2), reg_slice(&acc, 0, 4))],
+            ));
+            b
+        }))
+        .unwrap_err();
+        assert!(err.contains("same fragment"), "{err}");
+        // A/B in a bf16 element dtype (not packed words): no lowering.
+        let ab16 = reg_tensor(13, DType::Bf16, 4);
+        let err = kernel_to_tirx_source(&kernel(vec![
+            Stmt::TensorDef {
+                tensor: ab16.clone(),
+            },
+            Stmt::TensorDef {
+                tensor: acc.clone(),
+            },
+            wg_if(
+                0,
+                vec![Stmt::WarpMma {
+                    d: reg_slice(&acc, 0, 4),
+                    a: reg_slice(&ab16, 0, 4),
+                    b: reg_slice(&ab16, 0, 2),
+                    c: reg_slice(&acc, 0, 4),
+                    m: 16,
+                    n: 8,
+                    k: 8,
+                    ab_dtype: DType::Bf16,
+                }],
+            ),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("packed words"), "{err}");
+        // Unsupported shape.
+        let err = kernel_to_tirx_source(&kernel({
+            let mut b = defs.clone();
+            b.push(wg_if(
+                0,
+                vec![Stmt::WarpMma {
+                    d: reg_slice(&acc, 0, 4),
+                    a: reg_slice(&imm_a, 0, 2),
+                    b: reg_slice(&imm_b, 0, 1),
+                    c: reg_slice(&acc, 0, 4),
+                    m: 8,
+                    n: 8,
+                    k: 8,
+                    ab_dtype: DType::Bf16,
+                }],
+            ));
+            b
+        }))
+        .unwrap_err();
+        assert!(err.contains("m8n8k8"), "{err}");
     }
 
     #[test]
