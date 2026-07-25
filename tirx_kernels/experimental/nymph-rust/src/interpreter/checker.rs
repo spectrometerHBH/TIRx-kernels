@@ -1518,19 +1518,18 @@ fn check_tmem_window_conflicts(
 /// A TMEM access, with the point at which the trace records it as landed.
 struct TmemAccess {
     event_idx: usize,
+    stream_id: usize,
     region: Region,
     async_kind: TmemAsyncKind,
-    /// Completion observations, FIRST per waiting stream: the
-    /// `tcgen05.wait::ld/st` that retired a load/store, or an mbar wait
-    /// whose cell a covering `tcgen05.commit` handed the access to (a commit
-    /// tracks EVERY async op the warp issued before it, so every later
-    /// commit covers the access again and any one of those cells' waits is
-    /// a valid observation). Only the first witness per stream is kept: a
-    /// stream's events are program-ordered, so its earliest witness is the
-    /// easiest for any happens-before query to cover — keeping more from
-    /// the same stream cannot change the answer, and a long mainloop would
-    /// otherwise pile one witness per tile onto every access.
-    drains: Vec<(usize, usize)>,
+    /// For a load or store: the `tcgen05.wait` of its kind on its own stream
+    /// that retired it.
+    wait_idx: Option<usize>,
+    /// For an mma or cp: the mbarrier cells a covering `tcgen05.commit` handed
+    /// it to. A commit makes the barrier track EVERY async op the warp issued
+    /// before it, so waiting ANY of these cells observes this access — which
+    /// of them the freeing warp is ordered after is decided once per cell at
+    /// the end, not once per access.
+    cells: Vec<MbarKey>,
 }
 
 /// One `alloc .. dealloc` interval of a TMEM band.
@@ -1573,14 +1572,15 @@ fn tmem_lifecycle_order_local(cx: &mut CheckerCx<'_>) -> CheckResult {
     // it, so a later commit covers them again — waiting any one of those
     // cells proves completion.
     let mut undrained_async: HashMap<usize, Vec<usize>> = HashMap::new();
-    let mut committed: HashMap<MbarKey, Vec<usize>> = HashMap::new();
-    // Per (cell, committing stream): how many of the stream's pending
-    // accesses were already handed to the cell. `undrained_async` is
-    // append-only, so re-extending from the watermark hands each access to
-    // each cell at most once — without it a commit per tile re-copies the
-    // whole pending set into the cell and the structure grows quadratically
-    // in the tile count.
+    // Per (cell, committing stream): how many of the stream's async accesses
+    // already carry that cell. Both lists are append-only and the tag is
+    // PERMANENT, so each access is tagged with each cell at most once — the
+    // whole bookkeeping is linear in (accesses + commits + waits) however
+    // long the mainloop is.
     let mut handed: HashMap<(MbarKey, usize), usize> = HashMap::new();
+    // Every wait on a cell, in trace order. Which of them the freeing warp is
+    // ordered after is asked once per cell per generation, at the end.
+    let mut cell_waits: HashMap<MbarKey, Vec<usize>> = HashMap::new();
     for (event_idx, event) in cx.event_index.events.iter().enumerate() {
         match &event.payload {
             TraceEventKind::TmemAlloc { region, .. } => {
@@ -1626,9 +1626,11 @@ fn tmem_lifecycle_order_local(cx: &mut CheckerCx<'_>) -> CheckResult {
                 }
                 accesses.push(TmemAccess {
                     event_idx,
+                    stream_id: scope.stream_id,
                     region: region.clone(),
                     async_kind: *async_kind,
-                    drains: Vec::new(),
+                    wait_idx: None,
+                    cells: Vec::new(),
                 });
             }
             // `tcgen05.wait::ld/st` retires the EXECUTING thread's own loads
@@ -1638,10 +1640,7 @@ fn tmem_lifecycle_order_local(cx: &mut CheckerCx<'_>) -> CheckResult {
                 if let Some(pending) = undrained.get_mut(&scope.stream_id) {
                     pending.retain(|a| {
                         if accesses[*a].async_kind == *async_kind {
-                            let drains = &mut accesses[*a].drains;
-                            if !drains.iter().any(|(s, _)| *s == scope.stream_id) {
-                                drains.push((scope.stream_id, event_idx));
-                            }
+                            accesses[*a].wait_idx = Some(event_idx);
                             false
                         } else {
                             true
@@ -1659,37 +1658,17 @@ fn tmem_lifecycle_order_local(cx: &mut CheckerCx<'_>) -> CheckResult {
                 if let Some(pending) = undrained_async.get(&scope.stream_id) {
                     let key = MbarKey::from_target(target);
                     let watermark = handed.entry((key.clone(), scope.stream_id)).or_insert(0);
-                    if *watermark < pending.len() {
-                        committed
-                            .entry(key)
-                            .or_default()
-                            .extend(pending[*watermark..].iter().copied());
-                        *watermark = pending.len();
+                    for a in &pending[*watermark..] {
+                        accesses[*a].cells.push(key.clone());
                     }
+                    *watermark = pending.len();
                 }
             }
-            TraceEventKind::MbarWait { target, scope, .. } => {
-                let key = MbarKey::from_target(target);
-                if let Some(tracked) = committed.remove(&key) {
-                    for a in &tracked {
-                        let drains = &mut accesses[*a].drains;
-                        if !drains.iter().any(|(s, _)| *s == scope.stream_id) {
-                            drains.push((scope.stream_id, event_idx));
-                        }
-                    }
-                    // The wait consumed this generation of the cell: later
-                    // commits start a new one, and every prior async access is
-                    // handed to it again (a commit covers EVERY async op the
-                    // warp issued before it) — reset the watermarks so the
-                    // next wait is an equally valid observation of them. The
-                    // accesses also stay in `undrained_async` (never purged):
-                    // the first wait's stream may simply never synchronize
-                    // with the band's freeing warp (a pacing wait on a
-                    // commit-multicast SMEM-ring cell is not the observer the
-                    // teardown orders against; the epilogue's tmem_full wait
-                    // is).
-                    handed.retain(|(cell, _), _| *cell != key);
-                }
+            TraceEventKind::MbarWait { target, .. } => {
+                cell_waits
+                    .entry(MbarKey::from_target(target))
+                    .or_default()
+                    .push(event_idx);
             }
             TraceEventKind::TmemDealloc { region, .. } => {
                 let open = live.entry(region.owner.clone()).or_default();
@@ -1732,17 +1711,41 @@ fn tmem_lifecycle_order_local(cx: &mut CheckerCx<'_>) -> CheckResult {
     // Bind each access to the generation it uses — the one whose band covers
     // it, whose allocation it is ordered after, and whose free it is not
     // already past — then require that it retires before that free.
+    // A stream's accesses are program-ordered, so the generation one of them
+    // uses never moves backwards, and an alloc edge established for the first
+    // access of a stream holds for every later one by transitivity. Both are
+    // cached per (stream, owner) / (stream, generation): the scan over
+    // generations — region containment included — then runs once per access
+    // in the steady state instead of once per generation.
+    let mut bound: HashMap<(usize, PoolId), usize> = HashMap::new();
+    let mut cell_observed: HashMap<(MbarKey, usize), bool> = HashMap::new();
+    let mut alloc_edge: HashSet<(usize, usize)> = HashSet::new();
     for access in &accesses {
         let (access_idx, region) = (&access.event_idx, &access.region);
-        let generation = generations.iter().find(|g| {
-            g.region.owner == region.owner
-                && region_covers(&g.region, region)
-                && cx.ordering().happens_before(g.alloc_idx, *access_idx)
-                && !g
-                    .dealloc_idx
-                    .is_some_and(|d| cx.ordering().happens_before(d, *access_idx))
-        });
-        let Some(generation) = generation else {
+        let mut usable = |g_idx: usize, generations: &Vec<TmemGeneration>| {
+            let g = &generations[g_idx];
+            if g.region.owner != region.owner || !region_covers(&g.region, region) {
+                return false;
+            }
+            if !alloc_edge.contains(&(g_idx, access.stream_id)) {
+                if !cx.ordering().happens_before(g.alloc_idx, *access_idx) {
+                    return false;
+                }
+                alloc_edge.insert((g_idx, access.stream_id));
+            }
+            !g.dealloc_idx
+                .is_some_and(|d| cx.ordering().happens_before(d, *access_idx))
+        };
+        let key = (access.stream_id, region.owner.clone());
+        let found = bound
+            .get(&key)
+            .copied()
+            .filter(|g_idx| usable(*g_idx, &generations))
+            .or_else(|| (0..generations.len()).find(|g_idx| usable(*g_idx, &generations)));
+        if let Some(g_idx) = found {
+            bound.insert(key, g_idx);
+        }
+        let Some(generation) = found.map(|g_idx| &generations[g_idx]) else {
             let event = cx.event_index.events.get(*access_idx);
             return Err(cx.fail(
                 "tmem_lifecycle_use_without_allocation",
@@ -1761,14 +1764,30 @@ fn tmem_lifecycle_order_local(cx: &mut CheckerCx<'_>) -> CheckResult {
             // observation (the commit tracks every prior async op of the
             // warp), so the free needs a happens-before edge from ONE
             // recorded drain, not from a particular one.
+            // Which CELLS the freeing warp is ordered after is a property of
+            // the cell, not of the access, so it is decided once per (cell,
+            // free) and cached — an access then only asks whether one of its
+            // own cells is in that set.
+            // A cell only witnesses completion once somebody WAITS it: a commit
+            // that nobody ever waits observes nothing.
+            let has_witness = access.wait_idx.is_some()
+                || access.cells.iter().any(|c| cell_waits.contains_key(c));
             let observed_before_free = access
-                .drains
-                .iter()
-                .any(|(_, d)| cx.ordering().happens_before(*d, dealloc_idx));
+                .wait_idx
+                .is_some_and(|d| cx.ordering().happens_before(d, dealloc_idx))
+                || access.cells.iter().any(|cell| {
+                    *cell_observed
+                        .entry((cell.clone(), dealloc_idx))
+                        .or_insert_with(|| {
+                            cell_waits.get(cell).is_some_and(|waits| {
+                                waits
+                                    .iter()
+                                    .any(|w| cx.ordering().happens_before(*w, dealloc_idx))
+                            })
+                        })
+                });
             if !observed_before_free {
-                if access.drains.is_empty()
-                    && cx.ordering().happens_before(*access_idx, dealloc_idx)
-                {
+                if !has_witness && cx.ordering().happens_before(*access_idx, dealloc_idx) {
                     return Err(cx.fail(
                         "tmem_lifecycle_use_not_drained",
                         "TMEM access is never observed to complete — a `tcgen05.wait` of its \
@@ -1777,7 +1796,7 @@ fn tmem_lifecycle_order_local(cx: &mut CheckerCx<'_>) -> CheckResult {
                         cx.event_index.events.get(*access_idx),
                     ));
                 }
-                let message = if access.drains.is_empty() {
+                let message = if !has_witness {
                     "TMEM deallocation has no happens-before edge from an access of that \
                      generation; every accessing warp must be ordered before the free"
                 } else {
@@ -4133,6 +4152,11 @@ impl OrderingAnalysis {
         if from >= self.meta.len() || to >= self.meta.len() {
             return false;
         }
+        // The trace is one real execution, so it linearizes happens-before: an
+        // event can only be ordered after events emitted before it.
+        if from > to {
+            return false;
+        }
         let mf = &self.meta[from];
         let mt = &self.meta[to];
         if mf.mask == 0 || mt.mask == 0 {
@@ -4167,6 +4191,10 @@ impl OrderingAnalysis {
             return true;
         }
         if from >= self.meta.len() || to >= self.meta.len() {
+            return false;
+        }
+        // See `ordered_lane`: trace order linearizes happens-before.
+        if from > to {
             return false;
         }
         let mf = &self.meta[from];
