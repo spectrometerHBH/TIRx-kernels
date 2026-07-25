@@ -38,6 +38,7 @@ and the project memory for the full op map). State S[K,V] carried in TMEM.
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass
 
 from ..builder import IRBuilder, TmemBand
@@ -1174,3 +1175,265 @@ def _validate_config(config: GdnPrefillConfig) -> None:
     # lengths supported — the partial last chunk's OOB tokens are masked to no-ops (gate=1,
     # beta=0; K/Q/V additionally TMA-OOB-zero-filled) and the epilogue stores only valid
     # rows. cu_seqlens is the i32[NS+1] arg, passed at interpret time.
+
+
+# ---------------------------------------------------------------------------
+# Bench-suite interface (see bench/nymph_bench_guide.md). Lives IN the kernel
+# file, mirroring canon's single-file structure: pure data at module level;
+# bench-only deps (tvm / torch / flashinfer) imported lazily so the nymph_rs
+# package stays importable without them (CPU-only value sim, wheel installs).
+#
+# The baseline is the flashinfer Blackwell SM100 CuTeDSL kernel this file ports
+# (``flashinfer.gdn_prefill.chunk_gated_delta_rule`` -> ``chunk_gated_delta_rule_sm100``
+# -> ``GatedDeltaNetChunkedKernel``), imported read-only. Both impls go through
+# the identical ``bench()`` call, and the nymph side is correctness-gated
+# against the flashinfer output (cosine >= 0.999 on out AND state) BEFORE any
+# timing — a ratio of two kernels computing different results fails loudly.
+# ---------------------------------------------------------------------------
+
+KERNEL_META = {"name": "nymph_gdn_prefill", "category": "experimental", "compute_capability": 10}
+
+# Representative shapes, picked from the coverage CONFIGS / VARLEN_CONFIGS above
+# (labels match those lists). Rationale:
+#   ns1_t64    — 1 chunk, single seq: per-tile fixed cost floor (CONFIGS (1,64)).
+#   ns1_t512   — 8 chunks, single seq: mid chunk-loop throughput (CONFIGS (1,512)).
+#   ns1_t2048  — 32 chunks, single seq: long-seq steady state (CONFIGS (1,2048)).
+#   ns20_t192  — batch 20 x 3 chunks, num_work=160 ~ SM_COUNT (CONFIGS (20,192)).
+#   ns48_t64   — num_work=384 > SM_COUNT: persistent multi-tile/CTA (CONFIGS (48,64)).
+#   v_70_130   — varlen with non-BT-multiple tails (VARLEN_CONFIGS [70,130]); the
+#                flashinfer kernel is natively varlen (cu_seqlens is its only
+#                interface), so the baseline covers this shape unchanged.
+BENCH_CONFIGS = [
+    {"num_seqs": 1, "seqlen": 64, "label": "ns1_t64"},
+    {"num_seqs": 1, "seqlen": 512, "label": "ns1_t512"},
+    {"num_seqs": 1, "seqlen": 2048, "label": "ns1_t2048"},
+    {"num_seqs": 20, "seqlen": 192, "label": "ns20_t192"},
+    {"num_seqs": 48, "seqlen": 64, "label": "ns48_t64"},
+    {"seqlens": [70, 130], "label": "v_70_130"},
+]
+
+_CORRECTNESS_COSINE = 0.999
+
+
+def _bench_seqlens(num_seqs, seqlen, seqlens) -> list[int]:
+    """Normalize the two config forms (fixed / varlen) to per-sequence lengths."""
+    if seqlens is not None:
+        if num_seqs is not None or seqlen is not None:
+            raise ValueError("pass either seqlens or num_seqs+seqlen, not both")
+        return [int(s) for s in seqlens]
+    if num_seqs is None or seqlen is None:
+        raise ValueError("pass num_seqs+seqlen (fixed-length) or seqlens (varlen)")
+    return [int(seqlen)] * int(num_seqs)
+
+
+def _bench_inputs(seq_lens: list[int], io_dtype: str = "bfloat16", seed: int = 0) -> dict:
+    """One input set shared by BOTH impls, on GPU, in the sim tests' distributions.
+
+    q/k/v ~ N(0, 0.2^2) cast to the io dtype; the RAW gate exp(g) in (0,1) —
+    both kernels apply log2 to it internally (flashinfer parity, see the module
+    docstring) — and beta = sigmoid(.) stay f32; cu_seqlens is i32. Layouts are
+    the shared flashinfer/nymph ones: q/k (T, HQK, D), v (T, HV, D),
+    gate/beta (T, HV), with HQK=num_k_heads=min(num_q,num_v) for the default
+    (4q, 8v) GVA head config.
+    """
+    import torch
+
+    dt = {"bfloat16": torch.bfloat16, "float16": torch.float16}[io_dtype]
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    total = sum(seq_lens)
+
+    def randn(*shape):
+        return torch.randn(*shape, generator=gen, device="cuda", dtype=torch.float32)
+
+    q = (randn(total, HQK, K_DIM) * 0.2).to(dt)
+    k = (randn(total, HQK, K_DIM) * 0.2).to(dt)
+    v = (randn(total, HV, K_DIM) * 0.2).to(dt)
+    gate = torch.exp(torch.nn.functional.softplus(randn(total, HV)) * -0.3)
+    beta = torch.sigmoid(randn(total, HV))
+    cu = torch.tensor([0, *itertools.accumulate(seq_lens)], dtype=torch.int32, device="cuda")
+    return {"q": q, "k": k, "v": v, "gate": gate, "beta": beta, "cu": cu, "total": total}
+
+
+def _flashinfer_callable(data: dict, num_seqs: int):
+    """The flashinfer CuTeDSL baseline as a pure-launch closure + its outputs.
+
+    First call compiles the CuTeDSL kernel (flashinfer caches it per static
+    config); that call happens HERE, outside any timed region. use_cp=False
+    pins the SM100 chunked path (the one being ported). Outputs are NaN-filled
+    so a silently-unwritten region trips the cosine gate.
+    """
+    import torch
+    from flashinfer.gdn_prefill import chunk_gated_delta_rule
+
+    io_dt = data["q"].dtype
+    out = torch.full((data["total"], HV, K_DIM), float("nan"), dtype=io_dt, device="cuda")
+    state = torch.full(
+        (num_seqs, HV, K_DIM, K_DIM), float("nan"), dtype=torch.float32, device="cuda"
+    )
+    scale = GdnPrefillConfig().scale
+
+    def run():
+        chunk_gated_delta_rule(
+            data["q"], data["k"], data["v"], data["gate"], data["beta"], scale,
+            None, True, data["cu"], False,
+            output=out, output_state=state, use_cp=False,
+        )  # fmt: skip
+
+    run()  # CuTeDSL compile (first call) + warm, outside timing
+    torch.cuda.synchronize()
+    return run, out, state
+
+
+def _compile_nymph(seq_lens: list[int], io_dtype: str = "bfloat16"):
+    """kernel_to_tirx_source -> tvm.compile, mirroring nvfp4's _compile_nymph.
+
+    Uniform BT-multiple lengths build the fixed-length kernel; anything else
+    builds the varlen (cu_seqlens) kernel sized by max length.
+
+    Raises whatever the codegen/compile pipeline raises. TODAY this fails
+    closed inside kernel_to_tirx_source: the gdn IR uses flash/gdn-datapath
+    nodes with no TIRx lowering yet (RegUnary, RegFill, RegAdd/RegSub/RegFma,
+    Tcgen05St/Tcgen05WaitSt, LdMatrix/StMatrix, WarpMma) — the "sim-only ops"
+    of LIMITATIONS.md. That is the Wave-2 gap, not a bench bug.
+    """
+    import importlib.util
+    import os
+    import tempfile
+
+    import tvm
+
+    from ..nymph_rs import kernel_to_tirx_source
+
+    if seq_lens == [seq_lens[0]] * len(seq_lens) and seq_lens[0] % BT == 0:
+        config = GdnPrefillConfig(num_seqs=len(seq_lens), seqlen=seq_lens[0], io_dtype=io_dtype)
+    else:
+        config = GdnPrefillConfig(
+            num_seqs=len(seq_lens), seqlen=max(seq_lens), varlen=True, io_dtype=io_dtype
+        )
+    src = kernel_to_tirx_source(build_gdn_prefill(config))
+    p = os.path.join(tempfile.mkdtemp(prefix="nymph_gdn_"), "g.py")
+    with open(p, "w") as f:
+        f.write(src)
+    spec = importlib.util.spec_from_file_location("nymph_gdn_emitted", p)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    ex = tvm.compile(tvm.IRModule({"main": m.main}), tvm.target.Target("cuda"), tir_pipeline="tirx")
+    return ex, config
+
+
+def _nymph_callable(ex, config: GdnPrefillConfig, data: dict, seq_lens: list[int]):
+    """Pure-launch closure over preallocated nymph outputs (packed layout).
+
+    Fixed-length: the compiled fn takes (q, k, v, gate, beta, out, state).
+    Varlen: it additionally takes cu_seqlens, and the GMEM tensors carry the
+    static padded shape (num_seqs*maxlen tokens) the kernel was built with —
+    the packed rows sit at their cu_seqlens offsets (padding content is
+    irrelevant; the kernel masks OOB). state is (num_seqs, HV, K, V) — the
+    ORACLE layout, i.e. flashinfer's [N,H,V,K] transposed.
+    """
+    import torch
+
+    io_dt = data["q"].dtype
+    num_seqs = len(seq_lens)
+    state = torch.full(
+        (num_seqs, HV, K_DIM, K_DIM), float("nan"), dtype=torch.float32, device="cuda"
+    )
+    if config.varlen:
+        pad = num_seqs * config.seqlen
+        q = torch.zeros((pad, *data["q"].shape[1:]), dtype=io_dt, device="cuda")
+        k = torch.zeros_like(q)
+        v = torch.zeros((pad, *data["v"].shape[1:]), dtype=io_dt, device="cuda")
+        gate = torch.zeros((pad, HV), dtype=torch.float32, device="cuda")
+        beta = torch.zeros_like(gate)
+        cu = data["cu"].tolist()
+        for a, b in itertools.pairwise(cu):
+            q[a:b], k[a:b], v[a:b] = data["q"][a:b], data["k"][a:b], data["v"][a:b]
+            gate[a:b], beta[a:b] = data["gate"][a:b], data["beta"][a:b]
+        out = torch.full((pad, HV, K_DIM), float("nan"), dtype=io_dt, device="cuda")
+
+        def run():
+            ex(q, k, v, gate, beta, out, state, data["cu"])
+
+    else:
+        out = torch.full((data["total"], HV, K_DIM), float("nan"), dtype=io_dt, device="cuda")
+
+        def run():
+            ex(data["q"], data["k"], data["v"], data["gate"], data["beta"], out, state)
+
+    return run, out, state
+
+
+def _cosine(a, b) -> float:
+    import torch
+
+    return torch.nn.functional.cosine_similarity(
+        a.float().flatten(), b.float().flatten(), dim=0
+    ).item()
+
+
+def run_bench(
+    num_seqs=None, seqlen=None, seqlens=None, *, warmup=None, repeat=None, timer=None, **kwargs
+):
+    """Bench the flashinfer CuTeDSL baseline vs nymph with the bench-suite's
+    exact methodology — correctness gate BEFORE timing.
+
+    Both impls see the identical input tensors; nymph must match the
+    flashinfer output at cosine >= 0.999 (out AND state, state compared in
+    flashinfer's [N,H,V,K] layout) or this raises AssertionError. flashinfer
+    is passed as a ``references`` entry (external baseline), nymph as the
+    sole ``funcs`` impl ("tirx"), so both are timed by the one bench() call.
+    """
+    import torch
+
+    from tvm.tirx.bench import bench
+
+    seq_lens = _bench_seqlens(num_seqs, seqlen, seqlens)
+    ex, config = _compile_nymph(seq_lens)  # raises today: the codegen gap above
+    data = _bench_inputs(seq_lens, config.io_dtype)
+    nymph_run, n_out, n_state = _nymph_callable(ex, config, data, seq_lens)
+    fi_run, f_out, f_state = _flashinfer_callable(data, len(seq_lens))
+
+    nymph_run()
+    fi_run()
+    torch.cuda.synchronize()
+    total = data["total"]
+    cos_o = _cosine(n_out[:total], f_out)
+    cos_s = _cosine(n_state, f_state.transpose(-1, -2))
+    if min(cos_o, cos_s) < _CORRECTNESS_COSINE:
+        raise AssertionError(
+            f"nymph gdn_prefill diverges from flashinfer "
+            f"(cos_out={cos_o:.4f} cos_state={cos_s:.4f}, need >= {_CORRECTNESS_COSINE})"
+        )
+    return bench(
+        {"tirx": nymph_run},
+        warmup=warmup,
+        repeat=repeat,
+        timer=timer,
+        references={"flashinfer": lambda: fi_run},
+        **kwargs,
+    )
+
+
+def run_flashinfer_bench(
+    num_seqs=None, seqlen=None, seqlens=None, *, warmup=None, repeat=None, timer=None, **kwargs
+):
+    """Baseline-only runner: time the flashinfer CuTeDSL kernel on one shape
+    with the exact bench() methodology (proton/cold-cache/rounds — same call,
+    single-impl funcs). This is the Wave-1 fallback for while the nymph side
+    cannot compile (see _compile_nymph); run_bench is the permanent interface.
+    """
+    from tvm.tirx.bench import bench
+
+    seq_lens = _bench_seqlens(num_seqs, seqlen, seqlens)
+    data = _bench_inputs(seq_lens)
+    fi_run, _, _ = _flashinfer_callable(data, len(seq_lens))
+    return bench({"flashinfer": fi_run}, warmup=warmup, repeat=repeat, timer=timer, **kwargs)
+
+
+def register_bench_interface() -> None:
+    """Self-register into the bench-suite kernel cache (see bench/nymph_bench_guide.md)."""
+    import sys
+
+    from tirx_kernels.registry import _KERNEL_CACHE
+
+    _KERNEL_CACHE[KERNEL_META["name"]] = sys.modules[__name__]
