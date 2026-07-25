@@ -46,7 +46,9 @@
 use super::dtype::{DType, MemorySpace, ScalarOp, ScopeValueKind, Swizzle, VarBinding};
 use super::kernel::Kernel;
 use super::scalar::{ScalarExpr, ScalarInitial, ScalarValue, Var};
-use super::stmt::{LdStShape, RegLiteral, RegOperand, RegUnaryOp, Rounding, Stmt};
+use super::stmt::{
+    LdStShape, MatrixDType, MatrixShape, RegLiteral, RegOperand, RegUnaryOp, Rounding, Stmt,
+};
 use super::tensor::{Layout, MmaOperand, Tensor, TensorSlice, TmemOperand};
 use super::thread_filter::{static_thread_filter, ThreadSet};
 use std::collections::{HashMap, HashSet};
@@ -569,7 +571,12 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
     for t in collect_tensors(k) {
         // Layout-less SMEM = the flat i32/u32 scheduler mailbox + mbar buffers. Packed
         // fp4 operands (u8) DO get a swizzle, and e4m3 SF buffers get sf_smem_layout.
-        if t.space != MemorySpace::Smem || (is_int_dtype(t.dtype) && t.dtype != DType::U8) {
+        // Rank<2 SMEM (a flat scalar scratch row, e.g. gdn's gcs/beta vectors)
+        // takes no swizzle either — `mma_shared_layout` needs a (row, col) tile.
+        if t.space != MemorySpace::Smem
+            || (is_int_dtype(t.dtype) && t.dtype != DType::U8)
+            || t.shape.len() < 2
+        {
             continue;
         }
         let name = ctx.tensor_name(t.id)?;
@@ -764,7 +771,7 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
             .map(|d| d.to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        let is_mailbox = is_int_dtype(t.dtype) && t.dtype != DType::U8;
+        let is_mailbox = (is_int_dtype(t.dtype) && t.dtype != DType::U8) || t.shape.len() < 2;
         if k.smem_pool {
             // Alias into the dynamic pool at the IR's computed byte offset. `move_base_to`
             // sets the exact offset, then `pool.alloc` rounds it UP to `align` — the data
@@ -2266,6 +2273,49 @@ fn emit_wg_reg_operand(
 /// with auxiliary views (see `RegAuxViews`).
 fn flat_name(t: &Arc<Tensor>, ctx: &Ctx) -> Result<String, String> {
     Ok(format!("{}_flat", ctx.tensor_name(t.id)?))
+}
+
+/// `off + i` text for flat-view indices (simplified when the base is 0).
+fn flat_add(off_s: &str, i: usize) -> String {
+    if off_s == "0" {
+        i.to_string()
+    } else {
+        format!("{off_s} + {i}")
+    }
+}
+
+/// Python bool literal.
+fn py_bool(b: bool) -> &'static str {
+    if b {
+        "True"
+    } else {
+        "False"
+    }
+}
+
+/// Validate the ldmatrix/stmatrix SMEM operand: a rank-2 `(row, col)` slice of
+/// exactly one 8-element b16 row (the per-thread row-address form the
+/// interpreter's matrix model requires).
+fn check_matrix_smem_row(s: &TensorSlice, label: &str) -> Result<(), String> {
+    if s.offsets.len() != 2 || s.shape.len() != 2 {
+        return Err(format!(
+            "codegen: {label} SMEM operand must be a rank-2 (row, col) slice"
+        ));
+    }
+    if as_int(&s.shape[0]) != Some(1) || as_int(&s.shape[1]) != Some(8) {
+        return Err(format!(
+            "codegen: {label} SMEM operand must be one row of eight b16 elements \
+             (got shape {:?})",
+            s.shape
+        ));
+    }
+    if !matches!(s.tensor.dtype, DType::F16 | DType::Bf16) {
+        return Err(format!(
+            "codegen: {label} SMEM operand dtype {:?} must be a 16-bit type (b16 matrix)",
+            s.tensor.dtype
+        ));
+    }
+    Ok(())
 }
 
 /// Shared lowering for `RegAdd`/`RegSub`: `Tx.wg.{op}(dst, lhs, rhs)` over the
@@ -4197,8 +4247,33 @@ fn emit_stmt(
         // the buffer read into the fragment via the warpgroup-collective copy (the
         // matching `RegStore` writes it back). REG-source loads (an alias/copy between
         // two register tiles) are a structural no-op at the source level.
+        //
+        // A per-thread POINT src (every dim size-1, e.g. gdn's `gcs_s[row]` scalar
+        // reads) lowers to a raw element assignment on the flat view — the tile-op
+        // anchor cannot express "each thread reads its own address".
         RegLoad { dst, src } => {
             if src.tensor.space == MemorySpace::Smem {
+                if slice_all_size1(src) {
+                    let (dt, doff, dw) = reg_slice_parts(dst)?;
+                    if dt.dtype != src.tensor.dtype {
+                        return Err(format!(
+                            "codegen: RegLoad point src dtype {:?} != dst dtype {:?} — \
+                             the interpreter coerces; use an explicit RegCvt",
+                            src.tensor.dtype, dt.dtype
+                        ));
+                    }
+                    if dw != 1 {
+                        return Err(format!(
+                            "codegen: RegLoad point src loads one element per thread \
+                             (dst width {dw} != 1)"
+                        ));
+                    }
+                    let dflat = flat_name(dt, ctx)?;
+                    let doff_s = emit_scalar(doff, ctx)?;
+                    let addr = emit_scalar_addr(src, ctx)?;
+                    out.push_str(&format!("{p}{dflat}[{doff_s}] = {addr}\n"));
+                    return Ok(());
+                }
                 let src_s = emit_smem_wg_store_tile(src, ctx)?;
                 let zero = ScalarValue::Int(0);
                 let dst_off = dst.offsets.first().unwrap_or(&zero);
@@ -4209,6 +4284,103 @@ fn emit_stmt(
             Ok(())
         }
         RegStore { dst, src } => {
+            // REG -> REG per-thread copy (gdn's m16 A-broadcast): the
+            // interpreter copies values elementwise; emit the wg-view copy.
+            if dst.tensor.space == MemorySpace::Reg {
+                if src.tensor.space != MemorySpace::Reg {
+                    return Err(format!(
+                        "codegen: RegStore with a REG dst needs a REG src (got {:?})",
+                        src.tensor.space
+                    ));
+                }
+                let (dt, doff, dw) = reg_slice_parts(dst)?;
+                let (st, soff, sw) = reg_slice_parts(src)?;
+                if st.dtype != dt.dtype {
+                    return Err(format!(
+                        "codegen: RegStore REG->REG src dtype {:?} != dst dtype {:?} — \
+                         the interpreter coerces; use an explicit RegCvt",
+                        st.dtype, dt.dtype
+                    ));
+                }
+                if sw != dw && sw != 1 {
+                    return Err(format!(
+                        "codegen: RegStore REG->REG src width {sw} must be 1 or the dst \
+                         width {dw} (the interpreter matches the dst or broadcasts one \
+                         element per thread)"
+                    ));
+                }
+                let dst_s = emit_reg_view_slice(out, &p, dt, doff, dw, ctx)?;
+                let src_s = emit_reg_view_slice(out, &p, st, soff, sw, ctx)?;
+                out.push_str(&format!("{p}Tx.wg.copy({dst_s}, {src_s})\n"));
+                return Ok(());
+            }
+            // Per-thread point store (every dim size-1, e.g. gdn's
+            // `m_s[row, col] = r1` epilogue cells): a raw element assignment on
+            // the flat view.
+            if slice_all_size1(dst) {
+                let (st, soff, sw) = reg_slice_parts(src)?;
+                if st.dtype != dst.tensor.dtype {
+                    return Err(format!(
+                        "codegen: RegStore point dst dtype {:?} != src dtype {:?} — \
+                         the interpreter coerces; use an explicit RegCvt",
+                        dst.tensor.dtype, st.dtype
+                    ));
+                }
+                if sw != 1 {
+                    return Err(format!(
+                        "codegen: RegStore point dst stores one element per thread \
+                         (src width {sw} != 1)"
+                    ));
+                }
+                let sflat = flat_name(st, ctx)?;
+                let soff_s = emit_scalar(soff, ctx)?;
+                let addr = emit_scalar_addr(dst, ctx)?;
+                out.push_str(&format!("{p}{addr} = {sflat}[{soff_s}]\n"));
+                return Ok(());
+            }
+            // Per-thread GMEM row run (rank >= 3, leading size-1 dims, wide
+            // trailing dim — gdn's final-state store
+            // `state_g[seq, eh, tid, c0:c0+64] = frag32`): a raw per-thread loop.
+            if gmem_row_run(dst) {
+                let (st, soff, sw) = reg_slice_parts(src)?;
+                if st.dtype != dst.tensor.dtype {
+                    return Err(format!(
+                        "codegen: RegStore GMEM row dst dtype {:?} != src dtype {:?} — \
+                         the interpreter coerces; use an explicit RegCvt",
+                        dst.tensor.dtype, st.dtype
+                    ));
+                }
+                let w = as_int(dst.shape.last().unwrap()).unwrap() as usize;
+                if sw != w {
+                    return Err(format!(
+                        "codegen: RegStore GMEM row run width {w} != src width {sw}"
+                    ));
+                }
+                let sflat = flat_name(st, ctx)?;
+                let soff_s = emit_scalar(soff, ctx)?;
+                let name = ctx.tensor_name(dst.tensor.id)?;
+                let n = dst.offsets.len();
+                let lead = dst.offsets[..n - 1]
+                    .iter()
+                    .map(|o| emit_scalar(o, ctx))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join(", ");
+                let last_s = emit_scalar(&dst.offsets[n - 1], ctx)?;
+                let elem = |off_s: &str| {
+                    if off_s == "0" {
+                        "_i".to_string()
+                    } else {
+                        format!("{off_s} + _i")
+                    }
+                };
+                out.push_str(&format!("{p}for _i in range({w}):\n"));
+                out.push_str(&format!(
+                    "{p}    {name}[{lead}, {}] = {sflat}[{}]\n",
+                    elem(&last_s),
+                    elem(&soff_s)
+                ));
+                return Ok(());
+            }
             // Two store shapes, distinguished by the dst memory space:
             //   * GMEM dst (bootstrap direct epilogue): `Tx.copy(C[row, c0:c1], reg[:])`
             //     — each thread writes its own C row from its private fragment.
@@ -4560,8 +4732,134 @@ fn emit_stmt(
             out.push_str(&format!("{p}T.ptx.tcgen05.wait.st()\n"));
             Ok(())
         }
-        LdMatrix { .. } => Err("codegen: LdMatrix not yet supported".to_string()),
-        StMatrix { .. } => Err("codegen: StMatrix not yet supported".to_string()),
+        // `ldmatrix.sync.aligned.m8n8.xN.b16` — SMEM row-addresses -> packed
+        // REG words. The IR src slice is the PER-THREAD row start (8 b16
+        // elements); lanes 0..7N contribute addresses (PTX), exactly the
+        // interpreter's row_address_lane model. The dst is N u32 words in the
+        // flat view (ptr_to per register — the documented dst-handle form).
+        LdMatrix {
+            dst,
+            src,
+            shape,
+            num,
+            trans,
+            dtype,
+        } => {
+            if *shape != MatrixShape::M8N8 || *dtype != MatrixDType::B16 {
+                return Err(
+                    "codegen: LdMatrix supports only m8n8.x{1,2,4}.b16 (the interpreter's \
+                     matrix model)"
+                        .to_string(),
+                );
+            }
+            let (dt, doff, dw) = reg_slice_parts(dst)?;
+            if !matches!(dt.dtype, DType::U32 | DType::I32) {
+                return Err(format!(
+                    "codegen: LdMatrix dst dtype {:?} has no lowering (u32/i32 packed \
+                     words only; a b16 fragment dst fails in the interpreter too)",
+                    dt.dtype
+                ));
+            }
+            if dw != *num as usize {
+                return Err(format!(
+                    "codegen: LdMatrix dst width {dw} != num {num} (the dst spans num b32 \
+                     registers)"
+                ));
+            }
+            check_matrix_smem_row(src, "LdMatrix")?;
+            let dflat = flat_name(dt, ctx)?;
+            let doff_s = emit_scalar(doff, ctx)?;
+            let handles = (0..*num as usize)
+                .map(|i| format!("{dflat}.ptr_to([{}])", flat_add(&doff_s, i)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let row_s = emit_scalar(&src.offsets[0], ctx)?;
+            let col_s = emit_scalar(&src.offsets[1], ctx)?;
+            let src_name = ctx.tensor_name(src.tensor.id)?;
+            out.push_str(&format!(
+                "{p}T.ptx.ldmatrix({}, {num}, \"b16\", {src_name}.ptr_to([{row_s}, {col_s}]), {handles})\n",
+                py_bool(*trans),
+            ));
+            Ok(())
+        }
+        // `stmatrix.sync.aligned.m8n8.xN.b16` — REG words -> SMEM. Mirror of
+        // LdMatrix; a bf16/f16 src fragment reads through the `_flat_u32`
+        // reinterpret (consecutive b16 pairs ARE the words, matching the
+        // interpreter's pack).
+        StMatrix {
+            dst,
+            src,
+            shape,
+            num,
+            trans,
+            dtype,
+        } => {
+            if *shape != MatrixShape::M8N8 || *dtype != MatrixDType::B16 {
+                return Err(
+                    "codegen: StMatrix supports only m8n8.x{1,2,4}.b16 (the interpreter's \
+                     matrix model)"
+                        .to_string(),
+                );
+            }
+            check_matrix_smem_row(dst, "StMatrix")?;
+            let (st, soff, sw) = reg_slice_parts(src)?;
+            let soff_s = emit_scalar(soff, ctx)?;
+            let name = ctx.tensor_name(st.id)?;
+            let handles: String = match st.dtype {
+                DType::U32 | DType::I32 => {
+                    if sw != *num as usize {
+                        return Err(format!(
+                            "codegen: StMatrix src width {sw} != num {num} (the src spans \
+                             num b32 registers)"
+                        ));
+                    }
+                    (0..*num as usize)
+                        .map(|i| format!("{name}_flat.ptr_to([{}])", flat_add(&soff_s, i)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+                DType::F16 | DType::Bf16 => {
+                    if sw != 2 * *num as usize {
+                        return Err(format!(
+                            "codegen: StMatrix b16 src width {sw} != 2*num {} (the src spans \
+                             num packed b16x2 registers)",
+                            2 * *num as usize
+                        ));
+                    }
+                    let Some(word_off) = as_int(soff) else {
+                        return Err(
+                            "codegen: StMatrix b16 src offset must be static (the u32 word \
+                             index is offset/2)"
+                                .to_string(),
+                        );
+                    };
+                    if word_off % 2 != 0 {
+                        return Err(format!(
+                            "codegen: StMatrix b16 src offset {word_off} is odd (a packed \
+                             b16x2 register starts at an even element)"
+                        ));
+                    }
+                    (0..*num as usize)
+                        .map(|i| format!("{name}_flat_u32.ptr_to([{}])", word_off / 2 + i as i64))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+                other => {
+                    return Err(format!(
+                        "codegen: StMatrix src dtype {other:?} has no lowering (u32/i32 \
+                         words or a b16 fragment)"
+                    ))
+                }
+            };
+            let row_s = emit_scalar(&dst.offsets[0], ctx)?;
+            let col_s = emit_scalar(&dst.offsets[1], ctx)?;
+            let dst_name = ctx.tensor_name(dst.tensor.id)?;
+            out.push_str(&format!(
+                "{p}T.ptx.stmatrix({}, {num}, \"b16\", {dst_name}.ptr_to([{row_s}, {col_s}]), {handles})\n",
+                py_bool(*trans),
+            ));
+            Ok(())
+        }
         // Per-thread elementwise fill. Literal: `Tx.wg.fill` with a dst-typed
         // scalar (the interpreter's literal_array). Slice: a wg-copy (the
         // interpreter broadcasts a one-element-per-thread src, which the
@@ -5644,6 +5942,225 @@ mod tests {
             "{src}"
         );
         assert!(src.contains("T.ptx.tcgen05.wait.st()"), "{src}");
+    }
+
+    fn smem_tensor(id: u32, dtype: DType, shape: &[usize]) -> Arc<Tensor> {
+        Arc::new(Tensor {
+            id,
+            space: MemorySpace::Smem,
+            dtype,
+            shape: shape.to_vec(),
+            layout: None,
+            byte_offset: None,
+            reg_frag: None,
+        })
+    }
+
+    #[test]
+    fn ldmatrix_stmatrix_lowering() {
+        let imm_a = reg_tensor(10, DType::U32, 2);
+        let tile = reg_tensor(11, DType::Bf16, 2);
+        let sm = smem_tensor(12, DType::Bf16, &[64, 64]);
+        let smem_row = |off0: ScalarValue, off1: ScalarValue| TensorSlice {
+            tensor: sm.clone(),
+            offsets: vec![off0, off1],
+            shape: vec![ScalarValue::Int(1), ScalarValue::Int(8)],
+        };
+        let lane_row = ScalarValue::expr(
+            ScalarOp::Add,
+            vec![
+                ScalarValue::Int(8),
+                ScalarValue::expr(
+                    ScalarOp::Mod,
+                    vec![
+                        ScalarValue::Scope(ScopeValueKind::LaneId),
+                        ScalarValue::Int(8),
+                    ],
+                ),
+            ],
+        );
+        let body = vec![
+            Stmt::TensorDef {
+                tensor: sm.clone(),
+            },
+            Stmt::TensorDef {
+                tensor: imm_a.clone(),
+            },
+            Stmt::TensorDef {
+                tensor: tile.clone(),
+            },
+            wg_if(
+                0,
+                vec![
+                    Stmt::LdMatrix {
+                        dst: reg_slice(&imm_a, 0, 1),
+                        src: smem_row(lane_row.clone(), ScalarValue::Int(16)),
+                        shape: MatrixShape::M8N8,
+                        num: 1,
+                        trans: false,
+                        dtype: MatrixDType::B16,
+                    },
+                    Stmt::StMatrix {
+                        dst: smem_row(lane_row.clone(), ScalarValue::Int(32)),
+                        src: reg_slice(&tile, 0, 2),
+                        shape: MatrixShape::M8N8,
+                        num: 1,
+                        trans: true,
+                        dtype: MatrixDType::B16,
+                    },
+                ],
+            ),
+        ];
+        let src = kernel_to_tirx_source(&kernel(body)).unwrap();
+        assert!(
+            src.contains(
+                "T.ptx.ldmatrix(False, 1, \"b16\", d_smem0.ptr_to([8 + ((lane_id) & 7), 16]), accum_frag_flat.ptr_to([0]))"
+            ),
+            "{src}"
+        );
+        assert!(
+            src.contains(
+                "T.ptx.stmatrix(True, 1, \"b16\", d_smem0.ptr_to([8 + ((lane_id) & 7), 32]), out_frag_flat_u32.ptr_to([0]))"
+            ),
+            "{src}"
+        );
+
+        // dst width must equal num (b32 words).
+        let err = kernel_to_tirx_source(&kernel(vec![
+            Stmt::TensorDef {
+                tensor: sm.clone(),
+            },
+            Stmt::TensorDef {
+                tensor: imm_a.clone(),
+            },
+            wg_if(
+                0,
+                vec![Stmt::LdMatrix {
+                    dst: reg_slice(&imm_a, 0, 2),
+                    src: smem_row(lane_row.clone(), ScalarValue::Int(0)),
+                    shape: MatrixShape::M8N8,
+                    num: 1,
+                    trans: false,
+                    dtype: MatrixDType::B16,
+                }],
+            ),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("num"), "{err}");
+        // an f32 SMEM operand is not a b16 matrix.
+        let sm32 = smem_tensor(13, DType::F32, &[64, 64]);
+        let err = kernel_to_tirx_source(&kernel(vec![
+            Stmt::TensorDef {
+                tensor: sm32.clone(),
+            },
+            Stmt::TensorDef {
+                tensor: imm_a.clone(),
+            },
+            wg_if(
+                0,
+                vec![Stmt::LdMatrix {
+                    dst: reg_slice(&imm_a, 0, 1),
+                    src: TensorSlice {
+                        tensor: sm32,
+                        offsets: vec![lane_row, ScalarValue::Int(0)],
+                        shape: vec![ScalarValue::Int(1), ScalarValue::Int(8)],
+                    },
+                    shape: MatrixShape::M8N8,
+                    num: 1,
+                    trans: false,
+                    dtype: MatrixDType::B16,
+                }],
+            ),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("dtype"), "{err}");
+    }
+
+    #[test]
+    fn reg_transfer_forms_lowering() {
+        let r1 = reg_tensor(10, DType::F32, 1);
+        let frag = reg_tensor(11, DType::F32, 4);
+        let sm = smem_tensor(12, DType::F32, &[64, 64]);
+        let g = Arc::new(Tensor {
+            id: 0,
+            space: MemorySpace::Gmem,
+            dtype: DType::F32,
+            shape: vec![4, 4, 64, 128],
+            layout: None,
+            byte_offset: None,
+            reg_frag: None,
+        });
+        let tid_row = ScalarValue::Scope(ScopeValueKind::TidInWg);
+        let body = vec![
+            Stmt::TensorDef {
+                tensor: sm.clone(),
+            },
+            Stmt::TensorDef {
+                tensor: r1.clone(),
+            },
+            Stmt::TensorDef {
+                tensor: frag.clone(),
+            },
+            wg_if(
+                0,
+                vec![
+                    // per-thread point load: r1 = sm[tid, 3]
+                    Stmt::RegLoad {
+                        dst: reg_slice(&r1, 0, 1),
+                        src: TensorSlice {
+                            tensor: sm.clone(),
+                            offsets: vec![tid_row.clone(), ScalarValue::Int(3)],
+                            shape: vec![ScalarValue::Int(1), ScalarValue::Int(1)],
+                        },
+                    },
+                    // per-thread point store: sm[tid, 5] = r1
+                    Stmt::RegStore {
+                        dst: TensorSlice {
+                            tensor: sm,
+                            offsets: vec![tid_row.clone(), ScalarValue::Int(5)],
+                            shape: vec![ScalarValue::Int(1), ScalarValue::Int(1)],
+                        },
+                        src: reg_slice(&r1, 0, 1),
+                    },
+                    // REG->REG copy: frag[1] = frag[0]
+                    Stmt::RegStore {
+                        dst: reg_slice(&frag, 1, 1),
+                        src: reg_slice(&frag, 0, 1),
+                    },
+                    // per-thread GMEM row run: g[1, 2, tid, 16:80] = frag
+                    Stmt::RegStore {
+                        dst: TensorSlice {
+                            tensor: g,
+                            offsets: vec![
+                                ScalarValue::Int(1),
+                                ScalarValue::Int(2),
+                                tid_row,
+                                ScalarValue::Int(16),
+                            ],
+                            shape: vec![
+                                ScalarValue::Int(1),
+                                ScalarValue::Int(1),
+                                ScalarValue::Int(1),
+                                ScalarValue::Int(4),
+                            ],
+                        },
+                        src: reg_slice(&frag, 0, 4),
+                    },
+                ],
+            ),
+        ];
+        let src = kernel_to_tirx_source(&kernel(body)).unwrap();
+        assert!(src.contains("accum_frag_flat[0] = d_smem0[tid_in_wg, 3]"), "{src}");
+        assert!(src.contains("d_smem0[tid_in_wg, 5] = accum_frag_flat[0]"), "{src}");
+        assert!(
+            src.contains("Tx.wg.copy(out_frag[:, 1:1 + 1], out_frag[:, 0:0 + 1])"),
+            "{src}"
+        );
+        assert!(src.contains("for _i in range(4):"), "{src}");
+        assert!(
+            src.contains("A[1, 2, tid_in_wg, 16 + _i] = out_frag_flat[_i]"),
+            "{src}"
+        );
     }
 
     fn reg_tensor(id: u32, dtype: DType, width: i64) -> Arc<Tensor> {
