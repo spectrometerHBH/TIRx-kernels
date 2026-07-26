@@ -108,7 +108,7 @@ def main() -> None:
 
     rows = []
     baseline_broken = False
-    for cfg in gdn.BENCH_CONFIGS:
+    for cfg in gdn.CONFIGS[:6]:  # the 6 core regression shapes
         label = cfg["label"]
         if args.filter and args.filter not in label:
             continue

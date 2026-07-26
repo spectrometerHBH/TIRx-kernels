@@ -65,12 +65,27 @@ def main() -> None:
     yaml_path = _filtered_workloads(args.max_shape)
     env = os.environ.copy()
     env["NYMPH_BENCH_SUITE"] = "1"
+    # tvm must stay importable in the workers: the repo-local sitecustomize
+    # drops the editable-tvm meta-path finder (stale-install repair — it fires
+    # even when the finder is LIVE), so tvm's real location rides PYTHONPATH.
+    try:
+        import tvm as _tvm
+
+        tvm_py = os.path.dirname(os.path.dirname(os.path.abspath(_tvm.__file__)))
+    except Exception:
+        tvm_py = None
     # `bench/` first: its repo-local `sitecustomize.py` runs in EVERY child
     # python (orchestrator + per-workload workers) and performs the nymph
     # kernel auto-registration — no out-of-repo hook required.
     env["PYTHONPATH"] = os.pathsep.join(
         p
-        for p in [_HERE, os.path.join(_NYMPH_RUST, "python"), _REPO, env.get("PYTHONPATH", "")]
+        for p in [
+            _HERE,
+            os.path.join(_NYMPH_RUST, "python"),
+            _REPO,
+            tvm_py,
+            env.get("PYTHONPATH", ""),
+        ]
         if p
     )
     cmd = [

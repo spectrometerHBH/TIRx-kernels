@@ -1288,14 +1288,10 @@ KERNEL_META = {"name": "nymph_gdn_prefill", "category": "experimental", "compute
 #   v_70_130   — varlen with non-BT-multiple tails (VARLEN_CONFIGS [70,130]); the
 #                flashinfer kernel is natively varlen (cu_seqlens is its only
 #                interface), so the baseline covers this shape unchanged.
-BENCH_CONFIGS = [
-    {"num_seqs": 1, "seqlen": 64, "label": "ns1_t64"},
-    {"num_seqs": 1, "seqlen": 512, "label": "ns1_t512"},
-    {"num_seqs": 1, "seqlen": 2048, "label": "ns1_t2048"},
-    {"num_seqs": 20, "seqlen": 192, "label": "ns20_t192"},
-    {"num_seqs": 48, "seqlen": 64, "label": "ns48_t64"},
-    {"seqlens": [70, 130], "label": "v_70_130"},
-]
+# The bench CLI (`_get_bench_configs`) prefers BENCH_CONFIGS over CONFIGS —
+# keep them the same object so every orchestrator-visible label resolves. The
+# 6 core regression shapes are CONFIGS[:6] (the wave1 dev loop's corpus).
+BENCH_CONFIGS = CONFIGS
 
 _CORRECTNESS_COSINE = 0.999
 
