@@ -1816,10 +1816,19 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
     let mut reg_widths: HashMap<u32, usize> = HashMap::new();
     fn note_reg_width(s: &TensorSlice, widths: &mut HashMap<u32, usize>) {
         if s.tensor.space == MemorySpace::Reg {
-            let off = s.offsets.first().and_then(as_int).unwrap_or(0).max(0) as usize;
-            let w = s.shape.first().and_then(as_int).unwrap_or(0).max(0) as usize;
+            let need = match s.offsets.first().and_then(as_int) {
+                Some(o) => {
+                    let w = s.shape.first().and_then(as_int).unwrap_or(0).max(0) as usize;
+                    (o.max(0) as usize) + w
+                }
+                // Dynamic offset (runtime loop var): the slice may land anywhere
+                // in the tensor — the flat storage must cover the tensor's full
+                // declared extent (a dynamic slice used to shrink the decl to the
+                // slice width, which then broke the u32-packing of b16 pairs).
+                None => s.tensor.shape.first().copied().unwrap_or(0),
+            };
             let e = widths.entry(s.tensor.id).or_insert(0);
-            *e = (*e).max(off + w);
+            *e = (*e).max(need);
         }
     }
     fn walk_reg_widths(stmts: &[Stmt], widths: &mut HashMap<u32, usize>) {
