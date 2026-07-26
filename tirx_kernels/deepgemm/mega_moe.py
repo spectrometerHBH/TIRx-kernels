@@ -1621,11 +1621,24 @@ def get_kernel(
         sf_inv_pair = T.cuda.make_float2(sf_inv_x, sf_inv_y)
         upper[0] = T.cuda.fmul2_rn(T.cuda.make_float2(v0, v1), sf_inv_pair)
         lower[0] = T.cuda.fmul2_rn(T.cuda.make_float2(v2, v3), sf_inv_pair)
-        out[0] = T.cuda.fp8x4_e4m3_from_float4(
-            T.cuda.float2_x(upper[0]),
+        upper_fp8x2 = T.ptx.cvt(
             T.cuda.float2_y(upper[0]),
-            T.cuda.float2_x(lower[0]),
+            T.cuda.float2_x(upper[0]),
+            dtype="e4m3x2",
+            atype="f32",
+            rounding="rn",
+            satfinite=True,
+        )
+        lower_fp8x2 = T.ptx.cvt(
             T.cuda.float2_y(lower[0]),
+            T.cuda.float2_x(lower[0]),
+            dtype="e4m3x2",
+            atype="f32",
+            rounding="rn",
+            satfinite=True,
+        )
+        out[0] = T.bitwise_or(
+            T.cast(upper_fp8x2, "uint32"), T.shift_left(T.cast(lower_fp8x2, "uint32"), T.uint32(16))
         )
 
     def red_or_rel_gpu_u64(address, value):
@@ -1940,10 +1953,10 @@ def get_kernel(
         return T.ptx.stmatrix(True, 1, ".b8", smem_ptr, local_ptr, shape="m16n8", space="shared")
 
     def cast_into_bf16_and_pack(v0, v1):
-        return T.cuda.float22bfloat162_rn(v0, v1)
+        return T.ptx.cvt(v1, v0, dtype="bf16x2", atype="f32", rounding="rn")
 
     def bf16_to_f32(x):
-        return T.ptx.add_rn_f32_bf16(T.float32(0.0), x)
+        return T.ptx.cvt(x, dtype="f32", atype="bf16")
 
     def swiglu_sigmoid_gate(gate_value):
         denom = T.float32(1.0) + T.exp(-gate_value)
@@ -1964,7 +1977,9 @@ def get_kernel(
             bf16_up = T.cuda.hmax2(bf16_up, clamp_neg)
             bf16_up = T.cuda.hmin2(bf16_up, clamp_pos)
 
-        gate = T.cuda.bfloat1622float2(bf16_gate)
+        gate = T.cuda.make_float2(
+            bf16_to_f32(bf16x2_lo(bf16_gate)), bf16_to_f32(bf16x2_hi(bf16_gate))
+        )
         gate_x = T.cuda.float2_x(gate)
         gate_y = T.cuda.float2_y(gate)
         neg_gate_exp = T.cuda.make_float2(T.exp(-gate_x), T.exp(-gate_y))
@@ -1981,7 +1996,7 @@ def get_kernel(
                 gate_x / T.cuda.float2_x(denom), gate_y / T.cuda.float2_y(denom)
             )
 
-        up = T.cuda.bfloat1622float2(bf16_up)
+        up = T.cuda.make_float2(bf16_to_f32(bf16x2_lo(bf16_up)), bf16_to_f32(bf16x2_hi(bf16_up)))
         weights = T.cuda.make_float2(weight0, weight1)
         result = T.cuda.fmul2_rn(T.cuda.fmul2_rn(gate, up), weights)
         out[atom_idx, pair_idx, 0] = T.cuda.float2_x(result)

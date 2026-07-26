@@ -493,7 +493,7 @@ def _kernel(
                 s_x: T.let = T.ptx.exp2(T.cuda.float2_x(fma_pair))
                 s_y: T.let = T.ptx.exp2(T.cuda.float2_y(fma_pair))
                 li = li + s_x + s_y
-                s_pack[s_i] = T.cuda.float22bfloat162_rn(s_x, s_y)
+                s_pack[s_i] = T.ptx.cvt(s_y, s_x, dtype="bf16x2", atype="f32", rounding="rn")
 
             if k > 0:
                 prev_buf: T.let = (k - 1) % NUM_BUFS

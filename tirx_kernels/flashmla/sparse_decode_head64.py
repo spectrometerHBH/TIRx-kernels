@@ -876,7 +876,7 @@ def _kernel(
                         cur_sum_pair = T.ptx.add_f32x2(
                             cur_sum_pair, T.cuda.make_float2(sx, sy), rounding="", dps=False
                         )
-                        s_pack[s_i] = T.cuda.float22bfloat162_rn(sx, sy)
+                        s_pack[s_i] = T.ptx.cvt(sy, sx, dtype="bf16x2", atype="f32", rounding="rn")
                     cur_sum: T.let = T.cuda.float2_x(cur_sum_pair) + T.cuda.float2_y(cur_sum_pair)
                     li_next: T.float32
                     T.ptx.fma_f32(T.address_of(li_next), li, scale_for_old, cur_sum)
