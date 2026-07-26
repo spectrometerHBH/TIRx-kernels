@@ -142,6 +142,10 @@ def _assert_task_broadcast_contract() -> None:
         raise AssertionError("task_empty arrive count must match task consumer role composition")
 
 
+def _align(value: int, alignment: int) -> int:
+    return (value + alignment - 1) // alignment * alignment
+
+
 def build_flash_attention4(config: FlashAttention4Config = FlashAttention4Config()) -> Kernel:
     _validate_config(config)
     _assert_task_broadcast_contract()
@@ -166,7 +170,34 @@ def build_flash_attention4(config: FlashAttention4Config = FlashAttention4Config
     o_offset = kv_offset + kv_bytes
     scale_offset = o_offset + o_bytes
     task_offset = scale_offset + scale_bytes
-    smem_size_bytes = task_offset + TASK_BROADCAST_STAGES * TASK_BROADCAST_FIELDS * I32_BYTES
+    tensor_end = task_offset + TASK_BROADCAST_STAGES * TASK_BROADCAST_FIELDS * I32_BYTES
+    mbar_stages = [
+        *((f"q_full_{stage}", 1) for stage in range(2)),
+        *((f"q_empty_{stage}", 1) for stage in range(2)),
+        ("k_full", SMEM_PIPE_DEPTH_KV),
+        ("k_empty", SMEM_PIPE_DEPTH_KV),
+        ("v_full", SMEM_PIPE_DEPTH_KV),
+        ("v_empty", SMEM_PIPE_DEPTH_KV),
+        ("s_ready", 2),
+        ("p_first_ready", 2),
+        ("p_second_ready", 2),
+        ("p_o_rescale", 2),
+        ("softmax_corr", 2),
+        ("row_sum_ready", 2),
+        ("o_ready", 2),
+        ("corr_epi_full", 2),
+        ("corr_epi_empty", 2),
+        ("task_full", TASK_BROADCAST_STAGES),
+        ("task_empty", TASK_BROADCAST_STAGES),
+        ("softmax_corr_empty", 2),
+    ]
+    cursor = _align(tensor_end, 8)
+    mbar_offsets = {}
+    for name, stages in mbar_stages:
+        mbar_offsets[name] = cursor
+        cursor += stages * 8
+    tmem_addr_offset = _align(cursor, 4)
+    smem_size_bytes = tmem_addr_offset + 4
 
     k = IRBuilder(
         "nymph_flash_attention4",
@@ -263,24 +294,54 @@ def build_flash_attention4(config: FlashAttention4Config = FlashAttention4Config
     frac = k.tensor(space=MemorySpace.REG, dtype=DType.F32, shape=(SOFTMAX_CHUNK_CELLS,))
     frac_ex2 = k.tensor(space=MemorySpace.REG, dtype=DType.F32, shape=(SOFTMAX_CHUNK_CELLS,))
 
-    q_full = tuple(k.mbar(kind=MBarKind.TMA, stages=1) for _ in range(2))
-    q_empty = tuple(k.mbar(kind=MBarKind.THREAD, stages=1) for _ in range(2))
-    k_full = k.mbar(kind=MBarKind.TMA, stages=SMEM_PIPE_DEPTH_KV)
-    k_empty = k.mbar(kind=MBarKind.THREAD, stages=SMEM_PIPE_DEPTH_KV)
-    v_full = k.mbar(kind=MBarKind.TMA, stages=SMEM_PIPE_DEPTH_KV)
-    v_empty = k.mbar(kind=MBarKind.THREAD, stages=SMEM_PIPE_DEPTH_KV)
-    s_ready = k.mbar(kind=MBarKind.TCGEN05, stages=2)
-    p_first_ready = k.mbar(kind=MBarKind.THREAD, stages=2)
-    p_second_ready = k.mbar(kind=MBarKind.THREAD, stages=2)
-    p_o_rescale = k.mbar(kind=MBarKind.THREAD, stages=2)
-    softmax_corr = k.mbar(kind=MBarKind.THREAD, stages=2)
-    row_sum_ready = k.mbar(kind=MBarKind.THREAD, stages=2)
-    o_ready = k.mbar(kind=MBarKind.TCGEN05, stages=2)
-    corr_epi_full = k.mbar(kind=MBarKind.THREAD, stages=2)
-    corr_epi_empty = k.mbar(kind=MBarKind.THREAD, stages=2)
-    task_full = k.mbar(kind=MBarKind.THREAD, stages=TASK_BROADCAST_STAGES)
-    task_empty = k.mbar(kind=MBarKind.THREAD, stages=TASK_BROADCAST_STAGES)
-    softmax_corr_empty = k.mbar(kind=MBarKind.THREAD, stages=2)
+    q_full = tuple(
+        k.mbar(kind=MBarKind.TMA, byte_offset=mbar_offsets[f"q_full_{stage}"], stages=1)
+        for stage in range(2)
+    )
+    q_empty = tuple(
+        k.mbar(kind=MBarKind.THREAD, byte_offset=mbar_offsets[f"q_empty_{stage}"], stages=1)
+        for stage in range(2)
+    )
+    k_full = k.mbar(
+        kind=MBarKind.TMA, byte_offset=mbar_offsets["k_full"], stages=SMEM_PIPE_DEPTH_KV
+    )
+    k_empty = k.mbar(
+        kind=MBarKind.THREAD, byte_offset=mbar_offsets["k_empty"], stages=SMEM_PIPE_DEPTH_KV
+    )
+    v_full = k.mbar(
+        kind=MBarKind.TMA, byte_offset=mbar_offsets["v_full"], stages=SMEM_PIPE_DEPTH_KV
+    )
+    v_empty = k.mbar(
+        kind=MBarKind.THREAD, byte_offset=mbar_offsets["v_empty"], stages=SMEM_PIPE_DEPTH_KV
+    )
+    s_ready = k.mbar(kind=MBarKind.TCGEN05, byte_offset=mbar_offsets["s_ready"], stages=2)
+    p_first_ready = k.mbar(
+        kind=MBarKind.THREAD, byte_offset=mbar_offsets["p_first_ready"], stages=2
+    )
+    p_second_ready = k.mbar(
+        kind=MBarKind.THREAD, byte_offset=mbar_offsets["p_second_ready"], stages=2
+    )
+    p_o_rescale = k.mbar(kind=MBarKind.THREAD, byte_offset=mbar_offsets["p_o_rescale"], stages=2)
+    softmax_corr = k.mbar(kind=MBarKind.THREAD, byte_offset=mbar_offsets["softmax_corr"], stages=2)
+    row_sum_ready = k.mbar(
+        kind=MBarKind.THREAD, byte_offset=mbar_offsets["row_sum_ready"], stages=2
+    )
+    o_ready = k.mbar(kind=MBarKind.TCGEN05, byte_offset=mbar_offsets["o_ready"], stages=2)
+    corr_epi_full = k.mbar(
+        kind=MBarKind.THREAD, byte_offset=mbar_offsets["corr_epi_full"], stages=2
+    )
+    corr_epi_empty = k.mbar(
+        kind=MBarKind.THREAD, byte_offset=mbar_offsets["corr_epi_empty"], stages=2
+    )
+    task_full = k.mbar(
+        kind=MBarKind.THREAD, byte_offset=mbar_offsets["task_full"], stages=TASK_BROADCAST_STAGES
+    )
+    task_empty = k.mbar(
+        kind=MBarKind.THREAD, byte_offset=mbar_offsets["task_empty"], stages=TASK_BROADCAST_STAGES
+    )
+    softmax_corr_empty = k.mbar(
+        kind=MBarKind.THREAD, byte_offset=mbar_offsets["softmax_corr_empty"], stages=2
+    )
 
     task_space = k.task_space(
         grid=(num_q_blocks, config.num_kv_heads, config.batch_size),
@@ -291,7 +352,7 @@ def build_flash_attention4(config: FlashAttention4Config = FlashAttention4Config
     with k.if_warp(0):
         # tmem_alloc is warp-collective (exactly one full warp); mbarrier.init
         # is per-thread, so a single elected thread runs every init.
-        k.tmem_alloc(0, N_COLS_TMEM, config.cta_group)
+        k.tmem_alloc(0, N_COLS_TMEM, addr_byte_offset=tmem_addr_offset, cta_group=config.cta_group)
         with k.if_elected():
             # count=1 barriers: armed by the TMA engine (tx bytes), a tcgen05
             # commit, or a single-thread stream's lone arrive.
@@ -333,68 +394,81 @@ def build_flash_attention4(config: FlashAttention4Config = FlashAttention4Config
     with k.if_warpgroup(3):
         k.set_maxnreg(48)
 
-    _emit_scheduler_role(
-        k,
-        config,
-        scheduler,
-        task_smem,
-        task_full,
-        task_empty,
-        num_q_blocks,
-        num_kv_blocks,
-        seq_q_per_tile,
-    )
-    _emit_tma_load_role(
-        k,
-        config,
-        task_smem,
-        task_full,
-        task_empty,
-        q_gmem,
-        k_gmem,
-        v_gmem,
-        q_smem,
-        k_smem,
-        v_smem,
-        q_full,
-        q_empty,
-        k_full,
-        k_empty,
-        v_full,
-        v_empty,
-        num_q_blocks,
-        num_kv_blocks,
-        q_tile_bytes,
-        kv_tile_bytes,
-        seq_q_per_tile,
-    )
-    _emit_mma_role(
-        k,
-        config,
-        task_smem,
-        task_full,
-        task_empty,
-        q_smem,
-        k_smem,
-        v_smem,
-        s_tmem,
-        p_tmem,
-        o_tmem,
-        q_full,
-        q_empty,
-        k_full,
-        k_empty,
-        v_full,
-        v_empty,
-        s_ready,
-        p_first_ready,
-        p_second_ready,
-        p_o_rescale,
-        o_ready,
-        num_q_blocks,
-        num_kv_blocks,
-        seq_q_per_tile,
-    )
+        _emit_scheduler_role(
+            k,
+            config,
+            scheduler,
+            task_smem,
+            task_full,
+            task_empty,
+            num_q_blocks,
+            num_kv_blocks,
+            seq_q_per_tile,
+        )
+        _emit_tma_load_role(
+            k,
+            config,
+            task_smem,
+            task_full,
+            task_empty,
+            q_gmem,
+            k_gmem,
+            v_gmem,
+            q_smem,
+            k_smem,
+            v_smem,
+            q_full,
+            q_empty,
+            k_full,
+            k_empty,
+            v_full,
+            v_empty,
+            num_q_blocks,
+            num_kv_blocks,
+            q_tile_bytes,
+            kv_tile_bytes,
+            seq_q_per_tile,
+        )
+        _emit_mma_role(
+            k,
+            config,
+            task_smem,
+            task_full,
+            task_empty,
+            q_smem,
+            k_smem,
+            v_smem,
+            s_tmem,
+            p_tmem,
+            o_tmem,
+            q_full,
+            q_empty,
+            k_full,
+            k_empty,
+            v_full,
+            v_empty,
+            s_ready,
+            p_first_ready,
+            p_second_ready,
+            p_o_rescale,
+            o_ready,
+            num_q_blocks,
+            num_kv_blocks,
+            seq_q_per_tile,
+        )
+        _emit_tma_store_role(
+            k,
+            config,
+            task_smem,
+            task_full,
+            task_empty,
+            o_gmem,
+            o_smem,
+            corr_epi_full,
+            corr_epi_empty,
+            num_q_blocks,
+            seq_q_per_tile,
+        )
     _emit_softmax_roles(
         k,
         config,
@@ -453,20 +527,6 @@ def build_flash_attention4(config: FlashAttention4Config = FlashAttention4Config
         num_kv_blocks,
         seq_q_per_tile,
     )
-    _emit_tma_store_role(
-        k,
-        config,
-        task_smem,
-        task_full,
-        task_empty,
-        o_gmem,
-        o_smem,
-        corr_epi_full,
-        corr_epi_empty,
-        num_q_blocks,
-        seq_q_per_tile,
-    )
-
     # Teardown: every stream's pipeline work happens-before the dealloc.
     k.cta_sync()
     with k.if_warp(0):

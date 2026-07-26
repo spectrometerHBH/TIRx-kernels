@@ -304,7 +304,20 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
     sfa_off = b_off + smem_depth * b_tile_bytes
     sfb_off = sfa_off + smem_depth * sfa_tile_bytes
     d_off = sfb_off + smem_depth * sfb_tile_bytes
-    smem_size_bytes = d_off + TMEM_DEPTH * d_tile_bytes
+    data_end = d_off + TMEM_DEPTH * d_tile_bytes
+    metadata_cursor = (data_end + 7) // 8 * 8
+    smem_full_off = metadata_cursor
+    metadata_cursor += smem_depth * 8
+    smem_empty_off = metadata_cursor
+    metadata_cursor += smem_depth * 8
+    trans_done_off = metadata_cursor
+    metadata_cursor += smem_depth * 8
+    tmem_full_off = metadata_cursor
+    metadata_cursor += TMEM_DEPTH * 8
+    tmem_empty_off = metadata_cursor
+    metadata_cursor += TMEM_DEPTH * 8
+    tmem_addr_off = (metadata_cursor + 3) // 4 * 4
+    smem_size_bytes = tmem_addr_off + 4
 
     k = IRBuilder(
         "nymph_fp8_blockwise_gemm",
@@ -372,14 +385,14 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
     # smem_pipe: full = the TMA engine (arrive_expect_tx per k-tile, one barrier
     # covering A+B(+SF) bytes); empty = a tcgen05_commit from the MMA leader,
     # multicast to both CTAs once the k-tile's cp+MMA retire.
-    smem_full = k.mbar(kind=MBarKind.TMA, stages=smem_depth)
-    smem_empty = k.mbar(kind=MBarKind.TCGEN05, stages=smem_depth)
+    smem_full = k.mbar(kind=MBarKind.TMA, byte_offset=smem_full_off, stages=smem_depth)
+    smem_empty = k.mbar(kind=MBarKind.TCGEN05, byte_offset=smem_empty_off, stages=smem_depth)
     # trans_done: both CTAs' permute warps arrive at the LEADER's barrier; the
     # leader's MMA waits it, which transitively orders both CTAs' TMA data
     # (A halves, B halves, scales) before the cluster MMA reads them.
-    trans_done = k.mbar(kind=MBarKind.THREAD, stages=smem_depth)
-    tmem_full = k.mbar(kind=MBarKind.TCGEN05, stages=TMEM_DEPTH)
-    tmem_empty = k.mbar(kind=MBarKind.THREAD, stages=TMEM_DEPTH)
+    trans_done = k.mbar(kind=MBarKind.THREAD, byte_offset=trans_done_off, stages=smem_depth)
+    tmem_full = k.mbar(kind=MBarKind.TCGEN05, byte_offset=tmem_full_off, stages=TMEM_DEPTH)
+    tmem_empty = k.mbar(kind=MBarKind.THREAD, byte_offset=tmem_empty_off, stages=TMEM_DEPTH)
     trans_done_leader = k.mbar_ref(trans_done, remote_coord=0)
     tmem_empty_leader = k.mbar_ref(tmem_empty, remote_coord=0)
 
@@ -414,7 +427,7 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
     with k.if_warp(0):
         # tmem_alloc is warp-collective (full warp 0); mbarrier.init is
         # per-thread, so exactly one elected thread runs the inits.
-        k.tmem_alloc(0, N_COLS_TMEM, cta_group)
+        k.tmem_alloc(0, N_COLS_TMEM, addr_byte_offset=tmem_addr_off, cta_group=cta_group)
         with k.if_elected():
             for s in range(smem_depth):
                 k.mbarrier_init(smem_full, count=1, stage=s)

@@ -267,7 +267,25 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
     # grid-stride formula — the same primitive sequence canon emits, so codegen (a pure
     # 1:1 translator) reproduces canon's SASS (UGETNEXTWORKID.BROADCAST).
     clc_off = (pool_off + 15) // 16 * 16  # the CLC response handle is 16B-aligned
-    smem_size_bytes = clc_off + CLC_HANDLE_BYTES
+    data_end = clc_off + CLC_HANDLE_BYTES
+    metadata_cursor = (data_end + 7) // 8 * 8
+    smem_full_off = metadata_cursor
+    metadata_cursor += r.pipe_depth * 8
+    smem_empty_off = metadata_cursor
+    metadata_cursor += r.pipe_depth * 8
+    tmem_full_off = metadata_cursor
+    metadata_cursor += r.tmem_slots * 8
+    tmem_empty_off = metadata_cursor
+    metadata_cursor += r.tmem_slots * 8
+    sched_arr_full_off = metadata_cursor
+    metadata_cursor += 8
+    sched_fin_off = metadata_cursor
+    metadata_cursor += 8
+    tmem_fin_off = metadata_cursor if r.overlap else None
+    if r.overlap:
+        metadata_cursor += 8
+    tmem_addr_off = (metadata_cursor + 3) // 4 * 4
+    smem_size_bytes = tmem_addr_off + 4
 
     k = IRBuilder(
         "nymph_fp16_bf16_gemm",
@@ -319,12 +337,11 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
     # absolute physical (lane, col).
     accum = TmemBand(col0=0, dtype=DType.F32)
 
-    # leader_routed: both CTAs' A/B TMA completions signal the LEADER CTA's copy
-    # (the canonical cta_group=2 pattern replacing the illegal peer try_wait).
-    smem_full = k.mbar(kind=MBarKind.TMA, stages=r.pipe_depth, leader_routed=True)
-    smem_empty = k.mbar(kind=MBarKind.TCGEN05, stages=r.pipe_depth)
-    tmem_full = k.mbar(kind=MBarKind.TCGEN05, stages=r.tmem_slots)
-    tmem_empty = k.mbar(kind=MBarKind.THREAD, stages=r.tmem_slots)
+    smem_full = k.mbar(kind=MBarKind.TMA, byte_offset=smem_full_off, stages=r.pipe_depth)
+    smem_full_cta0 = k.mbar_ref(smem_full, remote_coord=0)
+    smem_empty = k.mbar(kind=MBarKind.TCGEN05, byte_offset=smem_empty_off, stages=r.pipe_depth)
+    tmem_full = k.mbar(kind=MBarKind.TCGEN05, byte_offset=tmem_full_off, stages=r.tmem_slots)
+    tmem_empty = k.mbar(kind=MBarKind.THREAD, byte_offset=tmem_empty_off, stages=r.tmem_slots)
     # ---- CLC scheduler objects (policy="custom", written out in nymph IR) ----
     # The task space the CLC scheduler rasters: one task per cluster tile (m, n).
     sched_space = k.task_space(grid=(r.num_m_tiles, r.num_n_tiles), fields=("m_idx", "n_idx"))
@@ -333,27 +350,25 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
     # both cluster CTAs); the scheduler and every worker wait it before decoding. A TMA
     # barrier (the response lands as a 16B tx), single-stage — the scheduler is lockstep
     # with the consumers via sched_fin (exactly canon's stages=1 sched_arr).
-    sched_arr_full = k.mbar(kind=MBarKind.TMA, stages=1)
+    sched_arr_full = k.mbar(kind=MBarKind.TMA, byte_offset=sched_arr_full_off, stages=1)
     # sched_fin: every worker loop arrives once per task at CTA-0's barrier; the leader
     # scheduler waits it before issuing the next try_cancel (the slot-reuse gate). The
     # MMA runs on the cluster LEADER only (canon's `warp_id < NC & cbx == 0`); the loader,
     # epilogue, and scheduler run on both CTAs — so arrivals/task = scheduler(2) +
     # loader(2) + epilogue(2*NC) + MMA(NC) = (2 + NC) * 2 + NC (canon's `finish_arrivals`).
     finish_arrivals = (2 + r.num_consumer) * 2 + r.num_consumer
-    sched_fin = k.mbar(kind=MBarKind.THREAD, stages=1)
+    sched_fin = k.mbar(kind=MBarKind.THREAD, byte_offset=sched_fin_off, stages=1)
     sched_fin_leader = k.mbar_ref(sched_fin, remote_coord=0)
     # tmem_fin: canon's lightweight 2-CTA teardown handshake (overlap path) — each CTA's
     # warp0/lane0 arrives at the PEER CTA's barrier, then warp0 waits its own, so both CTAs
     # finished their epilogue's TMEM reads before either deallocs. Lighter than a full
     # cluster_sync (only warp0 waits; the other 7 warps exit immediately).
-    tmem_fin = k.mbar(kind=MBarKind.THREAD, stages=1) if r.overlap else None
+    tmem_fin = (
+        k.mbar(kind=MBarKind.THREAD, byte_offset=tmem_fin_off, stages=1) if r.overlap else None
+    )
     # (No sched_sync rendezvous — canon's barrier set is just sched_arr + sched_fin. The
     # scheduler arms expect_tx on both CTAs before the leader's try_cancel, so the response
     # tx never races ahead of the peer's expect_tx.)
-    # The cluster MMA reads the peer CTA's tiles too: the leader waits its own
-    # and the peer's smem_full before issuing. The epilogues arrive at the
-    # leader's tmem_empty.
-    peer_smem_full = k.mbar_ref(smem_full, remote_coord=1)
     tmem_empty_leader = k.mbar_ref(tmem_empty, remote_coord=0)
 
     cta_id = k.cta_id()
@@ -392,7 +407,7 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
     with k.if_warp(0):
         # tmem_alloc is warp-collective (full warp 0); mbarrier.init is
         # per-thread, so exactly one thread runs the inits.
-        k.tmem_alloc(0, N_COLS_TMEM, CTA_GROUP)
+        k.tmem_alloc(0, N_COLS_TMEM, addr_byte_offset=tmem_addr_off, cta_group=CTA_GROUP)
         with k.if_elected():
             _init_stages(k, smem_full, stages=r.pipe_depth, count=1)
             _init_stages(k, smem_empty, stages=r.pipe_depth, count=r.num_consumer)
@@ -433,163 +448,167 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
     with k.if_warpgroup(r.num_consumer):
         k.set_maxnreg(PRODUCER_MAXNREG)
 
-    # ---- CLC scheduler warp (producer-wg warp 2, both CTAs) ----
-    # Written out explicitly in nymph IR (policy="custom"), the same primitive sequence as
-    # canon's `run_scheduler`: the dedicated scheduler warp issues clc_try_cancel and hands
-    # tiles to the workers through sched_arr / sched_fin.
-    with k.if_warp(r.producer_wg_base + 2):
-        # cluster_barrier_wait is WARP-COLLECTIVE: it must sit at warp scope, not
-        # inside the elected single-lane branch (an elected-lane wait deadlocks).
-        if r.overlap:
-            k.cluster_barrier_wait()
-        with k.if_elected():
-            with k.scheduler_impl(sched):
-                sf_phase = k.scalar(initial=1, dtype=ScalarDType.I32)
-                sa_phase = k.scalar(initial=0, dtype=ScalarDType.I32)
-                sched_done = k.scalar(initial=0, dtype=ScalarDType.I32)
-                with k.loop():
-                    k.break_if(sched_done.ne(0))
-                    with k.if_(cta_rank.eq(0)):
-                        k.mbarrier_wait(sched_fin, stage=0, phase=sf_phase)
-                        k.scalar_store(sf_phase, (sf_phase + 1) % 2)
-                    k.mbarrier_arrive_expect_tx(sched_arr_full, bytes=CLC_HANDLE_BYTES, stage=0)
-                    with k.if_(cta_rank.eq(0)):
-                        k.clc_try_cancel(sched, clc_handle, sched_arr_full, stage=0)
-                    k.mbarrier_wait(sched_arr_full, stage=0, phase=sa_phase)
-                    k.scalar_store(sa_phase, (sa_phase + 1) % 2)
-                    raw = k.clc_query_cancel(sched, clc_handle)
-                    k.mbarrier_arrive(sched_fin_leader, stage=0)
-                    with k.if_(raw < 0):
-                        k.scalar_store(sched_done, 1)
-
-    # ---- TMA loader (TIRx producer-wg warp 3) — single-elect (canon's `if elect_sync():
-    # while: tma_load`): one issuing thread runs the whole loop, collapsing the per-op
-    # elect at the branch top, so every single-issue op inside (mbar waits, loads)
-    # inherits it instead of carrying its own ELECT/VOTEU/PLOP3 guard.
-    with k.if_warp(r.producer_wg_base + 3):
-        if r.overlap:
-            k.cluster_barrier_wait()
-        with k.if_elected():
-            # Loop-carried SMEM-ring (stage, phase) induction counter (canon's
-            # PipelineState.advance): incremented by 1 per k-tile and wrapped at
-            # pipe_depth. Cheaper than recomputing `(local_iter*k_tiles+kt) % pipe_depth`
-            # each iteration (which regressed: the per-iter modulo/shift went vector +
-            # spilled). Walked inside a T.serial loop (uniform iteration).
-            ld_stage = k.scalar(initial=0, dtype=ScalarDType.I32)
-            ld_phase = k.scalar(initial=0, dtype=ScalarDType.I32)
-            with task_loop() as (task_id, local_iter):
-                # Hoist the per-task tile coords into registers ONCE per task (canon's
-                # `buffer_5`/`buffer_6`), instead of re-deriving the L2-raster expression
-                # `(task>>6)*4 + (task&63)&3` inline in every TMA address (3x/k-tile here).
-                # They are `let` bindings (canon's `tile_row`/`tile_col: T.let` decode
-                # chain): immutable SSA, NOT mutable local-scalar cells — a mutable cell
-                # defeats ptxas's uniform-register analysis and every TMA issue then pays
-                # vector math + R2UR moves (ncu fp16 1024: R2UR 13.5K vs canon 1.8K,
-                # clustered on the two g2cluster lines). __shfl_sync would also force the
-                # uniform datapath but is UB in this single-lane elected region (flaky GPU
-                # hang) — the let form needs no shuffle.
-                m_idx_e, n_idx_e = work_coords(task_id)
-                m_idx = k.let(m_idx_e)
-                n_idx = k.let(n_idx_e)
-                b_n = (n_idx * CTA_GROUP + cta_rank) * r.blk_n
-                with k.for_loop(stop=r.k_tiles) as kt:
-                    k.mbarrier_wait(smem_empty, stage=ld_stage, phase=(ld_phase + 1) % 2)
-                    tx = r.num_consumer * a_tile_bytes + b_tile_bytes
-                    k.mbarrier_arrive_expect_tx(smem_full, bytes=tx, stage=ld_stage)
-                    kc = kt * r.blk_k
-                    for c in range(r.num_consumer):
-                        a_m = ((m_idx * CTA_GROUP + cta_rank) * r.num_consumer + c) * BLK_M
-                        k.tma_load(
-                            TensorSlice(
-                                tensor=a_smem[c],
-                                offsets=(ld_stage, 0, 0),
-                                shape=(1, BLK_M, r.blk_k),
-                            ),
-                            a_gmem,
-                            mbar=smem_full,
-                            coords=(a_m, kc),
-                            shape=(1, BLK_M, r.blk_k),
-                            gmem_shape=(BLK_M, r.blk_k),
-                            mbar_stage=ld_stage,
-                            cta_group=CTA_GROUP,
-                        )
-                    k.tma_load(
-                        TensorSlice(
-                            tensor=b_smem, offsets=(ld_stage, 0, 0), shape=(1, r.blk_n, r.blk_k)
-                        ),
-                        b_gmem,
-                        mbar=smem_full,
-                        coords=(b_n, kc),
-                        shape=(1, r.blk_n, r.blk_k),
-                        gmem_shape=(r.blk_n, r.blk_k),
-                        mbar_stage=ld_stage,
-                        cta_group=CTA_GROUP,
-                    )
-                    _advance_ring(k, ld_stage, ld_phase, r.pipe_depth)
-
-    # ---- MMA (TIRx producer-wg warps 0..NUM_CONSUMER-1, cluster leader only) ----
-    # Single-elect the whole MMA worker loop (canon's `if elect_sync(): while ...`): one
-    # issuing thread runs the whole loop.
-    for c in range(r.num_consumer):
-        with k.if_warp(r.producer_wg_base + c):
+        # ---- CLC scheduler warp (producer-wg warp 2, both CTAs) ----
+        # Written out explicitly in nymph IR (policy="custom"), the same primitive sequence as
+        # canon's `run_scheduler`: the dedicated scheduler warp issues clc_try_cancel and hands
+        # tiles to the workers through sched_arr / sched_fin.
+        with k.if_warp(r.producer_wg_base + 2):
+            # cluster_barrier_wait is WARP-COLLECTIVE: it must sit at warp scope, not
+            # inside the elected single-lane branch (an elected-lane wait deadlocks).
             if r.overlap:
                 k.cluster_barrier_wait()
             with k.if_elected():
-                with k.if_(cta_rank.eq(0)):
-                    # Loop-carried SMEM-ring induction counter (canon's PipelineState),
-                    # walked by the same +1/wrap advance as the loader so the rolled
-                    # k-loop's operand-descriptor address math is one increment per iter
-                    # (NOT a per-iter modulo).
-                    mma_stage = k.scalar(initial=0, dtype=ScalarDType.I32)
-                    mma_phase = k.scalar(initial=0, dtype=ScalarDType.I32)
-                    with task_loop() as (task_id, local_iter):
-                        if r.overlap:
-                            slot = local_iter % r.tmem_slots
-                            tmem_empty_phase = (local_iter // r.tmem_slots + 1) % 2
-                        else:
-                            slot = c
-                            tmem_empty_phase = (local_iter + 1) % 2
-                        k.mbarrier_wait(tmem_empty, stage=slot, phase=tmem_empty_phase)
-                        acc_op = accum.at(0, slot * r.mma_n)
+                with k.scheduler_impl(sched):
+                    sf_phase = k.scalar(initial=1, dtype=ScalarDType.I32)
+                    sa_phase = k.scalar(initial=0, dtype=ScalarDType.I32)
+                    sched_done = k.scalar(initial=0, dtype=ScalarDType.I32)
+                    with k.loop():
+                        k.break_if(sched_done.ne(0))
+                        with k.if_(cta_rank.eq(0)):
+                            k.mbarrier_wait(sched_fin, stage=0, phase=sf_phase)
+                            k.scalar_store(sf_phase, (sf_phase + 1) % 2)
+                        k.mbarrier_arrive_expect_tx(sched_arr_full, bytes=CLC_HANDLE_BYTES, stage=0)
+                        with k.if_(cta_rank.eq(0)):
+                            k.clc_try_cancel(sched, clc_handle, sched_arr_full, stage=0)
+                        k.mbarrier_wait(sched_arr_full, stage=0, phase=sa_phase)
+                        k.scalar_store(sa_phase, (sa_phase + 1) % 2)
+                        raw = k.clc_query_cancel(sched, clc_handle)
+                        k.mbarrier_arrive(sched_fin_leader, stage=0)
+                        with k.if_(raw < 0):
+                            k.scalar_store(sched_done, 1)
 
-                        # The ROLLED k-loop with a RUNTIME accum cell (canon's merged
-                        # `while k < k_tiles: gemm_async(accum=k>0)` form): one MMA issue
-                        # site whose accum flag is a loop-carried scalar, so ptxas keeps
-                        # the whole k-loop rolled and the ring math on the uniform
-                        # datapath (the R2UR convergence).
-                        accum_flag = k.scalar(initial=0, dtype=ScalarDType.I32)
-                        with k.for_loop(stop=r.k_tiles, unroll=False) as _kt:
-                            k.mbarrier_wait(smem_full, stage=mma_stage, phase=mma_phase)
-                            k.mbarrier_wait(peer_smem_full, stage=mma_stage, phase=mma_phase)
-                            k.tcgen05_mma(
-                                acc_op,
+        # ---- TMA loader (TIRx producer-wg warp 3) — single-elect (canon's `if elect_sync():
+        # while: tma_load`): one issuing thread runs the whole loop, collapsing the per-op
+        # elect at the branch top, so every single-issue op inside (mbar waits, loads)
+        # inherits it instead of carrying its own ELECT/VOTEU/PLOP3 guard.
+        with k.if_warp(r.producer_wg_base + 3):
+            if r.overlap:
+                k.cluster_barrier_wait()
+            with k.if_elected():
+                # Loop-carried SMEM-ring (stage, phase) induction counter (canon's
+                # PipelineState.advance): incremented by 1 per k-tile and wrapped at
+                # pipe_depth. Cheaper than recomputing `(local_iter*k_tiles+kt) % pipe_depth`
+                # each iteration (which regressed: the per-iter modulo/shift went vector +
+                # spilled). Walked inside a T.serial loop (uniform iteration).
+                ld_stage = k.scalar(initial=0, dtype=ScalarDType.I32)
+                ld_phase = k.scalar(initial=0, dtype=ScalarDType.I32)
+                with task_loop() as (task_id, local_iter):
+                    # Hoist the per-task tile coords into registers ONCE per task (canon's
+                    # `buffer_5`/`buffer_6`), instead of re-deriving the L2-raster expression
+                    # `(task>>6)*4 + (task&63)&3` inline in every TMA address (3x/k-tile here).
+                    # They are `let` bindings (canon's `tile_row`/`tile_col: T.let` decode
+                    # chain): immutable SSA, NOT mutable local-scalar cells — a mutable cell
+                    # defeats ptxas's uniform-register analysis and every TMA issue then pays
+                    # vector math + R2UR moves (ncu fp16 1024: R2UR 13.5K vs canon 1.8K,
+                    # clustered on the two g2cluster lines). __shfl_sync would also force the
+                    # uniform datapath but is UB in this single-lane elected region (flaky GPU
+                    # hang) — the let form needs no shuffle.
+                    m_idx_e, n_idx_e = work_coords(task_id)
+                    m_idx = k.let(m_idx_e)
+                    n_idx = k.let(n_idx_e)
+                    b_n = (n_idx * CTA_GROUP + cta_rank) * r.blk_n
+                    with k.for_loop(stop=r.k_tiles) as kt:
+                        k.mbarrier_wait(smem_empty, stage=ld_stage, phase=(ld_phase + 1) % 2)
+                        tx = r.num_consumer * a_tile_bytes + b_tile_bytes
+                        kc = kt * r.blk_k
+                        for c in range(r.num_consumer):
+                            a_m = ((m_idx * CTA_GROUP + cta_rank) * r.num_consumer + c) * BLK_M
+                            k.tma_load(
                                 TensorSlice(
                                     tensor=a_smem[c],
-                                    offsets=(mma_stage, 0, 0),
+                                    offsets=(ld_stage, 0, 0),
                                     shape=(1, BLK_M, r.blk_k),
                                 ),
-                                TensorSlice(
-                                    tensor=b_smem,
-                                    offsets=(mma_stage, 0, 0),
-                                    shape=(1, r.blk_n, r.blk_k),
-                                ),
-                                m=CTA_M,
-                                n=r.mma_n,
-                                k=r.blk_k,
-                                accum=accum_flag,
+                                a_gmem,
+                                mbar=smem_full_cta0,
+                                coords=(a_m, kc),
+                                shape=(1, BLK_M, r.blk_k),
+                                gmem_shape=(BLK_M, r.blk_k),
+                                mbar_stage=ld_stage,
                                 cta_group=CTA_GROUP,
                             )
-                            k.scalar_store(accum_flag, 1)
-                            k.tcgen05_commit(
-                                smem_empty,
-                                stage=mma_stage,
-                                cta_group=CTA_GROUP,
-                                multicast_cta_mask=0b11,
-                            )
-                            _advance_ring(k, mma_stage, mma_phase, r.pipe_depth)
-                        k.tcgen05_commit(
-                            tmem_full, stage=slot, cta_group=CTA_GROUP, multicast_cta_mask=0b11
+                        k.tma_load(
+                            TensorSlice(
+                                tensor=b_smem, offsets=(ld_stage, 0, 0), shape=(1, r.blk_n, r.blk_k)
+                            ),
+                            b_gmem,
+                            mbar=smem_full_cta0,
+                            coords=(b_n, kc),
+                            shape=(1, r.blk_n, r.blk_k),
+                            gmem_shape=(r.blk_n, r.blk_k),
+                            mbar_stage=ld_stage,
+                            cta_group=CTA_GROUP,
                         )
+                        # Canonical fp16 ordering: all A/B copies precede the
+                        # leader's one full-cluster arrive/expect.
+                        with k.if_(cta_rank.eq(0)):
+                            k.mbarrier_arrive_expect_tx(
+                                smem_full_cta0, bytes=CTA_GROUP * tx, stage=ld_stage
+                            )
+                        _advance_ring(k, ld_stage, ld_phase, r.pipe_depth)
+
+        # ---- MMA (TIRx producer-wg warps 0..NUM_CONSUMER-1, cluster leader only) ----
+        # Single-elect the whole MMA worker loop (canon's `if elect_sync(): while ...`): one
+        # issuing thread runs the whole loop.
+        for c in range(r.num_consumer):
+            with k.if_warp(r.producer_wg_base + c):
+                if r.overlap:
+                    k.cluster_barrier_wait()
+                with k.if_elected():
+                    with k.if_(cta_rank.eq(0)):
+                        # Loop-carried SMEM-ring induction counter (canon's PipelineState),
+                        # walked by the same +1/wrap advance as the loader so the rolled
+                        # k-loop's operand-descriptor address math is one increment per iter
+                        # (NOT a per-iter modulo).
+                        mma_stage = k.scalar(initial=0, dtype=ScalarDType.I32)
+                        mma_phase = k.scalar(initial=0, dtype=ScalarDType.I32)
+                        with task_loop() as (task_id, local_iter):
+                            if r.overlap:
+                                slot = local_iter % r.tmem_slots
+                                tmem_empty_phase = (local_iter // r.tmem_slots + 1) % 2
+                            else:
+                                slot = c
+                                tmem_empty_phase = (local_iter + 1) % 2
+                            k.mbarrier_wait(tmem_empty, stage=slot, phase=tmem_empty_phase)
+                            acc_op = accum.at(0, slot * r.mma_n)
+
+                            # The ROLLED k-loop with a RUNTIME accum cell (canon's merged
+                            # `while k < k_tiles: gemm_async(accum=k>0)` form): one MMA issue
+                            # site whose accum flag is a loop-carried scalar, so ptxas keeps
+                            # the whole k-loop rolled and the ring math on the uniform
+                            # datapath (the R2UR convergence).
+                            accum_flag = k.scalar(initial=0, dtype=ScalarDType.I32)
+                            with k.for_loop(stop=r.k_tiles, unroll=False) as _kt:
+                                k.mbarrier_wait(smem_full, stage=mma_stage, phase=mma_phase)
+                                k.tcgen05_mma(
+                                    acc_op,
+                                    TensorSlice(
+                                        tensor=a_smem[c],
+                                        offsets=(mma_stage, 0, 0),
+                                        shape=(1, BLK_M, r.blk_k),
+                                    ),
+                                    TensorSlice(
+                                        tensor=b_smem,
+                                        offsets=(mma_stage, 0, 0),
+                                        shape=(1, r.blk_n, r.blk_k),
+                                    ),
+                                    m=CTA_M,
+                                    n=r.mma_n,
+                                    k=r.blk_k,
+                                    accum=accum_flag,
+                                    cta_group=CTA_GROUP,
+                                )
+                                k.scalar_store(accum_flag, 1)
+                                k.tcgen05_commit(
+                                    smem_empty,
+                                    stage=mma_stage,
+                                    cta_group=CTA_GROUP,
+                                    multicast_cta_mask=0b11,
+                                )
+                                _advance_ring(k, mma_stage, mma_phase, r.pipe_depth)
+                            k.tcgen05_commit(
+                                tmem_full, stage=slot, cta_group=CTA_GROUP, multicast_cta_mask=0b11
+                            )
 
     # ---- epilogue (TIRx consumer warpgroups 0..NUM_CONSUMER-1) ----
     for c in range(r.num_consumer):

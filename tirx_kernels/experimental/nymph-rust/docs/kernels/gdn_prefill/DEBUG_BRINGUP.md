@@ -29,11 +29,11 @@ retroactively.
 | gdn stripped + no CG0 rss, no gate compute | Passed | **HANGS** |
 | gdn stripped + no EPI warp, no zrow st | Passed | **HANGS** |
 
-Early probe kernels of mine deadlocked *by construction* (TMA producer warp
-nested inside the consumer warpgroup's branch — the top-level If chaining
-serializes the wg body before the nested producer in the producer's own
-stream). fp16's proven shape puts producer warps in a *different* warpgroup
-than their consumers; all later probes follow that.
+Early probe kernels of mine deadlocked *by construction* (the then-present
+top-level If chaining nested a TMA producer warp inside the consumer
+warpgroup's branch, serializing the wg body before the nested producer in the
+producer's own stream). That control-flow rewrite has since been removed:
+codegen now preserves the IR tree exactly.
 
 ## Established facts
 
@@ -96,14 +96,14 @@ All issues above are now resolved; final gate numbers at the bottom.
    The `alloc_local(W)+view(...)` Apply mapped (tid,j) out of bounds; use
    `T.wg_reg_tile + .local()` (storage-layout view, thread axis peeled).
    `WarpSync` lowered to nothing; now emits `T.cuda.warp_sync()`.
-4. **chain_top_level_ifs reorder → TMA-after-wait deadlock** (`c5da1718`).
-   The top-level If-chaining pass ran each group's warpgroup-prefix body
-   BEFORE its warp-level branches regardless of source order: a probe's
-   warp-1 TMA issue (source-order before the consumer warpgroup's
-   `mbarrier_wait`) was emitted AFTER the wait → spin forever. Only the
-   canonical wg-prefix-then-warp-roles order chains now; mixed runs emit
-   flat (source order, always sound). Regression test:
-   `codegen.rs::tests::warp_before_warpgroup_run_stays_flat`.
+4. **top-level If rewrite → TMA-after-wait deadlock** (`c5da1718`).
+   The former chaining pass ran each group's warpgroup-prefix body BEFORE its
+   warp-level branches regardless of source order: a probe's warp-1 TMA issue
+   (source-order before the consumer warpgroup's `mbarrier_wait`) was emitted
+   AFTER the wait → spin forever. The pass is now deleted rather than patched:
+   sibling IR branches always emit as siblings and preserve source order.
+   Regression tests:
+   `codegen.rs::tests::{top_level_ifs_preserve_structure_and_order,nested_ifs_preserve_structure}`.
 5. **WarpMma B fragment transposed in the interpreter** (`db96f0fe`). The
    interpreter unpacked the mma.sync B operand as bmat[(2t+h)·kk + g]; real
    sm_100 hardware (pinned by tests/mma_sync_hardware.rs's direct-feed
@@ -205,7 +205,7 @@ bring-up equipment:
   by this harness on its first run).
 - New IR-introspection surface for the pass (py.rs): PyStmt.kind /
   barrier_id / mbar_id / tensor / unroll, PyKernel.cluster_shape /
-  smem_pool.
+  explicit dynamic-SMEM layout fields.
 
 ### Emission invariants — status after zero-inference
 

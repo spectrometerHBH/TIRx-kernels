@@ -63,6 +63,7 @@ fn fields(stmt: &Stmt) -> (usize, usize, u8) {
             base_col,
             n_cols,
             cta_group,
+            addr_byte_offset: _,
         }
         | Stmt::TmemDealloc {
             base_col,

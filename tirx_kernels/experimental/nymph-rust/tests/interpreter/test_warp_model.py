@@ -66,7 +66,7 @@ def test_single_thread_issue_ops_reject_multi_lane_masks():
     a = b.tensor(space=nr.MemorySpace.SMEM, dtype=nr.DType.F16, shape=(128, 16), byte_offset=0)
     bb = b.tensor(space=nr.MemorySpace.SMEM, dtype=nr.DType.F16, shape=(16, 16), byte_offset=4096)
     with b.if_warp(0):
-        b.tmem_alloc(0, 32)
+        b.tmem_alloc(0, 32, addr_byte_offset=0)
         b.tcgen05_mma(acc, a, bb, m=128, n=16, k=16)
     with pytest.raises(ValueError, match="single_issue_scope"):
         b.build()
@@ -77,7 +77,7 @@ def test_mbarrier_arrive_is_per_thread():
     # Each thread applies the operand, so the 32 arrivals fill the barrier and
     # the waiter completes.
     b = builder("mbar_per_thread", num_warps=4)
-    mbar = b.mbar(kind=nr.MBarKind.THREAD, stages=1)
+    mbar = b.mbar(kind=nr.MBarKind.THREAD, byte_offset=0, stages=1)
     with b.if_warp(0):
         with b.if_elected():
             b.mbarrier_init(mbar, count=32)
@@ -98,7 +98,7 @@ def test_consumer_before_producer_in_source_order_completes():
     out = gmem_arg(b, shape=(4,))
     reg = b.tensor(space=nr.MemorySpace.REG, dtype=nr.DType.U32, shape=[4])
     smem = b.tensor(space=nr.MemorySpace.SMEM, dtype=nr.DType.U32, shape=[4], byte_offset=0)
-    mbar = b.mbar(kind=nr.MBarKind.THREAD, stages=1)
+    mbar = b.mbar(kind=nr.MBarKind.THREAD, byte_offset=0, stages=1)
     with b.if_warp(0):
         with b.if_elected():
             b.mbarrier_init(mbar, count=1)

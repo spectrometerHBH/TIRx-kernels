@@ -12,7 +12,8 @@
 
 use super::super::diagnostics::{IResult, InterpreterError};
 use super::super::mbar_ops::{
-    arrive_mbarrier_cell, expect_tx_cell, initialized_mbar_cell, uniform_mbar_target,
+    arrive_mbarrier_cell, complete_mbarrier_phase_if_ready, expect_tx_cell, initialized_mbar_cell,
+    uniform_mbar_target,
 };
 use super::super::outcomes::{StepStatus, WakeCondition};
 use super::super::protocol::TraceEventKind;
@@ -176,7 +177,10 @@ fn execute_mbarrier_expect_tx<'a, 'k>(
     let cell = initialized_mbar_cell(ctx, target.key())?;
     // Per-thread instruction: every executing thread adds its byte count.
     let total = bytes as i64 * ctx.lanes.len() as i64;
-    let updated = expect_tx_cell(cell, total);
+    // complete-tx may legally have added actual bytes before this instruction.
+    // Subtracting expect_tx back to exactly zero can therefore be the operation
+    // that completes the phase.
+    let updated = complete_mbarrier_phase_if_ready(expect_tx_cell(cell, total));
     let key = target.key();
     ctx.state.values.mbars.cells.insert(key, updated);
     if ctx.trace_mode() {

@@ -521,6 +521,7 @@ fn validate_stmt(s: &Stmt) -> R {
             base_col,
             n_cols,
             cta_group,
+            addr_byte_offset: _,
         }
         | Stmt::TmemDealloc {
             base_col,
@@ -1338,7 +1339,11 @@ fn validate_stmt(s: &Stmt) -> R {
                 return bail("ldmatrix src dtype must be f16, bf16, i16, or u16");
             }
             if let Some(n) = static_shape_numel(&dst.shape) {
-                let want = if b16_dst { 2 * *num as usize } else { *num as usize };
+                let want = if b16_dst {
+                    2 * *num as usize
+                } else {
+                    *num as usize
+                };
                 if n != want {
                     return bail(
                         "ldmatrix dst slice must contain num b32 registers (2*num b16 elements)",
@@ -2434,6 +2439,7 @@ fn check_tmem_alloc_bands(kernel: &Kernel) -> R {
                     base_col,
                     n_cols,
                     cta_group,
+                    addr_byte_offset: _,
                 } => {
                     if let Some(msg) = banned_here() {
                         return bail(msg);
@@ -2558,77 +2564,6 @@ fn check_tmem_alloc_bands(kernel: &Kernel) -> R {
     )
 }
 
-/// Walk 5: the `leader_routed` IR flag is the ONLY authority on cluster
-/// TMA-completion routing — codegen honors it and never guesses it from the
-/// usage structure. Consistency rules for a leader-routed mbar:
-///   1. it must carry a peer reference (an `MBarRef` with `remote_coord` — the
-///      cross-CTA wait the leader routing replaces), and
-///   2. it must be named ONLY by TMA-transaction ops (`TmaLoad`,
-///      `MBarrierExpectTx`, `MBarrierArriveExpectTx`) plus the bookkeeping ops
-///      that keep their local form (`MBarrierInit`, `MBarrierWait`). Routing a
-///      thread arrive, a tcgen05 commit, or a CLC/S2Cluster completion to the
-///      leader would corrupt the barrier's accounting.
-fn check_leader_routed_mbars(kernel: &Kernel) -> R {
-    let mut leader_ids: HashSet<u32> = HashSet::new();
-    let mut has_peer_ref: HashSet<u32> = HashSet::new();
-    fn walk(stmts: &[Stmt], leader_ids: &HashSet<u32>, has_peer: &mut HashSet<u32>) -> R {
-        for s in stmts {
-            let (refs, is_tx_use): (Vec<&MBarRef>, bool) = match s {
-                Stmt::MBarrierInit { mbar, .. }
-                | Stmt::MBarrierWait { mbar, .. }
-                | Stmt::MBarrierExpectTx { mbar, .. }
-                | Stmt::MBarrierArriveExpectTx { mbar, .. }
-                | Stmt::TmaLoad { mbar, .. } => (vec![mbar], true),
-                Stmt::MBarrierArrive { mbar, .. }
-                | Stmt::Tcgen05Commit { mbar, .. }
-                | Stmt::ClcTryCancel { mbar, .. }
-                | Stmt::CpAsyncBulkS2Cluster { mbar, .. } => (vec![mbar], false),
-                _ => (vec![], true),
-            };
-            for mref in refs {
-                if mref.remote_coord.is_some() {
-                    has_peer.insert(mref.mbar.id);
-                }
-                if leader_ids.contains(&mref.mbar.id) && !is_tx_use {
-                    return bail(format!(
-                        "leader_routed mbar {} must only be used by TmaLoad/expect_tx \
-                         (plus init/wait) — an arrive/commit/CLC completion cannot be \
-                         leader-routed",
-                        mref.mbar.id
-                    ));
-                }
-            }
-            for child in s.child_bodies() {
-                walk(child, leader_ids, has_peer)?;
-            }
-        }
-        Ok(())
-    }
-    fn collect_defs(stmts: &[Stmt], leader_ids: &mut HashSet<u32>) {
-        for s in stmts {
-            if let Stmt::MBarDef { mbar } = s {
-                if mbar.leader_routed {
-                    leader_ids.insert(mbar.id);
-                }
-            }
-            for child in s.child_bodies() {
-                collect_defs(child, leader_ids);
-            }
-        }
-    }
-    collect_defs(&kernel.body, &mut leader_ids);
-    walk(&kernel.body, &leader_ids, &mut has_peer_ref)?;
-    for id in leader_ids {
-        if !has_peer_ref.contains(&id) {
-            return bail(format!(
-                "leader_routed mbar {id} must carry a peer reference (an MBarRef with \
-                 remote_coord — the cross-CTA wait the leader routing replaces)"
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// A `ScalarLet` var is single-assignment: reject any `ScalarStore` targeting it
 /// (the immutable SSA binding is what lets ptxas keep the value on the uniform
 /// datapath; a store would reintroduce the mutable-local form that breaks it).
@@ -2656,7 +2591,33 @@ fn check_let_single_assignment(body: &[Stmt]) -> R {
     Ok(())
 }
 
-fn check_smem_pool_bounds(kernel: &Kernel) -> R {
+fn check_smem_layout(kernel: &Kernel) -> R {
+    // Physical ranges may overlap. Whether two views can safely reuse bytes is
+    // a live-range / happens-before property, not a static layout property;
+    // this pass has no complete SMEM liveness model. It therefore validates
+    // only representability (alignment, extent, and pool bounds).
+    fn tensor_codegen_alignment(tensor: &Tensor) -> usize {
+        let is_integer = matches!(
+            tensor.dtype,
+            DType::Bool
+                | DType::I8
+                | DType::U8
+                | DType::I16
+                | DType::U16
+                | DType::I32
+                | DType::U32
+                | DType::I64
+                | DType::U64
+        );
+        if (is_integer && tensor.dtype != DType::U8) || tensor.shape.len() < 2 {
+            1
+        } else if matches!(tensor.layout, Some(Layout::Swizzle(_))) {
+            1024
+        } else {
+            128
+        }
+    }
+
     fn check_tensor(tensor: &Tensor, smem_size_bytes: usize) -> R {
         if tensor.space != MemorySpace::Smem {
             return Ok(());
@@ -2671,37 +2632,92 @@ fn check_smem_pool_bounds(kernel: &Kernel) -> R {
         if end > smem_size_bytes {
             return bail("smem tensor byte range exceeds kernel smem_size_bytes");
         }
+        let alignment = tensor_codegen_alignment(tensor);
+        if offset % alignment != 0 {
+            return bail(format!(
+                "smem tensor byte_offset {offset} must be aligned to its codegen \
+                 alignment {alignment}"
+            ));
+        }
         Ok(())
     }
 
-    fn walk_stmt(stmt: &Stmt, smem_size_bytes: usize, seen: &mut HashSet<u32>) -> R {
+    fn walk_stmt(
+        stmt: &Stmt,
+        smem_size_bytes: usize,
+        seen_tensors: &mut HashSet<u32>,
+        seen_mbars: &mut HashSet<u32>,
+        tmem_addr_offset: &mut Option<usize>,
+    ) -> R {
         match stmt {
             Stmt::TensorDef { tensor } => {
-                if seen.insert(tensor.id) {
+                if seen_tensors.insert(tensor.id) {
                     check_tensor(tensor, smem_size_bytes)?;
+                }
+            }
+            Stmt::MBarDef { mbar } => {
+                if seen_mbars.insert(mbar.id) {
+                    if mbar.byte_offset % 8 != 0 {
+                        return bail(format!(
+                            "mbar {} byte_offset {} must be 8-byte aligned",
+                            mbar.id, mbar.byte_offset
+                        ));
+                    }
+                    let extent = (mbar.stages as usize)
+                        .checked_mul(8)
+                        .ok_or_else(|| err("mbar byte extent overflows usize"))?;
+                    let end = mbar
+                        .byte_offset
+                        .checked_add(extent)
+                        .ok_or_else(|| err("mbar byte range overflows usize"))?;
+                    if end > smem_size_bytes {
+                        return bail("mbar byte range exceeds kernel smem_size_bytes");
+                    }
+                }
+            }
+            Stmt::TmemAlloc {
+                addr_byte_offset, ..
+            } => {
+                if *addr_byte_offset % 4 != 0 {
+                    return bail(format!(
+                        "tmem_addr byte_offset {addr_byte_offset} must be 4-byte aligned"
+                    ));
+                }
+                let end = addr_byte_offset
+                    .checked_add(4)
+                    .ok_or_else(|| err("tmem_addr byte range overflows usize"))?;
+                if end > smem_size_bytes {
+                    return bail("tmem_addr byte range exceeds kernel smem_size_bytes");
+                }
+                match tmem_addr_offset {
+                    Some(existing) if *existing != *addr_byte_offset => {
+                        return bail("all TmemAlloc statements must use the same addr_byte_offset");
+                    }
+                    None => *tmem_addr_offset = Some(*addr_byte_offset),
+                    _ => {}
                 }
             }
             Stmt::ScalarDef {
                 initial: ScalarInitial::Tensor(slice),
                 ..
             } => {
-                if seen.insert(slice.tensor.id) {
+                if seen_tensors.insert(slice.tensor.id) {
                     check_tensor(&slice.tensor, smem_size_bytes)?;
                 }
             }
             Stmt::TmaLoad { dst, src, .. } => {
-                if seen.insert(dst.tensor.id) {
+                if seen_tensors.insert(dst.tensor.id) {
                     check_tensor(&dst.tensor, smem_size_bytes)?;
                 }
-                if seen.insert(src.id) {
+                if seen_tensors.insert(src.id) {
                     check_tensor(src, smem_size_bytes)?;
                 }
             }
             Stmt::TmaStore { dst, src, .. } => {
-                if seen.insert(dst.id) {
+                if seen_tensors.insert(dst.id) {
                     check_tensor(dst, smem_size_bytes)?;
                 }
-                if seen.insert(src.tensor.id) {
+                if seen_tensors.insert(src.tensor.id) {
                     check_tensor(&src.tensor, smem_size_bytes)?;
                 }
             }
@@ -2710,42 +2726,42 @@ fn check_smem_pool_bounds(kernel: &Kernel) -> R {
                 // no tensor; only SMEM operand tiles are pool-bound.
                 for op in [a, b] {
                     if let MmaOperand::Slice(s) = op {
-                        if seen.insert(s.tensor.id) {
+                        if seen_tensors.insert(s.tensor.id) {
                             check_tensor(&s.tensor, smem_size_bytes)?;
                         }
                     }
                 }
             }
             Stmt::Tcgen05Cp { src, .. } => {
-                if seen.insert(src.tensor.id) {
+                if seen_tensors.insert(src.tensor.id) {
                     check_tensor(&src.tensor, smem_size_bytes)?;
                 }
             }
             Stmt::Tcgen05Ld { dst, .. } => {
-                if seen.insert(dst.tensor.id) {
+                if seen_tensors.insert(dst.tensor.id) {
                     check_tensor(&dst.tensor, smem_size_bytes)?;
                 }
             }
             Stmt::Tcgen05St { src, .. } => {
-                if seen.insert(src.tensor.id) {
+                if seen_tensors.insert(src.tensor.id) {
                     check_tensor(&src.tensor, smem_size_bytes)?;
                 }
             }
             Stmt::ClcTryCancel { handle, .. } | Stmt::ClcQueryCancel { handle, .. } => {
-                if seen.insert(handle.id) {
+                if seen_tensors.insert(handle.id) {
                     check_tensor(handle, smem_size_bytes)?;
                 }
             }
             Stmt::LdMatrix { dst, src, .. } | Stmt::StMatrix { dst, src, .. } => {
                 for tensor in [&dst.tensor, &src.tensor] {
-                    if seen.insert(tensor.id) {
+                    if seen_tensors.insert(tensor.id) {
                         check_tensor(tensor, smem_size_bytes)?;
                     }
                 }
             }
             Stmt::WarpMma { d, a, b, c, .. } => {
                 for sl in [d, a, b, c] {
-                    if seen.insert(sl.tensor.id) {
+                    if seen_tensors.insert(sl.tensor.id) {
                         check_tensor(&sl.tensor, smem_size_bytes)?;
                     }
                 }
@@ -2770,13 +2786,13 @@ fn check_smem_pool_bounds(kernel: &Kernel) -> R {
                 let mut slices = Vec::new();
                 reg_stmt_slices(stmt, &mut slices);
                 for slice in slices {
-                    if seen.insert(slice.tensor.id) {
+                    if seen_tensors.insert(slice.tensor.id) {
                         check_tensor(&slice.tensor, smem_size_bytes)?;
                     }
                 }
             }
             Stmt::StoreScalar { dst, .. } => {
-                if seen.insert(dst.tensor.id) {
+                if seen_tensors.insert(dst.tensor.id) {
                     check_tensor(&dst.tensor, smem_size_bytes)?;
                 }
             }
@@ -2784,20 +2800,34 @@ fn check_smem_pool_bounds(kernel: &Kernel) -> R {
         }
         for child in stmt.child_bodies() {
             for nested in child {
-                walk_stmt(nested, smem_size_bytes, seen)?;
+                walk_stmt(
+                    nested,
+                    smem_size_bytes,
+                    seen_tensors,
+                    seen_mbars,
+                    tmem_addr_offset,
+                )?;
             }
         }
         Ok(())
     }
 
-    let mut seen = HashSet::new();
+    let mut seen_tensors = HashSet::new();
     for tensor in &kernel.args {
-        if seen.insert(tensor.id) {
+        if seen_tensors.insert(tensor.id) {
             check_tensor(tensor, kernel.smem_size_bytes)?;
         }
     }
+    let mut seen_mbars = HashSet::new();
+    let mut tmem_addr_offset = None;
     for stmt in &kernel.body {
-        walk_stmt(stmt, kernel.smem_size_bytes, &mut seen)?;
+        walk_stmt(
+            stmt,
+            kernel.smem_size_bytes,
+            &mut seen_tensors,
+            &mut seen_mbars,
+            &mut tmem_addr_offset,
+        )?;
     }
     Ok(())
 }
@@ -2822,7 +2852,7 @@ impl Kernel {
         for s in &self.body {
             validate_stmt(s)?;
         }
-        check_smem_pool_bounds(self)?;
+        check_smem_layout(self)?;
         let mut defined = HashSet::new();
         check_context(
             &self.body,
@@ -2836,7 +2866,6 @@ impl Kernel {
         )?;
         check_cta_group_consistency(self)?;
         check_tmem_alloc_bands(self)?;
-        check_leader_routed_mbars(self)?;
         check_let_single_assignment(&self.body)?;
         Ok(())
     }
@@ -2896,8 +2925,8 @@ mod tests {
             id,
             kind,
             stages: 1,
+            byte_offset: (1 << 19) + id as usize * 8,
             arrive_count: None,
-            leader_routed: false,
         })
     }
 
@@ -2917,7 +2946,6 @@ mod tests {
             smem_size_bytes: 1 << 20,
             launch_shape: vec![1],
             cluster_shape: vec![1],
-            smem_pool: false,
         }
     }
 
@@ -2982,6 +3010,7 @@ mod tests {
                     base_col: 0,
                     n_cols: 512,
                     cta_group: 1,
+                    addr_byte_offset: 900_000,
                 }],
             ),
             warp_if(0, body),
@@ -3250,6 +3279,7 @@ mod tests {
                     base_col,
                     n_cols,
                     cta_group: 1,
+                    addr_byte_offset: 900_000,
                 }],
             )
         };
@@ -3294,6 +3324,7 @@ mod tests {
             base_col: 0,
             n_cols: 64,
             cta_group: 1,
+            addr_byte_offset: 900_000,
         }])
         .validate()
         .unwrap_err();
@@ -3311,6 +3342,7 @@ mod tests {
                     base_col: 0,
                     n_cols: 64,
                     cta_group: 1,
+                    addr_byte_offset: 900_000,
                 }],
             )],
             unroll: true,
@@ -3337,6 +3369,7 @@ mod tests {
                         base_col: 0,
                         n_cols: 64,
                         cta_group: 1,
+                        addr_byte_offset: 900_000,
                     }],
                 )],
             },
@@ -3494,8 +3527,8 @@ mod tests {
             id: 2,
             kind: MBarKind::Tma,
             stages: 1,
+            byte_offset: 800_016,
             arrive_count: None,
-            leader_routed: true,
         });
         let mut k = kernel(vec![Stmt::MBarDef { mbar: peer.clone() }]);
         k.launch_shape = vec![2];
@@ -3650,55 +3683,6 @@ mod tests {
         assert!(e.message.contains("unroll=false"), "{}", e.message);
         let e = kernel(vec![lp(0, 2, false)]).validate().unwrap_err();
         assert!(e.message.contains("unroll=false"), "{}", e.message);
-    }
-
-    #[test]
-    fn leader_routed_mbar_consistency() {
-        let make = |leader: bool| {
-            Arc::new(MBar {
-                id: 1,
-                kind: MBarKind::Tma,
-                stages: 1,
-                arrive_count: None,
-                leader_routed: leader,
-            })
-        };
-        // a leader-routed mbar used only by a TMA load with a peer ref: legal.
-        let m = make(true);
-        let mut load = tma_load(&m, vec![64, 64], None, 2);
-        if let Stmt::TmaLoad { mbar, .. } = &mut load {
-            mbar.remote_coord = Some(ScalarValue::Int(0));
-        }
-        let mut k = kernel(vec![
-            Stmt::MBarDef { mbar: m.clone() },
-            elected_if(vec![load]),
-        ]);
-        k.launch_shape = vec![2];
-        k.cluster_shape = vec![2];
-        assert!(k.validate().is_ok());
-        // without any peer reference the routing has no meaning.
-        let k2 = kernel(vec![
-            Stmt::MBarDef { mbar: m.clone() },
-            elected_if(vec![tma_load(&m, vec![64, 64], None, 1)]),
-        ]);
-        let e = k2.validate().unwrap_err();
-        assert!(e.message.contains("peer reference"), "{}", e.message);
-        // routing a thread arrive to the leader corrupts the accounting.
-        let mut k3 = kernel(vec![
-            Stmt::MBarDef { mbar: m.clone() },
-            Stmt::MBarrierArrive {
-                mbar: MBarRef {
-                    mbar: m.clone(),
-                    remote_coord: Some(ScalarValue::Int(0)),
-                },
-                stage: None,
-                count: ScalarValue::Int(1),
-            },
-        ]);
-        k3.launch_shape = vec![2];
-        k3.cluster_shape = vec![2];
-        let e = k3.validate().unwrap_err();
-        assert!(e.message.contains("TmaLoad/expect_tx"), "{}", e.message);
     }
 
     #[test]

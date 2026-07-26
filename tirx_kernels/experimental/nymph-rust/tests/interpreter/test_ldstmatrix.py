@@ -28,7 +28,7 @@ def _ldmatrix_kernel(num, trans):
     out = gmem_arg(b, dtype=nr.DType.U32, shape=(32, num))
     smem = smem_tensor(b, dtype=nr.DType.U16, shape=(rows, 8), byte_offset=0)
     frag = reg_tensor(b, dtype=nr.DType.U32, shape=(num,))
-    mbar = b.mbar(kind=nr.MBarKind.TMA)
+    mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
 
     with b.if_warp(0), b.if_elected():
         b.mbarrier_init(mbar, count=1)
@@ -69,7 +69,7 @@ def _ldmatrix_b16_dst_kernel(num, trans):
     out = gmem_arg(b, dtype=nr.DType.BF16, shape=(32, 2 * num))
     smem = smem_tensor(b, dtype=nr.DType.U16, shape=(rows, 8), byte_offset=0)
     frag = reg_tensor(b, dtype=nr.DType.BF16, shape=(2 * num,))
-    mbar = b.mbar(kind=nr.MBarKind.TMA)
+    mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
 
     with b.if_warp(0), b.if_elected():
         b.mbarrier_init(mbar, count=1)
@@ -95,9 +95,9 @@ def test_ldmatrix_m8n8_b16_fragment_dst_decodes_pairs():
                 for matrix_id in range(num):
                     for half in range(2):
                         row, col = _coord(lane, half, trans)
-                        bits = np.array(
-                            [(matrix_id * 8 + row) << 8 | col], dtype=np.uint16
-                        ).astype(np.uint32)
+                        bits = np.array([(matrix_id * 8 + row) << 8 | col], dtype=np.uint16).astype(
+                            np.uint32
+                        )
                         expected[lane, 2 * matrix_id + half] = (bits << 16).view(np.float32)[0]
             np.testing.assert_array_equal(result, expected, err_msg=f"x{num} trans={trans}")
 

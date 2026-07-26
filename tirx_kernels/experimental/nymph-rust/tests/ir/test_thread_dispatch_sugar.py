@@ -38,6 +38,30 @@ def test_setmaxnreg_nested_under_warpgroup_validates():
     b.build()
 
 
+def test_codegen_preserves_sibling_dispatch_structure():
+    b = builder()
+    b.arg(space=nr.MemorySpace.GMEM, dtype=nr.DType.U32, shape=(1,))
+    with b.if_warpgroup(1):
+        b.set_maxnreg(232)
+    with b.if_warp(4):
+        b.warp_sync()
+    with b.if_warp(5):
+        b.warp_sync()
+
+    src = nr.kernel_to_tirx_source(b.build())
+    expected = """\
+    if wg_id == 1:
+        T.ptx.setmaxnreg(True, 232)
+    if warp_id == 4:
+        T.cuda.warp_sync()
+    if warp_id == 5:
+        T.cuda.warp_sync()
+"""
+    assert expected in src
+    assert "T.ptx.setmaxnreg(True, 232)\n        if warp_id" not in src
+    assert "    else:" not in src
+
+
 def test_nested_sugar_runs_in_simulator():
     b = nr.IRBuilder(
         "sugar_sim", num_warps=4, smem_size_bytes=64, launch_shape=(1,), cluster_shape=(1,)

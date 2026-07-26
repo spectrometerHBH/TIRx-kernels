@@ -98,6 +98,10 @@ def _ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
+def _align(value: int, alignment: int) -> int:
+    return (value + alignment - 1) // alignment * alignment
+
+
 def _sl(t, offs, shape):
     return TensorSlice(tensor=t, offsets=offs, shape=shape)
 
@@ -519,6 +523,53 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
     for alias, target in aliases.items():
         offs[alias] = offs[target]
 
+    # ---- mbarrier storage plan (producer/consumer pipeline) ----
+    # spec = (kind, arrive_count[, stages]). The counts reflect per-thread
+    # mbarrier.arrive semantics; the optional third item controls physical extent.
+    WG_T = 128
+    bar_spec = {
+        "tk": (MBarKind.TMA, 1),
+        "tv": (MBarKind.TMA, 1),
+        "tq": (MBarKind.TMA, 1, NSTAGE),
+        "tdo": (MBarKind.TMA, 1, NSTAGE),
+        "tlse": (MBarKind.TMA, 1, NSTAGE),
+        "tdps": (MBarKind.TMA, 1, NSTAGE),
+        "s_ready": (MBarKind.TCGEN05, 1),
+        "dp_ready": (MBarKind.TCGEN05, 1),
+        "p_ready": (MBarKind.THREAD, 2 * WG_T),
+        "ds_ready": (MBarKind.THREAD, 2 * WG_T),
+        "dv_done": (MBarKind.TCGEN05, 1),
+        "dk_done": (MBarKind.TCGEN05, 1),
+        "dq_done": (MBarKind.TCGEN05, 1),
+        "dq_free": (MBarKind.THREAD, WG_T),
+        "q_free": (MBarKind.THREAD, 1, NSTAGE),
+        "do_free": (MBarKind.THREAD, 1, NSTAGE),
+        "lse_free": (MBarKind.THREAD, 2 * WG_T, NSTAGE),
+        "dps_free": (MBarKind.THREAD, 2 * WG_T, NSTAGE),
+    }
+    if use_2cta:
+        bar_spec["tqt"] = (MBarKind.TMA, 1, NSTAGE)
+        bar_spec["tdot"] = (MBarKind.TMA, 1, NSTAGE)
+        bar_spec["tkt"] = (MBarKind.TMA, 1)
+        bar_spec["qt_free"] = (MBarKind.THREAD, 1, NSTAGE)
+        bar_spec["dot_free"] = (MBarKind.THREAD, 1, NSTAGE)
+        bar_spec["dS_cluster_full"] = (MBarKind.TMA, 1)
+        bar_spec["dS_cluster_leader"] = (MBarKind.THREAD, 2)
+        bar_spec["dS_free"] = (MBarKind.THREAD, 1)
+        if not is_hd192 and n_mb > 1:
+            bar_spec["s_cons"] = (MBarKind.THREAD, 2 * WG_T)
+        if is_hd192:
+            bar_spec["s_free"] = (MBarKind.THREAD, 2 * WG_T)
+            bar_spec["dQaccum_empty"] = (MBarKind.THREAD, WG_T)
+
+    cursor = _align(off, 8)
+    bar_offsets = {}
+    for name, spec in bar_spec.items():
+        bar_offsets[name] = cursor
+        cursor += (spec[2] if len(spec) > 2 else 1) * 8
+    tmem_addr_offset = _align(cursor, 4)
+    smem_size_bytes = tmem_addr_offset + 4
+
     # INVARIANT-OVERRIDE I1a (F11): nymph uses a 1D PERSISTENT grid (min(SM_COUNT,num_work)
     # CTAs + for_each_task) instead of flashattn's SingleTileScheduler 3D NON-persistent grid
     # (num_block, num_head, num_batch), 1 tile/CTA (tile_scheduler.py:241). The work->tile decode
@@ -533,7 +584,7 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
     k = IRBuilder(
         "flash_bwd_sm100",
         num_warps=NUM_WARPS,
-        smem_size_bytes=off,
+        smem_size_bytes=smem_size_bytes,
         launch_shape=config.launch_shape or default_launch,
         cluster_shape=(cg,) if use_2cta else (1,),
     )
@@ -740,7 +791,9 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
             # dq_free (the compute wg waits the PREVIOUS block's phase, cross-mb WAR).
             bar_spec["dQaccum_empty"] = (MBarKind.THREAD, WG_T)
     bars = {
-        nm: k.mbar(kind=spec[0], stages=(spec[2] if len(spec) > 2 else 1))
+        nm: k.mbar(
+            kind=spec[0], byte_offset=bar_offsets[nm], stages=(spec[2] if len(spec) > 2 else 1)
+        )
         for nm, spec in bar_spec.items()
     }
 
@@ -797,7 +850,7 @@ def build_flash_bwd_sm100(config: FlashBwdSm100Config = FlashBwdSm100Config()) -
         # tmem_alloc is warp-collective (full warp 0); mbarrier.init is
         # per-thread, so exactly one elected thread runs every init (a
         # warp-wide init would double-init each cell 32x).
-        k.tmem_alloc(0, N_COLS_TMEM, cg)
+        k.tmem_alloc(0, N_COLS_TMEM, addr_byte_offset=tmem_addr_offset, cta_group=cg)
         with k.if_elected():
             for nm, spec in bar_spec.items():
                 stg = spec[2] if len(spec) > 2 else 1

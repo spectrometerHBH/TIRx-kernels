@@ -118,7 +118,6 @@ mod tests {
             smem_size_bytes: 256 * 16 * 2,
             launch_shape: vec![2],
             cluster_shape: vec![2],
-            smem_pool: false,
         };
 
         // Arg tensor data is reachable directly through its Arc.
@@ -138,7 +137,6 @@ mod tests {
             smem_size_bytes: 0,
             launch_shape: vec![2],
             cluster_shape: vec![2],
-            smem_pool: false,
         }
     }
 

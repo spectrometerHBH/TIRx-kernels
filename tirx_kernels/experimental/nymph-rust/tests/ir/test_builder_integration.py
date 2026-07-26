@@ -11,6 +11,44 @@ import pytest
 nymph_rs = pytest.importorskip("nymph_rs")
 
 
+def _scope_cmp(stmt, op):
+    if stmt.kind != "if" or stmt.cond.op != op:
+        return None
+    lhs, rhs = stmt.cond.args
+    if hasattr(lhs, "kind") and isinstance(rhs, int):
+        return lhs.kind, rhs
+    if hasattr(rhs, "kind") and isinstance(lhs, int):
+        return rhs.kind, lhs
+    return None
+
+
+def _scope_eq(stmt):
+    return _scope_cmp(stmt, nymph_rs.ScalarOp.EQ)
+
+
+def _assert_leader_expect_tx_guards_are_explicit_ir(kernel, expected_mbar_count):
+    arrive_mbar_ids = set()
+    tma_refs = []
+
+    def walk(stmts, under_cta_leader=False):
+        for stmt in stmts:
+            leader = under_cta_leader or _scope_eq(stmt) == ("ctaid_in_cluster", 0)
+            if stmt.kind == "mbarrier_arrive_expect_tx" and stmt.mbar.remote_coord is not None:
+                assert leader
+                assert stmt.mbar.remote_coord == 0
+                arrive_mbar_ids.add(stmt.mbar_id)
+            elif stmt.kind == "tma_load":
+                tma_refs.append((stmt.mbar_id, stmt.mbar.remote_coord))
+            if stmt.kind in {"if", "for_loop", "for_each_task", "scheduler_impl", "loop"}:
+                walk(stmt.body, leader)
+
+    walk(kernel.body)
+    assert len(arrive_mbar_ids) == expected_mbar_count
+    routed_tma_refs = [remote for mbar_id, remote in tma_refs if mbar_id in arrive_mbar_ids]
+    assert routed_tma_refs
+    assert set(routed_tma_refs) == {0}
+
+
 def test_real_gemm_builds_rust_ir_and_validates():
     from nymph_rs.kernels import build_fp16_bf16_gemm
 
@@ -20,6 +58,29 @@ def test_real_gemm_builds_rust_ir_and_validates():
     assert k.num_warps > 0
     assert k.launch_cta_count() >= 1
     k.validate()  # the real kernel passes the Rust validator
+
+
+@pytest.mark.parametrize(
+    ("size", "producer_wg", "producer_warps"), [(1024, 1, (6, 7, 4)), (4096, 2, (10, 11, 8, 9))]
+)
+def test_gemm_producer_roles_are_nested_in_their_warpgroup(size, producer_wg, producer_warps):
+    from nymph_rs.kernels import Fp16Bf16GemmConfig, build_fp16_bf16_gemm
+
+    kernel = build_fp16_bf16_gemm(Fp16Bf16GemmConfig(m=size, n=size, k=size))
+    producer = next(
+        stmt for stmt in kernel.body if _scope_eq(stmt) == ("warpgroup_id", producer_wg)
+    )
+
+    assert producer.body[0].kind == "set_max_nreg"
+    assert tuple(_scope_eq(stmt)[1] for stmt in producer.body[1:]) == producer_warps
+
+
+def test_cluster_gemms_write_leader_only_expect_tx_in_ir():
+    from nymph_rs.kernels import build_bootstrap_gemm, build_fp16_bf16_gemm, build_nvfp4_gemm
+
+    _assert_leader_expect_tx_guards_are_explicit_ir(build_bootstrap_gemm(), 1)
+    _assert_leader_expect_tx_guards_are_explicit_ir(build_fp16_bf16_gemm(), 1)
+    _assert_leader_expect_tx_guards_are_explicit_ir(build_nvfp4_gemm(), 2)
 
 
 def test_builder_is_exposed():

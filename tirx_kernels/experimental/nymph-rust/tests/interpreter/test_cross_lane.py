@@ -174,7 +174,7 @@ def _publish_kernel(*, write: str, warp_sync: bool, arrive: str = "elected"):
     smem = smem_tensor(b, dtype=nr.DType.U32, shape=(LANES,), byte_offset=0)
     reg = reg_tensor(b, dtype=nr.DType.U32, shape=(1,))
     out = gmem_arg(b, dtype=nr.DType.U32, shape=(LANES,))
-    full = b.mbar(kind=nr.MBarKind.THREAD)
+    full = b.mbar(kind=nr.MBarKind.THREAD, byte_offset=0)
     with b.if_warp(0), b.if_elected():
         b.mbarrier_init(full, count=1 if arrive == "elected" else LANES)
     b.cta_sync()
@@ -273,7 +273,7 @@ def test_unconsumed_divergent_write_with_elected_arrive_passes():
     b = builder("cross_lane_unconsumed_divergent_write", smem_size_bytes=LANES * 4)
     smem = smem_tensor(b, dtype=nr.DType.U32, shape=(LANES,), byte_offset=0)
     reg = reg_tensor(b, dtype=nr.DType.U32, shape=(1,))
-    mbar = b.mbar(kind=nr.MBarKind.THREAD)
+    mbar = b.mbar(kind=nr.MBarKind.THREAD, byte_offset=0)
     with b.if_warp(0), b.if_elected():
         b.mbarrier_init(mbar, count=1)
     b.cta_sync()

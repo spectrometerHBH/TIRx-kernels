@@ -116,22 +116,70 @@ pub fn arrive_mbarrier_cell(cell: MbarCell, count: i64) -> IResult<MbarCell> {
 
 pub fn expect_tx_cell(cell: MbarCell, byte_count: i64) -> MbarCell {
     MbarCell {
-        pending_tx_bytes: cell.pending_tx_bytes + byte_count,
+        pending_tx_bytes: cell.pending_tx_bytes - byte_count,
         ..cell
     }
 }
 
 pub fn complete_mbarrier_tx(cell: MbarCell, byte_count: i64) -> IResult<MbarCell> {
-    if byte_count > cell.pending_tx_bytes {
+    if byte_count < 0 {
         return Err(InterpreterError::new(
-            "mbarrier_tx_underflow",
-            "mbarrier complete-tx exceeds pending tx bytes",
+            "mbarrier_complete_tx_count",
+            "mbarrier complete-tx byte count must be non-negative",
         ));
     }
+    // The PTX transaction balance is signed: expect_tx subtracts the expected
+    // bytes and complete-tx adds the actual bytes. Either instruction may run
+    // first; the phase completes only at exactly zero (and with no pending
+    // arrivals).
     Ok(complete_mbarrier_phase_if_ready(MbarCell {
-        pending_tx_bytes: cell.pending_tx_bytes - byte_count,
+        pending_tx_bytes: cell.pending_tx_bytes + byte_count,
         ..cell
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cell() -> MbarCell {
+        MbarCell {
+            expected_arrivals: 1,
+            pending_arrivals: 1,
+            pending_tx_bytes: 0,
+            parity: 0,
+            stage: 0,
+        }
+    }
+
+    #[test]
+    fn complete_tx_may_precede_expect_tx() {
+        let completed_first = complete_mbarrier_tx(cell(), 16).unwrap();
+        assert_eq!(completed_first.pending_tx_bytes, 16);
+        assert_eq!(completed_first.parity, 0);
+
+        let expected = expect_tx_cell(completed_first, 16);
+        assert_eq!(expected.pending_tx_bytes, 0);
+        assert_eq!(expected.parity, 0);
+
+        let arrived = arrive_mbarrier_cell(expected, 1).unwrap();
+        assert_eq!(arrived.pending_tx_bytes, 0);
+        assert_eq!(arrived.parity, 1);
+    }
+
+    #[test]
+    fn expect_tx_may_precede_complete_tx() {
+        let expected_first = expect_tx_cell(cell(), 16);
+        assert_eq!(expected_first.pending_tx_bytes, -16);
+
+        let arrived = arrive_mbarrier_cell(expected_first, 1).unwrap();
+        assert_eq!(arrived.pending_arrivals, 0);
+        assert_eq!(arrived.parity, 0);
+
+        let completed = complete_mbarrier_tx(arrived, 16).unwrap();
+        assert_eq!(completed.pending_tx_bytes, 0);
+        assert_eq!(completed.parity, 1);
+    }
 }
 
 // ---- cluster/CTA helpers ----

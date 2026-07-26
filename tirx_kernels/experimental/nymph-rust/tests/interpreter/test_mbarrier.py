@@ -4,7 +4,7 @@ from helpers import builder, expect_runtime_error, run
 
 def test_mbarrier_wait_runtime_failures_are_closed():
     b = builder("mbarrier_expect_tx_deadlock")
-    expect_tx = b.mbar(kind=nr.MBarKind.TMA)
+    expect_tx = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
     # mbarrier.init is per-thread now: issue it from a single elected thread.
     with b.if_warp(0), b.if_elected():
         b.mbarrier_init(expect_tx, count=1)
@@ -17,7 +17,7 @@ def test_mbarrier_wait_runtime_failures_are_closed():
         run(b.build())
 
     b = builder("mbar_duplicate")
-    duplicate = b.mbar(kind=nr.MBarKind.TMA)
+    duplicate = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
     # elected so the error pins DOUBLE init, not the multi-lane init.
     with b.if_warp(0), b.if_elected():
         b.mbarrier_init(duplicate, count=1)
@@ -27,7 +27,7 @@ def test_mbarrier_wait_runtime_failures_are_closed():
         run(b.build())
 
     b = builder("mbar_remote_oob")
-    remote = b.mbar(kind=nr.MBarKind.TMA)
+    remote = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
     with b.if_warp(0), b.if_elected():
         b.mbarrier_arrive(b.mbar_ref(remote, remote_coord=2))
 

@@ -91,6 +91,59 @@ def test_rejects_smem_tensor_outside_pool():
         )
 
 
+def test_smem_layout_accepts_overlapping_object_ranges():
+    tensor = n.Tensor(space=n.MemorySpace.SMEM, dtype=n.DType.U32, shape=[4], byte_offset=0)
+    first = n.MBar(kind=n.MBarKind.THREAD, byte_offset=0, stages=2)
+    second = n.MBar(kind=n.MBarKind.TMA, byte_offset=0, stages=1)
+    make(
+        [
+            n.TensorDef(tensor),
+            n.MBarDef(first),
+            n.MBarDef(second),
+            warp0(n.TmemAlloc(0, 32, addr_byte_offset=0)),
+        ],
+        launch=(1,),
+        cluster=(1,),
+    )
+
+
+def test_rejects_misaligned_or_out_of_bounds_metadata():
+    with pytest.raises(ValueError, match="8-byte aligned"):
+        make([n.MBarDef(n.MBar(kind=n.MBarKind.THREAD, byte_offset=4))])
+    with pytest.raises(ValueError, match="mbar byte range exceeds"):
+        n.Kernel(
+            name="bad_mbar_bounds",
+            body=(n.MBarDef(n.MBar(kind=n.MBarKind.THREAD, byte_offset=16)),),
+            num_warps=4,
+            smem_size_bytes=20,
+            launch_shape=[1],
+            cluster_shape=[1],
+        )
+    with pytest.raises(ValueError, match="4-byte aligned"):
+        make([warp0(n.TmemAlloc(0, 32, addr_byte_offset=2))], launch=(1,), cluster=(1,))
+    with pytest.raises(ValueError, match="tmem_addr byte range exceeds"):
+        n.Kernel(
+            name="bad_tmem_addr_bounds",
+            body=(warp0(n.TmemAlloc(0, 32, addr_byte_offset=20)),),
+            num_warps=4,
+            smem_size_bytes=20,
+            launch_shape=[1],
+            cluster_shape=[1],
+        )
+
+
+def test_rejects_tensor_offset_that_codegen_would_round_up():
+    tensor = n.Tensor(
+        space=n.MemorySpace.SMEM,
+        dtype=n.DType.F16,
+        shape=[16, 16],
+        layout=n.SmemSwizzleLayout(n.Swizzle.B128),
+        byte_offset=512,
+    )
+    with pytest.raises(ValueError, match="codegen alignment 1024"):
+        make([n.TensorDef(tensor)])
+
+
 # ---- tcgen05_mma -----------------------------------------------------------
 
 
@@ -116,7 +169,12 @@ def test_accepts_mma_tmem_operand():
     # accumulator's [0, 256) span — both inside one 512-column allocation.
     a = tmem_op(col=256, dtype=n.DType.F16)
     make(
-        [warp0(n.TmemAlloc(0, 512), elected0(n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=256, k=16)))],
+        [
+            warp0(
+                n.TmemAlloc(0, 512, 0),
+                elected0(n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=256, k=16)),
+            )
+        ],
         launch=(1,),
         cluster=(1,),
     )
@@ -182,7 +240,7 @@ def test_accepts_block_scaled_f8_and_nvfp4_mma():
     make(
         [
             warp0(
-                n.TmemAlloc(0, 512),
+                n.TmemAlloc(0, 512, 0),
                 elected0(n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=32, k=32, sfa=sfa, sfb=sfb)),
             )
         ],
@@ -193,7 +251,7 @@ def test_accepts_block_scaled_f8_and_nvfp4_mma():
     make(
         [
             warp0(
-                n.TmemAlloc(0, 512, cta_group=2),
+                n.TmemAlloc(0, 512, addr_byte_offset=0, cta_group=2),
                 elected0(n.Tcgen05Mma(dst=dst, a=a, b=b, sfa=sfa, sfb=sfb, **fp4_kwargs())),
             )
         ],
@@ -302,25 +360,25 @@ def tma_load(dst, src, mbar):
 
 
 def test_rejects_tma_dst_not_smem():
-    mbar = n.MBar(kind=n.MBarKind.TMA)
+    mbar = n.MBar(kind=n.MBarKind.TMA, byte_offset=0)
     with pytest.raises(ValueError, match="dst must be SMEM"):
         make([tma_load(gmem([128, 64])[:, :], gmem([1024, 1024]), mbar)])
 
 
 def test_rejects_tma_src_not_gmem():
-    mbar = n.MBar(kind=n.MBarKind.TMA)
+    mbar = n.MBar(kind=n.MBarKind.TMA, byte_offset=0)
     with pytest.raises(ValueError, match="src must be GMEM"):
         make([tma_load(smem([128, 64])[:, :], smem([1024, 1024]), mbar)])
 
 
 def test_rejects_tma_dtype_mismatch():
-    mbar = n.MBar(kind=n.MBarKind.TMA)
+    mbar = n.MBar(kind=n.MBarKind.TMA, byte_offset=0)
     with pytest.raises(ValueError, match="dtype must match"):
         make([tma_load(smem([128, 64])[:, :], gmem([1024, 1024], dtype=n.DType.F32), mbar)])
 
 
 def test_rejects_tma_mbar_kind():
-    mbar = n.MBar(kind=n.MBarKind.TCGEN05)
+    mbar = n.MBar(kind=n.MBarKind.TCGEN05, byte_offset=0)
     with pytest.raises(ValueError, match="mbar kind must be tma"):
         make([tma_load(smem([128, 64])[:, :], gmem([1024, 1024]), mbar)])
 
@@ -410,14 +468,14 @@ def test_rejects_reg_softmax_rescale_non_f32_scale_threshold():
 
 
 def test_rejects_mbarrier_init_zero_count():
-    mbar = n.MBar(kind=n.MBarKind.TMA)
+    mbar = n.MBar(kind=n.MBarKind.TMA, byte_offset=0)
     with pytest.raises(ValueError, match="must be a positive integer"):
         make([n.MBarrierInit(mbar, count=0)])
 
 
 def test_rejects_tmem_alloc_bad_ncols():
     with pytest.raises(ValueError, match=r"power-of-two integer in \[32, 512\]"):
-        make([n.TmemAlloc(0, 33)])
+        make([n.TmemAlloc(0, 33, 0)])
 
 
 # ---- thread-shape rules ----------------------------------------------------
@@ -447,7 +505,7 @@ def test_accepts_cta_sync_in_full_cta_branch():
 
 def test_rejects_tmem_alloc_outside_single_warp():
     with pytest.raises(ValueError, match="exactly one full warp"):
-        make([n.TmemAlloc(0, 64)])  # full-CTA branch
+        make([n.TmemAlloc(0, 64, 0)])  # full-CTA branch
 
 
 def test_rejects_wg_sync_not_covering_full_warpgroup():
@@ -514,7 +572,7 @@ def test_accepts_non_32x32b_tcgen05_ld_st_atom():
     frag = reg([4], dtype=n.DType.U32)
     make(
         [
-            warp0(n.TmemAlloc(0, 512)),
+            warp0(n.TmemAlloc(0, 512, 0)),
             n.If(
                 cond=n.ScopeValue(kind="warpgroup_id").eq(0),
                 then_body=(
@@ -610,7 +668,10 @@ def test_rejects_var_defined_twice():
 
 def test_rejects_inconsistent_cta_group():
     # two tmem allocs (in warp scope) with different cta_group
-    body = (n.TmemAlloc(0, 64, cta_group=1), n.TmemAlloc(0, 64, cta_group=2))
+    body = (
+        n.TmemAlloc(0, 64, addr_byte_offset=0, cta_group=1),
+        n.TmemAlloc(0, 64, addr_byte_offset=0, cta_group=2),
+    )
     with pytest.raises(ValueError, match="cta_group must be consistent"):
         make([n.If(cond=n.ScopeValue(kind="warp_id").eq(0), then_body=body)])
 
@@ -630,10 +691,12 @@ def test_setmaxnreg_requires_positive_multiple_of_8():
         make([n.SetMaxNReg(nreg=0)])
 
 
-def test_setmaxnreg_requires_whole_warpgroups():
-    cond = n.ScopeValue(kind="warp_id").eq(0)
-    with pytest.raises(ValueError, match="whole warpgroup"):
-        make([n.If(cond=cond, then_body=(n.SetMaxNReg(nreg=232),))], num_warps=8)
+def test_setmaxnreg_requires_whole_warps():
+    warp = n.ScopeValue(kind="warp_id").eq(0)
+    lane = n.ScopeValue(kind="lane_id").eq(0)
+    make([n.If(cond=warp, then_body=(n.SetMaxNReg(nreg=232),))], num_warps=8)
+    with pytest.raises(ValueError, match=r"whole warp\(s\)"):
+        make([n.If(cond=lane, then_body=(n.SetMaxNReg(nreg=232),))], num_warps=8)
 
 
 def test_rejects_loop_nonpositive_step():
@@ -664,9 +727,9 @@ def test_rejects_scalar_def_var_dtype_mismatch():
 
 def test_rejects_mbar_zero_stages():
     with pytest.raises(ValueError, match="stages must be a positive integer"):
-        n.MBar(kind=n.MBarKind.TMA, stages=0)
+        n.MBar(kind=n.MBarKind.TMA, byte_offset=0, stages=0)
 
 
 def test_rejects_mbar_zero_arrive_count():
     with pytest.raises(ValueError, match="arrive_count must be a positive integer"):
-        n.MBar(kind=n.MBarKind.TMA, arrive_count=0)
+        n.MBar(kind=n.MBarKind.TMA, byte_offset=0, arrive_count=0)

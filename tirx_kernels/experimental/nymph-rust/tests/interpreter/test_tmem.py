@@ -13,8 +13,8 @@ def test_tmem_lifecycle_failures_are_fail_closed():
 
     b = builder("tmem_duplicate")
     with b.if_warp(0):
-        b.tmem_alloc(0, 128)
-        b.tmem_alloc(0, 128)
+        b.tmem_alloc(0, 128, addr_byte_offset=0)
+        b.tmem_alloc(0, 128, addr_byte_offset=0)
     cases.append((b, "while another allocation is still live"))
 
     b = builder("tmem_missing")
@@ -24,13 +24,13 @@ def test_tmem_lifecycle_failures_are_fail_closed():
 
     b = builder("tmem_overlap")
     with b.if_warp(0):
-        b.tmem_alloc(0, 64)
-        b.tmem_alloc(32, 64)
+        b.tmem_alloc(0, 64, addr_byte_offset=0)
+        b.tmem_alloc(32, 64, addr_byte_offset=0)
     cases.append((b, "tmem_alloc base_col must be 0"))
 
     b = builder("tmem_mismatch")
     with b.if_warp(0):
-        b.tmem_alloc(0, 64)
+        b.tmem_alloc(0, 64, addr_byte_offset=0)
     with b.if_warp(0):
         b.tmem_dealloc(32, 64)
     cases.append((b, "tmem_dealloc does not match a live allocation"))
@@ -44,9 +44,9 @@ def test_tmem_lifecycle_failures_are_fail_closed():
     # band's n_cols may not exceed the previous one's within a CTA.
     b = builder("tmem_order")
     with b.if_warp(0):
-        b.tmem_alloc(0, 64)
+        b.tmem_alloc(0, 64, addr_byte_offset=0)
         b.tmem_dealloc(0, 64)
-        b.tmem_alloc(0, 128)
+        b.tmem_alloc(0, 128, addr_byte_offset=0)
     with expect_runtime_error("tmem_allocation_order"):
         run(b.build())
 
@@ -58,7 +58,7 @@ def test_tmem_cta_group2_missing_peer_fails_closed():
     # with a real pair the peer always exists).
     b = builder("tmem_cta_group2_missing_peer")
     with b.if_warp(0):
-        b.tmem_alloc(0, 128, cta_group=2)
+        b.tmem_alloc(0, 128, addr_byte_offset=0, cta_group=2)
 
     with pytest.raises(ValueError, match=r"tmem_alloc cta_group=2 != kernel cta_group=1"):
         b.build()
