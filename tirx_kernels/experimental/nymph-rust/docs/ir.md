@@ -49,7 +49,7 @@ and interpretation.
   exactly one full warpgroup, `warp_sync` whole warps, `tmem_alloc`/
   `tmem_dealloc` exactly one full warp, and `sched_next` and `set_maxnreg`
   (which have no runtime backstop) require statically-resolvable branches
-  confined to a single warp and whole warpgroup(s) respectively.
+  confined to whole warp(s).
 
 ## Builder Bridge
 

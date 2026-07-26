@@ -197,6 +197,13 @@ def main() -> None:
     )
     ap.add_argument("--ncu", default=_NCU, help="ncu CLI path")
     ap.add_argument(
+        "--source",
+        action="store_true",
+        help="add SourceCounters + --import-source on for SASS<->source line "
+        "attribution (needs lineinfo in the build: nymph side TVM_KERNEL_DUMP=<dir>, "
+        "flashinfer side CUTE_DSL_LINEINFO=1)",
+    )
+    ap.add_argument(
         "--reuse-report",
         action="store_true",
         help="skip collection if the .ncu-rep already exists (re-parse only)",
@@ -214,6 +221,8 @@ def main() -> None:
         cmd = [args.ncu, "--target-processes", "all", "-f", "-o", rep_base]
         for sec in args.sections.split(","):
             cmd += ["--section", sec.strip()]
+        if args.source:
+            cmd += ["--section", "SourceCounters", "--import-source", "on"]
         cmd += [
             "--profile-from-start",
             "off",  # worker re-enables around the single target launch

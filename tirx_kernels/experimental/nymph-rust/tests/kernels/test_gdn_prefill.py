@@ -19,6 +19,7 @@ from nymph_rs.kernels.gdn_prefill import (
     HEAD_CONFIGS,
     HQK,
     HV,
+    PROTOCOL_CONFIGS,
     VARLEN_CONFIGS,
     GdnPrefillConfig,
     build_gdn_prefill,
@@ -119,7 +120,7 @@ def test_gdn_prefill_heads(hc):
         assert (np.abs(state[0, eh] - s_ref) <= 1e-2 + 0.3 * np.abs(s_ref)).mean() >= 0.9
 
 
-@pytest.mark.parametrize("cfg", _tier(CONFIGS), ids=[c["label"] for c in CONFIGS])
+@pytest.mark.parametrize("cfg", _tier(PROTOCOL_CONFIGS), ids=[c["label"] for c in PROTOCOL_CONFIGS])
 def test_gdn_prefill_build_protocol(cfg):
     """Every fixed-length workload shape (1..32 chunks, batch 1..48) builds + protocol-checks."""
     kernel = build_gdn_prefill(GdnPrefillConfig(num_seqs=cfg["num_seqs"], seqlen=cfg["seqlen"]))

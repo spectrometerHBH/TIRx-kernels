@@ -147,20 +147,41 @@ CONFIGS = [
 # PipelineState, never per-tile reset), with the chunk_free handoff spanning tile
 # boundaries.
 
-# Cheaper fixed-length shapes for the cell-exact value sweep: 1–4 chunks, small batch,
-# plus multi-tile/CTA (num_work > SM_COUNT) with odd chunks/tile (the phase-carry case).
-CONFIGS_SUPPORTED = [
+# Build + protocol-check coverage (tests only — the bench CONFIGS above includes
+# 1024-chunk shapes whose protocol trace would take hours; this is the original
+# fixed-length corpus): chunk counts 1/2/4/8/16/32 crossed with batch sizes,
+# including num_work = num_seqs·NEFF > SM_COUNT (multi-tile/CTA, phase-carry).
+PROTOCOL_CONFIGS = [
     {"num_seqs": ns, "seqlen": T, "label": f"ns{ns}_t{T}"}
     for ns, T in [
         (1, 64),
         (1, 128),
         (1, 192),
         (1, 256),
+        (1, 512),
+        (1, 1024),
+        (1, 2048),
         (2, 128),
         (2, 256),
+        (2, 512),
         (4, 128),
+        (4, 256),
+        (8, 64),
         (20, 64),
         (20, 192),
+        (32, 128),
+        (48, 64),  # num_work > SM_COUNT: multi-tile/CTA
+    ]
+]
+
+# Cheaper fixed-length shapes for the cell-exact value sweep: the two smallest
+# (1- and 2-chunk) keep the dev-loop gate fast — the full-shape protocol sweep
+# runs in the value-sim's own extended tier, not on every dev iteration.
+CONFIGS_SUPPORTED = [
+    {"num_seqs": ns, "seqlen": T, "label": f"ns{ns}_t{T}"}
+    for ns, T in [
+        (1, 64),
+        (1, 128),
     ]
 ]
 
@@ -603,49 +624,53 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
     # ============== TMA-load warp (9): cp.async.bulk.tensor (UTMALDG) ==============
     # Single-thread TMA producer stream: arrive_expect_tx is per-thread (one arm
     # per load) and tma_load requires a single-thread mask.
-    with k.if_warp(TMA_WARP), k.if_elected():
-        gc = k.scalar(initial=0)  # cumulative chunk index, carried across the persistent
-        with k.for_each_task(
-            sched
-        ) as task:  # tile loop (= CUTLASS PipelineState, never per-tile reset)
-            seq, eh, q_head, k_head, v_head, tok_base, NCH, slen = task_geom(task)
-            with k.for_loop(stop=NCH) as c:  # runtime chunk loop (varlen num_chunks)
-                gtok = tok_base + c * BT
-                # K (double-buffered): stage gc%2; wait that stage is free (chunk gc-2's
-                # GEMM7 freed it) then load — overlaps the previous chunk's compute.
-                kstg, kocc = gc % 2, gc // 2
-                k.mbarrier_wait(bars["k_free"], stage=kstg, phase=(kocc + 1) % 2)
-                k.mbarrier_arrive_expect_tx(bars["tk"], bytes=BT * K_DIM * 2, stage=kstg)
-                k.tma_load(
-                    _sl(k_s, (kstg, 0, 0), (1, BT, K_DIM)),
-                    k_g,
-                    mbar=bars["tk"],
-                    coords=(gtok, k_head, 0),
-                    mbar_stage=kstg,
-                    shape=(1, BT, K_DIM),
-                    gmem_shape=(BT, 1, K_DIM),
-                )
-                # q, v (single-buffered): gated by chunk_free (chunk gc-1 freed the buffers —
-                # gc>0 so the wait spans tile boundaries, handing buffers off across tasks).
-                with k.if_(gc > 0):
-                    k.mbarrier_wait(bars["chunk_free"], phase=(gc - 1) % 2)
-                for nm, dst, src, hd, cols in (
-                    ("tq", q_s, q_g, q_head, K_DIM),
-                    ("tv", v_s, v_g, v_head, V_DIM),
-                ):
-                    k.mbarrier_arrive_expect_tx(bars[nm], bytes=BT * cols * 2)
+    with k.if_warp(TMA_WARP):
+        # fi's register budgets (CK:241-243): support warps squeeze to 24.
+        k.set_maxnreg(24)
+        with k.if_elected():
+            gc = k.scalar(initial=0)  # cumulative chunk index, carried across the persistent
+            with k.for_each_task(
+                sched
+            ) as task:  # tile loop (= CUTLASS PipelineState, never per-tile reset)
+                seq, eh, q_head, k_head, v_head, tok_base, NCH, slen = task_geom(task)
+                with k.for_loop(stop=NCH) as c:  # runtime chunk loop (varlen num_chunks)
+                    gtok = tok_base + c * BT
+                    # K (double-buffered): stage gc%2; wait that stage is free (chunk gc-2's
+                    # GEMM7 freed it) then load — overlaps the previous chunk's compute.
+                    kstg, kocc = gc % 2, gc // 2
+                    k.mbarrier_wait(bars["k_free"], stage=kstg, phase=(kocc + 1) % 2)
+                    k.mbarrier_arrive_expect_tx(bars["tk"], bytes=BT * K_DIM * 2, stage=kstg)
                     k.tma_load(
-                        _sl(dst, (0, 0), (BT, cols)),
-                        src,
-                        mbar=bars[nm],
-                        coords=(gtok, hd, 0),
-                        shape=(BT, cols),
-                        gmem_shape=(BT, 1, cols),
+                        _sl(k_s, (kstg, 0, 0), (1, BT, K_DIM)),
+                        k_g,
+                        mbar=bars["tk"],
+                        coords=(gtok, k_head, 0),
+                        mbar_stage=kstg,
+                        shape=(1, BT, K_DIM),
+                        gmem_shape=(BT, 1, K_DIM),
                     )
-                k.scalar_store(gc, gc + 1)  # advance the pipeline state
+                    # q, v (single-buffered): gated by chunk_free (chunk gc-1 freed the buffers —
+                    # gc>0 so the wait spans tile boundaries, handing buffers off across tasks).
+                    with k.if_(gc > 0):
+                        k.mbarrier_wait(bars["chunk_free"], phase=(gc - 1) % 2)
+                    for nm, dst, src, hd, cols in (
+                        ("tq", q_s, q_g, q_head, K_DIM),
+                        ("tv", v_s, v_g, v_head, V_DIM),
+                    ):
+                        k.mbarrier_arrive_expect_tx(bars[nm], bytes=BT * cols * 2)
+                        k.tma_load(
+                            _sl(dst, (0, 0), (BT, cols)),
+                            src,
+                            mbar=bars[nm],
+                            coords=(gtok, hd, 0),
+                            shape=(BT, cols),
+                            gmem_shape=(BT, 1, cols),
+                        )
+                    k.scalar_store(gc, gc + 1)  # advance the pipeline state
 
     # ============== gate/beta warp (10): load gate/beta + cumsum -> gate_ready ==============
     with k.if_warp(GATE_WARP):
+        k.set_maxnreg(24)  # fi's support-warp budget (CK:241-243)
         lane = k.lane_id()
         gc = k.scalar(initial=0)  # cumulative chunk index (pipeline state across tiles)
         with k.for_each_task(sched) as task:
@@ -730,73 +755,77 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
     # ============== MMA warp (8): issues all 7 GEMMs (UTCHMMA) ==============
     # Single-thread MMA issuer stream: tcgen05_mma/tcgen05_commit require a
     # single-thread mask; the k_free arrive is one arrival (count=1).
-    with k.if_warp(MMA_WARP), k.if_elected():
-        # gc = every-chunk pipeline state; gc_pos = the GEMM3/4 pipeline (used only on
-        # chunk>0 — S_prev exists), advancing on its own cadence (= flashinfer's separate
-        # per-pipeline PipelineState). Both carried across the persistent tile loop.
-        gc = k.scalar(initial=0)
-        gc_pos = k.scalar(initial=0)
-        with k.for_each_task(sched) as task:
-            seq, eh, q_head, k_head, v_head, tok_base, NCH, slen = task_geom(task)
-            with k.for_loop(stop=NCH) as c:
-                kstg = gc % 2  # K double-buffer stage (leading dim of k_s)
-                k.mbarrier_wait(bars["tk"], stage=gc % 2, phase=(gc // 2) % 2)
-                issue(
-                    acc_s0, k_s, k_s, BT, BT, K_DIM, "d_kk", a_stg=kstg, b_stg=kstg
-                )  # GEMM1 W_kk -> stage 0
-                k.mbarrier_wait(bars["f_kk"], phase=ph(gc))
-                k.mbarrier_wait(bars["tq"], phase=ph(gc))
-                issue(acc_s1, q_s, k_s, BT, BT, K_DIM, "d_qk", b_stg=kstg)  # GEMM2 W_qk -> stage 1
-                k.mbarrier_wait(bars["f_qk"], phase=ph(gc))
-                with k.if_(c > 0):  # chunk 0: S_prev=0, skip GEMM3/4 (flashinfer is_first_chunk)
-                    # GEMM3/4 read the fp16 s_s (SMEM) as B=Sᵀ (trans_b); GEMM4 → q_state.
-                    k.mbarrier_wait(bars["sT_ready"], phase=ph(gc_pos))
+    with k.if_warp(MMA_WARP):
+        k.set_maxnreg(24)  # fi's support-warp budget (CK:241-243)
+        with k.if_elected():
+            # gc = every-chunk pipeline state; gc_pos = the GEMM3/4 pipeline (used only on
+            # chunk>0 — S_prev exists), advancing on its own cadence (= flashinfer's separate
+            # per-pipeline PipelineState). Both carried across the persistent tile loop.
+            gc = k.scalar(initial=0)
+            gc_pos = k.scalar(initial=0)
+            with k.for_each_task(sched) as task:
+                seq, eh, q_head, k_head, v_head, tok_base, NCH, slen = task_geom(task)
+                with k.for_loop(stop=NCH) as c:
+                    kstg = gc % 2  # K double-buffer stage (leading dim of k_s)
+                    k.mbarrier_wait(bars["tk"], stage=gc % 2, phase=(gc // 2) % 2)
                     issue(
-                        acc_tmem, k_s, s_s, BT, V_DIM, K_DIM, "d_ks", trans_b=True, a_stg=kstg
-                    )  # GEMM3 K@S
-                    k.mbarrier_wait(bars["f_ks"], phase=ph(gc_pos))
+                        acc_s0, k_s, k_s, BT, BT, K_DIM, "d_kk", a_stg=kstg, b_stg=kstg
+                    )  # GEMM1 W_kk -> stage 0
+                    k.mbarrier_wait(bars["f_kk"], phase=ph(gc))
+                    k.mbarrier_wait(bars["tq"], phase=ph(gc))
+                    issue(acc_s1, q_s, k_s, BT, BT, K_DIM, "d_qk", b_stg=kstg)  # GEMM2 W_qk -> stage 1
+                    k.mbarrier_wait(bars["f_qk"], phase=ph(gc))
+                    with k.if_(c > 0):  # chunk 0: S_prev=0, skip GEMM3/4 (flashinfer is_first_chunk)
+                        # GEMM3/4 read the fp16 s_s (SMEM) as B=Sᵀ (trans_b); GEMM4 → q_state.
+                        k.mbarrier_wait(bars["sT_ready"], phase=ph(gc_pos))
+                        issue(
+                            acc_tmem, k_s, s_s, BT, V_DIM, K_DIM, "d_ks", trans_b=True, a_stg=kstg
+                        )  # GEMM3 K@S
+                        k.mbarrier_wait(bars["f_ks"], phase=ph(gc_pos))
+                        issue(
+                            qstate_tmem, q_s, s_s, BT, V_DIM, K_DIM, "d_qs", trans_b=True
+                        )  # GEMM4 Q@S → q_state
+                        k.mbarrier_wait(bars["f_qs"], phase=ph(gc_pos))
+                    k.mbarrier_wait(bars["ainv_ready"], phase=ph(gc))
+                    k.mbarrier_wait(bars["delta_ready"], phase=ph(gc))
+                    with k.if_(c.eq(0)):  # chunk 0: S=0 → delta=v; read v_s directly (vᵀ via trans_b)
+                        issue(acc_tmem, ainv_s, v_s, BT, V_DIM, BT, "d_nv", trans_b=True)
+                    with k.if_(c > 0):
+                        issue(
+                            acc_tmem, ainv_s, tmpt_s, BT, V_DIM, BT, "d_nv"
+                        )  # GEMM5 VNEW (deltaᵀ from tmpt_s, SMEM)
+                    k.mbarrier_wait(bars["f_nv"], phase=ph(gc))
+                    k.mbarrier_wait(bars["qkv_ready"], phase=ph(gc))
+                    k.mbarrier_wait(bars["vnew_ready"], phase=ph(gc))
                     issue(
-                        qstate_tmem, q_s, s_s, BT, V_DIM, K_DIM, "d_qs", trans_b=True
-                    )  # GEMM4 Q@S → q_state
-                    k.mbarrier_wait(bars["f_qs"], phase=ph(gc_pos))
-                k.mbarrier_wait(bars["ainv_ready"], phase=ph(gc))
-                k.mbarrier_wait(bars["delta_ready"], phase=ph(gc))
-                with k.if_(c.eq(0)):  # chunk 0: S=0 → delta=v; read v_s directly (vᵀ via trans_b)
-                    issue(acc_tmem, ainv_s, v_s, BT, V_DIM, BT, "d_nv", trans_b=True)
-                with k.if_(c > 0):
+                        acc_tmem, attn_s, vnewt_s, BT, V_DIM, BT, "d_oi"
+                    )  # GEMM6 O_intra (NVᵀ from vnewt_s, SMEM)
+                    k.mbarrier_wait(bars["f_oi"], phase=ph(gc))
+                    k.mbarrier_wait(bars["ktvng_ready"], phase=ph(gc))
                     issue(
-                        acc_tmem, ainv_s, tmpt_s, BT, V_DIM, BT, "d_nv"
-                    )  # GEMM5 VNEW (deltaᵀ from tmpt_s, SMEM)
-                k.mbarrier_wait(bars["f_nv"], phase=ph(gc))
-                k.mbarrier_wait(bars["qkv_ready"], phase=ph(gc))
-                k.mbarrier_wait(bars["vnew_ready"], phase=ph(gc))
-                issue(
-                    acc_tmem, attn_s, vnewt_s, BT, V_DIM, BT, "d_oi"
-                )  # GEMM6 O_intra (NVᵀ from vnewt_s, SMEM)
-                k.mbarrier_wait(bars["f_oi"], phase=ph(gc))
-                k.mbarrier_wait(bars["ktvng_ready"], phase=ph(gc))
-                issue(
-                    s_tmem,
-                    k_s,
-                    tmpt_s,
-                    K_DIM,
-                    V_DIM,
-                    BT,
-                    "d_ds",
-                    accum0=True,
-                    trans_a=True,
-                    a_stg=kstg,
-                )  # GEMM7 dS
-                # GEMM7 was the last K[c] consumer → free this K stage for chunk
-                # gc+2. tcgen05_commit (not a thread arrive): the stage may only
-                # be released once the engine's reads of it actually completed.
-                k.tcgen05_commit(bars["k_free"], stage=gc % 2)
-                k.scalar_store(gc, gc + 1)
-                with k.if_(c > 0):
-                    k.scalar_store(gc_pos, gc_pos + 1)
+                        s_tmem,
+                        k_s,
+                        tmpt_s,
+                        K_DIM,
+                        V_DIM,
+                        BT,
+                        "d_ds",
+                        accum0=True,
+                        trans_a=True,
+                        a_stg=kstg,
+                    )  # GEMM7 dS
+                    # GEMM7 was the last K[c] consumer → free this K stage for chunk
+                    # gc+2. tcgen05_commit (not a thread arrive): the stage may only
+                    # be released once the engine's reads of it actually completed.
+                    k.tcgen05_commit(bars["k_free"], stage=gc % 2)
+                    k.scalar_store(gc, gc + 1)
+                    with k.if_(c > 0):
+                        k.scalar_store(gc_pos, gc_pos + 1)
 
     # ============== compute group 0 (warps 0-3): kk_epi, qk_epi, WY inverse ==============
     with k.if_warpgroup(0):
+        # fi's register budgets (CK:241-243, setmaxregister at role top): CG0 224.
+        k.set_maxnreg(224)
         tid = k.tid_in_wg()
         lane = tid % 32
         warp = tid // 32
@@ -950,6 +979,9 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
 
     # ============== compute group 1 (warps 4-7): new_v, qkv, kv_update ==============
     with k.if_warpgroup(1):
+        # fi's register budgets (CK:241-243): CG1 256 — the epilogue fragments
+        # (64-wide f32 readbacks) only fit registers under this budget.
+        k.set_maxnreg(256)
         tid = k.tid_in_wg()
         lane = tid % 32
         warp = tid // 32
@@ -1098,30 +1130,31 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                 k.reg_store(_sl(state_g, (seq, eh, tid, half * 64), (1, 1, 1, 64)), frag32)
 
     # ============== epilogue warp (11): output store (UTMASTG) ==============
-    if not config.varlen:
-        with k.if_warp(EPI_WARP), k.if_elected():
-            gc = k.scalar(initial=0)  # cumulative chunk index (pipeline state across tiles)
-            with k.for_each_task(sched) as task:
-                seq, eh, q_head, k_head, v_head, tok_base, NCH, slen = task_geom(task)
-                with k.for_loop(stop=NCH) as c:  # runtime chunk loop
-                    k.mbarrier_wait(bars["o_ready"], phase=gc % 2)
-                    gtok = tok_base + c * BT
-                    k.tma_store(
-                        out_g,
-                        _sl(out_s, (0, 0), (BT, V_DIM)),
-                        coords=(gtok, eh, 0),
-                        shape=(BT, V_DIM),
-                        gmem_shape=(BT, 1, V_DIM),
-                    )
-                    k.cp_async_bulk_commit_group()
-                    k.cp_async_bulk_wait_group_read(0)
-                    k.mbarrier_arrive(bars["chunk_free"])  # out_s freed for next chunk's o_inter
-                    k.scalar_store(gc, gc + 1)
-    else:
-        # varlen: the partial last chunk's OOB rows must NOT be stored (they'd overrun
-        # into the next packed sequence). Full-warp scalar store, predicated to valid
-        # rows (global pos < seqlen_b); boundary-tile checklist guidance.
-        with k.if_warp(EPI_WARP):
+    with k.if_warp(EPI_WARP):
+        k.set_maxnreg(24)  # fi's support-warp budget (CK:241-243)
+        if not config.varlen:
+            with k.if_elected():
+                gc = k.scalar(initial=0)  # cumulative chunk index (pipeline state across tiles)
+                with k.for_each_task(sched) as task:
+                    seq, eh, q_head, k_head, v_head, tok_base, NCH, slen = task_geom(task)
+                    with k.for_loop(stop=NCH) as c:  # runtime chunk loop
+                        k.mbarrier_wait(bars["o_ready"], phase=gc % 2)
+                        gtok = tok_base + c * BT
+                        k.tma_store(
+                            out_g,
+                            _sl(out_s, (0, 0), (BT, V_DIM)),
+                            coords=(gtok, eh, 0),
+                            shape=(BT, V_DIM),
+                            gmem_shape=(BT, 1, V_DIM),
+                        )
+                        k.cp_async_bulk_commit_group()
+                        k.cp_async_bulk_wait_group_read(0)
+                        k.mbarrier_arrive(bars["chunk_free"])  # out_s freed for next chunk's o_inter
+                        k.scalar_store(gc, gc + 1)
+        else:
+            # varlen: the partial last chunk's OOB rows must NOT be stored (they'd overrun
+            # into the next packed sequence). Full-warp scalar store, predicated to valid
+            # rows (global pos < seqlen_b); boundary-tile checklist guidance.
             gc = k.scalar(initial=0)
             with k.for_each_task(sched) as task:
                 seq, eh, q_head, k_head, v_head, tok_base, NCH, slen = task_geom(task)

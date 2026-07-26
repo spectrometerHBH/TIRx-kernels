@@ -1930,8 +1930,12 @@ fn check_context(
                     return bail("setmaxnreg requires a statically-resolvable thread branch");
                 }
                 Some(set) => {
-                    if !set.is_union_of_full_warpgroups() {
-                        return bail("setmaxnreg must cover whole warpgroup(s)");
+                    // setmaxnreg is a .sync.aligned warp collective: the branch must
+                    // cover whole warps (fi's GDN emits per-warp budgets: 224/256 for
+                    // the compute warpgroups, 24 for the single support warps).
+                    let touched = set.warps_touched();
+                    if touched.is_empty() || !touched.iter().all(|&w| set.is_full_warp(w)) {
+                        return bail("setmaxnreg must cover whole warp(s)");
                     }
                 }
             },
