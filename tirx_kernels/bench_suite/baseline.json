@@ -2,13 +2,13 @@
   "timestamp": "2",
   "label": "691feec4-dirty",
   "git": {
-    "tir": "8777f744-dirty",
-    "tirx-kernels": "691feec4-dirty",
+    "tir": "57a23172-dirty",
+    "tirx-kernels": "1e4e55a3-dirty",
     "tirx-bench-ci": null
   },
   "kernel_tree": {
-    "tir:python/tvm/tirx": "7e0e555b403a27365d5fddccf3d2e68d55dd9aad",
-    "tirx-kernels:tirx_kernels": "0af5247128a47c9b3b0034bbc0f5232848774b2c"
+    "tir:python/tvm/tirx": "e6aad21cda04435b411c32e0f43703d7abf2be9f",
+    "tirx-kernels:tirx_kernels": "b127c933d6109965b37d59638db7f58b7afaeee3"
   },
   "baselines": {
     "torch": {
@@ -41,21 +41,18 @@
       "importable": true,
       "source_dir": "/home/bohanhou/flash-attention/flash_attn/cute",
       "dist": "flash-attn-4",
-      "version": "4.0.0b15.dev2+g3da76cd",
+      "version": "4.0.0b22.dev8+g00756db.d20260725",
       "editable": true,
       "git_dir": "/home/bohanhou/flash-attention",
-      "git_sha": "3da76cdb"
+      "git_sha": "00756db9"
     },
     "sglang": {
-      "importable": false,
-      "source_dir": "/home/bohanhou/kernel-libs/sglang/python/sglang",
-      "git_dir": "/home/bohanhou/kernel-libs/sglang",
-      "git_sha": "96a04cb1"
+      "installed": false
     },
     "cutlass": {
       "importable": true,
-      "source_dir": "/home/bohanhou/my/lib/python3.11/site-packages/nvidia_cutlass_dsl/python_packages/cutlass",
-      "version": "4.5.2"
+      "source_dir": "/home/bohanhou/my/lib/python3.11/site-packages/nvidia_cutlass_dsl/dsl_packages/cutlass",
+      "version": "4.6.0"
     }
   },
   "probe": {
@@ -1460,6 +1457,216 @@
         "tir": 185.88687925456713,
         "flashinfer": 177.46575606658948,
         "cublaslt_nvfp4": 183.91122769561886
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "deepseek_v4_v32_b128_sq2_sk32768_topk2048_p64",
+      "label": "deepseek_v4_v32_b128_sq2_sk32768_topk2048_p64",
+      "status": "ok",
+      "impls": {
+        "tirx": 136.4365728514894,
+        "flashmla": 144.20800841970976
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "model1_b128_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
+      "label": "model1_b128_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
+      "status": "ok",
+      "impls": {
+        "tirx": 69.89760983326683,
+        "flashmla": 73.66456556026317
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "model1_b128_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
+      "label": "model1_b128_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
+      "status": "ok",
+      "impls": {
+        "tirx": 57.396923633775735,
+        "flashmla": 58.372638461473535
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "model1_b148_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
+      "label": "model1_b148_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
+      "status": "ok",
+      "impls": {
+        "tirx": 74.84392928880082,
+        "flashmla": 78.91613235454159
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "model1_b148_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
+      "label": "model1_b148_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
+      "status": "ok",
+      "impls": {
+        "tirx": 59.68172933503848,
+        "flashmla": 60.5584310011009
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "model1_b148_sq2_sk32768_topk16384_p64",
+      "label": "model1_b148_sq2_sk32768_topk16384_p64",
+      "status": "ok",
+      "impls": {
+        "tirx": 858.6105296013303,
+        "flashmla": 894.2940364593952
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "model1_b256_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
+      "label": "model1_b256_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
+      "status": "ok",
+      "impls": {
+        "tirx": 109.84525880923906,
+        "flashmla": 114.20952181815778
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "model1_b256_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
+      "label": "model1_b256_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
+      "status": "ok",
+      "impls": {
+        "tirx": 104.15933805661521,
+        "flashmla": 108.59189584685015
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "model1_b2_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
+      "label": "model1_b2_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
+      "status": "ok",
+      "impls": {
+        "tirx": 19.12346268823308,
+        "flashmla": 23.287803039633538
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "model1_b2_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
+      "label": "model1_b2_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
+      "status": "ok",
+      "impls": {
+        "tirx": 16.559105725229504,
+        "flashmla": 21.21172935159576
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "model1_b64_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
+      "label": "model1_b64_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
+      "status": "ok",
+      "impls": {
+        "tirx": 42.98451184017294,
+        "flashmla": 47.33039397712244
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "model1_b64_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
+      "label": "model1_b64_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
+      "status": "ok",
+      "impls": {
+        "tirx": 31.495693770476763,
+        "flashmla": 32.54445549891241
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "model1_b74_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
+      "label": "model1_b74_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
+      "status": "ok",
+      "impls": {
+        "tirx": 49.72953504814571,
+        "flashmla": 53.49196019666756
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "model1_b74_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
+      "label": "model1_b74_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
+      "status": "ok",
+      "impls": {
+        "tirx": 33.63601485366053,
+        "flashmla": 34.285473406397024
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "v32_b148_sq2_sk32768_topk16384_p64",
+      "label": "v32_b148_sq2_sk32768_topk16384_p64",
+      "status": "ok",
+      "impls": {
+        "tirx": 918.9302976367751,
+        "flashmla": 955.5961613704256
       },
       "aggregated": {
         "rounds": 5,
