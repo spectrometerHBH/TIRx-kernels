@@ -16,11 +16,21 @@ features = ["python"]
 python-source = "python"
 
 [tool.pytest.ini_options]
+# Parallel by default, so a bare `pytest tests` is not a 40-minute serial run.
+# `auto` alone would take the machine's core count (224 here) and this box is
+# shared — an over-subscribed run is slower than a right-sized one and skews
+# everyone's timings — so the cap is the measured sweet spot rather than the
+# maximum.
+#
+# To turn it off for a single invocation, pass `-n 0`; `-s`, `--pdb` and
+# `pytest.set_trace()` all need that.
+addopts = "-n auto --maxprocesses=16"
+
 # Two tiers, one suite. The default run is everything (no filter, so a gate
 # cannot silently lose coverage); the inner loop excludes the tiers that need
 # a toolchain or a device:
 #
-#   pytest tests -q -n 16 -m "not codegen and not gpu and not slow"
+#   pytest tests -q -m "not codegen and not gpu and not slow"
 #
 # `codegen` needs a tvm able to lower TIRx, `gpu` needs a CUDA device, and
 # `slow` is the big-shape protocol/value work whose runtime is dominated by
