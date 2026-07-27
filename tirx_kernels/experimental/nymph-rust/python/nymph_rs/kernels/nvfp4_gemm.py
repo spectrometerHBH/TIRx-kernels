@@ -331,8 +331,6 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     smem_full = k.mbar(kind=MBarKind.TMA, byte_offset=smem_full_off, stages=smem_depth)
     smem_full_leader = k.mbar_ref(smem_full, remote_coord=0)
     # Separate SF-load completion barrier.
-    sf_full = k.mbar(kind=MBarKind.TMA, byte_offset=sf_full_off, stages=smem_depth)
-    sf_full_leader = k.mbar_ref(sf_full, remote_coord=0)
     smem_empty = k.mbar(kind=MBarKind.TCGEN05, byte_offset=smem_empty_off, stages=smem_depth)
     tmem_full = k.mbar(kind=MBarKind.TCGEN05, byte_offset=tmem_full_off, stages=ACC_DEPTH)
     # tmem_empty: one elected thread per CTA's epilogue arrives.
@@ -384,7 +382,6 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
         with k.if_elected():
             for s in range(smem_depth):
                 k.mbarrier_init(smem_full, count=1, stage=s)
-                k.mbarrier_init(sf_full, count=1, stage=s)
                 k.mbarrier_init(smem_empty, count=1, stage=s)
             for s in range(ACC_DEPTH):
                 k.mbarrier_init(tmem_full, count=1, stage=s)
@@ -423,10 +420,11 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                 with k.if_elected():
                     with k.for_loop(stop=k_tiles, unroll=False) as t:
                         k.mbarrier_wait(smem_empty, stage=ld_stage, phase=(ld_phase + 1) % 2)
-                        # canon's split arrive.
+                        # canon's split arrive: ONE expect covering A/B AND
+                        # the SF tiles (both producers complete-tx here).
                         with k.if_(cta_rank.eq(0)):
                             k.mbarrier_arrive_expect_tx(
-                                smem_full_leader, bytes=cta_group * ab_bytes, stage=ld_stage
+                                smem_full_leader, bytes=cta_group * (ab_bytes + sf_bytes), stage=ld_stage
                             )
                         kb = t * blk_k_bytes  # packed-fp4 byte column
                         # canon tags every g2c load with the L2 `evict_normal` policy.
@@ -474,10 +472,6 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                 with k.if_elected():
                     with k.for_loop(stop=k_tiles, unroll=False) as t:
                         k.mbarrier_wait(smem_empty, stage=sf_stage, phase=(sf_phase + 1) % 2)
-                        with k.if_(cta_rank.eq(0)):
-                            k.mbarrier_arrive_expect_tx(
-                                sf_full_leader, bytes=cta_group * sf_bytes, stage=sf_stage
-                            )
                         # SFA: this CTA's M rows.
                         sf_k_outer = t * (sf_cta_k // 4)
                         k.tma_load(
@@ -487,7 +481,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                                 shape=(1, blk_m // 128, sf_cta_k // 4, 32, 16),
                             ),
                             sfa_gmem,
-                            mbar=sf_full_leader,
+                            mbar=smem_full_leader,
                             coords=(a_m // 128, sf_k_outer, 0, 0),
                             shape=(1, blk_m // 128, sf_cta_k // 4, 32, 16),
                             gmem_shape=(blk_m // 128, sf_cta_k // 4, 32, 16),
@@ -505,7 +499,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                                         shape=(1, 1, sf_cta_k // 4, 32, 16),
                                     ),
                                     sfb_gmem,
-                                    mbar=sf_full_leader,
+                                    mbar=smem_full_leader,
                                     coords=(sf_n // 128, sf_k_outer, 0, 0),
                                     shape=(1, 1, sf_cta_k // 4, 32, 16),
                                     gmem_shape=(1, sf_cta_k // 4, 32, 16),
@@ -522,7 +516,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                                     shape=(1, 1, sf_cta_k // 4, 32, 16),
                                 ),
                                 sfb_gmem,
-                                mbar=sf_full_leader,
+                                mbar=smem_full_leader,
                                 coords=(sf_n // 128 + cta_rank, sf_k_outer, 0, 0),
                                 shape=(1, 1, sf_cta_k // 4, 32, 16),
                                 gmem_shape=(1, sf_cta_k // 4, 32, 16),
@@ -561,9 +555,8 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                         acc_op = accum.at(0, tmem_idx * mma_n)
 
                         def mma_ktile(accum_flag):
-                            # Wait loads, copy scales to TMEM, and issue one block-scaled MMA k-tile.
-                            # smem_full starts EMPTY.
-                            k.mbarrier_wait(sf_full, stage=mma_stage, phase=mma_phase)
+                            # ONE full barrier per k-tile (ootst's shape):
+                            # A/B and SF all complete-tx on smem_full.
                             k.mbarrier_wait(smem_full, stage=mma_stage, phase=mma_phase)
                             for m_super in range(blk_m // 128):
                                 for k_outer in range(sf_cta_k // 4):
