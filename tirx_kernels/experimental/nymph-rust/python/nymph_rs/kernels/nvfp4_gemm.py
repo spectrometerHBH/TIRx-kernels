@@ -14,6 +14,7 @@ from ..nymph_rs import (
     LaunchShape,
     MBarKind,
     MemorySpace,
+    ScalarDType,
     SmemSwizzleLayout,
     Swizzle,
     TensorSlice,
@@ -43,6 +44,25 @@ SF_BASE_COL = 448  # canon's fixed SF base column (the accumulator spans 0..MMA_
 
 def _ceil_div(lhs: int, rhs: int) -> int:
     return (lhs + rhs - 1) // rhs
+
+
+def _advance_ring(k: IRBuilder, stage_sc, phase_sc, pipe_depth: int) -> None:
+    """Advance a persistent SMEM-ring (fp16_bf16_gemm's idiom)."""
+    # Snapshot stage+1 into its own scalar FIRST.
+    nxt = k.scalar(initial=stage_sc + 1, dtype=ScalarDType.I32)
+    with k.if_(nxt >= pipe_depth):
+        k.scalar_store(nxt, 0)
+        k.scalar_store(phase_sc, (phase_sc + 1) % 2)
+    k.scalar_store(stage_sc, nxt)
+
+
+def _d_smem_layout(epi_tile: int) -> SmemSwizzleLayout | None:
+    """Widest swizzle the epilogue store tile's row (epi_tile bf16 elems) fits."""
+    row_bytes = epi_tile * 2
+    for swizzle, atom in ((Swizzle.B128, 128), (Swizzle.B64, 64), (Swizzle.B32, 32)):
+        if row_bytes >= atom and row_bytes % atom == 0:
+            return SmemSwizzleLayout(swizzle)
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,19 +128,17 @@ GEMM_CONFIGS = {
     # 1024: the coarse default MMA_N=256 tiling yields only 16 clusters (32 CTAs) on 148 SMs.
     (1024, 1024, 1024): {
         "cta_n": 64,
-        "l2_group_size": 2,
+        "l2_group_size": 12,
         "load_cache_hint": None,
         # Canon's dynamic SMEM pool.
-        "smem_depth": 4,
+        "smem_depth": 5,
         # Limit epilogue registers while using 32-column store tiles.
-        "maxnreg_epilogue": 96,
         "epi_tile": 32,
     },
     # 2048: l2_group_size=4 matches canon's TIRX_CONFIGS[2048] L2_GROUP_SIZE=4.
     (2048, 2048, 2048): {
         "l2_group_size": 4,
         "load_cache_hint": "evict_normal",
-        "maxnreg_epilogue": 96,
         "epi_tile": 32,
     },
     # 4096: the epilogue is the wall-clock residual.
@@ -129,16 +147,27 @@ GEMM_CONFIGS = {
         "load_cache_hint": None,
         "epilogue": "no_overlap",
         "epi_tile": 32,
-        "maxnreg_epilogue": 240,
     },
-    # 8192: the same no-overlap epilogue config as 4096 (see that comment).
+    # 8192: canon's PIPE_DEPTH=4 / L2_GROUP_SIZE=1 / OVERLAP_EPI=False;
+    # EPI_TILE=32 (not canon's 16): the B64-swizzled 8-band store measured
+    # faster than canon's B32 16-band shape (0.995 vs 0.989).
     (8192, 8192, 8192): {
-        "l2_group_size": 2,
+        "l2_group_size": 1,
         "load_cache_hint": None,
         "epilogue": "no_overlap",
+        "smem_depth": 4,
         "epi_tile": 32,
     },
-    # 16384: left at default.
+    # 16384: canon's TIRX_CONFIGS[16384] (EPI_TILE=16, PIPE_DEPTH=4,
+    # OVERLAP_EPI=False); L2_GROUP 12 -> 8, the largest divisor of the 64-row
+    # cluster-tile grid near canon's 12.
+    (16384, 16384, 16384): {
+        "l2_group_size": 16,
+        "load_cache_hint": None,
+        "epilogue": "no_overlap",
+        "smem_depth": 4,
+        "epi_tile": 16,
+    },
 }
 
 
@@ -259,6 +288,10 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
         space=MemorySpace.SMEM,
         dtype=DType.BF16,
         shape=(d_depth, blk_m, epi_tile),
+        # Swizzle the epilogue staging tile as wide as the row allows: the
+        # per-thread row stores (tid, c:c+chunk) otherwise land on the same
+        # bank group, the measured SMEM store-bank-conflict driver.
+        layout=_d_smem_layout(epi_tile),
         byte_offset=d_off,
     )
 
@@ -337,64 +370,82 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
         if config.maxnreg_producer is not None:
             k.set_maxnreg(config.maxnreg_producer)
 
-        # ---- TMA producer.
+        # ---- A/B producer (warp 2). SF loads live on warp 3 (canon's two-warp
+        # producer topology).
         with k.if_warp(2):
+            # Loop-carried SMEM-ring induction state (fp16_bf16_gemm's idiom):
+            # no per-k-tile `% smem_depth` magic-divide chain.
+            ld_stage = k.scalar(initial=0, dtype=ScalarDType.I32)
+            ld_phase = k.scalar(initial=0, dtype=ScalarDType.I32)
             with k.for_each_task(task_scheduler) as task:
-                # `let` SSA binding.
-                local_iter = k.let((task.task_id - task_start) // task_step)
                 m_idx, n_idx = work_coords(task.task_id, cta_rank)
                 a_m = m_idx * CTA_M  # this CTA's own M tile
                 b_n = n_idx * mma_n + cta_rank * cta_n  # this CTA's half of the N band
-                sf_n = n_idx * mma_n  # the FULL N band's B scales (rank-independent)
-                # Rolled k-loop (canon's T.serial).
-                with k.for_loop(stop=k_tiles) as t:
-                    seq = local_iter * k_tiles + t
-                    stage = seq % smem_depth
-                    occ = seq // smem_depth
-                    k.mbarrier_wait(smem_empty, stage=stage, phase=(occ + 1) % 2)
-                    with k.if_elected():
+                # Canon's producer shape: ONE elected region wrapping the whole
+                # rolled k-loop (no per-iteration elect open/close).
+                with k.if_elected():
+                    with k.for_loop(stop=k_tiles, unroll=False) as t:
+                        k.mbarrier_wait(smem_empty, stage=ld_stage, phase=(ld_phase + 1) % 2)
                         # canon's split arrive.
                         with k.if_(cta_rank.eq(0)):
                             k.mbarrier_arrive_expect_tx(
-                                smem_full_leader, bytes=cta_group * ab_bytes, stage=stage
-                            )
-                            k.mbarrier_arrive_expect_tx(
-                                sf_full_leader, bytes=cta_group * sf_bytes, stage=stage
+                                smem_full_leader, bytes=cta_group * ab_bytes, stage=ld_stage
                             )
                         kb = t * BLK_K_BYTES  # packed-fp4 byte column
                         # canon tags every g2c load with the L2 `evict_normal` policy.
                         k.tma_load(
                             TensorSlice(
-                                tensor=a_smem, offsets=(stage, 0, 0), shape=(1, blk_m, BLK_K_BYTES)
+                                tensor=a_smem,
+                                offsets=(ld_stage, 0, 0),
+                                shape=(1, blk_m, BLK_K_BYTES),
                             ),
                             a_gmem,
                             mbar=smem_full_leader,
                             coords=(a_m, kb),
                             shape=(1, blk_m, BLK_K_BYTES),
                             gmem_shape=(blk_m, BLK_K_BYTES),
-                            mbar_stage=stage,
+                            mbar_stage=ld_stage,
                             cache_hint=load_cache_hint,
                             cta_group=cta_group,
                         )
                         k.tma_load(
                             TensorSlice(
-                                tensor=b_smem, offsets=(stage, 0, 0), shape=(1, blk_n, BLK_K_BYTES)
+                                tensor=b_smem,
+                                offsets=(ld_stage, 0, 0),
+                                shape=(1, blk_n, BLK_K_BYTES),
                             ),
                             b_gmem,
                             mbar=smem_full_leader,
                             coords=(b_n, kb),
                             shape=(1, blk_n, BLK_K_BYTES),
                             gmem_shape=(blk_n, BLK_K_BYTES),
-                            mbar_stage=stage,
+                            mbar_stage=ld_stage,
                             cache_hint=load_cache_hint,
                             cta_group=cta_group,
                         )
+                        _advance_ring(k, ld_stage, ld_phase, smem_depth)
+        # ---- SF producer (canon's second producer warp): scale-factor loads on
+        # warp 3, pacing its own arrive/loads per k-tile.
+        with k.if_warp(3):
+            sf_stage = k.scalar(initial=0, dtype=ScalarDType.I32)
+            sf_phase = k.scalar(initial=0, dtype=ScalarDType.I32)
+            with k.for_each_task(task_scheduler) as task:
+                m_idx, n_idx = work_coords(task.task_id, cta_rank)
+                a_m = m_idx * CTA_M
+                sf_n = n_idx * mma_n  # the FULL N band's B scales (rank-independent)
+                with k.if_elected():
+                    with k.for_loop(stop=k_tiles, unroll=False) as t:
+                        k.mbarrier_wait(smem_empty, stage=sf_stage, phase=(sf_phase + 1) % 2)
+                        with k.if_(cta_rank.eq(0)):
+                            k.mbarrier_arrive_expect_tx(
+                                sf_full_leader, bytes=cta_group * sf_bytes, stage=sf_stage
+                            )
                         # SFA: this CTA's M rows.
                         sf_k_outer = t * (SF_CTA_K // 4)
                         k.tma_load(
                             TensorSlice(
                                 tensor=sfa_smem,
-                                offsets=(stage, 0, 0, 0, 0),
+                                offsets=(sf_stage, 0, 0, 0, 0),
                                 shape=(1, blk_m // 128, SF_CTA_K // 4, 32, 16),
                             ),
                             sfa_gmem,
@@ -402,7 +453,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                             coords=(a_m // 128, sf_k_outer, 0, 0),
                             shape=(1, blk_m // 128, SF_CTA_K // 4, 32, 16),
                             gmem_shape=(blk_m // 128, SF_CTA_K // 4, 32, 16),
-                            mbar_stage=stage,
+                            mbar_stage=sf_stage,
                             cache_hint=load_cache_hint,
                             cta_group=cta_group,
                         )
@@ -412,7 +463,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                                 k.tma_load(
                                     TensorSlice(
                                         tensor=sfb_smem,
-                                        offsets=(stage, 0, 0, 0, 0),
+                                        offsets=(sf_stage, 0, 0, 0, 0),
                                         shape=(1, 1, SF_CTA_K // 4, 32, 16),
                                     ),
                                     sfb_gmem,
@@ -420,7 +471,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                                     coords=(sf_n // 128, sf_k_outer, 0, 0),
                                     shape=(1, 1, SF_CTA_K // 4, 32, 16),
                                     gmem_shape=(1, SF_CTA_K // 4, 32, 16),
-                                    mbar_stage=stage,
+                                    mbar_stage=sf_stage,
                                     multicast_cta_mask=0b11,
                                     cache_hint=load_cache_hint,
                                     cta_group=cta_group,
@@ -429,7 +480,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                             k.tma_load(
                                 TensorSlice(
                                     tensor=sfb_smem,
-                                    offsets=(stage, cta_rank, 0, 0, 0),
+                                    offsets=(sf_stage, cta_rank, 0, 0, 0),
                                     shape=(1, 1, SF_CTA_K // 4, 32, 16),
                                 ),
                                 sfb_gmem,
@@ -437,14 +488,18 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                                 coords=(sf_n // 128 + cta_rank, sf_k_outer, 0, 0),
                                 shape=(1, 1, SF_CTA_K // 4, 32, 16),
                                 gmem_shape=(1, SF_CTA_K // 4, 32, 16),
-                                mbar_stage=stage,
+                                mbar_stage=sf_stage,
                                 multicast_cta_mask=0b11,
                                 cache_hint=load_cache_hint,
                                 cta_group=cta_group,
                             )
+                        _advance_ring(k, sf_stage, sf_phase, smem_depth)
 
         # ---- MMA (wg0/warp0, cluster leader only).
         with k.if_warp(0), k.if_elected():
+            # Loop-carried SMEM-ring induction state (persistent across tasks).
+            mma_stage = k.scalar(initial=0, dtype=ScalarDType.I32)
+            mma_phase = k.scalar(initial=0, dtype=ScalarDType.I32)
             with k.for_each_task(task_scheduler) as task:
                 # NO shuffle_sync here.
                 local_iter = k.let((task.task_id - task_start) // task_step)
@@ -455,21 +510,18 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                     )
                     acc_op = accum.at(0, tmem_idx * mma_n)
 
-                    def mma_ktile(t, accum_flag):
+                    def mma_ktile(accum_flag):
                         # Wait loads, copy scales to TMEM, and issue one block-scaled MMA k-tile.
-                        seq = local_iter * k_tiles + t
-                        stage = seq % smem_depth
-                        occ = seq // smem_depth
                         # smem_full starts EMPTY.
-                        k.mbarrier_wait(sf_full, stage=stage, phase=occ % 2)
-                        k.mbarrier_wait(smem_full, stage=stage, phase=occ % 2)
+                        k.mbarrier_wait(sf_full, stage=mma_stage, phase=mma_phase)
+                        k.mbarrier_wait(smem_full, stage=mma_stage, phase=mma_phase)
                         for m_super in range(blk_m // 128):
                             for k_outer in range(SF_CTA_K // 4):
                                 k.tcgen05_cp(
                                     sfa_tmem.at(0, 4 * m_super + (blk_m // 32) * k_outer),
                                     k.smem_tile(
                                         sfa_smem,
-                                        prefix_indices=(stage, m_super, k_outer),
+                                        prefix_indices=(mma_stage, m_super, k_outer),
                                         row_offset=0,
                                         col_offset=0,
                                         rows=32,
@@ -485,7 +537,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                                     sfb_tmem.at(0, 4 * m_super + (mma_n // 32) * k_outer),
                                     k.smem_tile(
                                         sfb_smem,
-                                        prefix_indices=(stage, m_super, k_outer),
+                                        prefix_indices=(mma_stage, m_super, k_outer),
                                         row_offset=0,
                                         col_offset=0,
                                         rows=32,
@@ -501,7 +553,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                             k.mma_a_smem(
                                 k.smem_tile(
                                     a_smem,
-                                    prefix_indices=(stage,),
+                                    prefix_indices=(mma_stage,),
                                     row_offset=0,
                                     col_offset=0,
                                     rows=blk_m,
@@ -510,7 +562,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                             ),
                             k.smem_tile(
                                 b_smem,
-                                prefix_indices=(stage,),
+                                prefix_indices=(mma_stage,),
                                 row_offset=0,
                                 col_offset=0,
                                 rows=blk_n,
@@ -535,13 +587,16 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                             cta_group=cta_group,
                         )
                         k.tcgen05_commit(
-                            smem_empty, stage=stage, cta_group=cta_group, multicast_cta_mask=0b11
+                            smem_empty, stage=mma_stage, cta_group=cta_group, multicast_cta_mask=0b11
                         )
+                        _advance_ring(k, mma_stage, mma_phase, smem_depth)
 
-                    # Peel the first k-tile.
-                    mma_ktile(0, False)
-                    with k.for_loop(stop=k_tiles - 1) as ti:
-                        mma_ktile(ti + 1, True)
+                    # The k-loop with a RUNTIME accum cell (canon's shape;
+                    # no first-k-tile peel doubling the MMA/SF-cp body).
+                    accum_flag = k.scalar(initial=0, dtype=ScalarDType.I32)
+                    with k.for_loop(stop=k_tiles, unroll=False) as t:
+                        mma_ktile(accum_flag)
+                        k.scalar_store(accum_flag, 1)
                     k.tcgen05_commit(
                         tmem_full, stage=tmem_idx, cta_group=cta_group, multicast_cta_mask=0b11
                     )
@@ -610,7 +665,10 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                 k.wg_sync(barrier_id=10)
                 with k.if_(k.tid_in_wg().eq(0)):
                     k.mbarrier_arrive(tmem_empty_leader, stage=tmem_idx)
-                k.reg_mul(accum_frag, accum_frag, config.alpha)
+                # alpha is baked at build time: skip the rescale entirely when 1.0
+                # (a per-thread mul-by-1.0 over the whole fragment is pure waste).
+                if config.alpha != 1.0:
+                    k.reg_mul(accum_frag, accum_frag, config.alpha)
                 k.reg_cvt(out_frag, accum_frag)
                 for ot in range(store_tiles):
                     store_band(local_iter, d_m, d_n, ot, frag_off=ot * epi_tile)
@@ -619,7 +677,9 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                 for ot in range(store_tiles):
                     k.tcgen05_ld(accum_frag, accum.at(0, acc_col0 + ot * epi_tile), num=epi_tile)
                     k.tcgen05_wait_ld()
-                    k.reg_mul(accum_frag, accum_frag, config.alpha)
+                    # alpha baked at build time: skip the rescale when 1.0.
+                    if config.alpha != 1.0:
+                        k.reg_mul(accum_frag, accum_frag, config.alpha)
                     k.reg_cvt(out_frag, accum_frag)
                     if ot == store_tiles - 1:
                         # Free the accumulator after the LAST tile's reads.
