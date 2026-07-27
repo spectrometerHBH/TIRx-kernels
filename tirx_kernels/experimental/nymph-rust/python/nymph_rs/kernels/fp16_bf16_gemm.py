@@ -58,7 +58,8 @@ GEMM_CONFIGS = {
         # grouped swizzle here (0.984 -> 0.989).
         "l2_group_size": 16,
         "overlap_epilogue": True,
-        "pipe_depth": 5,
+        # depth 6 (nvjet's 64x6): bf16_2048 0.985 -> 1.002; fp16 stays 1.00.
+        "pipe_depth": 6,
         # wb_pipe_depth=8 (EPI_N=32, not 64): measured better than canon's 4
         # (0.971 vs 0.921) — kept deliberately.
         "wb_pipe_depth": 8,

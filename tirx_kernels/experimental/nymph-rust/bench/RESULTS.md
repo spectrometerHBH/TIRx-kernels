@@ -32,3 +32,33 @@ nine rows, most visibly for NVFP4. The physical representation and kernel
 schedule remain unchanged based on these measurements, as required. Run 26
 automatically discarded two interfered attempts for NVFP4 4096³ and reports
 the clean third attempt.
+
+## cuBLAS alignment (2026-07-27, dev fc4c5f17)
+
+`cublas/tirx = torch.matmul_us / nymph_us` from `python bench/run_suite.py
+--rounds 5 --filter fp16_bf16 --max-shape 16384` (portable record:
+`.bench-suite/runs/` latest `cublas_*` labels). After the nvjet-shape
+alignment (one launch tile per cluster, nvjet stage counts and M-major
+raster, static task source at 1024, single-consumer epilogue at 4096) and
+the prologue restructure (tcgen05.alloc overlapped with the first TMA
+flight via an `alloc_done` gate; mbarrier inits split across warps 1/2):
+
+| shape | fp16 | bf16 |
+|---|---:|---:|
+| 1024 | 0.93–0.95 | 0.93–0.95 |
+| 2048 | 0.99–1.01 | 0.98–1.00 |
+| 4096 | 1.00–1.03 | 1.00 |
+| 8192 | 1.01–1.05 | 1.00–1.04 |
+| 16384 | 0.99–1.03 | 0.97–1.01 |
+
+1024 stop-rule (measured, not converged at kernel-body level): the K-sweep
+gap is a pure ~0.34us intercept (per-k-tile slopes identical); a micro
+kernel measures `tcgen05.alloc+relinquish+dealloc` at ~0.87us per cluster,
+of which the alloc part is now hidden under the first TMA flight
+(+0.03 ratio); the remainder sits in the cluster prologue barrier, the
+D-store drain wait, and the dealloc pair rendezvous. nvjet avoids this
+class entirely: its SASS contains no tcgen05.alloc/dealloc (TMEM is taken
+via `UTCATOMSWS.FIND_AND_SET` atomics) and it uses PREEXIT for the exit
+overlap. Closing 1024 requires launch/framework-level work (atomic TMEM
+management / PREEXIT / PDL launch attributes), which is out of the
+kernel-body boundary.
