@@ -54,7 +54,8 @@ GEMM_CONFIGS = {
         "l2_group_size": 8,
         "overlap_epilogue": True,
         "pipe_depth": 5,
-        # wb_pipe_depth=8 (EPI_N=32, not 64).
+        # wb_pipe_depth=8 (EPI_N=32, not 64): measured better than canon's 4
+        # (0.971 vs 0.921) — kept deliberately.
         "wb_pipe_depth": 8,
     },
     4096: {
@@ -231,11 +232,22 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
         layout=ab_layout,
         byte_offset=b_off,
     )
+    # Swizzle the epilogue write-back tile as wide as its row allows (canon's
+    # `_swizzle_for_row_bytes(EPI_N * elem)`): the per-thread row stores
+    # otherwise land on the same bank group — the measured 96x SMEM
+    # store-bank-conflict gap at 2048³.
+    d_row_bytes = r.epi_n * elem
+    d_layout = None
+    for swizzle, atom in ((Swizzle.B128, 128), (Swizzle.B64, 64), (Swizzle.B32, 32)):
+        if d_row_bytes >= atom and d_row_bytes % atom == 0:
+            d_layout = SmemSwizzleLayout(swizzle)
+            break
     d_smem = tuple(
         k.tensor(
             space=MemorySpace.SMEM,
             dtype=config.dtype,
             shape=(r.num_d_tiles, BLK_M, r.epi_n),
+            layout=d_layout,
             byte_offset=off,
         )
         for off in d_offsets
