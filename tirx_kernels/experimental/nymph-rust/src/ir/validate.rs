@@ -1966,7 +1966,7 @@ fn check_cta_group_consistency(kernel: &Kernel) -> R {
 ///     rule per CTA at run time).
 ///
 /// Placement (warp-model adaptation of #18's "top-level Role body" rule):
-/// lifecycle ops are banned inside any re-executing body (ForLoop / Loop /
+/// `TmemAlloc` is banned inside any re-executing body (ForLoop / Loop /
 /// ForEachTask / SchedulerImpl) and inside an `If` whose predicate is NOT
 /// statically resolvable (a runtime conditional). The one-pass band walk is
 /// unsound in both: it visits the body once, so a `for_loop(stop=2)` alloc +
@@ -1975,6 +1975,14 @@ fn check_cta_group_consistency(kernel: &Kernel) -> R {
 /// execute at all. A statically-known `If` (warp/lane dispatch — the
 /// warp-model execution model's role branch) executes its body exactly once
 /// per covered thread, so it does NOT taint.
+///
+/// `TmemDealloc` and `TmemRelinquish` are deliberately NOT placement-banned:
+/// freeing creates no allocation, so the codegen single-view invariant
+/// (`decl_buffer(allocated_addr=0)`) is unaffected, and a mismatched or
+/// leaked free is a protocol error the trace-time lifecycle checker proves
+/// exactly (double-free, free-without-alloc, leak at kernel end). This is
+/// what lets a kernel move its teardown earlier (e.g. a dealloc on the last
+/// scheduler task, hidden under the epilogue store work).
 fn check_tmem_alloc_bands(kernel: &Kernel) -> R {
     /// One TMEM operand use with its static (lane, column) extent, when known.
     struct Use<'a> {
@@ -2104,7 +2112,7 @@ fn check_tmem_alloc_bands(kernel: &Kernel) -> R {
         for s in stmts {
             let banned_here = || {
                 lifecycle_banned.then(|| {
-                    "tmem lifecycle ops (alloc/dealloc/relinquish) are not allowed inside                      a loop or scheduler body (ForLoop/Loop/ForEachTask/SchedulerImpl) or a                      runtime-value conditional"
+                    "tmem_alloc is not allowed inside a loop or scheduler body (ForLoop/Loop/ForEachTask/SchedulerImpl) or a                      runtime-value conditional"
                 })
             };
             match s {
@@ -2148,9 +2156,10 @@ fn check_tmem_alloc_bands(kernel: &Kernel) -> R {
                     n_cols,
                     cta_group,
                 } => {
-                    if let Some(msg) = banned_here() {
-                        return bail(msg);
-                    }
+                    // Dealloc is NOT placement-banned: it creates no
+                    // allocation, so the codegen single-view invariant is
+                    // unaffected. A mismatched/leaked free is caught by the
+                    // trace-time lifecycle checker instead of this static walk.
                     if *cta_group != kernel_cta_group {
                         return bail(format!(
                             "tmem_dealloc cta_group={cta_group} != kernel cta_group={kernel_cta_group}"
@@ -2163,9 +2172,9 @@ fn check_tmem_alloc_bands(kernel: &Kernel) -> R {
                     live.remove(pos);
                 }
                 Stmt::TmemRelinquish { cta_group } => {
-                    if let Some(msg) = banned_here() {
-                        return bail(msg);
-                    }
+                    // Relinquish is NOT placement-banned either (it only
+                    // yields the alloc permit; the alloc arm still rejects a
+                    // later alloc anywhere, including in loops).
                     if *cta_group != kernel_cta_group {
                         return bail(format!(
                             "tmem_relinquish cta_group={cta_group} != kernel cta_group={kernel_cta_group}"
@@ -3302,6 +3311,43 @@ mod tests {
         .validate()
         .unwrap_err();
         assert!(e.message.contains("not allowed inside"), "{}", e.message);
+    }
+
+    #[test]
+    fn tmem_dealloc_and_relinquish_are_allowed_inside_a_loop() {
+        // Freeing ops create no allocation (the codegen single-view invariant
+        // is unaffected), so they may appear in loops/conditionals; pairing
+        // is proven by the trace-time lifecycle checker.
+        let alloc = warp_if(
+            0,
+            vec![Stmt::TmemAlloc {
+                base_col: 0,
+                n_cols: 64,
+                cta_group: 1,
+                addr_byte_offset: 900_000,
+            }],
+        );
+        let free = warp_if(
+            0,
+            vec![Stmt::TmemRelinquish { cta_group: 1 }, Stmt::TmemDealloc {
+                base_col: 0,
+                n_cols: 64,
+                cta_group: 1,
+            }],
+        );
+        kernel(vec![
+            alloc,
+            Stmt::ForLoop {
+                var: var(3, VarBinding::Loop),
+                start: ScalarValue::Int(0),
+                stop: ScalarValue::Int(2),
+                step: ScalarValue::Int(1),
+                body: vec![free],
+                unroll: true,
+            },
+        ])
+        .validate()
+        .unwrap();
     }
 
     #[test]

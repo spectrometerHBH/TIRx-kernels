@@ -719,8 +719,8 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                 with k.if_(k.tid_in_wg().eq(0)):
                     k.mbarrier_arrive(tmem_empty_leader, stage=tmem_idx)
                 # Fire the teardown handshake's ARRIVE here on the last task
-                # (an mbarrier arrive is loop-legal; only alloc/dealloc/
-                # relinquish are restricted): the trailing wait is then free.
+                # (accumulator reads provably done at wait_ld + wg_sync); the
+                # wait+dealloc runs on the IDLE MMA warp (see its region).
                 with k.if_(local_iter.eq((pair_tasks - 1 - task_start) // task_step)):
                     with k.if_(k.tid_in_wg().eq(0)):
                         k.mbarrier_arrive(k.mbar_ref(tmem_fin, remote_coord=1 - cta_rank), stage=0)
@@ -745,8 +745,8 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                         k.wg_sync(barrier_id=10)
                         with k.if_(k.tid_in_wg().eq(0)):
                             k.mbarrier_arrive(tmem_empty_leader, stage=tmem_idx)
-                        # The teardown handshake's ARRIVE fires here on the
-                        # last task (loop-legal op): the trailing wait is free.
+                        # Fire the teardown handshake's ARRIVE here on the
+                        # last task; wait+dealloc runs on the idle MMA warp.
                         with k.if_(local_iter.eq((pair_tasks - 1 - task_start) // task_step)):
                             with k.if_(k.tid_in_wg().eq(0)):
                                 k.mbarrier_arrive(k.mbar_ref(tmem_fin, remote_coord=1 - cta_rank), stage=0)
@@ -756,7 +756,9 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
         # tmem_fin handshake + dealloc below overlaps the last store flight
         # (nvjet's PREEXIT-style tail).
 
-    # TMEM teardown via canon's tmem_finished 2-CTA handshake (NOT a bare cluster_sync).
+    # TMEM teardown via canon's tmem_finished 2-CTA handshake (NOT a bare
+    # cluster_sync): the arrive fires mid-epilogue on the last task (see the
+    # epilogue regions), and warp 4 waits + deallocs here after its stores.
     epilogue_warp = 4  # wg1's first warp (num_warps=8: wg0=0-3, wg1=4-7); canon's EPILOGUE
     with k.if_warp(epilogue_warp):
         k.mbarrier_wait(tmem_fin, stage=0, phase=0)
