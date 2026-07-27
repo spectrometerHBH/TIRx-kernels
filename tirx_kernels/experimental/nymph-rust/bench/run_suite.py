@@ -132,14 +132,15 @@ def main() -> None:
             f"{res['kernel']} {res['config']}: tir/tirx={ratio:.3f}{spread}  "
             f"tir={im['tir']:.1f}us tirx={im['tirx']:.1f}us"
         )
-        # cuBLAS third impl: show the cublas/tirx ratio as well.
-        if "cublas" in im:
-            cratio = im["cublas"] / im["tirx"]
-            cspread = ""
-            if rs.get("cublas") and rs.get("tirx"):
-                cpr = sorted(c / n for c, n in zip(rs["cublas"], rs["tirx"]))
-                cspread = f"  per-round[{cpr[0]:.3f}-{cpr[-1]:.3f}]"
-            line += f"  cublas/tirx={cratio:.3f}{cspread} cublas={im['cublas']:.1f}us"
+        # Third impl (cublas / cublaslt): show its tirx ratio as well.
+        for third in ("cublas", "cublaslt"):
+            if third in im:
+                cratio = im[third] / im["tirx"]
+                cspread = ""
+                if rs.get(third) and rs.get("tirx"):
+                    cpr = sorted(c / n for c, n in zip(rs[third], rs["tirx"]))
+                    cspread = f"  per-round[{cpr[0]:.3f}-{cpr[-1]:.3f}]"
+                line += f"  {third}/tirx={cratio:.3f}{cspread} {third}={im[third]:.1f}us"
         print(line + f"  (gpu {res.get('gpu')})")
 
 
