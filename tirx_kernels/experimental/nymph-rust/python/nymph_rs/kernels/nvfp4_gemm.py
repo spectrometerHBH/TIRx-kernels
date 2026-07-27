@@ -148,24 +148,24 @@ GEMM_CONFIGS = {
         "epilogue": "no_overlap",
         "epi_tile": 32,
     },
-    # 8192: canon's PIPE_DEPTH=4 / L2_GROUP_SIZE=1 / OVERLAP_EPI=False;
-    # EPI_TILE=32 (not canon's 16): the B64-swizzled 8-band store measured
-    # faster than canon's B32 16-band shape (0.995 vs 0.989).
+    # 8192: OVERLAP_EPI=False / L2_GROUP_SIZE=1 (canon); smem_depth=5 and
+    # EPI_TILE=32 (canon has 4/16) both measured faster: depth 5 1.013 vs
+    # 0.987, epi32's B64-swizzled 8-band store 0.995 vs B32 16-band 0.989.
     (8192, 8192, 8192): {
         "l2_group_size": 1,
         "load_cache_hint": None,
         "epilogue": "no_overlap",
-        "smem_depth": 4,
+        "smem_depth": 5,
         "epi_tile": 32,
     },
-    # 16384: canon's TIRX_CONFIGS[16384] (EPI_TILE=16, PIPE_DEPTH=4,
-    # OVERLAP_EPI=False); L2_GROUP 12 -> 8, the largest divisor of the 64-row
-    # cluster-tile grid near canon's 12.
+    # 16384: OVERLAP_EPI=False / EPI_TILE=16 (canon); smem_depth=5 (canon 4)
+    # measured 1.046 vs 0.99; L2_GROUP 12 -> 16 (12 does not divide the
+    # 64-row cluster-tile grid).
     (16384, 16384, 16384): {
         "l2_group_size": 16,
         "load_cache_hint": None,
         "epilogue": "no_overlap",
-        "smem_depth": 4,
+        "smem_depth": 5,
         "epi_tile": 16,
     },
 }

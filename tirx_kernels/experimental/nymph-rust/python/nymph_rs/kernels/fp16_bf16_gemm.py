@@ -77,11 +77,12 @@ GEMM_CONFIGS = {
     },
     16384: {
         "mma_n": 256,
-        # blk_k=128/pipe_depth=2 (same SMEM as 64/4).
-        "blk_k": 128,
+        # Canon verbatim: blk_k=64/pipe_depth=4 (was 128/2 "same SMEM";
+        # fp16_16384 measured 0.959 there).
+        "blk_k": 64,
         "l2_group_size": 8,
         "overlap_epilogue": False,
-        "pipe_depth": 2,
+        "pipe_depth": 4,
         "wb_pipe_depth": 8,
     },
 }
