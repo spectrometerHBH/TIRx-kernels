@@ -376,6 +376,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     # after the leader-side inits (flight ~0.5us >> init ~0.04us), and every
     # tmem-side signal is downstream of the MMA warp's own alloc.
     with k.if_warp(1):
+        k.cluster_barrier_arrive()
         with k.if_elected():
             for s in range(smem_depth):
                 k.mbarrier_init(smem_full, count=1, stage=s)
@@ -387,11 +388,6 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
             # canon's tmem_finished (init_full=1): one cross-CTA arrival releases the wait.
             k.mbarrier_init(tmem_fin, count=1, stage=0)
             k.mbarrier_init(inits_done, count=1, stage=0)
-
-    with k.if_warp(0):
-        # tmem_alloc is warp-collective (full warp 0), pre-sync on its own
-        # stream — the tmem-lifecycle checker accepts only alloc-before-sync.
-        k.tmem_alloc(0, N_COLS_TMEM, addr_byte_offset=tmem_addr_off, cta_group=cta_group)
 
     # Seal the mbarrier-init epoch (canon's `T.ptx.fence.mbarrier_init` + the
     # fused cluster_sync). The inits live on warp 1 (free role) so the sync
@@ -409,6 +405,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
         # ---- A/B producer (warp 2). SF loads live on warp 3 (canon's two-warp
         # producer topology).
         with k.if_warp(2):
+            k.cluster_barrier_arrive()
             # Loop-carried SMEM-ring induction state (fp16_bf16_gemm's idiom):
             # no per-k-tile `% smem_depth` magic-divide chain.
             ld_stage = k.scalar(initial=0, dtype=ScalarDType.I32)
@@ -463,6 +460,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
         # ---- SF producer (canon's second producer warp): scale-factor loads on
         # warp 3, pacing its own arrive/loads per k-tile.
         with k.if_warp(3):
+            k.cluster_barrier_arrive()
             sf_stage = k.scalar(initial=0, dtype=ScalarDType.I32)
             sf_phase = k.scalar(initial=0, dtype=ScalarDType.I32)
             with k.for_each_task(task_scheduler) as task:
@@ -532,7 +530,16 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                         _advance_ring(k, sf_stage, sf_phase, smem_depth)
 
         # ---- MMA (wg0/warp0, cluster leader only).
-        with k.if_warp(0), k.if_elected():
+        with k.if_warp(0):
+            # tmem_alloc (warp-collective, full warp 0), then the split
+            # cluster barrier: the pair's alloc completions rendezvous and
+            # the wait makes them visible (the tmem-lifecycle checker's
+            # alloc-before-use sync edge) WITHOUT gating the producers —
+            # they arrive non-blocking at role entry (nvjet's alloc-late).
+            k.tmem_alloc(0, N_COLS_TMEM, addr_byte_offset=tmem_addr_off, cta_group=cta_group)
+            k.cluster_barrier_arrive()
+            k.cluster_barrier_wait()
+            with k.if_elected():
                 # Loop-carried SMEM-ring induction state (persistent across tasks).
                 mma_stage = k.scalar(initial=0, dtype=ScalarDType.I32)
                 mma_phase = k.scalar(initial=0, dtype=ScalarDType.I32)
@@ -678,6 +685,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
         k.cp_async_bulk_commit_group()
 
     with k.if_warpgroup(1):
+        k.cluster_barrier_arrive()
         # Consumer epilogue register cap.
         if config.maxnreg_epilogue is not None:
             k.set_maxnreg(config.maxnreg_epilogue)
