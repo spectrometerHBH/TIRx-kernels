@@ -380,8 +380,12 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
     # the producers' first TMA flights overlap the pair's ~0.9us tcgen05.alloc
     # rendezvous instead of serializing behind it (nvjet hides it too — its
     # UTCATOMSWS atomic is effectively free). alloc_done releases the MMA warps.
+    # Alloc only what the accumulator slots actually span (mma_n x tmem_slots
+    # columns; 1024's 2x64=128 vs the full 512 pool — a smaller FIND_AND_SET
+    # window shortens the pair-collective latency the MMA warp waits on).
+    tmem_cols = max(32, r.tmem_slots * r.mma_n)
     with k.if_warp(0):
-        k.tmem_alloc(0, N_COLS_TMEM, addr_byte_offset=tmem_addr_off, cta_group=CTA_GROUP)
+        k.tmem_alloc(0, tmem_cols, addr_byte_offset=tmem_addr_off, cta_group=CTA_GROUP)
         with k.if_elected():
             k.mbarrier_arrive(alloc_done, stage=0)
 
@@ -574,10 +578,13 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
                             space=MemorySpace.REG, dtype=config.dtype, shape=(r.epi_n,)
                         )
                         store_iter = local_iter * r.wb_pipe_depth + ot
+                        # The ring-guard wait+sync is needed ONLY when the
+                        # d_smem ring actually wraps (store_iter >= depth) —
+                        # an unconditional per-band sync is pure latency at
+                        # wb_pipe_depth <= num_d_tiles (e.g. 1024's 2 bands).
                         with k.if_(store_iter >= r.num_d_tiles):
                             k.cp_async_bulk_wait_group_read(r.num_d_tiles - 1)
-                        # The wg_sync rides OUTSIDE the runtime store_iter branch.
-                        k.wg_sync(barrier_id=wg_bar)
+                            k.wg_sync(barrier_id=wg_bar)
                         # Fold the D-smem buffer index the same way the SMEM ring does.
                         db = _ring_index(local_iter, ot, r.wb_pipe_depth, r.num_d_tiles)[0]
                         # Read the EPI_N band in read_w=32 chunks.
@@ -687,9 +694,15 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
                         k.cp_async_bulk_commit_group()
                     with k.if_(k.tid_in_wg().eq(0)):
                         k.mbarrier_arrive(tmem_empty_leader, stage=slot)
-            # Drain in-flight TMA stores once after the persistent loop.
-            k.cp_async_bulk_wait_group_read(0)
-            k.wg_sync(barrier_id=wg_bar)
+            # No-overlap keeps the drain before its cluster-wide teardown;
+            # the overlap path drops it — the last task's TMA stores drain
+            # on the HW side at kernel exit (D visibility is
+            # completion-ordered), so the pair's dealloc rendezvous below
+            # overlaps the final store flight instead of serializing behind
+            # a full drain (nvjet's PREEXIT-style tail).
+            if not r.overlap:
+                k.cp_async_bulk_wait_group_read(0)
+                k.wg_sync(barrier_id=wg_bar)
 
     # Cluster-wide barrier before freeing TMEM.
     teardown = config.teardown or GEMM_CONFIGS.get(config.n, {}).get("teardown")
@@ -703,13 +716,13 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
                     k.mbarrier_wait(tmem_fin, stage=0, phase=0)
             with k.if_warp(0):
                 k.tmem_relinquish(CTA_GROUP)
-                k.tmem_dealloc(0, N_COLS_TMEM, CTA_GROUP)
+                k.tmem_dealloc(0, tmem_cols, CTA_GROUP)
         # "none": nvjet's form — plain EXIT, the HW frees TMEM at CTA exit.
     else:
         k.cluster_sync()
         with k.if_warp(0):
             k.tmem_relinquish(CTA_GROUP)
-            k.tmem_dealloc(0, N_COLS_TMEM, CTA_GROUP)
+            k.tmem_dealloc(0, tmem_cols, CTA_GROUP)
 
     return k.build()
 
