@@ -1041,6 +1041,7 @@ fn scope_kind_from_str(kind: &str) -> PyResult<ir::ScopeValueKind> {
         "ctaid_in_cluster" => CtaidInCluster,
         "cta_id" => CtaId,
         "nvshmem_my_pe" => NvshmemMyPe,
+        "elected" => Elected,
         other => {
             return Err(PyTypeError::new_err(format!(
                 "unknown scope value kind: {other}"
@@ -1058,6 +1059,7 @@ fn scope_kind_str(kind: ir::ScopeValueKind) -> &'static str {
         CtaidInCluster => "ctaid_in_cluster",
         CtaId => "cta_id",
         NvshmemMyPe => "nvshmem_my_pe",
+        Elected => "elected",
     }
 }
 

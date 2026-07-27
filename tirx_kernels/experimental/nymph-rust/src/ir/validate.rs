@@ -3010,13 +3010,7 @@ mod tests {
 
     fn elected_if(body: Vec<Stmt>) -> Stmt {
         Stmt::If {
-            cond: ScalarValue::expr(
-                ScalarOp::Eq,
-                vec![
-                    ScalarValue::Scope(ScopeValueKind::LaneId),
-                    ScalarValue::Int(0),
-                ],
-            ),
+            cond: ScalarValue::Scope(ScopeValueKind::Elected),
             then_body: body,
         }
     }

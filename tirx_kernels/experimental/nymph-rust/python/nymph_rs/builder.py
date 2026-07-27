@@ -709,12 +709,15 @@ class IRBuilder:
 
     @contextmanager
     def if_elected(self) -> Iterator[None]:
-        """Lane 0 of EVERY warp in context (`lane_id() == 0`).
+        """One elected lane of EVERY warp in context (``T.ptx.elect_sync()``).
 
-        For one thread per warpgroup use `if_(tid_in_wg().eq(0))`; for one
-        thread per CTA nest this under `if_warp(w)`.
+        The IR predicate is the elect.sync intrinsic itself (printed as
+        canon's ``if T.ptx.elect_sync():``); a literal ``lane_id() == 0``
+        compare is what ``if_lane(0)`` spells. For one thread per warpgroup
+        use `if_(tid_in_wg().eq(0))`; for one thread per CTA nest this under
+        `if_warp(w)`.
         """
-        with self.if_(self.lane_id().eq(0)):
+        with self.if_(ScopeValue(kind="elected")):
             yield
 
     def set_maxnreg(self, nreg: int) -> None:

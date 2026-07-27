@@ -21,6 +21,8 @@ pub fn eval_scope_value(kind: ScopeValueKind, thread: &ThreadId) -> i64 {
         ScopeValueKind::CtaidInCluster => thread.ctaid_in_cluster,
         ScopeValueKind::CtaId => thread.cta_id,
         ScopeValueKind::NvshmemMyPe => 0,
+        // elect.sync over a fully-active warp selects its lane 0.
+        ScopeValueKind::Elected => usize::from(thread.lane_id == 0),
     }) as i64
 }
 
@@ -78,6 +80,7 @@ pub fn scalar_is_lane_invariant(value: &ScalarValue) -> bool {
             kind,
             ScopeValueKind::TidInWg
                 | ScopeValueKind::LaneId
+                | ScopeValueKind::Elected
                 | ScopeValueKind::WarpId
                 | ScopeValueKind::WarpgroupId
         ),

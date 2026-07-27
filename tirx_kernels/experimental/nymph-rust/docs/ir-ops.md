@@ -41,9 +41,11 @@ commit 76600421 (codegen-side rejections + sf_block validation).
 5. **Accumulation order**: MMA via OpenBLAS sgemm (BLAS blocking order), not
    the HW's fixed tensor-core order. Exact for exact arithmetic; f32-rounding-
    level differences otherwise. Hardware fixtures use exact small integers.
-6. **Election sugar = explicit lane 0**: `if_elected` builds the ordinary IR
-   predicate `lane_id == 0`. It is not a PTX `elect.sync` operation, and
-   codegen prints the predicate unchanged.
+6. **Election sugar = elect.sync**: `if_elected` builds the dedicated
+   `ScopeValueKind::Elected` IR predicate, printed as `T.ptx.elect_sync()`.
+   The interpreter evaluates it as lane 0 — the elect.sync result on a
+   fully-active warp. A hand-written `lane_id() == 0` stays a literal
+   compare (faithful translation).
 7. **sim⇄GPU bit-exactness is measured, not assumed**:
    `tests/gpu/test_gpu_sim_parity.py` runs one kernel + one input set through
    BOTH the value simulator and the tirx codegen + `tvm.compile` on a real GPU

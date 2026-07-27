@@ -9,7 +9,9 @@ Structural control statements are interpreter core: `If`, `ForLoop`,
 `If` over per-thread scalar predicates. The same structure is authoritative
 for codegen: predicates are printed literally, sibling/nested structure is
 preserved, and no `lane_id == 0` condition is replaced with `elect_sync()` or
-`thread_rank() == 0`. Leaf-style operation statements execute through built-in
+`thread_rank() == 0` — the `if_elected` sugar carries its own `Elected`
+predicate (the elect.sync intrinsic), evaluated as lane 0 of each
+fully-active warp. Leaf-style operation statements execute through built-in
 executors. Unsupported statements fail closed with `unsupported_stmt`.
 
 Each execution stream is one warp, and a statement executes over the stream's

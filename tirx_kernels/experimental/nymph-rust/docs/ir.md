@@ -56,7 +56,8 @@ and interpretation.
 The Python package under `python/nymph_rs/` is the user-facing builder surface
 and constructs Rust IR objects through PyO3. Thread dispatch is `if_` over
 scope-value predicates, with canonical sugar `if_warp(n)`, `if_warpgroup(n)`,
-`if_lane(n)`, and `if_elected()` (lane 0 of every warp in context), plus
+`if_lane(n)`, and `if_elected()` (the `elect.sync` intrinsic — one elected
+lane of every fully-active warp in context, i.e. lane 0), plus
 `set_maxnreg(n)` for the `SetMaxNReg` directive. The exported
 `interpret(kernel, inputs)` binding validates and runs the Rust kernel, marshals
 typed numpy inputs into `ValueArray1`, and returns GMEM outputs as numpy arrays.

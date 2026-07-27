@@ -7,7 +7,8 @@ in chat.
 
 Current structural rule: codegen is a literal IR emitter. It preserves every
 `If` condition, sibling/nested relationship, and statement order; it never
-substitutes `elect_sync()`/`thread_rank()` for `lane_id == 0`, folds adjacent
+substitutes `elect_sync()`/`thread_rank()` for a hand-written `lane_id == 0`
+(the `if_elected` sugar emits `T.ptx.elect_sync()` by definition), folds adjacent
 guards, or builds an if/else dispatch chain. Historical measurements below
 that mention those transforms remain evidence about older code, not a tuning
 technique available in the current codegen. A desired control-flow form must
@@ -214,8 +215,8 @@ them and is recorded in `bench/RESULTS.md`.
   shape — the 2026-05 guarded form was a deliberate UTMACMDFLUSH trade, now
   reverted for size). Mbarrier init is legal only beneath an explicit
   single-lane IR branch; codegen neither inserts nor coalesces that branch.
-  `if_elected` is builder sugar for `lane_id == 0`, which remains
-  `lane_id == 0` in the emitted source.
+  `if_elected` is its own IR predicate (`ScopeValueKind::Elected`),
+  emitted as `T.ptx.elect_sync()` — canon's elected-region form.
 - builder (fp16_bf16_gemm): scheduler done-flag + phase cells; MMA single
   merged k-loop + per-task accum cell + `unroll=False`; prologue inits grouped
   before the alloc + proxy fence on both paths; `_init_stages` flat (so the

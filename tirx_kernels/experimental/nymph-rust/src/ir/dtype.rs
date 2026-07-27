@@ -158,4 +158,9 @@ pub enum ScopeValueKind {
     CtaidInCluster,
     CtaId,
     NvshmemMyPe,
+    /// The `elect.sync` predicate (boolean): true on the one elected lane of
+    /// each fully-active warp. This is the `if_elected` sugar's own IR value —
+    /// DISTINCT from `LaneId == 0`, which stays a literal lane compare when
+    /// the IR spells it that way (faithful translation).
+    Elected,
 }
