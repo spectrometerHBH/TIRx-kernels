@@ -59,12 +59,9 @@ def f32(values, shape=None):
     return arr.reshape(shape) if shape is not None else arr
 
 
-def tmem_band(*, dtype=nr.DType.F32, col0=0, lane0=0):
-    """A named TMEM column band (pure Python, not IR) — the replacement for the
-    removed TMEM `Tensor` + `TmemLayout`. `band.at(row, col)` yields the
-    absolute physical `TmemOperand(lane0 + row, col0 + col, dtype)` the IR's
-    tcgen05 ops address; the band's extent is implied by the op it feeds."""
-    return nr.builder.TmemBand(col0, dtype, lane0)
+def tmem_tensor(start_col=0):
+    """An idless logical TMEM view at one explicit physical start column."""
+    return nr.TmemTensor(start_col)
 
 
 def reg_tensor(b, *, dtype=nr.DType.U32, shape=(1,)):

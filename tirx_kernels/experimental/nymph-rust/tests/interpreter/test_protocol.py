@@ -1,5 +1,13 @@
 import nymph_rs as nr
-from helpers import builder, expect_runtime_error, gmem_arg, reg_tensor, smem_tensor, tmem_band, u32
+from helpers import (
+    builder,
+    expect_runtime_error,
+    gmem_arg,
+    reg_tensor,
+    smem_tensor,
+    tmem_tensor,
+    u32,
+)
 from nymph_rs.kernels import build_fp16_bf16_gemm
 from nymph_rs.kernels.fp16_bf16_gemm import Fp16Bf16GemmConfig
 
@@ -31,6 +39,12 @@ def _pass_status(report, name):
         if item["name"] == name:
             return item["status"]
     raise AssertionError(f"missing pass summary for {name}")
+
+
+def _dense_mma_operands(b, a, rhs, *, m, n, k):
+    a_tile = b.smem_tile(a, prefix_indices=(), row_offset=0, col_offset=0, rows=m, cols=k)
+    b_tile = b.smem_tile(rhs, prefix_indices=(), row_offset=0, col_offset=0, rows=n, cols=k)
+    return b.mma_a_smem(a_tile), b_tile
 
 
 def test_protocol_trace_scheduler_scalar_bridge_passes():
@@ -201,10 +215,10 @@ def test_protocol_deadlock_returns_failed_report():
 
 
 def test_protocol_blocked_mbar_wait_emits_completion_event():
-    b = builder("protocol_blocked_mbar_wait_event", smem_size_bytes=16)
+    b = builder("protocol_blocked_mbar_wait_event", smem_size_bytes=24)
     source = gmem_arg(b, shape=(4,))
     smem = smem_tensor(b, shape=(4,), byte_offset=0)
-    mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
+    mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=16)
 
     # New model: the ISSUING thread (warp 1) arms expect_tx right before its own
     # tma_load; warp 0 only waits. cta_sync publishes the per-thread init. The
@@ -233,10 +247,10 @@ def test_protocol_blocked_mbar_wait_emits_completion_event():
 
 
 def test_protocol_tma_complete_tx_may_precede_expect_tx():
-    b = builder("protocol_complete_before_expect", smem_size_bytes=16)
+    b = builder("protocol_complete_before_expect", smem_size_bytes=24)
     source = gmem_arg(b, shape=(4,))
     smem = smem_tensor(b, shape=(4,), byte_offset=0)
-    mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
+    mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=16)
 
     with b.if_warp(0), b.if_elected():
         b.mbarrier_init(mbar, count=1)
@@ -255,10 +269,10 @@ def test_protocol_tma_complete_tx_may_precede_expect_tx():
 
 
 def test_protocol_payload_control_bridge_is_inconclusive():
-    b = builder("protocol_payload_bridge", smem_size_bytes=8)
+    b = builder("protocol_payload_bridge", smem_size_bytes=16)
     source = gmem_arg(b, shape=(1,))
     smem = smem_tensor(b, shape=(1,), byte_offset=0)
-    mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
+    mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=8)
     # mbarrier.init is per-thread now: issue it from a single elected thread.
     with b.if_warp(0), b.if_elected():
         b.mbarrier_init(mbar, count=1)
@@ -273,10 +287,10 @@ def test_protocol_payload_control_bridge_is_inconclusive():
 
 
 def test_protocol_skipped_bulk_write_invalidates_prior_scalar_cell():
-    b = builder("protocol_payload_invalidates_scalar", smem_size_bytes=8)
+    b = builder("protocol_payload_invalidates_scalar", smem_size_bytes=16)
     source = gmem_arg(b, shape=(1,))
     smem = smem_tensor(b, shape=(1,), byte_offset=0)
-    mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
+    mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=8)
     # mbarrier.init is per-thread now: issue it from a single elected thread.
     with b.if_warp(0), b.if_elected():
         b.mbarrier_init(mbar, count=1)
@@ -292,7 +306,7 @@ def test_protocol_skipped_bulk_write_invalidates_prior_scalar_cell():
 
 
 def test_protocol_gemm_trace_runs_without_payload_inputs():
-    cfg = Fp16Bf16GemmConfig(k=16, blk_k=16, launch_shape=(2,))
+    cfg = Fp16Bf16GemmConfig(k=64, blk_k=64, launch_shape=(2,))
     kernel = build_fp16_bf16_gemm(cfg)
 
     report = nr.check_protocol(kernel, include_events=True)
@@ -321,7 +335,8 @@ def test_protocol_tmem_mma_layout_f_emits_union_boxes():
     b = builder("protocol_tmem_layout_f_boxes", smem_size_bytes=a_bytes + b_bytes)
     a_s = smem_tensor(b, dtype=nr.DType.F16, shape=(m, k), byte_offset=0)
     b_s = smem_tensor(b, dtype=nr.DType.F16, shape=(n, k), byte_offset=a_bytes)
-    dst = tmem_band(dtype=nr.DType.F32)
+    dst = tmem_tensor()
+    a_operand, b_tile = _dense_mma_operands(b, a_s, b_s, m=m, n=n, k=k)
 
     with b.if_warp(0):
         b.tmem_alloc(0, 32, addr_byte_offset=0)
@@ -332,7 +347,20 @@ def test_protocol_tmem_mma_layout_f_emits_union_boxes():
         b.mbarrier_init(done, count=1)
     b.cta_sync()
     with b.if_warp(0), b.if_elected():
-        b.tcgen05_mma(dst.at(0, 0), a_s, b_s, m=m, n=n, k=k, accum=False, cta_group=1)
+        b.tcgen05_mma(
+            dst.at(0, 0),
+            a_operand,
+            b_tile,
+            mma_m=m,
+            mma_n=n,
+            format="f16",
+            block_scale=None,
+            accum=False,
+            trans_a=False,
+            trans_b=False,
+            ws=False,
+            cta_group=1,
+        )
         # The mma is async: commit hands it to a barrier and the wait is where
         # it is observed to have landed — a band may not be freed before that.
         b.tcgen05_commit(done, cta_group=1)
@@ -370,7 +398,8 @@ def _tmem_teardown_kernel(*, drain: bool):
     b = builder("protocol_tmem_teardown", smem_size_bytes=a_bytes + b_bytes)
     a_s = smem_tensor(b, dtype=nr.DType.F16, shape=(m, k), byte_offset=0)
     b_s = smem_tensor(b, dtype=nr.DType.F16, shape=(n, k), byte_offset=a_bytes)
-    dst = tmem_band(dtype=nr.DType.F32)
+    dst = tmem_tensor()
+    a_operand, b_tile = _dense_mma_operands(b, a_s, b_s, m=m, n=n, k=k)
     done = b.mbar(kind=nr.MBarKind.TCGEN05, byte_offset=0)
     with b.if_warp(0):
         b.tmem_alloc(0, 32, addr_byte_offset=0)
@@ -378,7 +407,20 @@ def _tmem_teardown_kernel(*, drain: bool):
             b.mbarrier_init(done, count=1)
     b.cta_sync()
     with b.if_warp(0), b.if_elected():
-        b.tcgen05_mma(dst.at(0, 0), a_s, b_s, m=m, n=n, k=k, accum=False, cta_group=1)
+        b.tcgen05_mma(
+            dst.at(0, 0),
+            a_operand,
+            b_tile,
+            mma_m=m,
+            mma_n=n,
+            format="f16",
+            block_scale=None,
+            accum=False,
+            trans_a=False,
+            trans_b=False,
+            ws=False,
+            cta_group=1,
+        )
         b.tcgen05_commit(done, cta_group=1)
     if drain:
         with b.if_warp(0):
@@ -404,7 +446,7 @@ def test_protocol_tmem_free_after_the_commit_is_awaited_passes():
 
 def test_protocol_tmem_async_overlap_fails_before_wait():
     b = builder("protocol_tmem_async_overlap")
-    tmem = tmem_band(dtype=nr.DType.F32)
+    tmem = tmem_tensor()
     reg = reg_tensor(b, dtype=nr.DType.F32, shape=(1,))
 
     with b.if_warp(0):

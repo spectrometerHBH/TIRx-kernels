@@ -14,6 +14,7 @@ pub mod mbar;
 pub mod scalar;
 pub mod scheduler;
 pub mod stmt;
+pub(crate) mod tcgen05_layout;
 pub mod tensor;
 pub mod thread_filter;
 pub mod validate;
@@ -27,6 +28,7 @@ pub use mbar::*;
 pub use scalar::*;
 pub use scheduler::*;
 pub use stmt::*;
+pub(crate) use tcgen05_layout::*;
 pub use tensor::*;
 pub use thread_filter::*;
 pub use validate::*;
@@ -49,7 +51,6 @@ mod tests {
             shape: vec![256, 256],
             layout: None,
             byte_offset: None,
-            reg_frag: None,
         });
         let a = Arc::new(Tensor {
             id: 1,
@@ -58,7 +59,6 @@ mod tests {
             shape: vec![256, 16],
             layout: None,
             byte_offset: Some(0),
-            reg_frag: None,
         });
 
         // A loop variable `k` (identity is its id).

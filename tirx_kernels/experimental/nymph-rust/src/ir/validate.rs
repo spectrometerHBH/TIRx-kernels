@@ -164,40 +164,6 @@ fn smem_extent_bytes(tensor: &Tensor) -> Result<usize, IrError> {
         .ok_or_else(|| err("smem tensor byte extent overflows usize"))
 }
 
-/// `_check_tcgen05_mma_shape`. `block_scaled_f8` selects the block-scaled f8
-/// instruction family (sfa/sfb present, non-fp4) — only it may step N by 16.
-fn check_mma_shape(m: u32, n: u32, k: u32, cta_group: u8, block_scaled_f8: bool) -> R {
-    check_positive(m, "tcgen05_mma m")?;
-    check_positive(n, "tcgen05_mma n")?;
-    check_positive(k, "tcgen05_mma k")?;
-    // The k rule itself is per operand KIND and lives at the Tcgen05Mma arm
-    // (which sees the dtypes): dense f16/bf16 is any positive multiple of the
-    // k=16 atom (an ordered run of atomic MMAs — canon issues one full-K
-    // gemm_async per k-tile and TVM lowers it to the atoms); the block-scaled
-    // f8 instruction is k=32 (128/256 its folded k-tile forms); fp4 (mxf4) is
-    // k in {64, 128, 256}.
-    match cta_group {
-        1 => {
-            let granularity = if m == 64 { 8 } else { 16 };
-            if (m != 64 && m != 128) || n > 256 || n % granularity != 0 {
-                return bail("tcgen05_mma matrix shape is invalid for cta_group=1");
-            }
-            Ok(())
-        }
-        2 => {
-            // The block-scaled f8 instruction (k=32) steps N by 16 (DeepGEMM's
-            // swap_ab grid uses N = block_m in 16-element steps, e.g. 240);
-            // the dense f16/bf16 and nvfp4 (k=64) shapes keep the 32-step rule.
-            let granularity = if block_scaled_f8 && k == 32 { 16 } else { 32 };
-            if (m != 128 && m != 256) || n > 256 || n % granularity != 0 {
-                return bail("tcgen05_mma matrix shape is invalid for cta_group=2");
-            }
-            Ok(())
-        }
-        _ => check_cta_group(cta_group, "tcgen05_mma cta_group"),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // leaf walkers: scalar exprs, layouts, slices
 // ---------------------------------------------------------------------------
@@ -220,7 +186,8 @@ fn validate_scalar(v: &ScalarValue) -> R {
 }
 
 /// `Tensor.__post_init__`: SMEM tensors carry a byte offset; nothing else may.
-/// (TMEM used to validate its layout here — TMEM is no longer a tensor.)
+/// Every nontrivial physical layout is explicit and validated independently of
+/// tensor usage.
 fn validate_tensor(t: &Tensor) -> R {
     match t.space {
         MemorySpace::Smem => {
@@ -231,6 +198,41 @@ fn validate_tensor(t: &Tensor) -> R {
         _ => {
             if t.byte_offset.is_some() {
                 return bail("byte_offset is only valid for SMEM tensors");
+            }
+        }
+    }
+    if let Some(Layout::Swizzle(layout)) = t.layout {
+        if t.space != MemorySpace::Smem {
+            return bail("smem swizzle layout is only valid for SMEM tensors");
+        }
+        if t.shape.len() < 2 {
+            return bail("smem swizzle layout requires a tensor rank of at least 2");
+        }
+        if layout.swizzle != Swizzle::None {
+            let rows = t.shape[t.shape.len() - 2];
+            let cols = t.shape[t.shape.len() - 1];
+            let row_bytes = cols
+                .checked_mul(dtype_size_bytes(t.dtype))
+                .ok_or_else(|| err("smem swizzle row byte width overflows usize"))?;
+            let atom_bytes = match layout.swizzle {
+                Swizzle::None => unreachable!(),
+                Swizzle::B32 => 32,
+                Swizzle::B64 => 64,
+                Swizzle::B128 => 128,
+            };
+            if row_bytes < atom_bytes || row_bytes % atom_bytes != 0 {
+                return bail(format!(
+                    "smem swizzle {:?} requires the final row to be a multiple of \
+                     {atom_bytes} bytes, got {row_bytes}",
+                    layout.swizzle
+                ));
+            }
+            if rows == 0 || rows % 8 != 0 {
+                return bail(format!(
+                    "smem swizzle {:?} requires the penultimate dimension to be a \
+                     positive multiple of 8, got {rows}",
+                    layout.swizzle
+                ));
             }
         }
     }
@@ -268,22 +270,15 @@ fn validate_slice(s: &TensorSlice, label: &str) -> R {
     Ok(())
 }
 
-/// `_check_slice_covers_shape`: a static slice dim may not be smaller than the
-/// requested shape dim.
-/// All-static slice dims, or None if any dim is a runtime scalar.
-fn static_slice_shape(s: &TensorSlice) -> Option<Vec<usize>> {
-    s.shape
-        .iter()
-        .map(|d| static_int(d).map(|v| v as usize))
-        .collect()
-}
-
-/// `TmemOperand` checks: the address scalars are well-formed, and a constant
+/// `TmemAddr` checks: the address scalars are well-formed, and a constant
 /// lane/column base is in range. (Column-band membership against the live
 /// allocations is the liveness walk's job — see `check_tmem_alloc_bands`.)
-fn validate_tmem_operand(op: &TmemOperand, label: &str) -> R {
+fn validate_tmem_addr(op: &TmemAddr, label: &str) -> R {
     validate_scalar(&op.row)?;
     validate_scalar(&op.col)?;
+    if op.tensor.start_col >= 512 {
+        return bail(format!("{label} tensor start_col must be in [0, 512)"));
+    }
     if let Some(r) = static_int(&op.row) {
         if !(0..128).contains(&r) {
             return bail(format!("{label} row (TMEM lane) must be in [0, 128)"));
@@ -293,17 +288,25 @@ fn validate_tmem_operand(op: &TmemOperand, label: &str) -> R {
         if !(0..512).contains(&c) {
             return bail(format!("{label} col (TMEM column) must be in [0, 512)"));
         }
+        if i64::from(op.tensor.start_col) + c >= 512 {
+            return bail(format!(
+                "{label} start_col + col (TMEM column) must be in [0, 512)"
+            ));
+        }
     }
     Ok(())
 }
 
-/// The cell dtype an MMA A/B operand carries, regardless of which memory it
-/// lives in (SMEM slice dtype, or the TMEM cell interpretation).
-fn mma_operand_dtype(op: &MmaOperand) -> DType {
-    match op {
-        MmaOperand::Slice(s) => s.tensor.dtype,
-        MmaOperand::Tmem(t) => t.dtype,
+/// Recursively validate every scalar embedded in an explicit physical SMEM
+/// tile. Shape/space/bounds checks live in the shared tcgen05 resolver.
+fn validate_smem_tile_scalars(tile: &SmemTile) -> R {
+    validate_tensor(&tile.tensor)?;
+    for index in &tile.prefix_indices {
+        validate_scalar(index)?;
     }
+    validate_scalar(&tile.row_offset)?;
+    validate_scalar(&tile.col_offset)?;
+    Ok(())
 }
 
 /// The TMEM column-cell span of a `Tcgen05Ld`/`Tcgen05St` atom: 32x32b moves
@@ -317,31 +320,6 @@ fn tmem_operand_lanes_cols(shape: &LdStShape, num: u32) -> Option<usize> {
         LdStShape::B16x256 => 8,
     };
     usize::try_from(num).ok().map(|n| n * per)
-}
-
-/// `check_slice_covers` against the slice's TRAILING dims: a staged operand is
-/// a (1, ..., rows, k) box of a stage-major tensor; the leading dims must be
-/// unit and the trailing dims must cover the requested tile.
-fn check_slice_covers_trailing(s: &TensorSlice, shape: &[usize], label: &str) -> R {
-    if s.shape.len() < shape.len() {
-        return bail(format!("{label} does not cover requested shape"));
-    }
-    let lead = s.shape.len() - shape.len();
-    for dim in &s.shape[..lead] {
-        if let Some(d) = static_int(dim) {
-            if d != 1 {
-                return bail(format!("{label} staged operand leading dims must be 1"));
-            }
-        }
-    }
-    for (slice_dim, &shape_dim) in s.shape[lead..].iter().zip(shape.iter()) {
-        if let Some(d) = static_int(slice_dim) {
-            if (d as usize) < shape_dim {
-                return bail(format!("{label} does not cover requested shape"));
-            }
-        }
-    }
-    Ok(())
 }
 
 fn check_slice_covers(s: &TensorSlice, shape: &[usize], label: &str) -> R {
@@ -795,17 +773,6 @@ fn validate_stmt(s: &Stmt) -> R {
             validate_tma_gmem_shape(gmem_shape, &src.shape, shape, "tma_load")?;
             check_slice_covers(dst, shape, "tma_load dst slice")?;
             check_cta_group(*cta_group, "tma_load cta_group")?;
-            // cta_group=2 + multicast + a shared (peer-referenced) mbar: the
-            // sim's tx accounting completes once per UNIQUE barrier cell, but
-            // hardware completes once per multicast DESTINATION — no single
-            // expect_tx count satisfies both on a shared barrier (the nvfp4
-            // SFB note), so the combination is unmodelable.
-            if *cta_group == 2 && multicast_cta_mask.is_some() && mbar.remote_coord.is_some() {
-                return bail(
-                    "tma_load cta_group=2 multicast with a peer-referenced (shared) \
-                     mbar is not modeled",
-                );
-            }
         }
         Stmt::TmaStore {
             dst,
@@ -920,324 +887,53 @@ fn validate_stmt(s: &Stmt) -> R {
             dst,
             a,
             b,
-            m,
-            n,
-            k,
+            mma_m,
+            mma_n,
+            format,
+            block_scale,
             accum,
             trans_a,
             trans_b,
+            ws,
             cta_group,
-            sfa,
-            sfb,
-            sf_byte,
-            sf_e4m3,
-            sf_block,
-            a_fp4,
-            b_fp4,
-            lane_align,
         } => {
-            validate_tmem_operand(dst, "tcgen05_mma dst")?;
-            // The full-datapath accumulator layouts are lane-anchored: the dst
-            // base lane must be 0 (checked statically when the address is a
-            // constant; the interpreter re-checks the evaluated value).
-            if let Some(r) = static_int(&dst.row) {
-                if r != 0 {
-                    return bail("tcgen05_mma dst row (lane) must be 0");
-                }
-            }
+            validate_tmem_addr(dst, "tcgen05_mma dst")?;
             validate_scalar(accum)?;
-            let validate_ab = |op: &MmaOperand, lbl: &str| -> R {
-                match op {
-                    MmaOperand::Slice(s) => {
-                        validate_slice(s, &format!("tcgen05_mma {lbl}"))?;
-                        if s.tensor.space != MemorySpace::Smem {
-                            return bail(format!(
-                                "tcgen05_mma {lbl} slice operand must be SMEM \
-                                 (a TMEM operand is a TmemOperand)"
-                            ));
-                        }
-                    }
-                    MmaOperand::Tmem(t) => {
-                        validate_tmem_operand(t, &format!("tcgen05_mma {lbl}"))?;
-                    }
-                }
-                Ok(())
-            };
-            validate_ab(a, "a")?;
-            validate_ab(b, "b")?;
-            check_cta_group(*cta_group, "tcgen05_mma cta_group")?;
-            // k is coupled to the operand kind (the PTX tcgen05.mma instruction
-            // shapes): dense f16/bf16 is any positive multiple of the k=16 atom
-            // — one IR MMA with k = 16q means the q atomic k=16 MMAs accumulated
-            // in order (canon issues ONE full-K gemm_async per k-tile; TVM
-            // lowers it to the atom sequence on hardware) — the block-scaled f8
-            // instruction is k=32 (k=128/256 stay valid as the explicit folded
-            // k-tile abstraction, but ONLY with scale vectors); fp4 (mxf4) is
-            // k in {64, 128, 256}. Anything else was silently computed with a k
-            // the silicon does not have.
-            check_mma_shape(
-                *m,
-                *n,
-                *k,
+            validate_smem_tile_scalars(b)?;
+            match a {
+                MmaAOperand::Smem(tile) => validate_smem_tile_scalars(tile)?,
+                MmaAOperand::Tmem { addr, .. } => validate_tmem_addr(addr, "tcgen05_mma a")?,
+            }
+            if let Some(scale) = block_scale {
+                validate_tmem_addr(&scale.sfa, "tcgen05_mma sfa")?;
+                validate_tmem_addr(&scale.sfb, "tcgen05_mma sfb")?;
+            }
+            resolve_tcgen05_mma(
+                dst,
+                a,
+                b,
+                *mma_m,
+                *mma_n,
+                *format,
+                block_scale.as_ref(),
+                *trans_a,
+                *trans_b,
+                *ws,
                 *cta_group,
-                (sfa.is_some() || sfb.is_some()) && !*a_fp4,
-            )?;
-            let a_dtype = mma_operand_dtype(a);
-            let b_dtype = mma_operand_dtype(b);
-            if *a_fp4 || *b_fp4 {
-                if !matches!(*k, 64 | 128 | 256) {
-                    return bail("tcgen05_mma fp4 (mxf4) k must be 64, 128, or 256");
-                }
-            } else if sfa.is_some() || sfb.is_some() {
-                if !matches!(*k, 32 | 128 | 256) {
-                    return bail("tcgen05_mma block-scaled f8 k must be 32, 128, or 256");
-                }
-            } else if *k % 16 != 0 && a_dtype != DType::F8E4M3 && b_dtype != DType::F8E4M3 {
-                return bail(
-                    "tcgen05_mma dense f16/bf16 k must be a positive multiple of 16 \
-                     (an ordered run of k/16 atomic MMAs — the full-K gemm_async)",
-                );
-            }
-            if *lane_align != 0 && *lane_align != 16 {
-                return bail("tcgen05_mma lane_align must be 0 or 16");
-            }
-            // lane_align shifts the accumulator lane field and exists only for
-            // the cta_group=1 m=64 (Layout F) accumulator; the interpreter's
-            // mma_blocks/inplace_geometry reject every other layout at run
-            // time — reject it here instead of after the IR was trusted.
-            if *lane_align != 0 && !(*cta_group == 1 && *m == 64) {
-                return bail("tcgen05_mma lane_align != 0 requires cta_group=1 and m=64");
-            }
-            // A TMEM operand is the value model's accumulator-readback
-            // abstraction (the GDN state read straight out of TMEM). It is
-            // exact only for the dtypes the TMEM readback path models —
-            // f16/bf16 (packed halves) and f32; an f8e4m3 or packed-fp4 (u8)
-            // TMEM operand has no modeled readback semantics.
-            for (op, lbl) in [(a, "a"), (b, "b")] {
-                if let MmaOperand::Tmem(t) = op {
-                    if !matches!(t.dtype, DType::F16 | DType::Bf16 | DType::F32) {
-                        return bail(format!(
-                            "tcgen05_mma {lbl} TMEM operand dtype must be f16, bf16, or f32"
-                        ));
-                    }
-                }
-            }
-            // A TMEM operand may be the f32 accumulator read directly as the MMA
-            // operand (e.g. the GDN state S, kept in TMEM); the value model reads
-            // every operand as logical f32, so an f32 TMEM operand is exact.
-            let tmem_f32 =
-                |op: &MmaOperand| matches!(op, MmaOperand::Tmem(t) if t.dtype == DType::F32);
-            if *a_fp4 || *b_fp4 {
-                // NVFP4: operands are e2m1 fp4 packed 2-per-u8; both must be fp4.
-                if !*a_fp4 || !*b_fp4 {
-                    return bail("tcgen05_mma a_fp4 and b_fp4 must be set together");
-                }
-                if a_dtype != DType::U8 || b_dtype != DType::U8 {
-                    return bail("tcgen05_mma fp4 operands must be u8 (2 packed e2m1 per byte)");
-                }
-                // PTX Table 54: the mxf4* shapes have no transposed form and
-                // exist only as (cta_group=1, M=128) or (cta_group=2, M=256);
-                // the value model's fp4 path is the in-place SMEM datapath, so
-                // a TMEM fp4 operand is out too (the TMEM-operand dtype rule
-                // above already rejects u8 TMEM operands with that message).
-                if *trans_a || *trans_b {
-                    return bail("tcgen05_mma fp4 (mxf4) does not support trans_a/trans_b");
-                }
-                if !((*cta_group == 1 && *m == 128) || (*cta_group == 2 && *m == 256)) {
-                    return bail(
-                        "tcgen05_mma fp4 requires (cta_group=1, m=128) or (cta_group=2, m=256)",
-                    );
-                }
-            } else {
-                // Operands are f16/bf16/f8e4m3 one-per-slot, OR an f32 TMEM operand
-                // (e.g. the GDN state S read directly out of TMEM).
-                let ok_dtype = |op: &MmaOperand| {
-                    matches!(
-                        mma_operand_dtype(op),
-                        DType::F16 | DType::Bf16 | DType::F8E4M3
-                    ) || tmem_f32(op)
-                };
-                if !ok_dtype(a) || !ok_dtype(b) {
-                    return bail(
-                        "tcgen05_mma operand dtype must be f16, bf16, f8e4m3, or an f32 TMEM operand",
-                    );
-                }
-                // Operand dtypes must match, EXCEPT an f16/bf16 operand paired
-                // with an f32 TMEM operand (the accumulator-readback
-                // abstraction; both materialize to f32 in value mode). Any
-                // other mix — e.g. f8e4m3 against an f32 TMEM operand — has no
-                // modeled (or hardware) semantics.
-                if a_dtype != b_dtype {
-                    let f32_tmem_with_b16 = |tmem_side: &MmaOperand, other: &MmaOperand| {
-                        tmem_f32(tmem_side)
-                            && matches!(mma_operand_dtype(other), DType::F16 | DType::Bf16)
-                    };
-                    if !f32_tmem_with_b16(a, b) && !f32_tmem_with_b16(b, a) {
-                        return bail(
-                            "tcgen05_mma a and b operand dtype must match \
-                             (an f32 TMEM operand mixes only with f16/bf16)",
-                        );
-                    }
-                }
-            }
-            if dst.dtype != DType::F32 {
-                return bail("tcgen05_mma dst dtype must be f32");
-            }
-            // fp4 operands are packed 2-per-byte, so the K (contraction) extent in the
-            // SMEM tile is k/2 bytes, not k elements.
-            let a_rows = if *cta_group == 1 { *m } else { m / 2 };
-            let b_rows = if *cta_group == 1 { *n } else { n / 2 };
-            let a_kdim = if *a_fp4 {
-                (*k / 2) as usize
-            } else {
-                *k as usize
-            };
-            let b_kdim = if *b_fp4 {
-                (*k / 2) as usize
-            } else {
-                *k as usize
-            };
-            let a_shape = if *trans_a {
-                [a_kdim, a_rows as usize]
-            } else {
-                [a_rows as usize, a_kdim]
-            };
-            let b_shape = if *trans_b {
-                [b_kdim, b_rows as usize]
-            } else {
-                [b_rows as usize, b_kdim]
-            };
-            // SMEM operands keep the slice-coverage check; a TMEM operand's
-            // extent is implied by m/n/k and verified against the live TMEM
-            // allocation bands (walk 4).
-            if let MmaOperand::Slice(s) = a {
-                check_slice_covers_trailing(s, &a_shape, "tcgen05_mma a")?;
-            }
-            if let MmaOperand::Slice(s) = b {
-                check_slice_covers_trailing(s, &b_shape, "tcgen05_mma b")?;
-            }
-            match (sfa, sfb) {
-                (None, None) => {
-                    if a_dtype == DType::F8E4M3 {
-                        return bail("tcgen05_mma f8e4m3 operands require sfa/sfb scale vectors");
-                    }
-                    if *sf_e4m3 || *sf_block != 0 {
-                        return bail("tcgen05_mma sf_e4m3/sf_block require sfa/sfb scale vectors");
-                    }
-                }
-                (Some(sfa), Some(sfb)) => {
-                    // PTX: the block-scaled kinds (mxf8f6f4/mxf4) with
-                    // cta_group::1 exist only at M=128 — an m=64 cg1 MMA has no
-                    // scale mode, so sfa/sfb there is unemittable.
-                    if *cta_group == 1 && *m == 64 {
-                        return bail(
-                            "tcgen05_mma m=64 cta_group=1 does not support block-scaled \
-                             (sfa/sfb) modes",
-                        );
-                    }
-                    // UE8M0 path requires f8e4m3 operands; NVFP4 (sf_e4m3) uses fp4 operands.
-                    if !*sf_e4m3 && (a_dtype != DType::F8E4M3 || b_dtype != DType::F8E4M3) {
-                        return bail("tcgen05_mma sfa/sfb require f8e4m3 operands");
-                    }
-                    if *sf_e4m3 && !*a_fp4 {
-                        return bail("tcgen05_mma sf_e4m3 (NVFP4) requires fp4 operands");
-                    }
-                    if *sf_byte >= 4 {
-                        return bail("tcgen05_mma sf_byte must be in 0..4");
-                    }
-                    // The NVFP4 e4m3 decode reads scale bytes 0..k/16 of each
-                    // cell — sf_byte exists only in the packed-UE8M0 (fp8)
-                    // layout and is silently ignored on the e4m3 path.
-                    if *sf_e4m3 && *sf_byte != 0 {
-                        return bail("tcgen05_mma sf_byte must be 0 for sf_e4m3 (NVFP4) scales");
-                    }
-                    // The two supported scale modes fix sf_block: nvfp4 block-16
-                    // (sf_e4m3) or fp8 per-row (sf_block=0). Anything else would be
-                    // silently mis-divided by the k/sf_block block math downstream.
-                    match (*sf_e4m3, *sf_block) {
-                        (true, 16) => {
-                            if *k % 16 != 0 {
-                                return bail(
-                                    "tcgen05_mma nvfp4 k must be a multiple of sf_block=16",
-                                );
-                            }
-                        }
-                        (true, _) => return bail("tcgen05_mma sf_e4m3 requires sf_block=16"),
-                        (false, 0) => {}
-                        (false, _) => {
-                            return bail("tcgen05_mma UE8M0 (fp8) mode requires sf_block=0")
-                        }
-                    }
-                    for (sf, label) in [(sfa, "tcgen05_mma sfa"), (sfb, "tcgen05_mma sfb")] {
-                        validate_tmem_operand(sf, label)?;
-                        if let Some(r) = static_int(&sf.row) {
-                            if r != 0 {
-                                return bail(format!("{label} row (lane) must be 0"));
-                            }
-                        }
-                        // UE8M0 packs 4 exponent bytes per u32 cell; NVFP4 holds e4m3 bytes.
-                        let want = if *sf_e4m3 { DType::F8E4M3 } else { DType::U32 };
-                        if sf.dtype != want {
-                            return bail(format!(
-                                "{label} dtype must be {} ({})",
-                                if *sf_e4m3 { "e4m3" } else { "u32" },
-                                if *sf_e4m3 {
-                                    "nvfp4 scales"
-                                } else {
-                                    "4 packed UE8M0 bytes"
-                                }
-                            ));
-                        }
-                    }
-                }
-                _ => return bail("tcgen05_mma sfa and sfb must be provided together"),
-            }
+            )
+            .map_err(|error| err(error.message))?;
         }
         Stmt::Tcgen05Cp {
             dst,
             src,
+            shape,
+            multicast,
             cta_group,
         } => {
-            validate_tmem_operand(dst, "tcgen05_cp dst")?;
-            if let Some(r) = static_int(&dst.row) {
-                if r != 0 {
-                    return bail("tcgen05_cp dst row (lane) must be 0");
-                }
-            }
-            validate_slice(src, "tcgen05_cp src")?;
-            check_cta_group(*cta_group, "tcgen05_cp cta_group")?;
-            if src.tensor.space != MemorySpace::Smem {
-                return bail("tcgen05_cp src must be SMEM");
-            }
-            // dst/src dtype must MATCH: the u32 path writes whole cells and the
-            // e4m3 path writes raw scale bytes — a mixed pair (e.g. an e4m3 src
-            // into a u32 dst) would write bytes into word cells (write_sf_byte
-            // carries no dtype check).
-            if dst.dtype != src.tensor.dtype {
-                return bail("tcgen05_cp dst and src dtype must match");
-            }
-            // UE8M0 path packs scale bytes as u32 cells; NVFP4 moves e4m3 scale bytes.
-            if !matches!(dst.dtype, DType::U32 | DType::F8E4M3) {
-                return bail("tcgen05_cp moves u32 (UE8M0) or e4m3 (nvfp4) scale cells");
-            }
-            let Some(src_shape) = static_slice_shape(src) else {
-                return bail("tcgen05_cp slice shapes must be static");
-            };
-            if src.tensor.dtype == DType::F8E4M3 {
-                // NVFP4: the src's innermost dim is the per-row SF-block count;
-                // rows ≥ 128 fold into TMEM column super-blocks of that width.
-                let nblocks = *src_shape.last().unwrap_or(&0);
-                if nblocks == 0 {
-                    return bail("tcgen05_cp e4m3 src innermost SF-block dim must be non-zero");
-                }
-            } else {
-                // UE8M0 u32: the value model enumerates the src flat into
-                // (lane, col) cells, so it must be a single effective vector —
-                // a 2-D tile's (row, col) reading is not what the copy models.
-                if src_shape.iter().filter(|&&d| d != 1).count() > 1 {
-                    return bail("tcgen05_cp u32 src must be effectively 1-D");
-                }
-            }
+            validate_tmem_addr(dst, "tcgen05_cp dst")?;
+            validate_smem_tile_scalars(src)?;
+            resolve_tcgen05_cp(dst, src, *shape, *multicast, *cta_group)
+                .map_err(|error| err(error.message))?;
         }
         Stmt::Tcgen05Commit {
             mbar,
@@ -1264,12 +960,9 @@ fn validate_stmt(s: &Stmt) -> R {
             if dst.tensor.space != MemorySpace::Reg {
                 return bail("tcgen05_ld dst must be REG");
             }
-            validate_tmem_operand(src, "tcgen05_ld src")?;
-            if dst.tensor.dtype != src.dtype {
-                return bail("tcgen05_ld REG and TMEM operands must share a dtype");
-            }
+            validate_tmem_addr(src, "tcgen05_ld src")?;
             if !matches!(
-                src.dtype,
+                dst.tensor.dtype,
                 DType::F16 | DType::Bf16 | DType::F32 | DType::I32 | DType::U32
             ) {
                 return bail("tcgen05_ld dtype must be f16, bf16, f32, i32, or u32");
@@ -1291,15 +984,12 @@ fn validate_stmt(s: &Stmt) -> R {
             num,
         } => {
             validate_slice(src, "tcgen05_st src")?;
-            validate_tmem_operand(dst, "tcgen05_st dst")?;
+            validate_tmem_addr(dst, "tcgen05_st dst")?;
             if src.tensor.space != MemorySpace::Reg {
                 return bail("tcgen05_st src must be REG");
             }
-            if dst.dtype != src.tensor.dtype {
-                return bail("tcgen05_st REG and TMEM operands must share a dtype");
-            }
             if !matches!(
-                dst.dtype,
+                src.tensor.dtype,
                 DType::F16 | DType::Bf16 | DType::F32 | DType::I32 | DType::U32
             ) {
                 return bail("tcgen05_st dtype must be f16, bf16, f32, i32, or u32");
@@ -1620,9 +1310,12 @@ fn validate_stmt(s: &Stmt) -> R {
                 "reg_combine_int_frac_ex2",
             )?;
         }
-        Stmt::RegCvt { dst, src, .. } => {
+        Stmt::RegCvt { dst, src, rounding } => {
             validate_slice(dst, "reg_cvt dst")?;
             validate_slice(src, "reg_cvt src")?;
+            if *rounding != Rounding::Rn {
+                return bail("reg_cvt rounding=rm has no TIRx lowering");
+            }
             if dst.tensor.space != MemorySpace::Reg || src.tensor.space != MemorySpace::Reg {
                 return bail("reg_cvt dst and src must be REG");
             }
@@ -2285,9 +1978,9 @@ fn check_cta_group_consistency(kernel: &Kernel) -> R {
 fn check_tmem_alloc_bands(kernel: &Kernel) -> R {
     /// One TMEM operand use with its static (lane, column) extent, when known.
     struct Use<'a> {
-        op: &'a TmemOperand,
-        rows: Option<usize>,
-        cols: Option<usize>,
+        addr: &'a TmemAddr,
+        max_lane_offset: Option<u32>,
+        cols: Option<u32>,
         label: &'static str,
     }
 
@@ -2298,116 +1991,96 @@ fn check_tmem_alloc_bands(kernel: &Kernel) -> R {
                 dst,
                 a,
                 b,
-                m,
-                n,
-                k,
+                mma_m,
+                mma_n,
+                format,
+                block_scale,
                 trans_a,
                 trans_b,
+                ws,
                 cta_group,
-                sfa,
-                sfb,
-                sf_block,
                 ..
             } => {
-                // The accumulator is f32: one cell per (lane, n-column). Layout B
-                // (cta_group=2, m=128) splits n in half per CTA — the two n-halves
-                // stack into the lower/upper 64 lanes over the SAME column range,
-                // so the per-CTA column span is ceil(n/2), not n (mma_blocks).
-                let dst_cols = if *cta_group == 2 && *m == 128 {
-                    (*n as usize).div_ceil(2)
-                } else {
-                    *n as usize
-                };
+                let resolved = resolve_tcgen05_mma(
+                    dst,
+                    a,
+                    b,
+                    *mma_m,
+                    *mma_n,
+                    *format,
+                    block_scale.as_ref(),
+                    *trans_a,
+                    *trans_b,
+                    *ws,
+                    *cta_group,
+                )
+                .map_err(|error| err(error.message))?;
                 uses.push(Use {
-                    op: dst,
-                    rows: None,
-                    cols: Some(dst_cols),
+                    addr: dst,
+                    max_lane_offset: Some(resolved.d.max_lane_offset),
+                    cols: Some(resolved.d.physical_cols),
                     label: "tcgen05_mma dst",
                 });
-                let kk = *k as usize;
-                let a_rows = (if *cta_group == 1 { *m } else { m / 2 }) as usize;
-                let b_rows = (if *cta_group == 1 { *n } else { n / 2 }) as usize;
-                for (op, rows, cols, label) in [
-                    (
-                        a,
-                        if *trans_a { kk } else { a_rows },
-                        if *trans_a { a_rows } else { kk },
-                        "tcgen05_mma a",
-                    ),
-                    (
-                        b,
-                        if *trans_b { kk } else { b_rows },
-                        if *trans_b { b_rows } else { kk },
-                        "tcgen05_mma b",
-                    ),
-                ] {
-                    if let MmaOperand::Tmem(t) = op {
-                        let cells = match t.dtype {
-                            // f16/bf16 pack two elements per 32-bit cell.
-                            DType::F16 | DType::Bf16 => {
-                                if cols % 2 != 0 {
-                                    return Err(err(format!(
-                                        "{label} packed-half TMEM operand needs an even column extent"
-                                    )));
-                                }
-                                cols / 2
-                            }
-                            _ => cols,
-                        };
-                        uses.push(Use {
-                            op: t,
-                            rows: Some(rows),
-                            cols: Some(cells),
-                            label,
-                        });
-                    }
+                if let (MmaAOperand::Tmem { addr, .. }, Some(footprint)) = (a, resolved.a_tmem) {
+                    uses.push(Use {
+                        addr,
+                        max_lane_offset: Some(footprint.max_lane_offset),
+                        cols: Some(footprint.physical_cols),
+                        label: "tcgen05_mma a",
+                    });
                 }
-                // Scale vectors: rows fold into 128-lane super-blocks of
-                // `nblocks` columns each (see read_scale_blocks).
-                let nblocks = if *sf_block == 0 {
-                    1
-                } else {
-                    (*k / *sf_block) as usize
-                };
-                for (sf, rows, label) in [
-                    (sfa, a_rows, "tcgen05_mma sfa"),
-                    (sfb, *n as usize, "tcgen05_mma sfb"),
-                ] {
-                    if let Some(sf) = sf {
+                if let Some(scale) = block_scale {
+                    for (addr, footprint, label) in [
+                        (
+                            &scale.sfa,
+                            resolved.sfa.expect("resolved block-scale SFA").footprint,
+                            "tcgen05_mma sfa",
+                        ),
+                        (
+                            &scale.sfb,
+                            resolved.sfb.expect("resolved block-scale SFB").footprint,
+                            "tcgen05_mma sfb",
+                        ),
+                    ] {
                         uses.push(Use {
-                            op: sf,
-                            rows: None,
-                            cols: Some(rows.div_ceil(128) * nblocks),
+                            addr,
+                            max_lane_offset: Some(footprint.max_lane_offset),
+                            cols: Some(footprint.physical_cols),
                             label,
                         });
                     }
                 }
             }
-            Stmt::Tcgen05Cp { dst, src, .. } => {
-                // The copy enumerates the src tile lane-major from (lane 0,
-                // col): `count` elements land in ceil(count / 128) columns.
-                let cols = static_shape_numel(&src.shape).map(|e| e.div_ceil(128));
+            Stmt::Tcgen05Cp {
+                dst,
+                src,
+                shape,
+                multicast,
+                cta_group,
+            } => {
+                let resolved = resolve_tcgen05_cp(dst, src, *shape, *multicast, *cta_group)
+                    .map_err(|error| err(error.message))?;
                 uses.push(Use {
-                    op: dst,
-                    rows: None,
-                    cols,
+                    addr: dst,
+                    max_lane_offset: Some(resolved.target.max_lane_offset),
+                    cols: Some(resolved.target.physical_cols),
                     label: "tcgen05_cp dst",
                 });
             }
             Stmt::Tcgen05Ld {
                 src, shape, num, ..
             } => uses.push(Use {
-                op: src,
-                rows: None,
-                cols: tmem_operand_lanes_cols(shape, *num),
+                addr: src,
+                max_lane_offset: None,
+                cols: tmem_operand_lanes_cols(shape, *num).and_then(|cols| cols.try_into().ok()),
                 label: "tcgen05_ld src",
             }),
             Stmt::Tcgen05St {
                 dst, shape, num, ..
             } => uses.push(Use {
-                op: dst,
-                rows: None,
-                cols: tmem_operand_lanes_cols(shape, *num),
+                addr: dst,
+                max_lane_offset: None,
+                cols: tmem_operand_lanes_cols(shape, *num).and_then(|cols| cols.try_into().ok()),
                 label: "tcgen05_st dst",
             }),
             _ => {}
@@ -2505,17 +2178,19 @@ fn check_tmem_alloc_bands(kernel: &Kernel) -> R {
                 _ => {}
             }
             for u in tmem_uses(s)? {
-                if let (Some(r), Some(rows)) = (static_int(&u.op.row), u.rows) {
-                    if r < 0 || r + rows as i64 > 128 {
+                if let (Some(r), Some(max_lane_offset)) =
+                    (static_int(&u.addr.row), u.max_lane_offset)
+                {
+                    if r < 0 || r + i64::from(max_lane_offset) >= 128 {
                         return bail(format!("{} lane span escapes the 128 TMEM lanes", u.label));
                     }
                 }
-                if let (Some(c), Some(cols)) = (static_int(&u.op.col), u.cols) {
-                    if cols > 0
-                        && !live
-                            .iter()
-                            .any(|&(b, n)| b <= c && c + cols as i64 <= b + n)
-                    {
+                if let (Some(c), Some(cols)) = (static_int(&u.addr.col), u.cols) {
+                    let c = i64::from(u.addr.tensor.start_col)
+                        .checked_add(c)
+                        .ok_or_else(|| err(format!("{} column address overflows i64", u.label)))?;
+                    let cols = i64::from(cols);
+                    if cols > 0 && !live.iter().any(|&(b, n)| b <= c && c + cols <= b + n) {
                         return bail(format!(
                             "{} column span is not inside a live tmem allocation band",
                             u.label
@@ -2592,30 +2267,16 @@ fn check_let_single_assignment(body: &[Stmt]) -> R {
 }
 
 fn check_smem_layout(kernel: &Kernel) -> R {
-    // Physical ranges may overlap. Whether two views can safely reuse bytes is
-    // a live-range / happens-before property, not a static layout property;
-    // this pass has no complete SMEM liveness model. It therefore validates
-    // only representability (alignment, extent, and pool bounds).
+    // Tensor ranges are explicit aliases and may overlap freely. Metadata
+    // cells (mbarriers and the tcgen05 allocation-address cell) may also reuse
+    // those bytes, but only when a structured lexical live-range analysis can
+    // prove that the lifetimes are disjoint. Unknown cross-branch ordering is
+    // deliberately not rejected.
     fn tensor_codegen_alignment(tensor: &Tensor) -> usize {
-        let is_integer = matches!(
-            tensor.dtype,
-            DType::Bool
-                | DType::I8
-                | DType::U8
-                | DType::I16
-                | DType::U16
-                | DType::I32
-                | DType::U32
-                | DType::I64
-                | DType::U64
-        );
-        if (is_integer && tensor.dtype != DType::U8) || tensor.shape.len() < 2 {
-            1
-        } else if matches!(tensor.layout, Some(Layout::Swizzle(_))) {
-            1024
-        } else {
-            128
+        if matches!(tensor.layout, Some(Layout::Swizzle(_))) {
+            return 1024;
         }
+        1
     }
 
     fn check_tensor(tensor: &Tensor, smem_size_bytes: usize) -> R {
@@ -2722,14 +2383,13 @@ fn check_smem_layout(kernel: &Kernel) -> R {
                 }
             }
             Stmt::Tcgen05Mma { a, b, .. } => {
-                // TMEM operands (dst/sfa/sfb, and a/b in TmemOperand form) carry
-                // no tensor; only SMEM operand tiles are pool-bound.
-                for op in [a, b] {
-                    if let MmaOperand::Slice(s) = op {
-                        if seen_tensors.insert(s.tensor.id) {
-                            check_tensor(&s.tensor, smem_size_bytes)?;
-                        }
+                if let MmaAOperand::Smem(tile) = a {
+                    if seen_tensors.insert(tile.tensor.id) {
+                        check_tensor(&tile.tensor, smem_size_bytes)?;
                     }
+                }
+                if seen_tensors.insert(b.tensor.id) {
+                    check_tensor(&b.tensor, smem_size_bytes)?;
                 }
             }
             Stmt::Tcgen05Cp { src, .. } => {
@@ -2812,6 +2472,386 @@ fn check_smem_layout(kernel: &Kernel) -> R {
         Ok(())
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+    enum ObjectId {
+        Tensor(u32),
+        MBar(u32),
+        TmemAddr,
+    }
+
+    #[derive(Clone, PartialEq, Eq, Debug)]
+    struct ByteObject {
+        id: ObjectId,
+        start: usize,
+        end: usize,
+        label: String,
+    }
+
+    #[derive(Clone, Default)]
+    struct UseSummary {
+        tensors: Vec<ByteObject>,
+        mbars: Vec<ByteObject>,
+    }
+
+    #[derive(Clone)]
+    struct TimedObject {
+        object: ByteObject,
+        first: usize,
+        last: usize,
+    }
+
+    fn byte_ranges_overlap(lhs: &ByteObject, rhs: &ByteObject) -> bool {
+        lhs.start < rhs.end && rhs.start < lhs.end
+    }
+
+    fn time_ranges_overlap(lhs: &TimedObject, rhs: &TimedObject) -> bool {
+        lhs.first <= rhs.last && rhs.first <= lhs.last
+    }
+
+    fn push_unique(objects: &mut Vec<ByteObject>, object: ByteObject) {
+        if !objects.iter().any(|existing| existing == &object) {
+            objects.push(object);
+        }
+    }
+
+    fn tensor_object(tensor: &Tensor) -> Result<Option<ByteObject>, IrError> {
+        if tensor.space != MemorySpace::Smem {
+            return Ok(None);
+        }
+        let start = tensor
+            .byte_offset
+            .ok_or_else(|| err("smem tensor byte_offset is required"))?;
+        let extent = smem_extent_bytes(tensor)?;
+        let end = start
+            .checked_add(extent)
+            .ok_or_else(|| err("smem tensor byte range overflows usize"))?;
+        Ok(Some(ByteObject {
+            id: ObjectId::Tensor(tensor.id),
+            start,
+            end,
+            label: format!("smem tensor {}", tensor.id),
+        }))
+    }
+
+    fn push_tensor(summary: &mut UseSummary, tensor: &Tensor) -> Result<(), IrError> {
+        if let Some(object) = tensor_object(tensor)? {
+            push_unique(&mut summary.tensors, object);
+        }
+        Ok(())
+    }
+
+    fn mbar_object(mbar: &MBarRef, stage: Option<&ScalarValue>) -> Result<ByteObject, IrError> {
+        let (start, stages) = match stage.and_then(static_int) {
+            Some(stage) if stage >= 0 && stage < i64::from(mbar.mbar.stages) => {
+                let stage =
+                    usize::try_from(stage).map_err(|_| err("mbar stage does not fit in usize"))?;
+                let delta = stage
+                    .checked_mul(8)
+                    .ok_or_else(|| err("mbar stage byte offset overflows usize"))?;
+                (
+                    mbar.mbar
+                        .byte_offset
+                        .checked_add(delta)
+                        .ok_or_else(|| err("mbar stage byte offset overflows usize"))?,
+                    1usize,
+                )
+            }
+            Some(_) => (
+                mbar.mbar.byte_offset,
+                usize::try_from(mbar.mbar.stages)
+                    .map_err(|_| err("mbar stages do not fit in usize"))?,
+            ),
+            None if stage.is_some() => (
+                mbar.mbar.byte_offset,
+                usize::try_from(mbar.mbar.stages)
+                    .map_err(|_| err("mbar stages do not fit in usize"))?,
+            ),
+            // A phase-less/stage-less instruction names slot zero, not every
+            // slot of a staged barrier.
+            None => (mbar.mbar.byte_offset, 1usize),
+        };
+        let bytes = stages
+            .checked_mul(8)
+            .ok_or_else(|| err("mbar byte extent overflows usize"))?;
+        let end = start
+            .checked_add(bytes)
+            .ok_or_else(|| err("mbar byte range overflows usize"))?;
+        Ok(ByteObject {
+            id: ObjectId::MBar(mbar.mbar.id),
+            start,
+            end,
+            label: format!("mbar {}", mbar.mbar.id),
+        })
+    }
+
+    fn direct_uses(stmt: &Stmt) -> Result<UseSummary, IrError> {
+        let mut summary = UseSummary::default();
+        match stmt {
+            Stmt::ScalarDef {
+                initial: ScalarInitial::Tensor(slice),
+                ..
+            } => push_tensor(&mut summary, &slice.tensor)?,
+            Stmt::StoreScalar { dst, .. } => push_tensor(&mut summary, &dst.tensor)?,
+            Stmt::TmaLoad { dst, .. } => push_tensor(&mut summary, &dst.tensor)?,
+            Stmt::TmaStore { src, .. } => push_tensor(&mut summary, &src.tensor)?,
+            Stmt::CpAsyncBulkS2Cluster { dst, src, .. } => {
+                push_tensor(&mut summary, &dst.tensor)?;
+                push_tensor(&mut summary, &src.tensor)?;
+            }
+            Stmt::Tcgen05Mma { a, b, .. } => {
+                if let MmaAOperand::Smem(tile) = a {
+                    push_tensor(&mut summary, &tile.tensor)?;
+                }
+                push_tensor(&mut summary, &b.tensor)?;
+            }
+            Stmt::Tcgen05Cp { src, .. } => push_tensor(&mut summary, &src.tensor)?,
+            Stmt::ClcTryCancel { handle, .. } | Stmt::ClcQueryCancel { handle, .. } => {
+                push_tensor(&mut summary, handle)?
+            }
+            Stmt::LdMatrix { dst, src, .. } | Stmt::StMatrix { dst, src, .. } => {
+                push_tensor(&mut summary, &dst.tensor)?;
+                push_tensor(&mut summary, &src.tensor)?;
+            }
+            Stmt::RegFill { .. }
+            | Stmt::RegUnary { .. }
+            | Stmt::RegReduce { .. }
+            | Stmt::RegAdd { .. }
+            | Stmt::RegSub { .. }
+            | Stmt::RegMul { .. }
+            | Stmt::RegMax { .. }
+            | Stmt::RegMin { .. }
+            | Stmt::RegBitwise { .. }
+            | Stmt::RegFma { .. }
+            | Stmt::RegCondRescale { .. }
+            | Stmt::RegSoftmaxRescale { .. }
+            | Stmt::RegCausalMask { .. }
+            | Stmt::RegCombineIntFracEx2 { .. }
+            | Stmt::RegCvt { .. }
+            | Stmt::RegLoad { .. }
+            | Stmt::RegStore { .. } => {
+                let mut slices = Vec::new();
+                reg_stmt_slices(stmt, &mut slices);
+                for slice in slices {
+                    push_tensor(&mut summary, &slice.tensor)?;
+                }
+            }
+            _ => {}
+        }
+
+        let mbar_use = match stmt {
+            Stmt::MBarrierInit { mbar, stage, .. }
+            | Stmt::MBarrierArrive { mbar, stage, .. }
+            | Stmt::MBarrierWait { mbar, stage, .. }
+            | Stmt::MBarrierExpectTx { mbar, stage, .. }
+            | Stmt::MBarrierArriveExpectTx { mbar, stage, .. }
+            | Stmt::Tcgen05Commit { mbar, stage, .. }
+            | Stmt::ClcTryCancel { mbar, stage, .. } => Some((mbar, stage.as_ref())),
+            Stmt::TmaLoad {
+                mbar, mbar_stage, ..
+            } => Some((mbar, mbar_stage.as_ref())),
+            Stmt::CpAsyncBulkS2Cluster { mbar, .. } => Some((mbar, None)),
+            _ => None,
+        };
+        if let Some((mbar, stage)) = mbar_use {
+            push_unique(&mut summary.mbars, mbar_object(mbar, stage)?);
+        }
+        Ok(summary)
+    }
+
+    fn merge_summary(dst: &mut UseSummary, src: UseSummary) {
+        for object in src.tensors {
+            push_unique(&mut dst.tensors, object);
+        }
+        for object in src.mbars {
+            push_unique(&mut dst.mbars, object);
+        }
+    }
+
+    fn recursive_uses(stmt: &Stmt) -> Result<UseSummary, IrError> {
+        let mut summary = direct_uses(stmt)?;
+        for body in stmt.child_bodies() {
+            for child in body {
+                merge_summary(&mut summary, recursive_uses(child)?);
+            }
+        }
+        Ok(summary)
+    }
+
+    fn conflict(lhs: &ByteObject, rhs: &ByteObject) -> R {
+        bail(format!(
+            "structured SMEM live ranges overlap: {} [{}, {}) and {} [{}, {})",
+            lhs.label, lhs.start, lhs.end, rhs.label, rhs.start, rhs.end
+        ))
+    }
+
+    fn check_structured_liveness(
+        stmts: &[Stmt],
+        inherited_tensors: &[ByteObject],
+        inherited_metadata: &[ByteObject],
+    ) -> R {
+        let summaries = stmts
+            .iter()
+            .map(recursive_uses)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // A statement that simultaneously touches a tensor and a barrier is
+        // an intrinsic overlap proof even when the barrier was initialized in
+        // another structured branch (TMA and CLC are the common cases).
+        for stmt in stmts {
+            let direct = direct_uses(stmt)?;
+            for tensor in &direct.tensors {
+                for mbar in &direct.mbars {
+                    if byte_ranges_overlap(tensor, mbar) {
+                        return conflict(tensor, mbar);
+                    }
+                }
+            }
+        }
+
+        let mut tensor_intervals: HashMap<u32, TimedObject> = HashMap::new();
+        for (index, summary) in summaries.iter().enumerate() {
+            for tensor in &summary.tensors {
+                let ObjectId::Tensor(id) = tensor.id else {
+                    unreachable!("tensor summary contains only tensors");
+                };
+                tensor_intervals
+                    .entry(id)
+                    .and_modify(|interval| interval.last = index)
+                    .or_insert_with(|| TimedObject {
+                        object: tensor.clone(),
+                        first: index,
+                        last: index,
+                    });
+            }
+        }
+        let tensors = tensor_intervals.into_values().collect::<Vec<_>>();
+
+        let mut metadata = Vec::new();
+        for (index, stmt) in stmts.iter().enumerate() {
+            if let Stmt::MBarrierInit { mbar, stage, .. } = stmt {
+                let object = mbar_object(mbar, stage.as_ref())?;
+                let last = summaries
+                    .iter()
+                    .enumerate()
+                    .skip(index)
+                    .filter(|(_, summary)| {
+                        summary.mbars.iter().any(|other| {
+                            other.id == object.id && byte_ranges_overlap(other, &object)
+                        })
+                    })
+                    .map(|(position, _)| position)
+                    .last()
+                    .unwrap_or(index);
+                metadata.push(TimedObject {
+                    object,
+                    first: index,
+                    last,
+                });
+            }
+            if let Stmt::TmemAlloc {
+                base_col,
+                n_cols,
+                cta_group,
+                addr_byte_offset,
+            } = stmt
+            {
+                let last =
+                    stmts
+                        .iter()
+                        .enumerate()
+                        .skip(index + 1)
+                        .find_map(|(position, candidate)| match candidate {
+                            Stmt::TmemDealloc {
+                                base_col: dealloc_base,
+                                n_cols: dealloc_cols,
+                                cta_group: dealloc_group,
+                            } if dealloc_base == base_col
+                                && dealloc_cols == n_cols
+                                && dealloc_group == cta_group =>
+                            {
+                                Some(position)
+                            }
+                            _ => None,
+                        });
+                if let Some(last) = last {
+                    metadata.push(TimedObject {
+                        object: ByteObject {
+                            id: ObjectId::TmemAddr,
+                            start: *addr_byte_offset,
+                            end: addr_byte_offset + 4,
+                            label: "tmem allocation-address cell".to_string(),
+                        },
+                        first: index,
+                        last,
+                    });
+                }
+            }
+        }
+
+        for meta in &metadata {
+            for tensor in &tensors {
+                if time_ranges_overlap(meta, tensor)
+                    && byte_ranges_overlap(&meta.object, &tensor.object)
+                {
+                    return conflict(&meta.object, &tensor.object);
+                }
+            }
+            for tensor in inherited_tensors {
+                if byte_ranges_overlap(&meta.object, tensor) {
+                    return conflict(&meta.object, tensor);
+                }
+            }
+            for other in inherited_metadata {
+                if meta.object.id != other.id && byte_ranges_overlap(&meta.object, other) {
+                    return conflict(&meta.object, other);
+                }
+            }
+        }
+        for tensor in &tensors {
+            for meta in inherited_metadata {
+                if byte_ranges_overlap(&tensor.object, meta) {
+                    return conflict(&tensor.object, meta);
+                }
+            }
+        }
+        for (index, lhs) in metadata.iter().enumerate() {
+            for rhs in &metadata[index + 1..] {
+                if lhs.object.id != rhs.object.id
+                    && time_ranges_overlap(lhs, rhs)
+                    && byte_ranges_overlap(&lhs.object, &rhs.object)
+                {
+                    return conflict(&lhs.object, &rhs.object);
+                }
+            }
+        }
+
+        for (index, stmt) in stmts.iter().enumerate() {
+            let mut child_tensors = inherited_tensors.to_vec();
+            child_tensors.extend(
+                tensors
+                    .iter()
+                    // A range used only inside this child has its precise
+                    // ordering analyzed recursively.  Inherit only ranges
+                    // proven live across the whole child by uses on both
+                    // sides; treating the child as one coarse event would
+                    // otherwise reject legal sequential reuse inside it.
+                    .filter(|interval| interval.first < index && index < interval.last)
+                    .map(|interval| interval.object.clone()),
+            );
+            let mut child_metadata = inherited_metadata.to_vec();
+            child_metadata.extend(
+                metadata
+                    .iter()
+                    .filter(|interval| interval.first <= index && index <= interval.last)
+                    .map(|interval| interval.object.clone()),
+            );
+            for body in stmt.child_bodies() {
+                check_structured_liveness(body, &child_tensors, &child_metadata)?;
+            }
+        }
+        Ok(())
+    }
+
     let mut seen_tensors = HashSet::new();
     for tensor in &kernel.args {
         if seen_tensors.insert(tensor.id) {
@@ -2829,7 +2869,7 @@ fn check_smem_layout(kernel: &Kernel) -> R {
             &mut tmem_addr_offset,
         )?;
     }
-    Ok(())
+    check_structured_liveness(&kernel.body, &[], &[])
 }
 
 impl Kernel {
@@ -2896,7 +2936,6 @@ mod tests {
             shape,
             layout: None,
             byte_offset: (space == MemorySpace::Smem).then_some(0),
-            reg_frag: None,
         })
     }
 
@@ -2912,11 +2951,18 @@ mod tests {
         }
     }
 
-    fn tmem_op(row: i64, col: i64, dtype: DType) -> TmemOperand {
-        TmemOperand {
-            row: ScalarValue::Int(row),
-            col: ScalarValue::Int(col),
-            dtype,
+    fn tmem_addr(start_col: u32, row: i64, col: i64) -> TmemAddr {
+        TmemTensor { start_col }.at(ScalarValue::Int(row), ScalarValue::Int(col))
+    }
+
+    fn smem_tile(t: &Arc<Tensor>, rows: u32, cols: u32) -> SmemTile {
+        SmemTile {
+            tensor: t.clone(),
+            prefix_indices: vec![],
+            row_offset: ScalarValue::Int(0),
+            col_offset: ScalarValue::Int(0),
+            rows,
+            cols,
         }
     }
 
@@ -2977,27 +3023,21 @@ mod tests {
 
     /// A plain dense cg1 m128 MMA over SMEM operands, accum literal.
     fn dense_mma(k: u32, accum: ScalarValue) -> Stmt {
-        let a = tensor(1, MemorySpace::Smem, DType::F16, vec![128, 256]);
-        let b = tensor(2, MemorySpace::Smem, DType::F16, vec![256, 256]);
+        let a = tensor(1, MemorySpace::Smem, DType::F16, vec![128, k as usize]);
+        let b = tensor(2, MemorySpace::Smem, DType::F16, vec![256, k as usize]);
         Stmt::Tcgen05Mma {
-            dst: tmem_op(0, 0, DType::F32),
-            a: MmaOperand::Slice(full_slice(&a)),
-            b: MmaOperand::Slice(full_slice(&b)),
-            m: 128,
-            n: 256,
-            k,
+            dst: tmem_addr(0, 0, 0),
+            a: MmaAOperand::Smem(smem_tile(&a, 128, k)),
+            b: smem_tile(&b, 256, k),
+            mma_m: 128,
+            mma_n: 256,
+            format: MmaElemFormat::F16,
+            block_scale: None,
             accum,
             trans_a: false,
             trans_b: false,
+            ws: false,
             cta_group: 1,
-            sfa: None,
-            sfb: None,
-            sf_byte: 0,
-            sf_e4m3: false,
-            sf_block: 0,
-            a_fp4: false,
-            b_fp4: false,
-            lane_align: 0,
         }
     }
 
@@ -3039,7 +3079,7 @@ mod tests {
         let e = kernel(tmem_body(vec![dense_mma(17, ScalarValue::Int(0))]))
             .validate()
             .unwrap_err();
-        assert!(e.message.contains("multiple of 16"), "{}", e.message);
+        assert!(e.message.contains("multiple of mma_k=16"), "{}", e.message);
         // k=32 dense IS full-K (two k=16 atoms accumulated in order); the f8
         // block-scaled instruction at k=32 is gated by the sfa/sfb rules, not
         // the dense k rule.
@@ -3065,209 +3105,100 @@ mod tests {
         assert!(kernel(body).validate().is_ok());
     }
 
-    fn block_scaled_mma(m: u32, n: u32, k: u32, sf_byte: u8, lane_align: u8) -> Stmt {
-        let a = tensor(1, MemorySpace::Smem, DType::F8E4M3, vec![128, 256]);
-        let b = tensor(2, MemorySpace::Smem, DType::F8E4M3, vec![256, 256]);
+    fn fp4_mma_new(trans_b: bool) -> Stmt {
+        let a = tensor(20, MemorySpace::Smem, DType::U8, vec![128, 32]);
+        let b_shape = if trans_b {
+            vec![32, 128]
+        } else {
+            vec![128, 32]
+        };
+        let b = tensor(21, MemorySpace::Smem, DType::U8, b_shape.clone());
         Stmt::Tcgen05Mma {
-            dst: tmem_op(0, 0, DType::F32),
-            a: MmaOperand::Slice(full_slice(&a)),
-            b: MmaOperand::Slice(full_slice(&b)),
-            m,
-            n,
-            k,
-            accum: ScalarValue::Int(1),
-            trans_a: false,
-            trans_b: false,
-            cta_group: 1,
-            sfa: Some(tmem_op(0, 300, DType::U32)),
-            sfb: Some(tmem_op(0, 316, DType::U32)),
-            sf_byte,
-            sf_e4m3: false,
-            sf_block: 0,
-            a_fp4: false,
-            b_fp4: false,
-            lane_align,
-        }
-    }
-
-    #[test]
-    fn block_scaled_f8_k_set_and_sf_byte_rules() {
-        assert!(kernel(tmem_body(vec![elected_if(vec![block_scaled_mma(
-            128, 256, 32, 1, 0
-        )])]))
-        .validate()
-        .is_ok());
-        // folded k-tile forms are valid only with scale vectors.
-        assert!(kernel(tmem_body(vec![elected_if(vec![block_scaled_mma(
-            128, 256, 128, 0, 0
-        )])]))
-        .validate()
-        .is_ok());
-        // m=64 cta_group=1 has no block-scaled instruction (PTX mxf8f6f4 cg1
-        // exists only at M=128).
-        let e = kernel(tmem_body(vec![elected_if(vec![block_scaled_mma(
-            64, 256, 32, 0, 0,
-        )])]))
-        .validate()
-        .unwrap_err();
-        assert!(e.message.contains("m=64 cta_group=1"), "{}", e.message);
-        // sf_byte addresses one of the 4 packed bytes.
-        let e = kernel(tmem_body(vec![elected_if(vec![block_scaled_mma(
-            128, 256, 32, 4, 0,
-        )])]))
-        .validate()
-        .unwrap_err();
-        assert!(e.message.contains("sf_byte"), "{}", e.message);
-    }
-
-    fn fp4_mma(m: u32, k: u32, trans_b: bool, cta_group: u8) -> Stmt {
-        let a = tensor(1, MemorySpace::Smem, DType::U8, vec![256, 128]);
-        let b = tensor(2, MemorySpace::Smem, DType::U8, vec![256, 128]);
-        Stmt::Tcgen05Mma {
-            dst: tmem_op(0, 0, DType::F32),
-            a: MmaOperand::Slice(full_slice(&a)),
-            b: MmaOperand::Slice(full_slice(&b)),
-            m,
-            n: 256,
-            k,
+            dst: tmem_addr(0, 0, 0),
+            a: MmaAOperand::Smem(smem_tile(&a, 128, 32)),
+            b: smem_tile(&b, b_shape[0] as u32, b_shape[1] as u32),
+            mma_m: 128,
+            mma_n: 128,
+            format: MmaElemFormat::F4E2M1,
+            block_scale: Some(BlockScaleSpec {
+                sfa: tmem_addr(256, 0, 0),
+                sfb: tmem_addr(264, 0, 0),
+                sfa_k_offset: 0,
+                sfb_k_offset: 0,
+                scale_format: ScaleFormat::E4M3FN,
+                sf_per_mma: 4,
+                sf_reuse: 1,
+            }),
             accum: ScalarValue::Int(1),
             trans_a: false,
             trans_b,
-            cta_group,
-            sfa: Some(tmem_op(0, 300, DType::F8E4M3)),
-            sfb: Some(tmem_op(0, 316, DType::F8E4M3)),
-            sf_byte: 0,
-            sf_e4m3: true,
-            sf_block: 16,
-            a_fp4: true,
-            b_fp4: true,
-            lane_align: 0,
+            ws: false,
+            cta_group: 1,
         }
     }
 
     #[test]
-    fn fp4_mxf4_shape_transpose_cg_rules() {
-        assert!(kernel(tmem_body(vec![elected_if(vec![fp4_mma(
-            128, 64, false, 1
-        )])]))
-        .validate()
-        .is_ok());
-        // fp4 k must be one of the mxf4 instruction widths.
-        let e = kernel(tmem_body(vec![elected_if(vec![fp4_mma(
-            128, 16, false, 1,
-        )])]))
-        .validate()
-        .unwrap_err();
-        assert!(e.message.contains("fp4 (mxf4) k"), "{}", e.message);
-        // the mxf4 shapes have no transposed form.
-        let e = kernel(tmem_body(vec![elected_if(vec![fp4_mma(128, 64, true, 1)])]))
+    fn fp4_validation_uses_physical_resolver_rules() {
+        assert!(
+            kernel(tmem_body(vec![elected_if(vec![fp4_mma_new(false)])]))
+                .validate()
+                .is_ok()
+        );
+        let e = kernel(tmem_body(vec![elected_if(vec![fp4_mma_new(true)])]))
             .validate()
             .unwrap_err();
         assert!(
-            e.message.contains("does not support trans"),
+            e.message.contains("do not support transpose"),
             "{}",
             e.message
         );
-        // and exist only as (cg1, m=128) / (cg2, m=256).
-        let e = kernel(tmem_body(vec![elected_if(vec![fp4_mma(64, 64, false, 1)])]))
-            .validate()
-            .unwrap_err();
-        assert!(e.message.contains("fp4 requires"), "{}", e.message);
-        // NVFP4 decode reads scale bytes 0..k/16: sf_byte must be 0.
-        let mut bad = fp4_mma(128, 64, false, 1);
-        if let Stmt::Tcgen05Mma { sf_byte, .. } = &mut bad {
-            *sf_byte = 1;
-        }
-        let e = kernel(tmem_body(vec![elected_if(vec![bad])]))
-            .validate()
-            .unwrap_err();
-        assert!(e.message.contains("sf_byte must be 0"), "{}", e.message);
     }
 
-    #[test]
-    fn tmem_operand_dtype_is_narrowed_to_modelled_readback() {
-        // An f32 TMEM operand is the exact accumulator-readback abstraction.
-        let a = tensor(1, MemorySpace::Smem, DType::F16, vec![128, 16]);
-        let mut mma_tmem_a = |a_tmem: TmemOperand| Stmt::Tcgen05Mma {
-            dst: tmem_op(0, 0, DType::F32),
-            a: MmaOperand::Tmem(a_tmem),
-            b: MmaOperand::Slice(full_slice(&tensor(
-                2,
-                MemorySpace::Smem,
-                DType::F16,
-                vec![256, 16],
-            ))),
-            m: 128,
-            n: 256,
-            k: 16,
-            accum: ScalarValue::Int(1),
+    fn tmem_a_mma(form: TmemAForm, start_col: u32) -> Stmt {
+        let b = tensor(22, MemorySpace::Smem, DType::F16, vec![64, 32]);
+        Stmt::Tcgen05Mma {
+            dst: tmem_addr(0, 0, 0),
+            a: MmaAOperand::Tmem {
+                addr: tmem_addr(start_col, 0, 0),
+                form,
+            },
+            b: smem_tile(&b, 64, 32),
+            mma_m: 64,
+            mma_n: 64,
+            format: MmaElemFormat::F16,
+            block_scale: None,
+            accum: ScalarValue::Int(0),
             trans_a: false,
             trans_b: false,
+            ws: true,
             cta_group: 1,
-            sfa: None,
-            sfb: None,
-            sf_byte: 0,
-            sf_e4m3: false,
-            sf_block: 0,
-            a_fp4: false,
-            b_fp4: false,
-            lane_align: 0,
-        };
-        let _ = a;
-        // f32 TMEM operand x f16 SMEM operand: the readback mix is legal.
-        assert!(kernel(tmem_body(vec![elected_if(vec![mma_tmem_a(tmem_op(
-            0,
-            128,
-            DType::F32
-        ))])]))
-        .validate()
-        .is_ok());
-        // a u8 (packed fp4) TMEM operand has no modelled readback semantics.
-        let e = kernel(tmem_body(vec![elected_if(vec![mma_tmem_a(tmem_op(
-            0,
-            128,
-            DType::U8,
-        ))])]))
-        .validate()
-        .unwrap_err();
-        assert!(e.message.contains("TMEM operand dtype"), "{}", e.message);
-        // an f8e4m3 TMEM operand is likewise unmodelled.
-        let e = kernel(tmem_body(vec![elected_if(vec![mma_tmem_a(tmem_op(
-            0,
-            128,
-            DType::F8E4M3,
-        ))])]))
-        .validate()
-        .unwrap_err();
-        assert!(e.message.contains("TMEM operand dtype"), "{}", e.message);
+        }
     }
 
     #[test]
-    fn lane_align_only_m64_cg1() {
-        let mut m = dense_mma(16, ScalarValue::Int(0));
-        if let Stmt::Tcgen05Mma {
-            lane_align, m: mm, ..
-        } = &mut m
-        {
-            *lane_align = 16;
-            *mm = 64;
-        }
-        assert!(kernel(tmem_body(vec![elected_if(vec![m])]))
-            .validate()
-            .is_ok());
-        // lane_align on a full-datapath (m=128) layout is not a hardware shape.
-        let mut m = dense_mma(16, ScalarValue::Int(0));
-        if let Stmt::Tcgen05Mma { lane_align, .. } = &mut m {
-            *lane_align = 16;
-        }
-        let e = kernel(tmem_body(vec![elected_if(vec![m])]))
-            .validate()
-            .unwrap_err();
-        assert!(
-            e.message.contains("lane_align != 0 requires"),
-            "{}",
-            e.message
-        );
+    fn tmem_a_form_and_absolute_band_are_validated() {
+        assert!(kernel(tmem_body(vec![elected_if(vec![tmem_a_mma(
+            TmemAForm::BankBatched,
+            400
+        )])]))
+        .validate()
+        .is_ok());
+
+        let e = kernel(tmem_body(vec![elected_if(vec![tmem_a_mma(
+            TmemAForm::Flat,
+            400,
+        )])]))
+        .validate()
+        .unwrap_err();
+        assert!(e.message.contains("requires BankBatched"), "{}", e.message);
+
+        let e = kernel(tmem_body(vec![elected_if(vec![tmem_a_mma(
+            TmemAForm::BankBatched,
+            500,
+        )])]))
+        .validate()
+        .unwrap_err();
+        assert!(e.message.contains("column footprint"), "{}", e.message);
     }
 
     #[test]
@@ -3381,75 +3312,102 @@ mod tests {
 
     #[test]
     fn tmem_operand_static_spans_must_land_in_a_live_band() {
-        // dst col 400 + 256 columns overruns the 512-column grid's live band.
-        let e = kernel(tmem_body(vec![elected_if({
-            let mut m = dense_mma(16, ScalarValue::Int(0));
-            if let Stmt::Tcgen05Mma { dst, .. } = &mut m {
-                *dst = tmem_op(0, 400, DType::F32);
-            }
-            vec![m]
-        })]))
-        .validate()
-        .unwrap_err();
+        let frag = tensor(1, MemorySpace::Reg, DType::F32, vec![32]);
+        let alloc = warp_if(
+            0,
+            vec![Stmt::TmemAlloc {
+                base_col: 0,
+                n_cols: 64,
+                cta_group: 1,
+                addr_byte_offset: 900_000,
+            }],
+        );
+        // start_col is part of the absolute address: 48 + a 32-column LD
+        // footprint escapes the live [0, 64) band.
+        let ld = Stmt::Tcgen05Ld {
+            dst: full_slice(&frag),
+            src: tmem_addr(48, 0, 0),
+            shape: LdStShape::B32x32,
+            num: 32,
+        };
+        let e = kernel(vec![alloc.clone(), warp_if(0, vec![ld])])
+            .validate()
+            .unwrap_err();
         assert!(
             e.message.contains("not inside a live tmem allocation band"),
             "{}",
             e.message
         );
         // a constant address outside [0, 512) is rejected outright.
-        let e = kernel(tmem_body(vec![elected_if({
-            let mut m = dense_mma(16, ScalarValue::Int(0));
-            if let Stmt::Tcgen05Mma { dst, .. } = &mut m {
-                *dst = tmem_op(0, 512, DType::F32);
-            }
-            vec![m]
-        })]))
-        .validate()
-        .unwrap_err();
+        let ld = Stmt::Tcgen05Ld {
+            dst: full_slice(&frag),
+            src: tmem_addr(0, 0, 512),
+            shape: LdStShape::B32x32,
+            num: 32,
+        };
+        let e = kernel(vec![alloc, warp_if(0, vec![ld])])
+            .validate()
+            .unwrap_err();
         assert!(e.message.contains("col (TMEM column)"), "{}", e.message);
     }
 
     #[test]
     fn tcgen05_cp_dtype_and_layout_rules() {
-        let src_u32 = tensor(1, MemorySpace::Smem, DType::U32, vec![128]);
-        let src_f32 = tensor(2, MemorySpace::Smem, DType::F32, vec![128]);
-        let src_2d = tensor(3, MemorySpace::Smem, DType::U32, vec![8, 16]);
-        let cp = |dst: TmemOperand, src: &Arc<Tensor>| Stmt::Tcgen05Cp {
-            dst,
-            src: full_slice(src),
+        let plain = tensor(0, MemorySpace::Smem, DType::U8, vec![256, 64]);
+        let src = Arc::new(Tensor {
+            id: 1,
+            space: MemorySpace::Smem,
+            dtype: DType::U8,
+            shape: vec![256, 64],
+            layout: Some(Layout::Swizzle(SmemSwizzleLayout {
+                swizzle: Swizzle::B32,
+            })),
+            byte_offset: Some(0),
+        });
+        let cp = |multicast| Stmt::Tcgen05Cp {
+            dst: tmem_addr(300, 0, 0),
+            src: smem_tile(&src, 256, 64),
+            shape: Tcgen05CpShape::B128x256,
+            multicast,
             cta_group: 1,
         };
-        // u32 cells, effectively-1-D src: legal.
+        // The shape names one physical atom; a whole-number multi-atom tile
+        // is legal and its full target span is checked.
         assert!(kernel(tmem_body(vec![elected_if(vec![cp(
-            tmem_op(0, 300, DType::U32),
-            &src_u32
+            Tcgen05CpMulticast::None
         )])]))
         .validate()
         .is_ok());
-        // dst/src dtype must match.
+        let plain_cp = Stmt::Tcgen05Cp {
+            dst: tmem_addr(300, 0, 0),
+            src: smem_tile(&plain, 256, 64),
+            shape: Tcgen05CpShape::B128x256,
+            multicast: Tcgen05CpMulticast::None,
+            cta_group: 1,
+        };
+        let e = kernel(tmem_body(vec![elected_if(vec![plain_cp])]))
+            .validate()
+            .unwrap_err();
+        assert!(e.message.contains("explicit B32"), "{}", e.message);
         let e = kernel(tmem_body(vec![elected_if(vec![cp(
-            tmem_op(0, 300, DType::U32),
-            &src_f32,
+            Tcgen05CpMulticast::Warp4,
         )])]))
         .validate()
         .unwrap_err();
-        assert!(e.message.contains("dtype must match"), "{}", e.message);
-        // a 2-D u32 src is not the single effective vector the copy models.
-        let e = kernel(tmem_body(vec![elected_if(vec![cp(
-            tmem_op(0, 300, DType::U32),
-            &src_2d,
-        )])]))
-        .validate()
-        .unwrap_err();
-        assert!(e.message.contains("effectively 1-D"), "{}", e.message);
-        // only u32 (UE8M0) or e4m3 (nvfp4) scale cells move through cp.
-        let e = kernel(tmem_body(vec![elected_if(vec![cp(
-            tmem_op(0, 300, DType::F32),
-            &src_f32,
-        )])]))
-        .validate()
-        .unwrap_err();
-        assert!(e.message.contains("scale cells"), "{}", e.message);
+        assert!(e.message.contains("illegal"), "{}", e.message);
+
+        let partial = tensor(2, MemorySpace::Smem, DType::U8, vec![192, 32]);
+        let bad = Stmt::Tcgen05Cp {
+            dst: tmem_addr(300, 0, 0),
+            src: smem_tile(&partial, 192, 32),
+            shape: Tcgen05CpShape::B128x256,
+            multicast: Tcgen05CpMulticast::None,
+            cta_group: 1,
+        };
+        let e = kernel(tmem_body(vec![elected_if(vec![bad])]))
+            .validate()
+            .unwrap_err();
+        assert!(e.message.contains("multiple of 128"), "{}", e.message);
     }
 
     #[test]
@@ -3457,7 +3415,7 @@ mod tests {
         let frag = tensor(1, MemorySpace::Reg, DType::F32, vec![32]);
         let ld = Stmt::Tcgen05Ld {
             dst: full_slice(&frag),
-            src: tmem_op(0, 0, DType::F32),
+            src: tmem_addr(0, 0, 0),
             shape: LdStShape::B32x32,
             num: 32,
         };
@@ -3465,7 +3423,7 @@ mod tests {
         // a TMEM operand lane base outside [0, 128) fails closed.
         let bad = Stmt::Tcgen05Ld {
             dst: full_slice(&frag),
-            src: tmem_op(128, 0, DType::F32),
+            src: tmem_addr(0, 128, 0),
             shape: LdStShape::B32x32,
             num: 32,
         };
@@ -3473,7 +3431,7 @@ mod tests {
         assert!(e.message.contains("row (TMEM lane)"), "{}", e.message);
         // ld/st column span must land in a live band (num=32 x 1 col cells).
         let oob = Stmt::Tcgen05St {
-            dst: tmem_op(0, 500, DType::F32),
+            dst: tmem_addr(0, 0, 500),
             src: full_slice(&frag),
             shape: LdStShape::B32x32,
             num: 32,
@@ -3522,7 +3480,8 @@ mod tests {
         .validate()
         .unwrap_err();
         assert!(e.message.contains("nonzero element count"), "{}", e.message);
-        // cg2 + multicast + a peer-referenced (shared) mbar is unmodelable.
+        // cg2 multicast may target one explicit peer-referenced leader mbar;
+        // every multicast destination contributes its own complete-tx.
         let peer = Arc::new(MBar {
             id: 2,
             kind: MBarKind::Tma,
@@ -3538,12 +3497,7 @@ mod tests {
             mbar.remote_coord = Some(ScalarValue::Int(0));
         }
         k.body.push(elected_if(vec![load]));
-        let e = k.validate().unwrap_err();
-        assert!(
-            e.message.contains("multicast with a peer-referenced"),
-            "{}",
-            e.message
-        );
+        assert!(k.validate().is_ok());
     }
 
     #[test]

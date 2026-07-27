@@ -6,12 +6,9 @@
 //! ZERO-INFERENCE guard rule (user-mandated): codegen NEVER synthesizes an
 //! emission guard from the statically-computed thread scope. Every guard in
 //! the output comes from the IR:
-//! - The `if_elected` sugar (`lane_id == 0`) emits as `if T.ptx.elect_sync():`
-//!   (canon's guard), narrowed to `if T.cuda.thread_rank() == 0:` when the
-//!   enclosed thread set is provably exactly CTA thread 0 AND the body is
-//!   loop-free (canon's prologue form — the same one thread, an emission
-//!   spelling change only). A warp-collective `ClusterBarrierWait` nested
-//!   under this single-lane scope fails closed; codegen never hoists it.
+//! - Every `Stmt::If` prints its scalar predicate literally. In particular,
+//!   `lane_id == 0` remains `lane_id == 0`; codegen never substitutes
+//!   `elect_sync()` or `thread_rank() == 0`.
 //! - Hardware single-issue ops (TmaLoad/TmaStore/CpAsyncBulkS2Cluster,
 //!   Tcgen05Mma/Tcgen05Cp/Tcgen05Commit, MBarrierInit, ClcTryCancel) are
 //!   legal ONLY under an explicit single-lane `If` — the validator's
@@ -27,7 +24,7 @@
 //! - The thread scope of a body is still CLASSIFIED from the enclosing `If`
 //!   conditions (`static_thread_filter`) — but only for legality checks
 //!   (CTA-wide `cta_sync` at function scope, warp-collective forms) and for
-//!   the `Elected` recognition above, never to invent a guard.
+//!   legality checks, never to invent or rewrite a guard.
 //! - Control-flow structure is preserved exactly: sibling IR `If`s emit as
 //!   sibling TVMScript `if`s, nested IR `If`s emit nested, and source order is
 //!   unchanged. Codegen never merges conditions, synthesizes role-dispatch
@@ -51,151 +48,61 @@ use super::scalar::{ScalarExpr, ScalarInitial, ScalarValue, Var};
 use super::stmt::{
     LdStShape, MatrixDType, MatrixShape, RegLiteral, RegOperand, RegUnaryOp, Rounding, Stmt,
 };
-use super::tensor::{Layout, MmaOperand, Tensor, TensorSlice, TmemOperand};
+use super::tcgen05_layout::{
+    resolve_tcgen05_cp, resolve_tcgen05_mma, tcgen05_cp_source_bits, CpLaneLayout, CpSmemLayout,
+    TmemDatapath,
+};
+use super::tensor::{
+    Layout, MmaAOperand, MmaElemFormat, ScaleFormat, SmemTile, Tensor, TensorSlice, TmemAForm,
+    TmemAddr,
+};
 use super::thread_filter::{static_thread_filter, ThreadSet};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// The imports the emitted source needs (prepended so the file is self-contained).
 const HEADER_IMPORTS: &str = "\
-import tvm
-from tvm.ir.type import PointerType, PrimType
+from tvm.backend.cuda.operator.tile_primitive.gemm_async.tcgen05 import sf_tmem_layout
+from tvm.backend.cuda.operator.tile_primitive.tma_utils import SwizzleMode
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.layout import ComposeLayout, R, S, TCol, TileLayout, TLane
-from tvm.tirx.layout import tcgen05_atom_layout, tmem_datapath_layout
-from tvm.tirx.layout import tid_in_wg as axis_tid_in_wg
+from tvm.tirx.layout import tmem_datapath_layout, tmem_mma_operand_layout
 ";
 
-/// Vendored `mma_shared_layout(dtype, swizzle_mode, shape)` — a faithful port of
-/// TVM's `tile_primitive.tma_utils.mma_shared_layout`, emitted into the source so
-/// the generated file depends only on the PUBLIC `tvm.tirx.layout` algebra
-/// (`ComposeLayout`/`TileLayout`/`S`), not the TVM-private
-/// `tvm.tirx.cuda.operator.tile_primitive.tma_utils` import path. Same
-/// swizzle-atom math: the no-swizzle mode is the packed-16B atom; modes 1/2/3
-/// tile the (8, 256/512/1024-bit) MMA atom over the tile via `tile_to`.
-const MMA_SHARED_LAYOUT_HELPER: &str = r#"
-def mma_shared_layout(dtype, swizzle_mode, shape):
-    """MMA-compatible shared-memory layout for shape and dtype (vendored from
-    tvm.tirx.cuda.operator.tile_primitive.tma_utils so the emitted source has
-    no TVM-private import). Same default tiling of the TMA atom layout."""
-    bits = tvm.DataType(dtype).bits
-    if swizzle_mode == 0:
-        # No-swizzle MMA smem is the packed-16B atom: offset e16*m +
-        # M*e16*(k//e16) + k%e16 (e16=128/bits); plain tile if K % e16 != 0.
-        e16 = 128 // bits
-        m, k = int(shape[-2]), int(shape[-1])
-        if k % e16 == 0:
-            lead = [int(s) for s in shape[:-2]]
-            extents = [*lead, m, k // e16, e16]
-            strides = []
-            stride = m * k
-            for e in reversed(lead):
-                strides.insert(0, stride)
-                stride *= e
-            strides += [e16, m * e16, 1]
-            return TileLayout(S[tuple(extents) : tuple(strides)]).canonicalize()
-        return TileLayout(S[tuple(shape)]).canonicalize()
-    # The (8, 256/512/1024-bit) swizzle atom for modes 1/2/3, in element units.
-    atom_shape = {1: [8, 256], 2: [8, 512], 3: [8, 1024]}[swizzle_mode]
-    atom_shape[-1] //= bits
-    atom_shape = [1] * (len(shape) - len(atom_shape)) + atom_shape
-    per_element = (128 // bits).bit_length() - 1
-    period = 1 << (per_element + swizzle_mode + 3)
-    layout = ComposeLayout(per_element, swizzle_mode, 3, TileLayout(S[(period,)]))
-    tile_to_shape = list(atom_shape)
-    tile_to_shape[-2] = shape[-2]
-    return layout.tile_to(tile_to_shape, atom_shape).tile_to(shape, tile_to_shape).canonicalize()
+/// Apply an explicit physical TMEM `(lane, 32-bit column)` offset to a
+/// statement-local non-owning buffer view.  The base layout's TCol unit is the
+/// buffer element, so callers convert physical columns to elements before
+/// invoking this helper.
+const TMEM_VIEW_LAYOUT_HELPER: &str = r#"
+def tmem_view_layout(layout, lane_offset, col_offset):
+    offset = dict(layout.offset)
+    offset[TLane] = offset.get(TLane, 0) + lane_offset
+    offset[TCol] = offset.get(TCol, 0) + col_offset
+    return TileLayout.from_iters(layout.shard, layout.replica, offset)
 "#;
-
-/// SF SMEM/GMEM physical layout, computed HERE from the fixed nvfp4 SF formula
-/// (128-row super-blocks, epc=4) instead of importing TVM's `sf_smem_layout`.
-/// Emits the same `TileLayout(S[...])` nymph already emits for the SF *TMEM*
-/// side, so the codegen is self-contained — no external SF-layout helper.
-///
-/// Mirrors `sf_smem_layout(rows, sf_k, sf_per_mma, pipe_depth)`: the SF is read
-/// in 128-row super-blocks of 32 lanes; a logical `(rows, sf_k)` tile decomposes
-/// as `M_super x M_SF_INNER(4) x LANE(32) x K_outer x sf_per_mma x in_lane_K`,
-/// size-1 dims dropped, optional pipe-depth outer prepended.
-fn sf_smem_tile_layout(
-    rows: usize,
-    sf_k: usize,
-    sf_per_mma: usize,
-    pipe_depth: Option<usize>,
-) -> String {
-    const EPC: usize = 4;
-    const M_SUPER_ROWS: usize = 128;
-    const LANE: usize = 32;
-    let m_sf_inner = M_SUPER_ROWS / LANE; // 4
-    let in_lane_k = EPC / sf_per_mma; // 1 for nvfp4 (sf_per_mma=4)
-    let k_outer = sf_k / EPC;
-    let m_super = rows / M_SUPER_ROWS;
-    let lane_bytes = EPC * m_sf_inner; // 16
-    let super_bytes = lane_bytes * LANE; // 512
-    let k_total_bytes = super_bytes * k_outer;
-    let stage_bytes = k_total_bytes * m_super;
-
-    let raw_shape = [m_super, m_sf_inner, LANE, k_outer, sf_per_mma, in_lane_k];
-    let raw_strides = [k_total_bytes, EPC, lane_bytes, super_bytes, in_lane_k, 1];
-    let mut shape: Vec<usize> = Vec::new();
-    let mut strides: Vec<usize> = Vec::new();
-    for (s, st) in raw_shape.iter().zip(raw_strides.iter()) {
-        if *s != 1 {
-            shape.push(*s);
-            strides.push(*st);
-        }
-    }
-    if let Some(p) = pipe_depth {
-        shape.insert(0, p);
-        strides.insert(0, stage_bytes);
-    }
-    let sh = shape
-        .iter()
-        .map(|x| x.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let st = strides
-        .iter()
-        .map(|x| x.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("TileLayout(S[({sh}) : ({st})])")
-}
 
 /// The thread scope of the enclosing `If`-condition stack, derived per body
 /// from `static_thread_filter` (see `classify_scope`). It plays the role the
-/// Role node's warp/warpgroup/elected fields played in #18: it decides (a)
-/// whether a CTA-wide `cta_sync` may be emitted (only at function scope, where
-/// all CTA threads converge), (b) whether a single-thread async issue
-/// (`mbarrier`/`TMA`/`MMA`/`commit`) still needs a guard, and (c) which guard
-/// that is.
+/// Role node's warp/warpgroup/elected fields played in #18, but only as a
+/// fail-closed legality check for hardware collectives and single-issue ops.
+/// It never changes, deletes, or supplements the IR's control flow.
 ///
-/// The single-issue guard is the crux of the cross-CTA mailbox handshake: one
-/// warp's elected lane is exactly 1 thread of a 1-warp branch, but a
-/// *warpgroup* branch spans 4 warps, so `elect.sync` inside it is true for 4
-/// threads (one per warp) — a single-issue `mbarrier.arrive` under it would
-/// arrive FOUR times, over-counting the barrier. A warpgroup branch must elect
-/// `tid_in_wg == 0` (thread 0 of the whole 128-thread warpgroup) instead.
+/// A single-issue operation is printed bare only when the enclosing explicit
+/// IR predicates prove an elected scope. Otherwise codegen returns an error;
+/// it never invents the missing predicate.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Scope {
-    /// Function scope (no narrowing condition, or a full-CTA one). CTA-wide
-    /// sync is legal here.
+    /// Function scope (no narrowing condition, or a full-CTA one).
     Function,
     /// Inside a one-full-warp branch (`if warp_id == w:`).
     Warp,
     /// Inside a one-full-warpgroup branch (`if wg_id == g:`).
     Warpgroup,
-    /// Inside a branch with at most one lane per warp (an elect guard, a
-    /// single-thread branch, ...): single-issue ops emit with NO further
-    /// per-op guard (canon's `if elect_sync(): while ...:` loops).
+    /// Inside an explicit branch with at most one lane per warp (or one
+    /// statically identified thread). Single-issue ops emit in place.
     Elected,
-}
-
-impl Scope {
-    /// True at function scope: all CTA threads converge, so `cta_sync` is legal.
-    fn is_function(self) -> bool {
-        self == Scope::Function
-    }
 }
 
 /// The scope plus the static thread set it was classified from (kept so nested
@@ -214,9 +121,6 @@ impl ScopeInfo {
             scope: Scope::Function,
             set: Some(ThreadSet::full(num_warps)),
         }
-    }
-    fn is_function(&self) -> bool {
-        self.scope.is_function()
     }
 }
 
@@ -266,34 +170,6 @@ fn child_scope_info(cond: &ScalarValue, parent: &ScopeInfo, num_warps: u32) -> S
     classify_scope(set, parent)
 }
 
-/// The `if_elected` sugar condition: `lane_id == 0` (either operand order).
-fn as_lane_zero_equality(cond: &ScalarValue) -> bool {
-    let ScalarValue::Expr(e) = cond else {
-        return false;
-    };
-    if e.op != ScalarOp::Eq || e.args.len() != 2 {
-        return false;
-    }
-    e.args
-        .iter()
-        .any(|a| matches!(a, ScalarValue::Scope(ScopeValueKind::LaneId)))
-        && e.args.iter().any(|a| matches!(a, ScalarValue::Int(0)))
-}
-
-/// True when any statement in the body is (or contains) a persistent loop —
-/// used to keep the prologue `thread_rank() == 0` guard off hot worker loops.
-fn body_has_loop(body: &[Stmt]) -> bool {
-    body.iter().any(|s| {
-        matches!(
-            s,
-            Stmt::ForLoop { .. }
-                | Stmt::Loop { .. }
-                | Stmt::ForEachTask { .. }
-                | Stmt::SchedulerImpl { .. }
-        ) || s.child_bodies().iter().any(|b| body_has_loop(b))
-    })
-}
-
 /// Per-kernel naming + lookup context built once, then read while walking the body.
 struct Ctx {
     /// Tensor id -> emitted Python name.
@@ -310,46 +186,16 @@ struct Ctx {
     cta_group: u8,
     /// CTA warp count (the thread-filter geometry).
     num_warps: u32,
-    /// Column span of the single TMEM view buffer: the largest
-    /// `base_col + n_cols` over the kernel's `TmemAlloc`s. The view is one
-    /// `decl_buffer((128, cols), allocated_addr=0)` — TMEM is not a tensor, so
-    /// every TMEM instruction references it by absolute column slice.
-    tmem_view_cols: Option<usize>,
-    /// Per-REG-tensor declared width: the fragment is declared `T.alloc_local(8)`
-    /// in the nymph IR (instruction granularity); the wide read/cast/store band
-    /// needs it sized to the full column band. id -> width.
-    reg_widths: HashMap<u32, usize>,
-    /// Per-REG-tensor auxiliary view needs (see `RegAuxViews` /
-    /// `collect_reg_aux_views`): warp-matrix ops, `.16x*b` tcgen05 atom
-    /// fragments, and per-thread scalar transfers address the raw per-thread
-    /// storage, which the default `(128, W)` thread-axis tile cannot express.
-    reg_aux_views: HashMap<u32, RegAuxViews>,
-    /// 16-bit TMEM cell dtypes used by tcgen05 st (packed halves, two elements
-    /// per 32-bit cell) — each gets a `tmem_f16`/`tmem_bf16` decl_buffer over
-    /// the same allocated band as the f32 view (dense-packed convention, the
-    /// TIRx 16-bit `.32x32b` datapath).
-    tmem_16_views: Vec<DType>,
-    /// An M=64 `Tcgen05Mma` exists (gdn's BT=64 accumulators): the dst
-    /// accumulator is the M=64 non-ws datapath F (64 rows scattered
-    /// 16-per-warp), so a `tmem_f` decl_buffer with
-    /// `tmem_datapath_layout("F", 64, cols)` joins the f32 view.
-    needs_tmem_f: bool,
-    /// SMEM tensors partially sliced by a TMA load/store (a slice extent
-    /// strictly inside the tensor extent — e.g. gdn's row-half K double
-    /// buffer). A swizzle atom tiles the FULL row band, so the partial slice
-    /// breaks the tma_auto shared-chain stride rule; these take swizzle
-    /// mode 0 (a plain 16B-atom tile the chain slices cleanly).
-    tma_partial_smem: std::collections::HashSet<u32>,
+    /// REG tensors that need a non-owning u32 reinterpret for packed b16
+    /// physical instruction operands.
+    reg_u32_views: HashSet<u32>,
     /// Number of launched clusters (`launch_cta_count / cta_group`) — the grid stride
     /// for a `ForEachTask` grid-stride scheduler loop.
     num_clusters: usize,
-    /// NVFP4 e4m3 scale-factor TMEM views (SFA_tmem, SFB_tmem), keyed by the
-    /// operand's absolute physical base column; declared via `decl_buffer`
-    /// right after the `tmem` view.
-    sf_views: Vec<SfView>,
-    /// Usage-derived scale-factor tensor ids (see `collect_sf_ids`) — the ONLY
-    /// authority on "is this tensor a scale factor"; dtype is never consulted.
-    sf: SfIds,
+    /// Deterministic statement-local TMEM view suffix.  Each tcgen05 statement
+    /// declares only the non-owning views it consumes; there is no kernel-wide
+    /// TMEM buffer, cache, or hoisting pass.
+    tmem_view_index: Cell<usize>,
     /// Var ids provably non-negative (see `collect_nonneg_vars`) — the ONLY
     /// authority `is_nonneg` consults for `ScalarValue::Var`: ForLoop induction
     /// vars with a non-negative-literal start and positive-literal step, plus
@@ -359,51 +205,18 @@ struct Ctx {
     nonneg_vars: std::collections::HashSet<u32>,
 }
 
-/// One NVFP4 e4m3 scale-factor TMEM view (`SFA_tmem`/`SFB_tmem`). The IR's SF
-/// operands are absolute physical TMEM addresses; the view re-materializes
-/// canon's logical `(rows, SF_K)` `decl_buffer` at that column so the
-/// block-scaled `Tx.gemm_async`/`Tx.copy_async` emission is unchanged.
-#[derive(Clone)]
-struct SfView {
-    name: String,
-    /// Absolute physical base column of the SF band.
-    col: usize,
-    /// Logical rows: the scaled-row count rounded up to whole 128-lane
-    /// super-blocks (a 256-row SFB band folds into 2 column super-blocks).
-    logical_rows: usize,
-    /// Logical cols: the per-row scale-block count (nvfp4 `k/16`).
-    logical_cols: usize,
-}
-
-/// Auxiliary physical views a REG tensor needs beyond the bare
-/// `T.wg_reg_tile` (collected by `collect_reg_aux_views`). The default wg tile
-/// is a `(128, W)` thread-axis layout — right for `Tx.wg.*` tile ops, but
-/// warp-matrix ops (`ldmatrix`/`stmatrix`/`mma.sync`), `.16x*b` tcgen05 atom
-/// fragments, and per-thread scalar transfers must address the RAW per-thread
-/// storage: LowerTIRxCleanup rejects direct element access on thread-axis
-/// layouts ("unable to verify that the coordinate matches the current
-/// thread"). With `flat` set, the TensorDef declares
-/// `{name}_flat = T.alloc_local((W,), dt)` (the raw per-thread storage) and
-/// turns `{name}` into a `(128, W)` wg VIEW over it, so both addressing forms
-/// share one register file.
-#[derive(Clone, Default)]
-struct RegAuxViews {
-    /// Declare `{name}_flat` and make `{name}` a view of it.
-    flat: bool,
-    /// `.16x*b` tcgen05 ld/st atom view `{name}_atom` (the PTX instr shape).
-    atom_shape: Option<&'static str>,
-    /// `uint32` reinterpret `{name}_flat_u32` (stmatrix's packed b16x2 words).
-    flat_u32: bool,
-    /// bf16/f16 reinterpret `{name}_flat_ab` (WarpMma A/B operand elements).
-    flat_ab: Option<DType>,
-}
-
 impl Ctx {
     fn tensor_name(&self, id: u32) -> Result<&str, String> {
         self.names
             .get(&id)
             .map(|s| s.as_str())
             .ok_or_else(|| format!("codegen: no name for tensor id {id}"))
+    }
+
+    fn next_tmem_view_index(&self) -> usize {
+        let index = self.tmem_view_index.get();
+        self.tmem_view_index.set(index + 1);
+        index
     }
 }
 
@@ -427,47 +240,13 @@ fn dtype_str(dtype: super::dtype::DType) -> &'static str {
     }
 }
 
-/// `Swizzle` -> mma_shared_layout swizzle mode (B128 -> 3).
-fn swizzle_mode(sw: Swizzle) -> u8 {
+/// `Swizzle` -> the exact TIRx allocator enum member.
+fn swizzle_mode_name(sw: Swizzle) -> &'static str {
     match sw {
-        Swizzle::None => 0,
-        Swizzle::B32 => 1,
-        Swizzle::B64 => 2,
-        Swizzle::B128 => 3,
-    }
-}
-
-/// Element byte width of a dtype.
-fn dtype_bytes(dt: super::dtype::DType) -> usize {
-    use super::dtype::DType::*;
-    match dt {
-        Bool | I8 | U8 | F8E4M3 => 1,
-        I16 | U16 | F16 | Bf16 => 2,
-        I32 | U32 | F32 => 4,
-        I64 | U64 => 8,
-    }
-}
-
-/// Integer dtype predicate (the I32 scheduler mailbox vs the f16/bf16 data rings).
-fn is_int_dtype(dt: super::dtype::DType) -> bool {
-    use super::dtype::DType::*;
-    matches!(dt, I8 | U8 | I16 | U16 | I32 | U32 | I64 | U64 | Bool)
-}
-
-/// Pick the MMA-shared swizzle atom matching a tile row's byte width — mirrors the
-/// canonical kernel's `_swizzle_for_row_bytes`. Used for the D writeback ring, whose
-/// layout the value model leaves implicit.
-fn swizzle_for_row_bytes(row_bytes: usize) -> u8 {
-    // The atom row must FIT in and DIVIDE the tile row (mirrors the canonical
-    // `_suggest_swizzle_for_row_bytes`: `row_bytes >= atom && row_bytes % atom == 0`).
-    if row_bytes >= 128 && row_bytes % 128 == 0 {
-        3
-    } else if row_bytes >= 64 && row_bytes % 64 == 0 {
-        2
-    } else if row_bytes >= 32 && row_bytes % 32 == 0 {
-        1
-    } else {
-        0
+        Swizzle::None => "SWIZZLE_NONE",
+        Swizzle::B32 => "SWIZZLE_32B_ATOM",
+        Swizzle::B64 => "SWIZZLE_64B_ATOM",
+        Swizzle::B128 => "SWIZZLE_128B_ATOM",
     }
 }
 
@@ -518,7 +297,7 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
     let mut out = Emitter::new();
 
     out.push_str(HEADER_IMPORTS);
-    out.push_str(MMA_SHARED_LAYOUT_HELPER);
+    out.push_str(TMEM_VIEW_LAYOUT_HELPER);
     out.push('\n');
 
     // Argument tensors, named by position (A, B, C, D, …). The fp16/bootstrap GEMM
@@ -527,82 +306,6 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
     if k.args.is_empty() {
         return Err("codegen: kernel has no args".to_string());
     }
-
-    // SMEM tensor layout helper vars (mma_shared_layout(...)) — declared above the
-    // prim_func so the parser sees plain Python values. Every f16/bf16 SMEM buffer
-    // (A/B operand rings AND D writeback rings) gets an MMA-compatible swizzled
-    // layout. The D ring carries no explicit layout in the IR (the value model is
-    // layout-agnostic), so we synthesize the swizzle from the row byte width — the
-    // canonical kernel's `_swizzle_for_row_bytes(EPI_N * elem_bytes)`. The plain I32
-    // mailbox (task_smem) takes no layout (a flat row-major buffer).
-    for t in collect_tensors(k) {
-        // Layout-less SMEM = the flat i32/u32 scheduler mailbox + mbar buffers. Packed
-        // fp4 operands (u8) DO get a swizzle, and e4m3 SF buffers get sf_smem_layout.
-        // Rank<2 SMEM (a flat scalar scratch row, e.g. gdn's gcs/beta vectors)
-        // takes no swizzle either — `mma_shared_layout` needs a (row, col) tile.
-        if t.space != MemorySpace::Smem
-            || (is_int_dtype(t.dtype) && t.dtype != DType::U8)
-            || t.shape.len() < 2
-        {
-            continue;
-        }
-        let name = ctx.tensor_name(t.id)?;
-        let shape_tuple = t
-            .shape
-            .iter()
-            .map(|d| d.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        // SF-usage SMEM (a tcgen05.cp source ring) → canon's sf_smem_layout(rows,
-        // sf_k, sf_per_mma=4, pipe_depth). The TMA lands the bytes in cp-ready
-        // order. Classified by USAGE, not dtype — a plain fp8 DATA ring is also
-        // e4m3 but must take the normal MMA swizzle below.
-        if ctx.sf.smem.contains(&t.id) {
-            if t.dtype != DType::F8E4M3 {
-                return Err(format!(
-                    "codegen: SF SMEM tensor {name} must be e4m3 (got {:?})",
-                    t.dtype
-                ));
-            }
-            let (rows, sf_k, pipe) = if t.shape.len() == 3 {
-                (t.shape[1], t.shape[2], Some(t.shape[0]))
-            } else {
-                (t.shape[0], t.shape[1], None)
-            };
-            let layout = sf_smem_tile_layout(rows, sf_k, 4, pipe);
-            out.push_str(&format!("{name}_layout = {layout}\n"));
-            continue;
-        }
-        // The swizzle atom row (128/64/32 B for mode 3/2/1) must DIVIDE the tile row
-        // width, else `mma_shared_layout` tiles a too-wide atom over a narrower row and
-        // `Layout.tile_to` lowers to a `floormod`-by-zero ("Divide by zero"). The IR's
-        // A/B operand rings carry a fixed `Swizzle::B128`, but a small `blk_k` (e.g.
-        // blk_k=32 f16 -> 64-byte rows) cannot host the 128-byte atom. So clamp the
-        // requested swizzle DOWN to the largest atom the row width supports — never
-        // upgrade past the IR's intent. (The D ring carries no layout; its mode comes
-        // straight from the row byte width, same helper.)
-        let row_bytes = t.shape[t.shape.len() - 1] * dtype_bytes(t.dtype);
-        let row_mode = swizzle_for_row_bytes(row_bytes);
-        let mode = match &t.layout {
-            Some(Layout::Swizzle(sw)) => swizzle_mode(sw.swizzle).min(row_mode),
-            _ => row_mode,
-        };
-        // A partially-TMA-sliced buffer breaks the swizzle chain (see
-        // `tma_partial_smem`) — fall to the no-swizzle 16B atom.
-        let mode = if ctx.tma_partial_smem.contains(&t.id) {
-            0
-        } else {
-            mode
-        };
-        out.push_str(&format!(
-            "{name}_layout = mma_shared_layout(\"{dt}\", {mode}, ({shape_tuple}))\n",
-            name = name,
-            dt = dtype_str(t.dtype),
-            mode = mode,
-            shape_tuple = shape_tuple,
-        ));
-    }
-    out.push('\n');
 
     // ---- prim_func header ----
     out.push_str("@T.prim_func\n");
@@ -617,19 +320,14 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
     let ind = 1;
     for (i, t) in k.args.iter().enumerate() {
         let dims = python_shape(&t.shape);
-        // SF-usage GMEM args (the TMA sources of an SF SMEM ring): lay them out with
-        // canon's sf_smem_layout(rows, sf_k, sf_per_mma=4) so the TMA reads cp-ready
-        // bytes. Usage-derived — a plain fp8 GMEM data arg keeps its natural layout.
-        let layout = if ctx.sf.gmem.contains(&t.id) && t.shape.len() == 2 {
-            format!(
-                ", layout={}",
-                sf_smem_tile_layout(t.shape[0], t.shape[1], 4, None)
-            )
-        } else {
-            String::new()
-        };
+        if t.layout.is_some() {
+            return Err(format!(
+                "codegen: GMEM tensor {} cannot carry a layout",
+                t.id
+            ));
+        }
         out.push_str(&format!(
-            "{p}{name} = T.match_buffer({name}_ptr, {dims}, \"{dt}\"{layout})\n",
+            "{p}{name} = T.match_buffer({name}_ptr, {dims}, \"{dt}\")\n",
             p = pad(ind),
             name = arg_name(i),
             dims = dims,
@@ -707,12 +405,8 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
         p = pad(ind),
         wg_threads = WG_THREADS
     ));
-    // Lane within the warp. Single-issue async ops (mbarrier / TMA / MMA / commit)
-    // run under a single-warp branch, so the per-thread guard must be lane 0 of that
-    // warp (`T.ptx.elect_sync()`) — NOT `tid_in_wg == 0`, which is thread 0 of the
-    // whole *warpgroup* and is never true for a warp whose lanes map to tid_in_wg
-    // 32..63 (e.g. warp 5 in warpgroup 1), so the issue would never fire and the MMA
-    // would deadlock. Mirrors the canonical kernels' `elect_sync` guard.
+    // Lane within the warp. Kernel IR uses this value directly in any
+    // single-lane predicate it requires; codegen preserves that predicate.
     out.push_str(&format!(
         "{p}lane_id = T.lane_id([{warp_lanes}])\n",
         p = pad(ind),
@@ -731,7 +425,6 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
         }
         let name = ctx.tensor_name(t.id)?;
         let dims = python_shape(&t.shape);
-        let is_mailbox = (is_int_dtype(t.dtype) && t.dtype != DType::U8) || t.shape.len() < 2;
         // `move_base_to` is exact because validate has already proved every
         // explicitly aligned tensor offset satisfies the same alignment
         // codegen requests here. No silent allocator round-up is permitted.
@@ -743,25 +436,24 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
             p = pad(ind),
             off = off,
         ));
-        let (layout, align) = if is_mailbox {
-            (String::new(), 0)
-        } else {
-            let align = if matches!(t.layout, Some(Layout::Swizzle(_))) {
-                1024
-            } else {
-                128
-            };
-            (format!(", layout={name}_layout"), align)
-        };
-        out.push_str(&format!(
-            "{p}{name} = pool.alloc({dims}, \"{dt}\", scope=\"shared.dyn\", align={align}{layout})\n",
-            p = pad(ind),
-            name = name,
-            dims = dims,
-            dt = dtype_str(t.dtype),
-            align = align,
-            layout = layout,
-        ));
+        match t.layout {
+            Some(Layout::Swizzle(layout)) => out.push_str(&format!(
+                "{p}{name} = pool.alloc_tcgen05_mma_AB({dims}, \"{dt}\", \
+                 swizzle_mode=SwizzleMode.{mode}, align=1024)\n",
+                p = pad(ind),
+                name = name,
+                dims = dims,
+                dt = dtype_str(t.dtype),
+                mode = swizzle_mode_name(layout.swizzle),
+            )),
+            None => out.push_str(&format!(
+                "{p}{name} = pool.alloc({dims}, \"{dt}\", scope=\"shared.dyn\")\n",
+                p = pad(ind),
+                name = name,
+                dims = dims,
+                dt = dtype_str(t.dtype),
+            )),
+        }
     }
     // ---- mbar shared buffers + tmem_addr ----
     // A multi-stage mbarrier allocates `[stages]` slots; each op indexes the slot it
@@ -798,113 +490,19 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
         size = k.smem_size_bytes,
     ));
 
-    // ---- REG fragments (epilogue) ----
-    // Each is a warpgroup-collective `(128, width)` register tile (`T.wg_reg_tile`): the 128
-    // threads of the warpgroup own one row each. These are emitted INLINE at their TensorDef
-    // site (inside the epilogue task loop), NOT hoisted here — see the TensorDef arm in
-    // emit_stmt: a function-scope tile is whole-kernel-lived and ptxas spills it to local
-    // memory, while a loop-local declaration (like canon's) promotes to registers.
+    // REG tensors are emitted inline at their TensorDef sites as per-thread
+    // `T.alloc_local` arrays with exactly the IR shape and dtype.
     out.push('\n');
 
     // ---- walk the body ----
-    // Emit top-level statements 1:1 in IR order. The single TMEM view + SF
-    // views are declared at function scope right after the top-level statement
-    // carrying the first `TmemAlloc` (#18 declared them right after
-    // `KernelInit`).
+    // Emit top-level statements 1:1 in IR order. TMEM views are statement-local
+    // declarations emitted immediately beside the physical instruction that
+    // consumes them; nothing is hoisted to function scope or inserted after a
+    // different IR statement.
     let fn_scope = ScopeInfo::function(k.num_warps);
-    let mut tmem_declared = ctx.tmem_view_cols.is_none();
-    for stmt in &k.body {
-        emit_stmt(&mut out, stmt, ind, &ctx, &fn_scope)?;
-        if !tmem_declared && stmt_contains_tmem_alloc(stmt) {
-            emit_tmem_view_decls(&mut out, ind, &ctx);
-            tmem_declared = true;
-        }
-    }
-    if !tmem_declared {
-        // The view decl anchors to the alloc site; an alloc buried where the walk
-        // cannot see it (validate requires lifecycle ops top-level) would leave
-        // `tmem` undeclared for the tcgen05 arms — fail closed.
-        return Err(
-            "codegen: no top-level TmemAlloc found for the TMEM view declaration".to_string(),
-        );
-    }
+    emit_body(&mut out, &k.body, ind, &ctx, &fn_scope)?;
 
     Ok(render_lines(fill_empty_blocks(out.finish())))
-}
-
-/// Declare the single TMEM view buffer (+ the NVFP4 SF views) at function scope.
-/// `tmem` is visible to the MMA + epilogue, so it must NOT be nested under the
-/// warp-0 alloc guard. TMEM is not a tensor: one (128, cols) f32 view over the
-/// whole allocated band, addressed everywhere by absolute column slices.
-/// allocated_addr=0 (not tmem_addr[0], the SMEM-stored alloc result): the single
-/// tcgen05.alloc always bases at TMEM column 0, so the view address is a
-/// compile-time constant — exactly canon's form; pinning it to 0 cuts the
-/// epilogue address math (VIADD/LOP3/LDS) roughly in half.
-fn emit_tmem_view_decls(out: &mut Emitter, ind: usize, ctx: &Ctx) {
-    let Some(cols) = ctx.tmem_view_cols else {
-        return;
-    };
-    out.push_str(&format!(
-        "{p}tmem = T.decl_buffer(({wg_threads}, {cols}), \"float32\", scope=\"tmem\", allocated_addr=0, layout=TileLayout(S[({wg_threads}, {cols}) : (1 @ TLane, 1 @ TCol)]))\n",
-        p = pad(ind),
-        wg_threads = WG_THREADS,
-    ));
-    // The M=64 datapath-F accumulator view (gdn's BT=64 GEMM dsts): 64
-    // logical rows scattered 16-per-warp over the 128 lanes.
-    if ctx.needs_tmem_f {
-        out.push_str(&format!(
-            "{p}tmem_f = T.decl_buffer((64, {cols}), \"float32\", scope=\"tmem\", allocated_addr=0, layout=tmem_datapath_layout(\"F\", 64, {cols}))\n",
-            p = pad(ind),
-        ));
-    }
-    // 16-bit packed-half views over the same band (dense: two elements per
-    // 32-bit cell) for the tcgen05.st fp16/bf16 datapath — the TIRx
-    // `.32x32b` local2tmem path requires the TMEM buffer dtype to equal the
-    // fragment dtype.
-    for dt in &ctx.tmem_16_views {
-        let (name, dt_s) = match dt {
-            DType::F16 => ("tmem_f16", "float16"),
-            DType::Bf16 => ("tmem_bf16", "bfloat16"),
-            other => {
-                debug_assert!(false, "unexpected 16-bit tmem view dtype {other:?}");
-                continue;
-            }
-        };
-        let elems = cols * 2;
-        out.push_str(&format!(
-            "{p}{name} = T.decl_buffer(({wg_threads}, {elems}), \"{dt_s}\", scope=\"tmem\", allocated_addr=0, layout=TileLayout(S[({wg_threads}, {elems}) : (1 @ TLane, 1 @ TCol)]))\n",
-            p = pad(ind),
-            wg_threads = WG_THREADS,
-        ));
-    }
-    // NVFP4 e4m3 scale-factor TMEM views (canon's tmem_pool.alloc_sf(...,
-    // sf_per_mma=4)). The TileLayout follows `sf_tmem_layout(rows, SF_K,
-    // sf_per_mma=4)`: S[(M, 32, 4, 4) : (4 @ TCol, 1 @ TLane, M*4 @ TCol,
-    // 1 @ TCol)] + R[4:32 @ TLane], M = rows // 32. The view's logical
-    // (rows, SF_K) re-materializes the folded physical band the IR operand
-    // addresses directly (a 256-row SFB folds into 2 column super-blocks).
-    for view in &ctx.sf_views {
-        let m_super = view.logical_rows / 32;
-        out.push_str(&format!(
-            "{p}{name} = T.decl_buffer(({rows}, {cols}), \"float8_e4m3fn\", scope=\"tmem\", layout=TileLayout(S[({m_super}, 32, 4, 4) : (4 @ TCol, 1 @ TLane, {m_stride} @ TCol, 1 @ TCol)] + R[4:32 @ TLane]), allocated_addr={col})\n",
-            p = pad(ind),
-            name = view.name,
-            rows = view.logical_rows,
-            cols = view.logical_cols,
-            m_super = m_super,
-            m_stride = m_super * 4,
-            col = view.col,
-        ));
-    }
-}
-
-/// Does this top-level statement contain a `TmemAlloc` anywhere?
-fn stmt_contains_tmem_alloc(stmt: &Stmt) -> bool {
-    matches!(stmt, Stmt::TmemAlloc { .. })
-        || stmt
-            .child_bodies()
-            .iter()
-            .any(|body| body.iter().any(stmt_contains_tmem_alloc))
 }
 
 /// Every emitted block opener (`if`/`else`/`for`/`while`/`def` …) must own at
@@ -951,22 +549,18 @@ fn fill_empty_blocks(lines: Vec<Line>) -> Vec<Line> {
     out
 }
 
-/// One emitted source line: its indent in 4-space units, its text WITHOUT the
-/// leading pad, and an optional single-issue-guard annotation. The annotation
-/// is set at the emission site when the line opens a `if tid_in_wg == 0:` /
-/// `if T.ptx.elect_sync():` single-issue guard block — it is what the guard
+/// One emitted source line: its indent in 4-space units and its text WITHOUT
+/// the leading pad.
 #[derive(Clone, PartialEq, Eq)]
 struct Line {
     indent: usize,
     text: String,
 }
 
-/// The emission sink: accumulates the source as STRUCTURED lines (not one flat
-/// string) so the guard merge works on the (indent, guard-annotation) line
-/// structure instead of re-parsing text (fragile to blank lines and to
-/// guard-looking non-guard lines). `push_str` keeps the call sites
-/// string-shaped; the sink splits into lines and records each line's indent
-/// (all padding goes through `pad()` = 4-space units).
+/// The emission sink accumulates source as structured lines so empty blocks
+/// can receive `pass` without reparsing or changing the IR's control-flow
+/// nesting. `push_str` keeps call sites string-shaped; the sink splits lines
+/// and records their indentation (all padding uses `pad()` = 4-space units).
 struct Emitter {
     lines: Vec<Line>,
     /// A line started but not yet `\n`-terminated (a push_str may split mid-line).
@@ -1031,67 +625,6 @@ fn render_lines(lines: Vec<Line>) -> String {
         }
     }
     s
-}
-
-/// Collect every tensor referenced anywhere (args + defs + slices), deduped by id,
-/// in a deterministic (id-sorted) order.
-/// Scale-factor tensor ids derived from USAGE, not dtype. A tensor is a scale
-/// factor iff it feeds the block-scaled MMA datapath on its way INTO TMEM: an
-/// endpoint of a `tcgen05.cp` (the SMEM→TMEM SF staging copy), or the GMEM
-/// source of a `TmaLoad` that fills an SF SMEM ring. dtype alone proves
-/// nothing — a plain fp8 DATA tensor is also e4m3, and laying it out as SF
-/// bytes would silently corrupt it. (The TMEM side of the SF path is a
-/// `TmemOperand` — physical addresses, no tensor ids; see `sf_views`.)
-#[derive(Default)]
-struct SfIds {
-    smem: HashSet<u32>,
-    gmem: HashSet<u32>,
-}
-
-fn collect_sf_ids(k: &Kernel) -> SfIds {
-    fn walk(stmts: &[Stmt], f: &mut dyn FnMut(&Stmt)) {
-        for s in stmts {
-            f(s);
-            for body in s.child_bodies() {
-                walk(body, f);
-            }
-        }
-    }
-    let mut ids = SfIds::default();
-    // Pass 1: tcgen05.cp sources (SMEM).
-    walk(&k.body, &mut |s| {
-        if let Stmt::Tcgen05Cp {
-            dst: _,
-            src,
-            cta_group: _,
-        } = s
-        {
-            ids.smem.insert(src.tensor.id);
-        }
-    });
-    // Pass 2: GMEM sources of the TMA loads that fill an SF SMEM ring (one level —
-    // SF bytes flow gmem -> smem -> tmem, there are no longer chains).
-    walk(&k.body, &mut |s| {
-        if let Stmt::TmaLoad {
-            dst,
-            src,
-            mbar: _,
-            coords: _,
-            shape: _,
-            gmem_shape: _,
-            mbar_stage: _,
-            multicast_cta_mask: _,
-            cache_hint: _,
-            prefetch_tensormap: _,
-            cta_group: _,
-        } = s
-        {
-            if ids.smem.contains(&dst.tensor.id) {
-                ids.gmem.insert(src.id);
-            }
-        }
-    });
-    ids
 }
 
 fn collect_tensors(k: &Kernel) -> Vec<Arc<Tensor>> {
@@ -1214,35 +747,29 @@ fn collect_from_stmt(s: &Stmt, map: &mut HashMap<u32, Arc<Tensor>>) {
             dst: _,
             a,
             b,
-            m: _,
-            n: _,
-            k: _,
+            mma_m: _,
+            mma_n: _,
+            format: _,
+            block_scale: _,
             accum: _,
             trans_a: _,
             trans_b: _,
+            ws: _,
             cta_group: _,
-            sfa: _,
-            sfb: _,
-            sf_byte: _,
-            sf_e4m3: _,
-            sf_block: _,
-            a_fp4: _,
-            b_fp4: _,
-            lane_align: _,
         } => {
-            // TMEM operands (dst/sfa/sfb, TmemOperand-form a/b) carry no tensor.
-            for op in [a, b] {
-                if let MmaOperand::Slice(s) = op {
-                    note_slice(s, map);
-                }
+            if let MmaAOperand::Smem(tile) = a {
+                note_tensor(&tile.tensor, map);
             }
+            note_tensor(&b.tensor, map);
         }
         Tcgen05Cp {
             dst: _,
             src,
+            shape: _,
+            multicast: _,
             cta_group: _,
         } => {
-            note_slice(src, map);
+            note_tensor(&src.tensor, map);
         }
         Tcgen05Ld {
             dst,
@@ -1286,7 +813,6 @@ fn as_int(sv: &ScalarValue) -> Option<i64> {
 fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
     let mut names: HashMap<u32, String> = HashMap::new();
     let mut tensors: HashMap<u32, Arc<Tensor>> = HashMap::new();
-    let sf = collect_sf_ids(k);
     for (i, t) in k.args.iter().enumerate() {
         names.insert(t.id, arg_name(i));
         tensors.insert(t.id, t.clone());
@@ -1303,6 +829,7 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
     let mut reg_idx = 0usize;
     let mut ab_idx = 0usize;
     let mut d_idx = 0usize;
+    let mut task_idx = 0usize;
     for t in collect_tensors(k) {
         tensors.entry(t.id).or_insert_with(|| t.clone());
         if names.contains_key(&t.id) {
@@ -1323,11 +850,17 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
                 );
                 // u8 = packed-fp4 operand ring (NOT the i32/u32 mailbox); give it a
                 // unique ab_smem name so two operands don't collide on "task_smem".
-                if is_int && t.dtype != DType::U8 {
-                    "task_smem".to_string()
-                } else if t.dtype == DType::U8 || t.layout.is_some() {
+                if t.layout.is_some() || t.dtype == DType::U8 {
                     let n = format!("ab_smem{ab_idx}");
                     ab_idx += 1;
+                    n
+                } else if is_int {
+                    let n = if task_idx == 0 {
+                        "task_smem".to_string()
+                    } else {
+                        format!("task_smem{task_idx}")
+                    };
+                    task_idx += 1;
                     n
                 } else {
                     let n = format!("d_smem{d_idx}");
@@ -1400,161 +933,10 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
     // cta_group from the cluster size (the bootstrap is cta_group=2).
     let cta_group = k.cluster_shape.iter().product::<usize>().max(1) as u8;
 
-    // The single TMEM view buffer spans every allocated column band:
-    // `max(base_col + n_cols)` over the kernel's TmemAllocs.
-    let mut tmem_view_cols: Option<usize> = None;
-    fn find_tmem_view_cols(stmts: &[Stmt], out: &mut Option<usize>) {
-        for s in stmts {
-            if let Stmt::TmemAlloc {
-                base_col,
-                n_cols,
-                cta_group: _,
-                addr_byte_offset: _,
-            } = s
-            {
-                let end = (*base_col + *n_cols) as usize;
-                *out = Some(out.map_or(end, |e: usize| e.max(end)));
-            }
-            for body in s.child_bodies() {
-                find_tmem_view_cols(body, out);
-            }
-        }
-    }
-    find_tmem_view_cols(&k.body, &mut tmem_view_cols);
-
-    // NVFP4 SF TMEM views, keyed by the operands' physical base columns.
-    let mut sf_views: Vec<SfView> = Vec::new();
-    collect_sf_views(&k.body, &mut sf_views)?;
-
-    // Per-REG-tensor width. Walk the bodies and record, for each REG fragment,
-    // `max(offset + width)` over every slice — the band a single `.view(...)`
-    // alias must span. (A capped drain writes the 256-wide output reg in two
-    // 128-col groups, so the FULL extent comes from offset+width, not the
-    // per-op width alone.)
-    let mut reg_widths: HashMap<u32, usize> = HashMap::new();
-    fn note_reg_width(s: &TensorSlice, widths: &mut HashMap<u32, usize>) {
-        if s.tensor.space == MemorySpace::Reg {
-            let need = match s.offsets.first().and_then(as_int) {
-                Some(o) => {
-                    let w = s.shape.first().and_then(as_int).unwrap_or(0).max(0) as usize;
-                    (o.max(0) as usize) + w
-                }
-                // Dynamic offset (runtime loop var): the slice may land anywhere
-                // in the tensor — the flat storage must cover the tensor's full
-                // declared extent (a dynamic slice used to shrink the decl to the
-                // slice width, which then broke the u32-packing of b16 pairs).
-                None => s.tensor.shape.first().copied().unwrap_or(0),
-            };
-            let e = widths.entry(s.tensor.id).or_insert(0);
-            *e = (*e).max(need);
-        }
-    }
-    fn walk_reg_widths(stmts: &[Stmt], widths: &mut HashMap<u32, usize>) {
-        for s in stmts {
-            match s {
-                Stmt::Tcgen05Ld {
-                    dst,
-                    src,
-                    shape,
-                    num,
-                } => {
-                    if dst.tensor.space == MemorySpace::Reg {
-                        let off = dst.offsets.first().and_then(as_int).unwrap_or(0).max(0) as usize;
-                        let e = widths.entry(dst.tensor.id).or_insert(0);
-                        *e = (*e).max(off + tcgen05_frag_regs(shape, *num as usize, src.dtype));
-                    }
-                }
-                Stmt::Tcgen05St {
-                    dst,
-                    src,
-                    shape: _,
-                    num,
-                } => {
-                    if src.tensor.space == MemorySpace::Reg {
-                        let off = src.offsets.first().and_then(as_int).unwrap_or(0).max(0) as usize;
-                        // The IR slice counts b32 registers; a packed-half st
-                        // reads two elements per register.
-                        let e32 = if matches!(dst.dtype, DType::F16 | DType::Bf16) {
-                            2
-                        } else {
-                            1
-                        };
-                        let e = widths.entry(src.tensor.id).or_insert(0);
-                        *e = (*e).max(off + *num as usize * e32);
-                    }
-                }
-                Stmt::RegCvt {
-                    dst,
-                    src,
-                    rounding: _,
-                } => {
-                    note_reg_width(dst, widths);
-                    note_reg_width(src, widths);
-                }
-                Stmt::RegStore { dst: _, src } => note_reg_width(src, widths),
-                _ => {}
-            }
-            for body in s.child_bodies() {
-                walk_reg_widths(body, widths);
-            }
-        }
-    }
-    walk_reg_widths(&k.body, &mut reg_widths);
-
-    // Auxiliary REG-tensor views (flat storage / atom tcgen05 frags / dtype
-    // reinterprets) required by the warp-matrix and per-thread scalar uses.
-    let mut reg_aux_views: HashMap<u32, RegAuxViews> = HashMap::new();
-    let mut tmem_16_views: Vec<DType> = Vec::new();
-    collect_reg_aux_views(&k.body, &mut reg_aux_views, &mut tmem_16_views)?;
-
-    // An M=64 tcgen05 MMA needs the datapath-F accumulator view.
-    let mut needs_tmem_f = false;
-    fn find_m64_mma(stmts: &[Stmt], out: &mut bool) {
-        for s in stmts {
-            if let Stmt::Tcgen05Mma { m, .. } = s {
-                if *m == 64 {
-                    *out = true;
-                }
-            }
-            for body in s.child_bodies() {
-                find_m64_mma(body, out);
-            }
-        }
-    }
-    find_m64_mma(&k.body, &mut needs_tmem_f);
-
-    // SMEM tensors partially sliced by TMA (see `tma_partial_smem`).
-    let mut tma_partial_smem: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    fn find_tma_partial(stmts: &[Stmt], out: &mut std::collections::HashSet<u32>) {
-        fn note_slice(s: &TensorSlice, out: &mut std::collections::HashSet<u32>) {
-            if s.tensor.space != MemorySpace::Smem || s.shape.len() != s.tensor.shape.len() {
-                return;
-            }
-            // A leading stage-dim slice (extent 1) collapses to an outer index
-            // and leaves the tiled (M, K) box whole — only a partial slice of a
-            // TILED dim (extent > 1, strictly inside the tensor) breaks the
-            // shared-chain stride rule.
-            let partial = s
-                .shape
-                .iter()
-                .zip(s.tensor.shape.iter())
-                .any(|(e, full)| as_int(e).is_some_and(|e| e > 1 && (e as usize) < *full));
-            if partial {
-                out.insert(s.tensor.id);
-            }
-        }
-        for s in stmts {
-            match s {
-                Stmt::TmaLoad { dst, .. } => note_slice(dst, out),
-                Stmt::TmaStore { src, .. } => note_slice(src, out),
-                _ => {}
-            }
-            for body in s.child_bodies() {
-                find_tma_partial(body, out);
-            }
-        }
-    }
-    find_tma_partial(&k.body, &mut tma_partial_smem);
+    // Packed b16 physical instructions address the same local REG storage
+    // through a non-owning u32 reinterpret.
+    let mut reg_u32_views = HashSet::new();
+    collect_reg_u32_views(&k.body, &mut reg_u32_views);
 
     // Scalar var names. Every `ScalarDef` introduces an SSA register var
     // (`NAME: T.int32 = init`, read as `NAME`). Var ids are globally unique, so
@@ -1596,330 +978,47 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
         scalar_names,
         cta_group,
         num_warps: k.num_warps,
-        tmem_view_cols,
-        reg_widths,
-        reg_aux_views,
-        tmem_16_views,
-        needs_tmem_f,
-        tma_partial_smem,
+        reg_u32_views,
         num_clusters: (k.launch_cta_count() / (cta_group as usize).max(1)).max(1),
-        sf_views,
-        sf,
+        tmem_view_index: Cell::new(0),
         nonneg_vars: collect_nonneg_vars(k),
     })
 }
 
-/// Walk the body once and record, per REG tensor, the auxiliary views its
-/// uses require (see `RegAuxViews`).
-fn collect_reg_aux_views(
-    stmts: &[Stmt],
-    views: &mut HashMap<u32, RegAuxViews>,
-    tmem_16: &mut Vec<DType>,
-) -> Result<(), String> {
+/// Record REG tensors whose packed b16 physical instructions require a u32
+/// reinterpret. Every REG tensor still owns exactly one `T.alloc_local`.
+fn collect_reg_u32_views(stmts: &[Stmt], views: &mut HashSet<u32>) {
     for s in stmts {
         match s {
-            Stmt::Tcgen05Ld { dst, shape, .. } => {
-                if *shape != LdStShape::B32x32 {
-                    let v = views.entry(dst.tensor.id).or_default();
-                    v.flat = true;
-                    note_atom_shape(v, dst.tensor.id, shape)?;
+            Stmt::Tcgen05Ld { dst, .. } => {
+                if matches!(dst.tensor.dtype, DType::F16 | DType::Bf16) {
+                    views.insert(dst.tensor.id);
                 }
             }
-            Stmt::Tcgen05St {
-                dst, src, shape, ..
-            } => {
-                if *shape != LdStShape::B32x32 {
-                    let v = views.entry(src.tensor.id).or_default();
-                    v.flat = true;
-                    note_atom_shape(v, src.tensor.id, shape)?;
+            Stmt::Tcgen05St { src, .. } => {
+                if matches!(src.tensor.dtype, DType::F16 | DType::Bf16) {
+                    views.insert(src.tensor.id);
                 }
-                if matches!(dst.dtype, DType::F16 | DType::Bf16) && !tmem_16.contains(&dst.dtype) {
-                    tmem_16.push(dst.dtype);
-                }
-            }
-            Stmt::Tcgen05Mma { a, b, .. } => {
-                // 16-bit TMEM MMA operands read through the packed views.
-                for op in [a, b] {
-                    if let MmaOperand::Tmem(t) = op {
-                        if matches!(t.dtype, DType::F16 | DType::Bf16)
-                            && !tmem_16.contains(&t.dtype)
-                        {
-                            tmem_16.push(t.dtype);
-                        }
-                    }
-                }
-            }
-            Stmt::WarpMma {
-                d,
-                a,
-                b,
-                c,
-                ab_dtype,
-                ..
-            } => {
-                for sl in [d, a, b, c] {
-                    views.entry(sl.tensor.id).or_default().flat = true;
-                }
-                views.entry(a.tensor.id).or_default().flat_ab = Some(*ab_dtype);
-                views.entry(b.tensor.id).or_default().flat_ab = Some(*ab_dtype);
             }
             Stmt::LdMatrix { dst, .. } => {
-                let v = views.entry(dst.tensor.id).or_default();
-                v.flat = true;
                 if matches!(dst.tensor.dtype, DType::F16 | DType::Bf16) {
-                    v.flat_u32 = true;
+                    views.insert(dst.tensor.id);
                 }
             }
             Stmt::StMatrix { src, .. } => {
-                let v = views.entry(src.tensor.id).or_default();
-                v.flat = true;
                 if matches!(src.tensor.dtype, DType::F16 | DType::Bf16) {
-                    v.flat_u32 = true;
-                }
-            }
-            // Every elementwise-touched tensor may need the flat view: the
-            // `Tx.wg.*` elementwise dispatches require the full launch intra
-            // (whole warpgroup), so an op under a narrowed warp/lane branch
-            // lowers to the per-thread scalar form on the flat views instead
-            // (the emit side picks per site via `wg_elem_ok`).
-            Stmt::RegFill { dst, value } => {
-                views.entry(dst.tensor.id).or_default().flat = true;
-                if let RegOperand::Slice(s) = value {
-                    views.entry(s.tensor.id).or_default().flat = true;
-                }
-            }
-            Stmt::RegAdd { dst, lhs, rhs, .. }
-            | Stmt::RegSub { dst, lhs, rhs, .. }
-            | Stmt::RegMul { dst, lhs, rhs } => {
-                views.entry(dst.tensor.id).or_default().flat = true;
-                for op in [lhs, rhs] {
-                    if let RegOperand::Slice(s) = op {
-                        views.entry(s.tensor.id).or_default().flat = true;
-                    }
-                }
-            }
-            Stmt::RegFma { dst, a, b, c } => {
-                views.entry(dst.tensor.id).or_default().flat = true;
-                for op in [a, b, c] {
-                    if let RegOperand::Slice(s) = op {
-                        views.entry(s.tensor.id).or_default().flat = true;
-                    }
-                }
-            }
-            Stmt::RegUnary { dst, src, .. } => {
-                views.entry(dst.tensor.id).or_default().flat = true;
-                if let RegOperand::Slice(s) = src {
-                    views.entry(s.tensor.id).or_default().flat = true;
-                }
-            }
-            Stmt::RegCvt { dst, src, .. } => {
-                views.entry(dst.tensor.id).or_default().flat = true;
-                views.entry(src.tensor.id).or_default().flat = true;
-            }
-            // Per-thread point transfers lower to raw element assignments on
-            // the flat view (see the RegLoad/RegStore arms).
-            Stmt::RegLoad { dst, src } => {
-                if matches!(src.tensor.space, MemorySpace::Smem | MemorySpace::Gmem)
-                    && slice_all_size1(src)
-                {
-                    views.entry(dst.tensor.id).or_default().flat = true;
-                }
-            }
-            Stmt::RegStore { dst, src } => {
-                if src.tensor.space == MemorySpace::Reg
-                    && dst.tensor.space != MemorySpace::Reg
-                    && (slice_all_size1(dst) || gmem_row_run(dst))
-                {
-                    views.entry(src.tensor.id).or_default().flat = true;
+                    views.insert(src.tensor.id);
                 }
             }
             _ => {}
         }
         for body in s.child_bodies() {
-            collect_reg_aux_views(body, views, tmem_16)?;
+            collect_reg_u32_views(body, views);
         }
     }
-    Ok(())
 }
 
-fn note_atom_shape(v: &mut RegAuxViews, id: u32, shape: &LdStShape) -> Result<(), String> {
-    match shape {
-        LdStShape::B16x64 | LdStShape::B16x128 | LdStShape::B16x256 => {}
-        other => {
-            return Err(format!(
-                "codegen: tcgen05 shape {} has no atom-fragment lowering \
-                 (only 16x64b/16x128b/16x256b)",
-                other.as_str()
-            ))
-        }
-    }
-    if let Some(prev) = v.atom_shape {
-        if prev != shape.as_str() {
-            return Err(format!(
-                "codegen: REG tensor {id} is used as both a {prev} and a {} \
-                 tcgen05 fragment (one atom view per tensor)",
-                shape.as_str()
-            ));
-        }
-    }
-    v.atom_shape = Some(shape.as_str());
-    Ok(())
-}
-
-/// Every slice dim is a static size-1 — a per-thread point transfer.
-fn slice_all_size1(s: &TensorSlice) -> bool {
-    !s.shape.is_empty() && s.shape.iter().all(|d| as_int(d) == Some(1))
-}
-
-/// A per-thread narrow contiguous SMEM run: rank >= 2, leading dims all
-/// size-1 (offsets arbitrary), trailing dim a static width 2..=8. Returns the
-/// run width. (Rank-2 `(1, w)` with a TidInWg leading offset could also take
-/// the wg.collective tile form, but the raw per-thread form is at least as
-/// good at these widths, and arithmetic rows REQUIRE it.)
-fn narrow_smem_run(s: &TensorSlice) -> Option<usize> {
-    if s.tensor.space != MemorySpace::Smem || s.shape.len() < 2 {
-        return None;
-    }
-    if !s.shape[..s.shape.len() - 1]
-        .iter()
-        .all(|d| as_int(d) == Some(1))
-    {
-        return None;
-    }
-    match s.shape.last().and_then(as_int) {
-        Some(w) if (2..=8).contains(&w) => Some(w as usize),
-        _ => None,
-    }
-}
-
-/// A per-thread GMEM row run: rank >= 3, leading dims all size-1, trailing dim
-/// > 1 (e.g. the gdn final-state store `state_g[seq, eh, tid, c0:c0+64]`).
-/// Rank-2 `(1, w)` row stores keep the existing wg-band lowering.
-fn gmem_row_run(s: &TensorSlice) -> bool {
-    s.tensor.space == MemorySpace::Gmem
-        && s.shape.len() >= 3
-        && s.shape[..s.shape.len() - 1]
-            .iter()
-            .all(|d| as_int(d) == Some(1))
-        && s.shape.last().and_then(as_int).is_some_and(|w| w > 1)
-}
-
-/// Register one SF view per physical base column, in first-use order
-/// (`SFA_tmem`, `SFB_tmem`, then `sf_tmem{i}`). `rows` is the scaled-row count
-/// of this use; the view's logical rows round it up to whole 128-lane
-/// super-blocks — exactly canon's `(128 * n_chunks, SF_K)` decl_buffer.
-fn note_sf_view(
-    views: &mut Vec<SfView>,
-    op: &TmemOperand,
-    rows: usize,
-    nblocks: usize,
-) -> Result<(), String> {
-    let Some(col) = as_int(&op.col) else {
-        return Err(
-            "codegen: SF TMEM operand base column must be a compile-time constant".to_string(),
-        );
-    };
-    if col < 0 {
-        return Err("codegen: SF TMEM operand base column is negative".to_string());
-    }
-    let col = col as usize;
-    // The logical rows round up to whole TMEM-lane (128-row) super-blocks.
-    let logical_rows = rows.div_ceil(WG_THREADS) * WG_THREADS;
-    let logical_cols = nblocks;
-    if let Some(v) = views.iter().find(|v| v.col == col) {
-        if v.logical_rows != logical_rows || v.logical_cols != logical_cols {
-            return Err(format!(
-                "codegen: SF TMEM views at col {col} disagree on the logical shape"
-            ));
-        }
-        return Ok(());
-    }
-    let name = match views.len() {
-        0 => "SFA_tmem".to_string(),
-        1 => "SFB_tmem".to_string(),
-        i => format!("sf_tmem{i}"),
-    };
-    views.push(SfView {
-        name,
-        col,
-        logical_rows,
-        logical_cols,
-    });
-    Ok(())
-}
-
-fn collect_sf_views(stmts: &[Stmt], views: &mut Vec<SfView>) -> Result<(), String> {
-    for s in stmts {
-        match s {
-            Stmt::Tcgen05Mma {
-                dst: _,
-                a: _,
-                b: _,
-                m,
-                n,
-                k,
-                accum: _,
-                trans_a: _,
-                trans_b: _,
-                cta_group,
-                sfa: Some(sfa),
-                sfb: Some(sfb),
-                sf_byte: _,
-                sf_e4m3: _,
-                sf_block,
-                a_fp4: _,
-                b_fp4: _,
-                lane_align: _,
-            } => {
-                let nblocks = if *sf_block == 0 {
-                    1
-                } else {
-                    (*k / *sf_block) as usize
-                };
-                let a_rows = (if *cta_group == 1 { *m } else { *m / 2 }) as usize;
-                note_sf_view(views, sfa, a_rows, nblocks)?;
-                note_sf_view(views, sfb, *n as usize, nblocks)?;
-            }
-            Stmt::Tcgen05Cp {
-                dst,
-                src,
-                cta_group: _,
-            } if dst.dtype == DType::F8E4M3 => {
-                // The src is the staged SF SMEM tile (..., rows, SF_CTA_K); its
-                // trailing dims are the view's logical (rows, cols).
-                let (Some(rows), Some(sf_k)) = (
-                    src.shape
-                        .get(src.shape.len().saturating_sub(2))
-                        .and_then(as_int),
-                    src.shape.last().and_then(as_int),
-                ) else {
-                    return Err(
-                        "codegen: tcgen05_cp src shape must be static for the SF view".to_string(),
-                    );
-                };
-                note_sf_view(views, dst, rows.max(0) as usize, sf_k.max(0) as usize)?;
-            }
-            _ => {}
-        }
-        for body in s.child_bodies() {
-            collect_sf_views(body, views)?;
-        }
-    }
-    Ok(())
-}
-
-/// The declared (full) width of a REG fragment's wg tile = its spanned band width.
-fn reg_view_width(t: &Arc<Tensor>, ctx: &Ctx) -> usize {
-    ctx.reg_widths
-        .get(&t.id)
-        .copied()
-        .filter(|w| *w > 0)
-        .unwrap_or_else(|| t.shape.first().copied().unwrap_or(0))
-}
-
-/// Column-sliced expression on a REG wg tile: `name[:, off:off+width]` (or
-/// `name[:, :]` when it spans the whole tile). The fragment is a `T.wg_reg_tile`,
-/// i.e. already a 2D `(128, full)` warpgroup tile — no `.view()` indirection.
+/// Slice a rank-1 per-thread local REG array.
 fn emit_reg_view_slice(
     _out: &mut Emitter,
     _p: &str,
@@ -1929,12 +1028,13 @@ fn emit_reg_view_slice(
     ctx: &Ctx,
 ) -> Result<String, String> {
     let name = ctx.tensor_name(t.id)?.to_string();
-    let full = reg_view_width(t, ctx);
-    if as_int(off) == Some(0) && width == full {
-        Ok(format!("{name}[:, :]"))
+    let full = t.shape.first().copied().unwrap_or(0);
+    let all = as_int(off) == Some(0) && width == full;
+    if all {
+        Ok(format!("{name}[:]"))
     } else {
         let off_s = emit_scalar(off, ctx)?;
-        Ok(format!("{name}[:, {off_s}:{off_s} + {width}]"))
+        Ok(format!("{name}[{off_s}:{off_s} + {width}]"))
     }
 }
 
@@ -1962,7 +1062,7 @@ fn reg_slice_parts(s: &TensorSlice) -> Result<(&Arc<Tensor>, &ScalarValue, usize
     Ok((&s.tensor, &s.offsets[0], w))
 }
 
-/// A `T.<dtype>(value)` scalar literal for `Tx.wg.*` operands (a bare number
+/// A `T.<dtype>(value)` scalar literal for thread-local REG operands (a bare number
 /// has no dtype; the literal takes the DST tensor's dtype, exactly the
 /// interpreter's `literal_array`).
 fn typed_scalar(dtype: DType, l: RegLiteral) -> Result<String, String> {
@@ -1984,11 +1084,11 @@ fn typed_scalar(dtype: DType, l: RegLiteral) -> Result<String, String> {
     }
 }
 
-/// One operand arm of a `Tx.wg.*` elementwise call: a wg-view slice, or a typed
+/// One operand arm of a `Tx.thread.*` elementwise call: a local slice, or a typed
 /// scalar for a literal. Slice operands must share the dst dtype — the
 /// interpreter coerces per-op, so a genuinely mixed-dtype op must say so with
 /// an explicit RegCvt instead of being silently coerced here.
-fn emit_wg_reg_operand(
+fn emit_reg_operand(
     op: &RegOperand,
     dst_dtype: DType,
     out: &mut Emitter,
@@ -2011,131 +1111,9 @@ fn emit_wg_reg_operand(
     }
 }
 
-/// True when the enclosing scope provably covers a whole warpgroup: the
-/// `Tx.wg.*` elementwise dispatches require the full launch intra (all 32
-/// lanes of all four warps), so anything narrower (a lone warp, a
-/// lane/warp-predicated branch) must take the per-thread scalar form.
-fn wg_elem_ok(scope: &ScopeInfo) -> bool {
-    scope
-        .set
-        .as_ref()
-        .is_some_and(|s| s.is_full_cta() || s.is_exactly_one_full_warpgroup().is_some())
-}
-
-/// True when the slice spans the whole wg view (offset 0, width == the view's
-/// full width). `Tx.wg.*` elementwise ops DROP the column offset of sliced
-/// operands/dsts (B200-verified: `fill(frag[:, 1:2])` writes element 0; the
-/// plain and dual-view forms differ in src-slice behavior), so anything
-/// narrower than a full-extent slice must take the per-thread scalar form on
-/// the flat views, which addresses elements exactly.
-fn slice_is_full(t: &Arc<Tensor>, off: &ScalarValue, w: usize, ctx: &Ctx) -> bool {
-    as_int(off) == Some(0) && w == reg_view_width(t, ctx)
-}
-
-/// True when every slice of a reg elementwise op (dst + slice operands) is
-/// full-extent — the only case `Tx.wg.*` honors.
-fn reg_op_slices_full(
-    dst: &TensorSlice,
-    operands: &[&RegOperand],
-    ctx: &Ctx,
-) -> Result<bool, String> {
-    let (dt, doff, dw) = reg_slice_parts(dst)?;
-    if !slice_is_full(dt, doff, dw, ctx) {
-        return Ok(false);
-    }
-    for op in operands {
-        if let RegOperand::Slice(s) = op {
-            let (t, off, w) = reg_slice_parts(s)?;
-            if !slice_is_full(t, off, w, ctx) {
-                return Ok(false);
-            }
-        }
-    }
-    Ok(true)
-}
-
-/// One element's index into a flat view: `off + _i` (simplified for a base-0
-/// slice or a constant read).
-fn flat_elem_idx(off: &ScalarValue, i: &str, ctx: &Ctx) -> Result<String, String> {
-    Ok(match (as_int(off), i) {
-        (Some(0), _) => i.to_string(),
-        (Some(b), "0") => b.to_string(),
-        (Some(b), _) => format!("{b} + {i}"),
-        (None, "0") => emit_scalar(off, ctx)?,
-        (None, _) => format!("{} + {i}", emit_scalar(off, ctx)?),
-    })
-}
-
-/// The per-thread scalar form of a reg elementwise op:
-/// `for _i in range(w): <dst>_flat[d] = <expr>`. With `convert`, a 16-bit dst
-/// follows the interpreter's f32-compute-then-round: operands upcast to f32,
-/// the result cast back at the write (literals are rounded to the dst dtype
-/// FIRST, exactly `literal_array`). Slice operands of width 1 read their base
-/// element (the one-element-per-thread broadcast).
-fn emit_scalar_elem(
-    out: &mut Emitter,
-    p: &str,
-    ctx: &Ctx,
-    dst: &TensorSlice,
-    operands: &[&RegOperand],
-    convert: bool,
-    expr: impl Fn(&[&str]) -> String,
-) -> Result<(), String> {
-    let (dt, doff, w) = reg_slice_parts(dst)?;
-    let dflat = flat_name(dt, ctx)?;
-    let convert = convert && matches!(dt.dtype, DType::F16 | DType::Bf16);
-    let mut elems: Vec<String> = Vec::with_capacity(operands.len());
-    for op in operands {
-        elems.push(match op {
-            RegOperand::Literal(l) => {
-                let t = typed_scalar(dt.dtype, *l)?;
-                if convert {
-                    format!("T.float32({t})")
-                } else {
-                    t
-                }
-            }
-            RegOperand::Slice(s) => {
-                let (t, off, sw) = reg_slice_parts(s)?;
-                if t.dtype != dt.dtype {
-                    return Err(format!(
-                        "codegen: reg operand dtype {:?} != dst dtype {:?} — \
-                         the interpreter coerces operands per-op; use an explicit RegCvt",
-                        t.dtype, dt.dtype
-                    ));
-                }
-                if sw != 1 && sw != w {
-                    return Err(format!(
-                        "codegen: reg operand width {sw} must be 1 or the dst width {w} \
-                         (the interpreter matches the dst or broadcasts one element per thread)"
-                    ));
-                }
-                let idx = flat_elem_idx(off, if sw == 1 { "0" } else { "_i" }, ctx)?;
-                let e = format!("{}[{idx}]", flat_name(t, ctx)?);
-                if convert {
-                    format!("T.float32({e})")
-                } else {
-                    e
-                }
-            }
-        });
-    }
-    let body = expr(&elems.iter().map(|s| s.as_str()).collect::<Vec<_>>());
-    let body = if convert {
-        format!("T.{}({body})", dtype_str(dt.dtype))
-    } else {
-        body
-    };
-    let d_idx = flat_elem_idx(doff, "_i", ctx)?;
-    out.push_str(&format!("{p}for _i in range({w}):\n"));
-    out.push_str(&format!("{p}    {dflat}[{d_idx}] = {body}\n"));
-    Ok(())
-}
-
-/// The `{name}_flat` raw per-thread storage name for a REG tensor declared
-/// with auxiliary views (see `RegAuxViews`).
-fn flat_name(t: &Arc<Tensor>, ctx: &Ctx) -> Result<String, String> {
-    Ok(format!("{}_flat", ctx.tensor_name(t.id)?))
+/// The owning per-thread local storage name for a REG tensor.
+fn reg_name(t: &Arc<Tensor>, ctx: &Ctx) -> Result<String, String> {
+    Ok(ctx.tensor_name(t.id)?.to_string())
 }
 
 /// `off + i` text for flat-view indices (simplified when the base is 0).
@@ -2156,18 +1134,18 @@ fn py_bool(b: bool) -> &'static str {
     }
 }
 
-/// Validate the ldmatrix/stmatrix SMEM operand: a rank-2 `(row, col)` slice of
-/// exactly one 8-element b16 row (the per-thread row-address form the
-/// interpreter's matrix model requires).
+/// Validate the ldmatrix/stmatrix SMEM operand: one contiguous 8-element b16
+/// row. Owning SMEM tensors may carry explicit leading stage/tile axes, so
+/// those axes remain in the slice as extent-one point dimensions.
 fn check_matrix_smem_row(s: &TensorSlice, label: &str) -> Result<(), String> {
-    if s.offsets.len() != 2 || s.shape.len() != 2 {
+    if s.shape.is_empty()
+        || as_int(s.shape.last().expect("non-empty")) != Some(8)
+        || s.shape[..s.shape.len() - 1]
+            .iter()
+            .any(|extent| as_int(extent) != Some(1))
+    {
         return Err(format!(
-            "codegen: {label} SMEM operand must be a rank-2 (row, col) slice"
-        ));
-    }
-    if as_int(&s.shape[0]) != Some(1) || as_int(&s.shape[1]) != Some(8) {
-        return Err(format!(
-            "codegen: {label} SMEM operand must be one row of eight b16 elements \
+            "codegen: {label} SMEM operand must end in one contiguous row of eight b16 elements \
              (got shape {:?})",
             s.shape
         ));
@@ -2181,13 +1159,20 @@ fn check_matrix_smem_row(s: &TensorSlice, label: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Shared lowering for `RegAdd`/`RegSub`: `Tx.wg.{op}(dst, lhs, rhs)` over the
-/// wg views when the scope is provably warpgroup-full, else the per-thread
-/// scalar form (the elementwise dispatches reject a narrowed intra; the
-/// scalar form IS the interpreter's per-thread semantics).
+fn emit_matrix_smem_ptr(s: &TensorSlice, ctx: &Ctx) -> Result<String, String> {
+    let name = ctx.tensor_name(s.tensor.id)?;
+    let offsets = s
+        .offsets
+        .iter()
+        .map(|offset| emit_scalar(offset, ctx))
+        .collect::<Result<Vec<_>, _>>()?
+        .join(", ");
+    Ok(format!("{name}.ptr_to([{offsets}])"))
+}
+
+/// Shared lowering for `RegAdd`/`RegSub`/`RegMul` on per-thread local arrays.
 /// `rounding=rm` (the interpreter's post-op floor) has no TIRx elementwise
 /// form — fail closed rather than silently skip the floor.
-#[allow(clippy::too_many_arguments)]
 fn emit_reg_binary(
     out: &mut Emitter,
     p: &str,
@@ -2197,7 +1182,6 @@ fn emit_reg_binary(
     rounding: Rounding,
     op: &str,
     ctx: &Ctx,
-    scope: &ScopeInfo,
 ) -> Result<(), String> {
     if rounding != Rounding::Rn {
         return Err(format!(
@@ -2212,77 +1196,69 @@ fn emit_reg_binary(
             t.dtype
         ));
     }
-    if wg_elem_ok(scope) && reg_op_slices_full(dst, &[lhs, rhs], ctx)? {
-        let dst_s = emit_reg_view_slice(out, p, t, off, w, ctx)?;
-        let lhs_s = emit_wg_reg_operand(lhs, t.dtype, out, p, ctx)?;
-        let rhs_s = emit_wg_reg_operand(rhs, t.dtype, out, p, ctx)?;
-        out.push_str(&format!("{p}Tx.wg.{op}({dst_s}, {lhs_s}, {rhs_s})\n"));
-        Ok(())
-    } else {
-        let sym = if op == "add" { "+" } else { "-" };
-        emit_scalar_elem(out, p, ctx, dst, &[lhs, rhs], true, |e| {
-            format!("{} {sym} {}", e[0], e[1])
-        })
-    }
+    let dst_s = emit_reg_view_slice(out, p, t, off, w, ctx)?;
+    let lhs_s = emit_reg_operand(lhs, t.dtype, out, p, ctx)?;
+    let rhs_s = emit_reg_operand(rhs, t.dtype, out, p, ctx)?;
+    out.push_str(&format!("{p}Tx.thread.{op}({dst_s}, {lhs_s}, {rhs_s})\n"));
+    Ok(())
 }
 
-/// Per-thread register count (in dtype ELEMENTS) of one tcgen05 ld/st atom
-/// issue: `.32x32b`/`.16x64b` hold `num` b32 regs per thread, `.16x128b`
-/// `2*num`, `.16x256b` `4*num`; 16-bit dtypes pack two elements per b32 reg.
-/// (PTX ISA Table 49; M=64 slab only — the M=128 `.16x*b` two-issue form is
-/// rejected by the lowering.)
-fn tcgen05_frag_regs(shape: &LdStShape, num: usize, dtype: DType) -> usize {
-    let b32 = match shape {
-        LdStShape::B32x32 | LdStShape::B16x64 => num,
-        LdStShape::B16x128 => 2 * num,
-        LdStShape::B16x256 => 4 * num,
-        // No codegen lowering (rejected at the op site); sized so the width
-        // walk stays total.
-        LdStShape::B16x32Bx2 => num,
-    };
-    let e32 = if matches!(dtype, DType::F16 | DType::Bf16) {
-        2
-    } else {
-        1
-    };
-    b32 * e32
-}
-
-/// The `.16x*b` atom view's column count for a per-thread width-W fragment:
-/// the M=64 warpgroup frag is `(64, K)` with `64*K/128 = W` per-thread
-/// elements, so `K = 2W`; the implied `.xN` rep is `K / (col_factor *
-/// elems_per_b32)` and must be integral.
-fn atom_frag_cols(shape: &str, width: usize, dtype: DType) -> Result<usize, String> {
-    let factor = match shape {
-        "16x64b" => 2usize,
-        "16x128b" => 4,
-        "16x256b" => 8,
-        other => {
-            return Err(format!(
-                "codegen: tcgen05 shape {other} has no atom-fragment view \
-                 (only 16x64b/16x128b/16x256b)"
-            ))
-        }
-    };
-    let e32 = match dtype {
-        DType::F32 => 1usize,
-        DType::F16 | DType::Bf16 => 2,
-        other => {
-            return Err(format!(
-                "codegen: tcgen05 {shape} fragment dtype {other:?} has no lowering \
-                 (only f32/f16/bf16)"
-            ))
-        }
-    };
-    let k = 2 * width;
-    if k % (factor * e32) != 0 {
+/// Render the physical b32 register tuple carried by one tcgen05.ld/st
+/// instruction.  The IR's REG slice is in dtype elements; a 16-bit fragment
+/// therefore contributes two elements per physical register and is addressed
+/// through its uint32 reinterpret view.
+fn emit_tcgen05_reg_tuple(
+    slice: &TensorSlice,
+    shape: LdStShape,
+    num: u32,
+    ctx: &Ctx,
+) -> Result<(String, bool), String> {
+    let (tensor, offset, width) = reg_slice_parts(slice)?;
+    let register_count = shape.register_count(num).ok_or_else(|| {
+        format!(
+            "codegen: invalid tcgen05.ld/st shape={} num={num}",
+            shape.as_str()
+        )
+    })?;
+    let is_b16 = matches!(tensor.dtype, DType::F16 | DType::Bf16);
+    if !is_b16 && !matches!(tensor.dtype, DType::F32 | DType::I32 | DType::U32) {
         return Err(format!(
-            "codegen: tcgen05 {shape} fragment of {width} per-thread {dtype:?} elements \
-             has no integral .xN rep (K = {k} cols is not a multiple of {})",
-            factor * e32
+            "codegen: tcgen05.ld/st REG dtype {:?} has no physical b32 register form",
+            tensor.dtype
         ));
     }
-    Ok(k)
+    let expected_width = register_count * if is_b16 { 2 } else { 1 };
+    if width != expected_width {
+        return Err(format!(
+            "codegen: tcgen05.ld/st shape={} num={num} needs {expected_width} \
+             REG elements of dtype {:?}, got {width}",
+            shape.as_str(),
+            tensor.dtype
+        ));
+    }
+
+    let name = ctx.tensor_name(tensor.id)?;
+    let (view, base) = if is_b16 {
+        let Some(offset) = as_int(offset) else {
+            return Err(
+                "codegen: packed 16-bit tcgen05.ld/st REG offset must be static".to_string(),
+            );
+        };
+        if offset < 0 || offset % 2 != 0 {
+            return Err(format!(
+                "codegen: packed 16-bit tcgen05.ld/st REG offset {offset} \
+                 must be non-negative and even"
+            ));
+        }
+        (format!("{name}_u32"), (offset / 2).to_string())
+    } else {
+        (name.to_string(), emit_scalar(offset, ctx)?)
+    };
+    let regs = (0..register_count)
+        .map(|index| format!("{view}[{}]", flat_add(&base, index)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok((regs, is_b16))
 }
 
 // ===========================================================================
@@ -2616,9 +1592,14 @@ fn emit_expr(e: &ScalarExpr, ctx: &Ctx, parent_prec: u8) -> Result<String, Strin
             emit_scalar_prec(&e.args[0], ctx, 0)?,
             emit_scalar_prec(&e.args[1], ctx, 0)?
         ),
+        ScalarOp::Xor => format!(
+            "T.bitwise_xor({}, {})",
+            emit_scalar_prec(&e.args[0], ctx, 0)?,
+            emit_scalar_prec(&e.args[1], ctx, 0)?
+        ),
         _ => {
             let Some(sym) = binop_symbol(e.op) else {
-                // An op with no TVMScript lowering (e.g. `Xor`) must not leak a
+                // An op with no TVMScript lowering must not leak a
                 // placeholder literal into the emitted Python source (a syntax
                 // error at best) — fail closed like every other unsupported node.
                 return Err(format!(
@@ -2692,28 +1673,319 @@ fn emit_smem_tile(s: &TensorSlice, ctx: &Ctx) -> Result<String, String> {
     Ok(format!("{name}[{}]", dims.join(", ")))
 }
 
-/// Emit a warpgroup-collective SMEM store DST tile: like `emit_smem_tile`, but a
-/// size-1 dim whose offset is the per-thread `tid_in_wg` lane axis becomes a full
-/// span `:` (the 128-row warpgroup tile) — the value model writes that row per
-/// thread, but `Tx.wg.copy` takes the whole tile and the layout maps lanes to rows.
-/// (Canonical: `Tx.wg.copy(Dsmem[0, db, :, c0:c1], ...)`.)
-fn emit_smem_wg_store_tile(s: &TensorSlice, ctx: &Ctx) -> Result<String, String> {
+/// Emit a literal BufferRegion for a generic synchronous `Tx.copy`. Every IR
+/// dimension remains an explicit range, including extent-one dimensions, so
+/// the printer never turns a one-element region into a scalar BufferLoad.
+fn emit_buffer_region(s: &TensorSlice, ctx: &Ctx) -> Result<String, String> {
     let name = ctx.tensor_name(s.tensor.id)?;
-    let mut dims = Vec::new();
-    for (off, ext) in s.offsets.iter().zip(s.shape.iter()) {
-        let is_lane_axis = matches!(off, ScalarValue::Scope(ScopeValueKind::TidInWg));
-        if is_lane_axis {
-            // per-thread row -> the full warpgroup row span
-            dims.push(":".to_string());
-        } else if as_int(ext) == Some(1) {
-            dims.push(emit_scalar(off, ctx)?); // size-1 ring index: drop the axis
+    let dims = s
+        .offsets
+        .iter()
+        .zip(&s.shape)
+        .map(|(offset, extent)| {
+            let lo = emit_scalar(offset, ctx)?;
+            let hi = add_bound(offset, extent, ctx)?;
+            Ok(format!("{lo}:{hi}"))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(format!("{name}[{}]", dims.join(", ")))
+}
+
+/// Emit the exact rank-2 SMEM tile carried by a physical tcgen05 statement.
+/// Leading axes are explicit point indices; only the final row/column axes are
+/// ranges.  No shape or stage axis is inferred here.
+fn emit_named_smem_tile(tile: &SmemTile, name: &str, ctx: &Ctx) -> Result<String, String> {
+    let mut dims = tile
+        .prefix_indices
+        .iter()
+        .map(|index| emit_scalar(index, ctx))
+        .collect::<Result<Vec<_>, _>>()?;
+    let row_lo = emit_scalar(&tile.row_offset, ctx)?;
+    let row_hi = add_bound(
+        &tile.row_offset,
+        &ScalarValue::Int(i64::from(tile.rows)),
+        ctx,
+    )?;
+    let col_lo = emit_scalar(&tile.col_offset, ctx)?;
+    let col_hi = add_bound(
+        &tile.col_offset,
+        &ScalarValue::Int(i64::from(tile.cols)),
+        ctx,
+    )?;
+    dims.push(format!("{row_lo}:{row_hi}"));
+    dims.push(format!("{col_lo}:{col_hi}"));
+    Ok(format!("{name}[{}]", dims.join(", ")))
+}
+
+fn emit_explicit_smem_tile(tile: &SmemTile, ctx: &Ctx) -> Result<String, String> {
+    emit_named_smem_tile(tile, ctx.tensor_name(tile.tensor.id)?, ctx)
+}
+
+/// Emit an MMA SMEM operand.  F4 is physically backed by U8 in Nymph, so the
+/// explicit byte offsets/extents become twice as many logical e2m1 elements
+/// after the buffer-level view; every other format uses the tile verbatim.
+fn emit_mma_smem_tile(tile: &SmemTile, format: MmaElemFormat, ctx: &Ctx) -> Result<String, String> {
+    if format != MmaElemFormat::F4E2M1 {
+        return emit_explicit_smem_tile(tile, ctx);
+    }
+    let name = ctx.tensor_name(tile.tensor.id)?;
+    let mut dims = tile
+        .prefix_indices
+        .iter()
+        .map(|index| emit_scalar(index, ctx))
+        .collect::<Result<Vec<_>, _>>()?;
+    let row_lo = emit_scalar(&tile.row_offset, ctx)?;
+    let row_hi = add_bound(
+        &tile.row_offset,
+        &ScalarValue::Int(i64::from(tile.rows)),
+        ctx,
+    )?;
+    let col_lo = emit_scalar_prec(&tile.col_offset, ctx, 4)?;
+    let col_hi = add_bound(
+        &tile.col_offset,
+        &ScalarValue::Int(i64::from(tile.cols)),
+        ctx,
+    )?;
+    dims.push(format!("{row_lo}:{row_hi}"));
+    dims.push(format!("({col_lo}) * 2:({col_hi}) * 2"));
+    Ok(format!(
+        "{name}.view(\"float4_e2m1fn\")[{}]",
+        dims.join(", ")
+    ))
+}
+
+fn mma_format_dtype(format: MmaElemFormat) -> &'static str {
+    match format {
+        MmaElemFormat::F16 => "float16",
+        MmaElemFormat::BF16 => "bfloat16",
+        MmaElemFormat::F8E4M3 => "float8_e4m3fn",
+        MmaElemFormat::F4E2M1 => "float4_e2m1fn",
+    }
+}
+
+fn mma_format_bits(format: MmaElemFormat) -> u32 {
+    match format {
+        MmaElemFormat::F16 | MmaElemFormat::BF16 => 16,
+        MmaElemFormat::F8E4M3 => 8,
+        MmaElemFormat::F4E2M1 => 4,
+    }
+}
+
+fn scale_format_dtype(format: ScaleFormat) -> &'static str {
+    match format {
+        ScaleFormat::E8M0FNU => "float8_e8m0fnu",
+        ScaleFormat::E4M3FN => "float8_e4m3fn",
+    }
+}
+
+fn bool_py(value: bool) -> &'static str {
+    if value {
+        "True"
+    } else {
+        "False"
+    }
+}
+
+/// Physical TMEM coordinates become offsets on the statement-local buffer
+/// layout. `elements_per_cell` converts the IR's 32-bit column unit into the
+/// declared buffer dtype's TCol element unit.
+fn emit_tmem_layout_offsets(
+    addr: &TmemAddr,
+    elements_per_cell: u32,
+    extra_col_elements: u32,
+    ctx: &Ctx,
+) -> Result<(String, String), String> {
+    let lane = emit_scalar(&addr.row, ctx)?;
+    let expr = if let Some(col) = as_int(&addr.col) {
+        col.checked_mul(i64::from(elements_per_cell))
+            .and_then(|value| value.checked_add(i64::from(extra_col_elements)))
+            .ok_or_else(|| "codegen: TMEM column offset overflows i64".to_string())?
+            .to_string()
+    } else {
+        let col = emit_scalar_prec(&addr.col, ctx, 4)?;
+        let scaled = if elements_per_cell == 1 {
+            col
         } else {
-            let lo = emit_scalar(off, ctx)?;
-            let hi = add_bound(off, ext, ctx)?;
-            dims.push(format!("{lo}:{hi}"));
+            format!("({col}) * {elements_per_cell}")
+        };
+        if extra_col_elements == 0 {
+            scaled
+        } else {
+            format!("({scaled}) + {extra_col_elements}")
+        }
+    };
+    Ok((lane, expr))
+}
+
+fn datapath_name(datapath: TmemDatapath) -> &'static str {
+    match datapath {
+        TmemDatapath::A => "A",
+        TmemDatapath::B => "B",
+        TmemDatapath::D => "D",
+        TmemDatapath::E => "E",
+        TmemDatapath::F => "F",
+    }
+}
+
+fn emit_cp_tmem_layout(lane_layout: CpLaneLayout, rows: u32, cols: u32) -> Result<String, String> {
+    let layout = match lane_layout {
+        CpLaneLayout::Identity => {
+            if rows % 128 != 0 {
+                return Err(format!(
+                    "codegen: identity tcgen05.cp rows {rows} are not divisible by 128"
+                ));
+            }
+            format!(
+                "TileLayout(S[({}, 128, {cols}) : ({cols} @ TCol, 1 @ TLane, 1 @ TCol)])",
+                rows / 128
+            )
+        }
+        CpLaneLayout::Quadrant4 => {
+            if rows % 4 != 0 {
+                return Err(format!(
+                    "codegen: 4x tcgen05.cp rows {rows} are not divisible by 4"
+                ));
+            }
+            format!(
+                "TileLayout(S[({}, 4, {cols}) : (1 @ TLane, 32 @ TLane, 1 @ TCol)])",
+                rows / 4
+            )
+        }
+        CpLaneLayout::Warp2_02_13 => {
+            if rows % 64 != 0 {
+                return Err(format!(
+                    "codegen: 64x tcgen05.cp rows {rows} are not divisible by 64"
+                ));
+            }
+            format!(
+                "TileLayout(S[({}, 64, {cols}) : ({cols} @ TCol, 1 @ TLane, 1 @ TCol)] + R[2:64 @ TLane])",
+                rows / 64
+            )
+        }
+        CpLaneLayout::Warp2_01_23 => {
+            if rows % 64 != 0 {
+                return Err(format!(
+                    "codegen: 64x tcgen05.cp rows {rows} are not divisible by 64"
+                ));
+            }
+            format!(
+                "TileLayout(S[({}, 2, 32, {cols}) : ({cols} @ TCol, 64 @ TLane, 1 @ TLane, 1 @ TCol)] + R[2:32 @ TLane])",
+                rows / 64
+            )
+        }
+        CpLaneLayout::Warp4 => {
+            if rows % 32 != 0 {
+                return Err(format!(
+                    "codegen: 32x tcgen05.cp rows {rows} are not divisible by 32"
+                ));
+            }
+            format!(
+                "TileLayout(S[({}, 32, {cols}) : ({cols} @ TCol, 1 @ TLane, 1 @ TCol)] + R[4:32 @ TLane])",
+                rows / 32
+            )
+        }
+    };
+    Ok(layout)
+}
+
+fn emit_cp_smem_layout(layout: CpSmemLayout, shape: &[usize], bits: u32) -> Result<String, String> {
+    let shape_s = python_shape(shape);
+    match layout {
+        CpSmemLayout::Plain16B => {
+            let rows = shape[0];
+            let cols = shape[1];
+            Ok(format!("TileLayout(S[({rows}, {cols}) : ({cols}, 1)])"))
+        }
+        CpSmemLayout::Swizzle32B => {
+            let elements_per_128b = 128 / bits;
+            if !elements_per_128b.is_power_of_two() || shape.len() != 2 {
+                return Err(
+                    "codegen: invalid B32 tcgen05.cp source dtype or tensor rank".to_string(),
+                );
+            }
+            let per_element = elements_per_128b.ilog2();
+            let period = 1u32
+                .checked_shl(per_element + 1 + 3)
+                .ok_or_else(|| "codegen: B32 tcgen05.cp layout period overflows".to_string())?;
+            let atom_shape = vec![8, (256 / bits) as usize];
+            let mut tile_shape = atom_shape.clone();
+            tile_shape[0] = shape[0];
+            Ok(format!(
+                "ComposeLayout({per_element}, 1, 3, \
+                 TileLayout(S[{}])).tile_to({}, {}).tile_to({shape_s}, {}).canonicalize()",
+                python_shape(&[period as usize]),
+                python_shape(&tile_shape),
+                python_shape(&atom_shape),
+                python_shape(&tile_shape),
+            ))
         }
     }
-    Ok(format!("{name}[{}]", dims.join(", ")))
+}
+
+fn emit_cp_smem_elem_offset(
+    layout: CpSmemLayout,
+    tile: &SmemTile,
+    bits: u32,
+    ctx: &Ctx,
+) -> Result<String, String> {
+    let byte_offset = tile
+        .tensor
+        .byte_offset
+        .ok_or_else(|| "codegen: Tcgen05Cp source has no absolute byte_offset".to_string())?;
+    let base_bits = byte_offset
+        .checked_mul(8)
+        .ok_or_else(|| "codegen: Tcgen05Cp source byte_offset overflows".to_string())?;
+    if base_bits % bits as usize != 0 {
+        return Err(format!(
+            "codegen: Tcgen05Cp source byte_offset {byte_offset} is not element aligned"
+        ));
+    }
+    let base_elements = base_bits / bits as usize;
+    let rank = tile.tensor.shape.len();
+    let mut prefix_linear = "0".to_string();
+    for (index, extent) in tile
+        .prefix_indices
+        .iter()
+        .zip(tile.tensor.shape[..rank - 2].iter())
+    {
+        let index = emit_scalar_prec(index, ctx, 4)?;
+        prefix_linear = format!("({prefix_linear}) * {extent} + ({index})");
+    }
+    let rows = tile.tensor.shape[rank - 2];
+    let cols = tile.tensor.shape[rank - 1];
+    let physical = match layout {
+        CpSmemLayout::Plain16B => {
+            let row = emit_scalar_prec(&tile.row_offset, ctx, 4)?;
+            let col = emit_scalar_prec(&tile.col_offset, ctx, 4)?;
+            format!("((({prefix_linear}) * {rows} + ({row})) * {cols} + ({col}))")
+        }
+        CpSmemLayout::Swizzle32B => {
+            let row = as_int(&tile.row_offset)
+                .ok_or_else(|| "codegen: B32 Tcgen05Cp row_offset is not static".to_string())?;
+            let col = as_int(&tile.col_offset)
+                .ok_or_else(|| "codegen: B32 Tcgen05Cp col_offset is not static".to_string())?;
+            let atom_cols = i64::from(256 / bits);
+            let col_block = col / atom_cols;
+            let row_block = row / 8;
+            format!(
+                "(({prefix_linear}) * {} + {col_block} * {} + {row_block} * {})",
+                rows * cols,
+                rows * atom_cols as usize,
+                8 * atom_cols as usize,
+            )
+        }
+    };
+    Ok(format!("{base_elements} + {physical}"))
+}
+
+fn cp_multicast_config(multicast: super::stmt::Tcgen05CpMulticast) -> &'static str {
+    use super::stmt::Tcgen05CpMulticast::*;
+    match multicast {
+        None => "",
+        Warp2_02_13 => "warpx2::02_13",
+        Warp2_01_23 => "warpx2::01_23",
+        Warp4 => "warpx4",
+    }
 }
 
 /// A scalar element address into the SMEM mailbox: every dim is a size-1 index, so
@@ -2733,20 +2005,6 @@ fn emit_scalar_addr(s: &TensorSlice, ctx: &Ctx) -> Result<String, String> {
 /// A scalar load from a 1-element tensor slice — same address form as a store.
 fn emit_scalar_load(s: &TensorSlice, ctx: &Ctx) -> Result<String, String> {
     emit_scalar_addr(s, ctx)
-}
-
-/// The MMA accumulator dst: an absolute column slice of the single `tmem`
-/// view — `tmem[:, col:col+n]`. The accumulator is lane-anchored at row 0, so
-/// the lane axis spans all 128 lanes; the column band is the operand's
-/// absolute physical base plus the MMA's n. An M=64 accumulator (gdn's BT=64
-/// GEMMs) is the non-ws datapath F — the `tmem_f` view's scattered-row layout.
-fn emit_tmem_dst(op: &TmemOperand, n: u32, m: u32, ctx: &Ctx) -> Result<String, String> {
-    let col_s = emit_scalar(&op.col, ctx)?;
-    let hi = add_bound(&op.col, &ScalarValue::Int(i64::from(n)), ctx)?;
-    if m == 64 {
-        return Ok(format!("tmem_f[:, {col_s}:{hi}]"));
-    }
-    Ok(format!("tmem[:, {col_s}:{hi}]"))
 }
 
 // ===========================================================================
@@ -2808,110 +2066,29 @@ fn emit_stmt(
     use Stmt::*;
     let p = pad(indent);
     match stmt {
-        // ---- REG fragments: emit INLINE at the TensorDef site (canon's loop-local
-        // `T.wg_reg_tile(...)`), NOT hoisted to function scope. A function-scope register
-        // tile is whole-kernel-lived and ptxas keeps it in LOCAL memory (the LDL/STL spill);
-        // declared inside the consuming loop it is task-local and promotes to registers. ----
+        // REG storage is exactly the tensor declared by the IR: one per-thread
+        // local array with the IR shape and dtype, emitted at the TensorDef site.
         TensorDef { tensor } if tensor.space == MemorySpace::Reg => {
             let name = ctx.tensor_name(tensor.id)?.to_string();
-            let width = ctx
-                .reg_widths
-                .get(&tensor.id)
-                .copied()
-                .filter(|w| *w > 0)
-                .unwrap_or_else(|| tensor.shape.first().copied().unwrap_or(0));
-            match &tensor.reg_frag {
-                // STMATRIX epilogue datapath (canon's nvfp4 epilogue): the reg frag is
-                // a `tcgen05.{ld,st}`-atom fragment, not a plain thread-axis tile, so the
-                // reg->smem store lowers to STSM/stmatrix (vs the thread-axis tile's plain
-                // STS, which carries 5.4x the SMEM bank conflicts). The read frag is
-                // `alloc_tcgen05_ldst_frag(instr_shape, (128, W), dtype)`; the cast (output)
-                // frag is `alloc_cast_frag(<read_frag>, dtype)`, inheriting the read frag's
-                // (lane, register) layout so the f32->bf16 cast is a per-thread no-movement op.
-                Some(super::tensor::RegFrag::Stmatrix {
-                    instr_shape,
-                    cast_of,
-                }) => match cast_of {
-                    None => {
-                        out.push_str(&format!(
-                            "{p}{name} = T.alloc_tcgen05_ldst_frag(\"{instr_shape}\", ({wg_threads}, {width}), \"{dt}\")\n",
-                            p = pad(indent),
-                            wg_threads = WG_THREADS,
-                            dt = dtype_str(tensor.dtype),
-                        ));
-                    }
-                    Some(src_id) => {
-                        let src_name = ctx.tensor_name(*src_id)?.to_string();
-                        out.push_str(&format!(
-                            "{p}{name} = T.alloc_cast_frag({src_name}, \"{dt}\")\n",
-                            p = pad(indent),
-                            dt = dtype_str(tensor.dtype),
-                        ));
-                    }
-                },
-                None => {
-                    // Auxiliary-view form (see `RegAuxViews`): the plain wg tile for
-                    // full-extent `Tx.wg.*` ops, plus `{name}.local()` — the
-                    // TIRx-sanctioned per-thread storage view (mem-only layout, raw
-                    // element access legal) for the warp-matrix intrinsics, atom
-                    // fragments, and the scalar elementwise forms. (The inverted
-                    // `alloc_local + view(128, W, wg_layout)` form is physically
-                    // inconsistent: its Apply maps (tid, j) to flat[tid + j].)
-                    if let Some(aux) = ctx.reg_aux_views.get(&tensor.id).filter(|a| a.flat) {
-                        out.push_str(&format!(
-                            "{p}{name} = T.wg_reg_tile({width}, dtype=\"{dt}\")\n",
-                            p = pad(indent),
-                            dt = dtype_str(tensor.dtype),
-                        ));
-                        out.push_str(&format!(
-                            "{p}{name}_flat = {name}.local()\n",
-                            p = pad(indent)
-                        ));
-                        if let Some(shape) = aux.atom_shape {
-                            let k_cols = atom_frag_cols(shape, width, tensor.dtype)?;
-                            out.push_str(&format!(
-                                "{p}{name}_atom = {name}_flat.view(64, {k_cols}, layout=tcgen05_atom_layout(\"{shape}\", (64, {k_cols}), \"{dt}\"))\n",
-                                p = pad(indent),
-                                dt = dtype_str(tensor.dtype),
-                            ));
-                        }
-                        if aux.flat_u32 {
-                            out.push_str(&format!(
-                                "{p}{name}_flat_u32 = {name}_flat.view(\"uint32\")\n",
-                                p = pad(indent),
-                            ));
-                        }
-                        if let Some(ab) = aux.flat_ab {
-                            out.push_str(&format!(
-                                "{p}{name}_flat_ab = {name}_flat.view(\"{ab_dt}\")\n",
-                                p = pad(indent),
-                                ab_dt = dtype_str(ab),
-                            ));
-                        }
-                        return Ok(());
-                    }
-                    out.push_str(&format!(
-                        "{p}{name} = T.wg_reg_tile({width}, dtype=\"{dt}\")\n",
-                        p = pad(indent),
-                        dt = dtype_str(tensor.dtype),
-                    ));
-                }
+            let shape = python_shape(&tensor.shape);
+            out.push_str(&format!(
+                "{p}{name} = T.alloc_local({shape}, \"{dt}\")\n",
+                dt = dtype_str(tensor.dtype),
+            ));
+            if ctx.reg_u32_views.contains(&tensor.id) {
+                out.push_str(&format!("{p}{name}_u32 = {name}.view(\"uint32\")\n"));
             }
             Ok(())
         }
         // ---- definitions handled in the header; skip in the body walk ----
         TensorDef { .. } | MBarDef { .. } => Ok(()),
 
-        // ---- TMEM alloc / dealloc / relinquish (already under the prologue's
-        // warp==0 guard) ----
-        // The generated code carries exactly ONE TMEM view buffer (`tmem`) based at
-        // column 0, one alloc writing `tmem_addr`, and one dealloc of `tmem_addr[0]`
-        // — validate has already proven the kernel fits that shape (base_col==0, one
-        // live band at a time, alloc only before relinquish, and the kernel-level
-        // cta_group on every op). The arms below still check the fields they cannot
-        // honor instead of dropping them: codegen is reachable without validate, and
-        // a silently-dropped field is how "validate one semantics, run another" used
-        // to happen here.
+        // ---- TMEM alloc / dealloc / relinquish ----
+        // TMEM data views are declared statement-locally by the instructions
+        // that consume them; only the explicit SMEM address cell is shared by
+        // alloc/dealloc. Validation proves the lifecycle is base-0, balanced,
+        // and uses the kernel CTA group. These arms recheck fields they cannot
+        // honor because codegen is also callable without validation.
         TmemAlloc {
             base_col,
             n_cols,
@@ -2973,32 +2150,6 @@ fn emit_stmt(
         // ---- structural ----
         If { cond, then_body } => {
             let child = child_scope_info(cond, scope, ctx.num_warps);
-            // The `if_elected` sugar (`lane_id == 0`) emits canon's hardware
-            // forms instead of the naive `lane_id == 0` predicate: normally
-            // `T.ptx.elect_sync()` (one elected lane per warp, no modulo
-            // recompute per site); when the enclosed set is exactly CTA thread
-            // {(0, 0)} (an elect nested in the warp-0 prologue branch), the
-            // CTA-uniform `T.cuda.thread_rank() == 0` — canon's prologue form.
-            if as_lane_zero_equality(cond) {
-                // The thread_rank form is canon's PROLOGUE guard (one-time init
-                // code). A warp-0 elected region that CONTAINS a persistent loop
-                // (a worker role that happens to live on warp 0 — the nvfp4 MMA
-                // warp) is a hot loop guard, and canon writes `elect_sync()`
-                // there: the thread_rank predicate (a %tid.x read + compare on
-                // the vector path) measurably degrades ptxas's handling of the
-                // loop (nvfp4 1024: 6.26 -> 5.22 us on the guard form alone).
-                // So the narrowing applies only to loop-free (one-time) bodies.
-                let thread_rank0 = !body_has_loop(then_body)
-                    && child.set.as_ref().and_then(|s| s.single_thread()) == Some((0, 0));
-                let guard = if thread_rank0 {
-                    "T.cuda.thread_rank() == 0"
-                } else {
-                    "T.ptx.elect_sync()"
-                };
-                out.push_str(&format!("{p}if {guard}:\n"));
-                emit_body(out, then_body, indent + 1, ctx, &child)?;
-                return Ok(());
-            }
             out.push_str(&format!("{p}if {}:\n", emit_scalar(cond, ctx)?));
             emit_body(out, then_body, indent + 1, ctx, &child)?;
             Ok(())
@@ -3137,8 +2288,8 @@ fn emit_stmt(
         }
         // CLC async work-steal issue: 1:1 to `clusterlaunchcontrol.try_cancel`. The
         // 16B response lands in `handle`; the second arg is the mbar it completes-tx
-        // (the kernel's own `sched_arr` full barrier). Single-issue (the enclosing
-        // elect guard), exactly like canon's `if T.ptx.elect_sync(): clc_try_cancel(...)`.
+        // (the kernel's own `sched_arr` full barrier). The enclosing explicit
+        // single-lane IR branch provides its single-issue scope.
         ClcTryCancel {
             scheduler: _, // sim-only metadata (keys the CLC handle slot; no emission arg)
             handle,
@@ -3406,282 +2557,242 @@ fn emit_stmt(
             dst,
             a,
             b,
-            m,
-            n,
-            k,
+            mma_m,
+            mma_n,
+            format,
+            block_scale,
             accum,
-            sfa,
-            sfb,
-            a_fp4,
-            b_fp4,
             trans_a,
             trans_b,
+            ws,
             cta_group,
-            sf_byte,
-            sf_e4m3,
-            sf_block,
-            lane_align,
         } => {
-            // `Tx.gemm_async` fixes the operand convention the slices are emitted in:
-            // A=(M,K), B=(N,K), full-datapath accumulator, kernel-level cta_group. Any
-            // IR field the emitted form cannot represent is rejected — the validator
-            // and value model honor these fields, so dropping one here would run a
-            // different semantics than was verified. (`m/n/k` vs the operand slice
-            // shapes is already enforced by the validator, incl. the trans variants.)
-            // transA/transB pass through to gemm_async (TIRx computes the MN-major
-            // SMEM descriptor / TMEM window): the transposed IR slice is already the
-            // (K, M) / (K, N) tile. A TMEM A cannot transpose (a TIRx/hardware rule).
-            if *trans_a && matches!(a, MmaOperand::Tmem(_)) {
-                return Err(
-                    "codegen: Tcgen05Mma trans_a on a TMEM A operand has no lowering \
-                     (tcgen05 requires transA=False from TMEM)"
-                        .to_string(),
-                );
-            }
-            // PTX + the TIRx tcgen05 schedule: the B operand comes from SMEM
-            // ONLY (A may be TMEM or SMEM). A TMEM B (the GDN S^T/delta/NV
-            // readback bands) is unrealizable — the kernel must stage those
-            // tiles through SMEM instead (fail closed, never silently reroute).
-            if matches!(b, MmaOperand::Tmem(_)) {
-                return Err("codegen: Tcgen05Mma with a TMEM B operand has no lowering \
-                     (tcgen05.mma reads B from SMEM only; stage the tile through SMEM)"
-                    .to_string());
-            }
-            // The accumulator views are row-0 anchored (the m=64 datapath-F
-            // scatter and the m=128 full datapath both base at lane 0); a
-            // nonzero dst lane base would write different cells than emitted.
-            if as_int(&dst.row) != Some(0) {
-                return Err(
-                    "codegen: Tcgen05Mma dst row must be a static 0 (the TMEM views base at lane 0)"
-                        .to_string(),
-                );
-            }
-            if *lane_align != 0 {
-                return Err(
-                    "codegen: Tcgen05Mma lane_align != 0 (m=64 Layout F) not supported".to_string(),
-                );
-            }
             if *cta_group != ctx.cta_group {
                 return Err(format!(
                     "codegen: Tcgen05Mma cta_group={} != kernel cta_group={}",
                     cta_group, ctx.cta_group
                 ));
             }
-            if *a_fp4 != *b_fp4 {
-                return Err("codegen: Tcgen05Mma a_fp4/b_fp4 must match".to_string());
-            }
-            match (sfa.as_ref(), sfb.as_ref()) {
-                // Block-scaled path: the emitted SFA/SFB slice form is the NVFP4
-                // block-16 e4m3 layout (BASE_SF_K=16, byte 0..k/16 per cell) — the
-                // only mode the SF slice math below encodes.
-                (Some(_), Some(_)) => {
-                    if !*sf_e4m3 || *sf_block != 16 || *sf_byte != 0 {
-                        return Err(format!(
-                            "codegen: block-scaled Tcgen05Mma supports only the NVFP4 mode \
-                             (sf_e4m3=true, sf_block=16, sf_byte=0); got sf_e4m3={sf_e4m3}, \
-                             sf_block={sf_block}, sf_byte={sf_byte}"
-                        ));
-                    }
-                }
-                (None, None) => {
-                    if *a_fp4 {
-                        return Err("codegen: fp4 Tcgen05Mma operands require sfa/sfb".to_string());
-                    }
-                }
-                _ => {
-                    return Err("codegen: Tcgen05Mma sfa/sfb must be set together".to_string());
-                }
-            }
-            let dst_s = emit_tmem_dst(dst, *n, *m, ctx)?;
-            // The A/B operands are staged SMEM tiles: drop the leading ring index so
-            // the operand is the 2D `(M, K)` / `(N, K)` MMA tile (canonical
-            // `Asmem[stage, warp_id]` / `Bsmem[stage]`). A TMEM operand (the GDN
-            // accumulator-readback) is an absolute (lane, col) slice of the single
-            // `tmem` view — or of the `tmem_f16`/`tmem_bf16` packed view for a
-            // 16-bit band. `trans` swaps the (rows, cols) window: a non-transposed
-            // operand spans `rows` lanes x `k` cells, a transposed one (the GDN
-            // S^T readback) spans `k` lanes x `rows` cells.
-            let emit_ab = |op: &MmaOperand, rows: u32, trans: bool| -> Result<String, String> {
-                match op {
-                    MmaOperand::Slice(s) => emit_smem_tile(s, ctx),
-                    MmaOperand::Tmem(t) => {
-                        let (row_ext, cell_dim) = if trans {
-                            (i64::from(*k), i64::from(rows))
-                        } else {
-                            (i64::from(rows), i64::from(*k))
-                        };
-                        let row_s = emit_scalar(&t.row, ctx)?;
-                        let col_s = emit_scalar(&t.col, ctx)?;
-                        let row_hi = add_bound(&t.row, &ScalarValue::Int(row_ext), ctx)?;
-                        match t.dtype {
-                            DType::F32 => {
-                                let col_hi = add_bound(&t.col, &ScalarValue::Int(cell_dim), ctx)?;
-                                Ok(format!("tmem[{row_s}:{row_hi}, {col_s}:{col_hi}]"))
-                            }
-                            DType::F16 | DType::Bf16 => {
-                                let view = if t.dtype == DType::F16 {
-                                    "tmem_f16"
-                                } else {
-                                    "tmem_bf16"
-                                };
-                                if cell_dim % 2 != 0 {
-                                    return Err(format!(
-                                        "codegen: Tcgen05Mma 16-bit TMEM operand cell-span \
-                                         {cell_dim} is odd (packed halves come in pairs)"
-                                    ));
-                                }
-                                // Packed halves: the element window doubles the
-                                // cell column.
-                                Ok(format!(
-                                    "{view}[{row_s}:{row_hi}, ({col_s}) * 2:({col_s}) * 2 + {cell_dim}]"
-                                ))
-                            }
-                            other => Err(format!(
-                                "codegen: Tcgen05Mma TMEM operand dtype {other:?} has no \
-                                 lowering (f32 or packed f16/bf16 only)"
-                            )),
-                        }
-                    }
+            let resolved = resolve_tcgen05_mma(
+                dst,
+                a,
+                b,
+                *mma_m,
+                *mma_n,
+                *format,
+                block_scale.as_ref(),
+                *trans_a,
+                *trans_b,
+                *ws,
+                *cta_group,
+            )
+            .map_err(|error| format!("codegen: {error}"))?;
+            let view_index = ctx.next_tmem_view_index();
+
+            // D is a statement-local, non-owning view at the address carried
+            // by this exact IR operation. No kernel-wide TMEM cache exists.
+            let d_name = format!("mma_d{view_index}");
+            let (d_lane, d_col) = emit_tmem_layout_offsets(dst, 1, 0, ctx)?;
+            let d_layout = format!(
+                "tmem_view_layout(tmem_datapath_layout(\"{}\", {}, {}), {d_lane}, {d_col})",
+                datapath_name(resolved.datapath),
+                resolved.d.logical.rows,
+                resolved.d.logical.cols,
+            );
+            out.push_str(&format!(
+                "{p}{d_name} = T.decl_buffer(({}, {}), \"float32\", scope=\"tmem\", \
+                 allocated_addr={}, layout={d_layout})\n",
+                resolved.d.logical.rows, resolved.d.logical.cols, dst.tensor.start_col,
+            ));
+            let dst_s = format!("{d_name}[:, :]");
+
+            let a_s = match a {
+                MmaAOperand::Smem(tile) => emit_mma_smem_tile(tile, *format, ctx)?,
+                MmaAOperand::Tmem { addr, form } => {
+                    let footprint = resolved.a_tmem.as_ref().ok_or_else(|| {
+                        "codegen: resolver omitted the Tcgen05Mma TMEM A footprint".to_string()
+                    })?;
+                    let a_name = format!("mma_a{view_index}");
+                    let elements_per_cell = 32 / mma_format_bits(*format);
+                    let (a_lane, a_col) =
+                        emit_tmem_layout_offsets(addr, elements_per_cell, 0, ctx)?;
+                    let (shape_s, region_s) = match form {
+                        TmemAForm::Flat => (
+                            format!("({}, {})", footprint.logical.rows, footprint.logical.cols),
+                            format!("{a_name}[:, :]"),
+                        ),
+                        TmemAForm::BankBatched => (
+                            format!(
+                                "(2, {}, {})",
+                                footprint.logical.rows, footprint.logical.cols
+                            ),
+                            format!("{a_name}[:, :, :]"),
+                        ),
+                    };
+                    let a_layout = format!(
+                        "tmem_view_layout(tmem_mma_operand_layout(\"A\", {shape_s}, \
+                         \"{}\", M={}, cta_group={}, ws={}), {a_lane}, {a_col})",
+                        mma_format_dtype(*format),
+                        mma_m,
+                        cta_group,
+                        bool_py(*ws),
+                    );
+                    out.push_str(&format!(
+                        "{p}{a_name} = T.decl_buffer({shape_s}, \"{}\", scope=\"tmem\", \
+                         allocated_addr={}, layout={a_layout})\n",
+                        mma_format_dtype(*format),
+                        addr.tensor.start_col,
+                    ));
+                    region_s
                 }
             };
-            let a_rows = if *cta_group == 1 { *m } else { *m / 2 };
-            let b_rows = if *cta_group == 1 { *n } else { *n / 2 };
-            let mut a_s = emit_ab(a, a_rows, *trans_a)?;
-            let mut b_s = emit_ab(b, b_rows, *trans_b)?;
-            // Runtime accum flag: literal 0/1 keep the old True/False form (every
-            // existing kernel); a real scalar expr (canon's loop-carried accum cell)
-            // emits as-is — `Tx.gemm_async` takes a runtime accum predicate.
+            let b_s = emit_mma_smem_tile(b, *format, ctx)?;
             let accum_s = match accum {
                 ScalarValue::Int(0) => "False".to_string(),
                 ScalarValue::Int(1) => "True".to_string(),
                 other => emit_scalar(other, ctx)?,
             };
-            // Transposed operands (the GDN S^T / K^T reads): emit the flags only
-            // when set, keeping the untransposed emission byte-identical.
-            let trans_kw = |t: bool, name: &str| {
-                if t {
-                    format!(", {name}=True")
-                } else {
-                    String::new()
-                }
-            };
-            let trans_a_kw = trans_kw(*trans_a, "transA");
-            let trans_b_kw = trans_kw(*trans_b, "transB");
-            if let (Some(sfa), Some(sfb)) = (sfa.as_ref(), sfb.as_ref()) {
-                // NVFP4 block-scaled: view the packed-u8 operand BUFFER as e2m1 fp4 (the
-                // last dim doubles: bytes -> fp4 elems), then slice — `.view` is on the
-                // buffer, not a region (canon: A_smem = A_smem_packed.view(...); A_smem[stage]).
-                if *a_fp4 {
-                    let view = |op: &MmaOperand| -> Result<String, String> {
-                        let MmaOperand::Slice(s) = op else {
-                            return Err(
-                                "codegen: fp4 Tcgen05Mma operands must be SMEM slices".to_string()
-                            );
-                        };
-                        let buf = ctx.tensor_name(s.tensor.id)?;
-                        let stage =
-                            emit_scalar(s.offsets.first().unwrap_or(&ScalarValue::Int(0)), ctx)?;
-                        let rows = s.shape.get(1).and_then(as_int).unwrap_or(0);
-                        let cols = s.shape.get(2).and_then(as_int).unwrap_or(0) * 2;
-                        Ok(format!(
-                            "{buf}.view(\"float4_e2m1fn\")[{stage}, 0:{rows}, 0:{cols}]"
-                        ))
-                    };
-                    a_s = view(a)?;
-                    b_s = view(b)?;
-                }
-                // Emit the SF operands as EXPLICIT logical slices `[0:rows, 0:cols]`
-                // of their views, exactly like canon (`SFA_tmem[0:128, 0:16]`,
-                // `SFB_tmem[0:256, 0:16]`) — the view at the operand's physical base
-                // column re-materializes the folded logical shape.
-                let sf_slice = |op: &TmemOperand| -> Result<String, String> {
-                    let Some(col) = as_int(&op.col) else {
-                        return Err(
-                            "codegen: SF TMEM operand col must be a compile-time constant"
-                                .to_string(),
-                        );
-                    };
-                    let view = ctx
-                        .sf_views
-                        .iter()
-                        .find(|v| v.col as i64 == col)
-                        .ok_or_else(|| format!("codegen: no SF TMEM view at col {col}"))?;
-                    Ok(format!(
-                        "{}[0:{}, 0:{}]",
-                        view.name, view.logical_rows, view.logical_cols
-                    ))
-                };
-                let sfa_s = sf_slice(sfa)?;
-                let sfb_s = sf_slice(sfb)?;
-                emit_single_issue(
-                    out,
-                    &p,
-                    scope,
-                    "tcgen05_mma",
-                    &format!(
-                        "Tx.gemm_async({dst_s}, {a_s}, {b_s}, SFA={sfa_s}, SFB={sfb_s}, accum={accum_s}, dispatch=\"tcgen05\", cta_group={cg}{trans_a_kw}{trans_b_kw})",
-                        cg = ctx.cta_group,
-                    ),
-                )?;
+
+            let call = if let Some(spec) = block_scale {
+                let sfa = resolved.sfa.as_ref().ok_or_else(|| {
+                    "codegen: resolver omitted the Tcgen05Mma SFA footprint".to_string()
+                })?;
+                let sfb = resolved.sfb.as_ref().ok_or_else(|| {
+                    "codegen: resolver omitted the Tcgen05Mma SFB footprint".to_string()
+                })?;
+                let sfa_name = format!("mma_sfa{view_index}");
+                let sfb_name = format!("mma_sfb{view_index}");
+                let sfa_extra = sfa.cell_delta * 4 + u32::from(sfa.subbyte);
+                let sfb_extra = sfb.cell_delta * 4 + u32::from(sfb.subbyte);
+                let (sfa_lane, sfa_col) = emit_tmem_layout_offsets(&spec.sfa, 4, sfa_extra, ctx)?;
+                let (sfb_lane, sfb_col) = emit_tmem_layout_offsets(&spec.sfb, 4, sfb_extra, ctx)?;
+                let sfa_layout = format!(
+                    "tmem_view_layout(sf_tmem_layout({}, SF_K={}, sf_per_mma={}, \
+                     sf_reuse={}), {sfa_lane}, {sfa_col})",
+                    sfa.footprint.logical.rows, sfa.sf_k, spec.sf_per_mma, spec.sf_reuse,
+                );
+                let sfb_layout = format!(
+                    "tmem_view_layout(sf_tmem_layout({}, SF_K={}, sf_per_mma={}, \
+                     sf_reuse={}), {sfb_lane}, {sfb_col})",
+                    sfb.footprint.logical.rows, sfb.sf_k, spec.sf_per_mma, spec.sf_reuse,
+                );
+                out.push_str(&format!(
+                    "{p}{sfa_name} = T.decl_buffer(({}, {}), \"{}\", scope=\"tmem\", \
+                     allocated_addr={}, layout={sfa_layout})\n",
+                    sfa.footprint.logical.rows,
+                    sfa.logical_last,
+                    scale_format_dtype(spec.scale_format),
+                    spec.sfa.tensor.start_col,
+                ));
+                out.push_str(&format!(
+                    "{p}{sfb_name} = T.decl_buffer(({}, {}), \"{}\", scope=\"tmem\", \
+                     allocated_addr={}, layout={sfb_layout})\n",
+                    sfb.footprint.logical.rows,
+                    sfb.logical_last,
+                    scale_format_dtype(spec.scale_format),
+                    spec.sfb.tensor.start_col,
+                ));
+                format!(
+                    "Tx.gemm_async({dst_s}, {a_s}, {b_s}, \
+                     SFA={sfa_name}[:, :], SFB={sfb_name}[:, :], accum={accum_s}, \
+                     transA={}, transB={}, dispatch=\"tcgen05\", cta_group={}, \
+                     mma_m={}, mma_n={}, weight_stationary={})",
+                    bool_py(*trans_a),
+                    bool_py(*trans_b),
+                    cta_group,
+                    mma_m,
+                    mma_n,
+                    bool_py(*ws),
+                )
             } else {
-                emit_single_issue(
-                    out,
-                    &p,
-                    scope,
-                    "tcgen05_mma",
-                    &format!(
-                        "Tx.gemm_async({dst_s}, {a_s}, {b_s}, accum={accum_s}, dispatch=\"tcgen05\", cta_group={cg}{trans_a_kw}{trans_b_kw})",
-                        cg = ctx.cta_group,
-                    ),
-                )?;
-            }
+                format!(
+                    "Tx.gemm_async({dst_s}, {a_s}, {b_s}, accum={accum_s}, \
+                     transA={}, transB={}, dispatch=\"tcgen05\", cta_group={}, \
+                     mma_m={}, mma_n={}, weight_stationary={})",
+                    bool_py(*trans_a),
+                    bool_py(*trans_b),
+                    cta_group,
+                    mma_m,
+                    mma_n,
+                    bool_py(*ws),
+                )
+            };
+            emit_single_issue(out, &p, scope, "tcgen05_mma", &call)?;
             Ok(())
         }
-        // NVFP4 scale-factor copy SMEM -> e4m3 TMEM (canon's Tx.copy_async(SFA_tmem,
-        // SFA_smem[stage], cta_group=2)). Single-issue, like the MMA/commit.
+        // One physical tcgen05.cp IR statement becomes one Tx.copy_async.
+        // The explicit source tile, shape, multicast, and CTA group select the
+        // statement-local physical source/destination views.
         Tcgen05Cp {
             dst,
             src,
+            shape,
+            multicast,
             cta_group,
         } => {
-            // Emit canon's EXACT cp form: `Tx.copy_async(SFB_tmem[0:256, 0:16],
-            // SFB_smem[stage, 0:256, 0:16], cta_group=2)` — explicit logical slices
-            // on BOTH ends. The dst's view comes from its physical base column;
-            // the src is the staged SF SMEM `(rows, SF_CTA_K)`.
-            let Some(col) = as_int(&dst.col) else {
-                return Err(
-                    "codegen: tcgen05_cp dst col must be a compile-time constant".to_string(),
-                );
-            };
-            let view = ctx
-                .sf_views
-                .iter()
-                .find(|v| v.col as i64 == col)
-                .ok_or_else(|| format!("codegen: no SF TMEM view at col {col}"))?;
-            let src_name = ctx.tensor_name(src.tensor.id)?;
-            let stage = emit_scalar(src.offsets.first().unwrap_or(&ScalarValue::Int(0)), ctx)?;
-            // src is a staged SF SMEM tile `(SMEM_DEPTH, rows, SF_CTA_K)`; its full
-            // (rows, SF_CTA_K) at this stage — the trailing slice dims.
-            let (Some(r), Some(c)) = (
-                src.shape
-                    .get(src.shape.len().saturating_sub(2))
-                    .and_then(as_int),
-                src.shape.last().and_then(as_int),
-            ) else {
-                return Err("codegen: tcgen05_cp src shape must be static".to_string());
-            };
-            emit_single_issue(
-                out,
-                &p,
-                scope,
-                "tcgen05_cp",
-                &format!(
-                    "Tx.copy_async({name}[0:{rows}, 0:{cols}], {src_name}[{stage}, 0:{r}, 0:{c}], cta_group={cta_group})",
-                    name = view.name,
-                    rows = view.logical_rows,
-                    cols = view.logical_cols,
-                ),
+            if *cta_group != ctx.cta_group {
+                return Err(format!(
+                    "codegen: Tcgen05Cp cta_group={} != kernel cta_group={}",
+                    cta_group, ctx.cta_group
+                ));
+            }
+            let resolved = resolve_tcgen05_cp(dst, src, *shape, *multicast, *cta_group)
+                .map_err(|error| format!("codegen: {error}"))?;
+            let bits = tcgen05_cp_source_bits(src);
+            if bits > 32 || 32 % bits != 0 {
+                return Err(format!(
+                    "codegen: Tcgen05Cp source dtype {:?} must divide one 32-bit TMEM cell",
+                    src.tensor.dtype
+                ));
+            }
+
+            let view_index = ctx.next_tmem_view_index();
+            let dst_name = format!("cp_dst{view_index}");
+            let src_name = format!("cp_src{view_index}");
+            let elements_per_cell = 32 / bits;
+            let (dst_lane, dst_col) = emit_tmem_layout_offsets(dst, elements_per_cell, 0, ctx)?;
+            let base_layout = emit_cp_tmem_layout(
+                resolved.lane_layout,
+                resolved.source.rows,
+                resolved.source.cols,
             )?;
+            let src_owner = ctx.tensor_name(src.tensor.id)?;
+            let src_view_rows = if resolved.source_layout == CpSmemLayout::Swizzle32B {
+                resolved.source.rows.div_ceil(8) * 8
+            } else {
+                resolved.source.rows
+            };
+            let src_view_shape = [src_view_rows as usize, resolved.source.cols as usize];
+            let src_layout = emit_cp_smem_layout(resolved.source_layout, &src_view_shape, bits)?;
+            let src_elem_offset = emit_cp_smem_elem_offset(resolved.source_layout, src, bits, ctx)?;
+            out.push_str(&format!(
+                "{p}{src_name} = T.decl_buffer({}, \"{}\", data={src_owner}.data, \
+                 elem_offset={src_elem_offset}, \
+                 scope=\"shared.dyn\", layout={src_layout})\n",
+                python_shape(&src_view_shape),
+                dtype_str(src.tensor.dtype),
+            ));
+            let src_s = format!(
+                "{src_name}[0:{}, 0:{}]",
+                resolved.source.rows, resolved.source.cols
+            );
+            let dst_layout = format!("tmem_view_layout({base_layout}, {dst_lane}, {dst_col})");
+            out.push_str(&format!(
+                "{p}{dst_name} = T.decl_buffer(({}, {}), \"{}\", scope=\"tmem\", \
+                 allocated_addr={}, layout={dst_layout})\n",
+                resolved.source.rows,
+                resolved.source.cols,
+                dtype_str(src.tensor.dtype),
+                dst.tensor.start_col,
+            ));
+            let call = format!(
+                "Tx.copy_async({dst_name}[:, :], {src_s}, shape=\"{}\", \
+                 multicast=\"{}\", cta_group={})",
+                shape.as_str(),
+                cp_multicast_config(*multicast),
+                cta_group,
+            );
+            emit_single_issue(out, &p, scope, "tcgen05_cp", &call)?;
             Ok(())
         }
         Tcgen05Commit {
@@ -3711,130 +2822,23 @@ fn emit_stmt(
             Ok(())
         }
 
-        // ---- epilogue: tcgen05_ld -> Tx.wg.copy_async, wait_ld, reg_cvt -> Tx.wg.cast,
-        // reg_store -> Tx.copy. Whole warpgroup participates (no per-thread guard). ----
+        // ---- epilogue physical load + per-thread register operations ----
         Tcgen05Ld {
             dst,
             src,
             shape,
             num,
         } => {
-            // Fail closed on every field the emission cannot honor — the
-            // `Tx.wg.copy_async` below reads the single base-0 (128, cols) f32
-            // `tmem` view, so:
-            //   * shape: only .32x32b addresses exactly the (all-128-lanes,
-            //     num-col) window the wg-view emission encodes. A .16x*b atom
-            //     reads col_factor*num columns from a 16-lane half-slab — it
-            //     lowers through the `{name}_atom` atom-layout view instead.
-            //   * dtype: the tmem view is f32 and TIRx requires the fragment
-            //     dtype to equal it.
-            //   * row: the lane base of the read. The view always starts at
-            //     lane 0, and for .32x32b row must be 0 anyway (the atom spans
-            //     each warp's whole 32-lane subpartition) — anything else reads
-            //     different lanes in the interpreter than on silicon.
-            if *shape != LdStShape::B32x32 {
-                // `.16x*b` M=64 atom read into the dual-view fragment
-                // (`{name}_atom`, declared at the TensorDef). The M=128
-                // two-issue form (a second ld at row=16) has no lowering.
-                if src.dtype != DType::F32 {
-                    return Err(format!(
-                        "codegen: Tcgen05Ld shape={} dtype {:?} has no lowering \
-                         (the 16-bit TMEM read path is st-only; f32 only)",
-                        shape.as_str(),
-                        src.dtype
-                    ));
-                }
-                if as_int(&src.row) != Some(0) {
-                    return Err(format!(
-                        "codegen: Tcgen05Ld shape={} row must be a static 0 (the M=64 \
-                         atom frag; row=16 is the M=128 second issue — no lowering)",
-                        shape.as_str()
-                    ));
-                }
-                let (t, off, w) = reg_slice_parts(dst)?;
-                if t.dtype != src.dtype {
-                    return Err(format!(
-                        "codegen: Tcgen05Ld REG dtype {:?} != TMEM dtype {:?} \
-                         (the interpreter requires them equal)",
-                        t.dtype, src.dtype
-                    ));
-                }
-                let k_cols = atom_frag_cols(shape.as_str(), w, t.dtype)?;
-                let implied = k_cols
-                    / (match shape.as_str() {
-                        "16x64b" => 2,
-                        "16x128b" => 4,
-                        "16x256b" => 8,
-                        _ => unreachable!("note_atom_shape gates the shapes"),
-                    });
-                if implied != *num as usize {
-                    return Err(format!(
-                        "codegen: Tcgen05Ld num={num} disagrees with the fragment width \
-                         ({w} per-thread elements is .x{implied} for {})",
-                        shape.as_str()
-                    ));
-                }
-                let full = reg_view_width(t, ctx);
-                if as_int(off) != Some(0) || w != full {
-                    return Err(format!(
-                        "codegen: Tcgen05Ld shape={} dst must span the whole fragment \
-                         (the atom fills all {full} per-thread registers; got off={off:?}, width {w})",
-                        shape.as_str()
-                    ));
-                }
-                let aux = ctx
-                    .reg_aux_views
-                    .get(&t.id)
-                    .and_then(|a| a.atom_shape)
-                    .ok_or_else(|| {
-                        format!(
-                            "codegen: Tcgen05Ld shape={} dst tensor {} was not declared \
-                             as an atom fragment (internal view-collection bug)",
-                            shape.as_str(),
-                            t.id
-                        )
-                    })?;
-                if aux != shape.as_str() {
-                    return Err(format!(
-                        "codegen: Tcgen05Ld shape={} mismatches the tensor's {} atom view",
-                        shape.as_str(),
-                        aux
-                    ));
-                }
-                let col_s = emit_scalar(&src.col, ctx)?;
-                let name = ctx.tensor_name(t.id)?;
-                out.push_str(&format!(
-                    "{p}Tx.wg.copy_async({name}_atom[:, :], tmem[0:64, {col_s}:{col_s} + {k_cols}])\n"
-                ));
-                return Ok(());
-            }
-            if src.dtype != DType::F32 {
-                return Err(format!(
-                    "codegen: Tcgen05Ld dtype {:?} has no lowering (the TMEM view is f32)",
-                    src.dtype
-                ));
-            }
-            if as_int(&src.row) != Some(0) {
-                return Err(
-                    "codegen: Tcgen05Ld row must be a static 0 (the TMEM view bases at lane 0)"
-                        .to_string(),
-                );
-            }
-            // dst is the f32 reg fragment (read as a wg view of `num` cols); src is the
-            // tmem band at the operand's absolute physical `col`. The fragment is
-            // filled from column 0 (scratch reused per drain group), so the view
-            // slice starts at 0.
-            let width = *num as usize;
-            let col_s = emit_scalar(&src.col, ctx)?;
-            // Read this atom into its sub-slice of the (wide) read fragment: the
-            // epilogue issues a whole band's atoms into distinct slices, THEN a
-            // single wait_ld (matching the canonical fence structure). A legacy
-            // single-atom drain passes offset 0, so this is unchanged for it.
-            let zero = ScalarValue::Int(0);
-            let dst_off = dst.offsets.first().unwrap_or(&zero);
-            let frag_s = emit_reg_view_slice(out, &p, &dst.tensor, dst_off, width, ctx)?;
+            let (regs, pack) = emit_tcgen05_reg_tuple(dst, *shape, *num, ctx)?;
+            let row = emit_scalar(&src.row, ctx)?;
+            let col = emit_scalar(&src.col, ctx)?;
             out.push_str(&format!(
-                "{p}Tx.wg.copy_async({frag_s}, tmem[:, {col_s}:{col_s} + {width}])\n"
+                "{p}T.ptx.tcgen05.ld(T.uint32({}), {regs}, shape=\"{}\", num={}, \
+                 row={row}, col={col}, pack={})\n",
+                src.tensor.start_col,
+                shape.as_str(),
+                num,
+                bool_py(pack),
             ));
             Ok(())
         }
@@ -3842,288 +2846,47 @@ fn emit_stmt(
             out.push_str(&format!("{p}T.ptx.tcgen05.wait.ld()\n"));
             Ok(())
         }
-        RegCvt {
-            dst,
-            src,
-            // Inert on both sides today: the interpreter's cvt path coerces to the
-            // dst dtype without consulting `rounding`, and `Tx.wg.cast` carries no
-            // rounding argument. Listed explicitly so a future rounding-aware cvt
-            // must touch both sides (and validate) at once.
-            rounding: _,
-        } => {
-            let src_op = RegOperand::Slice(src.clone());
-            if !(wg_elem_ok(scope) && reg_op_slices_full(dst, &[&src_op], ctx)?) {
-                // Per-thread scalar cast (the interpreter's per-thread
-                // convert): `dst_flat[i] = T.<dst dtype>(src_flat[i])`. The
-                // dtype conversion IS the op here (unlike the elementwise
-                // arithmetic ops, which require a shared dtype).
-                let (dt, doff, w) = reg_slice_parts(dst)?;
-                let (st, soff, sw) = reg_slice_parts(src)?;
-                if sw != 1 && sw != w {
-                    return Err(format!(
-                        "codegen: RegCvt src width {sw} must be 1 or the dst width {w} \
-                         (the interpreter matches the dst or broadcasts one element per thread)"
-                    ));
-                }
-                let dflat = flat_name(dt, ctx)?;
-                let sflat = flat_name(st, ctx)?;
-                let d_idx = flat_elem_idx(doff, "_i", ctx)?;
-                let s_idx = flat_elem_idx(soff, if sw == 1 { "0" } else { "_i" }, ctx)?;
-                let body = if dt.dtype == st.dtype {
-                    format!("{sflat}[{s_idx}]")
-                } else {
-                    format!("T.{}({sflat}[{s_idx}])", dtype_str(dt.dtype))
-                };
-                out.push_str(&format!("{p}for _i in range({w}):\n"));
-                out.push_str(&format!("{p}    {dflat}[{d_idx}] = {body}\n"));
-                return Ok(());
+        RegCvt { dst, src, rounding } => {
+            if *rounding != Rounding::Rn {
+                return Err(
+                    "codegen: RegCvt rounding=rm has no Tx.thread.cast lowering".to_string()
+                );
             }
-            // Cast a band of the f32 read fragment to the matching band of the wide
-            // output reg. Both bands are sliced by their (offset, width) so a capped
-            // (≤128-col) drain group writes the right slice of the 256-wide output reg.
-            let zero = ScalarValue::Int(0);
-            let dst_off = dst.offsets.first().unwrap_or(&zero);
-            let src_off = src.offsets.first().unwrap_or(&zero);
-            let dst_w = dst.shape.first().and_then(as_int).unwrap_or(0).max(0) as usize;
-            let src_w = src.shape.first().and_then(as_int).unwrap_or(0).max(0) as usize;
-            let dst_s = emit_reg_view_slice(out, &p, &dst.tensor, dst_off, dst_w, ctx)?;
-            let src_s = emit_reg_view_slice(out, &p, &src.tensor, src_off, src_w, ctx)?;
-            out.push_str(&format!("{p}Tx.wg.cast({dst_s}, {src_s})\n"));
+            let (dt, doff, dw) = reg_slice_parts(dst)?;
+            let (st, soff, sw) = reg_slice_parts(src)?;
+            if sw != 1 && sw != dw {
+                return Err(format!(
+                    "codegen: RegCvt src width {sw} must be 1 or the dst width {dw}"
+                ));
+            }
+            let dst_s = emit_reg_view_slice(out, &p, dt, doff, dw, ctx)?;
+            let src_s = emit_reg_view_slice(out, &p, st, soff, sw, ctx)?;
+            out.push_str(&format!("{p}Tx.thread.cast({dst_s}, {src_s})\n"));
             Ok(())
         }
-        // SF-permute load (nvfp4 dev permute warp): read an SMEM scale-cell band into
-        // a per-lane register fragment, symmetric to the SMEM branch of `RegStore`. The
-        // byte permutation itself is below the value model — codegen only materializes
-        // the buffer read into the fragment via the warpgroup-collective copy (the
-        // matching `RegStore` writes it back). REG-source loads (an alias/copy between
-        // two register tiles) are a structural no-op at the source level.
-        //
-        // A per-thread POINT src (every dim size-1, e.g. gdn's `gcs_s[row]` scalar
-        // reads) lowers to a raw element assignment on the flat view — the tile-op
-        // anchor cannot express "each thread reads its own address".
+        // Register transfers preserve the explicit IR slices one-for-one.
         RegLoad { dst, src } => {
-            // A per-thread POINT src (every dim size-1) lowers to a raw element
-            // assignment on the flat view, for SMEM and GMEM alike — anything
-            // else used to fall through and emit NOTHING (a silent miscompile:
-            // the interpreter transfers values for every src space).
-            if slice_all_size1(src)
-                && matches!(src.tensor.space, MemorySpace::Smem | MemorySpace::Gmem)
-            {
-                let (dt, doff, dw) = reg_slice_parts(dst)?;
-                if dt.dtype != src.tensor.dtype {
-                    return Err(format!(
-                        "codegen: RegLoad point src dtype {:?} != dst dtype {:?} — \
-                         the interpreter coerces; use an explicit RegCvt",
-                        src.tensor.dtype, dt.dtype
-                    ));
-                }
-                if dw != 1 {
-                    return Err(format!(
-                        "codegen: RegLoad point src loads one element per thread \
-                         (dst width {dw} != 1)"
-                    ));
-                }
-                let dflat = flat_name(dt, ctx)?;
-                let doff_s = emit_scalar(doff, ctx)?;
-                let addr = emit_scalar_addr(src, ctx)?;
-                out.push_str(&format!("{p}{dflat}[{doff_s}] = {addr}\n"));
-                return Ok(());
-            }
-            // A per-thread narrow contiguous SMEM run: leading dims all size-1
-            // (arbitrary per-thread offsets), trailing dim a static width 2..=8
-            // (gdn's v_s value pairs). The wg.collective copy needs a
-            // TidInWg-leading (128-row) source tile, which an arithmetic
-            // per-thread row is not — lower narrow runs to raw per-thread
-            // element assigns so one swizzled row-base computation is shared
-            // by the run's immediate-offset element addresses.
-            if src.tensor.space == MemorySpace::Smem && narrow_smem_run(src).is_some() {
-                let w = narrow_smem_run(src).unwrap();
-                let (dt, doff, dw) = reg_slice_parts(dst)?;
-                if dt.dtype != src.tensor.dtype {
-                    return Err(format!(
-                        "codegen: RegLoad narrow-run src dtype {:?} != dst dtype {:?} — \
-                         the interpreter coerces; use an explicit RegCvt",
-                        src.tensor.dtype, dt.dtype
-                    ));
-                }
-                if dw != w {
-                    return Err(format!(
-                        "codegen: RegLoad narrow-run width {w} != dst width {dw}"
-                    ));
-                }
-                let dflat = flat_name(dt, ctx)?;
-                let doff_s = emit_scalar(doff, ctx)?;
-                let name = ctx.tensor_name(src.tensor.id)?;
-                let n = src.offsets.len();
-                let lead = src.offsets[..n - 1]
-                    .iter()
-                    .map(|o| emit_scalar(o, ctx))
-                    .collect::<Result<Vec<_>, _>>()?
-                    .join(", ");
-                let c0 = emit_scalar(&src.offsets[n - 1], ctx)?;
-                let elem = |off_s: &str| {
-                    if off_s == "0" {
-                        "_i".to_string()
-                    } else {
-                        format!("{off_s} + _i")
-                    }
-                };
-                out.push_str(&format!("{p}for _i in range({w}):\n"));
-                out.push_str(&format!(
-                    "{p}    {dflat}[{}] = {name}[{lead}, {}]\n",
-                    elem(&doff_s),
-                    elem(&c0)
-                ));
-                return Ok(());
-            }
-            if src.tensor.space == MemorySpace::Smem {
-                let src_s = emit_smem_wg_store_tile(src, ctx)?;
-                let zero = ScalarValue::Int(0);
-                let dst_off = dst.offsets.first().unwrap_or(&zero);
-                let width = dst.shape.first().and_then(as_int).unwrap_or(0).max(0) as usize;
-                let dst_s = emit_reg_view_slice(out, &p, &dst.tensor, dst_off, width, ctx)?;
-                out.push_str(&format!("{p}Tx.wg.copy({dst_s}, {src_s})\n"));
-                return Ok(());
-            }
-            // REG src: a structural no-op (see the comment above the arm).
-            if src.tensor.space == MemorySpace::Reg {
-                return Ok(());
-            }
-            Err(format!(
-                "codegen: RegLoad src space {:?} shape {:?} has no lowering (SMEM point/tile \
-                 loads and GMEM point loads only)",
-                src.tensor.space, src.shape
-            ))
+            let (tensor, offset, width) = reg_slice_parts(dst)?;
+            let dst_s = emit_reg_view_slice(out, &p, tensor, offset, width, ctx)?;
+            let src_s = if src.tensor.space == MemorySpace::Reg {
+                let (tensor, offset, width) = reg_slice_parts(src)?;
+                emit_reg_view_slice(out, &p, tensor, offset, width, ctx)?
+            } else {
+                emit_buffer_region(src, ctx)?
+            };
+            out.push_str(&format!("{p}Tx.copy({dst_s}, {src_s})\n"));
+            Ok(())
         }
         RegStore { dst, src } => {
-            // REG -> REG per-thread copy (gdn's m16 A-broadcast): the
-            // interpreter copies values elementwise. A `Tx.wg.copy` on the wg
-            // views falls to the scalar copy fallback, whose raw thread-axis
-            // BufferLoad LowerTIRxCleanup rejects — emit the flat scalar form.
-            if dst.tensor.space == MemorySpace::Reg {
-                if src.tensor.space != MemorySpace::Reg {
-                    return Err(format!(
-                        "codegen: RegStore with a REG dst needs a REG src (got {:?})",
-                        src.tensor.space
-                    ));
-                }
-                let (dt, _, _) = reg_slice_parts(dst)?;
-                let (st, _, _) = reg_slice_parts(src)?;
-                if st.dtype != dt.dtype {
-                    return Err(format!(
-                        "codegen: RegStore REG->REG src dtype {:?} != dst dtype {:?} — \
-                         the interpreter coerces; use an explicit RegCvt",
-                        st.dtype, dt.dtype
-                    ));
-                }
-                let s_op = RegOperand::Slice(src.clone());
-                return emit_scalar_elem(out, &p, ctx, dst, &[&s_op], false, |e| e[0].to_string());
-            }
-            // Per-thread point store (every dim size-1, e.g. gdn's
-            // `m_s[row, col] = r1` epilogue cells): a raw element assignment on
-            // the flat view.
-            if slice_all_size1(dst) {
-                let (st, soff, sw) = reg_slice_parts(src)?;
-                if st.dtype != dst.tensor.dtype {
-                    return Err(format!(
-                        "codegen: RegStore point dst dtype {:?} != src dtype {:?} — \
-                         the interpreter coerces; use an explicit RegCvt",
-                        dst.tensor.dtype, st.dtype
-                    ));
-                }
-                if sw != 1 {
-                    return Err(format!(
-                        "codegen: RegStore point dst stores one element per thread \
-                         (src width {sw} != 1)"
-                    ));
-                }
-                let sflat = flat_name(st, ctx)?;
-                let soff_s = emit_scalar(soff, ctx)?;
-                let addr = emit_scalar_addr(dst, ctx)?;
-                out.push_str(&format!("{p}{addr} = {sflat}[{soff_s}]\n"));
-                return Ok(());
-            }
-            // Per-thread GMEM row run (rank >= 3, leading size-1 dims, wide
-            // trailing dim — gdn's final-state store
-            // `state_g[seq, eh, tid, c0:c0+64] = frag32`): a raw per-thread loop.
-            if gmem_row_run(dst) {
-                let (st, soff, sw) = reg_slice_parts(src)?;
-                if st.dtype != dst.tensor.dtype {
-                    return Err(format!(
-                        "codegen: RegStore GMEM row dst dtype {:?} != src dtype {:?} — \
-                         the interpreter coerces; use an explicit RegCvt",
-                        dst.tensor.dtype, st.dtype
-                    ));
-                }
-                let w = as_int(dst.shape.last().unwrap()).unwrap() as usize;
-                if sw != w {
-                    return Err(format!(
-                        "codegen: RegStore GMEM row run width {w} != src width {sw}"
-                    ));
-                }
-                let sflat = flat_name(st, ctx)?;
-                let soff_s = emit_scalar(soff, ctx)?;
-                let name = ctx.tensor_name(dst.tensor.id)?;
-                let n = dst.offsets.len();
-                let lead = dst.offsets[..n - 1]
-                    .iter()
-                    .map(|o| emit_scalar(o, ctx))
-                    .collect::<Result<Vec<_>, _>>()?
-                    .join(", ");
-                let last_s = emit_scalar(&dst.offsets[n - 1], ctx)?;
-                let elem = |off_s: &str| {
-                    if off_s == "0" {
-                        "_i".to_string()
-                    } else {
-                        format!("{off_s} + _i")
-                    }
-                };
-                out.push_str(&format!("{p}for _i in range({w}):\n"));
-                out.push_str(&format!(
-                    "{p}    {name}[{lead}, {}] = {sflat}[{}]\n",
-                    elem(&last_s),
-                    elem(&soff_s)
-                ));
-                return Ok(());
-            }
-            // Two store shapes, distinguished by the dst memory space:
-            //   * GMEM dst (bootstrap direct epilogue): `Tx.copy(C[row, c0:c1], reg[:])`
-            //     — each thread writes its own C row from its private fragment.
-            //   * SMEM dst (smem-staged epilogue): `Tx.wg.copy(d_smem[db, :, c0:c1],
-            //     reg_view[:, b0:b1])` — the warpgroup-collective reg->smem store that
-            //     feeds the subsequent TMA store. The reg src is the wide `out_wide`
-            //     band, read through its wg view (sliced by column).
-            if dst.tensor.space == MemorySpace::Smem {
-                let dst_s = emit_smem_wg_store_tile(dst, ctx)?;
-                let zero = ScalarValue::Int(0);
-                let src_off = src.offsets.first().unwrap_or(&zero);
-                let width = src.shape.first().and_then(as_int).unwrap_or(0).max(0) as usize;
-                let src_s = emit_reg_view_slice(out, &p, &src.tensor, src_off, width, ctx)?;
-                // STMATRIX epilogue: a `tcgen05.{ld,st}`-atom src frag stores reg->smem via
-                // `dispatch="ldstmatrix"` (canon's `regs_to_smem`), lowering to STSM. The
-                // kernel slices the store in 16-col chunks (stmatrix.x4 granularity). A plain
-                // thread-axis frag (reg_frag=None) keeps the default `Tx.wg.copy` (STS).
-                let dispatch = if src.tensor.reg_frag.is_some() {
-                    ", dispatch=\"ldstmatrix\""
-                } else {
-                    ""
-                };
-                out.push_str(&format!("{p}Tx.wg.copy({dst_s}, {src_s}{dispatch})\n"));
+            let (src_tensor, src_offset, src_width) = reg_slice_parts(src)?;
+            let src_s = emit_reg_view_slice(out, &p, src_tensor, src_offset, src_width, ctx)?;
+            let dst_s = if dst.tensor.space == MemorySpace::Reg {
+                let (tensor, offset, width) = reg_slice_parts(dst)?;
+                emit_reg_view_slice(out, &p, tensor, offset, width, ctx)?
             } else {
-                // GMEM store (bootstrap direct epilogue): the warpgroup-collective
-                // `Tx.wg.copy(C[row:row+128, c0:c1], reg[:, :])`. The reg fragment is a
-                // `wg_reg_tile` (thread-axis layout), so the copy MUST be warpgroup-
-                // scoped — a thread-scoped `Tx.copy` falls to the scalar fallback,
-                // which does a direct thread-axis BufferLoad and is rejected by
-                // LowerTIRxCleanup. The dst row offset carries a per-thread
-                // `tid_in_wg` term in the value model; for the wg-collective store it
-                // becomes the 128-row band (the layout maps lanes to rows).
-                let dst_s = emit_gmem_row_store(dst, ctx)?;
-                let zero = ScalarValue::Int(0);
-                let w = src.shape.first().and_then(as_int).unwrap_or(0).max(0) as usize;
-                let src_s = emit_reg_view_slice(out, &p, &src.tensor, &zero, w, ctx)?;
-                out.push_str(&format!("{p}Tx.wg.copy({dst_s}, {src_s})\n"));
-            }
+                emit_buffer_region(dst, ctx)?
+            };
+            out.push_str(&format!("{p}Tx.copy({dst_s}, {src_s})\n"));
             Ok(())
         }
 
@@ -4250,11 +3013,10 @@ fn emit_stmt(
             Ok(())
         }
         CtaSync => {
-            // Suppress CTA-wide cta_sync inside a single-warp/wg branch (not
-            // all CTA threads reach it → illegal __syncthreads).
-            if scope.is_function() {
-                out.push_str(&format!("{p}T.cuda.cta_sync()\n"));
-            }
+            // The validator rejects statically narrowed CTA barriers. Codegen
+            // must still print the statement at its exact IR position; it may
+            // not silently delete or hoist control-dependent synchronization.
+            out.push_str(&format!("{p}T.cuda.cta_sync()\n"));
             Ok(())
         }
         ClusterSync => {
@@ -4334,13 +3096,10 @@ fn emit_stmt(
         // semaphore, or DSMEM cluster-copy lowering machinery, and no smoke-test kernel
         // (nvfp4 / fp16) exercises them. Fail closed with `Err` (a PyValueError through
         // the wrapper) like every other unsupported node — never panic. ----
-        // `mma.sync.aligned.m16n8k{8,16}.row.col.f32.{ab}.{ab}.f32` — warp-level
-        // SM80 HMMA via the legacy WMMA-fragment intrinsic: one flat local
-        // buffer + base offset per operand, the accumulator reused as both C
-        // and D (the intrinsic's single accumulator slot), exactly the
-        // interpreter's D = A·Bᵀ + C over the standard warp fragment layout
-        // (the layout LdMatrix produces — A/B ride the `{name}_flat_ab`
-        // bf16/f16 reinterpret of their packed u32 words).
+        // `mma.sync.aligned.m16n8k{8,16}.row.col.f32.{ab}.{ab}.f32` — one IR
+        // WarpMma prints one non-legacy `T.ptx.mma` call. Operand register
+        // handles come directly from the explicit local tensor slices;
+        // LdMatrix defines the packed A/B word representation.
         WarpMma {
             d,
             a,
@@ -4361,23 +3120,14 @@ fn emit_stmt(
                     "codegen: WarpMma ab_dtype {ab_dtype:?} has no lowering (bf16/f16 only)"
                 ));
             }
-            // d == c: the legacy intrinsic reuses the one accumulator buffer as
-            // both input and output — distinct C/D slices would need a second
-            // fragment (no lowering; gdn always accumulates in place).
-            if d != c {
-                return Err(
-                    "codegen: WarpMma d and c must be the same fragment (the mma.sync \
-                     accumulator is read-modify-write)"
-                        .to_string(),
-                );
-            }
             let (dt, doff, dw) = reg_slice_parts(d)?;
+            let (ct, coff, cw) = reg_slice_parts(c)?;
             let (at, aoff, aw) = reg_slice_parts(a)?;
             let (bt, boff, bw) = reg_slice_parts(b)?;
-            if dt.dtype != DType::F32 {
+            if dt.dtype != DType::F32 || ct.dtype != DType::F32 {
                 return Err(format!(
-                    "codegen: WarpMma C/D dtype {:?} must be f32 (the PTX accumulator)",
-                    dt.dtype
+                    "codegen: WarpMma D/C dtypes {:?}/{:?} must both be f32",
+                    dt.dtype, ct.dtype
                 ));
             }
             if !matches!(at.dtype, DType::U32 | DType::I32)
@@ -4393,23 +3143,41 @@ fn emit_stmt(
             let len_b = (*n * *k / 64) as usize;
             let len_cd = (*m * *n / 32) as usize;
             for (off, w, want, label) in [
-                (doff, dw, len_cd, "C/D"),
+                (doff, dw, len_cd, "D"),
+                (coff, cw, len_cd, "C"),
                 (aoff, aw, len_a, "A"),
                 (boff, bw, len_b, "B"),
             ] {
-                if as_int(off) != Some(0) || w != want {
+                if w != want {
                     return Err(format!(
                         "codegen: WarpMma {label} fragment must span exactly {want} b32 \
-                         registers from offset 0 (got off={off:?}, width {w})"
+                         registers (got off={off:?}, width {w})"
                     ));
                 }
             }
-            let a_name = ctx.tensor_name(at.id)?;
-            let b_name = ctx.tensor_name(bt.id)?;
-            let d_name = ctx.tensor_name(dt.id)?;
+            let ptrs = |tensor: &Arc<Tensor>,
+                        offset: &ScalarValue,
+                        count: usize|
+             -> Result<String, String> {
+                let flat = reg_name(tensor, ctx)?;
+                let base = emit_scalar(offset, ctx)?;
+                Ok(format!(
+                    "[{}]",
+                    (0..count)
+                        .map(|index| { format!("{flat}.ptr_to([{}])", flat_add(&base, index)) })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            };
+            let d_ptrs = ptrs(dt, doff, len_cd)?;
+            let c_ptrs = ptrs(ct, coff, len_cd)?;
+            let a_ptrs = ptrs(at, aoff, len_a)?;
+            let b_ptrs = ptrs(bt, boff, len_b)?;
             let ab_s = dtype_str(*ab_dtype);
             out.push_str(&format!(
-                "{p}T.ptx.mma.legacy(\"m{m}n{n}k{k}\", \"row\", \"col\", \"{ab_s}\", \"{ab_s}\", \"float32\", {a_name}_flat_ab.data, 0, {b_name}_flat_ab.data, 0, {d_name}_flat.data, 0, False, dtype=\"float32\")\n"
+                "{p}T.ptx.mma(\"m{m}n{n}k{k}\", \"row\", \"col\", \"float32\", \
+                 \"{ab_s}\", \"{ab_s}\", \"float32\", {d_ptrs}, {a_ptrs}, \
+                 {b_ptrs}, {c_ptrs})\n"
             ));
             Ok(())
         }
@@ -4419,42 +3187,9 @@ fn emit_stmt(
             Err("codegen: CpAsyncBulkS2Cluster not yet supported".to_string())
         }
 
-        // NVFP4 epilogue alpha rescale: Tx.wg.mul(frag, frag, alpha). lhs is a reg slice,
-        // rhs the alpha literal (or vice versa). Under a narrowed branch (the
-        // gdn predicated epilogues) the wg dispatch rejects the intra — fall
-        // to the per-thread scalar form.
+        // NVFP4 epilogue alpha rescale.
         RegMul { dst, lhs, rhs } => {
-            if !(wg_elem_ok(scope) && reg_op_slices_full(dst, &[lhs, rhs], ctx)?) {
-                let (t, _, _) = reg_slice_parts(dst)?;
-                if !matches!(t.dtype, DType::F16 | DType::Bf16 | DType::F32) {
-                    return Err(format!(
-                        "codegen: RegMul dst dtype {:?} has no lowering (float dsts only)",
-                        t.dtype
-                    ));
-                }
-                return emit_scalar_elem(out, &p, ctx, dst, &[lhs, rhs], true, |e| {
-                    format!("{} * {}", e[0], e[1])
-                });
-            }
-            let zero = ScalarValue::Int(0);
-            let reg_op = |op: &RegOperand, out: &mut Emitter| -> Result<String, String> {
-                match op {
-                    RegOperand::Slice(s) => {
-                        let off = s.offsets.first().unwrap_or(&zero);
-                        let w = s.shape.first().and_then(as_int).unwrap_or(0).max(0) as usize;
-                        emit_reg_view_slice(out, &p, &s.tensor, off, w, ctx)
-                    }
-                    // wg.mul needs a typed scalar (a bare int literal has no .dtype).
-                    RegOperand::Literal(l) => Ok(format!("T.float32({})", l.as_f32())),
-                }
-            };
-            let dst_off = dst.offsets.first().unwrap_or(&zero);
-            let dst_w = dst.shape.first().and_then(as_int).unwrap_or(0).max(0) as usize;
-            let dst_s = emit_reg_view_slice(out, &p, &dst.tensor, dst_off, dst_w, ctx)?;
-            let lhs_s = reg_op(lhs, out)?;
-            let rhs_s = reg_op(rhs, out)?;
-            out.push_str(&format!("{p}Tx.wg.mul({dst_s}, {lhs_s}, {rhs_s})\n"));
-            Ok(())
+            emit_reg_binary(out, &p, dst, lhs, rhs, Rounding::Rn, "mul", ctx)
         }
         // ---- Fail closed, per variant (no catch-all): every Stmt variant is
         // either lowered above or rejected HERE with an explicit Err, so adding
@@ -4475,61 +3210,17 @@ fn emit_stmt(
             shape,
             num,
         } => {
-            if *shape != LdStShape::B32x32 {
-                return Err(format!(
-                    "codegen: Tcgen05St shape={} has no lowering (only 32x32b; \
-                     the 16x*b atoms need an atom-layout src fragment)",
-                    shape.as_str()
-                ));
-            }
-            if as_int(&dst.row) != Some(0) {
-                return Err(
-                    "codegen: Tcgen05St row must be a static 0 (the TMEM view bases at lane 0)"
-                        .to_string(),
-                );
-            }
-            let (t, off, w) = reg_slice_parts(src)?;
-            if t.dtype != dst.dtype {
-                return Err(format!(
-                    "codegen: Tcgen05St REG dtype {:?} != TMEM dtype {:?} \
-                     (the interpreter requires them equal)",
-                    t.dtype, dst.dtype
-                ));
-            }
-            if w != *num as usize {
-                return Err(format!(
-                    "codegen: Tcgen05St src width {w} != num {num} (the register \
-                     slice must span exactly the atom's b32 registers)"
-                ));
-            }
-            match dst.dtype {
-                DType::F32 => {
-                    let col_s = emit_scalar(&dst.col, ctx)?;
-                    let frag_s = emit_reg_view_slice(out, &p, t, off, w, ctx)?;
-                    out.push_str(&format!(
-                        "{p}Tx.wg.copy_async(tmem[:, {col_s}:{col_s} + {w}], {frag_s})\n"
-                    ));
-                }
-                DType::F16 | DType::Bf16 => {
-                    let view = if dst.dtype == DType::F16 {
-                        "tmem_f16"
-                    } else {
-                        "tmem_bf16"
-                    };
-                    let col_s = emit_scalar(&dst.col, ctx)?;
-                    let frag_s = emit_reg_view_slice(out, &p, t, off, 2 * w, ctx)?;
-                    out.push_str(&format!(
-                        "{p}Tx.wg.copy_async({view}[:, ({col_s}) * 2:({col_s}) * 2 + {}], {frag_s})\n",
-                        2 * w
-                    ));
-                }
-                other => {
-                    return Err(format!(
-                        "codegen: Tcgen05St dtype {other:?} has no lowering \
-                         (f32 or packed f16/bf16 TMEM cells only)"
-                    ))
-                }
-            }
+            let (regs, _) = emit_tcgen05_reg_tuple(src, *shape, *num, ctx)?;
+            let row = emit_scalar(&dst.row, ctx)?;
+            let col = emit_scalar(&dst.col, ctx)?;
+            out.push_str(&format!(
+                "{p}T.ptx.tcgen05.st(T.uint32({}), {regs}, shape=\"{}\", num={}, \
+                 row={row}, col={col}, unpack={})\n",
+                dst.tensor.start_col,
+                shape.as_str(),
+                num,
+                bool_py(false),
+            ));
             Ok(())
         }
         Tcgen05WaitSt => {
@@ -4567,14 +3258,14 @@ fn emit_stmt(
                              num b32 registers)"
                         ));
                     }
-                    let dflat = flat_name(dt, ctx)?;
+                    let dflat = reg_name(dt, ctx)?;
                     (0..*num as usize)
                         .map(|i| format!("{dflat}.ptr_to([{}])", flat_add(&doff_s, i)))
                         .collect::<Vec<_>>()
                         .join(", ")
                 }
                 // A b16 fragment dst: the xN words are written through the
-                // `_flat_u32` reinterpret — consecutive b16 pairs ARE the b32
+                // `_u32` reinterpret — consecutive b16 pairs ARE the b32
                 // registers (the mirror of the StMatrix b16 src form).
                 DType::F16 | DType::Bf16 => {
                     if dw != 2 * *num as usize {
@@ -4599,7 +3290,7 @@ fn emit_stmt(
                     }
                     let name = ctx.tensor_name(dt.id)?;
                     (0..*num as usize)
-                        .map(|i| format!("{name}_flat_u32.ptr_to([{}])", word_off / 2 + i as i64))
+                        .map(|i| format!("{name}_u32.ptr_to([{}])", word_off / 2 + i as i64))
                         .collect::<Vec<_>>()
                         .join(", ")
                 }
@@ -4611,17 +3302,15 @@ fn emit_stmt(
                     ))
                 }
             };
-            let row_s = emit_scalar(&src.offsets[0], ctx)?;
-            let col_s = emit_scalar(&src.offsets[1], ctx)?;
-            let src_name = ctx.tensor_name(src.tensor.id)?;
+            let src_ptr = emit_matrix_smem_ptr(src, ctx)?;
             out.push_str(&format!(
-                "{p}T.ptx.ldmatrix({}, {num}, \".b16\", {src_name}.ptr_to([{row_s}, {col_s}]), {handles})\n",
+                "{p}T.ptx.ldmatrix({}, {num}, \".b16\", {src_ptr}, {handles})\n",
                 py_bool(*trans),
             ));
             Ok(())
         }
         // `stmatrix.sync.aligned.m8n8.xN.b16` — REG words -> SMEM. Mirror of
-        // LdMatrix; a bf16/f16 src fragment reads through the `_flat_u32`
+        // LdMatrix; a bf16/f16 src fragment reads through the `_u32`
         // reinterpret (consecutive b16 pairs ARE the words, matching the
         // interpreter's pack).
         StMatrix {
@@ -4651,8 +3340,9 @@ fn emit_stmt(
                              num b32 registers)"
                         ));
                     }
+                    let flat = reg_name(st, ctx)?;
                     (0..*num as usize)
-                        .map(|i| format!("{name}_flat.ptr_to([{}])", flat_add(&soff_s, i)))
+                        .map(|i| format!("{flat}.ptr_to([{}])", flat_add(&soff_s, i)))
                         .collect::<Vec<_>>()
                         .join(", ")
                 }
@@ -4678,7 +3368,7 @@ fn emit_stmt(
                         ));
                     }
                     (0..*num as usize)
-                        .map(|i| format!("{name}_flat_u32.ptr_to([{}])", word_off / 2 + i as i64))
+                        .map(|i| format!("{name}_u32.ptr_to([{}])", word_off / 2 + i as i64))
                         .collect::<Vec<_>>()
                         .join(", ")
                 }
@@ -4689,65 +3379,53 @@ fn emit_stmt(
                     ))
                 }
             };
-            let row_s = emit_scalar(&dst.offsets[0], ctx)?;
-            let col_s = emit_scalar(&dst.offsets[1], ctx)?;
-            let dst_name = ctx.tensor_name(dst.tensor.id)?;
+            let dst_ptr = emit_matrix_smem_ptr(dst, ctx)?;
             out.push_str(&format!(
-                "{p}T.ptx.stmatrix({}, {num}, \".b16\", {dst_name}.ptr_to([{row_s}, {col_s}]), {handles})\n",
+                "{p}T.ptx.stmatrix({}, {num}, \".b16\", {dst_ptr}, {handles})\n",
                 py_bool(*trans),
             ));
             Ok(())
         }
-        // Per-thread elementwise fill. Literal: dst-typed scalar (the
-        // interpreter's literal_array). Slice: elementwise copy (the
-        // interpreter broadcasts a one-element-per-thread src — validate the
-        // two legal widths). `Tx.wg.*` when the scope is provably
-        // warpgroup-full, else the per-thread scalar form.
+        // Per-thread elementwise fill/copy.
         RegFill { dst, value } => {
-            if wg_elem_ok(scope) && reg_op_slices_full(dst, &[value], ctx)? {
-                let (t, off, w) = reg_slice_parts(dst)?;
-                let dst_s = emit_reg_view_slice(out, &p, t, off, w, ctx)?;
-                match value {
-                    RegOperand::Literal(l) => {
-                        let v = typed_scalar(t.dtype, *l)?;
-                        out.push_str(&format!("{p}Tx.wg.fill({dst_s}, {v})\n"));
-                    }
-                    RegOperand::Slice(src) => {
-                        let (st, soff, sw) = reg_slice_parts(src)?;
-                        if st.dtype != t.dtype {
-                            return Err(format!(
-                                "codegen: RegFill src dtype {:?} != dst dtype {:?} — \
-                                 the interpreter coerces per-op; use an explicit RegCvt",
-                                st.dtype, t.dtype
-                            ));
-                        }
-                        if sw != 1 && sw != w {
-                            return Err(format!(
-                                "codegen: RegFill src width {sw} must be 1 or the dst width {w} \
-                                 (the interpreter matches the dst or broadcasts one element per thread)"
-                            ));
-                        }
-                        let src_s = emit_reg_view_slice(out, &p, st, soff, sw, ctx)?;
-                        out.push_str(&format!("{p}Tx.wg.copy({dst_s}, {src_s})\n"));
-                    }
+            let (t, off, w) = reg_slice_parts(dst)?;
+            let dst_s = emit_reg_view_slice(out, &p, t, off, w, ctx)?;
+            match value {
+                RegOperand::Literal(literal) => {
+                    let value_s = typed_scalar(t.dtype, *literal)?;
+                    out.push_str(&format!("{p}Tx.thread.fill({dst_s}, {value_s})\n"));
                 }
-                Ok(())
-            } else {
-                emit_scalar_elem(out, &p, ctx, dst, &[value], false, |e| e[0].to_string())
+                RegOperand::Slice(src) => {
+                    let (st, soff, sw) = reg_slice_parts(src)?;
+                    if st.dtype != t.dtype {
+                        return Err(format!(
+                            "codegen: RegFill src dtype {:?} != dst dtype {:?}",
+                            st.dtype, t.dtype
+                        ));
+                    }
+                    if sw != 1 && sw != w {
+                        return Err(format!(
+                            "codegen: RegFill src width {sw} must be 1 or dst width {w}"
+                        ));
+                    }
+                    let src_s = emit_reg_view_slice(out, &p, st, soff, sw, ctx)?;
+                    out.push_str(&format!("{p}Tx.thread.copy({dst_s}, {src_s})\n"));
+                }
             }
+            Ok(())
         }
         RegAdd {
             dst,
             lhs,
             rhs,
             rounding,
-        } => emit_reg_binary(out, &p, dst, lhs, rhs, *rounding, "add", ctx, scope),
+        } => emit_reg_binary(out, &p, dst, lhs, rhs, *rounding, "add", ctx),
         RegSub {
             dst,
             lhs,
             rhs,
             rounding,
-        } => emit_reg_binary(out, &p, dst, lhs, rhs, *rounding, "sub", ctx, scope),
+        } => emit_reg_binary(out, &p, dst, lhs, rhs, *rounding, "sub", ctx),
         // dst = a * b + c elementwise (the interpreter's unfused f32 mul+add;
         // the TIRx fma may fuse — a 1-ulp difference the GPU gates tolerate).
         RegFma { dst, a, b, c } => {
@@ -4758,26 +3436,14 @@ fn emit_stmt(
                     t.dtype
                 ));
             }
-            if wg_elem_ok(scope) && reg_op_slices_full(dst, &[a, b, c], ctx)? {
-                let dst_s = emit_reg_view_slice(out, &p, t, off, w, ctx)?;
-                let a_s = emit_wg_reg_operand(a, t.dtype, out, &p, ctx)?;
-                let b_s = emit_wg_reg_operand(b, t.dtype, out, &p, ctx)?;
-                let c_s = emit_wg_reg_operand(c, t.dtype, out, &p, ctx)?;
-                out.push_str(&format!("{p}Tx.wg.fma({dst_s}, {a_s}, {b_s}, {c_s})\n"));
-                Ok(())
-            } else {
-                emit_scalar_elem(out, &p, ctx, dst, &[a, b, c], true, |e| {
-                    format!("{} * {} + {}", e[0], e[1], e[2])
-                })
-            }
+            let dst_s = emit_reg_view_slice(out, &p, t, off, w, ctx)?;
+            let a_s = emit_reg_operand(a, t.dtype, out, &p, ctx)?;
+            let b_s = emit_reg_operand(b, t.dtype, out, &p, ctx)?;
+            let c_s = emit_reg_operand(c, t.dtype, out, &p, ctx)?;
+            out.push_str(&format!("{p}Tx.thread.fma({dst_s}, {a_s}, {b_s}, {c_s})\n"));
+            Ok(())
         }
-        // Elementwise unary over an f32 fragment. exp2/rcp/neg map to the TIRx
-        // unary tile ops at warpgroup-full scope (rcp lowers to a true `1.0 /
-        // x` division, matching the interpreter; neg is an exact sign flip);
-        // log2 has NO tile op and always takes the per-thread scalar form.
-        // Anything under a narrowed branch takes the scalar form. A literal
-        // src folds at codegen time: the interpreter applies the same rust f32
-        // math, so the fold is bit-identical.
+        // Elementwise unary over an f32 local array maps directly to Tx.thread.
         RegUnary { dst, src, op } => {
             let (t, off, w) = reg_slice_parts(dst)?;
             if t.dtype != DType::F32 {
@@ -4797,14 +3463,9 @@ fn emit_stmt(
                 (RegOperand::Slice(_), _) => None,
             };
             if let Some(v) = folded {
-                if wg_elem_ok(scope) && slice_is_full(t, off, w, ctx) {
-                    let dst_s = emit_reg_view_slice(out, &p, t, off, w, ctx)?;
-                    out.push_str(&format!("{p}Tx.wg.fill({dst_s}, T.float32({v}))\n"));
-                    return Ok(());
-                }
-                return emit_scalar_elem(out, &p, ctx, dst, &[], false, |_| {
-                    format!("T.float32({v})")
-                });
+                let dst_s = emit_reg_view_slice(out, &p, t, off, w, ctx)?;
+                out.push_str(&format!("{p}Tx.thread.fill({dst_s}, T.float32({v}))\n"));
+                return Ok(());
             }
             let RegOperand::Slice(src) = src else {
                 return Err("codegen: RegUnary src must be a slice or literal".to_string());
@@ -4823,34 +3484,25 @@ fn emit_stmt(
                      (the interpreter matches the dst or broadcasts one element per thread)"
                 ));
             }
-            let src_op = RegOperand::Slice(src.clone());
-            if wg_elem_ok(scope)
-                && *op != RegUnaryOp::Log2
-                && reg_op_slices_full(dst, &[&src_op], ctx)?
-            {
-                let dst_s = emit_reg_view_slice(out, &p, t, off, w, ctx)?;
-                let src_s = emit_reg_view_slice(out, &p, st, soff, sw, ctx)?;
-                match op {
-                    RegUnaryOp::Exp2 => {
-                        out.push_str(&format!("{p}Tx.wg.exp2({dst_s}, {src_s})\n"));
-                    }
-                    RegUnaryOp::Rcp => {
-                        out.push_str(&format!("{p}Tx.wg.reciprocal({dst_s}, {src_s})\n"));
-                    }
-                    RegUnaryOp::Neg => {
-                        out.push_str(&format!("{p}Tx.wg.mul({dst_s}, {src_s}, T.float32(-1))\n"));
-                    }
-                    RegUnaryOp::Log2 => unreachable!("log2 takes the scalar form"),
+            let dst_s = emit_reg_view_slice(out, &p, t, off, w, ctx)?;
+            let src_s = emit_reg_view_slice(out, &p, st, soff, sw, ctx)?;
+            match op {
+                RegUnaryOp::Exp2 => {
+                    out.push_str(&format!("{p}Tx.thread.exp2({dst_s}, {src_s})\n"));
                 }
-                Ok(())
-            } else {
-                emit_scalar_elem(out, &p, ctx, dst, &[&src_op], false, |e| match op {
-                    RegUnaryOp::Exp2 => format!("T.exp2({})", e[0]),
-                    RegUnaryOp::Log2 => format!("T.log2({})", e[0]),
-                    RegUnaryOp::Rcp => format!("1.0 / ({})", e[0]),
-                    RegUnaryOp::Neg => format!("-({})", e[0]),
-                })
+                RegUnaryOp::Log2 => {
+                    out.push_str(&format!("{p}Tx.thread.log2({dst_s}, {src_s})\n"));
+                }
+                RegUnaryOp::Rcp => {
+                    out.push_str(&format!("{p}Tx.thread.reciprocal({dst_s}, {src_s})\n"));
+                }
+                RegUnaryOp::Neg => {
+                    out.push_str(&format!(
+                        "{p}Tx.thread.mul({dst_s}, {src_s}, T.float32(-1))\n"
+                    ));
+                }
             }
+            Ok(())
         }
         RegMax { .. } => Err("codegen: RegMax not yet supported".to_string()),
         RegMin { .. } => Err("codegen: RegMin not yet supported".to_string()),
@@ -4937,47 +3589,6 @@ fn gmem_extents<'a>(gmem_shape: &'a Option<Vec<usize>>, shape: &'a [usize]) -> &
     gmem_shape.as_deref().unwrap_or(shape)
 }
 
-/// Strip a `+ tid_in_wg` addend from a row-offset expr (the per-thread lane term of
-/// a value-model store), returning the warpgroup tile base. Returns None if the expr
-/// has no such addend.
-fn strip_tid_in_wg(sv: &ScalarValue) -> Option<ScalarValue> {
-    if let ScalarValue::Expr(e) = sv {
-        if e.op == ScalarOp::Add && e.args.len() == 2 {
-            for (i, a) in e.args.iter().enumerate() {
-                if matches!(a, ScalarValue::Scope(ScopeValueKind::TidInWg)) {
-                    return Some(e.args[1 - i].clone());
-                }
-            }
-        }
-    }
-    None
-}
-
-/// reg_store dst (GMEM) -> the warpgroup-collective row band `C[base:base+128,
-/// col:col+w]`. The value model's row offset is `base + tid_in_wg` (one row per
-/// thread); the wg-collective `Tx.copy` takes the whole 128-row tile, so the lane
-/// term is stripped and the row becomes a 128-wide range (WG_THREADS rows = one
-/// row per warpgroup thread, a hardware constant).
-fn emit_gmem_row_store(dst: &TensorSlice, ctx: &Ctx) -> Result<String, String> {
-    let name = ctx.tensor_name(dst.tensor.id)?;
-    if dst.offsets.len() != 2 {
-        return Err("codegen: reg_store dst must be 2D".to_string());
-    }
-    let clo = emit_scalar(&dst.offsets[1], ctx)?;
-    let chi = add_bound(&dst.offsets[1], &dst.shape[1], ctx)?;
-    let wg_rows = ScalarValue::Int(WG_THREADS as i64);
-    if let Some(base) = strip_tid_in_wg(&dst.offsets[0]) {
-        let lo = emit_scalar(&base, ctx)?;
-        let hi = add_bound(&base, &wg_rows, ctx)?;
-        Ok(format!("{name}[{lo}:{hi}, {clo}:{chi}]"))
-    } else {
-        // No lane term (already a tile base): emit a 128-row band from the offset.
-        let lo = emit_scalar(&dst.offsets[0], ctx)?;
-        let hi = add_bound(&dst.offsets[0], &wg_rows, ctx)?;
-        Ok(format!("{name}[{lo}:{hi}, {clo}:{chi}]"))
-    }
-}
-
 // ===========================================================================
 // tests
 // ===========================================================================
@@ -4987,6 +3598,7 @@ mod tests {
     use super::*;
     use crate::ir::dtype::ScalarDType;
     use crate::ir::scalar::VarId;
+    use crate::ir::stmt::{Tcgen05CpMulticast, Tcgen05CpShape};
     use crate::ir::tensor::Tensor;
 
     fn gmem_arg(id: u32) -> Arc<Tensor> {
@@ -4997,7 +3609,6 @@ mod tests {
             shape: vec![16, 16],
             layout: None,
             byte_offset: None,
-            reg_frag: None,
         })
     }
 
@@ -5059,18 +3670,16 @@ mod tests {
         }
     }
 
-    /// A scalar op with no TVMScript lowering (Xor) must fail closed with a
-    /// codegen `Err` — never leak an `<unsupported op …>` placeholder into the
-    /// emitted Python source (that was a syntax error at exec time).
+    /// Scalar XOR is emitted directly as the TIR builtin.
     #[test]
-    fn unsupported_scalar_op_is_an_err_not_source_text() {
+    fn scalar_xor_is_direct_bitwise_xor() {
         let cond = ScalarValue::expr(
             ScalarOp::Xor,
             vec![ScalarValue::Int(1), ScalarValue::Int(2)],
         );
         let k = kernel(vec![Stmt::BreakIf { cond }]);
-        let err = kernel_to_tirx_source(&k).unwrap_err();
-        assert!(err.contains("no TVMScript lowering"), "{err}");
+        let src = kernel_to_tirx_source(&k).unwrap();
+        assert!(src.contains("if T.bitwise_xor(1, 2):"), "{src}");
     }
 
     /// `ForLoop { unroll: false }` pins the rolled `T.serial(N, unroll=False)`
@@ -5169,7 +3778,6 @@ mod tests {
             shape: vec![1],
             layout: None,
             byte_offset: Some(0),
-            reg_frag: None,
         });
         let load = TensorSlice {
             tensor: mailbox.clone(),
@@ -5284,11 +3892,25 @@ mod tests {
         assert!(src.contains(expected), "{src}");
     }
 
-    /// The `if_elected` sugar emits `if T.ptx.elect_sync():` inside a warp
-    /// branch, narrowed to `if T.cuda.thread_rank() == 0:` for the warp-0
-    /// prologue elect (thread set exactly {(0, 0)} — canon's prologue form).
     #[test]
-    fn elected_if_emits_the_hardware_forms() {
+    fn codegen_never_deletes_a_sync_from_its_ir_branch() {
+        // This shape is rejected by validation because a CTA barrier cannot be
+        // reached by one warp. The codegen-side contract is nevertheless
+        // structural: if invoked directly, it prints the statement exactly
+        // where the IR put it instead of silently suppressing or hoisting it.
+        let body = vec![warp_if(1, vec![Stmt::CtaSync])];
+        let src = kernel_to_tirx_source(&kernel_n(body, 8)).unwrap();
+        let expected = "\
+    if warp_id == 1:
+        T.cuda.cta_sync()
+";
+        assert!(src.contains(expected), "{src}");
+    }
+
+    /// An elected predicate is still an ordinary IR `If`: its exact scalar
+    /// expression and nesting are preserved for prologues and loops alike.
+    #[test]
+    fn elected_if_preserves_literal_predicate_and_nesting() {
         use super::super::dtype::MBarKind;
         use super::super::mbar::{MBar, MBarRef};
         let mbar = Arc::new(MBar {
@@ -5306,25 +3928,33 @@ mod tests {
             count: 1,
             stage: None,
         };
-        // Prologue: warp-0 branch + elected init -> thread_rank guard.
+        // Prologue: warp-0 branch + lane-0 branch remain nested literally.
         let src = kernel_to_tirx_source(&kernel(vec![
             Stmt::MBarDef { mbar: mbar.clone() },
             warp_if(0, vec![elected_if(vec![init()])]),
         ]))
         .unwrap();
-        assert!(src.contains("if T.cuda.thread_rank() == 0:"), "{src}");
+        assert!(
+            src.contains("if warp_id == 0:\n        if lane_id == 0:"),
+            "{src}"
+        );
         assert!(!src.contains("if T.ptx.elect_sync():"), "{src}");
-        // Non-zero warp: the same sugar emits elect_sync.
+        assert!(!src.contains("if T.cuda.thread_rank() == 0:"), "{src}");
+
+        // A non-zero warp uses the identical literal nested predicate.
         let src = kernel_to_tirx_source(&kernel(vec![
             Stmt::MBarDef { mbar: mbar.clone() },
             warp_if(2, vec![elected_if(vec![init()])]),
         ]))
         .unwrap();
-        assert!(src.contains("if T.ptx.elect_sync():"), "{src}");
+        assert!(
+            src.contains("if warp_id == 2:\n        if lane_id == 0:"),
+            "{src}"
+        );
+        assert!(!src.contains("if T.ptx.elect_sync():"), "{src}");
         assert!(!src.contains("if T.cuda.thread_rank() == 0:"), "{src}");
-        // A warp-0 elected region CONTAINING a persistent loop (a worker role
-        // on warp 0, e.g. the nvfp4 MMA warp) is a hot-loop guard, not the
-        // prologue: it emits elect_sync, not thread_rank.
+
+        // A loop does not authorize a different spelling or structure.
         let loop_body = vec![Stmt::ForLoop {
             var: crate::ir::scalar::Var {
                 id: crate::ir::scalar::VarId(90),
@@ -5342,7 +3972,11 @@ mod tests {
             warp_if(0, vec![elected_if(loop_body)]),
         ]))
         .unwrap();
-        assert!(src.contains("if T.ptx.elect_sync():"), "{src}");
+        assert!(
+            src.contains("if warp_id == 0:\n        if lane_id == 0:"),
+            "{src}"
+        );
+        assert!(!src.contains("if T.ptx.elect_sync():"), "{src}");
         assert!(!src.contains("if T.cuda.thread_rank() == 0:"), "{src}");
     }
 
@@ -5415,11 +4049,9 @@ mod tests {
             src.contains("T.ptx.tcgen05.relinquish_alloc_permit(cta_group=2)"),
             "{src}"
         );
-        // The TMEM view decl lands at function scope right after the prologue
-        // alloc branch (the KernelInit-era position), before any role body.
-        let alloc_if = src.find("if warp_id == 0:").unwrap();
-        let view = src.find("tmem = T.decl_buffer").unwrap();
-        assert!(alloc_if < view, "{src}");
+        // Physical instruction operands declare their own non-owning views;
+        // allocation alone must not invent a kernel-global TMEM buffer.
+        assert!(!src.contains("tmem = T.decl_buffer"), "{src}");
 
         // A nonzero base band used to silently generate the SAME base-0 code.
         let k = tmem_kernel(vec![warp_if(1, vec![tmem_alloc(64, 64, 2)])], vec![]);
@@ -5438,36 +4070,35 @@ mod tests {
     }
 
     fn reg_frag_tensor_w(id: u32, w: usize) -> Arc<Tensor> {
+        reg_frag_tensor_dtype_w(id, DType::F32, w)
+    }
+
+    fn reg_frag_tensor_dtype_w(id: u32, dtype: DType, w: usize) -> Arc<Tensor> {
         Arc::new(Tensor {
             id,
             space: MemorySpace::Reg,
-            dtype: DType::F32,
+            dtype,
             shape: vec![w],
             layout: None,
             byte_offset: None,
-            reg_frag: None,
         })
     }
 
-    fn tcgen05_ld(row: i64, shape: LdStShape, dtype: DType) -> Stmt {
-        Stmt::Tcgen05Ld {
-            dst: TensorSlice {
-                tensor: reg_frag_tensor(7),
-                offsets: vec![ScalarValue::Int(0)],
-                shape: vec![ScalarValue::Int(8)],
-            },
-            src: TmemOperand {
-                row: ScalarValue::Int(row),
-                col: ScalarValue::Int(0),
-                dtype,
-            },
-            shape,
-            num: 8,
+    fn tmem_addr(start_col: u32, row: i64, col: i64) -> TmemAddr {
+        TmemAddr {
+            tensor: super::super::tensor::TmemTensor { start_col },
+            row: ScalarValue::Int(row),
+            col: ScalarValue::Int(col),
         }
     }
 
     fn epilogue_kernel(ld: Stmt) -> Kernel {
-        epilogue_kernel_t(ld, reg_frag_tensor(7))
+        let tensor = match &ld {
+            Stmt::Tcgen05Ld { dst, .. } => dst.tensor.clone(),
+            Stmt::Tcgen05St { src, .. } => src.tensor.clone(),
+            _ => reg_frag_tensor(7),
+        };
+        epilogue_kernel_t(ld, tensor)
     }
 
     fn epilogue_kernel_t(ld: Stmt, tensor: Arc<Tensor>) -> Kernel {
@@ -5486,185 +4117,114 @@ mod tests {
     }
 
     #[test]
-    fn tcgen05_ld_dropped_fields_are_rejected() {
-        // row=0 / 32x32b / f32: lowered (and the two row variants no longer
-        // share one emission).
-        let ok = kernel_to_tirx_source(&epilogue_kernel(tcgen05_ld(
-            0,
-            LdStShape::B32x32,
-            DType::F32,
-        )))
-        .unwrap();
-        assert!(
-            ok.contains("Tx.wg.copy_async(accum_frag[:, :], tmem[:, 0:0 + 8])"),
-            "{ok}"
-        );
-
-        // 16x256b M=64 f32: lowered through the atom view (num=8 -> 32 regs).
-        let atom_ld = Stmt::Tcgen05Ld {
+    fn tcgen05_ld_preserves_physical_fields() {
+        let f32 = reg_frag_tensor_dtype_w(7, DType::F32, 8);
+        let ld = Stmt::Tcgen05Ld {
             dst: TensorSlice {
-                tensor: reg_frag_tensor_w(7, 32),
-                offsets: vec![ScalarValue::Int(0)],
-                shape: vec![ScalarValue::Int(32)],
+                tensor: f32.clone(),
+                offsets: vec![ScalarValue::Int(2)],
+                shape: vec![ScalarValue::Int(4)],
             },
-            src: TmemOperand {
-                row: ScalarValue::Int(0),
-                col: ScalarValue::Int(0),
-                dtype: DType::F32,
-            },
-            shape: LdStShape::B16x256,
-            num: 8,
+            src: tmem_addr(37, 16, 9),
+            shape: LdStShape::B16x64,
+            num: 4,
         };
-        let ok =
-            kernel_to_tirx_source(&epilogue_kernel_t(atom_ld, reg_frag_tensor_w(7, 32))).unwrap();
+        let src = kernel_to_tirx_source(&epilogue_kernel_t(ld, f32)).unwrap();
         assert!(
-            ok.contains("Tx.wg.copy_async(accum_frag_atom[:, :], tmem[0:64, 0:0 + 64])"),
-            "{ok}"
+            src.contains("accum_frag = T.alloc_local((8,), \"float32\")"),
+            "{src}"
+        );
+        assert_eq!(src.matches("T.ptx.tcgen05.ld(").count(), 1, "{src}");
+        assert!(src.contains("T.ptx.tcgen05.ld(T.uint32(37), "), "{src}");
+        assert!(
+            src.contains("shape=\"16x64b\", num=4, row=16, col=9, pack=False)"),
+            "{src}"
+        );
+        assert!(!src.contains("Tx.wg.copy_async"), "{src}");
+
+        // A packed b16 instruction still carries the same physical fields, and
+        // addresses its b32 register tuple through the explicit u32 view.
+        let bf16 = reg_frag_tensor_dtype_w(8, DType::Bf16, 12);
+        let ld = Stmt::Tcgen05Ld {
+            dst: TensorSlice {
+                tensor: bf16.clone(),
+                offsets: vec![ScalarValue::Int(2)],
+                shape: vec![ScalarValue::Int(8)],
+            },
+            src: tmem_addr(211, 31, 17),
+            shape: LdStShape::B16x128,
+            num: 2,
+        };
+        let src = kernel_to_tirx_source(&epilogue_kernel_t(ld, bf16)).unwrap();
+        assert!(
+            src.contains("accum_frag = T.alloc_local((12,), \"bfloat16\")"),
+            "{src}"
+        );
+        assert!(
+            src.contains("accum_frag_u32 = accum_frag.view(\"uint32\")"),
+            "{src}"
+        );
+        assert!(src.contains("T.ptx.tcgen05.ld(T.uint32(211), "), "{src}");
+        assert!(
+            src.contains("shape=\"16x128b\", num=2, row=31, col=17, pack=True)"),
+            "{src}"
         );
 
-        // num must agree with the fragment width (num=8 needs 32 f32 regs).
+        // The only rejected case here is a physically wrong register tuple
+        // width; row, col, instruction shape, and 16-bit packing are all
+        // representable and therefore emitted literally.
         let bad_num = Stmt::Tcgen05Ld {
             dst: TensorSlice {
                 tensor: reg_frag_tensor_w(7, 8),
                 offsets: vec![ScalarValue::Int(0)],
                 shape: vec![ScalarValue::Int(8)],
             },
-            src: TmemOperand {
-                row: ScalarValue::Int(0),
-                col: ScalarValue::Int(0),
-                dtype: DType::F32,
-            },
+            src: tmem_addr(0, 0, 0),
             shape: LdStShape::B16x256,
             num: 8,
         };
         let err = kernel_to_tirx_source(&epilogue_kernel(bad_num)).unwrap_err();
         assert!(err.contains("num"), "{err}");
-
-        let err = kernel_to_tirx_source(&epilogue_kernel(tcgen05_ld(
-            16,
-            LdStShape::B32x32,
-            DType::F32,
-        )))
-        .unwrap_err();
-        assert!(err.contains("row"), "{err}");
-
-        // row=16 is the M=128 second issue — no lowering.
-        let atom_ld16 = Stmt::Tcgen05Ld {
-            dst: TensorSlice {
-                tensor: reg_frag_tensor_w(7, 32),
-                offsets: vec![ScalarValue::Int(0)],
-                shape: vec![ScalarValue::Int(32)],
-            },
-            src: TmemOperand {
-                row: ScalarValue::Int(16),
-                col: ScalarValue::Int(0),
-                dtype: DType::F32,
-            },
-            shape: LdStShape::B16x256,
-            num: 8,
-        };
-        let err = kernel_to_tirx_source(&epilogue_kernel_t(atom_ld16, reg_frag_tensor_w(7, 32)))
-            .unwrap_err();
-        assert!(err.contains("row"), "{err}");
-
-        let err = kernel_to_tirx_source(&epilogue_kernel(tcgen05_ld(
-            0,
-            LdStShape::B16x32Bx2,
-            DType::F32,
-        )))
-        .unwrap_err();
-        assert!(err.contains("16x32bx2"), "{err}");
-
-        let err = kernel_to_tirx_source(&epilogue_kernel(tcgen05_ld(
-            0,
-            LdStShape::B32x32,
-            DType::F16,
-        )))
-        .unwrap_err();
-        assert!(err.contains("dtype"), "{err}");
-
-        // A 16-bit atom read has no lowering (the packed TMEM datapath is st-only).
-        let err = kernel_to_tirx_source(&epilogue_kernel(tcgen05_ld(
-            0,
-            LdStShape::B16x256,
-            DType::Bf16,
-        )))
-        .unwrap_err();
-        assert!(err.contains("dtype"), "{err}");
-    }
-
-    fn tcgen05_st(dst: TmemOperand, shape: LdStShape, src_w: i64, num: u32) -> Stmt {
-        Stmt::Tcgen05St {
-            dst,
-            src: TensorSlice {
-                tensor: reg_frag_tensor(7),
-                offsets: vec![ScalarValue::Int(0)],
-                shape: vec![ScalarValue::Int(src_w)],
-            },
-            shape,
-            num,
-        }
-    }
-
-    fn tmem_op(row: i64, col: i64, dtype: DType) -> TmemOperand {
-        TmemOperand {
-            row: ScalarValue::Int(row),
-            col: ScalarValue::Int(col),
-            dtype,
-        }
     }
 
     #[test]
-    fn tcgen05_st_lowering_and_rejects() {
-        // f32 32x32b: tmem[:, c:c+w] <- frag wg view.
-        let ok = kernel_to_tirx_source(&epilogue_kernel(tcgen05_st(
-            tmem_op(0, 8, DType::F32),
-            LdStShape::B32x32,
-            8,
-            8,
-        )))
-        .unwrap();
+    fn tcgen05_st_preserves_physical_fields() {
+        let f32 = reg_frag_tensor_dtype_w(7, DType::F32, 12);
+        let st = Stmt::Tcgen05St {
+            dst: tmem_addr(73, 48, 19),
+            src: TensorSlice {
+                tensor: f32.clone(),
+                offsets: vec![ScalarValue::Int(3)],
+                shape: vec![ScalarValue::Int(8)],
+            },
+            shape: LdStShape::B16x256,
+            num: 2,
+        };
+        let src = kernel_to_tirx_source(&epilogue_kernel_t(st, f32)).unwrap();
         assert!(
-            ok.contains("Tx.wg.copy_async(tmem[:, 8:8 + 8], accum_frag[:, :])"),
-            "{ok}"
+            src.contains("accum_frag = T.alloc_local((12,), \"float32\")"),
+            "{src}"
         );
+        assert_eq!(src.matches("T.ptx.tcgen05.st(").count(), 1, "{src}");
+        assert!(src.contains("T.ptx.tcgen05.st(T.uint32(73), "), "{src}");
+        assert!(
+            src.contains("shape=\"16x256b\", num=2, row=48, col=19, unpack=False)"),
+            "{src}"
+        );
+        assert!(!src.contains("Tx.wg.copy_async"), "{src}");
 
-        // dst width != num: the slice must span exactly the atom's registers.
-        let err = kernel_to_tirx_source(&epilogue_kernel(tcgen05_st(
-            tmem_op(0, 0, DType::F32),
-            LdStShape::B32x32,
-            4,
-            8,
-        )))
-        .unwrap_err();
+        let bad_width = Stmt::Tcgen05St {
+            dst: tmem_addr(0, 0, 0),
+            src: TensorSlice {
+                tensor: reg_frag_tensor_w(7, 4),
+                offsets: vec![ScalarValue::Int(0)],
+                shape: vec![ScalarValue::Int(4)],
+            },
+            shape: LdStShape::B32x32,
+            num: 8,
+        };
+        let err = kernel_to_tirx_source(&epilogue_kernel(bad_width)).unwrap_err();
         assert!(err.contains("num"), "{err}");
-        // non-32x32b atom: no st lowering (would need an atom-layout src frag).
-        let err = kernel_to_tirx_source(&epilogue_kernel(tcgen05_st(
-            tmem_op(0, 0, DType::F32),
-            LdStShape::B16x256,
-            8,
-            8,
-        )))
-        .unwrap_err();
-        assert!(err.contains("32x32b"), "{err}");
-        // row != 0: the TMEM view bases at lane 0.
-        let err = kernel_to_tirx_source(&epilogue_kernel(tcgen05_st(
-            tmem_op(16, 0, DType::F32),
-            LdStShape::B32x32,
-            8,
-            8,
-        )))
-        .unwrap_err();
-        assert!(err.contains("row"), "{err}");
-        // dtype mismatch REG vs TMEM: the interpreter requires them equal.
-        let err = kernel_to_tirx_source(&epilogue_kernel(tcgen05_st(
-            tmem_op(0, 0, DType::Bf16),
-            LdStShape::B32x32,
-            8,
-            8,
-        )))
-        .unwrap_err();
-        assert!(err.contains("dtype"), "{err}");
     }
 
     #[test]
@@ -5676,7 +4236,6 @@ mod tests {
             shape: vec![16],
             layout: None,
             byte_offset: None,
-            reg_frag: None,
         });
         let mut body = vec![warp_if(0, vec![tmem_alloc(0, 512, 2)])];
         body.push(Stmt::TensorDef {
@@ -5687,11 +4246,11 @@ mod tests {
             0,
             vec![
                 Stmt::Tcgen05St {
-                    dst: tmem_op(0, 128, DType::Bf16),
+                    dst: tmem_addr(128, 7, 11),
                     src: TensorSlice {
                         tensor: bf,
                         offsets: vec![ScalarValue::Int(0)],
-                        shape: vec![ScalarValue::Int(8)],
+                        shape: vec![ScalarValue::Int(16)],
                     },
                     shape: LdStShape::B32x32,
                     num: 8,
@@ -5708,16 +4267,17 @@ mod tests {
             }],
         ));
         let src = kernel_to_tirx_source(&kernel(body)).unwrap();
-        // The packed view is declared over the whole band (2 elems per cell) and
-        // the st window doubles the cell column.
         assert!(
-            src.contains("tmem_bf16 = T.decl_buffer((128, 1024), \"bfloat16\""),
+            src.contains("out_frag = T.alloc_local((16,), \"bfloat16\")"),
             "{src}"
         );
         assert!(
-            src.contains(
-                "Tx.wg.copy_async(tmem_bf16[:, (128) * 2:(128) * 2 + 16], out_frag[:, :])"
-            ),
+            src.contains("out_frag_u32 = out_frag.view(\"uint32\")"),
+            "{src}"
+        );
+        assert!(src.contains("T.ptx.tcgen05.st(T.uint32(128), "), "{src}");
+        assert!(
+            src.contains("shape=\"32x32b\", num=8, row=7, col=11, unpack=False)"),
             "{src}"
         );
         assert!(src.contains("T.ptx.tcgen05.wait.st()"), "{src}");
@@ -5731,8 +4291,201 @@ mod tests {
             shape: shape.to_vec(),
             layout: None,
             byte_offset: Some(0),
-            reg_frag: None,
         })
+    }
+
+    #[test]
+    fn dense_tcgen05_mma_is_one_explicit_gemm_async() {
+        let a = smem_tensor(10, DType::F16, &[64, 64]);
+        let b = smem_tensor(11, DType::F16, &[64, 64]);
+        let tile = |tensor: Arc<Tensor>| SmemTile {
+            tensor,
+            prefix_indices: vec![],
+            row_offset: ScalarValue::Int(0),
+            col_offset: ScalarValue::Int(0),
+            rows: 64,
+            cols: 64,
+        };
+        let mma = Stmt::Tcgen05Mma {
+            dst: tmem_addr(32, 0, 0),
+            a: MmaAOperand::Smem(tile(a.clone())),
+            b: tile(b.clone()),
+            mma_m: 128,
+            mma_n: 64,
+            format: MmaElemFormat::F16,
+            block_scale: None,
+            accum: ScalarValue::Int(1),
+            trans_a: false,
+            trans_b: false,
+            ws: false,
+            cta_group: 2,
+        };
+        let src = kernel_to_tirx_source(&kernel(vec![
+            Stmt::TensorDef { tensor: a },
+            Stmt::TensorDef { tensor: b },
+            warp_if(0, vec![tmem_alloc(0, 512, 2)]),
+            warp_if(1, vec![elected_if(vec![mma])]),
+        ]))
+        .unwrap();
+
+        assert_eq!(src.matches("Tx.gemm_async(").count(), 1, "{src}");
+        assert!(
+            src.contains(
+                "dispatch=\"tcgen05\", cta_group=2, mma_m=128, mma_n=64, \
+                 weight_stationary=False)"
+            ),
+            "{src}"
+        );
+        assert!(
+            src.contains(
+                "mma_d0 = T.decl_buffer((64, 128), \"float32\", scope=\"tmem\", \
+                 allocated_addr=32"
+            ),
+            "{src}"
+        );
+        assert_eq!(src.matches("T.decl_buffer(").count(), 1, "{src}");
+        assert!(!src.contains("\n    tmem = T.decl_buffer"), "{src}");
+        assert!(
+            src.find("mma_d0 = T.decl_buffer").unwrap() < src.find("Tx.gemm_async(").unwrap(),
+            "{src}"
+        );
+    }
+
+    #[test]
+    fn tcgen05_cp_is_one_explicit_copy_async() {
+        let sf = smem_tensor(10, DType::F8E4M3, &[32, 16]);
+        let cp = Stmt::Tcgen05Cp {
+            dst: tmem_addr(200, 0, 0),
+            src: SmemTile {
+                tensor: sf.clone(),
+                prefix_indices: vec![],
+                row_offset: ScalarValue::Int(0),
+                col_offset: ScalarValue::Int(0),
+                rows: 32,
+                cols: 16,
+            },
+            shape: Tcgen05CpShape::B32x128,
+            multicast: Tcgen05CpMulticast::Warp4,
+            cta_group: 2,
+        };
+        let src = kernel_to_tirx_source(&kernel(vec![
+            Stmt::TensorDef { tensor: sf },
+            warp_if(0, vec![tmem_alloc(0, 512, 2)]),
+            warp_if(1, vec![elected_if(vec![cp])]),
+        ]))
+        .unwrap();
+
+        assert_eq!(src.matches("Tx.copy_async(").count(), 1, "{src}");
+        assert!(
+            src.contains("shape=\"32x128b\", multicast=\"warpx4\", cta_group=2)"),
+            "{src}"
+        );
+        assert!(
+            src.contains(
+                "cp_dst0 = T.decl_buffer((32, 16), \"float8_e4m3fn\", scope=\"tmem\", \
+                 allocated_addr=200"
+            ),
+            "{src}"
+        );
+        assert!(
+            src.contains(
+                "cp_src0 = T.decl_buffer((32, 16), \"float8_e4m3fn\", \
+                 data=d_smem0.data, elem_offset="
+            ),
+            "{src}"
+        );
+        assert!(
+            src.contains("scope=\"shared.dyn\", layout=TileLayout(S[(32, 16) : (16, 1)]))"),
+            "{src}"
+        );
+        assert!(
+            src.contains("Tx.copy_async(cp_dst0[:, :], cp_src0[0:32, 0:16]"),
+            "{src}"
+        );
+        assert_eq!(src.matches("T.decl_buffer(").count(), 2, "{src}");
+        assert!(!src.contains("\n    tmem = T.decl_buffer"), "{src}");
+        assert!(
+            src.find("cp_dst0 = T.decl_buffer").unwrap() < src.find("Tx.copy_async(").unwrap(),
+            "{src}"
+        );
+    }
+
+    #[test]
+    fn two_explicit_u32_swizzles_are_unique_and_not_flat_mailboxes() {
+        let tensor0 = Arc::new(Tensor {
+            id: 10,
+            space: MemorySpace::Smem,
+            dtype: DType::U32,
+            shape: vec![128, 8],
+            layout: Some(Layout::Swizzle(super::super::SmemSwizzleLayout {
+                swizzle: Swizzle::B32,
+            })),
+            byte_offset: Some(0),
+        });
+        let tensor1 = Arc::new(Tensor {
+            id: 11,
+            space: MemorySpace::Smem,
+            dtype: DType::U32,
+            shape: vec![128, 8],
+            layout: Some(Layout::Swizzle(super::super::SmemSwizzleLayout {
+                swizzle: Swizzle::B32,
+            })),
+            byte_offset: Some(4096),
+        });
+        let src = kernel_to_tirx_source(&kernel(vec![
+            Stmt::TensorDef { tensor: tensor0 },
+            Stmt::TensorDef { tensor: tensor1 },
+        ]))
+        .unwrap();
+        assert!(
+            src.contains(
+                "ab_smem0 = pool.alloc_tcgen05_mma_AB((128, 8), \"uint32\", \
+                 swizzle_mode=SwizzleMode.SWIZZLE_32B_ATOM, align=1024)"
+            ),
+            "{src}"
+        );
+        assert!(
+            src.contains(
+                "ab_smem1 = pool.alloc_tcgen05_mma_AB((128, 8), \"uint32\", \
+                 swizzle_mode=SwizzleMode.SWIZZLE_32B_ATOM, align=1024)"
+            ),
+            "{src}"
+        );
+        assert!(!src.contains("mma_shared_layout"), "{src}");
+        assert!(!src.contains("task_smem"), "{src}");
+    }
+
+    #[test]
+    fn multiple_layoutless_integer_smem_views_have_unique_names() {
+        let tensor0 = Arc::new(Tensor {
+            id: 10,
+            space: MemorySpace::Smem,
+            dtype: DType::U32,
+            shape: vec![5, 128],
+            layout: None,
+            byte_offset: Some(0),
+        });
+        let tensor1 = Arc::new(Tensor {
+            id: 11,
+            space: MemorySpace::Smem,
+            dtype: DType::U32,
+            shape: vec![5, 128],
+            layout: None,
+            byte_offset: Some(2560),
+        });
+        let src = kernel_to_tirx_source(&kernel(vec![
+            Stmt::TensorDef { tensor: tensor0 },
+            Stmt::TensorDef { tensor: tensor1 },
+        ]))
+        .unwrap();
+        assert!(
+            src.contains("task_smem = pool.alloc((5, 128), \"uint32\", scope=\"shared.dyn\")"),
+            "{src}"
+        );
+        assert!(
+            src.contains("task_smem1 = pool.alloc((5, 128), \"uint32\", scope=\"shared.dyn\")"),
+            "{src}"
+        );
     }
 
     #[test]
@@ -5791,14 +4544,50 @@ mod tests {
         let src = kernel_to_tirx_source(&kernel(body)).unwrap();
         assert!(
             src.contains(
-                "T.ptx.ldmatrix(False, 1, \".b16\", d_smem0.ptr_to([8 + ((lane_id) & 7), 16]), accum_frag_flat.ptr_to([0]))"
+                "T.ptx.ldmatrix(False, 1, \".b16\", d_smem0.ptr_to([8 + ((lane_id) & 7), 16]), accum_frag.ptr_to([0]))"
             ),
             "{src}"
         );
         assert!(
             src.contains(
-                "T.ptx.stmatrix(True, 1, \".b16\", d_smem0.ptr_to([8 + ((lane_id) & 7), 32]), out_frag_flat_u32.ptr_to([0]))"
+                "T.ptx.stmatrix(True, 1, \".b16\", d_smem0.ptr_to([8 + ((lane_id) & 7), 32]), out_frag_u32.ptr_to([0]))"
             ),
+            "{src}"
+        );
+
+        // Explicit stage/tile axes remain part of the physical pointer. Only
+        // the final eight-element row is consumed by the instruction.
+        let staged = smem_tensor(14, DType::Bf16, &[3, 16, 128]);
+        let src = kernel_to_tirx_source(&kernel(vec![
+            Stmt::TensorDef {
+                tensor: staged.clone(),
+            },
+            Stmt::TensorDef {
+                tensor: tile.clone(),
+            },
+            wg_if(
+                0,
+                vec![Stmt::StMatrix {
+                    dst: TensorSlice {
+                        tensor: staged,
+                        offsets: vec![ScalarValue::Int(2), lane_row.clone(), ScalarValue::Int(32)],
+                        shape: vec![
+                            ScalarValue::Int(1),
+                            ScalarValue::Int(1),
+                            ScalarValue::Int(8),
+                        ],
+                    },
+                    src: reg_slice(&tile, 0, 2),
+                    shape: MatrixShape::M8N8,
+                    num: 1,
+                    trans: true,
+                    dtype: MatrixDType::B16,
+                }],
+            ),
+        ]))
+        .unwrap();
+        assert!(
+            src.contains("ptr_to([2, 8 + ((lane_id) & 7), 32])"),
             "{src}"
         );
 
@@ -5888,22 +4677,17 @@ mod tests {
         let src = kernel_to_tirx_source(&kernel(body)).unwrap();
         assert!(
             src.contains(
-                "T.ptx.mma.legacy(\"m16n8k8\", \"row\", \"col\", \"bfloat16\", \"bfloat16\", \"float32\", accum_frag_flat_ab.data, 0, out_frag_flat_ab.data, 0, reg2_flat.data, 0, False, dtype=\"float32\")"
+                "T.ptx.mma(\"m16n8k8\", \"row\", \"col\", \"float32\", \"bfloat16\", \
+                 \"bfloat16\", \"float32\", [reg2.ptr_to([0]), reg2.ptr_to([1]), \
+                 reg2.ptr_to([2]), reg2.ptr_to([3])], [accum_frag.ptr_to([0]), \
+                 accum_frag.ptr_to([1])], [out_frag.ptr_to([0])], \
+                 [reg2.ptr_to([0]), reg2.ptr_to([1]), reg2.ptr_to([2]), \
+                 reg2.ptr_to([3])])"
             ),
             "{src}"
         );
+        assert!(!src.contains("mma.legacy"), "{src}");
 
-        // d != c: the accumulator is read-modify-write.
-        let err = kernel_to_tirx_source(&kernel({
-            let mut b = defs.clone();
-            b.push(wg_if(
-                0,
-                vec![mma(reg_slice(&acc, 0, 2), reg_slice(&acc, 0, 4))],
-            ));
-            b
-        }))
-        .unwrap_err();
-        assert!(err.contains("same fragment"), "{err}");
         // A/B in a bf16 element dtype (not packed words): no lowering.
         let ab16 = reg_tensor(13, DType::Bf16, 4);
         let err = kernel_to_tirx_source(&kernel(vec![
@@ -6017,7 +4801,6 @@ mod tests {
             shape: vec![4],
             layout: None,
             byte_offset: None,
-            reg_frag: None,
         });
         let point = |v: i64| TensorSlice {
             tensor: g.clone(),
@@ -6131,7 +4914,6 @@ mod tests {
             shape: vec![4, 4, 64, 128],
             layout: None,
             byte_offset: None,
-            reg_frag: None,
         });
         let tid_row = ScalarValue::Scope(ScopeValueKind::TidInWg);
         let body = vec![
@@ -6190,24 +4972,30 @@ mod tests {
         ];
         let src = kernel_to_tirx_source(&kernel(body)).unwrap();
         assert!(
-            src.contains("accum_frag_flat[0] = d_smem0[tid_in_wg, 3]"),
+            src.contains("accum_frag = T.alloc_local((1,), \"float32\")"),
             "{src}"
         );
         assert!(
-            src.contains("d_smem0[tid_in_wg, 5] = accum_frag_flat[0]"),
+            src.contains("out_frag = T.alloc_local((4,), \"float32\")"),
             "{src}"
         );
-        // REG->REG copy: the flat scalar form (the wg.copy scalar fallback's
-        // raw thread-axis BufferLoad is rejected by LowerTIRxCleanup).
         assert!(
-            src.contains("out_frag_flat[1 + _i] = out_frag_flat[0]"),
+            src.contains("Tx.copy(accum_frag[:], d_smem0[tid_in_wg:tid_in_wg + 1, 3:4])"),
             "{src}"
         );
-        assert!(src.contains("for _i in range(4):"), "{src}");
         assert!(
-            src.contains("A[1, 2, tid_in_wg, 16 + _i] = out_frag_flat[_i]"),
+            src.contains("Tx.copy(d_smem0[tid_in_wg:tid_in_wg + 1, 5:6], accum_frag[:])"),
             "{src}"
         );
+        assert!(
+            src.contains("Tx.copy(out_frag[1:1 + 1], out_frag[0:0 + 1])"),
+            "{src}"
+        );
+        assert!(
+            src.contains("Tx.copy(A[1:2, 2:3, tid_in_wg:tid_in_wg + 1, 16:20], out_frag[:])"),
+            "{src}"
+        );
+        assert!(!src.contains("Tx.wg."), "{src}");
     }
 
     fn reg_tensor(id: u32, dtype: DType, width: i64) -> Arc<Tensor> {
@@ -6218,7 +5006,6 @@ mod tests {
             shape: vec![width as usize],
             layout: None,
             byte_offset: None,
-            reg_frag: None,
         })
     }
 
@@ -6303,55 +5090,58 @@ mod tests {
         ];
         let src = kernel_to_tirx_source(&reg_kernel(body)).unwrap();
         assert!(
-            src.contains("Tx.wg.fill(accum_frag[:, :], T.float32(0))"),
+            src.contains("accum_frag = T.alloc_local((1,), \"float32\")"),
             "{src}"
         );
         assert!(
-            src.contains("Tx.wg.add(accum_frag[:, :], accum_frag[:, :], out_frag[:, :])"),
+            src.contains("out_frag = T.alloc_local((1,), \"float32\")"),
             "{src}"
         );
         assert!(
-            src.contains("Tx.wg.sub(accum_frag[:, :], accum_frag[:, :], T.float32(-1))"),
+            src.contains("reg2 = T.alloc_local((2,), \"bfloat16\")"),
             "{src}"
         );
         assert!(
-            src.contains(
-                "Tx.wg.fma(accum_frag[:, :], accum_frag[:, :], out_frag[:, :], accum_frag[:, :])"
-            ),
+            src.contains("Tx.thread.fill(accum_frag[:], T.float32(0))"),
             "{src}"
         );
         assert!(
-            src.contains("Tx.wg.exp2(accum_frag[:, :], out_frag[:, :])"),
+            src.contains("Tx.thread.add(accum_frag[:], accum_frag[:], out_frag[:])"),
             "{src}"
         );
         assert!(
-            src.contains("Tx.wg.reciprocal(accum_frag[:, :], out_frag[:, :])"),
+            src.contains("Tx.thread.sub(accum_frag[:], accum_frag[:], T.float32(-1))"),
             "{src}"
         );
         assert!(
-            src.contains("Tx.wg.mul(accum_frag[:, :], out_frag[:, :], T.float32(-1))"),
-            "{src}"
-        );
-        // log2: no tile op — per-thread scalar loop on the flat views.
-        assert!(
-            src.contains("accum_frag_flat = accum_frag.local()"),
-            "{src}"
-        );
-        assert!(src.contains("for _i in range(1):"), "{src}");
-        // (width-1 src broadcasts — the interpreter's one-element-per-thread rule)
-        assert!(
-            src.contains("accum_frag_flat[_i] = T.log2(out_frag_flat[0])"),
-            "{src}"
-        );
-        // bf16 fill/add: literal takes the dst dtype.
-        assert!(
-            src.contains("Tx.wg.fill(reg2[:, :], T.bfloat16(1))"),
+            src.contains("Tx.thread.fma(accum_frag[:], accum_frag[:], out_frag[:], accum_frag[:])"),
             "{src}"
         );
         assert!(
-            src.contains("Tx.wg.add(reg2[:, :], reg2[:, :], reg2[:, :])"),
+            src.contains("Tx.thread.exp2(accum_frag[:], out_frag[:])"),
             "{src}"
         );
+        assert!(
+            src.contains("Tx.thread.reciprocal(accum_frag[:], out_frag[:])"),
+            "{src}"
+        );
+        assert!(
+            src.contains("Tx.thread.mul(accum_frag[:], out_frag[:], T.float32(-1))"),
+            "{src}"
+        );
+        assert!(
+            src.contains("Tx.thread.log2(accum_frag[:], out_frag[:])"),
+            "{src}"
+        );
+        assert!(
+            src.contains("Tx.thread.fill(reg2[:], T.bfloat16(1))"),
+            "{src}"
+        );
+        assert!(
+            src.contains("Tx.thread.add(reg2[:], reg2[:], reg2[:])"),
+            "{src}"
+        );
+        assert!(!src.contains("Tx.wg."), "{src}");
     }
 
     #[test]
@@ -6467,13 +5257,16 @@ mod tests {
         }
     }
 
-    /// A cta_sync is emitted at function scope and suppressed inside a
-    /// warp/warpgroup branch (a CTA-wide `__syncthreads` not all threads reach).
+    /// Codegen preserves a CTA sync even in an invalid nested branch; the
+    /// validator, not codegen, is responsible for rejecting that program.
     #[test]
-    fn cta_sync_is_function_scope_only() {
+    fn cta_sync_is_never_deleted_or_hoisted() {
         let src = kernel_to_tirx_source(&kernel(vec![Stmt::CtaSync])).unwrap();
         assert!(src.contains("T.cuda.cta_sync()"), "{src}");
         let src = kernel_to_tirx_source(&kernel(vec![warp_if(1, vec![Stmt::CtaSync])])).unwrap();
-        assert!(!src.contains("T.cuda.cta_sync()"), "{src}");
+        assert!(
+            src.contains("if warp_id == 1:\n        T.cuda.cta_sync()"),
+            "{src}"
+        );
     }
 }

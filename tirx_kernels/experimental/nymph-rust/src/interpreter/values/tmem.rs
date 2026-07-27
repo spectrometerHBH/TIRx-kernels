@@ -60,28 +60,30 @@ impl TmemScratchpad {
         Ok(())
     }
 
-    /// Store one raw e4m3 scale byte at a TMEM cell. The nvfp4 block-scale
-    /// datapath holds its e4m3 SF in TMEM as one byte per (lane, col) cell —
-    /// not the packed-u32 4-bytes-per-cell layout the fp8/UE8M0 path uses — so
-    /// `tcgen05.cp` writes and `read_scale_blocks` reads through this raw byte
-    /// accessor (the typed read_cells/write_cells path is U32/F32/F16 only).
-    pub fn write_sf_byte(&mut self, lane: usize, col: usize, byte: u8) -> IResult<()> {
+    /// Store one physical 32-bit TMEM cell without interpreting its bits.
+    pub fn write_raw_cell(&mut self, lane: usize, col: usize, bits: u32) -> IResult<()> {
         self.check_cell(lane, col)?;
-        self.data[[lane, col]] = byte as u32;
+        self.data[[lane, col]] = bits;
         self.valid[[lane, col]] = true;
         Ok(())
     }
 
-    /// Read back a raw e4m3 scale byte written by `write_sf_byte`.
-    pub fn read_sf_byte(&self, lane: usize, col: usize) -> IResult<u8> {
+    /// Read one of the four 8-bit TCol elements packed into a physical cell.
+    pub fn read_cell_byte(&self, lane: usize, col: usize, subbyte: u8) -> IResult<u8> {
         self.check_cell(lane, col)?;
+        if subbyte >= 4 {
+            return Err(InterpreterError::new(
+                "tmem_value",
+                "TMEM cell byte index is out of bounds",
+            ));
+        }
         if !self.valid[[lane, col]] {
             return Err(InterpreterError::new(
                 "missing_tmem_value",
                 "TMEM scale cell is unwritten",
             ));
         }
-        Ok((self.data[[lane, col]] & 0xFF) as u8)
+        Ok(((self.data[[lane, col]] >> (8 * subbyte)) & 0xFF) as u8)
     }
 
     fn check_supported_dtype(dtype: DType) -> IResult<()> {
@@ -346,6 +348,41 @@ impl TmemScratchpad {
             ])
             .fill(true);
         Ok(true)
+    }
+
+    /// Gather-scatter f32 accumulator update at explicit physical TMEM cells.
+    pub fn accumulate_f32_cells(
+        &mut self,
+        lanes: &[usize],
+        cols: &[usize],
+        values: &[f32],
+        accum: bool,
+    ) -> IResult<()> {
+        if lanes.len() != cols.len() || lanes.len() != values.len() {
+            return Err(InterpreterError::new(
+                "tmem_value",
+                "TMEM accumulator scatter value count mismatch",
+            ));
+        }
+        for (&lane, &col) in lanes.iter().zip(cols) {
+            self.check_cell(lane, col)?;
+            if accum && !self.valid[[lane, col]] {
+                return Err(InterpreterError::new(
+                    "missing_tmem_value",
+                    "TMEM cell is unwritten",
+                ));
+            }
+        }
+        for ((&lane, &col), &value) in lanes.iter().zip(cols).zip(values) {
+            let next = if accum {
+                f32::from_bits(self.data[[lane, col]]) + value
+            } else {
+                value
+            };
+            self.data[[lane, col]] = next.to_bits();
+            self.valid[[lane, col]] = true;
+        }
+        Ok(())
     }
 
     pub fn write_packed_half_cells(

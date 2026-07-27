@@ -9,11 +9,20 @@ from helpers import (
     reg_tensor,
     run,
     smem_tensor,
-    tmem_band,
     u32,
 )
 
 DP_B = 1 << 21
+
+
+def _tmem(start_col=0):
+    return nr.TmemTensor(start_col)
+
+
+def _tile(b, tensor, rows, cols, *, row=0, col=0, prefix=()):
+    return b.smem_tile(
+        tensor, prefix_indices=prefix, row_offset=row, col_offset=col, rows=rows, cols=cols
+    )
 
 
 def _layout_eval(shape, stride, index):
@@ -123,7 +132,7 @@ def u32_sentinels(rows, cols):
 
 def _tcgen05_role_failure_kernel(op, *, row=0, col=0, elected=False):
     b = builder("tcgen05_datapath_failure")
-    band = tmem_band(dtype=nr.DType.F32)
+    band = _tmem()
     dst = reg_tensor(b, dtype=nr.DType.F32, shape=(1,))
     # The (row, col) base rides runtime scalars so the out-of-range cases reach
     # the interpreter's fail-closed checks instead of the static TmemOperand
@@ -168,7 +177,7 @@ def _reg_row_cols(b, tensor, col, cols):
 def _tcgen05_datapath_kernel(shape, num, mode):
     reg_size = register_count(shape, num)
     b = builder(f"tcgen05_{mode}_datapath")
-    tmem = tmem_band(dtype=nr.DType.U32)
+    tmem = _tmem()
     seed_g = gmem_arg(b, shape=(128, 256))
     source_g = gmem_arg(b, shape=(128, reg_size))
     out = gmem_arg(b, shape=(128, 256 if mode == "st" else reg_size))
@@ -243,44 +252,42 @@ def test_tcgen05_ld_non32_shapes_gather_from_modeled_physical_cells():
         np.testing.assert_array_equal(dump, expected, err_msg=f"{shape}.x{num}")
 
 
-def _mma64_kernel(dtype, lane_align, accum, trans_a, trans_b):
-    m, n, k = 64, 16, 16
+def _align8(value):
+    return (value + 7) // 8 * 8
+
+
+def _dense_smem_kernel(dtype, *, trans_a=False, trans_b=False, accumulate=False):
+    m, n = 128, 16
+    k = 32 if dtype == nr.DType.F8E4M3 else 16
+    elem_bytes = 1 if dtype == nr.DType.F8E4M3 else 2
     a_shape = (k, m) if trans_a else (m, k)
     b_shape = (k, n) if trans_b else (n, k)
-    a_bytes = int(np.prod(a_shape)) * 2
-    b_bytes = int(np.prod(b_shape)) * 2
-    b = builder("mma64", smem_size_bytes=a_bytes + b_bytes)
+    a_bytes = int(np.prod(a_shape)) * elem_bytes
+    b_bytes = int(np.prod(b_shape)) * elem_bytes
+    metadata = _align8(a_bytes + b_bytes)
+    b = builder("tcgen05_dense_smem", smem_size_bytes=metadata + 3 * 8 + 4)
     a_g = gmem_arg(b, dtype=dtype, shape=a_shape)
     b_g = gmem_arg(b, dtype=dtype, shape=b_shape)
-    zero_g = gmem_arg(b, dtype=nr.DType.F32, shape=(128, n))
-    out = gmem_arg(b, dtype=nr.DType.F32, shape=(128, n))
+    out = gmem_arg(b, dtype=nr.DType.F32, shape=(m, n))
     a_s = smem_tensor(b, dtype=dtype, shape=a_shape, byte_offset=0)
     b_s = smem_tensor(b, dtype=dtype, shape=b_shape, byte_offset=a_bytes)
-    dst = tmem_band(dtype=nr.DType.F32)
+    a_tile = _tile(b, a_s, *a_shape)
+    b_tile = _tile(b, b_s, *b_shape)
+    d = _tmem()
     frag = reg_tensor(b, dtype=nr.DType.F32, shape=(n,))
-    ma = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
-    mb = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
-    mc = b.mbar(kind=nr.MBarKind.TCGEN05, byte_offset=0)
+    ma = b.mbar(kind=nr.MBarKind.TMA, byte_offset=metadata)
+    mb = b.mbar(kind=nr.MBarKind.TMA, byte_offset=metadata + 8)
+    done = b.mbar(kind=nr.MBarKind.TCGEN05, byte_offset=metadata + 16)
 
     with b.if_warp(0):
-        b.tmem_alloc(0, 32, addr_byte_offset=0)
-        # mbarrier.init is per-thread: exactly one thread initializes each cell.
+        b.tmem_alloc(0, 32, addr_byte_offset=metadata + 24)
         with b.if_elected():
             b.mbarrier_init(ma, count=1)
             b.mbarrier_init(mb, count=1)
-            b.mbarrier_init(mc, count=1)
-    # Publish the alloc + mbar cells to every warp stream before any consumer
-    # touches them.
+            b.mbarrier_init(done, count=1)
     b.cta_sync()
 
     with b.if_warpgroup(0):
-        b.reg_load(frag, zero_g[b.tid_in_wg(), 0:n])
-        b.tcgen05_st(dst.at(0, 0), frag, shape="32x32b", num=n)
-        b.tcgen05_wait_st()
-        # All four warps' seed stores must land before the single-thread MMA issue.
-        b.wg_sync(barrier_id=1)
-        # Producer thread: arrive_expect_tx then tma issue, waits, then the MMA
-        # issue — all in its own program order (single-thread instructions).
         with b.if_(b.tid_in_wg().eq(0)):
             b.mbarrier_arrive_expect_tx(ma, bytes=a_bytes)
             b.tma_load(a_s, a_g, mbar=ma, coords=(0, 0), shape=a_shape)
@@ -288,448 +295,747 @@ def _mma64_kernel(dtype, lane_align, accum, trans_a, trans_b):
             b.tma_load(b_s, b_g, mbar=mb, coords=(0, 0), shape=b_shape)
             b.mbarrier_wait(ma, phase=0)
             b.mbarrier_wait(mb, phase=0)
-            b.tcgen05_mma(
-                dst.at(0, 0),
-                a_s,
-                b_s,
-                m=m,
-                n=n,
-                k=k,
-                accum=False,
-                trans_a=trans_a,
-                trans_b=trans_b,
-                lane_align=lane_align,
-            )
-            if accum:
+            data_format = {nr.DType.F16: "f16", nr.DType.BF16: "bf16", nr.DType.F8E4M3: "f8_e4m3"}[
+                dtype
+            ]
+            for accum_flag in [0, 1] if accumulate else [0]:
                 b.tcgen05_mma(
-                    dst.at(0, 0),
-                    a_s,
-                    b_s,
-                    m=m,
-                    n=n,
-                    k=k,
-                    accum=True,
+                    d.at(0, 0),
+                    b.mma_a_smem(a_tile),
+                    b_tile,
+                    mma_m=m,
+                    mma_n=n,
+                    format=data_format,
+                    block_scale=None,
+                    accum=accum_flag,
                     trans_a=trans_a,
                     trans_b=trans_b,
-                    lane_align=lane_align,
+                    ws=False,
+                    cta_group=1,
                 )
-            b.tcgen05_commit(mc)
-        # Accumulator reads are released by the commit, not the issue.
-        b.mbarrier_wait(mc, phase=0)
-        b.tcgen05_ld(frag, dst.at(0, 0), shape="32x32b", num=n)
+            b.tcgen05_commit(done)
+        b.mbarrier_wait(done, phase=0)
+        b.tcgen05_ld(frag, d.at(0, 0), num=n)
         b.tcgen05_wait_ld()
         b.reg_store(out[b.tid_in_wg(), 0:n], frag)
 
-    # Every warp's loads retire before the dealloc.
     b.cta_sync()
     with b.if_warp(0):
         b.tmem_dealloc(0, 32)
-
-    return b.build(), a_g, b_g, zero_g, out
-
-
-def _mma64_inputs(trans_b):
-    a = np.ones((64, 16), dtype=np.float32)
-    b = np.zeros((16, 16), dtype=np.float32)
-    if trans_b:
-        for kk in range(16):
-            for ni in range(16):
-                b[kk, ni] = ni + 1
-    else:
-        for ni in range(16):
-            for kk in range(16):
-                b[ni, kk] = ni + 1
-    return a, b
+    return b.build(), a_g, b_g, out
 
 
-def test_tcgen05_mma_m64_layout_f_transpose_accum_and_dtype():
-    for dtype in [nr.DType.F16, nr.DType.BF16]:
-        for lane_align in [0, 16]:
-            for trans_a, trans_b in [(False, False), (True, False), (False, True), (True, True)]:
-                kernel, a_g, b_g, zero_g, out = _mma64_kernel(
-                    dtype, lane_align, True, trans_a, trans_b
-                )
-                a, b_values = _mma64_inputs(trans_b)
-                if trans_a:
-                    a = a.T
-                outputs = run(
-                    kernel,
-                    {
-                        a_g: a.astype(np.float32),
-                        b_g: b_values.astype(np.float32),
-                        zero_g: np.zeros((128, 16), dtype=np.float32),
-                    },
-                )
-                dump = output(outputs, out)
-                for mi in [0, 15, 16, 63]:
-                    for ni in [0, 7, 15]:
-                        lane = 32 * (mi // 16) + (mi % 16) + lane_align
-                        got = dump[lane, ni]
-                        expected = 2.0 * 16.0 * (ni + 1.0)
-                        assert got == expected
+@pytest.mark.parametrize("dtype", [nr.DType.F16, nr.DType.BF16])
+def test_tcgen05_dense_smem_a_uses_resolved_mnk_and_d_footprint(dtype):
+    kernel, a_g, b_g, out = _dense_smem_kernel(dtype)
+    a = np.ones((128, 16), dtype=np.float32)
+    b_values = np.arange(1, 17, dtype=np.float32)[:, None] * np.ones((1, 16), np.float32)
+    outputs = run(kernel, {a_g: a, b_g: b_values})
+    expected = np.broadcast_to(16.0 * np.arange(1, 17, dtype=np.float32), (128, 16))
+    np.testing.assert_array_equal(output(outputs, out), expected)
 
 
-def _build_mma_failure(*, a_shape=(128, 16), dst_row=0, dst_col=0, lane_align=0, allocate=True):
-    b = builder("mma_failure", smem_size_bytes=1 << 16)
-    a = smem_tensor(b, dtype=nr.DType.F16, shape=a_shape, byte_offset=0)
-    b_s = smem_tensor(b, dtype=nr.DType.F16, shape=(16, 16), byte_offset=4096)
-    # The dst base rides runtime scalars so the offset/bounds/scratchpad cases
-    # reach the interpreter's fail-closed checks instead of the static
-    # TmemOperand / live-band validation at build time.
-    row_v = b.scalar(initial=dst_row, dtype=nr.ScalarDType.I32)
-    col_v = b.scalar(initial=dst_col, dtype=nr.ScalarDType.I32)
-    dst = nr.TmemOperand(row_v, col_v, nr.DType.F32)
-    if allocate:
-        with b.if_warp(0):
-            b.tmem_alloc(0, 32, addr_byte_offset=0)
-    # tcgen05_mma is a single-thread instruction now; issue it from an elected
-    # thread so each pinned validation code is reached (not tcgen05_mma_mask).
-    with b.if_warp(0), b.if_elected():
-        b.tcgen05_mma(dst, a, b_s, m=128, n=16, k=16, lane_align=lane_align)
-    return b.build()
+@pytest.mark.parametrize(
+    "dtype,trans_a,trans_b,accumulate",
+    [
+        (nr.DType.F8E4M3, False, False, False),
+        (nr.DType.F16, True, False, False),
+        (nr.DType.F16, False, True, False),
+        (nr.DType.F16, False, False, True),
+    ],
+)
+def test_tcgen05_dense_fp8_transpose_and_accumulate(dtype, trans_a, trans_b, accumulate):
+    kernel, a_g, b_g, out = _dense_smem_kernel(
+        dtype, trans_a=trans_a, trans_b=trans_b, accumulate=accumulate
+    )
+    k = 32 if dtype == nr.DType.F8E4M3 else 16
+    a_logical = np.fromfunction(lambda row, col: 1 + (row + col) % 3, (128, k)).astype(np.float32)
+    b_logical = np.fromfunction(lambda row, col: 1 + (2 * row + col) % 3, (16, k)).astype(
+        np.float32
+    )
+    a_physical = a_logical.T.copy() if trans_a else a_logical
+    b_physical = b_logical.T.copy() if trans_b else b_logical
+    dump = output(run(kernel, {a_g: a_physical, b_g: b_physical}), out)
+    expected = a_logical @ b_logical.T
+    if accumulate:
+        expected *= 2
+    np.testing.assert_array_equal(dump, expected)
+    assert nr.check_protocol(kernel)["status"] == "Passed"
 
 
-def test_tcgen05_mma_fail_closed_before_panics_or_wrong_writes():
-    # lane_align lives on the MMA itself now; the validator rejects it for any
-    # non-(cta_group=1, m=64) layout at build time (no valid kernel can carry
-    # the shape the old runtime tcgen05_mma_lane_align check rejected).
-    with pytest.raises(ValueError, match=r"lane_align != 0 requires cta_group=1 and m=64"):
-        _build_mma_failure(lane_align=16)
-
-    with expect_runtime_error("tcgen05_mma_dst_offset"):
-        run(_build_mma_failure(dst_row=1))
-
-    with expect_runtime_error("tcgen05_mma_out_of_range"):
-        run(_build_mma_failure(dst_col=500))
-
-    with expect_runtime_error("tcgen05_mma_shape"):
-        run(_build_mma_failure(a_shape=(129, 16)))
-
-    with expect_runtime_error("missing_tmem_scratchpad"):
-        run(_build_mma_failure(allocate=False))
-
-
-def _tmem_operand_mma_kernel():
+def _tmem_a_kernel(form):
     m, n, k = 64, 16, 16
-    b = builder("tmem_operand_mma", smem_size_bytes=n * k * 2)
-    p_g = gmem_arg(b, dtype=nr.DType.F16, shape=(128, k))
+    b_bytes = n * k * 2
+    metadata = _align8(b_bytes)
+    b = builder(f"tcgen05_tmem_a_{form}", smem_size_bytes=metadata + 2 * 8 + 4)
+    a_g = gmem_arg(b, dtype=nr.DType.F16, shape=(128, k))
     b_g = gmem_arg(b, dtype=nr.DType.F16, shape=(n, k))
     out = gmem_arg(b, dtype=nr.DType.F32, shape=(128, n))
-    # Two bands inside ONE 64-column allocation (the IR's lifecycle allows a
-    # single live base-0 band): the f16 A operand at col 0, the f32
-    # accumulator at col 32 — the same physical layout the old two-alloc form
-    # described.
-    p = tmem_band(dtype=nr.DType.F16, col0=0)
-    dst = tmem_band(dtype=nr.DType.F32, col0=32)
     b_s = smem_tensor(b, dtype=nr.DType.F16, shape=(n, k), byte_offset=0)
-    p_frag = reg_tensor(b, dtype=nr.DType.F16, shape=(k,))
+    b_tile = _tile(b, b_s, n, k)
+    a_tmem = _tmem(0)
+    d = _tmem(32)
+    a_frag = reg_tensor(b, dtype=nr.DType.F16, shape=(k,))
+    zero = reg_tensor(b, dtype=nr.DType.F32, shape=(n,))
     out_frag = reg_tensor(b, dtype=nr.DType.F32, shape=(n,))
-    mb = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
-    mc = b.mbar(kind=nr.MBarKind.TCGEN05, byte_offset=0)
+    mb = b.mbar(kind=nr.MBarKind.TMA, byte_offset=metadata)
+    done = b.mbar(kind=nr.MBarKind.TCGEN05, byte_offset=metadata + 8)
 
     with b.if_warp(0):
-        b.tmem_alloc(0, 64, addr_byte_offset=0)
-        # mbarrier.init is per-thread: one thread initializes each cell.
+        b.tmem_alloc(0, 64, addr_byte_offset=metadata + 16)
         with b.if_elected():
             b.mbarrier_init(mb, count=1)
-            b.mbarrier_init(mc, count=1)
-    # Publish alloc + mbar cells to every warp stream.
+            b.mbarrier_init(done, count=1)
     b.cta_sync()
+
     with b.if_warpgroup(0):
-        b.reg_fill(out_frag, 0.0)
-        b.tcgen05_st(dst.at(0, 0), out_frag, shape="32x32b", num=n)
+        b.reg_load(a_frag, a_g[b.tid_in_wg(), 0:k])
+        b.tcgen05_st(a_tmem.at(0, 0), a_frag[0 : k // 2], num=k // 2)
+        b.reg_fill(zero, 0.0)
+        b.tcgen05_st(d.at(0, 0), zero, num=n)
         b.tcgen05_wait_st()
-        b.reg_load(p_frag, p_g[b.tid_in_wg(), 0:k])
-        b.tcgen05_st(p.at(0, 0), p_frag[0 : k // 2], shape="32x32b", num=k // 2)
-        b.tcgen05_wait_st()
-        # All warps' TMEM operand/zero stores land before the MMA issue.
         b.wg_sync(barrier_id=1)
-        # Single producer thread: arrive_expect_tx + tma issue + wait + MMA
-        # issue + commit, in its own program order.
         with b.if_(b.tid_in_wg().eq(0)):
-            b.mbarrier_arrive_expect_tx(mb, bytes=n * k * 2)
+            b.mbarrier_arrive_expect_tx(mb, bytes=b_bytes)
             b.tma_load(b_s, b_g, mbar=mb, coords=(0, 0), shape=(n, k))
             b.mbarrier_wait(mb, phase=0)
-            b.tcgen05_mma(dst.at(0, 0), p.at(0, 0), b_s, m=m, n=n, k=k)
-            b.tcgen05_commit(mc)
-        # Accumulator reads release on the commit, not the issue.
-        b.mbarrier_wait(mc, phase=0)
-        b.tcgen05_ld(out_frag, dst.at(0, 0), shape="32x32b", num=n)
+            b.tcgen05_mma(
+                d.at(0, 0),
+                b.mma_a_tmem(a_tmem.at(0, 0), form=form),
+                b_tile,
+                mma_m=m,
+                mma_n=n,
+                format="f16",
+                block_scale=None,
+                accum=0,
+                trans_a=False,
+                trans_b=False,
+                ws=form == "bank_batched",
+                cta_group=1,
+            )
+            b.tcgen05_commit(done)
+        b.mbarrier_wait(done, phase=0)
+        b.tcgen05_ld(out_frag, d.at(0, 0), num=n)
         b.tcgen05_wait_ld()
         b.reg_store(out[b.tid_in_wg(), 0:n], out_frag)
-    # Every warp's loads retire before the dealloc.
+
+    b.cta_sync()
+    with b.if_warp(0):
+        b.tmem_dealloc(0, 64)
+    return b.build(), a_g, b_g, out
+
+
+@pytest.mark.parametrize("form", ["flat", "bank_batched"])
+def test_tcgen05_tmem_a_flat_and_bank_batched(form):
+    kernel, a_g, b_g, out = _tmem_a_kernel(form)
+    a = np.ones((128, 16), dtype=np.float32)
+    a[64:, :] = 2.0
+    b_values = np.ones((16, 16), dtype=np.float32)
+    dump = output(run(kernel, {a_g: a, b_g: b_values}), out)
+    if form == "flat":
+        mapped = np.r_[0:16, 32:48, 64:80, 96:112]
+        np.testing.assert_array_equal(dump[mapped], np.full((64, 16), 16.0, np.float32))
+        holes = np.setdiff1d(np.arange(128), mapped)
+        np.testing.assert_array_equal(dump[holes], np.zeros((64, 16), np.float32))
+    else:
+        np.testing.assert_array_equal(dump[:64, :8], np.full((64, 8), 16.0, np.float32))
+        np.testing.assert_array_equal(dump[64:, :8], np.full((64, 8), 32.0, np.float32))
+        np.testing.assert_array_equal(dump[:, 8:], np.zeros((128, 8), np.float32))
+
+
+def _block_scaled_kernel(format, *, sf_reuse=1, sf_k_offset=0, sf_col_offset=0, accumulate=False):
+    m, n = 128, 32
+    if format == "f8_e4m3":
+        storage_dtype = nr.DType.F8E4M3
+        storage_k = logical_k = 32 * sf_reuse
+        scale_format = "e8m0_fnu"
+        scale_bytes_a = [127, 128, 130, 131]
+        scale_bytes_b = [127, 129, 131, 132]
+        sf_per_mma = 1
+        scale_a = 2.0 ** (scale_bytes_a[sf_k_offset] - 127)
+        scale_b = 2.0 ** (scale_bytes_b[sf_k_offset] - 127)
+        expected = logical_k * scale_a * scale_b
+    else:
+        storage_dtype = nr.DType.U8
+        storage_k, logical_k = 32, 64
+        scale_format = "e4m3_fn"
+        scale_bytes_a = scale_bytes_b = [0x38] * 4  # e4m3fn 1.0
+        sf_per_mma = 4
+        expected = float(logical_k)
+    if accumulate:
+        expected *= 2
+
+    a_bytes = m * storage_k
+    b_bytes = n * storage_k
+    scale_bytes = 32 * 4 * 4
+    sfa_offset = a_bytes + b_bytes
+    sfb_offset = sfa_offset + scale_bytes
+    metadata = _align8(sfb_offset + scale_bytes)
+    b = builder(f"tcgen05_block_scaled_{format}", smem_size_bytes=metadata + 6 * 8 + 4)
+    a_g = gmem_arg(b, dtype=storage_dtype, shape=(m, storage_k))
+    b_g = gmem_arg(b, dtype=storage_dtype, shape=(n, storage_k))
+    sfa_g = gmem_arg(b, dtype=nr.DType.U32, shape=(32, 4))
+    sfb_g = gmem_arg(b, dtype=nr.DType.U32, shape=(32, 4))
+    out = gmem_arg(b, dtype=nr.DType.F32, shape=(m, n))
+    a_s = smem_tensor(b, dtype=storage_dtype, shape=(m, storage_k), byte_offset=0)
+    b_s = smem_tensor(b, dtype=storage_dtype, shape=(n, storage_k), byte_offset=a_bytes)
+    sfa_s = smem_tensor(b, dtype=nr.DType.U32, shape=(32, 4), byte_offset=sfa_offset)
+    sfb_s = smem_tensor(b, dtype=nr.DType.U32, shape=(32, 4), byte_offset=sfb_offset)
+    a_tile = _tile(b, a_s, m, storage_k)
+    b_tile = _tile(b, b_s, n, storage_k)
+    sfa_tile = _tile(b, sfa_s, 32, 4)
+    sfb_tile = _tile(b, sfb_s, 32, 4)
+    d = _tmem(0)
+    sfa = _tmem(32)
+    sfb = _tmem(40)
+    frag = reg_tensor(b, dtype=nr.DType.F32, shape=(n,))
+    mbars = [b.mbar(kind=nr.MBarKind.TMA, byte_offset=metadata + 8 * i) for i in range(4)]
+    cp_done = b.mbar(kind=nr.MBarKind.TCGEN05, byte_offset=metadata + 32)
+    mma_done = b.mbar(kind=nr.MBarKind.TCGEN05, byte_offset=metadata + 40)
+
+    with b.if_warp(0):
+        b.tmem_alloc(0, 64, addr_byte_offset=metadata + 48)
+        with b.if_elected():
+            for mbar in [*mbars, cp_done, mma_done]:
+                b.mbarrier_init(mbar, count=1)
+    b.cta_sync()
+
+    with b.if_warpgroup(0):
+        with b.if_(b.tid_in_wg().eq(0)):
+            for mbar, dst, src, shape, byte_count in [
+                (mbars[0], a_s, a_g, (m, storage_k), a_bytes),
+                (mbars[1], b_s, b_g, (n, storage_k), b_bytes),
+                (mbars[2], sfa_s, sfa_g, (32, 4), scale_bytes),
+                (mbars[3], sfb_s, sfb_g, (32, 4), scale_bytes),
+            ]:
+                b.mbarrier_arrive_expect_tx(mbar, bytes=byte_count)
+                b.tma_load(dst, src, mbar=mbar, coords=(0, 0), shape=shape)
+                b.mbarrier_wait(mbar, phase=0)
+            b.tcgen05_cp(
+                sfa.at(0, sf_col_offset), sfa_tile, shape="32x128b", multicast="warp4", cta_group=1
+            )
+            b.tcgen05_cp(
+                sfb.at(0, sf_col_offset), sfb_tile, shape="32x128b", multicast="warp4", cta_group=1
+            )
+            b.tcgen05_commit(cp_done)
+            b.mbarrier_wait(cp_done, phase=0)
+            scales = nr.BlockScaleSpec(
+                sfa.at(0, sf_col_offset),
+                sfb.at(0, sf_col_offset),
+                sf_k_offset,
+                sf_k_offset,
+                scale_format,
+                sf_per_mma,
+                sf_reuse,
+            )
+            for accum_flag in [0, 1] if accumulate else [0]:
+                b.tcgen05_mma(
+                    d.at(0, 0),
+                    b.mma_a_smem(a_tile),
+                    b_tile,
+                    mma_m=m,
+                    mma_n=n,
+                    format=format,
+                    block_scale=scales,
+                    accum=accum_flag,
+                    trans_a=False,
+                    trans_b=False,
+                    ws=False,
+                    cta_group=1,
+                )
+            b.tcgen05_commit(mma_done)
+        b.mbarrier_wait(mma_done, phase=0)
+        b.tcgen05_ld(frag, d.at(0, 0), num=n)
+        b.tcgen05_wait_ld()
+        b.reg_store(out[b.tid_in_wg(), 0:n], frag)
+
     b.cta_sync()
     with b.if_warp(0):
         b.tmem_dealloc(0, 64)
 
-    return b.build(), p_g, b_g, out
+    packed_a = int.from_bytes(bytes(scale_bytes_a), "little")
+    packed_b = int.from_bytes(bytes(scale_bytes_b), "little")
+    return b.build(), a_g, b_g, sfa_g, sfb_g, out, packed_a, packed_b, expected
 
 
-def test_tcgen05_mma_trace_accepts_tmem_operand_region():
-    kernel, _, _, _ = _tmem_operand_mma_kernel()
-    report = nr.check_protocol(kernel, include_events=True)
-    assert report["status"] == "Passed"
-    tmem_reads = [
-        event
-        for event in report["events"]
-        if event["kind"] == "read"
-        and event["access_category"] == "tensor"
-        and event["region"]["owner"] == {"kind": "tmem", "cta_id": 0}
-    ]
-    assert len(tmem_reads) == 1
-    assert tmem_reads[0]["region"]["boxes"] == [{"ranges": [(0, 64), (0, 32)]}]
+@pytest.mark.parametrize("format", ["f8_e4m3", "f4_e2m1"])
+def test_tcgen05_block_scale_f8_e8m0_and_f4_e4m3(format):
+    kernel, a_g, b_g, sfa_g, sfb_g, out, packed_a, packed_b, expected = _block_scaled_kernel(format)
+    if format == "f8_e4m3":
+        a = np.ones((128, 32), dtype=np.float32)
+        b_values = np.ones((32, 32), dtype=np.float32)
+    else:
+        a = np.full((128, 32), 0x22, dtype=np.uint8)
+        b_values = np.full((32, 32), 0x22, dtype=np.uint8)
+    scales_a = np.full((32, 4), packed_a, dtype=np.uint32)
+    scales_b = np.full((32, 4), packed_b, dtype=np.uint32)
+    dump = output(run(kernel, {a_g: a, b_g: b_values, sfa_g: scales_a, sfb_g: scales_b}), out)
+    np.testing.assert_array_equal(dump, np.full((128, 32), expected, np.float32))
 
 
-def test_tcgen05_mma_value_mode_accepts_tmem_operand():
-    kernel, p_g, b_g, out = _tmem_operand_mma_kernel()
-    p = np.ones((128, 16), dtype=np.float32)
-    b_values = np.zeros((16, 16), dtype=np.float32)
-    for ni in range(16):
-        b_values[ni, :] = ni + 1
-    outputs = run(kernel, {p_g: p, b_g: b_values})
-    dump = output(outputs, out)
-    for mi in [0, 15, 16, 63]:
-        for ni in [0, 7, 15]:
-            lane = 32 * (mi // 16) + (mi % 16)
-            assert dump[lane, ni] == 16.0 * (ni + 1.0)
+def test_tcgen05_block_scale_reuse_offset_and_accumulate():
+    kernel, a_g, b_g, sfa_g, sfb_g, out, packed_a, packed_b, expected = _block_scaled_kernel(
+        "f8_e4m3", sf_reuse=4, sf_k_offset=1, sf_col_offset=4, accumulate=True
+    )
+    a = np.ones((128, 128), dtype=np.float32)
+    b_values = np.ones((32, 128), dtype=np.float32)
+    scales_a = np.full((32, 4), packed_a, dtype=np.uint32)
+    scales_b = np.full((32, 4), packed_b, dtype=np.uint32)
+    dump = output(run(kernel, {a_g: a, b_g: b_values, sfa_g: scales_a, sfb_g: scales_b}), out)
+    np.testing.assert_array_equal(dump, np.full((128, 32), expected, np.float32))
+    assert nr.check_protocol(kernel)["status"] == "Passed"
 
 
-def _f16_tmem_store_kernel():
-    b = builder("f16_tmem_store")
-    out = gmem_arg(b, dtype=nr.DType.F16, shape=(32, 2))
-    tmem = tmem_band(dtype=nr.DType.F16)
-    frag = reg_tensor(b, dtype=nr.DType.F16, shape=(2,))
-    loaded = reg_tensor(b, dtype=nr.DType.F16, shape=(2,))
-    with b.if_warp(0):
-        b.tmem_alloc(0, 32, addr_byte_offset=0)
-    with b.if_warp(0):
-        b.reg_fill(frag[0], 1.0)
-        b.reg_fill(frag[1], 2.0)
-        b.tcgen05_st(tmem.at(0, 0), frag[0:1], shape="32x32b", num=1)
-        b.tcgen05_wait_st()
-        b.tcgen05_ld(loaded[0:1], tmem.at(0, 0), shape="32x32b", num=1)
-        b.tcgen05_wait_ld()
-        b.reg_store(out[b.tid_in_wg(), 0:2], loaded)
-    with b.if_warp(0):
-        b.tmem_dealloc(0, 32)
-    return b.build(), out
-
-
-def test_tcgen05_st_trace_accepts_f16_tmem_region():
-    kernel, _ = _f16_tmem_store_kernel()
-    report = nr.check_protocol(kernel, include_events=True)
-    assert report["status"] == "Passed"
-    tmem_writes = [
-        event
-        for event in report["events"]
-        if event["kind"] == "write"
-        and event["access_category"] == "tmem"
-        and event["access_kind"] == "st"
-    ]
-    assert len(tmem_writes) == 1
-    assert tmem_writes[0]["region"]["owner"] == {"kind": "tmem", "cta_id": 0}
-    reg_reads = [
-        event
-        for event in report["events"]
-        if event["stmt_kind"] == "Tcgen05St"
-        and event["kind"] == "read"
-        and event["region"]["owner"]["kind"] == "reg"
-    ]
-    reg_writes = [
-        event
-        for event in report["events"]
-        if event["stmt_kind"] == "Tcgen05Ld"
-        and event["kind"] == "write"
-        and event["region"]["owner"]["kind"] == "reg"
-    ]
-    assert reg_reads[0]["region"]["boxes"] == [{"ranges": [(0, 32), (0, 2)]}]
-    assert reg_writes[0]["region"]["boxes"] == [{"ranges": [(0, 32), (0, 2)]}]
-
-
-def test_tcgen05_st_value_mode_accepts_f16_tmem():
-    kernel, out = _f16_tmem_store_kernel()
-    outputs = run(kernel)
-    expected = np.tile(np.array([1.0, 2.0], dtype=np.float16), (32, 1))
-    np.testing.assert_array_equal(output(outputs, out), expected)
-
-
-def _mma_cg2_peer_smem_kernel(synced):
-    """One cluster pair; CTA1 writes its own SMEM operand tiles, CTA0 (the
-    leader) issues a cta_group=2 MMA that reads BOTH CTAs' tiles. With
-    synced=False there is no CTA1 -> CTA0 happens-before at all — the peer-SMEM
-    read must surface as a data race, and the events must show an operand read
-    on EACH CTA's pool (the old single-CTA trace only recorded smem:cta0)."""
-    m, n, mma_k = 256, 32, 16
-    a_bytes = 128 * mma_k * 2
-    b_bytes = (n // 2) * mma_k * 2
+def _fp4_cg2_m128_kernel(*, both_ctas_issue):
+    m, n, k = 128, 32, 64
+    per_cta_m, per_cta_n, packed_k = m // 2, n // 2, k // 2
+    a_bytes = per_cta_m * packed_k
+    b_bytes = per_cta_n * packed_k
+    metadata = _align8(a_bytes + b_bytes)
+    tmem_addr_offset = metadata + 16
     b = builder(
-        "mma_cg2_peer_smem" + ("_sync" if synced else "_race"),
-        smem_size_bytes=a_bytes + b_bytes,
+        f"tcgen05_fp4_cg2_m128_{'both' if both_ctas_issue else 'leader'}",
+        smem_size_bytes=tmem_addr_offset + 4,
         launch_shape=(2,),
         cluster_shape=(2,),
     )
-    a_smem = smem_tensor(b, dtype=nr.DType.F16, shape=(128, mma_k), byte_offset=0)
-    b_smem = smem_tensor(b, dtype=nr.DType.F16, shape=(n // 2, mma_k), byte_offset=a_bytes)
-    accum = tmem_band(dtype=nr.DType.F32)
-    ready = b.mbar(kind=nr.MBarKind.THREAD, byte_offset=0)
-    mma_done = b.mbar(kind=nr.MBarKind.TCGEN05, byte_offset=0)
-    ready_leader = b.mbar_ref(ready, remote_coord=0)  # absolute coord: the leader's cell
+    a_g = gmem_arg(b, dtype=nr.DType.U8, shape=(2, per_cta_m, packed_k))
+    b_g = gmem_arg(b, dtype=nr.DType.U8, shape=(2, per_cta_n, packed_k))
+    # These are already packed physical scale cells.  SFA has one cell for
+    # rows 0..31 and one for rows 32..63; SFB has one cell for each of the
+    # cluster-wide 32 rows.  Keeping this setup explicit makes the test about
+    # MMA interpretation, independent of tcgen05.cp.
+    sfa_g = gmem_arg(b, dtype=nr.DType.U32, shape=(2, 32, 2))
+    sfb_g = gmem_arg(b, dtype=nr.DType.U32, shape=(2, 32))
+    out = gmem_arg(b, dtype=nr.DType.F32, shape=(2, 2, per_cta_m, n))
+    a_s = smem_tensor(b, dtype=nr.DType.U8, shape=(per_cta_m, packed_k), byte_offset=0)
+    b_s = smem_tensor(b, dtype=nr.DType.U8, shape=(per_cta_n, packed_k), byte_offset=a_bytes)
+    a_tile = _tile(b, a_s, per_cta_m, packed_k)
+    b_tile = _tile(b, b_s, per_cta_n, packed_k)
+    d = _tmem(0)
+    sfa = _tmem(64)
+    sfb = _tmem(72)
+    sfa_reg = reg_tensor(b, dtype=nr.DType.U32, shape=(2,))
+    sfb_reg = reg_tensor(b, dtype=nr.DType.U32, shape=(1,))
+    frag = reg_tensor(b, dtype=nr.DType.F32, shape=(n // 2,))
+    ma = b.mbar(kind=nr.MBarKind.TMA, byte_offset=metadata)
+    mb = b.mbar(kind=nr.MBarKind.TMA, byte_offset=metadata + 8)
+    rank = b.ctaid_in_cluster()
+    tid = b.tid_in_wg()
+
     with b.if_warp(0):
-        b.tmem_alloc(0, 32, addr_byte_offset=0, cta_group=2)
-        # mbarrier.init is per-thread: one thread initializes the cell.
+        b.tmem_alloc(0, 128, addr_byte_offset=tmem_addr_offset, cta_group=2)
         with b.if_elected():
-            b.mbarrier_init(ready, count=1)
-            b.mbarrier_init(mma_done, count=1)
-    # Publish each CTA's alloc + mbar cell cluster-wide (the peer arrives the
-    # leader's cell remotely).
+            b.mbarrier_init(ma, count=1)
+            b.mbarrier_init(mb, count=1)
     b.cluster_sync()
+
+    with b.if_warp(0), b.if_elected():
+        b.mbarrier_arrive_expect_tx(ma, bytes=a_bytes)
+        b.tma_load(a_s, a_g, mbar=ma, coords=(rank, 0, 0), shape=(per_cta_m, packed_k))
+        b.mbarrier_arrive_expect_tx(mb, bytes=b_bytes)
+        b.tma_load(b_s, b_g, mbar=mb, coords=(rank, 0, 0), shape=(per_cta_n, packed_k))
+        b.mbarrier_wait(ma, phase=0)
+        b.mbarrier_wait(mb, phase=0)
+    b.cluster_sync()
+
     with b.if_warp(0):
-        cta = b.ctaid_in_cluster()
-        with b.if_(b.lane_id().eq(0)):
-            for r in range(2):
-                b.store_scalar(nr.TensorSlice(tensor=a_smem, offsets=(r, 0), shape=(1, 1)), 0)
-                b.store_scalar(nr.TensorSlice(tensor=b_smem, offsets=(r, 0), shape=(1, 1)), 0)
-        b.fence(kind=nr.FenceKind.ASYNC_PROXY, scope=nr.FenceScope.CTA)
-        if synced:
-            # CTA1 -> CTA0 edge: the peer arrives the leader's barrier.
-            with b.if_(cta.eq(1)):
-                with b.if_(b.lane_id().eq(0)):
-                    b.mbarrier_arrive(ready_leader)
-        with b.if_(cta.eq(0)):
-            if synced:
-                b.mbarrier_wait(ready, phase=0)
-            # Single-thread MMA issue (tcgen05_mma_mask otherwise).
-            with b.if_(b.lane_id().eq(0)):
+        b.reg_load(sfa_reg, sfa_g[rank, b.lane_id(), 0:2])
+        b.reg_load(sfb_reg, sfb_g[rank, b.lane_id()])
+        b.tcgen05_st(sfa.at(0, 0), sfa_reg, num=2)
+        b.tcgen05_st(sfb.at(0, 0), sfb_reg)
+        b.tcgen05_wait_st()
+    b.cluster_sync()
+
+    scales = nr.BlockScaleSpec(sfa.at(0, 0), sfb.at(0, 0), 0, 0, "e4m3_fn", 4, 1)
+    with b.if_warp(0), b.if_elected():
+        if both_ctas_issue:
+            # No leader routing is implicit: each CTA issues the statement.
+            # Give each issuer a disjoint D band so the odd CTA's execution is
+            # directly observable after the cluster rendezvous.
+            dst = d.at(0, rank * (n // 2))
+            b.tcgen05_mma(
+                dst,
+                b.mma_a_smem(a_tile),
+                b_tile,
+                mma_m=m,
+                mma_n=n,
+                format="f4_e2m1",
+                block_scale=scales,
+                accum=0,
+                trans_a=False,
+                trans_b=False,
+                ws=False,
+                cta_group=2,
+            )
+        else:
+            with b.if_(rank.eq(0)):
                 b.tcgen05_mma(
-                    accum.at(0, 0), a_smem, b_smem, m=m, n=n, k=mma_k, accum=False, cta_group=2
+                    d.at(0, 0),
+                    b.mma_a_smem(a_tile),
+                    b_tile,
+                    mma_m=m,
+                    mma_n=n,
+                    format="f4_e2m1",
+                    block_scale=scales,
+                    accum=0,
+                    trans_a=False,
+                    trans_b=False,
+                    ws=False,
+                    cta_group=2,
                 )
-                # The mma is async; the commit's barrier is where it is observed
-                # to have landed, and the band may not be freed before that.
-                b.tcgen05_commit(mma_done, cta_group=2)
-            b.mbarrier_wait(mma_done, phase=0)
-    # Keeps the peer CTA resident for the cluster-collective MMA/dealloc and
-    # orders all pipeline work before the dealloc.
+    b.cluster_sync()
+
+    for issuer in range(2 if both_ctas_issue else 1):
+        b.tcgen05_ld(frag, d.at(0, issuer * (n // 2)), num=n // 2)
+        b.tcgen05_wait_ld()
+        with b.if_(tid < per_cta_m):
+            b.reg_store(out[rank, issuer, tid, 0 : n // 2], frag)
+        with b.if_(tid >= per_cta_m):
+            b.reg_store(out[rank, issuer, tid - per_cta_m, n // 2 : n], frag)
+
     b.cluster_sync()
     with b.if_warp(0):
-        b.tmem_dealloc(0, 32, cta_group=2)
-    return b.build()
+        b.tmem_dealloc(0, 128, cta_group=2)
+    return b.build(), a_g, b_g, sfa_g, sfb_g, out
 
 
-def test_mma_cta_group2_records_peer_smem_reads_and_flags_unordered_writes():
-    report = nr.check_protocol(_mma_cg2_peer_smem_kernel(synced=False), include_events=True)
-    assert report["status"] == "Failed"
-    assert any(d["code"] == "memory_data_race" for d in report["diagnostics"])
-    owners = {
-        e["region"]["owner"].get("cta_id")
-        for e in report["events"]
-        if e["kind"] == "read"
-        and e.get("access_kind") == "tcgen05_mma"
-        and e["region"]["owner"]["kind"] == "smem"
-    }
-    assert owners == {0, 1}, owners
-
-    synced = nr.check_protocol(_mma_cg2_peer_smem_kernel(synced=True))
-    assert synced["status"] == "Passed", synced["diagnostics"][:2]
+def _pack_fp4_even_high(codes):
+    codes = np.asarray(codes, dtype=np.uint8)
+    return ((codes[..., 0::2] << 4) | codes[..., 1::2]).astype(np.uint8)
 
 
-def _mma_operand_overwrite_kernel(drain):
-    """An async MMA reads SMEM operands; the same stream overwrites an operand
-    byte afterwards. Without a tcgen05_commit drain between them the engine
-    may still be reading the tile on silicon — pinning the read at its issue
-    point (plain program order) must NOT bless this."""
-    b = builder(
-        "mma_operand_overwrite" + ("_drain" if drain else ""),
-        smem_size_bytes=128 * 16 * 2 + 16 * 16 * 2,
+def _pack_scale_words(values):
+    values = np.asarray(values, dtype=np.uint8)
+    shifts = np.arange(4, dtype=np.uint32) * 8
+    return np.sum(values.astype(np.uint32) << shifts, axis=-1, dtype=np.uint32)
+
+
+def _fp4_cg2_inputs():
+    rows_a = np.arange(64, dtype=np.uint8)[None, :, None]
+    rows_b = np.arange(16, dtype=np.uint8)[None, :, None]
+    cols = np.arange(64, dtype=np.uint8)[None, None, :]
+    ctas = np.arange(2, dtype=np.uint8)[:, None, None]
+    a_codes = 2 + (ctas + rows_a % 3 + cols // 16) % 4
+    b_codes = 1 + (2 * ctas + rows_b % 4 + cols // 16) % 4
+
+    scale_codes = np.array([0x30, 0x38, 0x40, 0x48], dtype=np.uint8)
+    a_scale_bytes = scale_codes[
+        (ctas + rows_a % 4 + np.arange(4, dtype=np.uint8)[None, None, :]) % 4
+    ]
+    out_ctas = np.arange(2, dtype=np.uint8)[:, None, None]
+    n_rows = np.arange(32, dtype=np.uint8)[None, :, None]
+    b_scale_bytes = scale_codes[
+        (2 * out_ctas + n_rows % 4 + np.arange(4, dtype=np.uint8)[None, None, :]) % 4
+    ]
+
+    a_scale_words = _pack_scale_words(a_scale_bytes)
+    sfa_cells = np.stack((a_scale_words[:, :32], a_scale_words[:, 32:]), axis=-1)
+    sfb_cells = _pack_scale_words(b_scale_bytes)
+
+    e2m1 = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=np.float32)
+    e4m3 = {0x30: 0.5, 0x38: 1.0, 0x40: 2.0, 0x48: 4.0}
+    a_values = e2m1[a_codes]
+    b_values = e2m1[b_codes].reshape(32, 64)
+    a_scales = np.vectorize(e4m3.__getitem__, otypes=[np.float32])(a_scale_bytes)
+    b_scales = np.vectorize(e4m3.__getitem__, otypes=[np.float32])(b_scale_bytes)
+    expected = np.empty((2, 64, 32), dtype=np.float32)
+    for cta in range(2):
+        scaled_a = a_values[cta] * np.repeat(a_scales[cta], 16, axis=1)
+        scaled_b = b_values * np.repeat(b_scales[cta], 16, axis=1)
+        expected[cta] = scaled_a @ scaled_b.T
+    return (
+        _pack_fp4_even_high(a_codes),
+        _pack_fp4_even_high(b_codes),
+        sfa_cells,
+        sfb_cells,
+        expected,
     )
-    a = smem_tensor(b, dtype=nr.DType.F16, shape=(128, 16), byte_offset=0)
-    bb = smem_tensor(b, dtype=nr.DType.F16, shape=(16, 16), byte_offset=128 * 16 * 2)
-    acc = tmem_band(dtype=nr.DType.F32)
-    done = b.mbar(kind=nr.MBarKind.TCGEN05, byte_offset=0)
-    with b.if_warp(0):
-        b.tmem_alloc(0, 32, addr_byte_offset=0, cta_group=1)
-        # mbarrier.init is per-thread: one thread initializes the cell.
-        with b.if_elected():
-            b.mbarrier_init(done, count=1)
-    with b.if_warp(0):
-        with b.if_(b.lane_id().eq(0)):
-            b.store_scalar(nr.TensorSlice(tensor=a, offsets=(0, 0), shape=(1, 1)), 0)
-            b.store_scalar(nr.TensorSlice(tensor=bb, offsets=(0, 0), shape=(1, 1)), 0)
-        b.fence(kind=nr.FenceKind.ASYNC_PROXY, scope=nr.FenceScope.CTA)
-        # Single-thread MMA/commit issue; the overwrite store below is the
-        # same lane-0 thread, so issue -> (commit -> wait) -> overwrite is one
-        # thread's program order — exactly the shape under test.
-        with b.if_elected():
-            b.tcgen05_mma(acc.at(0, 0), a, bb, m=128, n=16, k=16, accum=False, cta_group=1)
-            if drain:
-                b.tcgen05_commit(done, cta_group=1)
-        if drain:
-            b.mbarrier_wait(done, phase=0)
-        with b.if_(b.lane_id().eq(0)):
-            b.store_scalar(nr.TensorSlice(tensor=a, offsets=(0, 0), shape=(1, 1)), 1)
-    with b.if_warp(0):
-        b.tmem_dealloc(0, 32, cta_group=1)
-    return b.build()
 
 
-def test_mma_operand_overwrite_requires_commit_drain():
-    report = nr.check_protocol(_mma_operand_overwrite_kernel(drain=False))
-    assert report["status"] == "Failed"
-    assert any(d["code"] == "tcgen05_operand_overwrite_before_drain" for d in report["diagnostics"])
-
-    drained = nr.check_protocol(_mma_operand_overwrite_kernel(drain=True))
-    assert drained["status"] == "Passed", drained["diagnostics"][:2]
+def _run_fp4_cg2_m128(*, both_ctas_issue):
+    kernel, a_g, b_g, sfa_g, sfb_g, out = _fp4_cg2_m128_kernel(both_ctas_issue=both_ctas_issue)
+    a, b_values, sfa, sfb, expected = _fp4_cg2_inputs()
+    dump = output(run(kernel, {a_g: a, b_g: b_values, sfa_g: sfa, sfb_g: sfb}), out)
+    return dump, expected
 
 
-def _mma_acc_read_release_kernel(commit_release):
-    """Stream A issues an async MMA and signals stream B. If the signal is a
-    plain thread arrive (not a tcgen05_commit), B's accumulator read lands
-    while the MMA's write window is still open — ordered against the issue,
-    not against the drain."""
-    b = builder(
-        "mma_acc_read_" + ("commit" if commit_release else "arrive"),
-        smem_size_bytes=128 * 16 * 2 + 16 * 16 * 2,
-        num_warps=8,
+def test_tcgen05_fp4_cg2_m128_uses_both_ctas_nonuniform_operands_and_scales():
+    dump, expected = _run_fp4_cg2_m128(both_ctas_issue=False)
+    np.testing.assert_array_equal(dump[:, 0], expected)
+
+
+def test_tcgen05_fp4_cg2_odd_cta_executes_without_implicit_leader_routing():
+    dump, expected = _run_fp4_cg2_m128(both_ctas_issue=True)
+    np.testing.assert_array_equal(dump[:, 0], expected)
+    np.testing.assert_array_equal(dump[:, 1], expected)
+
+
+CP_CASES = [
+    ("128x256b", "none", 128, 8),
+    ("128x256b", "none", 256, 8),
+    ("4x256b", "none", 4, 8),
+    ("4x256b", "none", 64, 8),
+    ("128x128b", "none", 128, 4),
+    ("128x128b", "none", 256, 4),
+    ("64x128b", "warp2_02_13", 64, 4),
+    ("64x128b", "warp2_02_13", 128, 4),
+    ("64x128b", "warp2_01_23", 64, 4),
+    ("64x128b", "warp2_01_23", 128, 4),
+    ("32x128b", "warp4", 32, 4),
+    ("32x128b", "warp4", 64, 4),
+]
+
+
+def _cp_kernel(shape, multicast, rows, cols):
+    source_bytes = rows * cols * 4
+    is_256b = shape in ("128x256b", "4x256b")
+    owner_rows = max(rows, 8) if is_256b else rows
+    owner_bytes = owner_rows * cols * 4
+    metadata = _align8(owner_bytes)
+    b = builder(f"tcgen05_cp_{shape}_{multicast}", smem_size_bytes=metadata + 2 * 8 + 4)
+    source_g = gmem_arg(b, dtype=nr.DType.U32, shape=(rows, cols))
+    out = gmem_arg(b, dtype=nr.DType.U32, shape=(128, 32))
+    source_s = b.tensor(
+        space=nr.MemorySpace.SMEM,
+        dtype=nr.DType.U32,
+        shape=(owner_rows, cols),
+        layout=nr.SmemSwizzleLayout(nr.Swizzle.B32) if is_256b else None,
+        byte_offset=0,
     )
-    a = smem_tensor(b, dtype=nr.DType.F16, shape=(128, 16), byte_offset=0)
-    bb = smem_tensor(b, dtype=nr.DType.F16, shape=(16, 16), byte_offset=128 * 16 * 2)
-    acc = tmem_band(dtype=nr.DType.F32)
-    frag = reg_tensor(b, dtype=nr.DType.F32, shape=(16,))
-    done = b.mbar(kind=nr.MBarKind.TCGEN05 if commit_release else nr.MBarKind.THREAD, byte_offset=0)
+    source_tile = _tile(b, source_s, rows, cols)
+    tmem = _tmem()
+    zero = reg_tensor(b, dtype=nr.DType.U32, shape=(32,))
+    frag = reg_tensor(b, dtype=nr.DType.U32, shape=(32,))
+    loaded = b.mbar(kind=nr.MBarKind.TMA, byte_offset=metadata)
+    done = b.mbar(kind=nr.MBarKind.TCGEN05, byte_offset=metadata + 8)
+
     with b.if_warp(0):
-        b.tmem_alloc(0, 32, addr_byte_offset=0, cta_group=1)
-        # mbarrier.init is per-thread: one thread initializes the cell.
+        b.tmem_alloc(0, 32, addr_byte_offset=metadata + 16)
         with b.if_elected():
+            b.mbarrier_init(loaded, count=1)
             b.mbarrier_init(done, count=1)
-    # Publish the alloc + mbar cell to warp 4's stream before it waits.
     b.cta_sync()
-    with b.if_warp(0):
-        with b.if_(b.lane_id().eq(0)):
-            b.store_scalar(nr.TensorSlice(tensor=a, offsets=(0, 0), shape=(1, 1)), 0)
-            b.store_scalar(nr.TensorSlice(tensor=bb, offsets=(0, 0), shape=(1, 1)), 0)
-        b.fence(kind=nr.FenceKind.ASYNC_PROXY, scope=nr.FenceScope.CTA)
-        # Single-thread MMA issue; the release (commit or the fake thread
-        # arrive) comes from the same lane-0 thread's program order.
-        with b.if_elected():
-            b.tcgen05_mma(acc.at(0, 0), a, bb, m=128, n=16, k=16, accum=False, cta_group=1)
-            if commit_release:
-                b.tcgen05_commit(done, cta_group=1)
-            else:
-                b.mbarrier_arrive(done)
-    with b.if_warp(4):
+
+    with b.if_warpgroup(0):
+        b.reg_fill(zero, 0)
+        b.tcgen05_st(tmem.at(0, 0), zero, num=32)
+        b.tcgen05_wait_st()
+        b.wg_sync(barrier_id=1)
+        with b.if_(b.tid_in_wg().eq(0)):
+            b.mbarrier_arrive_expect_tx(loaded, bytes=source_bytes)
+            b.tma_load(
+                source_s[0:rows, 0:cols], source_g, mbar=loaded, coords=(0, 0), shape=(rows, cols)
+            )
+            b.mbarrier_wait(loaded, phase=0)
+            b.tcgen05_cp(tmem.at(0, 0), source_tile, shape=shape, multicast=multicast, cta_group=1)
+            b.tcgen05_commit(done)
         b.mbarrier_wait(done, phase=0)
-        b.tcgen05_ld(frag, acc.at(0, 0), num=16)
+        b.tcgen05_ld(frag, tmem.at(0, 0), num=32)
         b.tcgen05_wait_ld()
-    # Warp 4's accumulator read retires before the dealloc.
+        b.reg_store(out[b.tid_in_wg(), 0:32], frag)
+
     b.cta_sync()
     with b.if_warp(0):
-        b.tmem_dealloc(0, 32, cta_group=1)
-    return b.build()
+        b.tmem_dealloc(0, 32)
+    return b.build(), source_g, out
 
 
-def test_mma_acc_read_release_must_come_from_commit():
-    report = nr.check_protocol(_mma_acc_read_release_kernel(commit_release=False))
-    assert report["status"] == "Failed"
-    assert any(d["code"] == "tmem_access_before_drain" for d in report["diagnostics"])
+def _expected_cp(shape, multicast, source):
+    rows, cols = source.shape
+    expected = np.zeros((128, 32), dtype=np.uint32)
+    atom_rows = int(shape.split("x", maxsplit=1)[0])
+    for row in range(rows):
+        for col in range(cols):
+            if shape == "4x256b":
+                targets = [(row // 4 + 32 * (row % 4), col)]
+            elif multicast == "warp2_02_13":
+                inner = row % atom_rows
+                target_col = (row // atom_rows) * cols + col
+                targets = [(inner, target_col), (inner + 64, target_col)]
+            elif multicast == "warp2_01_23":
+                inner = row % atom_rows
+                lane = (inner // 32) * 64 + inner % 32
+                target_col = (row // atom_rows) * cols + col
+                targets = [(lane, target_col), (lane + 32, target_col)]
+            elif multicast == "warp4":
+                inner = row % atom_rows
+                target_col = (row // atom_rows) * cols + col
+                targets = [(inner + 32 * replica, target_col) for replica in range(4)]
+            else:
+                targets = [(row % atom_rows, (row // atom_rows) * cols + col)]
+            for lane, target_col in targets:
+                expected[lane, target_col] = source[row, col]
+    return expected
 
-    drained = nr.check_protocol(_mma_acc_read_release_kernel(commit_release=True))
-    assert drained["status"] == "Passed", drained["diagnostics"][:2]
+
+@pytest.mark.parametrize("shape,multicast,rows,cols", CP_CASES)
+def test_tcgen05_cp_all_shapes_and_multicast_mappings(shape, multicast, rows, cols):
+    kernel, source_g, out = _cp_kernel(shape, multicast, rows, cols)
+    source = np.fromfunction(
+        lambda row, col: (row.astype(np.uint32) << 16) | col.astype(np.uint32),
+        (rows, cols),
+        dtype=int,
+    ).astype(np.uint32)
+    np.testing.assert_array_equal(
+        output(run(kernel, {source_g: source}), out), _expected_cp(shape, multicast, source)
+    )
+
+
+def _physical_scale_cp_kernel(storage):
+    pipe_depth, stage = 2, 1
+    dtype = nr.DType.U8 if storage == "byte" else nr.DType.U32
+    source_shape = (pipe_depth, 1, 1, 32, 16) if storage == "byte" else (pipe_depth, 1, 32, 4)
+    input_shape = (pipe_depth, 128)
+    source_backing_bytes = pipe_depth * 128 * 4
+
+    tmem_addr_offset = _align8(source_backing_bytes)
+    b = builder(f"tcgen05_cp_physical_scale_{storage}", smem_size_bytes=tmem_addr_offset + 4)
+    source_g = gmem_arg(b, dtype=nr.DType.U32, shape=input_shape)
+    source_s = b.tensor(space=nr.MemorySpace.SMEM, dtype=dtype, shape=source_shape, byte_offset=0)
+    source_store_s = b.tensor(
+        space=nr.MemorySpace.SMEM, dtype=nr.DType.U32, shape=input_shape, byte_offset=0
+    )
+    out = gmem_arg(b, dtype=nr.DType.U32, shape=(128, 4))
+    source_tile = _tile(
+        b,
+        source_s,
+        32,
+        16 if storage == "byte" else 4,
+        prefix=(stage, 0, 0) if storage == "byte" else (stage, 0),
+    )
+    tmem = _tmem()
+    scalar = reg_tensor(b, dtype=nr.DType.U32, shape=(1,))
+    frag = reg_tensor(b, dtype=nr.DType.U32, shape=(4,))
+    tid = b.tid_in_wg()
+
+    with b.if_warp(0):
+        b.tmem_alloc(0, 32, addr_byte_offset=tmem_addr_offset)
+
+    b.reg_load(scalar, source_g[stage, tid])
+    b.reg_store(source_store_s[stage, tid], scalar)
+    b.cta_sync()
+
+    with b.if_warp(0), b.if_elected():
+        b.tcgen05_cp(tmem.at(0, 0), source_tile, shape="32x128b", multicast="warp4", cta_group=1)
+    b.cta_sync()
+
+    with b.if_warpgroup(0):
+        b.tcgen05_ld(frag, tmem.at(0, 0), num=4)
+        b.tcgen05_wait_ld()
+        b.reg_store(out[tid, 0:4], frag)
+
+    b.cta_sync()
+    with b.if_warp(0):
+        b.tmem_dealloc(0, 32)
+    return b.build(), source_g, out
+
+
+def _assert_scale_factor_cp_stage_trace(kernel):
+    report = nr.check_protocol(kernel, include_events=True)
+    trace_errors = [
+        diagnostic
+        for diagnostic in report["diagnostics"]
+        if diagnostic["code"].startswith("trace_region")
+    ]
+    assert not trace_errors
+    reads = [
+        event
+        for event in report["events"]
+        if event["kind"] == "read" and event.get("access_kind") == "tcgen05_cp"
+    ]
+    assert len(reads) == 1
+    assert reads[0]["region"]["owner"] == {"kind": "smem", "cta_id": 0}
+    assert reads[0]["region"]["boxes"] == [{"ranges": [(512, 1024)]}]
+
+
+def test_tcgen05_cp_plain_physical_byte_scale_roundtrip():
+    kernel, source_g, out = _physical_scale_cp_kernel("byte")
+    source = np.fromfunction(
+        lambda stage, word: (
+            (stage.astype(np.uint32) << 28)
+            | (word.astype(np.uint32) * np.uint32(0x01010101))
+            | np.uint32(0x005500AA)
+        ),
+        (2, 128),
+        dtype=int,
+    ).astype(np.uint32)
+    expected = np.tile(source[1].reshape(32, 4), (4, 1))
+    np.testing.assert_array_equal(output(run(kernel, {source_g: source}), out), expected)
+    _assert_scale_factor_cp_stage_trace(kernel)
+
+
+def test_tcgen05_cp_plain_physical_u32_scale_roundtrip():
+    kernel, source_g, out = _physical_scale_cp_kernel("packed_u32")
+    source = np.fromfunction(
+        lambda stage, row: (
+            (stage.astype(np.uint32) << 28)
+            | (row.astype(np.uint32) * np.uint32(0x01010101))
+            | np.uint32(0x005500AA)
+        ),
+        (2, 128),
+        dtype=int,
+    ).astype(np.uint32)
+    expected = np.tile(source[1].reshape(32, 4), (4, 1))
+    np.testing.assert_array_equal(output(run(kernel, {source_g: source}), out), expected)
+    _assert_scale_factor_cp_stage_trace(kernel)
+
+
+def test_tcgen05_new_schema_rejects_illegal_combinations_fail_closed():
+    b = builder("illegal_cp", smem_size_bytes=128 * 8 * 4 + 4)
+    source = b.tensor(
+        space=nr.MemorySpace.SMEM,
+        dtype=nr.DType.U32,
+        shape=(128, 8),
+        layout=nr.SmemSwizzleLayout(nr.Swizzle.B32),
+        byte_offset=0,
+    )
+    with b.if_warp(0):
+        b.tmem_alloc(0, 32, addr_byte_offset=128 * 8 * 4)
+    with b.if_warp(0), b.if_elected():
+        b.tcgen05_cp(
+            _tmem().at(0, 0),
+            _tile(b, source, 128, 8),
+            shape="128x256b",
+            multicast="warp4",
+            cta_group=1,
+        )
+    with pytest.raises(ValueError, match="illegal tcgen05.cp shape/multicast"):
+        b.build()
+
+    b = builder("missing_block_scale", smem_size_bytes=128 * 32 + 32 * 32 + 4)
+    a = smem_tensor(b, dtype=nr.DType.U8, shape=(128, 32), byte_offset=0)
+    bb = smem_tensor(b, dtype=nr.DType.U8, shape=(32, 32), byte_offset=128 * 32)
+    with b.if_warp(0):
+        b.tmem_alloc(0, 32, addr_byte_offset=128 * 32 + 32 * 32)
+    with b.if_warp(0), b.if_elected():
+        b.tcgen05_mma(
+            _tmem().at(0, 0),
+            b.mma_a_smem(_tile(b, a, 128, 32)),
+            _tile(b, bb, 32, 32),
+            mma_m=128,
+            mma_n=32,
+            format="f4_e2m1",
+            block_scale=None,
+            accum=0,
+            trans_a=False,
+            trans_b=False,
+            ws=False,
+            cta_group=1,
+        )
+    with pytest.raises(ValueError, match="requires block_scale"):
+        b.build()
+
+
+def test_tcgen05_resolved_regions_feed_protocol_checker():
+    dense, _, _, _ = _dense_smem_kernel(nr.DType.F16)
+    report = nr.check_protocol(dense, include_events=True)
+    assert report["status"] == "Passed", report["diagnostics"][:2]
+    mma_writes = [
+        event
+        for event in report["events"]
+        if event["kind"] == "write"
+        and event.get("access_kind") == "mma"
+        and event["region"]["owner"]["kind"] == "tmem"
+    ]
+    assert mma_writes

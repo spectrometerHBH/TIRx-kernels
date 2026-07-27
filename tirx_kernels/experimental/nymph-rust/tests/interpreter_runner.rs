@@ -31,7 +31,6 @@ fn reg_tensor(id: u32, dtype: DType, shape: Vec<usize>) -> Arc<Tensor> {
         shape,
         layout: None,
         byte_offset: None,
-        reg_frag: None,
     })
 }
 
@@ -43,7 +42,6 @@ fn gmem_tensor(id: u32, dtype: DType, shape: Vec<usize>) -> Arc<Tensor> {
         shape,
         layout: None,
         byte_offset: None,
-        reg_frag: None,
     })
 }
 
@@ -55,7 +53,6 @@ fn smem_tensor(id: u32, dtype: DType, shape: Vec<usize>, byte_offset: usize) -> 
         shape,
         layout: None,
         byte_offset: Some(byte_offset),
-        reg_frag: None,
     })
 }
 
@@ -301,7 +298,7 @@ fn tma_roundtrip_mbar_cell_parity_is_rust_internal() {
         id: 320,
         kind: MBarKind::Tma,
         stages: 1,
-        byte_offset: 0,
+        byte_offset: 16,
         arrive_count: None,
     });
     let kernel = Kernel {
@@ -355,7 +352,7 @@ fn tma_roundtrip_mbar_cell_parity_is_rust_internal() {
             ),
         ],
         num_warps: 4,
-        smem_size_bytes: 16,
+        smem_size_bytes: 24,
         launch_shape: vec![1],
         cluster_shape: vec![1],
     };
@@ -366,16 +363,20 @@ fn tma_roundtrip_mbar_cell_parity_is_rust_internal() {
 }
 
 #[test]
-fn tma_multicast_group2_mbar_targets_are_deduplicated() {
+fn tma_multicast_group2_mbar_targets_preserve_destination_multiplicity() {
     let source = gmem_tensor(330, DType::U32, vec![4]);
     let smem = smem_tensor(332, DType::U32, vec![4], 0);
     let mbar = Arc::new(MBar {
         id: 330,
         kind: MBarKind::Tma,
         stages: 1,
-        byte_offset: 0,
+        byte_offset: 16,
         arrive_count: None,
     });
+    let leader_mbar = MBarRef {
+        mbar: mbar.clone(),
+        remote_coord: Some(ScalarValue::Int(0)),
+    };
     let kernel = Kernel {
         name: "tma_multicast_cta_group2".into(),
         args: vec![source.clone()],
@@ -392,8 +393,8 @@ fn tma_multicast_group2_mbar_targets_are_deduplicated() {
                     Stmt::If {
                         cond: cta_eq(0),
                         then_body: vec![Stmt::MBarrierArriveExpectTx {
-                            mbar: mbar_ref(&mbar),
-                            bytes: 16,
+                            mbar: leader_mbar.clone(),
+                            bytes: 32,
                             stage: None,
                         }],
                     },
@@ -402,7 +403,7 @@ fn tma_multicast_group2_mbar_targets_are_deduplicated() {
                         then_body: vec![Stmt::TmaLoad {
                             dst: full_slice(smem),
                             src: source.clone(),
-                            mbar: mbar_ref(&mbar),
+                            mbar: leader_mbar.clone(),
                             coords: vec![ScalarValue::Int(0)],
                             shape: vec![4],
                             gmem_shape: None,
@@ -413,11 +414,16 @@ fn tma_multicast_group2_mbar_targets_are_deduplicated() {
                             cta_group: 2,
                         }],
                     },
+                    Stmt::MBarrierWait {
+                        mbar: leader_mbar,
+                        stage: None,
+                        phase: Some(ScalarValue::Int(0)),
+                    },
                 ],
             ),
         ],
         num_warps: 4,
-        smem_size_bytes: 16,
+        smem_size_bytes: 24,
         launch_shape: vec![2],
         cluster_shape: vec![2],
     };
@@ -426,6 +432,17 @@ fn tma_multicast_group2_mbar_targets_are_deduplicated() {
     assert_eq!(trace_status(&result), ProtocolStatus::Passed);
     assert!(has_mbar_complete_for_cta(&result, 0));
     assert!(!has_mbar_complete_for_cta(&result, 1));
+    let leader_completions = trace_events(&result)
+        .iter()
+        .filter(|event| {
+            matches!(
+                &event.payload,
+                TraceEventKind::MbarCompleteTx { target, bytes, .. }
+                    if target.ctaid_in_cluster == 0 && *bytes == 16
+            )
+        })
+        .count();
+    assert_eq!(leader_completions, 2);
 }
 
 #[test]
@@ -436,7 +453,7 @@ fn mbarrier_wait_success_and_blocked_frontier_are_rust_internal() {
         id: 340,
         kind: MBarKind::Tma,
         stages: 1,
-        byte_offset: 0,
+        byte_offset: 16,
         arrive_count: None,
     });
     let kernel = Kernel {
@@ -487,7 +504,7 @@ fn mbarrier_wait_success_and_blocked_frontier_are_rust_internal() {
             ),
         ],
         num_warps: 4,
-        smem_size_bytes: 16,
+        smem_size_bytes: 24,
         launch_shape: vec![1],
         cluster_shape: vec![1],
     };
@@ -933,7 +950,7 @@ fn clc_try_query_cancel_oracle_round_robin_and_offset() {
         id: 400,
         kind: MBarKind::Tma,
         stages: 1,
-        byte_offset: 0,
+        byte_offset: 16,
         arrive_count: None,
     });
     let space = Arc::new(TaskSpace {

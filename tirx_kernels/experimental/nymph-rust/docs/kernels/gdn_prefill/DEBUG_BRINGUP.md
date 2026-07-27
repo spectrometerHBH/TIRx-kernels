@@ -5,6 +5,14 @@ Purpose: pin down the ns1_t64 GPU deadlock + WarpMma NaN before the
 correctness gate. Filled in as evidence lands; do not edit conclusions
 retroactively.
 
+> This is a historical evidence log. Its probe outputs and measured root
+> causes are retained, but old emission spellings are not the current
+> contract. Current codegen preserves every IR `If` predicate and nesting edge
+> literally (no elect/thread-rank replacement or top-level chaining), uses
+> `T.alloc_local` + `Tx.thread.*`/`Tx.copy` for REG tensors, and emits
+> tcgen05 ld/st, ldmatrix/stmatrix, and warp MMA through direct `T.ptx.*`
+> intrinsics. See `docs/ir-ops.md` for the normative ledger.
+
 ## Verification ladder state
 
 - cargo test: 160 + 15 passed.
@@ -46,11 +54,11 @@ codegen now preserves the IR tree exactly.
   remaining instruction forms* (full-tile f32 gate/beta TMA, k_s ring TMA,
   point stores, scalar reg elementwise, scheduler loop), not the warp-matrix
   or MMA datapaths.
-- The WarpMma probe produces NaN — open whether it's my WarpMma lowering
-  (mma.legacy fragment order / accumulator init) or the probe's own dump
-  path (its write-back loop was admittedly broken).
+- The WarpMma probe produced NaN — at the time it was open whether this came
+  from the then-used legacy intrinsic fragment order/accumulator init or the
+  probe's own broken dump path. The resolution is recorded below.
 
-## WarpMma NaN — interpreter contract
+## Historical WarpMma NaN — interpreter contract
 
 Interpreter (`src/interpreter/semantics/warpmma.rs`): D = A·Bᵀ + C over the
 standard warp fragment layout (groupID g = lane/4, threadID t = lane%4):
@@ -59,14 +67,12 @@ standard warp fragment layout (groupID g = lane/4, threadID t = lane%4):
 - B (N×K bf16 packed u32): reg ru → kt=ru; halves hold B[2t + h][kt·8 + g].
 - C/D (f32): reg ri holds [(ri/2)·8 + g][2t + ri%2].
 
-The lowering emits `T.ptx.mma.legacy("m16n8k8", "row", "col", ab, ab,
-"float32", A_flat_ab.data, 0, B_flat_ab.data, 0, D_flat.data, 0, False,
-dtype="float32")` — the intrinsic derives the fragment register counts from
-shape+dtype and reads the fragments in PTX register order; the u32 words
-must hold (lo,hi) = (elem 2t, elem 2t+1) per the ldmatrix pack (little-
-endian, matches the interpreter's pack_b16x2). Open: accumulator init in
-the probe (reg_fill(acc, 0.0) under a narrowed `if_` may not have executed),
-the probe's broken write-back loop.
+At the time of this probe the lowering used the old legacy warp-MMA intrinsic,
+whose fragment registers were derived from shape and dtype. The u32 words had
+to hold `(lo, hi) = (elem 2t, elem 2t+1)` per the little-endian ldmatrix pack,
+matching the interpreter's `pack_b16x2`. The current lowering no longer uses
+that call: supported m16n8k8/m16n8k16 statements emit one direct, non-legacy
+`T.ptx.mma(...)` from explicit packed REG fragments.
 
 ## Next steps
 
@@ -88,14 +94,15 @@ All issues above are now resolved; final gate numbers at the bottom.
    (cuda-gdb backtrace). Fix: arrive emits per-thread; single-arrival sites
    are elected in the IR already.
 2. **wg-view column-slice offset dropped** (`02b55833`). Sliced reg element
-   ops (`frag[:, 1:2]`, `[r:r+1]`) lost the slice offset through the wg
-   tile view (B200 probe: `fill(frag[:,1:2])` wrote element 0). Fix: sliced
-   reg elementwise ops lower to the per-thread scalar flat form; full-extent
-   ops keep `Tx.wg.*`.
+   ops (`frag[:, 1:2]`, `[r:r+1]`) lost the slice offset through the then-used
+   wg tile view (B200 probe: `fill(frag[:,1:2])` wrote element 0). That
+   immediate fix is now superseded: every REG tensor is an exact-shape
+   `T.alloc_local`, supported elementwise ops use `Tx.thread.*`, and
+   `RegLoad`/`RegStore` use `Tx.copy` over the explicit IR slices.
 3. **Aux-view reverse-construction invalid + WarpSync no-op** (`02b55833`).
-   The `alloc_local(W)+view(...)` Apply mapped (tid,j) out of bounds; use
-   `T.wg_reg_tile + .local()` (storage-layout view, thread axis peeled).
-   `WarpSync` lowered to nothing; now emits `T.cuda.warp_sync()`.
+   The intermediate `T.wg_reg_tile + .local()` repair is also superseded by
+   direct `T.alloc_local` REG storage. `WarpSync` emits
+   `T.cuda.warp_sync()`.
 4. **top-level If rewrite → TMA-after-wait deadlock** (`c5da1718`).
    The former chaining pass ran each group's warpgroup-prefix body BEFORE its
    warp-level branches regardless of source order: a probe's warp-1 TMA issue
@@ -160,6 +167,13 @@ expect_tx / store_scalar / async-proxy fence) emit per-thread, matching
 the interpreter. Rule + audit table: docs/ir-ops.md §"Codegen emission
 guards". Negative tests: validate.rs `single_issue_scope_rule`,
 tests/test_compile_gate.py `test_single_issue_scope_negative`.
+
+The rule also covers spelling and structure: `lane_id == 0` is printed as
+`lane_id == 0`, never as `elect_sync()` or `thread_rank() == 0`; sibling
+IR `If`s remain siblings and nested IR `If`s remain nested. The former
+top-level-`If` chaining pass was deleted. Any required CTA-role condition
+(including an MMA issuer restriction) must be written explicitly in the
+kernel IR.
 
 ### Zero-inference follow-up (8689f62a) + final gates
 

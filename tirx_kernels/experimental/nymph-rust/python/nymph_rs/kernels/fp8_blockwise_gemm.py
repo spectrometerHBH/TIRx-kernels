@@ -1,45 +1,13 @@
-"""FP8 blockwise GEMM (DeepGEMM SM100 shape) expressed in Nymph IR.
-
-Faithful port of ``tirx_kernels/gemm/fp8_blockwise_gemm.py`` — both the
-non-swap and the swap_ab datapaths, resolved per shape by DeepGEMM's own config
-heuristic. The port keeps:
-
-- the verbatim DeepGEMM config heuristic (block sizes, SMEM pipeline depth,
-  cluster layout) including the TMEM column-budget constraint;
-- the warp split: one TMA-load warp, one scale-factor permute warp, one MMA
-  warp (issuing from the cluster leader only), and one epilogue warpgroup;
-- the pipeline protocol: ``smem_pipe`` (full = TMA arrive-expect-tx, empty =
-  tcgen05_commit multicast to both CTAs), ``trans_done`` (both CTAs' permute
-  warps arrive at the leader), and ``tmem_pipe`` (full = tcgen05_commit
-  multicast, empty = both CTAs' epilogues arrive at the leader, first wait
-  passes via the +1 phase offset);
-- the data path: the (m=256, cta_group=2) block-scaled MMA with packed-u32
-  UE8M0 scale factors TMA'd every ``SF_PACK`` k-tiles, permuted in SMEM,
-  ``tcgen05.cp``'d into TMEM (``sf_byte`` selects the packed byte per k-tile).
-  Non-swap: per-CTA A tile + N-split B tile. swap_ab: the cluster pair takes
-  two adjacent N tiles (scheduler axes swapped), A is split by M halves across
-  the pair, each CTA holds its own n-tile's B rows, and the MMA computes the
-  TRANSPOSED C tile (operands and scale vectors swapped: UMMA-A = B,
-  UMMA-B = A, N = DG_BLOCK_M);
-- the epilogue: accumulator drains (tcgen05.ld -> f32 regs -> bf16 -> SMEM ->
-  TMA store) paced by ``cp_async_bulk_wait_group_read``. Non-swap streams
-  EPI_TILE-wide column slices; swap_ab streams 16-row C tiles through a
-  transposed store (thread t holds C^T row t = a C column; on silicon this is
-  the .16x256b ld + stmatrix-transpose path, modeled value-exactly as a
-  per-thread column scatter).
-
-Physical-layout details below the value model (SMEM swizzles, the scale
-permute's byte shuffle, the TMEM scale-vector broadcast packing) are modeled
-logically, exactly like the fp16/bf16 GEMM and FA4 ports.
-"""
+"""FP8 blockwise GEMM (DeepGEMM SM100 shape) expressed in Nymph IR."""
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
 
-from ..builder import IRBuilder, SfTmemBand, TmemBand
+from ..builder import IRBuilder
 from ..nymph_rs import (
+    BlockScaleSpec,
     DType,
     FenceKind,
     FenceScope,
@@ -47,6 +15,8 @@ from ..nymph_rs import (
     LaunchShape,
     MBarKind,
     MemorySpace,
+    SmemSwizzleLayout,
+    Swizzle,
     TensorSlice,
 )
 
@@ -176,10 +146,7 @@ class Fp8BlockwiseGemmConfig:
     m: int = 1024
     n: int = 1024
     k: int = 1024
-    # Pin the DeepGEMM layout instead of resolving it from (m, n, k). The
-    # canonical single-cluster examination setting (see
-    # ``fp8_blockwise_task_config``) fixes the 16384^3 task shape while varying
-    # only the task count, mirroring the fp16/bf16 GEMM setting.
+    # Pin the DeepGEMM layout instead of resolving it from (m, n, k).
     swap_ab: bool | None = None
     block_m: int | None = None
     block_n: int | None = None
@@ -213,12 +180,7 @@ def _resolve_layout(config: Fp8BlockwiseGemmConfig) -> tuple[bool, int, int, int
 
 
 def fp8_blockwise_task_config(tasks: int) -> Fp8BlockwiseGemmConfig:
-    """The canonical single-cluster examination setting, mirroring the
-    fp16/bf16 GEMM one: the 16384^3-resolved task shape — swap_ab (240, 128),
-    one full m tile, k = 16384 (128 k-tiles per task) — on ONE cluster pair
-    (``launch_shape=(2,)``), with the task count varied through N = 256*tasks
-    (each pair-task covers two adjacent 128-row N tiles). tasks=4416
-    corresponds to the full 16384^3 tile count."""
+    """The canonical single-cluster examination setting, mirroring the fp16/bf16 GEMM one."""
     return Fp8BlockwiseGemmConfig(
         m=240, n=256 * tasks, k=16384, swap_ab=True, block_m=240, block_n=128, launch_shape=(2,)
     )
@@ -228,11 +190,7 @@ CONFIGS = [
     {"m": s, "n": s, "k": s, "label": f"{s}x{s}x{s}"} for s in [1024, 2048, 4096, 8192, 16384]
 ]
 
-# Cheap shapes covering both datapaths and different block sizes / pipeline
-# depths / k-tile counts / partial tiles, used by the protocol+value test
-# sweeps. Every TIRx CONFIGS shape (including the partial-tile squares) builds
-# and runs; the bigger squares are exercised by the build/protocol tests only
-# to keep the suite fast.
+# Cheap shapes covering both datapaths and different block sizes / pipeline depths / k-tile counts.
 FP8_CONFIGS_SUPPORTED = [
     {"m": 1024, "n": 1024, "k": 1024, "label": "1024x1024x1024"},  # non-swap (128, 64), 9 stages
     {"m": 2048, "n": 1024, "k": 1024, "label": "2048x1024x1024"},  # non-swap (128, 128), 7 stages
@@ -249,11 +207,7 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
     swap_ab, dg_block_m, dg_block_n, smem_depth, log_m, log_n = _resolve_layout(config)
     cta_group = log_m * log_n
     if swap_ab:
-        # The MMA computes the transposed C tile: UMMA-A is B (each CTA's own
-        # n-tile, 128 rows -> UMMA M = 256), UMMA-B is A (split by M halves
-        # across the pair -> UMMA N = DG_BLOCK_M). The scheduler walks N tiles
-        # as its row axis, so the cluster pair takes two adjacent N tiles and
-        # shares the m tile.
+        # The MMA computes the transposed C tile.
         mma_n = dg_block_m
         blk_m = dg_block_m // cta_group  # per-CTA A rows (M split across the pair)
         blk_n = dg_block_n  # per-CTA B rows (each CTA's own n tile)
@@ -270,8 +224,8 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
     mma_m = 2 * (blk_n if swap_ab else blk_m)  # 256 on both datapaths
     blk_sfa = _align(dg_block_m, 128)
     blk_sfb = _align(dg_block_n, 128)
-    sfa_cols = blk_sfa // 128  # packed-u32 TMEM cells per lane per stage
-    sfb_cols = blk_sfb // 128
+    sfa_cols = blk_sfa // 32  # packed-u32 TMEM columns per stage
+    sfb_cols = blk_sfb // 32
     k_tiles = K // BLK_K
     sf_k_packs = k_tiles // SF_PACK
     total_work = sched_rows * sched_cols
@@ -332,20 +286,19 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
     sfb_gmem = k.arg(space=MemorySpace.GMEM, dtype=DType.U32, shape=(sf_k_packs, N))
     d_gmem = k.arg(space=MemorySpace.GMEM, dtype=DType.BF16, shape=(M, N))
 
-    # Stage-major SMEM rings, indexed by a RUNTIME pipeline stage. The stage is
-    # the continuous TIRx PipelineState sequence (seq % depth, never reset per
-    # task) — a per-task static reset desynchronizes the stage from the phase
-    # accounting whenever k_tiles % smem_depth != 0.
+    # Stage-major SMEM rings, indexed by a RUNTIME pipeline stage.
     a_smem = k.tensor(
         space=MemorySpace.SMEM,
         dtype=DType.F8E4M3,
         shape=(smem_depth, blk_m, BLK_K),
+        layout=SmemSwizzleLayout(Swizzle.B128),
         byte_offset=a_off,
     )
     b_smem = k.tensor(
         space=MemorySpace.SMEM,
         dtype=DType.F8E4M3,
         shape=(smem_depth, blk_n, BLK_K),
+        layout=SmemSwizzleLayout(Swizzle.B128),
         byte_offset=b_off,
     )
     sfa_smem = k.tensor(
@@ -354,9 +307,20 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
     sfb_smem = k.tensor(
         space=MemorySpace.SMEM, dtype=DType.U32, shape=(smem_depth, blk_sfb), byte_offset=sfb_off
     )
-    # One staged rank-3 buffer for both datapaths: the EPI tile count may be
-    # odd (swap DG_BLOCK_M/16, or non-swap block_n=224 -> 7), so the stage
-    # index alternates across tasks and must be a runtime scalar.
+    # The TMA writes the source-order packed U32 tensors above.
+    sfa_cp_smem = k.tensor(
+        space=MemorySpace.SMEM,
+        dtype=DType.U32,
+        shape=(smem_depth, blk_sfa // 128, 32, 4),
+        byte_offset=sfa_off,
+    )
+    sfb_cp_smem = k.tensor(
+        space=MemorySpace.SMEM,
+        dtype=DType.U32,
+        shape=(smem_depth, blk_sfb // 128, 32, 4),
+        byte_offset=sfb_off,
+    )
+    # One staged rank-3 buffer for both datapaths.
     d_smem = k.tensor(
         space=MemorySpace.SMEM,
         dtype=DType.BF16,
@@ -364,32 +328,21 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
         byte_offset=d_off,
     )
 
-    # TMEM: one 512-column allocation; the accumulator and the scale vectors are
-    # column bands within it (the DeepGEMM heuristic's `2*umma_n + sf cols <= 512`
-    # budget guarantees the fit). (m=256, cta_group=2) accumulator layout: each
-    # CTA holds its OWN m tile's 128 rows x the full MMA_N band per stage.
-    accum = TmemBand(col0=0, dtype=DType.F32)
-    # SF bands: TMEM_DEPTH stages of the folded scale cells — one packed u32
-    # scale cell per row (nblocks=1), row r -> lane r % 128, col base + r // 128
-    # (the SfTmemBand rule); stage s sits at column offset s * <a/b>_cols.
-    sfa_tmem = SfTmemBand(col0=TMEM_DEPTH * mma_n, rows=blk_sfa, nblocks=1, dtype=DType.U32)
-    sfb_tmem = SfTmemBand(
-        col0=TMEM_DEPTH * mma_n + TMEM_DEPTH * sfa_cols, rows=blk_sfb, nblocks=1, dtype=DType.U32
-    )
+    # TMEM: one 512-column allocation.
+    accum = k.tmem_tensor(0)
+    # SF bands: each 128-row super-block occupies four physical TMEM columns.
+    sfa_tmem = k.tmem_tensor(TMEM_DEPTH * mma_n)
+    sfb_tmem = k.tmem_tensor(TMEM_DEPTH * mma_n + TMEM_DEPTH * sfa_cols)
 
     accum_frag = k.tensor(space=MemorySpace.REG, dtype=DType.F32, shape=(TMEM_LD_SIZE,))
     out_frag = k.tensor(space=MemorySpace.REG, dtype=DType.BF16, shape=(TMEM_LD_SIZE,))
     sfa_perm_frag = k.tensor(space=MemorySpace.REG, dtype=DType.U32, shape=(blk_sfa // 32,))
     sfb_perm_frag = k.tensor(space=MemorySpace.REG, dtype=DType.U32, shape=(blk_sfb // 32,))
 
-    # smem_pipe: full = the TMA engine (arrive_expect_tx per k-tile, one barrier
-    # covering A+B(+SF) bytes); empty = a tcgen05_commit from the MMA leader,
-    # multicast to both CTAs once the k-tile's cp+MMA retire.
+    # smem_pipe: full = the TMA engine.
     smem_full = k.mbar(kind=MBarKind.TMA, byte_offset=smem_full_off, stages=smem_depth)
     smem_empty = k.mbar(kind=MBarKind.TCGEN05, byte_offset=smem_empty_off, stages=smem_depth)
-    # trans_done: both CTAs' permute warps arrive at the LEADER's barrier; the
-    # leader's MMA waits it, which transitively orders both CTAs' TMA data
-    # (A halves, B halves, scales) before the cluster MMA reads them.
+    # trans_done: both CTAs' permute warps arrive at the LEADER's barrier.
     trans_done = k.mbar(kind=MBarKind.THREAD, byte_offset=trans_done_off, stages=smem_depth)
     tmem_full = k.mbar(kind=MBarKind.TCGEN05, byte_offset=tmem_full_off, stages=TMEM_DEPTH)
     tmem_empty = k.mbar(kind=MBarKind.THREAD, byte_offset=tmem_empty_off, stages=TMEM_DEPTH)
@@ -407,12 +360,7 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
     sf_bytes = (dg_block_m + dg_block_n) * U32_BYTES
 
     def work_coords(work_idx):
-        """ClusterPersistentScheduler2D group-major mapping (cluster_m=cluster_n=1):
-        rows walk within a TILE_GROUPS_ROW_SIZE-row L2 group, groups row-major.
-        Consecutive work indices (a cluster pair) land on adjacent rows of the
-        same column. Non-swap: rows are M tiles (the pair shares its B band);
-        swap_ab: rows are N tiles (the pair shares its A/m tile). Returns
-        (m_idx, n_idx)."""
+        """ClusterPersistentScheduler2D group-major mapping (cluster_m=cluster_n=1)."""
         if sched_rows <= TILE_GROUPS_ROW_SIZE:
             row, col = work_idx % sched_rows, work_idx // sched_rows
         else:
@@ -425,37 +373,28 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
         return (col, row) if swap_ab else (row, col)
 
     with k.if_warp(0):
-        # tmem_alloc is warp-collective (full warp 0); mbarrier.init is
-        # per-thread, so exactly one elected thread runs the inits.
+        # tmem_alloc is warp-collective (full warp 0).
         k.tmem_alloc(0, N_COLS_TMEM, addr_byte_offset=tmem_addr_off, cta_group=cta_group)
         with k.if_elected():
             for s in range(smem_depth):
                 k.mbarrier_init(smem_full, count=1, stage=s)
                 k.mbarrier_init(smem_empty, count=1, stage=s)
-                # One arrival per CTA: each CTA's permute warp arrives from a
-                # single elected thread.
+                # One arrival per CTA: each CTA's permute warp arrives from a single elected thread.
                 k.mbarrier_init(trans_done, count=cta_group, stage=s)
             for s in range(TMEM_DEPTH):
                 k.mbarrier_init(tmem_full, count=1, stage=s)
                 # One arrival per CTA: each CTA's epilogue leader thread.
                 k.mbarrier_init(tmem_empty, count=cta_group, stage=s)
-    # This sync IS the prologue ordering: it publishes the TMEM alloc and the
-    # mbarrier cells to every stream before any wait/arrive touches them. It
-    # must be cluster-wide — the peer CTA arrives at the LEADER's
-    # trans_done/tmem_empty.
+    # This sync IS the prologue ordering.
     k.cluster_sync()
 
-    # ---- TMA producer (TIRx wg0/warp0) ----
-    # Single thread drives the whole TMA pipeline (waits, per-thread
-    # arrive_expect_tx, single-thread tma_load issues).
+    # ---- TMA producer.
     with k.if_warp(0), k.if_elected():
         with k.for_each_task(task_scheduler) as task:
             local_iter = (task.task_id - task_start) // task_step
             work_idx = task.task_id * cta_group + cta_rank
             m_idx, n_idx = work_coords(work_idx)
-            # swap_ab: A is split by M halves across the pair; B is each CTA's
-            # own n tile (n_idx already differs per CTA). Non-swap: A is the
-            # CTA's own m tile; B is the rank's half of the shared n band.
+            # swap_ab: A is split by M halves across the pair.
             a_m = m_idx * dg_block_m + (cta_rank * blk_m if swap_ab else 0)
             b_n = n_idx * dg_block_n + (0 if swap_ab else cta_rank * blk_n)
             sf_m = m_idx * dg_block_m  # the FULL m band's scales, rank-independent
@@ -508,24 +447,16 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
                         cta_group=cta_group,
                     )
 
-    # ---- scale-factor permute (TIRx wg0/warp2) ----
-    # Whole-warp scope: the permute reg ops are warp-collective. Once-per-warp
-    # ops (the padding zeroing, the trans_done arrive) narrow to one elected
-    # thread.
+    # ---- scale-factor permute (TIRx wg0/warp2) ---- Whole-warp scope.
     with k.if_warp(2):
-        # The TMA writes only the first DG_BLOCK rows of each (128-aligned) scale
-        # buffer; the tcgen05.cp copies the whole aligned buffer. Zero the padding
-        # once (single lane) so the cp never reads uninitialized SMEM (on silicon
-        # those bytes are don't-care garbage feeding unused MMA rows).
+        # The TMA writes only the first DG_BLOCK rows of each (128-aligned) scale buffer.
         with k.if_elected():
             for s in range(smem_depth):
                 for i in range(dg_block_m, blk_sfa):
                     k.store_scalar(TensorSlice(tensor=sfa_smem, offsets=(s, i), shape=(1, 1)), 0)
                 for i in range(dg_block_n, blk_sfb):
                     k.store_scalar(TensorSlice(tensor=sfb_smem, offsets=(s, i), shape=(1, 1)), 0)
-        # The padding bytes the elected lane wrote are read below by whichever
-        # lane owns that column chunk: on sm_70+ lanes reconverge at an
-        # explicit sync, so the cross-lane handoff needs this one.
+        # Each lane later reads the padding byte written for its physical row.
         k.warp_sync()
         with k.for_each_task(task_scheduler) as task:
             local_iter = (task.task_id - task_start) // task_step
@@ -535,39 +466,48 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
                 occ = seq // smem_depth
                 k.mbarrier_wait(smem_full, stage=stage, phase=occ % 2)
                 if t % SF_PACK == 0:
-                    # TIRx `warp.permute_layout`: the warp shuffles the packed
-                    # scale bytes into the tcgen05.cp-required physical layout,
-                    # in place. The byte permutation is below the value model
-                    # (logical content is unchanged); the warp's read+write of
-                    # the buffer and the fence ARE the protocol-relevant part.
-                    per_a = blk_sfa // 32
-                    per_b = blk_sfb // 32
                     lane = k.lane_id()
-                    sfa_slice = TensorSlice(
-                        tensor=sfa_smem, offsets=(stage, lane * per_a), shape=(1, per_a)
-                    )
-                    k.reg_load(sfa_perm_frag, sfa_slice)
-                    k.reg_store(sfa_slice, sfa_perm_frag)
-                    sfb_slice = TensorSlice(
-                        tensor=sfb_smem, offsets=(stage, lane * per_b), shape=(1, per_b)
-                    )
-                    k.reg_load(sfb_perm_frag, sfb_slice)
-                    k.reg_store(sfb_slice, sfb_perm_frag)
-                    k.fence(kind=FenceKind.ASYNC_PROXY, scope=FenceScope.CTA)
-                    # Each lane permuted its own column chunk, but only the
-                    # elected lane arrives below: on sm_70+ lanes reconverge
-                    # only at an explicit sync, so converge the warp before
-                    # its stores are published to the MMA warp.
+
+                    def load_scale(raw, frag, rows):
+                        for r in range(rows // 32):
+                            j = r ^ ((lane // 8) % 4)
+                            m_super = j // 4
+                            m_inner = j % 4
+                            k.reg_load(
+                                TensorSlice(tensor=frag, offsets=(r,), shape=(1,)),
+                                TensorSlice(
+                                    tensor=raw,
+                                    offsets=(stage, m_super * 128 + m_inner * 32 + lane),
+                                    shape=(1, 1),
+                                ),
+                            )
+
+                    def store_scale(post, frag, rows):
+                        for r in range(rows // 32):
+                            j = r ^ ((lane // 8) % 4)
+                            m_super = j // 4
+                            m_inner = j % 4
+                            k.reg_store(
+                                TensorSlice(
+                                    tensor=post,
+                                    offsets=(stage, m_super, lane, m_inner),
+                                    shape=(1, 1, 1, 1),
+                                ),
+                                TensorSlice(tensor=frag, offsets=(r,), shape=(1,)),
+                            )
+
+                    load_scale(sfa_smem, sfa_perm_frag, blk_sfa)
+                    load_scale(sfb_smem, sfb_perm_frag, blk_sfb)
                     k.warp_sync()
-                # mbarrier.arrive is per-thread: exactly one thread per CTA's
-                # permute warp arrives at the leader, matching trans_done's
-                # count = cta_group.
+                    store_scale(sfa_cp_smem, sfa_perm_frag, blk_sfa)
+                    store_scale(sfb_cp_smem, sfb_perm_frag, blk_sfb)
+                    k.warp_sync()
+                    k.fence(kind=FenceKind.ASYNC_PROXY, scope=FenceScope.CTA)
+                # mbarrier.arrive is per-thread.
                 with k.if_elected():
                     k.mbarrier_arrive(trans_done_leader, stage=stage)
 
-    # ---- MMA (TIRx wg0/warp1, cluster leader only) ----
-    # Single thread: tcgen05_cp/tcgen05_mma/tcgen05_commit require a
-    # single-thread mask; the waits are fine from one thread too.
+    # ---- MMA (TIRx wg0/warp1, cluster leader only) ---- Single thread.
     with k.if_warp(1), k.if_elected():
         with k.for_each_task(task_scheduler) as task:
             local_iter = (task.task_id - task_start) // task_step
@@ -577,50 +517,86 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
                     tmem_empty, stage=tmem_idx, phase=(local_iter // TMEM_DEPTH + 1) % 2
                 )
                 acc_op = accum.at(0, tmem_idx * mma_n)
-                sfa_op = sfa_tmem.at(tmem_idx * sfa_cols)
-                sfb_op = sfb_tmem.at(tmem_idx * sfb_cols)
+                sfa_op = sfa_tmem.at(0, tmem_idx * sfa_cols)
+                sfb_op = sfb_tmem.at(0, tmem_idx * sfb_cols)
                 for t in range(k_tiles):
                     seq = local_iter * k_tiles + t
                     stage = seq % smem_depth
                     occ = seq // smem_depth
                     k.mbarrier_wait(trans_done, stage=stage, phase=occ % 2)
                     if t % SF_PACK == 0:
-                        k.tcgen05_cp(
-                            sfa_op,
-                            TensorSlice(tensor=sfa_smem, offsets=(stage, 0), shape=(1, blk_sfa)),
-                            cta_group=cta_group,
-                        )
-                        k.tcgen05_cp(
-                            sfb_op,
-                            TensorSlice(tensor=sfb_smem, offsets=(stage, 0), shape=(1, blk_sfb)),
-                            cta_group=cta_group,
-                        )
+                        for m_super in range(blk_sfa // 128):
+                            k.tcgen05_cp(
+                                sfa_tmem.at(0, tmem_idx * sfa_cols + 4 * m_super),
+                                k.smem_tile(
+                                    sfa_cp_smem,
+                                    prefix_indices=(stage, m_super),
+                                    row_offset=0,
+                                    col_offset=0,
+                                    rows=32,
+                                    cols=4,
+                                ),
+                                shape="32x128b",
+                                multicast="warp4",
+                                cta_group=cta_group,
+                            )
+                        for m_super in range(blk_sfb // 128):
+                            k.tcgen05_cp(
+                                sfb_tmem.at(0, tmem_idx * sfb_cols + 4 * m_super),
+                                k.smem_tile(
+                                    sfb_cp_smem,
+                                    prefix_indices=(stage, m_super),
+                                    row_offset=0,
+                                    col_offset=0,
+                                    rows=32,
+                                    cols=4,
+                                ),
+                                shape="32x128b",
+                                multicast="warp4",
+                                cta_group=cta_group,
+                            )
                     for ki in range(K_ITERS):
                         ko = ki * MMA_K
-                        a_op = TensorSlice(
-                            tensor=a_smem, offsets=(stage, 0, ko), shape=(1, blk_m, MMA_K)
+                        a_op = k.smem_tile(
+                            a_smem,
+                            prefix_indices=(stage,),
+                            row_offset=0,
+                            col_offset=ko,
+                            rows=blk_m,
+                            cols=MMA_K,
                         )
-                        b_op = TensorSlice(
-                            tensor=b_smem, offsets=(stage, 0, ko), shape=(1, blk_n, MMA_K)
+                        b_op = k.smem_tile(
+                            b_smem,
+                            prefix_indices=(stage,),
+                            row_offset=0,
+                            col_offset=ko,
+                            rows=blk_n,
+                            cols=MMA_K,
                         )
-                        # swap_ab computes the transposed C tile: the UMMA-A side
-                        # is B (with B's scales) and the UMMA-B side is A.
+                        # swap_ab computes the transposed C tile.
                         k.tcgen05_mma(
                             acc_op,
-                            b_op if swap_ab else a_op,
+                            k.mma_a_smem(b_op if swap_ab else a_op),
                             a_op if swap_ab else b_op,
-                            m=mma_m,
-                            n=mma_n,
-                            k=MMA_K,
+                            mma_m=mma_m,
+                            mma_n=mma_n,
+                            format="f8_e4m3",
+                            block_scale=BlockScaleSpec(
+                                sfa=sfb_op if swap_ab else sfa_op,
+                                sfb=sfa_op if swap_ab else sfb_op,
+                                sfa_k_offset=t % SF_PACK,
+                                sfb_k_offset=t % SF_PACK,
+                                scale_format="e8m0_fnu",
+                                sf_per_mma=1,
+                                sf_reuse=SF_PACK,
+                            ),
                             accum=(t > 0 or ki > 0),
+                            trans_a=False,
+                            trans_b=False,
+                            ws=False,
                             cta_group=cta_group,
-                            sfa=sfb_op if swap_ab else sfa_op,
-                            sfb=sfa_op if swap_ab else sfb_op,
-                            sf_byte=t % SF_PACK,
                         )
-                    # Release the SMEM stage to the producer in both CTAs once
-                    # this k-tile's cp+MMA retire (TIRx smem_pipe.empty.arrive
-                    # with cta_mask=3).
+                    # Release the SMEM stage in both CTAs after the k-tile is fully consumed.
                     k.tcgen05_commit(
                         smem_empty, stage=stage, cta_group=cta_group, multicast_cta_mask=0b11
                     )
@@ -629,12 +605,7 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
                     tmem_full, stage=tmem_idx, cta_group=cta_group, multicast_cta_mask=0b11
                 )
 
-    # ---- epilogue (TIRx wg1) ----
-    # Full-warpgroup scope for the warp-collective accumulator drains; every
-    # once-per-execution op (bulk-group wait, tmem_empty arrive, tma_store,
-    # commit_group) narrows to the leader thread, and wg_syncs (barrier_id=10,
-    # the warpgroup's one named barrier) carry the cross-warp program order
-    # between the two.
+    # ---- epilogue (TIRx wg1) ---- Full-warpgroup scope for the warp-collective accumulator drains.
     with k.if_warpgroup(1):
         with k.for_each_task(task_scheduler) as task:
             local_iter = (task.task_id - task_start) // task_step
@@ -644,25 +615,14 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
             k.mbarrier_wait(tmem_full, stage=tmem_idx, phase=(local_iter // TMEM_DEPTH) % 2)
             for ot in range(store_tiles):
                 store_iter = local_iter * store_tiles + ot
-                # Pace the D_smem stage ring against in-flight TMA stores. The
-                # bulk-async group lives on the leader thread's stream (it
-                # issued the commit), so only the leader may wait it; the
-                # wg_sync after publishes the drain to the other three warps
-                # before anyone overwrites the stage.
+                # Pace the D_smem stage ring against in-flight TMA stores.
                 with k.if_(store_iter >= TMEM_DEPTH):
                     with k.if_(k.tid_in_wg().eq(0)):
                         k.cp_async_bulk_wait_group_read(TMEM_DEPTH - 1)
                 k.wg_sync(barrier_id=10)
                 d_stage = store_iter % TMEM_DEPTH  # runtime: the EPI count may be odd
                 if swap_ab:
-                    # The accumulator holds C^T (rows = this CTA's n tile, cols =
-                    # the m direction). The TIRx transposed store, op for op:
-                    # two .16x256b ld issues per 8-col group (row=0 covers lanes
-                    # 0..15 of each warp's partition, row=16 the other half-slab
-                    # — the M=128 two-slab fragment), an f32->bf16 pair cast (on
-                    # silicon cvt.rn.bf16x2.f32 — born packed, no pack
-                    # instruction), and one stmatrix.x4.trans per warp whose
-                    # word m IS the fragment's m-th bf16 pair.
+                    # The accumulator holds C^T (rows = this CTA's n tile, cols = the m direction).
                     lane = k.lane_id()
                     tid = k.tid_in_wg()
                     for atom_m in range(2):
@@ -709,16 +669,11 @@ def build_fp8_blockwise_gemm(config: Fp8BlockwiseGemmConfig = Fp8BlockwiseGemmCo
                             ),
                             out_frag,
                         )
-                # All four warps' accumulator drains and d_smem writes must
-                # land before the single-thread tail (accum release + bulk
-                # store).
+                # Synchronize all accumulator drains and d_smem writes before publishing the store.
                 k.wg_sync(barrier_id=10)
                 with k.if_(k.tid_in_wg().eq(0)):
                     if ot == store_tiles - 1:
-                        # The accumulator stage is fully drained (the wg_sync
-                        # above proves all warps' loads retired); one arrive
-                        # per CTA's epilogue keeps tmem_empty's count at
-                        # cta_group.
+                        # The accumulator stage is fully drained.
                         k.mbarrier_arrive(tmem_empty_leader, stage=tmem_idx)
                     k.fence(kind=FenceKind.ASYNC_PROXY, scope=FenceScope.CTA)
                     if swap_ab:
@@ -779,9 +734,7 @@ def _validate_config(
         raise ValueError("fp8_blockwise_gemm nymph port models the cta_group=2 cluster datapath")
     if swap_ab and dg_block_n != 128:
         raise ValueError("fp8_blockwise_gemm swap_ab requires the DeepGEMM block_n=128 grid")
-    # Partial M/N tiles are first-class: the TMA tensormap clamps them (loads
-    # zero-fill, stores squash the out-of-bounds part). Only K stays exact —
-    # the packed-u32 scale layout has no partial-K story (matching TIRx).
+    # Partial M/N tiles are first-class.
     if config.k % (BLK_K * SF_PACK) != 0:
         raise ValueError("fp8_blockwise_gemm k must be a multiple of 512 (4 packed k-tiles)")
     if sched_rows % cta_group != 0:
