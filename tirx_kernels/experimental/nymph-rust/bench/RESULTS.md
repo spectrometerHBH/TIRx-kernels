@@ -57,8 +57,11 @@ kernel measures `tcgen05.alloc+relinquish+dealloc` at ~0.87us per cluster,
 of which the alloc part is now hidden under the first TMA flight
 (+0.03 ratio); the remainder sits in the cluster prologue barrier, the
 D-store drain wait, and the dealloc pair rendezvous. nvjet avoids this
-class entirely: its SASS contains no tcgen05.alloc/dealloc (TMEM is taken
-via `UTCATOMSWS.FIND_AND_SET` atomics) and it uses PREEXIT for the exit
-overlap. Closing 1024 requires launch/framework-level work (atomic TMEM
-management / PREEXIT / PDL launch attributes), which is out of the
-kernel-body boundary.
+class: `UTCATOMSWS.2CTA.FIND_AND_SET` IS the SASS form of
+`tcgen05.alloc` (bitmap find-and-set with a NANOSLEEP retry loop;
+`UTCATOMSWS.AND` is `tcgen05.dealloc`) — nvjet issues the same pair, so
+the residual sits in how early each side's alloc lands relative to the
+first TMA flight, plus the mandatory dealloc rendezvous at exit (nvjet
+additionally uses PREEXIT for the exit overlap). Closing 1024 requires
+launch/framework-level work (cheaper alloc placement / PREEXIT / PDL
+launch attributes), which is out of the kernel-body boundary.
