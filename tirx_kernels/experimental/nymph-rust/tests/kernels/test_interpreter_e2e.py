@@ -54,6 +54,20 @@ def test_gemm_matches_numpy_reference(dtype_name):
     assert int(np.sum(c != ref)) == 0
 
 
+def test_gemm_static_scheduler_matches_reference():
+    """The STATIC (no-CLC) task path: same math as the CLC default."""
+    if DType is None:
+        pytest.skip("DType binding unavailable")
+    cfg = Fp16Bf16GemmConfig(scheduler="static")
+    a, b = _inputs(cfg)
+    kernel = build_fp16_bf16_gemm(cfg)
+    a_t, b_t, c_t = kernel.args
+    outputs = nr.interpret(kernel, {a_t: a, b_t: b})
+    c = np.asarray(outputs[c_t.id], np.float64).reshape(cfg.m, cfg.n)
+    ref = _reference(a, b, cfg)
+    assert int(np.sum(c != ref)) == 0
+
+
 def test_gemm_completes_and_is_deterministic():
     cfg = Fp16Bf16GemmConfig()
     a, b = _inputs(cfg, seed=3)

@@ -128,10 +128,19 @@ def main() -> None:
         if rs.get("tir") and rs.get("tirx"):
             pr = sorted(c / n for c, n in zip(rs["tir"], rs["tirx"]))
             spread = f"  per-round[{pr[0]:.3f}-{pr[-1]:.3f}]"
-        print(
+        line = (
             f"{res['kernel']} {res['config']}: tir/tirx={ratio:.3f}{spread}  "
-            f"tir={im['tir']:.1f}us tirx={im['tirx']:.1f}us  (gpu {res.get('gpu')})"
+            f"tir={im['tir']:.1f}us tirx={im['tirx']:.1f}us"
         )
+        # cuBLAS third impl: show the cublas/tirx ratio as well.
+        if "cublas" in im:
+            cratio = im["cublas"] / im["tirx"]
+            cspread = ""
+            if rs.get("cublas") and rs.get("tirx"):
+                cpr = sorted(c / n for c, n in zip(rs["cublas"], rs["tirx"]))
+                cspread = f"  per-round[{cpr[0]:.3f}-{cpr[-1]:.3f}]"
+            line += f"  cublas/tirx={cratio:.3f}{cspread} cublas={im['cublas']:.1f}us"
+        print(line + f"  (gpu {res.get('gpu')})")
 
 
 if __name__ == "__main__":
