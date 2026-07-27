@@ -541,6 +541,9 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
             # alloc-before-use sync edge) WITHOUT gating the producers —
             # they arrive non-blocking at role entry (nvjet's alloc-late).
             k.tmem_alloc(0, N_COLS_TMEM, addr_byte_offset=tmem_addr_off, cta_group=cta_group)
+            # Relinquish the alloc permit NOW (this kernel allocs once) — it
+            # leaves the teardown with just the dealloc.
+            k.tmem_relinquish(cta_group)
             k.cluster_barrier_arrive()
             k.cluster_barrier_wait()
             with k.if_elected():
@@ -715,6 +718,12 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                 k.wg_sync(barrier_id=10)
                 with k.if_(k.tid_in_wg().eq(0)):
                     k.mbarrier_arrive(tmem_empty_leader, stage=tmem_idx)
+                # Fire the teardown handshake's ARRIVE here on the last task
+                # (an mbarrier arrive is loop-legal; only alloc/dealloc/
+                # relinquish are restricted): the trailing wait is then free.
+                with k.if_(local_iter.eq((pair_tasks - 1 - task_start) // task_step)):
+                    with k.if_(k.tid_in_wg().eq(0)):
+                        k.mbarrier_arrive(k.mbar_ref(tmem_fin, remote_coord=1 - cta_rank), stage=0)
                 # alpha is baked at build time: skip the rescale entirely when 1.0
                 # (a per-thread mul-by-1.0 over the whole fragment is pure waste).
                 if config.alpha != 1.0:
@@ -736,6 +745,11 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                         k.wg_sync(barrier_id=10)
                         with k.if_(k.tid_in_wg().eq(0)):
                             k.mbarrier_arrive(tmem_empty_leader, stage=tmem_idx)
+                        # The teardown handshake's ARRIVE fires here on the
+                        # last task (loop-legal op): the trailing wait is free.
+                        with k.if_(local_iter.eq((pair_tasks - 1 - task_start) // task_step)):
+                            with k.if_(k.tid_in_wg().eq(0)):
+                                k.mbarrier_arrive(k.mbar_ref(tmem_fin, remote_coord=1 - cta_rank), stage=0)
                     store_band(local_iter, d_m, d_n, ot, frag_off=0)
         # No final full drain: the last task's TMA stores drain on the HW
         # side at kernel exit (D visibility is completion-ordered), so the
@@ -745,10 +759,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     # TMEM teardown via canon's tmem_finished 2-CTA handshake (NOT a bare cluster_sync).
     epilogue_warp = 4  # wg1's first warp (num_warps=8: wg0=0-3, wg1=4-7); canon's EPILOGUE
     with k.if_warp(epilogue_warp):
-        with k.if_elected():
-            k.mbarrier_arrive(k.mbar_ref(tmem_fin, remote_coord=1 - cta_rank), stage=0)
         k.mbarrier_wait(tmem_fin, stage=0, phase=0)
-        k.tmem_relinquish(cta_group)
         k.tmem_dealloc(0, N_COLS_TMEM, cta_group)
 
     return k.build()
