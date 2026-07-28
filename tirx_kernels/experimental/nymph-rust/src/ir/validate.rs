@@ -3330,11 +3330,14 @@ mod tests {
         );
         let free = warp_if(
             0,
-            vec![Stmt::TmemRelinquish { cta_group: 1 }, Stmt::TmemDealloc {
-                base_col: 0,
-                n_cols: 64,
-                cta_group: 1,
-            }],
+            vec![
+                Stmt::TmemRelinquish { cta_group: 1 },
+                Stmt::TmemDealloc {
+                    base_col: 0,
+                    n_cols: 64,
+                    cta_group: 1,
+                },
+            ],
         );
         kernel(vec![
             alloc,

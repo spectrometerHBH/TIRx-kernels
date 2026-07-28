@@ -284,7 +284,11 @@ fn grid_dep_control_is_a_noop_in_value_and_trace_modes() {
     let trace = run_trace_kernel(&kernel, HashMap::new());
     assert!(trace.completed, "failed: {:?}", trace.failure_reason);
     // No TraceEventKind exists for it: the statement emits nothing.
-    assert!(trace_events(&trace).is_empty(), "{:?}", trace_events(&trace));
+    assert!(
+        trace_events(&trace).is_empty(),
+        "{:?}",
+        trace_events(&trace)
+    );
 }
 
 #[test]

@@ -4043,12 +4043,18 @@ mod tests {
             Stmt::GridDepControl {
                 action: GridDepAction::LaunchDependents,
             },
-            warp_if(4, vec![Stmt::GridDepControl {
-                action: GridDepAction::Wait,
-            }]),
+            warp_if(
+                4,
+                vec![Stmt::GridDepControl {
+                    action: GridDepAction::Wait,
+                }],
+            ),
         ]);
         let src = kernel_to_tirx_source(&k).unwrap();
-        assert!(src.contains("T.ptx.griddepcontrol.launch_dependents()"), "{src}");
+        assert!(
+            src.contains("T.ptx.griddepcontrol.launch_dependents()"),
+            "{src}"
+        );
         assert!(src.contains("T.ptx.griddepcontrol.wait()"), "{src}");
     }
 

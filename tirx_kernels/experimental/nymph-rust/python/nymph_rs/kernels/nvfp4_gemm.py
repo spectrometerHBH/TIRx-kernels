@@ -56,9 +56,8 @@ def _advance_ring(k: IRBuilder, stage_sc, phase_sc, pipe_depth: int) -> None:
     k.scalar_store(stage_sc, nxt)
 
 
-
 def _ab_smem_layout(blk_k_bytes):
-    'Widest swizzle the A/B stage row (packed fp4 bytes) fits.'
+    "Widest swizzle the A/B stage row (packed fp4 bytes) fits."
     for swizzle, atom in ((Swizzle.B128, 128), (Swizzle.B64, 64), (Swizzle.B32, 32)):
         if blk_k_bytes >= atom and blk_k_bytes % atom == 0:
             return SmemSwizzleLayout(swizzle)
@@ -98,10 +97,7 @@ class NvFp4GemmConfig:
     epilogue: str = "overlap"
     # K per pipeline tile (default 256; nvjet runs 64 = finer, deeper pipeline).
     cta_k: int | None = None
-    # A/B TMA loads per stage are issued as this many M-sub-boxes (1 = one box
-    # per operand). nvjet issues ~24-28 fine-grained TMA ops per k-tile; at
-    # 2048 a split of 8 measured +3.4% (the stage's last byte lands sooner with
-    # more parallel boxes in flight).
+    # A/B TMA loads per stage are issued as this many M-sub-boxes (1 = one box per operand). nvjet issues ~24-28 fine-grained TMA ops per k-tile; at 2048 a split of 8 measured +3.4% (the stage's last byte lands sooner with more parallel boxes in flight).
     tma_split: int | None = None
     # Per-warpgroup register budget (canon's INVARIANT-I1b per-role `setmaxnreg`).
     maxnreg_epilogue: int | None = None
@@ -164,8 +160,7 @@ GEMM_CONFIGS = {
         # D-store ring 3 deep: cuts the per-band drain waits (0.906 -> 0.933).
         "d_depth": 3,
         "epi_tile": 32,
-        # A/B as 8 M-sub-boxes per stage: the stage's last byte lands sooner
-        # with more parallel TMA boxes in flight (0.916 -> 0.95 vs cublasLt).
+        # A/B as 8 M-sub-boxes per stage: the stage's last byte lands sooner with more parallel TMA boxes in flight (0.916 -> 0.95 vs cublasLt).
         "tma_split": 8,
     },
     # 4096: the epilogue is the wall-clock residual.
@@ -175,9 +170,7 @@ GEMM_CONFIGS = {
         "epilogue": "no_overlap",
         "epi_tile": 32,
     },
-    # 8192: OVERLAP_EPI=False / L2_GROUP_SIZE=1 (canon); smem_depth=5 and
-    # EPI_TILE=32 (canon has 4/16) both measured faster: depth 5 1.013 vs
-    # 0.987, epi32's B64-swizzled 8-band store 0.995 vs B32 16-band 0.989.
+    # 8192: OVERLAP_EPI=False / L2_GROUP_SIZE=1 (canon); smem_depth=5 and EPI_TILE=32 (canon has 4/16) both measured faster: depth 5 1.013 vs 0.987, epi32's B64-swizzled 8-band store 0.995 vs B32 16-band 0.989.
     (8192, 8192, 8192): {
         "l2_group_size": 1,
         "load_cache_hint": None,
@@ -185,9 +178,7 @@ GEMM_CONFIGS = {
         "smem_depth": 5,
         "epi_tile": 32,
     },
-    # 16384: OVERLAP_EPI=False / EPI_TILE=16 (canon); smem_depth=5 (canon 4)
-    # measured 1.046 vs 0.99; L2_GROUP 12 -> 16 (12 does not divide the
-    # 64-row cluster-tile grid).
+    # 16384: OVERLAP_EPI=False / EPI_TILE=16 (canon); smem_depth=5 (canon 4) measured 1.046 vs 0.99; L2_GROUP 12 -> 16 (12 does not divide the 64-row cluster-tile grid).
     (16384, 16384, 16384): {
         "l2_group_size": 16,
         "load_cache_hint": None,
@@ -320,9 +311,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
         space=MemorySpace.SMEM,
         dtype=DType.BF16,
         shape=(d_depth, blk_m, epi_tile),
-        # Swizzle the epilogue staging tile as wide as the row allows: the
-        # per-thread row stores (tid, c:c+chunk) otherwise land on the same
-        # bank group, the measured SMEM store-bank-conflict driver.
+        # Swizzle the epilogue staging tile as wide as the row allows: the per-thread row stores (tid, c:c+chunk) otherwise land on the same bank group, the measured SMEM store-bank-conflict driver.
         layout=_d_smem_layout(epi_tile),
         byte_offset=d_off,
     )
@@ -350,10 +339,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     tmem_empty_leader = k.mbar_ref(tmem_empty, remote_coord=0)
     # tmem_fin: canon's exact lightweight 2-CTA teardown handshake (its `tmem_finished`).
     tmem_fin = k.mbar(kind=MBarKind.THREAD, byte_offset=tmem_fin_off, stages=1)
-    # inits_done: per-CTA "barriers initialized" flag (warp 1 -> all roles).
-    # Replaces the pair-wide cluster_sync on the startup critical path: the
-    # producers' first TMA flight then overlaps warp 0's tcgen05.alloc
-    # (~0.9us, the fp16 prologue lesson).
+    # inits_done: per-CTA "barriers initialized" flag (warp 1 -> all roles). Replaces the pair-wide cluster_sync on the startup critical path: the producers' first TMA flight then overlaps warp 0's tcgen05.alloc (~0.9us, the fp16 prologue lesson).
     inits_done = k.mbar(kind=MBarKind.THREAD, byte_offset=inits_done_off, stages=1)
 
     cta_id = k.cta_id()
@@ -381,14 +367,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
         m_idx = pair_row * CLUSTER_M + cta_rank
         return m_idx, n_idx
 
-    # mbarrier inits live on warp 1 (free role), which then publishes
-    # inits_done. There is NO pair-wide cluster_sync on the startup path:
-    # each role gates on inits_done once (cheap, local), so the producers'
-    # first TMA flight overlaps warp 0's tcgen05.alloc (~0.9us, the fp16
-    # prologue lesson). Cross-CTA init ordering is carried by the mbarrier
-    # phase protocol itself: the peer's complete-tx/expect-tx land well
-    # after the leader-side inits (flight ~0.5us >> init ~0.04us), and every
-    # tmem-side signal is downstream of the MMA warp's own alloc.
+    # mbarrier inits live on warp 1 (free role), which then publishes inits_done. There is NO pair-wide cluster_sync on the startup path: each role gates on inits_done once (cheap, local), so the producers' first TMA flight overlaps warp 0's tcgen05.alloc (~0.9us, the fp16 prologue lesson). Cross-CTA init ordering is carried by the mbarrier phase protocol itself: the peer's complete-tx/expect-tx land well after the leader-side inits (flight ~0.5us >> init ~0.04us), and every tmem-side signal is downstream of the MMA warp's own alloc.
     with k.if_warp(1):
         k.cluster_barrier_arrive()
         with k.if_elected():
@@ -402,10 +381,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
             k.mbarrier_init(tmem_fin, count=1, stage=0)
             k.mbarrier_init(inits_done, count=1, stage=0)
 
-    # Seal the mbarrier-init epoch (canon's `T.ptx.fence.mbarrier_init` + the
-    # fused cluster_sync). The inits live on warp 1 (free role) so the sync
-    # covers a ~0.2us init chain instead of warp 0's; the tcgen05.alloc is
-    # pre-sync (the tmem-lifecycle checker's requirement).
+    # Seal the mbarrier-init epoch (canon's `T.ptx.fence.mbarrier_init` + the fused cluster_sync). The inits live on warp 1 (free role) so the sync covers a ~0.2us init chain instead of warp 0's; the tcgen05.alloc is pre-sync (the tmem-lifecycle checker's requirement).
     k.fence(kind=FenceKind.MBARRIER_INIT)
     k.fence(kind=FenceKind.ASYNC_PROXY, scope=FenceScope.CTA)
     k.cluster_sync()
@@ -415,34 +391,29 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
         if config.maxnreg_producer is not None:
             k.set_maxnreg(config.maxnreg_producer)
 
-        # ---- A/B producer (warp 2). SF loads live on warp 3 (canon's two-warp
-        # producer topology).
+        # ---- A/B producer (warp 2). SF loads live on warp 3 (canon's two-warp producer topology).
         with k.if_warp(2):
             k.cluster_barrier_arrive()
-            # Loop-carried SMEM-ring induction state (fp16_bf16_gemm's idiom):
-            # no per-k-tile `% smem_depth` magic-divide chain.
+            # Loop-carried SMEM-ring induction state (fp16_bf16_gemm's idiom): no per-k-tile `% smem_depth` magic-divide chain.
             ld_stage = k.scalar(initial=0, dtype=ScalarDType.I32)
             ld_phase = k.scalar(initial=0, dtype=ScalarDType.I32)
             with k.for_each_task(task_scheduler) as task:
                 m_idx, n_idx = work_coords(task.task_id, cta_rank)
                 a_m = m_idx * CTA_M  # this CTA's own M tile
                 b_n = n_idx * mma_n + cta_rank * cta_n  # this CTA's half of the N band
-                # Canon's producer shape: ONE elected region wrapping the whole
-                # rolled k-loop (no per-iteration elect open/close).
+                # Canon's producer shape: ONE elected region wrapping the whole rolled k-loop (no per-iteration elect open/close).
                 with k.if_elected():
                     with k.for_loop(stop=k_tiles, unroll=False) as t:
                         k.mbarrier_wait(smem_empty, stage=ld_stage, phase=(ld_phase + 1) % 2)
-                        # canon's split arrive: ONE expect covering A/B AND
-                        # the SF tiles (both producers complete-tx here).
+                        # canon's split arrive: ONE expect covering A/B AND the SF tiles (both producers complete-tx here).
                         with k.if_(cta_rank.eq(0)):
                             k.mbarrier_arrive_expect_tx(
-                                smem_full_leader, bytes=cta_group * (ab_bytes + sf_bytes), stage=ld_stage
+                                smem_full_leader,
+                                bytes=cta_group * (ab_bytes + sf_bytes),
+                                stage=ld_stage,
                             )
                         kb = t * blk_k_bytes  # packed-fp4 byte column
-                        # canon tags every g2c load with the L2 `evict_normal` policy.
-                        # tma_split>1: A/B as N M-sub-boxes per stage (finer TMA
-                        # granularity, nvjet-style; the stage's last byte lands
-                        # sooner with more parallel boxes in flight).
+                        # canon tags every g2c load with the L2 `evict_normal` policy. tma_split>1: A/B as N M-sub-boxes per stage (finer TMA granularity, nvjet-style; the stage's last byte lands sooner with more parallel boxes in flight).
                         _split = _cfg_tma_split(config)
                         for ab_i in range(_split):
                             k.tma_load(
@@ -477,8 +448,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                                 cta_group=cta_group,
                             )
                         _advance_ring(k, ld_stage, ld_phase, smem_depth)
-        # ---- SF producer (canon's second producer warp): scale-factor loads on
-        # warp 3, pacing its own arrive/loads per k-tile.
+        # ---- SF producer (canon's second producer warp): scale-factor loads on warp 3, pacing its own arrive/loads per k-tile.
         with k.if_warp(3):
             k.cluster_barrier_arrive()
             sf_stage = k.scalar(initial=0, dtype=ScalarDType.I32)
@@ -547,14 +517,9 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
 
         # ---- MMA (wg0/warp0, cluster leader only).
         with k.if_warp(0):
-            # tmem_alloc (warp-collective, full warp 0), then the split
-            # cluster barrier: the pair's alloc completions rendezvous and
-            # the wait makes them visible (the tmem-lifecycle checker's
-            # alloc-before-use sync edge) WITHOUT gating the producers —
-            # they arrive non-blocking at role entry (nvjet's alloc-late).
+            # tmem_alloc (warp-collective, full warp 0), then the split cluster barrier: the pair's alloc completions rendezvous and the wait makes them visible (the tmem-lifecycle checker's alloc-before-use sync edge) WITHOUT gating the producers — they arrive non-blocking at role entry (nvjet's alloc-late).
             k.tmem_alloc(0, N_COLS_TMEM, addr_byte_offset=tmem_addr_off, cta_group=cta_group)
-            # Relinquish the alloc permit NOW (this kernel allocs once) — it
-            # leaves the teardown with just the dealloc.
+            # Relinquish the alloc permit NOW (this kernel allocs once) — it leaves the teardown with just the dealloc.
             k.tmem_relinquish(cta_group)
             k.cluster_barrier_arrive()
             k.cluster_barrier_wait()
@@ -573,8 +538,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                         acc_op = accum.at(0, tmem_idx * mma_n)
 
                         def mma_ktile(accum_flag):
-                            # ONE full barrier per k-tile (ootst's shape):
-                            # A/B and SF all complete-tx on smem_full.
+                            # ONE full barrier per k-tile (ootst's shape): A/B and SF all complete-tx on smem_full.
                             k.mbarrier_wait(smem_full, stage=mma_stage, phase=mma_phase)
                             for m_super in range(blk_m // 128):
                                 for k_outer in range(sf_cta_k // 4):
@@ -648,12 +612,14 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                                 cta_group=cta_group,
                             )
                             k.tcgen05_commit(
-                                smem_empty, stage=mma_stage, cta_group=cta_group, multicast_cta_mask=0b11
+                                smem_empty,
+                                stage=mma_stage,
+                                cta_group=cta_group,
+                                multicast_cta_mask=0b11,
                             )
                             _advance_ring(k, mma_stage, mma_phase, smem_depth)
 
-                        # The k-loop with a RUNTIME accum cell (canon's shape;
-                        # no first-k-tile peel doubling the MMA/SF-cp body).
+                        # The k-loop with a RUNTIME accum cell (canon's shape; no first-k-tile peel doubling the MMA/SF-cp body).
                         accum_flag = k.scalar(initial=0, dtype=ScalarDType.I32)
                         with k.for_loop(stop=k_tiles, unroll=False) as t:
                             mma_ktile(accum_flag)
@@ -670,9 +636,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     def store_band(local_iter, d_m, d_n, ot, frag_off):
         """Chunked reg->smem + S->G TMA store of one EPI_TILE band."""
         store_iter = local_iter * store_tiles + ot
-        # The ring-guard wait+sync is needed ONLY when the d_smem ring
-        # actually wraps (store_iter >= depth); an unconditional per-band
-        # sync is pure latency when store_tiles <= d_depth.
+        # The ring-guard wait+sync is needed ONLY when the d_smem ring actually wraps (store_iter >= depth); an unconditional per-band sync is pure latency when store_tiles <= d_depth.
         with k.if_(store_iter >= d_depth):
             k.cp_async_bulk_wait_group_read(d_depth - 1)
             k.wg_sync(barrier_id=10)
@@ -729,14 +693,11 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                 k.wg_sync(barrier_id=10)
                 with k.if_(k.tid_in_wg().eq(0)):
                     k.mbarrier_arrive(tmem_empty_leader, stage=tmem_idx)
-                # Fire the teardown handshake's ARRIVE here on the last task
-                # (accumulator reads provably done at wait_ld + wg_sync); the
-                # wait+dealloc runs on the IDLE MMA warp (see its region).
+                # Fire the teardown handshake's ARRIVE here on the last task (accumulator reads provably done at wait_ld + wg_sync); the wait+dealloc runs on the IDLE MMA warp (see its region).
                 with k.if_(local_iter.eq((pair_tasks - 1 - task_start) // task_step)):
                     with k.if_(k.tid_in_wg().eq(0)):
                         k.mbarrier_arrive(k.mbar_ref(tmem_fin, remote_coord=1 - cta_rank), stage=0)
-                # alpha is baked at build time: skip the rescale entirely when 1.0
-                # (a per-thread mul-by-1.0 over the whole fragment is pure waste).
+                # alpha is baked at build time: skip the rescale entirely when 1.0 (a per-thread mul-by-1.0 over the whole fragment is pure waste).
                 if config.alpha != 1.0:
                     k.reg_mul(accum_frag, accum_frag, config.alpha)
                 k.reg_cvt(out_frag, accum_frag)
@@ -756,20 +717,16 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                         k.wg_sync(barrier_id=10)
                         with k.if_(k.tid_in_wg().eq(0)):
                             k.mbarrier_arrive(tmem_empty_leader, stage=tmem_idx)
-                        # Fire the teardown handshake's ARRIVE here on the
-                        # last task; wait+dealloc runs on the idle MMA warp.
+                        # Fire the teardown handshake's ARRIVE here on the last task; wait+dealloc runs on the idle MMA warp.
                         with k.if_(local_iter.eq((pair_tasks - 1 - task_start) // task_step)):
                             with k.if_(k.tid_in_wg().eq(0)):
-                                k.mbarrier_arrive(k.mbar_ref(tmem_fin, remote_coord=1 - cta_rank), stage=0)
+                                k.mbarrier_arrive(
+                                    k.mbar_ref(tmem_fin, remote_coord=1 - cta_rank), stage=0
+                                )
                     store_band(local_iter, d_m, d_n, ot, frag_off=0)
-        # No final full drain: the last task's TMA stores drain on the HW
-        # side at kernel exit (D visibility is completion-ordered), so the
-        # tmem_fin handshake + dealloc below overlaps the last store flight
-        # (nvjet's PREEXIT-style tail).
+        # No final full drain: the last task's TMA stores drain on the HW side at kernel exit (D visibility is completion-ordered), so the tmem_fin handshake + dealloc below overlaps the last store flight (nvjet's PREEXIT-style tail).
 
-    # TMEM teardown via canon's tmem_finished 2-CTA handshake (NOT a bare
-    # cluster_sync): the arrive fires mid-epilogue on the last task (see the
-    # epilogue regions), and warp 4 waits + deallocs here after its stores.
+    # TMEM teardown via canon's tmem_finished 2-CTA handshake (NOT a bare cluster_sync): the arrive fires mid-epilogue on the last task (see the epilogue regions), and warp 4 waits + deallocs here after its stores.
     epilogue_warp = 4  # wg1's first warp (num_warps=8: wg0=0-3, wg1=4-7); canon's EPILOGUE
     with k.if_warp(epilogue_warp):
         k.mbarrier_wait(tmem_fin, stage=0, phase=0)
@@ -800,8 +757,7 @@ def _validate_config(config: NvFp4GemmConfig, cta_k: int = CTA_K) -> None:
     tma_split = _cfg_tma_split(config)
     if not isinstance(tma_split, int) or isinstance(tma_split, bool) or tma_split < 1:
         raise ValueError("nvfp4_gemm tma_split must be a positive integer")
-    # Sub-boxes keep full 128B swizzle-atom rows (M-split only): each operand's
-    # row count must split into >= 8-row boxes (the swizzle atom's row span).
+    # Sub-boxes keep full 128B swizzle-atom rows (M-split only): each operand's row count must split into >= 8-row boxes (the swizzle atom's row span).
     if CTA_M % tma_split != 0 or cta_n % tma_split != 0:
         raise ValueError("nvfp4_gemm tma_split must divide CTA_M and cta_n")
     if CTA_M // tma_split < 8 or cta_n // tma_split < 8:
@@ -869,11 +825,7 @@ def run_bench(M, N, K, *, warmup=None, repeat=None, timer=None, **kwargs):
     import torch
 
     import tvm
-    from tirx_kernels.gemm.nvfp4_gemm import (
-        _load_cublaslt_nvfp4_ext,
-        prepare_data,
-        tir_ws_kernel,
-    )
+    from tirx_kernels.gemm.nvfp4_gemm import _load_cublaslt_nvfp4_ext, prepare_data, tir_ws_kernel
     from tvm.tirx.bench import bench
 
     target = tvm.target.Target("cuda")
