@@ -6,7 +6,7 @@ import tvm
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.bench import bench
-from tvm.tirx.lang.pipeline import Pipeline, PipelineState
+from tvm.tirx.lang.pipeline import MBarrier, Pipeline, PipelineState
 from tvm.tirx.lang.tile_scheduler import ClusterLaunchControlScheduler
 
 
@@ -44,26 +44,27 @@ def _swizzle_for_row_bytes(row_bytes):
 GEMM_CONFIGS = {
     1024: {
         "cta_n": 64,
-        "cta_k": 128,
+        "cta_k": 64,
         "l2_group_size": 4,
         "overlap_epilogue": True,
-        "pipe_depth": 5,
+        "pipe_depth": 10,
         "wb_pipe_depth": 2,
+        "scheduler": "static",
     },
     2048: {
         "cta_n": 256,
         "cta_k": 64,
-        "l2_group_size": 8,
+        "l2_group_size": 16,
         "overlap_epilogue": True,
-        "pipe_depth": 5,
-        "wb_pipe_depth": 4,
+        "pipe_depth": 6,
+        "wb_pipe_depth": 8,
     },
     4096: {
         "cta_n": 256,
         "cta_k": 64,
-        "l2_group_size": 4,
-        "overlap_epilogue": False,
-        "pipe_depth": 4,
+        "l2_group_size": 16,
+        "overlap_epilogue": True,
+        "pipe_depth": 6,
         "wb_pipe_depth": 8,
     },
     8192: {
@@ -77,7 +78,7 @@ GEMM_CONFIGS = {
     16384: {
         "cta_n": 256,
         "cta_k": 64,
-        "l2_group_size": 8,
+        "l2_group_size": 4,
         "overlap_epilogue": False,
         "pipe_depth": 4,
         "wb_pipe_depth": 8,
@@ -91,6 +92,7 @@ _DEFAULT_CONFIG = {
     "overlap_epilogue": False,
     "pipe_depth": 4,
     "wb_pipe_depth": 8,
+    "scheduler": "clc",
 }
 
 
@@ -112,6 +114,7 @@ def _kernel(
     WB_PIPE_DEPTH: T.constexpr,
     L2_GROUP_SIZE: T.constexpr,
     OVERLAP_EPILOGUE: T.constexpr,
+    STATIC_SCHEDULER: T.constexpr,
 ):
     # Named locals: knob-branching or heavily-reused geometry; single-use values and
     # constants (CTA_GROUP=2, the cluster grid, ...) are inlined at their use-sites.
@@ -123,6 +126,9 @@ def _kernel(
     BLK_M = T.meta_var(128)  # CTA_M/2: per-CTA A rows (2-SM MMA combines the cluster)
     BLK_N = T.meta_var(MMA_N // 2)  # per-CTA B rows (cluster covers MMA_N)
     EPI_N = T.meta_var(MMA_N // WB_PIPE_DEPTH)  # epilogue N tile
+    TMEM_COLS = T.meta_var(max(32, TMEM_SLOTS * MMA_N))
+    NUM_M_TILES = T.meta_var(M // (256 * NUM_CONSUMER))
+    NUM_N_TILES = T.meta_var(N // MMA_N)
 
     T.device_entry()
     T.attr({"tirx.launch_bounds_min_blocks_per_sm": 1})
@@ -134,22 +140,40 @@ def _kernel(
 
     pool = T.SMEMPool()
     tmem_addr = pool.alloc((1,), "uint32")
-    tmem_pool = T.TMEMPool(pool, total_cols=512, cta_group=2, tmem_addr=tmem_addr)
-    # Input smem pipeline (full=tma expect_tx, empty=tcgen05 consumed).
-    smem_pipe = Pipeline(pool, PIPE_DEPTH, full="tma", empty="tcgen05", init_empty=NUM_CONSUMER)
-    # Accumulator tmem pipeline (full=tcgen05 commit, empty=mbar consumed).
-    tmem_pipe = Pipeline(pool, TMEM_SLOTS, full="tcgen05", empty="mbar", init_empty=2 * 128)
-    # CLC tile scheduler: owns the work-stealing handshake + scheduling barriers.
-    clc_sched = ClusterLaunchControlScheduler(
-        pool,
-        num_m_tiles=(M // (256 * NUM_CONSUMER)),
-        num_n_tiles=(N // MMA_N),
-        l2_group_size=L2_GROUP_SIZE,
-        cta_group=2,
-        finish_arrivals=((2 + NUM_CONSUMER) * 2 + NUM_CONSUMER),
+    tmem_pool = T.TMEMPool(
+        pool, total_cols=TMEM_COLS, cta_group=2, tmem_addr=tmem_addr, sync_after_alloc=False
     )
+    smem_mbar_leader = (wg_id == 0) & (warp_id == 1) & (lane_id == 0)
+    tmem_mbar_leader = (wg_id == 0) & (warp_id == 2) & (lane_id == 0)
+    alloc_mbar_leader = (wg_id == 0) & (warp_id == 0) & (lane_id == 0)
+    # Input smem pipeline (full=tma expect_tx, empty=tcgen05 consumed).
+    smem_pipe = Pipeline(
+        pool,
+        PIPE_DEPTH,
+        full="tma",
+        empty="tcgen05",
+        init_empty=NUM_CONSUMER,
+        leader=smem_mbar_leader,
+    )
+    # Accumulator tmem pipeline (full=tcgen05 commit, empty=mbar consumed).
+    tmem_pipe = Pipeline(
+        pool, TMEM_SLOTS, full="tcgen05", empty="mbar", init_empty=2 * 128, leader=tmem_mbar_leader
+    )
+    # CLC owns the work-stealing handshake. The 1024 static schedule launches
+    # exactly one tile per cluster and avoids allocating or running it.
+    if not STATIC_SCHEDULER:
+        clc_sched = ClusterLaunchControlScheduler(
+            pool,
+            num_m_tiles=NUM_M_TILES,
+            num_n_tiles=NUM_N_TILES,
+            l2_group_size=L2_GROUP_SIZE,
+            cta_group=2,
+            finish_arrivals=((2 + NUM_CONSUMER) * 2 + NUM_CONSUMER),
+        )
     # Teardown handshake: 1-arrival cross-CTA mbarrier (OVERLAP) vs the full cluster_sync.
-    tmem_fin = Pipeline(pool, 1, full="mbar", empty="mbar", init_full=1)
+    tmem_fin = Pipeline(pool, 1, full="mbar", empty="mbar", init_full=1, leader=tmem_mbar_leader)
+    alloc_done = MBarrier(pool, 1, leader=alloc_mbar_leader)
+    alloc_done.init(1)
     pool.move_base_to(1024)
     Asmem = pool.alloc_tcgen05_mma_AB((PIPE_DEPTH, NUM_CONSUMER, BLK_M, BLK_K), ab_type)
     Bsmem = pool.alloc_tcgen05_mma_AB((PIPE_DEPTH, BLK_N, BLK_K), ab_type)
@@ -160,9 +184,7 @@ def _kernel(
     )
     pool.commit()
     smem_full_cta0 = smem_pipe.full.remote_view(0)
-    tmem = tmem_pool.alloc((128, 512), "float32")
-    # TMEMPool.commit/dealloc wraps the tcgen05 alloc/dealloc handshake.
-    tmem_pool.commit()
+    tmem = tmem_pool.alloc((128, TMEM_COLS), "float32")
     T.ptx.fence.proxy_async("shared::cta")
     T.ptx.fence.mbarrier_init()
     # OVERLAP shapes split the prologue cluster barrier: arrive (relaxed) here, then each
@@ -173,13 +195,29 @@ def _kernel(
     else:
         T.cuda.cluster_sync()
 
+    # Delay the pair-collective allocation until after the prologue barrier:
+    # loaders can begin their first TMA flight while warp 0 allocates TMEM.
+    # MMA waits on the local alloc_done gate before its first tcgen05 access.
+    tmem_pool.commit()
+    if (wg_id == 0) & (warp_id == 0) & T.ptx.elect_sync():
+        alloc_done.arrive(0)
+
+    static_task = T.meta_var(bx // 2)
+    if NUM_M_TILES <= L2_GROUP_SIZE:
+        static_m = T.meta_var(static_task % NUM_M_TILES)
+        static_n = T.meta_var(static_task // NUM_M_TILES)
+    else:
+        static_group_span = T.meta_var(L2_GROUP_SIZE * NUM_N_TILES)
+        static_group = T.meta_var(static_task // static_group_span)
+        static_within = T.meta_var(static_task % static_group_span)
+        static_m = T.meta_var(static_group * L2_GROUP_SIZE + static_within % L2_GROUP_SIZE)
+        static_n = T.meta_var(static_within // L2_GROUP_SIZE)
+
     if wg_id == NUM_CONSUMER:
         # ==================== PRODUCER warpgroup ====================
         T.ptx.setmaxnreg(False, 56)  # reduce the producer's per-warp register budget
         if warp_id == 3:
             # -------- LOADER (TMA) --------
-            ld = clc_sched.worker("ld_sched")
-            ld.init(bx // 2)
             tma_cur = PipelineState(PIPE_DEPTH, 1)
             if OVERLAP_EPILOGUE:
                 T.ptx.barrier.cluster.wait(
@@ -222,20 +260,29 @@ def _kernel(
                     tma_load_stage(k_tile, m_idx, n_idx)
                     tma_cur.advance()
 
-            # CLC loader: load the current tile, then consume the schedule for the next.
-            if T.ptx.elect_sync():
-                while ld.valid():
-                    m_idx = T.meta_var(ld.m_idx)
-                    n_idx = T.meta_var(ld.n_idx)
-                    tma_load(m_idx, n_idx)
-                    ld.consume()
-                    ld.advance_coords()
-                    ld.mark_done_if_drained()
+            if STATIC_SCHEDULER:
+                if T.ptx.elect_sync():
+                    tma_load(static_m, static_n)
+            else:
+                # CLC loader: load the current tile, then consume the schedule for the next.
+                ld = clc_sched.worker("ld_sched")
+                ld.init(bx // 2)
+                if T.ptx.elect_sync():
+                    while ld.valid():
+                        m_idx = T.meta_var(ld.m_idx)
+                        n_idx = T.meta_var(ld.n_idx)
+                        tma_load(m_idx, n_idx)
+                        ld.consume()
+                        ld.advance_coords()
+                        ld.mark_done_if_drained()
         elif warp_id == 2:
             # -------- CLC SCHEDULER --------
-            if OVERLAP_EPILOGUE:
-                T.ptx.barrier.cluster.wait(acquire=True, aligned=False)  # split barrier (scheduler)
-            clc_sched.run_scheduler(cbx)
+            if not STATIC_SCHEDULER:
+                if OVERLAP_EPILOGUE:
+                    T.ptx.barrier.cluster.wait(
+                        acquire=True, aligned=False
+                    )  # split barrier (scheduler)
+                clc_sched.run_scheduler(cbx)
         elif (warp_id < NUM_CONSUMER) & (cbx == 0):
             # -------- MMA (tcgen05) --------
             mma_smem = PipelineState(PIPE_DEPTH, 0)
@@ -247,6 +294,7 @@ def _kernel(
                 T.ptx.barrier.cluster.wait(
                     acquire=True, aligned=False
                 )  # split cluster barrier (MMA)
+            alloc_done.wait(0, 0)
 
             @T.inline
             def mma_stage(buf):
@@ -277,22 +325,26 @@ def _kernel(
                 tmem_pipe.full.arrive(slot, cta_group=2, cta_mask=3)
                 tmem_buf.advance()
 
-            # CLC MMA: consume the schedule, then accumulate. mma() ignores the tile
-            # coords (it MMAs whatever the loader staged), so reset() not init().
-            mm = clc_sched.worker("mma_sched")
-            mm.reset()
-            if T.ptx.elect_sync():
-                while mm.valid():
-                    mm.consume()
+            if STATIC_SCHEDULER:
+                if T.ptx.elect_sync():
                     mma()
-                    mm.mark_done_if_drained()
+            else:
+                # CLC MMA: consume the schedule, then accumulate. mma() ignores the tile
+                # coords (it MMAs whatever the loader staged), so reset() not init().
+                mm = clc_sched.worker("mma_sched")
+                mm.reset()
+                if T.ptx.elect_sync():
+                    while mm.valid():
+                        mm.consume()
+                        mma()
+                        mm.mark_done_if_drained()
     elif wg_id < NUM_CONSUMER:
         # ==================== CONSUMER / EPILOGUE warpgroup(s) ====================
         if not OVERLAP_EPILOGUE:
             T.ptx.setmaxnreg(True, 224)  # raise the consumer's per-warp register budget
-        wb = clc_sched.worker("wb_sched")
-        wb.init(bx // 2)
         wb_buf = PipelineState(TMEM_PHASE_DEPTH, 0)
+        store_iter: T.int32
+        store_iter = 0
         if OVERLAP_EPILOGUE:
             T.ptx.barrier.cluster.wait(
                 acquire=True, aligned=False
@@ -316,9 +368,10 @@ def _kernel(
                     Tx.wg.cast(Dreg_16b, Dreg)
                     if i == WB_PIPE_DEPTH - 1:
                         tmem_pipe.empty.arrive(slot, remote=0, pred=True)
-                    db = T.meta_var(i % NUM_D_TILES)
-                    T.ptx.cp_async.bulk.wait_group(NUM_D_TILES - 1, read=True)
-                    T.cuda.warpgroup_sync(wg_id + 10)
+                    db = T.meta_var(store_iter % NUM_D_TILES)
+                    if store_iter >= NUM_D_TILES:
+                        T.ptx.cp_async.bulk.wait_group(NUM_D_TILES - 1, read=True)
+                        T.cuda.warpgroup_sync(wg_id + 10)
                     # consumer is wg_id==0 here; literal Dsmem[0,...] keeps STSM dispatch.
                     for jv in T.unroll(EPI_N // 8):
                         Tx.wg.copy(
@@ -340,6 +393,7 @@ def _kernel(
                         )
                     # commit_group collectively reconverges the warpgroup (no post-sync).
                     T.ptx.cp_async.bulk.commit_group()
+                    store_iter = store_iter + 1
             else:
                 # No-overlap: load+cast all chunks, free the accumulator, then store. Stage
                 # the tmem->reg f32 load in 16-col sub-chunks so the f32 footprint stays 16
@@ -354,8 +408,9 @@ def _kernel(
                     Tx.wg.cast(Dreg_16b[:, i * NOL : (i + 1) * NOL], Dreg)
                 tmem_pipe.empty.arrive(wg_id, remote=0, pred=True)
                 for i in T.unroll(WB_PIPE_DEPTH):
-                    db = T.meta_var(i % NUM_D_TILES)
-                    T.ptx.cp_async.bulk.wait_group(NUM_D_TILES - 1, read=True)
+                    db = T.meta_var(store_iter % NUM_D_TILES)
+                    if store_iter >= NUM_D_TILES:
+                        T.ptx.cp_async.bulk.wait_group(NUM_D_TILES - 1, read=True)
                     T.cuda.warpgroup_sync(wg_id + 10)
                     # Store reg->smem in 8-bf16 (128b) sub-slices -> st.128 (one swizzle
                     # chunk each), avoiding the scalar 16b loop / bank conflicts.
@@ -379,23 +434,31 @@ def _kernel(
                         )
                     # commit_group collectively reconverges the warpgroup (no post-sync).
                     T.ptx.cp_async.bulk.commit_group()
+                    store_iter = store_iter + 1
 
-        # CLC consumer: capture the current tile, consume the schedule for the next
-        # (overlapping it with the MMA-output wait), then store the captured tile.
-        cur_m: T.int32
-        cur_n: T.int32
-        while wb.valid():
-            cur_m = wb.m_idx
-            cur_n = wb.n_idx
-            wb.consume_wg(wg_id, warp_id, lane_id)
-            wb.advance_coords()
-            cm = T.meta_var(cur_m)
-            cn = T.meta_var(cur_n)
-            writeback(cm, cn)
+        if STATIC_SCHEDULER:
+            writeback(static_m, static_n)
             wb_buf.advance()
-            wb.mark_done_if_drained()
-        # Drain any in-flight TMA stores before tmem teardown.
-        T.ptx.cp_async.bulk.wait_group(0)
+        else:
+            # CLC consumer: capture the current tile, consume the schedule for the next
+            # (overlapping it with the MMA-output wait), then store the captured tile.
+            wb = clc_sched.worker("wb_sched")
+            wb.init(bx // 2)
+            cur_m: T.int32
+            cur_n: T.int32
+            while wb.valid():
+                cur_m = wb.m_idx
+                cur_n = wb.n_idx
+                wb.consume_wg(wg_id, warp_id, lane_id)
+                wb.advance_coords()
+                cm = T.meta_var(cur_m)
+                cn = T.meta_var(cur_n)
+                writeback(cm, cn)
+                wb_buf.advance()
+                wb.mark_done_if_drained()
+        # The overlap teardown can run while the final TMA store drains.
+        if not OVERLAP_EPILOGUE:
+            T.ptx.cp_async.bulk.wait_group(0)
         if OVERLAP_EPILOGUE:
             # Teardown: warpgroup_sync (all tmem reads done), then warp0 does a 1-arrival
             # cross-CTA mbarrier handshake before dealloc -- lighter than a full cluster_sync.
@@ -427,6 +490,7 @@ def tir_kernel(dtype: str, M: int, N: int, K: int):
         WB_PIPE_DEPTH=cfg["wb_pipe_depth"],
         L2_GROUP_SIZE=cfg["l2_group_size"],
         OVERLAP_EPILOGUE=cfg["overlap_epilogue"],
+        STATIC_SCHEDULER=cfg.get("scheduler", "clc") == "static",
     )
 
 

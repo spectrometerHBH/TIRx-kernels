@@ -16,7 +16,7 @@ from tvm.backend.cuda.operator.tile_primitive.tma_utils import SwizzleMode
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.bench import bench
-from tvm.tirx.lang.pipeline import MBarrier, Pipeline, PipelineState, TMABar
+from tvm.tirx.lang.pipeline import MBarrier, PipelineState, TCGen05Bar, TMABar
 from tvm.tirx.lang.tile_scheduler import ClusterPersistentScheduler2D
 
 
@@ -235,17 +235,18 @@ void nvfp4_cublaslt(torch::Tensor A, torch::Tensor B, torch::Tensor A_scale,
     return _CUBLASLT_EXT
 
 
-def _tma_g2s_args(bar, stage, cta_mask, cta_group):
-    """Shared kwargs for the A/B and SF TMA g2s loads; only the mbarrier and
-    cta_mask vary."""
-    return {
+def _tma_g2s_args(bar, stage, cta_mask, cta_group, cache_hint):
+    """Shared kwargs for the A/B and SF TMA g2s loads."""
+    args = {
         "dispatch": "tma_auto",
         "cta_group": cta_group,
         "mbar": T.reinterpret("handle", T.ptx.map_shared_rank(bar.ptr_to([stage]), 0)),
         "cta_mask": cta_mask,
-        "cache_hint": "evict_normal",
         "prefetch_tensormap": True,
     }
+    if cache_hint is not None:
+        args["cache_hint"] = cache_hint
+    return args
 
 
 @T.jit
@@ -278,6 +279,11 @@ def _kernel(
     L2_GROUP_SIZE: T.constexpr = 8,
     NUM_WARPS: T.constexpr = 8,
     OVERLAP_EPI: T.constexpr = True,
+    TMA_SPLIT: T.constexpr = 1,
+    LOAD_CACHE_HINT: T.constexpr = "evict_normal",
+    MERGE_TMA_BARRIERS: T.constexpr = False,
+    EARLY_TMEM_TEARDOWN: T.constexpr = False,
+    DIRECT_EPI: T.constexpr = False,
 ):
     # Derived shapes (formulas, so they track the params above).
     CLUSTER_SIZE = T.meta_var(CLUSTER_M * CLUSTER_N)
@@ -301,6 +307,7 @@ def _kernel(
     CLUSTER_M_TILES = T.meta_var(M // CTA_M // CLUSTER_M)
     CLUSTER_N_TILES = T.meta_var(N // MMA_N // CLUSTER_N)
     T.device_entry()
+    T.attr({"tirx.launch_bounds_min_blocks_per_sm": 1})
     cluster_rank = T.cta_id_in_cluster([CLUSTER_SIZE], preferred=[CLUSTER_SIZE])
     cta_idx = T.cta_id([SM_COUNT])
     tid_in_cta = T.thread_id([NUM_WARPS * 32])
@@ -349,23 +356,29 @@ def _kernel(
     )
     tmem_addr = pool.alloc([1], "uint32", align=4)
     mbar_leader = tid_in_cta == 32
-    smem_pipe = Pipeline(pool, PIPE_DEPTH, full="tma", empty="tcgen05", leader=mbar_leader)
-    tile_full_bar = TMABar(pool, PIPE_DEPTH, leader=mbar_leader)
-    tile_full_bar.init(1)
-    scale_full_bar = TMABar(pool, PIPE_DEPTH, leader=mbar_leader)
-    scale_full_bar.init(1)
-    tmem_pipe = Pipeline(
-        pool,
-        TMEM_PIPE_DEPTH,
-        full="tcgen05",
-        empty="mbar",
-        init_empty=CTA_GROUP,
-        leader=mbar_leader,
-    )
+    smem_full = TMABar(pool, PIPE_DEPTH, leader=mbar_leader)
+    smem_empty = TCGen05Bar(pool, PIPE_DEPTH, leader=mbar_leader)
+    if not MERGE_TMA_BARRIERS:
+        tile_full_bar = TMABar(pool, PIPE_DEPTH, leader=mbar_leader)
+        scale_full_bar = TMABar(pool, PIPE_DEPTH, leader=mbar_leader)
+    tmem_full = TCGen05Bar(pool, TMEM_PIPE_DEPTH, leader=mbar_leader)
+    tmem_empty = MBarrier(pool, TMEM_PIPE_DEPTH, leader=mbar_leader)
     tmem_finished = MBarrier(pool, 1, leader=mbar_leader)
-    tmem_finished.init(1)
+    if mbar_leader:
+        for stage in T.unroll(PIPE_DEPTH):
+            T.ptx.mbarrier.init(smem_full.ptr_to([stage]), 1)
+            T.ptx.mbarrier.init(smem_empty.ptr_to([stage]), 1)
+            if not MERGE_TMA_BARRIERS:
+                T.ptx.mbarrier.init(tile_full_bar.ptr_to([stage]), 1)
+                T.ptx.mbarrier.init(scale_full_bar.ptr_to([stage]), 1)
+        for stage in T.unroll(TMEM_PIPE_DEPTH):
+            T.ptx.mbarrier.init(tmem_full.ptr_to([stage]), 1)
+            T.ptx.mbarrier.init(tmem_empty.ptr_to([stage]), CTA_GROUP)
+        T.ptx.mbarrier.init(tmem_finished.ptr_to([0]), 1)
     pool.commit()
-    tmem_pool = T.TMEMPool(pool, total_cols=512, cta_group=CTA_GROUP, tmem_addr=tmem_addr)
+    tmem_pool = T.TMEMPool(
+        pool, total_cols=512, cta_group=CTA_GROUP, tmem_addr=tmem_addr, sync_after_alloc=False
+    )
     tmem = tmem_pool.alloc((CTA_M, 512), "float32")
     A_smem = A_smem_packed.view("float4_e2m1fn")
     B_smem = B_smem_packed.view("float4_e2m1fn")
@@ -379,10 +392,14 @@ def _kernel(
     SFB_tmem = tmem_pool.alloc_sf(
         (128 * SFB_n_chunks, sf_mma_k * MMA_K_BLOCKS), "float8_e4m3fn", sf_per_mma=sf_mma_k
     )
-    T.ptx.barrier.cluster.arrive(sem="release", aligned=True)
-    T.ptx.barrier.cluster.wait(acquire=True, aligned=False)
-    # Alloc TMEM after the cluster sync, warp-0-only, before the role split, so
-    # the TMA warp overlaps its first loads with the alloc.
+    T.ptx.fence.proxy_async("shared::cta")
+    T.ptx.fence.mbarrier_init()
+    if OVERLAP_EPI:
+        T.ptx.barrier.cluster.arrive(sem="relaxed", aligned=True)
+    else:
+        T.cuda.cluster_sync()
+    # Split the overlap prologue so the first TMA flight and TMEM allocation
+    # can run in parallel. Each active role performs the acquire wait below.
     tmem_pool.commit()
     if tid_in_cta < 32:
         T.ptx.tcgen05.relinquish_alloc_permit(cta_group=CTA_GROUP)
@@ -397,34 +414,60 @@ def _kernel(
     accum = 0
     epi_cur = PipelineState(TMEM_PIPE_DEPTH, 0)
     epi_wb_state = PipelineState(WB_PIPE_DEPTH, 1)
-    alpha_local: T.float32
-    alpha_local = alpha[0]
+    epi_store_iter: T.int32
+    epi_store_iter = 0
     if warp_id == int(WarpRole.TMA):
+        if OVERLAP_EPI:
+            T.ptx.barrier.cluster.wait(acquire=True, aligned=False)
 
         @T.inline
         def issue_tma_load(k_tile: T.int32):
             stage = tma_cur.stage
             k = T.meta_var(k_tile * CTA_K // 2)
-            smem_pipe.empty.wait(tma_cur.stage, tma_cur.phase)
+            smem_empty.wait(tma_cur.stage, tma_cur.phase)
             if id_in_pair == 0:
-                tile_bytes = T.meta_var(A_BYTES + B_BYTES)
-                T.ptx.mbarrier.arrive.expect_tx(
-                    tile_full_bar.ptr_to([stage]), tile_bytes, remote=pair_leader_rank, pred=True
-                )
+                if MERGE_TMA_BARRIERS:
+                    tile_bytes = T.meta_var(A_BYTES + B_BYTES + SFA_BYTES + SFB_BYTES)
+                    T.ptx.mbarrier.arrive.expect_tx(
+                        smem_full.ptr_to([stage]), tile_bytes, remote=pair_leader_rank, pred=True
+                    )
+                else:
+                    tile_bytes = T.meta_var(A_BYTES + B_BYTES)
+                    T.ptx.mbarrier.arrive.expect_tx(
+                        tile_full_bar.ptr_to([stage]),
+                        tile_bytes,
+                        remote=pair_leader_rank,
+                        pred=True,
+                    )
             single_cta_mask: T.int32 = 1 << id_in_pair
             # Barrier pre-mapped to the cluster leader (the g2s primitive maps
             # neither the barrier nor expect_tx — both handled above).
-            tile_copy = T.meta_var(_tma_g2s_args(tile_full_bar, stage, single_cta_mask, CTA_GROUP))
-            Tx.copy_async(
-                A_smem_packed[stage, 0:CTA_M, 0 : CTA_K // 2],
-                A_packed[a_m : a_m + CTA_M, k : k + CTA_K // 2],
-                **tile_copy,
-            )
-            Tx.copy_async(
-                B_smem_packed[stage, 0:CTA_N, 0 : CTA_K // 2],
-                B_packed[b_n : b_n + CTA_N, k : k + CTA_K // 2],
-                **tile_copy,
-            )
+            if MERGE_TMA_BARRIERS:
+                tile_copy = T.meta_var(
+                    _tma_g2s_args(smem_full, stage, single_cta_mask, CTA_GROUP, LOAD_CACHE_HINT)
+                )
+            else:
+                tile_copy = T.meta_var(
+                    _tma_g2s_args(tile_full_bar, stage, single_cta_mask, CTA_GROUP, LOAD_CACHE_HINT)
+                )
+            for split_idx in T.unroll(TMA_SPLIT):
+                split_m = T.meta_var(split_idx * (CTA_M // TMA_SPLIT))
+                Tx.copy_async(
+                    A_smem_packed[stage, split_m : split_m + CTA_M // TMA_SPLIT, 0 : CTA_K // 2],
+                    A_packed[
+                        a_m + split_m : a_m + split_m + CTA_M // TMA_SPLIT, k : k + CTA_K // 2
+                    ],
+                    **tile_copy,
+                )
+            for split_idx in T.unroll(TMA_SPLIT):
+                split_n = T.meta_var(split_idx * (CTA_N // TMA_SPLIT))
+                Tx.copy_async(
+                    B_smem_packed[stage, split_n : split_n + CTA_N // TMA_SPLIT, 0 : CTA_K // 2],
+                    B_packed[
+                        b_n + split_n : b_n + split_n + CTA_N // TMA_SPLIT, k : k + CTA_K // 2
+                    ],
+                    **tile_copy,
+                )
 
         if T.ptx.elect_sync():
             while tile_scheduler.valid():
@@ -433,6 +476,8 @@ def _kernel(
                     tma_cur.advance()
                 tile_scheduler.next_tile()
     elif warp_id == int(WarpRole.TMA) + 1:
+        if OVERLAP_EPI:
+            T.ptx.barrier.cluster.wait(acquire=True, aligned=False)
 
         @T.inline
         def issue_scale_tma_load(k_tile: T.int32):
@@ -440,22 +485,42 @@ def _kernel(
             sf_k = T.meta_var(k_tile * SF_CTA_K)
             sf_m = T.meta_var((a_m // 128) * 128)
             sf_n = T.meta_var((d_n // 128) * 128)
-            smem_pipe.empty.wait(tma_cur.stage, tma_cur.phase)
-            if id_in_pair == 0:
-                scale_bytes = T.meta_var(SFA_BYTES + SFB_BYTES)
-                T.ptx.mbarrier.arrive.expect_tx(
-                    scale_full_bar.ptr_to([stage]), scale_bytes, remote=pair_leader_rank, pred=True
-                )
+            smem_empty.wait(tma_cur.stage, tma_cur.phase)
+            if not MERGE_TMA_BARRIERS:
+                if id_in_pair == 0:
+                    scale_bytes = T.meta_var(SFA_BYTES + SFB_BYTES)
+                    T.ptx.mbarrier.arrive.expect_tx(
+                        scale_full_bar.ptr_to([stage]),
+                        scale_bytes,
+                        remote=pair_leader_rank,
+                        pred=True,
+                    )
             single_cta_mask: T.int32 = 1 << id_in_pair
             # SFA: each CTA loads its half (single_cta_mask). SFB: multicast to
             # both CTAs (pair_mask).
-            sfa_copy = T.meta_var(_tma_g2s_args(scale_full_bar, stage, single_cta_mask, CTA_GROUP))
+            if MERGE_TMA_BARRIERS:
+                sfa_copy = T.meta_var(
+                    _tma_g2s_args(smem_full, stage, single_cta_mask, CTA_GROUP, LOAD_CACHE_HINT)
+                )
+            else:
+                sfa_copy = T.meta_var(
+                    _tma_g2s_args(
+                        scale_full_bar, stage, single_cta_mask, CTA_GROUP, LOAD_CACHE_HINT
+                    )
+                )
             Tx.copy_async(
                 SFA_smem[stage, 0:CTA_M, 0:SF_CTA_K],
                 SFA_in[sf_m : sf_m + CTA_M, sf_k : sf_k + SF_CTA_K],
                 **sfa_copy,
             )
-            sfb_copy = T.meta_var(_tma_g2s_args(scale_full_bar, stage, pair_mask, CTA_GROUP))
+            if MERGE_TMA_BARRIERS:
+                sfb_copy = T.meta_var(
+                    _tma_g2s_args(smem_full, stage, pair_mask, CTA_GROUP, LOAD_CACHE_HINT)
+                )
+            else:
+                sfb_copy = T.meta_var(
+                    _tma_g2s_args(scale_full_bar, stage, pair_mask, CTA_GROUP, LOAD_CACHE_HINT)
+                )
             if SFB_N == 128:
                 if id_in_pair == 0:
                     Tx.copy_async(
@@ -477,12 +542,17 @@ def _kernel(
                     tma_cur.advance()
                 tile_scheduler.next_tile()
     elif (warp_id == int(WarpRole.MMA)) & (id_in_pair == 0):
+        if OVERLAP_EPI:
+            T.ptx.barrier.cluster.wait(acquire=True, aligned=False)
 
         @T.inline
         def execute_mma():
             stage = mma_smem.stage
-            scale_full_bar.wait(mma_smem.stage, mma_smem.phase)
-            tile_full_bar.wait(mma_smem.stage, mma_smem.phase)
+            if MERGE_TMA_BARRIERS:
+                smem_full.wait(mma_smem.stage, mma_smem.phase)
+            else:
+                scale_full_bar.wait(mma_smem.stage, mma_smem.phase)
+                tile_full_bar.wait(mma_smem.stage, mma_smem.phase)
             Tx.copy_async(SFA_tmem, SFA_smem[stage], cta_group=CTA_GROUP)
             Tx.copy_async(SFB_tmem, SFB_smem[stage], cta_group=CTA_GROUP)
             Tx.gemm_async(
@@ -496,41 +566,54 @@ def _kernel(
                 cta_group=CTA_GROUP,
             )
             accum = 1
-            smem_pipe.empty.arrive(mma_smem.stage, cta_group=CTA_GROUP, cta_mask=pair_mask)
+            smem_empty.arrive(mma_smem.stage, cta_group=CTA_GROUP, cta_mask=pair_mask)
 
         if T.ptx.elect_sync():
             while tile_scheduler.valid():
-                tmem_pipe.empty.wait(mma_tmem.stage, mma_tmem.phase)
+                tmem_empty.wait(mma_tmem.stage, mma_tmem.phase)
                 accum = 0
                 for k_tile in T.serial(K_TILES):
                     execute_mma()
                     mma_smem.advance()
-                tmem_pipe.full.arrive(mma_tmem.stage, cta_group=CTA_GROUP, cta_mask=pair_mask)
+                tmem_full.arrive(mma_tmem.stage, cta_group=CTA_GROUP, cta_mask=pair_mask)
                 mma_tmem.advance()
                 tile_scheduler.next_tile()
     elif warp_id >= int(WarpRole.EPILOGUE):
+        if OVERLAP_EPI:
+            T.ptx.barrier.cluster.wait(acquire=True, aligned=False)
+        alpha_local: T.float32
+        alpha_local = alpha[0]
 
         @T.inline
         def regs_to_smem(reg_ldst_16b):
-            # R->S in 16-col chunks to match stmatrix.x4 granularity (one wide
-            # copy schedules worse).
-            for cj in T.unroll(EPI_TILE // 16):
-                cc = T.meta_var(cj * 16)
-                Tx.wg.copy(
-                    output_smem[epi_wb_state.stage, 0:CTA_M, cc : cc + 16],
-                    reg_ldst_16b[:, cc : cc + 16],
-                    dispatch="ldstmatrix",
-                )
+            if DIRECT_EPI:
+                for cj in T.unroll(EPI_TILE // 8):
+                    cc = T.meta_var(cj * 8)
+                    Tx.wg.copy(
+                        output_smem[epi_wb_state.stage, 0:CTA_M, cc : cc + 8],
+                        reg_ldst_16b[:, cc : cc + 8],
+                    )
+            else:
+                # R->S in 16-col chunks to match stmatrix.x4 granularity (one wide
+                # copy schedules worse).
+                for cj in T.unroll(EPI_TILE // 16):
+                    cc = T.meta_var(cj * 16)
+                    Tx.wg.copy(
+                        output_smem[epi_wb_state.stage, 0:CTA_M, cc : cc + 16],
+                        reg_ldst_16b[:, cc : cc + 16],
+                        dispatch="ldstmatrix",
+                    )
 
         @T.inline
         def epilogue():
-            tmem_pipe.full.wait(epi_cur.stage, epi_cur.phase)
+            tmem_full.wait(epi_cur.stage, epi_cur.phase)
 
             # Per-chunk store: R->S (stmatrix) then S->G (TMA). Shared by both schedules.
             @T.inline
             def store_epi_chunk(reg_ldst_16b, linear_n: T.constexpr):
-                T.ptx.cp_async.bulk.wait_group(WB_PIPE_DEPTH - 1, read=True)
-                T.cuda.warpgroup_sync(1)
+                if epi_store_iter >= WB_PIPE_DEPTH:
+                    T.ptx.cp_async.bulk.wait_group(WB_PIPE_DEPTH - 1, read=True)
+                    T.cuda.warpgroup_sync(1)
                 regs_to_smem(reg_ldst_16b)
                 T.cuda.warpgroup_sync(1)
                 d_n_out: T.int32
@@ -546,41 +629,80 @@ def _kernel(
                     )
                     T.ptx.cp_async.bulk.commit_group()
                 epi_wb_state.advance()
+                epi_store_iter = epi_store_iter + 1
 
             # Fusion vs fission of {load; scale+cast; store}: overlap fuses and reuses
             # a small (128, EPI_TILE) frag; non-overlap splits the loops, needing a big
             # (128, MMA_N) frag (all chunks live between load and store).
             if OVERLAP_EPI:
-                reg_ldst = T.alloc_tcgen05_ldst_frag("16x256b", (128, EPI_TILE), "float32")
-                reg_ldst_16b = T.alloc_cast_frag(reg_ldst, "bfloat16")
+                if DIRECT_EPI:
+                    reg_ldst = T.wg_reg_tile(EPI_TILE)
+                    reg_ldst_16b = T.wg_reg_tile(EPI_TILE, dtype="bfloat16")
+                else:
+                    reg_ldst = T.alloc_tcgen05_ldst_frag("16x256b", (128, EPI_TILE), "float32")
+                    reg_ldst_16b = T.alloc_cast_frag(reg_ldst, "bfloat16")
                 for no in T.unroll(MMA_N // EPI_TILE):
                     linear_n = T.meta_var(no * EPI_TILE)
                     Tx.wg.copy_async(reg_ldst[:, :], tmem[:, linear_n : linear_n + EPI_TILE])
                     if no == MMA_N // EPI_TILE - 1:
                         T.ptx.tcgen05.wait.ld()
+                        if EARLY_TMEM_TEARDOWN:
+                            T.cuda.warpgroup_sync(1)
                         if tid_in_wg == 0:
-                            tmem_pipe.empty.arrive(
+                            tmem_empty.arrive(
                                 epi_cur.stage, remote=pair_leader_rank, pred=True, count=1
                             )
+                            if EARLY_TMEM_TEARDOWN:
+                                if (
+                                    tile_scheduler.linear_idx + NUM_CLUSTERS
+                                    >= CLUSTER_M_TILES * CLUSTER_N_TILES
+                                ):
+                                    T.ptx.mbarrier.arrive(
+                                        tmem_finished.ptr_to([0]),
+                                        remote=pair_leader_rank + 1 - id_in_pair,
+                                        pred=True,
+                                        count=1,
+                                    )
                     Tx.wg.mul(reg_ldst, reg_ldst, alpha_local)
                     Tx.wg.cast(reg_ldst_16b, reg_ldst)
                     store_epi_chunk(reg_ldst_16b, linear_n)
             else:
                 # Keep the 2D frag so it can be column-sliced for the chunked store.
-                reg_all = T.alloc_tcgen05_ldst_frag("16x256b", (128, MMA_N), "float32")
-                reg_all_16b = T.alloc_cast_frag(reg_all, "bfloat16")
+                if DIRECT_EPI:
+                    reg_all = T.wg_reg_tile(MMA_N)
+                    reg_all_16b = T.wg_reg_tile(MMA_N, dtype="bfloat16")
+                else:
+                    reg_all = T.alloc_tcgen05_ldst_frag("16x256b", (128, MMA_N), "float32")
+                    reg_all_16b = T.alloc_cast_frag(reg_all, "bfloat16")
                 for no in T.unroll(MMA_N // EPI_TILE):
                     ln = T.meta_var(no * EPI_TILE)
                     Tx.wg.copy_async(reg_all[:, ln : ln + EPI_TILE], tmem[:, ln : ln + EPI_TILE])
                 T.ptx.tcgen05.wait.ld()
+                if EARLY_TMEM_TEARDOWN:
+                    T.cuda.warpgroup_sync(1)
+                    if tid_in_wg == 0:
+                        tmem_empty.arrive(
+                            epi_cur.stage, remote=pair_leader_rank, pred=True, count=1
+                        )
+                        if (
+                            tile_scheduler.linear_idx + NUM_CLUSTERS
+                            >= CLUSTER_M_TILES * CLUSTER_N_TILES
+                        ):
+                            T.ptx.mbarrier.arrive(
+                                tmem_finished.ptr_to([0]),
+                                remote=pair_leader_rank + 1 - id_in_pair,
+                                pred=True,
+                                count=1,
+                            )
                 # scale + cast the whole frag
                 Tx.wg.mul(reg_all, reg_all, alpha_local)
                 Tx.wg.cast(reg_all_16b, reg_all)
-                if tid_in_wg == 0:
-                    tmem_pipe.empty.arrive(
-                        epi_cur.stage, remote=pair_leader_rank, pred=True, count=1
-                    )
-                T.cuda.warpgroup_sync(1)
+                if not EARLY_TMEM_TEARDOWN:
+                    if tid_in_wg == 0:
+                        tmem_empty.arrive(
+                            epi_cur.stage, remote=pair_leader_rank, pred=True, count=1
+                        )
+                    T.cuda.warpgroup_sync(1)
                 for no in T.unroll(MMA_N // EPI_TILE):
                     ln = T.meta_var(no * EPI_TILE)
                     store_epi_chunk(reg_all_16b[:, ln : ln + EPI_TILE], ln)
@@ -589,17 +711,19 @@ def _kernel(
             epilogue()
             epi_cur.advance()
             tile_scheduler.next_tile()
-        if tid_in_wg == 0:
-            T.ptx.cp_async.bulk.wait_group(0, read=True)
-        T.cuda.warpgroup_sync(1)
+        if not EARLY_TMEM_TEARDOWN:
+            if tid_in_wg == 0:
+                T.ptx.cp_async.bulk.wait_group(0, read=True)
+            T.cuda.warpgroup_sync(1)
     if warp_id == int(WarpRole.EPILOGUE):
-        if T.ptx.elect_sync():
-            T.ptx.mbarrier.arrive(
-                tmem_finished.ptr_to([0]),
-                remote=pair_leader_rank + 1 - id_in_pair,
-                pred=True,
-                count=1,
-            )
+        if not EARLY_TMEM_TEARDOWN:
+            if T.ptx.elect_sync():
+                T.ptx.mbarrier.arrive(
+                    tmem_finished.ptr_to([0]),
+                    remote=pair_leader_rank + 1 - id_in_pair,
+                    pred=True,
+                    count=1,
+                )
         T.ptx.mbarrier.try_wait_acquire_cluster(tmem_finished.ptr_to([0]), 0)
         T.ptx.tcgen05.dealloc(tmem_pool.addr, n_cols=512, cta_group=CTA_GROUP)
 
@@ -609,6 +733,10 @@ def tir_ws_kernel(M: int, N: int, K: int):
     assert (M // 128) % 2 == 0
     assert (K // 16) % 4 == 0
     config = dict(TIRX_CONFIGS.get((M, N, K), {}))
+    tma_split = config.get("TMA_SPLIT", 1)
+    cta_n = config.get("CTA_N", 128)
+    assert 128 % tma_split == 0 and cta_n % tma_split == 0
+    assert 128 // tma_split >= 8 and cta_n // tma_split >= 8
     return _kernel.specialize(M=M, N=N, K=K, **config)
 
 
@@ -619,17 +747,27 @@ TIRX_CONFIGS = {
         "SM_COUNT": 64,
         "CTA_N": 64,
         "EPI_TILE": 32,
+        "WB_PIPE_DEPTH": 3,
         "PIPE_DEPTH": 5,
         "L2_GROUP_SIZE": 12,
         "OVERLAP_EPI": True,
+        "LOAD_CACHE_HINT": None,
+        "MERGE_TMA_BARRIERS": True,
+        "EARLY_TMEM_TEARDOWN": True,
+        "DIRECT_EPI": True,
     },
     (2048, 2048, 2048): {
         "SM_COUNT": 128,
         "CTA_N": 128,
         "EPI_TILE": 32,
+        "WB_PIPE_DEPTH": 3,
         "PIPE_DEPTH": 5,
         "L2_GROUP_SIZE": 4,
         "OVERLAP_EPI": True,
+        "TMA_SPLIT": 8,
+        "MERGE_TMA_BARRIERS": True,
+        "EARLY_TMEM_TEARDOWN": True,
+        "DIRECT_EPI": True,
     },
     (4096, 4096, 4096): {
         "SM_COUNT": 148,
@@ -638,22 +776,28 @@ TIRX_CONFIGS = {
         "PIPE_DEPTH": 5,
         "L2_GROUP_SIZE": 4,
         "OVERLAP_EPI": False,
+        "LOAD_CACHE_HINT": None,
+        "DIRECT_EPI": True,
     },
     (8192, 8192, 8192): {
         "SM_COUNT": 148,
         "CTA_N": 128,
-        "EPI_TILE": 16,
-        "PIPE_DEPTH": 4,
+        "EPI_TILE": 32,
+        "PIPE_DEPTH": 5,
         "L2_GROUP_SIZE": 1,
         "OVERLAP_EPI": False,
+        "LOAD_CACHE_HINT": None,
+        "DIRECT_EPI": True,
     },
     (16384, 16384, 16384): {
         "SM_COUNT": 148,
         "CTA_N": 128,
         "EPI_TILE": 16,
-        "PIPE_DEPTH": 4,
-        "L2_GROUP_SIZE": 12,
+        "PIPE_DEPTH": 5,
+        "L2_GROUP_SIZE": 16,
         "OVERLAP_EPI": False,
+        "LOAD_CACHE_HINT": None,
+        "DIRECT_EPI": True,
     },
 }
 
