@@ -98,6 +98,11 @@ class NvFp4GemmConfig:
     epilogue: str = "overlap"
     # K per pipeline tile (default 256; nvjet runs 64 = finer, deeper pipeline).
     cta_k: int | None = None
+    # A/B TMA loads per stage are issued as this many M-sub-boxes (1 = one box
+    # per operand). nvjet issues ~24-28 fine-grained TMA ops per k-tile; at
+    # 2048 a split of 8 measured +3.4% (the stage's last byte lands sooner with
+    # more parallel boxes in flight).
+    tma_split: int | None = None
     # Per-warpgroup register budget (canon's INVARIANT-I1b per-role `setmaxnreg`).
     maxnreg_epilogue: int | None = None
     maxnreg_producer: int | None = None
@@ -121,6 +126,10 @@ def _cfg_d_depth(config: NvFp4GemmConfig) -> int:
 
 def _cfg_l2_group_size(config: NvFp4GemmConfig) -> int:
     return config.l2_group_size if config.l2_group_size is not None else TILE_GROUPS_ROW_SIZE
+
+
+def _cfg_tma_split(config: NvFp4GemmConfig) -> int:
+    return config.tma_split if config.tma_split is not None else 1
 
 
 def nvfp4_task_config(tasks: int) -> NvFp4GemmConfig:
@@ -155,6 +164,9 @@ GEMM_CONFIGS = {
         # D-store ring 3 deep: cuts the per-band drain waits (0.906 -> 0.933).
         "d_depth": 3,
         "epi_tile": 32,
+        # A/B as 8 M-sub-boxes per stage: the stage's last byte lands sooner
+        # with more parallel TMA boxes in flight (0.916 -> 0.95 vs cublasLt).
+        "tma_split": 8,
     },
     # 4096: the epilogue is the wall-clock residual.
     (4096, 4096, 4096): {
@@ -428,36 +440,42 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
                             )
                         kb = t * blk_k_bytes  # packed-fp4 byte column
                         # canon tags every g2c load with the L2 `evict_normal` policy.
-                        k.tma_load(
-                            TensorSlice(
-                                tensor=a_smem,
-                                offsets=(ld_stage, 0, 0),
-                                shape=(1, blk_m, blk_k_bytes),
-                            ),
-                            a_gmem,
-                            mbar=smem_full_leader,
-                            coords=(a_m, kb),
-                            shape=(1, blk_m, blk_k_bytes),
-                            gmem_shape=(blk_m, blk_k_bytes),
-                            mbar_stage=ld_stage,
-                            cache_hint=load_cache_hint,
-                            cta_group=cta_group,
-                        )
-                        k.tma_load(
-                            TensorSlice(
-                                tensor=b_smem,
-                                offsets=(ld_stage, 0, 0),
-                                shape=(1, blk_n, blk_k_bytes),
-                            ),
-                            b_gmem,
-                            mbar=smem_full_leader,
-                            coords=(b_n, kb),
-                            shape=(1, blk_n, blk_k_bytes),
-                            gmem_shape=(blk_n, blk_k_bytes),
-                            mbar_stage=ld_stage,
-                            cache_hint=load_cache_hint,
-                            cta_group=cta_group,
-                        )
+                        # tma_split>1: A/B as N M-sub-boxes per stage (finer TMA
+                        # granularity, nvjet-style; the stage's last byte lands
+                        # sooner with more parallel boxes in flight).
+                        _split = _cfg_tma_split(config)
+                        for ab_i in range(_split):
+                            k.tma_load(
+                                TensorSlice(
+                                    tensor=a_smem,
+                                    offsets=(ld_stage, ab_i * (blk_m // _split), 0),
+                                    shape=(1, blk_m // _split, blk_k_bytes),
+                                ),
+                                a_gmem,
+                                mbar=smem_full_leader,
+                                coords=(a_m + ab_i * (blk_m // _split), kb),
+                                shape=(1, blk_m // _split, blk_k_bytes),
+                                gmem_shape=(blk_m // _split, blk_k_bytes),
+                                mbar_stage=ld_stage,
+                                cache_hint=load_cache_hint,
+                                cta_group=cta_group,
+                            )
+                        for ab_i in range(_split):
+                            k.tma_load(
+                                TensorSlice(
+                                    tensor=b_smem,
+                                    offsets=(ld_stage, ab_i * (blk_n // _split), 0),
+                                    shape=(1, blk_n // _split, blk_k_bytes),
+                                ),
+                                b_gmem,
+                                mbar=smem_full_leader,
+                                coords=(b_n + ab_i * (blk_n // _split), kb),
+                                shape=(1, blk_n // _split, blk_k_bytes),
+                                gmem_shape=(blk_n // _split, blk_k_bytes),
+                                mbar_stage=ld_stage,
+                                cache_hint=load_cache_hint,
+                                cta_group=cta_group,
+                            )
                         _advance_ring(k, ld_stage, ld_phase, smem_depth)
         # ---- SF producer (canon's second producer warp): scale-factor loads on
         # warp 3, pacing its own arrive/loads per k-tile.
@@ -779,6 +797,15 @@ def _validate_config(config: NvFp4GemmConfig, cta_k: int = CTA_K) -> None:
     d_depth = _cfg_d_depth(config)
     if not isinstance(d_depth, int) or isinstance(d_depth, bool) or d_depth < 2:
         raise ValueError("nvfp4_gemm d_depth must be an integer >= 2")
+    tma_split = _cfg_tma_split(config)
+    if not isinstance(tma_split, int) or isinstance(tma_split, bool) or tma_split < 1:
+        raise ValueError("nvfp4_gemm tma_split must be a positive integer")
+    # Sub-boxes keep full 128B swizzle-atom rows (M-split only): each operand's
+    # row count must split into >= 8-row boxes (the swizzle atom's row span).
+    if CTA_M % tma_split != 0 or cta_n % tma_split != 0:
+        raise ValueError("nvfp4_gemm tma_split must divide CTA_M and cta_n")
+    if CTA_M // tma_split < 8 or cta_n // tma_split < 8:
+        raise ValueError("nvfp4_gemm tma_split sub-boxes must be at least 8 rows")
     sched_rows = _ceil_div(config.m, CTA_M)
     if sched_rows % CTA_GROUP != 0:
         raise ValueError("nvfp4_gemm requires an even number of M tiles per cluster pair")

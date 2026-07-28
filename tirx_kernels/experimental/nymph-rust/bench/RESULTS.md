@@ -65,3 +65,20 @@ first TMA flight, plus the mandatory dealloc rendezvous at exit (nvjet
 additionally uses PREEXIT for the exit overlap). Closing 1024 requires
 launch/framework-level work (cheaper alloc placement / PREEXIT / PDL
 launch attributes), which is out of the kernel-body boundary.
+
+## cuBLASLt NVFP4 alignment (2026-07-28, dev pending)
+
+`cublaslt/tirx` from `python bench/run_suite.py --rounds 5 --max-shape 16384
+--filter nvfp4` (run 55). The A/B TMA loads at 2048 are issued as 8 M-sub-boxes
+per stage (`tma_split`, nvjet issues ~24-28 fine-grained TMA ops per k-tile):
+the stage's last byte lands sooner with more parallel boxes in flight
+(official 0.909 -> 0.962). 1024 keeps one box per operand (no steady-state
+pipeline at 4 k-tiles; splitting measured -1..-3%).
+
+| shape | cublaslt/tirx | per-round |
+|---|---:|---|
+| 1024 | 0.946 | 0.944-0.949 |
+| 2048 | 0.962 | 0.961-0.964 |
+| 4096 | 1.011 | 1.011-1.012 |
+| 8192 | 1.004 | 0.987-1.026 |
+| 16384 | 0.990 | 0.955-1.034 |
