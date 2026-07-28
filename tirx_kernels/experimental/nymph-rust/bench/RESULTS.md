@@ -66,7 +66,7 @@ additionally uses PREEXIT for the exit overlap). Closing 1024 requires
 launch/framework-level work (cheaper alloc placement / PREEXIT / PDL
 launch attributes), which is out of the kernel-body boundary.
 
-## cuBLASLt NVFP4 alignment (2026-07-28, dev pending)
+## cuBLASLt NVFP4 alignment (2026-07-28, dev dc4eebd2)
 
 `cublaslt/tirx` from `python bench/run_suite.py --rounds 5 --max-shape 16384
 --filter nvfp4` (run 55). The A/B TMA loads at 2048 are issued as 8 M-sub-boxes
