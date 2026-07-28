@@ -1962,6 +1962,7 @@ impl PyStmt {
             ir::Stmt::ClusterSync => "cluster_sync",
             ir::Stmt::ClusterBarrierArrive { .. } => "cluster_barrier_arrive",
             ir::Stmt::ClusterBarrierWait => "cluster_barrier_wait",
+            ir::Stmt::GridDepControl { .. } => "grid_dep_control",
             ir::Stmt::Fence { .. } => "fence",
             ir::Stmt::SetMaxNReg { .. } => "set_max_nreg",
             ir::Stmt::If { .. } => "if",
@@ -3078,6 +3079,15 @@ fn cluster_barrier_wait() -> PyStmt {
     PyStmt(ir::Stmt::ClusterBarrierWait)
 }
 
+#[pyfunction]
+#[pyo3(name = "GridDepControl", signature = (action = "launch_dependents"))]
+fn grid_dep_control(action: &str) -> PyResult<PyStmt> {
+    let action = ir::GridDepAction::parse(action).ok_or_else(|| {
+        PyRuntimeError::new_err("grid_dep_control action must be 'launch_dependents' or 'wait'")
+    })?;
+    Ok(PyStmt(ir::Stmt::GridDepControl { action }))
+}
+
 // ===========================================================================
 // chunk 7 — Kernel
 // ===========================================================================
@@ -3274,6 +3284,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(cluster_sync, m)?,
         wrap_pyfunction!(cluster_barrier_arrive, m)?,
         wrap_pyfunction!(cluster_barrier_wait, m)?,
+        wrap_pyfunction!(grid_dep_control, m)?,
     ] {
         m.add_function(f)?;
     }

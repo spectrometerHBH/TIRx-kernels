@@ -28,6 +28,7 @@ from .nymph_rs import (
     ForLoop,
     GmemAtomicAdd,
     GmemWaitEq,
+    GridDepControl,
     If,
     Kernel,
     LaunchShape,
@@ -1128,6 +1129,15 @@ class IRBuilder:
         branch's warp(group) must execute it (an elected-lane wait deadlocks on
         hardware). Blocks until every CTA of the cluster has arrived."""
         self._append(ClusterBarrierWait())
+
+    def grid_dep_control(self, action: Literal["launch_dependents", "wait"]) -> None:
+        """Programmatic dependent launch — ``griddepcontrol.<action>`` (sm_90+).
+        A cross-grid launch hint with NO intra-kernel semantics (sim no-op):
+        ``launch_dependents`` (SASS PREEXIT) lets the next grid's prologue
+        overlap this grid's drain; ``wait`` blocks until the prerequisite
+        grid's memory is visible. Only effective when the kernel is launched
+        with ``tirx.use_programtic_dependent_launch``."""
+        self._append(GridDepControl(action=action))
 
     def _append(self, stmt: Stmt) -> None:
         self._body_stack[-1].append(stmt)

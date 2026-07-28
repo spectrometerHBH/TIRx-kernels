@@ -3021,6 +3021,20 @@ fn emit_stmt(
             }
             Ok(())
         }
+        GridDepControl { action } => {
+            // PDL hint (sm_90+): `launch_dependents` lowers to SASS PREEXIT,
+            // letting the dependent grid's prologue overlap this grid's drain.
+            use super::stmt::GridDepAction;
+            match action {
+                GridDepAction::LaunchDependents => {
+                    out.push_str(&format!("{p}T.ptx.griddepcontrol.launch_dependents()\n"));
+                }
+                GridDepAction::Wait => {
+                    out.push_str(&format!("{p}T.ptx.griddepcontrol.wait()\n"));
+                }
+            }
+            Ok(())
+        }
         CtaSync => {
             // The validator rejects statically narrowed CTA barriers. Codegen
             // must still print the statement at its exact IR position; it may
@@ -4018,6 +4032,24 @@ mod tests {
             let err = kernel_to_tirx_source(&nested).unwrap_err();
             assert!(err.contains("Put it explicitly at warp scope"), "{err}");
         }
+    }
+
+    /// PDL hint: both `griddepcontrol` actions lower 1:1 at their exact IR
+    /// position, at any scope (the statement is a scope-free leaf).
+    #[test]
+    fn grid_dep_control_lowers_to_griddepcontrol_ptx() {
+        use crate::ir::GridDepAction;
+        let k = kernel(vec![
+            Stmt::GridDepControl {
+                action: GridDepAction::LaunchDependents,
+            },
+            warp_if(4, vec![Stmt::GridDepControl {
+                action: GridDepAction::Wait,
+            }]),
+        ]);
+        let src = kernel_to_tirx_source(&k).unwrap();
+        assert!(src.contains("T.ptx.griddepcontrol.launch_dependents()"), "{src}");
+        assert!(src.contains("T.ptx.griddepcontrol.wait()"), "{src}");
     }
 
     // ------------------------------------------------------------------

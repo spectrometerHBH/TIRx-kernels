@@ -1335,6 +1335,7 @@ fn validate_stmt(s: &Stmt) -> R {
         Stmt::Fence { .. } => {}
         Stmt::CtaSync | Stmt::WarpSync | Stmt::ClusterSync => {}
         Stmt::ClusterBarrierArrive { .. } | Stmt::ClusterBarrierWait => {}
+        Stmt::GridDepControl { .. } => {}
         Stmt::WgSync { barrier_id } => {
             if *barrier_id < 1 || *barrier_id > 15 {
                 return bail("wg_sync barrier_id must be an integer in [1, 15]");
