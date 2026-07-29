@@ -88,8 +88,6 @@ class MegaMoeCase:
     x_fp8: tuple[torch.Tensor, torch.Tensor]
     topk_idx: torch.Tensor
     topk_weights: torch.Tensor
-    raw_l1_weights: tuple[torch.Tensor, torch.Tensor]
-    raw_l2_weights: tuple[torch.Tensor, torch.Tensor]
     transformed_l1_weights: tuple[torch.Tensor, torch.Tensor]
     transformed_l2_weights: tuple[torch.Tensor, torch.Tensor]
     workspace_layout: DeepGemmWorkspaceLayout
@@ -1384,7 +1382,7 @@ def _distributed_env(port: int):
 
 def _cast_grouped_weights_to_fp4(
     deep_gemm: Any, bf16_weights: torch.Tensor
-) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     num_groups, n, k = bf16_weights.shape
     weights = []
     scales = []
@@ -1399,7 +1397,7 @@ def _cast_grouped_weights_to_fp4(
     transformed_scales = deep_gemm.transform_sf_into_required_layout(
         raw_scales, n, k, (1, 32), num_groups
     )
-    return (packed_weights, raw_scales), (packed_weights, transformed_scales)
+    return packed_weights, transformed_scales
 
 
 def create_case(
@@ -1436,8 +1434,8 @@ def create_case(
     x_fp8 = deep_gemm.utils.per_token_cast_to_fp8(
         x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
     )
-    raw_l1_weights, transformed_l1_input = _cast_grouped_weights_to_fp4(deep_gemm, l1_weights)
-    raw_l2_weights, transformed_l2_input = _cast_grouped_weights_to_fp4(deep_gemm, l2_weights)
+    transformed_l1_input = _cast_grouped_weights_to_fp4(deep_gemm, l1_weights)
+    transformed_l2_input = _cast_grouped_weights_to_fp4(deep_gemm, l2_weights)
     transformed_l1_weights, transformed_l2_weights = deep_gemm.transform_weights_for_mega_moe(
         transformed_l1_input, transformed_l2_input
     )
@@ -1472,8 +1470,6 @@ def create_case(
         x_fp8=x_fp8,
         topk_idx=topk_idx,
         topk_weights=topk_weights,
-        raw_l1_weights=raw_l1_weights,
-        raw_l2_weights=raw_l2_weights,
         transformed_l1_weights=transformed_l1_weights,
         transformed_l2_weights=transformed_l2_weights,
         workspace_layout=workspace_layout,
@@ -1511,73 +1507,9 @@ def run_deepgemm_reference(
     return y
 
 
-def run_naive_reference(case: MegaMoeCase) -> torch.Tensor:
-    from deep_gemm.utils.math import cast_back_from_fp4, ceil_to_ue8m0, unpack_ue8m0_from_int
-
-    x_fp8, x_sf_packed = case.x_fp8
-    x_sf = unpack_ue8m0_from_int(x_sf_packed)
-    x = x_fp8.float() * x_sf.repeat_interleave(32, dim=1)
-    l1_weights = []
-    l2_weights = []
-    for expert_idx in range(case.config.num_experts):
-        l1_weights.append(
-            cast_back_from_fp4(
-                case.raw_l1_weights[0][expert_idx],
-                case.raw_l1_weights[1][expert_idx],
-                gran_k=32,
-                use_packed_ue8m0=False,
-            )
-        )
-        l2_weights.append(
-            cast_back_from_fp4(
-                case.raw_l2_weights[0][expert_idx],
-                case.raw_l2_weights[1][expert_idx],
-                gran_k=32,
-                use_packed_ue8m0=False,
-            )
-        )
-    l1_weights = torch.stack(l1_weights, dim=0).float()
-    l2_weights = torch.stack(l2_weights, dim=0).float()
-    y = torch.zeros(
-        (case.config.num_tokens, case.config.hidden), dtype=torch.float32, device="cuda"
-    )
-    for token_idx in range(case.config.num_tokens):
-        for topk_slot in range(case.config.num_topk):
-            expert_idx = int(case.topk_idx[token_idx, topk_slot].item())
-            if expert_idx < 0:
-                continue
-            topk_weight = case.topk_weights[token_idx, topk_slot]
-            l1 = torch.matmul(l1_weights[expert_idx], x[token_idx].float())
-            half_hidden = case.config.intermediate_hidden
-            gate = torch.clamp(l1[:half_hidden], max=case.config.activation_clamp)
-            up = torch.clamp(
-                l1[half_hidden:],
-                min=-case.config.activation_clamp,
-                max=case.config.activation_clamp,
-            )
-            acts = torch.nn.functional.silu(gate) * up * topk_weight
-            sf = ceil_to_ue8m0(acts.abs().view(-1, 32).amax(dim=1).clamp_min(1e-4) / 448.0)
-            acts = (
-                (acts.view(-1, 32) * (1.0 / sf.unsqueeze(1))).to(torch.float8_e4m3fn).float()
-                * sf.unsqueeze(1)
-            ).view(-1)
-            y[token_idx] += torch.matmul(l2_weights[expert_idx], acts.float())
-    return y.bfloat16()
-
-
 def _max_abs_diff(lhs: torch.Tensor, rhs: torch.Tensor) -> float:
     abs_diff = (lhs.float() - rhs.float()).abs()
     return 0.0 if abs_diff.numel() == 0 else float(abs_diff.max().item())
-
-
-def _is_optional_math_reference_error(exc: RuntimeError) -> bool:
-    message = str(exc)
-    return (
-        "CUBLAS_STATUS_ALLOC_FAILED" in message
-        or "cublasCreate(handle)" in message
-        or "CUDA out of memory" in message
-        or "out of memory" in message.lower()
-    )
 
 
 def get_kernel(
@@ -5639,18 +5571,6 @@ def _run_worker(local_rank: int, cfg_dict: dict[str, Any], mode: str) -> dict[st
             if torch.distributed.is_initialized():
                 torch.distributed.barrier()
             checksum = float(y_ref.float().sum().item())
-            y_math = None
-            naive_reference_error = None
-            if config.num_processes == 1:
-                try:
-                    y_math = run_naive_reference(case)
-                except RuntimeError as exc:
-                    if _is_optional_math_reference_error(exc):
-                        naive_reference_error = str(exc)
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                    else:
-                        raise
             try:
                 if torch.distributed.is_initialized():
                     torch.distributed.barrier()
@@ -5669,17 +5589,12 @@ def _run_worker(local_rank: int, cfg_dict: dict[str, Any], mode: str) -> dict[st
             stats_max_abs_diff = int(
                 (tirx_stats.to(torch.int64) - deepgemm_stats.to(torch.int64)).abs().max().item()
             )
-            max_abs_diff = (
-                _max_abs_diff(y_tir, y_math) if y_math is not None else deepgemm_max_abs_diff
-            )
             return {
                 "status": "OK",
                 "reference_source": source,
                 "reference_checksum": checksum,
-                "max_abs_diff": max_abs_diff,
                 "deepgemm_max_abs_diff": deepgemm_max_abs_diff,
                 "stats_max_abs_diff": stats_max_abs_diff,
-                "naive_reference_error": naive_reference_error,
             }
 
         if mode == "bench":
@@ -5887,13 +5802,11 @@ def _aggregate_rank_results(rank_results: list[tuple[int, dict[str, Any]]]) -> d
         return first
     return {
         **first,
-        "max_abs_diff": max(float(result["max_abs_diff"]) for result in results),
         "deepgemm_max_abs_diff": max(float(result["deepgemm_max_abs_diff"]) for result in results),
         "stats_max_abs_diff": max(int(result["stats_max_abs_diff"]) for result in results),
         "rank_results": [
             {
                 "rank": rank,
-                "max_abs_diff": float(result["max_abs_diff"]),
                 "deepgemm_max_abs_diff": float(result["deepgemm_max_abs_diff"]),
                 "stats_max_abs_diff": int(result["stats_max_abs_diff"]),
                 "reference_checksum": float(result["reference_checksum"]),
@@ -6294,7 +6207,7 @@ def _assert_correctness_result(result: dict[str, Any]) -> None:
         )
     assert result["deepgemm_max_abs_diff"] == 0.0, (
         f"Expected bitwise parity with DeepGEMM reference, got deepgemm_max_abs_diff="
-        f"{result['deepgemm_max_abs_diff']} (naive_max_abs_diff={result['max_abs_diff']})"
+        f"{result['deepgemm_max_abs_diff']}"
     )
     assert result["stats_max_abs_diff"] == 0, (
         "Expected cumulative_local_expert_recv_stats parity with DeepGEMM, got "
