@@ -935,10 +935,6 @@ def _check_scheduler(scheduler: str):
         )
 
 
-def _needs_unfused_reference(scheduler: str) -> bool:
-    return scheduler in ("static", "dynamic")
-
-
 def _compile_moe_schedulers(
     schedulers: tuple[str, ...], batch_size: int, world_size: int, profiler_on: bool
 ) -> tuple[MegaKernelMOE, dict[str, tvm.runtime.Module]]:
@@ -1311,7 +1307,9 @@ def _build_sglang_full_reference(mk: MegaKernelMOE):
     return run
 
 
-def _build_flashinfer_full_reference(batch_size: int, mk: MegaKernelMOE):
+def _build_flashinfer_full_reference(
+    batch_size: int, mk: MegaKernelMOE, *, tune: bool | None = None
+):
     try:
         import os
 
@@ -1320,7 +1318,11 @@ def _build_flashinfer_full_reference(batch_size: int, mk: MegaKernelMOE):
     except ImportError as err:
         raise RuntimeError(f"flashinfer full MoE reference is unavailable: {err}") from err
 
-    tune_mode = os.environ.get("TIRX_MEGAKERNEL_MOE_FLASHINFER_AUTOTUNE", "1") != "0"
+    tune_mode = (
+        os.environ.get("TIRX_MEGAKERNEL_MOE_FLASHINFER_AUTOTUNE", "1") != "0"
+        if tune is None
+        else tune
+    )
     tune_cache = os.environ.get(
         "TIRX_MEGAKERNEL_MOE_FLASHINFER_CACHE",
         os.path.expanduser("~/.cache/tirx-kernels/megakernel_moe_flashinfer_cutlass.json"),
@@ -1368,56 +1370,20 @@ def _build_flashinfer_full_reference(batch_size: int, mk: MegaKernelMOE):
     return run
 
 
-def _torch_moe_reference(data: dict[str, torch.Tensor], mk: MegaKernelMOE):
-    hidden_state = data["hidden_state"].cuda().to(torch.float32)
-    gate_weight = data["gate_weight"].cuda().to(torch.float32)
-    gate_up_weight = data["grp_gate_up_weight"].cuda().to(torch.float32)
-    down_weight = data["grp_down_weight"].cuda().to(torch.float32)
-
-    gating_output = hidden_state @ gate_weight.T
-    routing_weights = torch.softmax(gating_output, dim=-1)
-    topk_weights, topk_indices = torch.topk(routing_weights, mk.NUM_EXPERTS_PER_TOK, dim=-1)
-
-    output = torch.zeros(
-        (hidden_state.shape[0], mk.HIDDEN_SIZE), dtype=torch.float32, device="cuda"
-    )
-    for token_idx in range(hidden_state.shape[0]):
-        token = hidden_state[token_idx]
-        for route_idx in range(mk.NUM_EXPERTS_PER_TOK):
-            expert_idx = int(topk_indices[token_idx, route_idx])
-            gate_up = gate_up_weight[expert_idx] @ token
-            gate = gate_up[: mk.INTERMEDIATE_SIZE]
-            up = gate_up[mk.INTERMEDIATE_SIZE :]
-            activated = torch.nn.functional.silu(gate) * up
-            output[token_idx] += topk_weights[token_idx, route_idx] * (
-                down_weight[expert_idx] @ activated
-            )
-    return output.cpu().numpy()
-
-
-def _validate_tir_case(case, mk: MegaKernelMOE, *, check_torch: bool = True):
+def _run_tir_case_and_check_finite(case):
     out = _run_tir_case(case["tir"]).numpy()
     if not np.isfinite(out).all():
         raise AssertionError("MegaKernelMOE TIR output contains non-finite values")
-
-    if check_torch:
-        ref = _torch_moe_reference(case["cpu_data"], mk)
-        np.testing.assert_allclose(out, ref, rtol=2e-2, atol=1e-2)
-
-    reference = case.get("tir_reference")
-    if reference is not None:
-        ref = _run_tir_case(reference).numpy()
-        np.testing.assert_allclose(out, ref, rtol=1e-3, atol=1e-2)
     return out
 
 
-def _validate_tir_matches_reference(case, mk: MegaKernelMOE, reference_run):
+def _validate_tir_matches_reference(case, reference_output):
     out = case["tir"].get("last_output")
     if out is None:
-        out_np = _validate_tir_case(case, mk)
+        out_np = _run_tir_case_and_check_finite(case)
     else:
         out_np = out.numpy()
-    ref_np = reference_run(case).detach().cpu().numpy()
+    ref_np = reference_output.detach().cpu().numpy()
     np.testing.assert_allclose(out_np, ref_np, rtol=2e-2, atol=1e-2)
     abs_diff = np.abs(out_np.astype(np.float32) - ref_np.astype(np.float32))
     return {
@@ -1429,40 +1395,37 @@ def _validate_tir_matches_reference(case, mk: MegaKernelMOE, reference_run):
     }
 
 
-def run_test(batch_size: int, scheduler: str, world_size: int = 1, profiler_on: bool = False):
+def run_test(
+    batch_size: int, scheduler: str | None = None, world_size: int = 1, profiler_on: bool = False
+):
     _require_cuda_sm100()
-    _check_scheduler(scheduler)
-    compile_schedulers = [scheduler]
-    if _needs_unfused_reference(scheduler):
-        compile_schedulers.append("unfused")
-    mk, libs = _compile_moe_schedulers(
-        tuple(compile_schedulers), batch_size, world_size, profiler_on
-    )
+    schedulers = (scheduler,) if scheduler is not None else _SUPPORTED_SCHEDULERS
+    for scheduler_name in schedulers:
+        _check_scheduler(scheduler_name)
+    mk, libs = _compile_moe_schedulers(tuple(schedulers), batch_size, world_size, profiler_on)
 
     _reset_prepare_data_cache()
     data = dict(prepare_data(batch_size, mk))
-    case = {
-        "batch_size": batch_size,
-        "cpu_data": data,
-        "tir": _make_tir_case(
+    case = {"batch_size": batch_size, "cpu_data": data}
+    tir_cases = {
+        scheduler_name: _make_tir_case(
             batch_size=batch_size,
             mk=mk,
-            lib=libs[scheduler],
-            scheduler=scheduler,
-            data=data,
-            launch_slots=2,
-        ),
-    }
-    if _needs_unfused_reference(scheduler):
-        case["tir_reference"] = _make_tir_case(
-            batch_size=batch_size,
-            mk=mk,
-            lib=libs["unfused"],
-            scheduler="unfused",
+            lib=libs[scheduler_name],
+            scheduler=scheduler_name,
             data=data,
             launch_slots=2,
         )
-    _validate_tir_case(case, mk)
+        for scheduler_name in schedulers
+    }
+
+    for scheduler_name in schedulers:
+        _run_tir_case_and_check_finite({**case, "tir": tir_cases[scheduler_name]})
+
+    flashinfer_output = _build_flashinfer_full_reference(batch_size, mk, tune=False)(case)
+    for scheduler_name in schedulers:
+        validation_case = {**case, "tir": tir_cases[scheduler_name]}
+        _validate_tir_matches_reference(validation_case, flashinfer_output)
     torch.cuda.synchronize()
 
 
@@ -1561,9 +1524,7 @@ def run_bench(
     }
     for scheduler_name in schedulers:
         validation_case = {**case, "tir": tir_cases[scheduler_name]}
-        if scheduler_name != "unfused" and "unfused" in tir_cases:
-            validation_case["tir_reference"] = tir_cases["unfused"]
-        _validate_tir_case(validation_case, mk, check_torch=batch_size <= max(_TEST_BATCH_SIZES))
+        _run_tir_case_and_check_finite(validation_case)
 
     sglang_runner = None
     flashinfer_runner = None
@@ -1623,14 +1584,16 @@ def run_bench(
     if sglang_runner is None or flashinfer_runner is None:
         raise RuntimeError("MegaKernelMOE benchmark requires both full references")
 
+    sglang_output = sglang_runner()
+    flashinfer_output = flashinfer_runner()
     for scheduler_name in schedulers:
         impl_name = "tir" if scheduler is not None else f"tir_{scheduler_name}"
         validation_case = {**case, "tir": tir_cases[scheduler_name]}
         validation[f"{impl_name}_vs_flashinfer_full"] = _validate_tir_matches_reference(
-            validation_case, mk, lambda _: flashinfer_runner()
+            validation_case, flashinfer_output
         )
         validation[f"{impl_name}_vs_sglang_full"] = _validate_tir_matches_reference(
-            validation_case, mk, lambda _: sglang_runner()
+            validation_case, sglang_output
         )
 
     result.setdefault("metadata", {})
