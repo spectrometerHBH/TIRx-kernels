@@ -83,6 +83,51 @@ def test_aggregate_rank_results_rejects_mismatched_round_counts() -> None:
         )
 
 
+def test_aggregate_correctness_results_reports_deepgemm_parity_only() -> None:
+    result = _aggregate_rank_results(
+        [
+            (
+                0,
+                {
+                    "status": "OK",
+                    "reference_source": "installed",
+                    "reference_checksum": 1.0,
+                    "deepgemm_max_abs_diff": 0.0,
+                    "stats_max_abs_diff": 0,
+                },
+            ),
+            (
+                1,
+                {
+                    "status": "OK",
+                    "reference_source": "installed",
+                    "reference_checksum": 2.0,
+                    "deepgemm_max_abs_diff": 0.0,
+                    "stats_max_abs_diff": 0,
+                },
+            ),
+        ]
+    )
+
+    assert result["deepgemm_max_abs_diff"] == 0.0
+    assert result["stats_max_abs_diff"] == 0
+    assert result["rank_results"] == [
+        {
+            "rank": 0,
+            "deepgemm_max_abs_diff": 0.0,
+            "stats_max_abs_diff": 0,
+            "reference_checksum": 1.0,
+        },
+        {
+            "rank": 1,
+            "deepgemm_max_abs_diff": 0.0,
+            "stats_max_abs_diff": 0,
+            "reference_checksum": 2.0,
+        },
+    ]
+    assert "max_abs_diff" not in result
+
+
 @pytest.mark.parametrize(
     ("num_tokens", "expected_block_m", "expected_block_k"),
     [
