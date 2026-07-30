@@ -1,9 +1,4 @@
-"""FlashAttention-4 TIRx kernel and direct NVIDIA IKET profiling entry point.
-
-Run ``python -m tirx_kernels.attention.flash_attention4`` to profile the
-annotated kernel.  Correctness and ordinary benchmarks remain exposed through
-``run_test`` and ``run_bench``.
-"""
+"""FlashAttention-4 TIRx kernel with benchmark and NVIDIA IKET entry points."""
 
 from __future__ import annotations
 
@@ -48,10 +43,8 @@ IKET_EVENT_NAMES = (
     "softmax-phase-4",
     "softmax-phase-5",
 )
-# ex2-emulation ratio per regime (grid-searched under the bench protocol;
-# heavier and lighter both measured worse on their respective regimes):
-# emulate elements with (i*2 % 16) >= 16 - 2*PAIRS in fragments
-# [START, 3). Causal keeps fragment 0; non-causal skips it.
+# Shape-tuned ex2 emulation selects pairs where i*2%16 >= 16-2*PAIRS in [START, 3).
+# Causal includes fragment 0; non-causal starts at fragment 1.
 EMU_PAIRS_CAUSAL = 2
 EMU_START_CAUSAL = 0
 EMU_PAIRS_NC = 2
@@ -157,27 +150,8 @@ def _kernel(
 ):
     GQA_RATIO = T.meta_var(NUM_QO_HEADS // NUM_KV_HEADS)
     SEQ_Q_PER_TILE = T.meta_var(BLK_M // GQA_RATIO)
-    # HW named barrier for the softmax->correction stats handshake
-    # (cf. FA4 CuTeDSL sm_stats_barrier). One 256-thread barrier per stage
-    # (1 + stage): the whole softmax wg arrives, the whole correction wg
-    # syncs — collective release exactly like the 128-count mbarrier it
-    # replaces, but with HW-barrier wake instead of mbarrier
-    # try_wait+nanosleep (that wait gates p_o_rescale and thus the PV MMA).
-    # Per-warp pairing (softmax warp w <-> correction warp w) measured 12%
-    # WORSE on GQA-packed causal: uneven per-warp softmax finish times make
-    # pairwise rendezvous slower than collective release. The reverse
-    # (sScale slot reuse) direction stays on softmax_corr.empty.
-    # Stats handshake barrier WIDTH. cutedsl uses a 64-thread PAIRWISE
-    # barrier (softmax warp w <-> correction warp w, sm_stats_barrier
-    # index stage*4+warp). TIRx adopted a 256-thread COLLECTIVE barrier
-    # because per-warp pairing regressed GQA-PACKED causal 12% (uneven
-    # per-warp softmax finish times -> pairwise waits for the slow
-    # partner). But for GQA_RATIO==1 the rows within a warp are uniform,
-    # so pairwise rendezvous releases each correction warp as soon as ITS
-    # partner softmax warp finishes — no waiting for the slowest of all
-    # 128. ncu (s2048_h32kv32_c): the 256-collective shows a 3.7-cycle
-    # barrier stall (32% of 11.6 cyc/issue) that cutedsl's 64-pairwise
-    # lacks (cutedsl 10.8 cyc/issue). Gate on GQA==1.
+    # Use pairwise 64-thread stats barriers for GQA=1; packed GQA keeps a
+    # 256-thread collective. sScale slot reuse remains on softmax_corr.empty.
     STATS_BAR_PAIRWISE = T.meta_var(GQA_RATIO == 1)
     L2_SIZE = T.meta_var(50 * 1024 * 1024)
     SIZE_ONE_KV_HEAD = T.meta_var(SEQ_LEN_KV * HEAD_DIM * 2 * F16_BYTES)
@@ -189,24 +163,8 @@ def _kernel(
     num_q_blocks_total = T.meta_var(ceildiv(SEQ_LEN_Q, SEQ_Q_PER_TILE))
     num_q_blocks = T.meta_var(ceildiv(num_q_blocks_total, SMEM_PIPE_DEPTH_Q))
     num_total_tasks = T.meta_var(BATCH_SIZE * NUM_KV_HEADS * num_q_blocks)
-    # When every CTA runs exactly ONE task (causal always launches
-    # cta_count == num_total_tasks; non-causal whenever tasks <= 148), the
-    # task tail is fully exposed on the critical path — there is no next
-    # task to overlap the correction-wg epilogue with. In that regime the
-    # epilogue runs on the SOFTMAX warpgroups instead: each wg handles its
-    # own stage, so the two stages epilogue IN PARALLEL (correction did
-    # them serially), row_sum is normalized straight from the register
-    # (no sScale round-trip, no tail stats-handshake trip), and the idle
-    # 200-reg softmax budget affords 32-wide TMEM loads (4 round trips vs
-    # 16-wide x 8). Single-task locked-clock decomposition vs cutedsl
-    # (q256 kv2048 causal): tail 7.2/6.6us vs baseline 6.6/5.8 — the tail
-    # is where the small-shape ratio lives. Multi-task persistent shapes
-    # keep the correction-wg epilogue (it overlaps the next task there).
-    # Measured (ncu back-to-back, GPU 6): causal -1.9..-2.6%
-    # (s1024_h32kv32_c 22.05→21.47us, s1024_h32kv16_c 20.16→19.78);
-    # NON-causal single-wave (s1024_h32kv32) consistently +2% — restrict
-    # to causal, where the LPT longest-task tail is the kernel's critical
-    # path.
+    # Causal CTAs run one task, so their exposed tail uses stage-parallel
+    # softmax epilogues; persistent non-causal CTAs overlap correction epilogues.
     EPI_ON_SOFTMAX = T.meta_var(is_causal)
     EARLY_Q_RELEASE = T.meta_var(not is_causal)
     max_ctas: T.let = 148
@@ -256,21 +214,12 @@ def _kernel(
     p_ready_2 = MBarrier(pool, 2)
     p_ready_2.init(128)
     bar_s0_s1_sequence = MBarrier(pool, 8)
-    # Init in the FIRST init group so the single prologue fence (below) covers
-    # it; lets us drop the redundant 2nd fence+cta_sync (MEMBAR/FENCE/BSSY
-    # excess vs cutedsl, which uses one prologue init barrier).
+    # Initialize in the first group so the single prologue fence covers it.
     bar_s0_s1_sequence.init(32)
     pool.commit()
     iket = IketProfiler()
-    # TMEM is allocated by the MMA warp (cta-scope warp 12 = wg3/warp0) and
-    # the alloc deliberately sits AFTER the prologue cta_syncs (commit is
-    # emitted further down): every other warp's first TMEM access is
-    # transitively gated behind this warp's progress (softmax via s_ready
-    # from the first QK gemm, correction via the softmax handshake, TMA
-    # store via corr_epi), so no CTA-wide sync on the alloc is needed, and
-    # the TMA load warp issues the first Q/K copies without waiting for it.
-    # FA4 CuTeDSL structures its prologue the same way (alloc inside the
-    # MMA warp's branch; load warps never wait for it).
+    # MMA warp 12 allocates TMEM after the prologue sync; dependent barriers gate
+    # all other users, so TMA load warps need no extra CTA-wide allocation sync.
     tmem_pool = T.TMEMPool(
         pool,
         total_cols=N_COLS_TMEM,
@@ -285,10 +234,8 @@ def _kernel(
     T.ptx.fence.proxy_async("shared::cta")
     T.ptx.fence.mbarrier_init()
     T.cuda.cta_sync()
-    # S and O share the (128, N_COLS_TMEM) f32 tmem as 2*SMEM_PIPE_DEPTH_Q
-    # MMA_N-wide stages: S in the low SMEM_PIPE_DEPTH_Q, O in the high ones
-    # (indexed SMEM_PIPE_DEPTH_Q + stage). Indexing a constant stage at the use
-    # site keeps the column offset in the region so allocated_addr stays 0.
+    # S and O share low/high MMA_N-wide TMEM stages; constant stage indexing keeps
+    # the region base address at zero.
     S_region = T.meta_var(tmem.rearrange("m (s n) -> s m n", n=MMA_N))
     O_region = S_region
     # P overlays the f16 view of the S stages: the high MMA_N-wide half (two=1)
@@ -461,14 +408,8 @@ def _kernel(
                     if T.ptx.elect_sync():
                         s_ready.arrive(q_stage)
 
-                # PV gemm split point, regime-tuned: for causal, 64 cols
-                # (p_o_rescale waits TWO P quarter-stores instead of three,
-                # releasing the MMA warp earlier in the
-                # softmax->P->PV->QK->s_ready loop that binds the small-shape
-                # cadence; single-task phase tables vs cutedsl showed TIRx
-                # softmax idling ~26% of its cadence on s_ready vs baseline
-                # 14%). For non-causal the earlier release measured 2-3pp
-                # WORSE on s1024 shapes — keep 96.
+                # Use a 64-column causal PV split to release MMA earlier;
+                # non-causal keeps 96 columns after small-shape regressions.
                 K_SPLIT = T.meta_var((4 if is_causal else 6) * MMA_K)
 
                 @T.inline
@@ -533,15 +474,8 @@ def _kernel(
                         if i_q == 0:
                             kv_load.full.wait(stage_k, phase_k)
                         gemm_qk(i_q, stage_k)
-                        # Early Q release (non-causal / multi-task CTAs):
-                        # Q[i_q]'s LAST reader is this final QK — committing
-                        # here fires when it completes, ~2 tail-PV gemms
-                        # before the end-of-task commit, so the next task's
-                        # Q TMA load overlaps the PV tail + epilogue.
-                        # Causal keeps the tail commit: one task per CTA
-                        # (nothing to overlap) and packed-causal tasks can
-                        # have mma_trip_count == 1, where this steady-loop
-                        # site never executes.
+                        # Non-causal CTAs release Q after its final QK reader to overlap
+                        # the next load; causal one-task/one-trip cases keep tail release.
                         if EARLY_Q_RELEASE:
                             if i_kv == mma_trip_count - 2:
                                 if T.ptx.elect_sync():
@@ -580,23 +514,10 @@ def _kernel(
 
             @T.inline
             def mask_r2p(s_chunk_buf, col_limit, ncol: T.int32):
-                """Apply mask using R2P-style bit manipulation.
-
-                Optimizes: for j in range(N): buf[j] = -inf if j >= col_limit else buf[j]
-                Into: bitmask operations that compile to R2P PTX instruction.
-
-                Following flash_attn/cute/mask.py mask_r2p(): process in 32-col
-                chunks (PTX shl tolerates shift>=32, so no 24-col split).
-
-                The bit test `mask & (1 << i)` compiles to the R2P (Register to Predicate)
-                PTX instruction, which is more efficient than per-column comparisons.
-                """
+                """Apply a 32-column mask using R2P-style bit manipulation."""
                 ncol = T.meta_var(ncol)
-                # Subtract-free low-k bitmask: ~(0xFFFFFFFF<<k) gives the low-k-bits
-                # mask with NO `-1`; the ~ fuses into the per-column `& (1<<i)` test
-                # as ANDN (one LOP3), so there is no VIADD per chunk. PTX shl
-                # clamps k>=32 to zero, so mask_inv=0 => ~=all-ones => keep all;
-                # this also avoids VIMNMX. The bit test compiles to R2P.
+                # The subtract-free low-k mask uses PTX shl clamping and ANDN to avoid
+                # VIADD/VIMNMX before the bit test compiles to R2P.
                 CHUNK_SIZE: T.let = 32
                 num_chunks: T.let = ceildiv(ncol, CHUNK_SIZE)
                 s_chunk_local = s_chunk_buf.local(ncol)
@@ -618,20 +539,7 @@ def _kernel(
 
             @T.inline
             def apply_causal_mask(s_chunk_buf, m_blk_idx, n_blk_idx):
-                """Apply causal mask to attention scores.
-
-                Following flash_attn/cute/mask.py apply_mask_sm100() lines 384-400:
-                causal_row_offset = 1 + seqlen_k - n_block * tile_n - seqlen_q
-                row_idx = thread_row + m_block * tile_m
-                col_limit_right = row_idx + causal_row_offset
-                Mask if col >= col_limit_right
-
-                Coordinate Mapping:
-                - BLK_M = 128 packed rows per tile
-                - SEQ_Q_PER_TILE = BLK_M // GQA_RATIO (e.g., 32 for GQA_RATIO=4)
-                - Each warpgroup handles one Q stage with SEQ_Q_PER_TILE sequence positions
-                - tid_in_wg (0-127) maps to packed rows: (seq_pos, head) = (tid//GQA_RATIO, tid%GQA_RATIO)
-                """
+                """Map packed GQA rows to their causal limit and apply the R2P mask."""
                 seq_pos_in_wg: T.let = tid_in_wg // GQA_RATIO
                 row_idx: T.let = (
                     m_blk_idx * SEQ_Q_PER_TILE * SMEM_PIPE_DEPTH_Q
@@ -700,14 +608,8 @@ def _kernel(
                 if tid_in_wg < BLK_M and (not is_first):
                     sScale_idx: T.let = ACC_SCALE_BASE + tid_in_wg + wg_id * BLK_M
                     sScale[sScale_idx] = acc_scale
-                # Stats-ready handshake to the correction wg via HW named
-                # barrier (FA4 CuTeDSL sm_stats_barrier): softmax warp w of
-                # stage wg_id pairs with correction warp w on barrier
-                # 1 + wg_id*4 + w (64 threads). bar.arrive is non-blocking and
-                # the correction side's bar.sync wakes without the mbarrier
-                # try_wait + nanosleep latency — this wait gates p_o_rescale
-                # and therefore the PV MMA. The reverse (sScale slot reuse)
-                # direction stays on softmax_corr.empty.
+                # Signal correction with pairwise/collective HW barriers;
+                # sScale slot reuse remains on softmax_corr.empty.
                 if STATS_BAR_PAIRWISE:
                     tvm.backend.cuda.op.ptx_bar_arrive(1 + wg_id * 4 + warp_id, 64)
                 else:
@@ -726,9 +628,7 @@ def _kernel(
                     s_chunk_local = s_chunk_buf.local(BLK_N)
                     for i in T.unroll(BLK_N // 4 // 2):
                         idx = T.meta_var(frag_idx * BLK_N // 4 + 2 * i)
-                        # ex2 emulation ratio is shape-tuned (cf. FA4 CuTeDSL
-                        # _TUNING_CONFIG keyed on is_causal); see module-level
-                        # EMU_* knobs.
+                        # Select the shape-tuned ex2 window from the module-level knobs.
                         emu_pairs = T.meta_var(EMU_PAIRS_CAUSAL if is_causal else EMU_PAIRS_NC)
                         emu_start = T.meta_var(EMU_START_CAUSAL if is_causal else EMU_START_NC)
                         if (
@@ -797,21 +697,12 @@ def _kernel(
                 if USE_S0_S1_BARRIER:
                     phase_s0_s1 ^= 1
 
-            # Pre-loop empty.wait guards this task's first sScale write
-            # against the PREVIOUS task's tail row_sum read. Under
-            # EPI_ON_SOFTMAX there is no tail row_sum slot use and no
-            # previous task (one task per CTA), and correction's tail
-            # empty credits are gone too — the wait must go with them
-            # (credit/wait audit: n arrives vs n in-step waits per slot).
+            # Guard the first sScale write against the previous task's tail read;
+            # causal softmax epilogues have neither and skip this wait.
             if not EPI_ON_SOFTMAX:
                 softmax_corr.empty.wait(wg_id, phase_q)
-            # Keep the phase flip even when the wait is gone: parities are
-            # absolute, and correction's prologue empty.arrive can land
-            # BEFORE this wg reaches its step-1 wait — starting the in-step
-            # waits at phase 1 makes step-1 consume that prologue credit
-            # exactly like the original protocol (synccheck-verified; the
-            # phase-0 "free pass" is NOT sticky and deadlocks if the flip
-            # outruns the waiter).
+            # Flip phase even without the wait so step 1 consumes the prologue credit;
+            # starting at phase 0 can outrun the non-sticky credit and deadlock.
             phase_q ^= 1
             n_block_max: T.let = get_n_block_max(
                 m_block_idx, is_causal, SEQ_LEN_KV, SEQ_LEN_Q, SEQ_Q_PER_TILE
@@ -832,11 +723,8 @@ def _kernel(
                 n_block: T.let = n_block_max_after_p2 - 1 - i
                 softmax_step(n_block, apply_mask=False)
             if EPI_ON_SOFTMAX:
-                # Stage-parallel epilogue on this wg: row_sum is already in
-                # a register (no sScale round-trip / tail stats trip), and
-                # the post-loop softmax register file is idle — 32-wide
-                # TMEM loads are free (4 round trips, vs 8x16 under the
-                # correction wg's 64-reg budget).
+                # Run each causal stage epilogue on its softmax WG with
+                # register-resident row sums and 32-wide TMEM loads.
                 EPI_LD_SM = T.meta_var(32)
                 o_ready.wait(wg_id, phase_oepi)
                 corr_epi.empty.wait(wg_id, phase_oepi)
@@ -997,28 +885,14 @@ def _kernel(
             phase_q ^= 1
         scheduler.next_tile()
     tmem_pool.dealloc()
-    # No final cta_sync: warps exit independently after the dealloc. On the
-    # single-task causal shapes the kernel-end barrier is fully exposed (~11%
-    # of stall samples on the tail); dropping it is safe (50x reused-module
-    # GPU verify PASS — tcgen05 dealloc/relinquish by warp 0 needs no CTA-wide
-    # rendezvous, and there is no post-exit SMEM/TMEM reuse) and lifts the warm
-    # ratio ~+0.5pp. Validated first via tvm_callback_cuda_postproc injection,
-    # then moved here.
+    # No final CTA sync is required after TMEM deallocation; warps exit independently.
 
 
 def get_flash_attention4_kernel(
     batch_size, seq_len_q, seq_len_kv, num_qo_heads, num_kv_heads, head_dim, is_causal=False
 ):
-    # ptxas --register-usage-level: the default 10 over-allocates under the
-    # setmaxnreg caps and SPILLS (35K LDL/STL; cutedsl has 0). On the latency-
-    # bound causal GQA=1 (kv32) shapes those spills sit on the critical path.
-    # Clean isolated run_bench A/B (warm-L2) picks the best NON-spilling level
-    # per regime (swept 3..8; >=6 re-spills): multi-wave s2048/s4096_h32kv32_c
-    # want 5 (0.967->0.992, 0.974->0.993); the single-wave s1024_h32kv32_c
-    # wants 4 (0.954->0.962, won all 3 rounds, s2048/s4096 unaffected ~tie).
-    # GQA=2 (s1024kv16_c) and throughput-bound non-causal keep 10's ILP. Read
-    # by tir support/nvcc.py via the env var; set per-shape here because each
-    # bench config compiles in its own process. FA4_REG_LEVEL overrides (tuning).
+    # Shape-tuned ptxas levels avoid spills for causal GQA=1.
+    # Use 4 at s1024 and 5 otherwise; FA4_REG_LEVEL overrides this selection.
     _reg_override = os.environ.get("FA4_REG_LEVEL", "")
     if _reg_override:
         _reg_level = _reg_override
@@ -1027,14 +901,8 @@ def get_flash_attention4_kernel(
     else:
         _reg_level = "10"
     os.environ["TVM_CUDA_PTXAS_REG_LEVEL"] = _reg_level
-    # Pipeline-depth split by wave count. Single-wave causal shapes (s1024) are
-    # warpgroup-handshake-bound (stall-PC: ~40% mbarrier sync); a DEEPER
-    # O-accumulator TMEM pipeline (TMEM_PIPE_DEPTH 3, funded by SMEM_PIPE_DEPTH_KV
-    # 2 — SMEM-neutral) hides the correction-wg handshake bubble. Clean A/B
-    # (warmup=100): s1024_h32kv32_c 0.953->0.998, s1024_h32kv16_c 0.985->1.002.
-    # Multi-wave shapes (s2048+) instead need KV depth 3 for the long KV stream:
-    # 3/2 REGRESSES s2048 (0.991->0.951) and s4096 (0.992->0.968), so they keep
-    # the default 2/3. KV depth 1 deadlocks (pipeline needs >=2 stages).
+    # Single-wave causal s1024 uses TMEM/KV depths 3/2; multi-wave shapes keep 2/3.
+    # KV depth 1 deadlocks, while 3/2 regresses multi-wave cases.
     _deep_o = is_causal and seq_len_q <= 1024
     _tmem_depth = 3 if _deep_o else TMEM_PIPE_DEPTH
     _kv_depth = 2 if _deep_o else SMEM_PIPE_DEPTH_KV
@@ -1152,17 +1020,11 @@ def run_bench(
     funcs = {"tir": lambda: ex(Q_cuda, K_cuda, V_cuda, O_tir)}
 
     def _flashattn_sm100():
-        # Flash-Attention SM100 (CuTeDSL FA4) baseline.
-        #
-        # CUTe-DSL hard rule (discovered by experiment): every `cute_tensor_like`
-        # call must happen BEFORE `cute.compile`. Wrapping new tensors after
-        # compile poisons the host-side `cuTensorMapEncodeTiled` path (it starts
-        # failing ~hundreds of launches later anywhere in the process, including
-        # in unrelated TIR kernels). So we wrap one FA tensor set up-front, then
-        # compile exactly once using it.
-        import cutlass
+        # Build the CuTeDSL reference through TVM-FFI, converting tensors before compile.
+        # The run closure passes Torch tensors directly and creates no new CuTe wrappers.
         import cutlass.cute as cute
         import cutlass.torch as cutlass_torch
+        from flash_attn.cute.cute_dsl_utils import to_cute_tensor
         from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
         from flash_attn.cute.utils import AuxData
 
@@ -1173,18 +1035,10 @@ def run_bench(
         Kf = Ki.cuda().contiguous()
         Vf = Vi.cuda().contiguous()
         Of = torch.zeros_like(Qf)
-        q_t, q_th = cutlass_torch.cute_tensor_like(
-            Qf, cutlass.Float16, is_dynamic_layout=True, assumed_align=16
-        )
-        k_t, k_th = cutlass_torch.cute_tensor_like(
-            Kf, cutlass.Float16, is_dynamic_layout=True, assumed_align=16
-        )
-        v_t, v_th = cutlass_torch.cute_tensor_like(
-            Vf, cutlass.Float16, is_dynamic_layout=True, assumed_align=16
-        )
-        o_t, o_th = cutlass_torch.cute_tensor_like(
-            Of, cutlass.Float16, is_dynamic_layout=True, assumed_align=16
-        )
+        q_t = to_cute_tensor(Qf)
+        k_t = to_cute_tensor(Kf)
+        v_t = to_cute_tensor(Vf)
+        o_t = to_cute_tensor(Of)
 
         fa_fwd = FlashAttentionForwardSm100(
             head_dim=head_dim,
@@ -1199,7 +1053,6 @@ def run_bench(
         )
         _stream_fa = cutlass_torch.default_stream()
         _scale_fa = 1.0 / math.sqrt(head_dim)
-        _aux_data_fa = AuxData()
         compiled_fa = cute.compile(
             fa_fwd,
             q_t,
@@ -1218,16 +1071,17 @@ def run_bench(
             None,  # learnable_sink
             None,  # descale_tensors
             None,  # blocksparse_tensors
-            _aux_data_fa,
-            _stream_fa,  # stream (FA4 sm100 keeps stream as the LAST positional)
+            AuxData(),  # aux_data
+            _stream_fa,  # stream (compile-time only under tvm-ffi)
+            options="--enable-tvm-ffi",
         )
 
         def run():
             compiled_fa(
-                q_t,
-                k_t,
-                v_t,
-                o_t,
+                Qf,
+                Kf,
+                Vf,
+                Of,
                 None,  # mLSE
                 _scale_fa,
                 None,  # mCuSeqlensQ
@@ -1240,13 +1094,11 @@ def run_bench(
                 None,  # learnable_sink
                 None,  # descale_tensors
                 None,  # blocksparse_tensors
-                _aux_data_fa,
-                _stream_fa,  # stream (FA4 sm100 keeps stream as the LAST positional)
+                AuxData(),  # aux_data
             )
 
-        # Keep the backing torch storage alive for the run's lifetime
-        # (the cute tensors alias it).
-        run._fa_keep_alive = (q_th, k_th, v_th, o_th, Qf, Kf, Vf, Of)
+        # Keep compile-time CuTe wrappers and backing Torch storage alive with the closure.
+        run._fa_keep_alive = (q_t, k_t, v_t, o_t, Qf, Kf, Vf, Of)
         return run
 
     return bench(
