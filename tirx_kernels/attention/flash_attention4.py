@@ -62,28 +62,10 @@ def ceildiv(a, b):
     return (a + b - 1) // b
 
 
-def shl_u32_clamp(val, shift):
-    """Left shift with PTX clamping (shift>=32 -> 0). Lets the causal mask keep
-    the fused ``max(col_limit - s*CHUNK, 0)`` (one VIADDMNMX, like cutedsl) and
-    drop the ``min(.,CHUNK)`` clamp (which adds a VIMNMX above cutedsl's count):
-    ``~shl_clamp(0xFFFFFFFF, k)`` is the low-k-bits mask for any k, no min."""
-    func_name = "shl_u32_clamp"
-    source_code = (
-        f"\n__device__ __forceinline__ unsigned int {func_name}"
-        "(unsigned int val, unsigned int shift) {\n"
-        "  unsigned int r;\n"
-        '  asm("shl.b32 %0, %1, %2;" : "=r"(r) : "r"(val), "r"(shift));\n'
-        "  return r;\n}\n"
-    )
-    return T.cuda.func_call(func_name, val, shift, source_code=source_code, return_type="uint32")
-
-
 def combine_int_frac_ex2(x_rounded, frac_ex2):
-    func_name = "combine_int_frac_ex2"
-    source_code = f'\n__device__ __forceinline__ float {func_name}(float x_rounded, float frac_ex2) {{\n  float out;\n  asm volatile(\n    "{{\\n\\t"\n    ".reg .s32 x_rounded_i, frac_ex_i, x_rounded_e, out_i;\\n\\t"\n    "mov.b32 x_rounded_i, %1;\\n\\t"\n    "mov.b32 frac_ex_i, %2;\\n\\t"\n    "shl.b32 x_rounded_e, x_rounded_i, 23;\\n\\t"\n    "add.s32 out_i, x_rounded_e, frac_ex_i;\\n\\t"\n    "mov.b32 %0, out_i;\\n\\t"\n    "}}\\n"\n    : "=f"(out) : "f"(x_rounded), "f"(frac_ex2));\n  return out;\n}}\n'
-    return T.cuda.func_call(
-        func_name, x_rounded, frac_ex2, source_code=source_code, return_type="float32"
-    )
+    x_rounded_bits = T.cuda.float_as_uint(x_rounded)
+    frac_ex2_bits = T.cuda.float_as_uint(frac_ex2)
+    return T.cuda.uint_as_float(T.shift_left(x_rounded_bits, T.uint32(23)) + frac_ex2_bits)
 
 
 def get_n_block_max(m_block_idx, causal, SEQ_LEN_KV, SEQ_LEN_Q, SEQ_Q_PER_TILE):
@@ -604,7 +586,7 @@ def _kernel(
                 Into: bitmask operations that compile to R2P PTX instruction.
 
                 Following flash_attn/cute/mask.py mask_r2p(): process in 32-col
-                chunks (shl_u32_clamp tolerates shift>=32, so no 24-col split).
+                chunks (PTX shl tolerates shift>=32, so no 24-col split).
 
                 The bit test `mask & (1 << i)` compiles to the R2P (Register to Predicate)
                 PTX instruction, which is more efficient than per-column comparisons.
@@ -612,16 +594,18 @@ def _kernel(
                 ncol = T.meta_var(ncol)
                 # Subtract-free low-k bitmask: ~(0xFFFFFFFF<<k) gives the low-k-bits
                 # mask with NO `-1`; the ~ fuses into the per-column `& (1<<i)` test
-                # as ANDN (one LOP3), so there is no VIADD per chunk. shl clamps
-                # k>=32 -> 0 => mask_inv=0 => ~=all-ones => keep all (k>=32 correct),
-                # so no VIMNMX either. The bit test compiles to R2P.
+                # as ANDN (one LOP3), so there is no VIADD per chunk. PTX shl
+                # clamps k>=32 to zero, so mask_inv=0 => ~=all-ones => keep all;
+                # this also avoids VIMNMX. The bit test compiles to R2P.
                 CHUNK_SIZE: T.let = 32
                 num_chunks: T.let = ceildiv(ncol, CHUNK_SIZE)
                 s_chunk_local = s_chunk_buf.local(ncol)
                 for s in T.unroll(num_chunks):
                     k_keep: T.let = T.max(col_limit - s * CHUNK_SIZE, 0)
                     mask_inv: T.uint32
-                    mask_inv = shl_u32_clamp(T.uint32(0xFFFFFFFF), T.cast(k_keep, "uint32"))
+                    mask_inv = T.ptx.shl(
+                        T.uint32(0xFFFFFFFF), T.cast(k_keep, "uint32"), ptx_type="b32"
+                    )
                     for i in T.unroll(CHUNK_SIZE):
                         if i < ncol - s * CHUNK_SIZE:
                             c: T.let = s * CHUNK_SIZE + i
