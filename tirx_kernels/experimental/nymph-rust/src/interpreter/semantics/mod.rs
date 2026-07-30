@@ -7,6 +7,7 @@
 pub mod control;
 pub mod cp_async;
 pub mod fence;
+pub mod grid_dep;
 pub mod ldstmatrix;
 pub mod leaf;
 pub mod mbarrier;
@@ -36,6 +37,7 @@ pub fn default_executor_registry() -> StmtExecutorRegistry {
     ldstmatrix::register(&mut registry);
     warpmma::register(&mut registry);
     fence::register(&mut registry);
+    grid_dep::register(&mut registry);
     sync::register(&mut registry);
     cp_async::register(&mut registry);
     leaf::register(&mut registry);

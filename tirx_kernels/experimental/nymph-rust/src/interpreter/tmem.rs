@@ -3,6 +3,8 @@
 
 use std::collections::BTreeSet;
 
+use super::protocol::AccessScope;
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct TmemAllocationKey {
     pub cta_id: usize,
@@ -33,6 +35,7 @@ pub struct TmemCollectiveArrival {
     pub cta_id: usize,
     pub ctaid_in_cluster: usize,
     pub stream_id: usize,
+    pub scope: AccessScope,
     pub col_start: usize,
     pub n_cols: usize,
     pub cta_group: u8,

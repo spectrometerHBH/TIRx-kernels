@@ -149,9 +149,11 @@ def test_single_issue_scope_negative():
         build(with_elected=False)
     k = build(with_elected=True)
     src = nr.kernel_to_tirx_source(k)
-    # The IR's own nested predicate is printed literally. Codegen must not
-    # substitute either hardware spelling or move it out of the warp branch.
-    assert src.count("if lane_id == 0:") == 1, src
-    assert "if warp_id == 0:\n        if lane_id == 0:" in src
-    assert "if T.ptx.elect_sync():" not in src
+    # The `if_elected` sugar's own IR predicate prints as the elect.sync
+    # intrinsic (canon's elected-region form), nested literally inside the
+    # warp branch. A hand-written `lane_id() == 0` stays a literal compare —
+    # codegen never rewrites either spelling.
+    assert src.count("if T.ptx.elect_sync():") == 1, src
+    assert "if warp_id == 0:\n        if T.ptx.elect_sync():" in src
+    assert "if lane_id == 0:" not in src
     assert "if T.cuda.thread_rank() == 0:" not in src

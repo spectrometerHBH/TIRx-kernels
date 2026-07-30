@@ -8,7 +8,9 @@
 //! the output comes from the IR:
 //! - Every `Stmt::If` prints its scalar predicate literally. In particular,
 //!   `lane_id == 0` remains `lane_id == 0`; codegen never substitutes
-//!   `elect_sync()` or `thread_rank() == 0`.
+//!   `elect_sync()` or `thread_rank() == 0`. The `if_elected` SUGAR is its own
+//!   IR predicate (`ScopeValueKind::Elected`), printed as the
+//!   `T.ptx.elect_sync()` intrinsic — canon's exact elected-region form.
 //! - Hardware single-issue ops (TmaLoad/TmaStore/CpAsyncBulkS2Cluster,
 //!   Tcgen05Mma/Tcgen05Cp/Tcgen05Commit, MBarrierInit, ClcTryCancel) are
 //!   legal ONLY under an explicit single-lane `If` — the validator's
@@ -1289,6 +1291,9 @@ fn scope_name(kind: ScopeValueKind) -> &'static str {
         CtaidInCluster => "cbx",
         CtaId => "cta_id",
         NvshmemMyPe => "nvshmem_my_pe",
+        // `Elected` never reaches scope_name: emit_scalar_prec special-cases
+        // it to the `T.ptx.elect_sync()` intrinsic.
+        Elected => "elected",
     }
 }
 
@@ -1321,6 +1326,10 @@ fn emit_scalar_prec(sv: &ScalarValue, ctx: &Ctx, parent_prec: u8) -> Result<Stri
     match sv {
         ScalarValue::Int(i) => Ok(i.to_string()),
         ScalarValue::Var(v) => Ok(var_ref(ctx, v)),
+        // The `if_elected` predicate is the elect.sync intrinsic itself
+        // (canon's `if T.ptx.elect_sync():` — one elected lane per warp,
+        // single-issue ops inside emit bare).
+        ScalarValue::Scope(ScopeValueKind::Elected) => Ok("T.ptx.elect_sync()".to_string()),
         ScalarValue::Scope(k) => Ok(scope_name(*k).to_string()),
         ScalarValue::Expr(e) => emit_expr(e, ctx, parent_prec),
     }
@@ -3012,6 +3021,20 @@ fn emit_stmt(
             }
             Ok(())
         }
+        GridDepControl { action } => {
+            // PDL hint (sm_90+): `launch_dependents` lowers to SASS PREEXIT,
+            // letting the dependent grid's prologue overlap this grid's drain.
+            use super::stmt::GridDepAction;
+            match action {
+                GridDepAction::LaunchDependents => {
+                    out.push_str(&format!("{p}T.ptx.griddepcontrol.launch_dependents()\n"));
+                }
+                GridDepAction::Wait => {
+                    out.push_str(&format!("{p}T.ptx.griddepcontrol.wait()\n"));
+                }
+            }
+            Ok(())
+        }
         CtaSync => {
             // The validator rejects statically narrowed CTA barriers. Codegen
             // must still print the statement at its exact IR position; it may
@@ -3656,16 +3679,10 @@ mod tests {
         }
     }
 
-    /// `if lane_id == 0: body` — the `if_elected` sugar.
+    /// `if T.ptx.elect_sync(): body` — the `if_elected` sugar's own predicate.
     fn elected_if(body: Vec<Stmt>) -> Stmt {
         Stmt::If {
-            cond: ScalarValue::expr(
-                ScalarOp::Eq,
-                vec![
-                    ScalarValue::Scope(ScopeValueKind::LaneId),
-                    ScalarValue::Int(0),
-                ],
-            ),
+            cond: ScalarValue::Scope(ScopeValueKind::Elected),
             then_body: body,
         }
     }
@@ -3928,17 +3945,17 @@ mod tests {
             count: 1,
             stage: None,
         };
-        // Prologue: warp-0 branch + lane-0 branch remain nested literally.
+        // Prologue: warp-0 branch + elected branch remain nested literally.
         let src = kernel_to_tirx_source(&kernel(vec![
             Stmt::MBarDef { mbar: mbar.clone() },
             warp_if(0, vec![elected_if(vec![init()])]),
         ]))
         .unwrap();
         assert!(
-            src.contains("if warp_id == 0:\n        if lane_id == 0:"),
+            src.contains("if warp_id == 0:\n        if T.ptx.elect_sync():"),
             "{src}"
         );
-        assert!(!src.contains("if T.ptx.elect_sync():"), "{src}");
+        assert!(!src.contains("if lane_id == 0:"), "{src}");
         assert!(!src.contains("if T.cuda.thread_rank() == 0:"), "{src}");
 
         // A non-zero warp uses the identical literal nested predicate.
@@ -3948,11 +3965,33 @@ mod tests {
         ]))
         .unwrap();
         assert!(
-            src.contains("if warp_id == 2:\n        if lane_id == 0:"),
+            src.contains("if warp_id == 2:\n        if T.ptx.elect_sync():"),
             "{src}"
         );
-        assert!(!src.contains("if T.ptx.elect_sync():"), "{src}");
+        assert!(!src.contains("if lane_id == 0:"), "{src}");
         assert!(!src.contains("if T.cuda.thread_rank() == 0:"), "{src}");
+
+        // A HAND-WRITTEN `lane_id == 0` predicate stays a literal compare
+        // (faithful translation: only the `if_elected` sugar is elect.sync).
+        let lane0_if = Stmt::If {
+            cond: ScalarValue::expr(
+                ScalarOp::Eq,
+                vec![
+                    ScalarValue::Scope(ScopeValueKind::LaneId),
+                    ScalarValue::Int(0),
+                ],
+            ),
+            then_body: vec![init()],
+        };
+        let src = kernel_to_tirx_source(&kernel(vec![
+            Stmt::MBarDef { mbar: mbar.clone() },
+            warp_if(0, vec![lane0_if]),
+        ]))
+        .unwrap();
+        assert!(
+            src.contains("if warp_id == 0:\n        if lane_id == 0:"),
+            "{src}"
+        );
 
         // A loop does not authorize a different spelling or structure.
         let loop_body = vec![Stmt::ForLoop {
@@ -3973,10 +4012,10 @@ mod tests {
         ]))
         .unwrap();
         assert!(
-            src.contains("if warp_id == 0:\n        if lane_id == 0:"),
+            src.contains("if warp_id == 0:\n        if T.ptx.elect_sync():"),
             "{src}"
         );
-        assert!(!src.contains("if T.ptx.elect_sync():"), "{src}");
+        assert!(!src.contains("if lane_id == 0:"), "{src}");
         assert!(!src.contains("if T.cuda.thread_rank() == 0:"), "{src}");
     }
 
@@ -3993,6 +4032,30 @@ mod tests {
             let err = kernel_to_tirx_source(&nested).unwrap_err();
             assert!(err.contains("Put it explicitly at warp scope"), "{err}");
         }
+    }
+
+    /// PDL hint: both `griddepcontrol` actions lower 1:1 at their exact IR
+    /// position, at any scope (the statement is a scope-free leaf).
+    #[test]
+    fn grid_dep_control_lowers_to_griddepcontrol_ptx() {
+        use crate::ir::GridDepAction;
+        let k = kernel(vec![
+            Stmt::GridDepControl {
+                action: GridDepAction::LaunchDependents,
+            },
+            warp_if(
+                4,
+                vec![Stmt::GridDepControl {
+                    action: GridDepAction::Wait,
+                }],
+            ),
+        ]);
+        let src = kernel_to_tirx_source(&k).unwrap();
+        assert!(
+            src.contains("T.ptx.griddepcontrol.launch_dependents()"),
+            "{src}"
+        );
+        assert!(src.contains("T.ptx.griddepcontrol.wait()"), "{src}");
     }
 
     // ------------------------------------------------------------------

@@ -168,8 +168,10 @@ the interpreter. Rule + audit table: docs/ir-ops.md §"Codegen emission
 guards". Negative tests: validate.rs `single_issue_scope_rule`,
 tests/test_compile_gate.py `test_single_issue_scope_negative`.
 
-The rule also covers spelling and structure: `lane_id == 0` is printed as
-`lane_id == 0`, never as `elect_sync()` or `thread_rank() == 0`; sibling
+The rule also covers spelling and structure: a hand-written `lane_id == 0`
+is printed as `lane_id == 0`, never as `elect_sync()` or
+`thread_rank() == 0`, while the `if_elected` sugar is its own IR predicate
+(`ScopeValueKind::Elected`) printed as `T.ptx.elect_sync()`; sibling
 IR `If`s remain siblings and nested IR `If`s remain nested. The former
 top-level-`If` chaining pass was deleted. Any required CTA-role condition
 (including an MMA issuer restriction) must be written explicitly in the

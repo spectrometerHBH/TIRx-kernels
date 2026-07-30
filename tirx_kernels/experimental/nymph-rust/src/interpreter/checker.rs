@@ -3765,6 +3765,58 @@ impl EventHb {
     }
 }
 
+type TmemCollectiveKey = (u8, usize, Vec<usize>, usize, u32, RegionBoxes);
+
+/// A `cta_group::2` lifecycle operation is represented by one local event per
+/// owner. The two events still describe one physical collective, so its
+/// completion joins the participant streams before later local gates publish
+/// that completion to user warps.
+fn tmem_collective_key(event: &TraceEvent) -> Option<TmemCollectiveKey> {
+    let (kind, cta_ids, region, scope) = match &event.payload {
+        TraceEventKind::TmemAlloc {
+            cta_ids,
+            region,
+            scope,
+        } => (0, cta_ids, region, scope),
+        TraceEventKind::TmemDealloc {
+            cta_ids,
+            region,
+            scope,
+        } => (1, cta_ids, region, scope),
+        _ => return None,
+    };
+    if cta_ids.len() < 2 {
+        return None;
+    }
+    let mut sorted = cta_ids.clone();
+    sorted.sort_unstable();
+    Some((
+        kind,
+        event.stmt_id,
+        sorted,
+        scope.cluster_id,
+        region.tensor_id,
+        region.boxes.clone(),
+    ))
+}
+
+fn event_clock(meta: &EventHb) -> Clock {
+    let mut clock = (*meta.shared).clone();
+    if meta.mask == FULL_MASK {
+        clock_set_max(&mut clock, prefix_dim(meta.stream_id), meta.ordinal);
+    } else {
+        for lane in 0..WARP_LANES {
+            if meta.mask & (1 << lane) != 0 {
+                clock_set_max(&mut clock, lane_dim(meta.stream_id, lane), meta.ordinal);
+            }
+        }
+    }
+    for (_, extra) in &meta.extras {
+        join_clock(&mut clock, extra);
+    }
+    clock
+}
+
 struct OrderingAnalysis {
     meta: Vec<EventHb>,
 }
@@ -3837,6 +3889,7 @@ impl OrderingAnalysis {
         // it, so one lane's fence does not seal its warp-mates: a relaxed
         // arrive publishes only for arriving lanes that fenced themselves.
         let mut fenced_lanes: HashMap<usize, u32> = HashMap::new();
+        let mut pending_tmem_collectives: HashMap<TmemCollectiveKey, usize> = HashMap::new();
         for event in events.iter() {
             let Some(scope) = event_scope(&event.payload) else {
                 meta.push(no_scope.clone());
@@ -3918,6 +3971,13 @@ impl OrderingAnalysis {
             // view published for THAT address space, not for its own CTA.
             let engine = async_proxy_access_owner(event)
                 .map(|owner_cta| engines.view_for(owner_cta, scope.cluster_id));
+            let collective_key = tmem_collective_key(event);
+            if let Some(key) = collective_key.as_ref() {
+                if let Some(prior_idx) = pending_tmem_collectives.get(key).copied() {
+                    let prior_clock = event_clock(&meta[prior_idx]);
+                    join_clock(Arc::make_mut(&mut states[stream_id].shared), &prior_clock);
+                }
+            }
             meta.push(EventHb {
                 stream_id,
                 mask,
@@ -3926,6 +3986,19 @@ impl OrderingAnalysis {
                 extras,
                 engine,
             });
+
+            if let Some(key) = collective_key {
+                if let Some(prior_idx) = pending_tmem_collectives.remove(&key) {
+                    let current_clock = event_clock(meta.last().expect("event was just recorded"));
+                    let prior_stream = meta[prior_idx].stream_id;
+                    join_clock(
+                        Arc::make_mut(&mut states[prior_stream].shared),
+                        &current_clock,
+                    );
+                } else {
+                    pending_tmem_collectives.insert(key, meta.len() - 1);
+                }
+            }
 
             // A warp-collective instruction's effects are warp-visible once
             // it completes: raise the prefix over the event itself.

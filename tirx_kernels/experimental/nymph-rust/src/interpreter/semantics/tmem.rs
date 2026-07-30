@@ -7,7 +7,7 @@
 use super::super::diagnostics::{IResult, InterpreterError};
 use super::super::mbar_ops::peer_ctaid_in_cluster;
 use super::super::outcomes::{StepStatus, WakeCondition};
-use super::super::protocol::TraceEventKind;
+use super::super::protocol::{AccessScope, TraceEventKind};
 use super::super::region;
 use super::super::registry::{StmtExecutorRegistry, StmtKind};
 use super::super::state::InterpreterState;
@@ -118,6 +118,29 @@ fn lifecycle_apply(
     col_start: usize,
     n_cols: usize,
 ) -> IResult<()> {
+    let scope = ctx.access_scope();
+    let scopes: Vec<(usize, AccessScope)> = cta_ids
+        .iter()
+        .map(|&cta_id| (cta_id, scope.clone()))
+        .collect();
+    lifecycle_apply_with_scopes(ctx, stmt, op, cta_ids, col_start, n_cols, &scopes)
+}
+
+/// Apply one physical lifecycle transition and emit one event per CTA owner.
+///
+/// A cta_group::2 instruction has one physical allocation/deallocation, but
+/// its two local participant streams each need their own trace scope. Keeping
+/// those scopes separate is what lets the checker connect each CTA's later
+/// access to the allocation observed by that CTA's allocator stream.
+fn lifecycle_apply_with_scopes(
+    ctx: &mut WarpContext,
+    stmt: &Stmt,
+    op: &str,
+    cta_ids: &[usize],
+    col_start: usize,
+    n_cols: usize,
+    scopes: &[(usize, AccessScope)],
+) -> IResult<()> {
     let (_, _, cta_group) = fields(stmt);
     let mut sorted = cta_ids.to_vec();
     sorted.sort_unstable();
@@ -163,21 +186,30 @@ fn lifecycle_apply(
         }
     }
     if ctx.trace_mode() {
-        let scope = ctx.access_scope();
         for &cta_id in &sorted {
+            let scope = scopes
+                .iter()
+                .find(|(scope_cta_id, _)| *scope_cta_id == cta_id)
+                .map(|(_, scope)| scope)
+                .ok_or_else(|| {
+                    InterpreterError::new(
+                        "tmem_collective_scope_missing",
+                        "TMEM lifecycle event has no participant scope",
+                    )
+                })?;
             // The region's tensor_id slot carries the allocation's base column —
             // TMEM has no tensor identity; the band base is the alloc identity.
             let region =
                 region::tmem_allocation_region(col_start as u32, cta_id, col_start, n_cols)?;
             if op == "alloc" {
                 ctx.emit(TraceEventKind::TmemAlloc {
-                    cta_ids: vec![cta_id],
+                    cta_ids: sorted.clone(),
                     region,
                     scope: scope.clone(),
                 })?;
             } else {
                 ctx.emit(TraceEventKind::TmemDealloc {
-                    cta_ids: vec![cta_id],
+                    cta_ids: sorted.clone(),
                     region,
                     scope: scope.clone(),
                 })?;
@@ -334,6 +366,7 @@ fn cta_group_2<'a, 'k>(
         cta_id: current.cta_id,
         ctaid_in_cluster: current.ctaid_in_cluster,
         stream_id: ctx.stream.stream_id,
+        scope: ctx.access_scope(),
         col_start,
         n_cols,
         cta_group,
@@ -370,9 +403,10 @@ fn cta_group_2<'a, 'k>(
         return Ok(StepStatus::block(WakeCondition::Polled));
     }
     // this arrival completes the pair
+    let mut participants = collective.arrivals.clone();
+    participants.sort_unstable_by_key(|arrival| arrival.cta_id);
     let arrived: Vec<usize> = {
-        let mut v: Vec<usize> = collective.arrivals.iter().map(|a| a.cta_id).collect();
-        v.sort_unstable();
+        let v: Vec<usize> = participants.iter().map(|a| a.cta_id).collect();
         v
     };
     let mut expected = vec![current.cta_id, peer_global];
@@ -384,7 +418,11 @@ fn cta_group_2<'a, 'k>(
         ));
     }
     let completed = collective.with_completed(current.cta_id);
-    lifecycle_apply(ctx, stmt, op, &arrived, col_start, n_cols)?;
+    let scopes: Vec<(usize, AccessScope)> = participants
+        .into_iter()
+        .map(|arrival| (arrival.cta_id, arrival.scope))
+        .collect();
+    lifecycle_apply_with_scopes(ctx, stmt, op, &arrived, col_start, n_cols, &scopes)?;
     ctx.state.tmem_collectives.insert(key, completed);
     Ok(StepStatus::advance())
 }

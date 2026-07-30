@@ -1,4 +1,5 @@
 import nymph_rs as nr
+import pytest
 from helpers import (
     builder,
     expect_runtime_error,
@@ -326,6 +327,111 @@ def test_protocol_gemm_trace_runs_without_payload_inputs():
         for event in _events(report, "write")
     )
     assert any(event["async_kind"] == "ld" for event in _events(report, "tmem_wait"))
+
+
+@pytest.mark.parametrize("dtype", [nr.DType.F16, nr.DType.BF16])
+def test_protocol_small_overlap_gemm_initializes_alloc_done_on_warp_zero(dtype):
+    cfg = Fp16Bf16GemmConfig(
+        m=256,
+        n=64,
+        k=64,
+        dtype=dtype,
+        mma_n=64,
+        blk_k=64,
+        pipe_depth=1,
+        wb_pipe_depth=2,
+        launch_shape=(2,),
+        overlap_epilogue=True,
+        scheduler="static",
+    )
+
+    report = nr.check_protocol(build_fp16_bf16_gemm(cfg), include_events=True)
+    assert report["status"] == "Passed", report["diagnostics"][:2]
+    assert "uninitialized_mbarrier" not in _diagnostic_codes(report)
+
+
+def _cta_group2_lifecycle_kernel(*, delayed_cta=None):
+    b = builder(
+        "protocol_tmem_collective_lifecycle",
+        num_warps=4,
+        smem_size_bytes=4,
+        launch_shape=(2,),
+        cluster_shape=(2,),
+    )
+    if delayed_cta is not None:
+        with b.if_(b.ctaid_in_cluster().eq(delayed_cta)):
+            for _ in range(20):
+                b.scalar(initial=0, dtype=nr.ScalarDType.I32)
+    with b.if_warp(0):
+        b.tmem_alloc(0, 32, addr_byte_offset=0, cta_group=2)
+        b.tmem_dealloc(0, 32, cta_group=2)
+    return b.build()
+
+
+def _collective_lifecycle_mapping(report):
+    return [
+        (
+            event["kind"],
+            event["region"]["owner"]["cta_id"],
+            event["scope"]["cta_id"],
+            event["scope"]["stream_id"],
+            event["stmt_kind"],
+        )
+        for event in report["events"]
+        if event["kind"] in {"tmem_alloc", "tmem_dealloc"}
+    ]
+
+
+def test_protocol_tmem_collective_events_keep_owner_scope_and_generation_counts():
+    report = nr.check_protocol(_cta_group2_lifecycle_kernel(), include_events=True)
+    assert report["status"] == "Passed", report["diagnostics"][:2]
+    mapping = _collective_lifecycle_mapping(report)
+    assert mapping == [
+        ("tmem_alloc", 0, 0, 0, "TmemAlloc"),
+        ("tmem_alloc", 1, 1, 4, "TmemAlloc"),
+        ("tmem_dealloc", 0, 0, 0, "TmemDealloc"),
+        ("tmem_dealloc", 1, 1, 4, "TmemDealloc"),
+    ]
+    assert all(event["cta_ids"] == [0, 1] for event in _events(report, "tmem_alloc"))
+    assert all(event["cta_ids"] == [0, 1] for event in _events(report, "tmem_dealloc"))
+
+
+def test_protocol_tmem_collective_mapping_is_independent_of_arrival_variant():
+    cta0_last = nr.check_protocol(_cta_group2_lifecycle_kernel(delayed_cta=0), include_events=True)
+    cta1_last = nr.check_protocol(_cta_group2_lifecycle_kernel(delayed_cta=1), include_events=True)
+    assert cta0_last["status"] == cta1_last["status"] == "Passed"
+    assert _collective_lifecycle_mapping(cta0_last) == _collective_lifecycle_mapping(cta1_last)
+
+
+def test_protocol_tmem_cta_group_one_lifecycle_scope_is_unchanged():
+    b = builder("protocol_tmem_cta_group_one", num_warps=4, smem_size_bytes=4)
+    with b.if_warp(0):
+        b.tmem_alloc(0, 32, addr_byte_offset=0, cta_group=1)
+        b.tmem_dealloc(0, 32, cta_group=1)
+
+    report = nr.check_protocol(b.build(), include_events=True)
+    assert report["status"] == "Passed", report["diagnostics"][:2]
+    for kind in ("tmem_alloc", "tmem_dealloc"):
+        events = _events(report, kind)
+        assert len(events) == 1
+        assert events[0]["cta_ids"] == [0]
+        assert events[0]["region"]["owner"]["cta_id"] == events[0]["scope"]["cta_id"] == 0
+
+
+def test_protocol_tmem_collective_user_warp_requires_allocator_sync():
+    b = builder("protocol_tmem_collective_user_without_sync", smem_size_bytes=4)
+    tmem = tmem_tensor()
+    reg = reg_tensor(b, dtype=nr.DType.F32, shape=(1,))
+    with b.if_warp(0):
+        b.tmem_alloc(0, 32, addr_byte_offset=0)
+    with b.if_warp(1):
+        b.tcgen05_st(tmem.at(0, 0), reg, shape="32x32b", num=1)
+    with b.if_warp(0):
+        b.tmem_dealloc(0, 32)
+
+    report = nr.check_protocol(b.build(), include_events=True)
+    assert report["status"] == "Failed"
+    assert "tmem_lifecycle_use_without_allocation" in _diagnostic_codes(report)
 
 
 def test_protocol_tmem_mma_layout_f_emits_union_boxes():
