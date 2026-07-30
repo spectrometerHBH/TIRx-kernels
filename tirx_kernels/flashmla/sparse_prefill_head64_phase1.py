@@ -543,7 +543,7 @@ def _kernel(
                 s_y: T.let = T.ptx.exp2(T.cuda.float2_y(fma_pair))
                 s_pair: T.let = T.cuda.make_float2(s_x, s_y)
                 cur_sum_pair = T.ptx.add_f32x2(cur_sum_pair, s_pair, dps=False)
-                s_pack[s_i] = T.cuda.float22bfloat162_rn(s_x, s_y)
+                s_pack[s_i] = T.ptx.cvt(s_y, s_x, dtype="bf16x2", atype="f32", rounding="rn")
             cur_sum: T.let = T.cuda.float2_x(cur_sum_pair) + T.cuda.float2_y(cur_sum_pair)
             li_tmp: T.float32
             T.ptx.fma_f32(T.address_of(li_tmp), li, scale_for_old, cur_sum)

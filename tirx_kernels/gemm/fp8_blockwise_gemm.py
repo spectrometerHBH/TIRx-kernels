@@ -10,7 +10,7 @@ from tvm.backend.cuda.operator.tile_primitive.tma_utils import SwizzleMode
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.bench import bench
-from tvm.tirx.lang.pipeline import MBarrier, Pipeline, PipelineState
+from tvm.tirx.lang.pipeline import MBarrier, PipelineState, TCGen05Bar, TMABar
 from tvm.tirx.lang.tile_scheduler import ClusterPersistentScheduler2D
 
 
@@ -23,6 +23,15 @@ def _swizzle_mode(block_size: int, elem_size: int) -> int:
         if (block_size * elem_size) % mode == 0:
             return mode
     raise AssertionError("unreachable swizzle mode")
+
+
+def _tma_swizzle_mode(swizzle_bytes: int) -> SwizzleMode:
+    return {
+        128: SwizzleMode.SWIZZLE_128B_ATOM,
+        64: SwizzleMode.SWIZZLE_64B_ATOM,
+        32: SwizzleMode.SWIZZLE_32B_ATOM,
+        16: SwizzleMode.SWIZZLE_NONE,
+    }[swizzle_bytes]
 
 
 def _deepgemm_num_stages(
@@ -62,7 +71,11 @@ def _choose_deepgemm_config(M: int, N: int, K: int) -> tuple[bool, int, int, int
         else:
             block_m_candidates = [32] if M <= 32 else [64] if M <= 64 else [128]
             max_block_n = 128 if K <= 256 else 256
-            block_n_candidates = [16, *range(32, max_block_n + 1, 32)]
+            block_n_candidates = (
+                [16, *range(32, max_block_n + 1, 32)]
+                if K <= 512 or M == N
+                else range(16, max_block_n + 1, 16)
+            )
             cluster_candidates = [(2, 1)]
 
         for cluster_m, cluster_n in cluster_candidates:
@@ -166,6 +179,62 @@ def prepare_data(M: int, N: int, K: int):
     )
 
 
+def _cluster_sync_relaxed():
+    T.evaluate(T.ptx.barrier.cluster.arrive(sem="relaxed", aligned=True))
+    T.evaluate(T.ptx.barrier.cluster.wait(aligned=True))
+
+
+def _runtime_instr_desc_with_sf_id(desc, sfa_id, sfb_id):
+    runtime_desc = T.bitwise_and(desc, T.uint32(0x9FFFFFCF))
+    runtime_desc = T.bitwise_or(runtime_desc, T.shift_left(T.cast(sfa_id, "uint32"), T.uint32(29)))
+    return T.bitwise_or(runtime_desc, T.shift_left(T.cast(sfb_id, "uint32"), T.uint32(4)))
+
+
+def _advance_umma_desc_lo(desc, base_lo, k_offset):
+    return T.bitwise_or(
+        T.bitwise_and(desc, T.shift_left(T.uint64(0xFFFFFFFF), T.uint64(32))),
+        T.cast(base_lo + T.cast(k_offset // 16, "uint32"), "uint64"),
+    )
+
+
+def _transpose_sf_chunk(buf, stage, chunk, lane):
+    """Match DeepGEMM's 128-element UTCCP shared-memory transpose."""
+
+    base = chunk * 128
+    values = T.alloc_local((4,), "uint32")
+    T.buffer_store(
+        values, T.ptx.ld(buf.ptr_to([stage, base + lane]), "uint32", "u32", space="shared"), [0]
+    )
+    T.buffer_store(
+        values,
+        T.ptx.ld(buf.ptr_to([stage, base + 32 + lane]), "uint32", "u32", space="shared"),
+        [1],
+    )
+    T.buffer_store(
+        values,
+        T.ptx.ld(buf.ptr_to([stage, base + 64 + lane]), "uint32", "u32", space="shared"),
+        [2],
+    )
+    T.buffer_store(
+        values,
+        T.ptx.ld(buf.ptr_to([stage, base + 96 + lane]), "uint32", "u32", space="shared"),
+        [3],
+    )
+    T.evaluate(T.cuda.warp_sync())
+    T.evaluate(
+        T.ptx.st(
+            buf.ptr_to([stage, base + lane * 4]),
+            values[0],
+            values[1],
+            values[2],
+            values[3],
+            vec="v4",
+            ptx_type="u32",
+            space="shared",
+        )
+    )
+
+
 @T.jit
 def _kernel(
     A: T.Buffer((M, K), "float8_e4m3fn"),
@@ -187,7 +256,6 @@ def _kernel(
     # tile / MMA sizes
     BLK_K: T.constexpr = 128,
     MMA_K: T.constexpr = 32,
-    EPI_TILE: T.constexpr = 32,
     TMEM_LD_SIZE: T.constexpr = 8,
     # pipeline depths
     SMEM_DEPTH: T.constexpr,
@@ -219,13 +287,20 @@ def _kernel(
     SFAB_bytes = T.meta_var((DG_BLOCK_M + DG_BLOCK_N) * 4)  # SF packed as uint32: 4 B
     SCHED_M_NUM = T.meta_var(math.ceil(N / DG_BLOCK_N) if SWAP_AB else math.ceil(M / DG_BLOCK_M))
     SCHED_N_NUM = T.meta_var(math.ceil(M / DG_BLOCK_M) if SWAP_AB else math.ceil(N / DG_BLOCK_N))
-    D_SMEM_M = T.meta_var(16 if SWAP_AB else BLK_M)
-    D_SMEM_N = T.meta_var(DG_BLOCK_N if SWAP_AB else EPI_TILE)
-    D_SWIZZLE = T.meta_var(
-        SwizzleMode.SWIZZLE_128B_ATOM if SWAP_AB else SwizzleMode.SWIZZLE_64B_ATOM
+    D_SWIZZLE_BYTES = T.meta_var(_swizzle_mode(DG_BLOCK_N, 2))
+    D_SMEM_M = T.meta_var(16 if SWAP_AB else min(DG_BLOCK_M, 128))
+    D_SMEM_N = T.meta_var(DG_BLOCK_N if SWAP_AB else D_SWIZZLE_BYTES // 2)
+    D_SWIZZLE = T.meta_var(_tma_swizzle_mode(D_SWIZZLE_BYTES))
+    SMEM_CD_BYTES = T.meta_var(TMEM_DEPTH * D_SMEM_M * D_SMEM_N * 2)
+    SMEM_BARRIER_BYTES = T.meta_var(32 * 8 * 3 + 2 * 8 * 2 + 8)
+    SMEM_STAGE_BYTES = T.meta_var(AB_bytes + (BLK_SFA + BLK_SFB) * 4)
+    DG_SMEM_BYTES = T.meta_var(
+        SMEM_CD_BYTES + SMEM_BARRIER_BYTES + 4 + SMEM_DEPTH * SMEM_STAGE_BYTES
     )
     T.device_entry()
     T.attr({"tirx.launch_bounds_min_blocks_per_sm": 1})
+    # DeepGEMM uses relaxed cluster arrival at all three two-CTA sync points.
+    _cluster_sync_relaxed()
     cbx, cby = T.cta_id_in_cluster([M_CLUSTER, N_CLUSTER])
     cluster_rank = T.ptx.fetch_register(32, "cluster_ctarank")
     bx = T.cta_id([SM_NUMBER])
@@ -234,9 +309,20 @@ def _kernel(
     tid_in_wg = T.thread_id_in_wg([128])
     lane_id = T.lane_id([32])
     pool = T.SMEMPool()
-    barrier_leader = T.bitwise_and(T.cast(warp_id == 1, "uint32"), T.ptx.elect_sync()) != T.uint32(
-        0
+    # Preserve DeepGEMM's dynamic-SMEM order: D, A, B, SFA, SFB, barriers,
+    # then the shared TMEM pointer.
+    D_smem = pool.alloc_tcgen05_mma_AB(
+        (TMEM_DEPTH, D_SMEM_M, D_SMEM_N), "bfloat16", swizzle_mode=D_SWIZZLE
     )
+    A_smem = pool.alloc_tcgen05_mma_AB((SMEM_DEPTH, BLK_M, BLK_K), "float8_e4m3fn")
+    B_smem = pool.alloc_tcgen05_mma_AB((SMEM_DEPTH, BLK_N, BLK_K), "float8_e4m3fn")
+    SFA_smem = pool.alloc((SMEM_DEPTH, BLK_SFA), "uint32")
+    SFB_smem = pool.alloc((SMEM_DEPTH, BLK_SFB), "uint32")
+    full_barriers = TMABar(pool, SMEM_DEPTH, leader=False)
+    empty_barriers = TCGen05Bar(pool, SMEM_DEPTH, leader=False)
+    with_sf_full_barriers = MBarrier(pool, SMEM_DEPTH, leader=False)
+    tmem_full_barriers = TCGen05Bar(pool, TMEM_DEPTH, leader=False)
+    tmem_empty_barriers = MBarrier(pool, TMEM_DEPTH, phase_offset=1, leader=False)
     tmem_pool = T.TMEMPool(
         pool,
         total_cols=512,
@@ -245,39 +331,33 @@ def _kernel(
         dealloc_warp=0,
         sync_after_alloc=False,
     )
-    smem_pipe = Pipeline(pool, SMEM_DEPTH, full="tma", empty="tcgen05", leader=barrier_leader)
-    trans_done = MBarrier(pool, SMEM_DEPTH, leader=barrier_leader)
-    trans_done.init(CTA_GROUP * 32)
-    tmem_pipe = Pipeline(
-        pool,
-        TMEM_DEPTH,
-        full="tcgen05",
-        empty="mbar",
-        init_empty=CTA_GROUP * 128,
-        empty_phase_offset=1,
-        leader=barrier_leader,
-    )
     acc_buf = tmem_pool.alloc_tcgen05_mma_D(
         (128, TMEM_DEPTH * MMA_N), "float32", M=128 * CTA_GROUP, cta_group=CTA_GROUP
     )
     acc = T.meta_var(acc_buf.rearrange("m (s n) -> s m n", s=TMEM_DEPTH))
     SFA_tmem = tmem_pool.alloc_sf(
-        (TMEM_DEPTH, BLK_SFA, 4 * K_ITERS), "float8_e8m0fnu", sf_per_mma=1, sf_reuse=K_ITERS
+        (BLK_SFA, 4 * K_ITERS), "float8_e8m0fnu", sf_per_mma=1, sf_reuse=K_ITERS
     )
     SFB_tmem = tmem_pool.alloc_sf(
-        (TMEM_DEPTH, BLK_SFB, 4 * K_ITERS), "float8_e8m0fnu", sf_per_mma=1, sf_reuse=K_ITERS
+        (BLK_SFB, 4 * K_ITERS), "float8_e8m0fnu", sf_per_mma=1, sf_reuse=K_ITERS
     )
-    pool.move_base_to(1024)
-    A_smem = pool.alloc_tcgen05_mma_AB((SMEM_DEPTH, BLK_M, BLK_K), "float8_e4m3fn")
-    B_smem = pool.alloc_tcgen05_mma_AB((SMEM_DEPTH, BLK_N, BLK_K), "float8_e4m3fn")
-    D_smem = pool.alloc_tcgen05_mma_AB(
-        (TMEM_DEPTH, D_SMEM_M, D_SMEM_N), "bfloat16", swizzle_mode=D_SWIZZLE
-    )
-    SFA_smem = pool.alloc((SMEM_DEPTH, BLK_SFA), "uint32")
-    SFB_smem = pool.alloc((SMEM_DEPTH, BLK_SFB), "uint32")
-    pool.commit()
-    if barrier_leader:
-        T.ptx.fence.mbarrier_init()
+    pool.commit(size=DG_SMEM_BYTES)
+    if wg_id == 0:
+        if warp_id == 1:
+            if T.ptx.elect_sync():
+                for i in T.unroll(SMEM_DEPTH):
+                    T.ptx.mbarrier.init(full_barriers.ptr_to([i]), 1)
+                    T.ptx.mbarrier.init(empty_barriers.ptr_to([i]), 1)
+                    T.ptx.mbarrier.init(with_sf_full_barriers.ptr_to([i]), CTA_GROUP * 32)
+                for i in T.unroll(TMEM_DEPTH):
+                    T.ptx.mbarrier.init(tmem_full_barriers.ptr_to([i]), 1)
+                    T.ptx.mbarrier.init(tmem_empty_barriers.ptr_to([i]), CTA_GROUP * 128)
+                T.ptx.fence.mbarrier_init()
+        elif warp_id == 2:
+            tmem_pool.commit()
+    _cluster_sync_relaxed()
+    T.evaluate(T.ptx.griddepcontrol.wait())
+
     stage: T.int32
     tile_scheduler = ClusterPersistentScheduler2D(
         "tile_scheduler",
@@ -286,18 +366,12 @@ def _kernel(
         l2_group_size=TILE_GROUPS_ROW_SIZE,
         num_clusters=SM_NUMBER,
     )
-    tile_scheduler.init(bx)
-    tmem_pool.commit()
-    T.cuda.cluster_sync()
-    T.evaluate(T.ptx.griddepcontrol.wait())
-    T.cuda.trap_when_assert_failed(tmem_pool.addr == 0)
-
     m_idx = T.meta_var(tile_scheduler.n_idx if SWAP_AB else tile_scheduler.m_idx)
     n_idx = T.meta_var(tile_scheduler.m_idx if SWAP_AB else tile_scheduler.n_idx)
 
     if wg_id == 0:
         if warp_id == 0:
-            tma_cur = PipelineState(SMEM_DEPTH, 1)
+            tma_cur = PipelineState(SMEM_DEPTH, 0)
             a_m = T.meta_var(
                 m_idx * DG_BLOCK_M + cluster_rank * BLK_M if SWAP_AB else m_idx * DG_BLOCK_M
             )
@@ -309,13 +383,13 @@ def _kernel(
 
             @T.inline
             def tma_load(k_tile):
-                smem_pipe.empty.wait(tma_cur.stage, tma_cur.phase)
+                empty_barriers.wait(tma_cur.stage, tma_cur.phase ^ 1)
                 stage = tma_cur.stage
                 k = T.meta_var(k_tile * BLK_K)
                 tma_copy = T.meta_var(
                     {
                         "dispatch": "tma_auto",
-                        "mbar": smem_pipe.full.ptr_to([stage]),
+                        "mbar": full_barriers.ptr_to([stage]),
                         "cta_group": 1,
                         "cache_hint": "evict_normal",
                         "prefetch_tensormap": True,
@@ -334,8 +408,7 @@ def _kernel(
                         SFB[k_tile // 4, sf_n : sf_n + DG_BLOCK_N],
                         **tma_copy,
                     )
-
-                smem_pipe.full.arrive(
+                full_barriers.arrive(
                     tma_cur.stage,
                     tx_count=T.if_then_else(k_tile % 4 == 0, AB_bytes + SFAB_bytes, AB_bytes),
                 )
@@ -347,32 +420,13 @@ def _kernel(
                     tma_cur.advance()
 
             if T.ptx.elect_sync():
+                tile_scheduler.linear_idx = bx
+                tile_scheduler.tile_count = 0
                 while tile_scheduler.valid():
+                    tile_scheduler.update_current_m_n_idx(tile_scheduler.linear_idx)
                     tma_iter()
-                    tile_scheduler.next_tile()
-        elif warp_id == 2:
-            SFA_smem_post = SFA_smem.view(SMEM_DEPTH, BLK_SFA, layout=SFA_post_layout)
-            SFB_smem_post = SFB_smem.view(SMEM_DEPTH, BLK_SFB, layout=SFB_post_layout)
-            trans_state = PipelineState(SMEM_DEPTH, 0)
-
-            @T.inline
-            def transpose(ks, k_tile):
-                smem_pipe.full.wait(ks, trans_state.phase)
-                if k_tile % 4 == 0:
-                    Tx.warp.permute_layout(SFA_smem_post[ks, :], SFA_smem[ks, :])
-                    Tx.warp.permute_layout(SFB_smem_post[ks, :], SFB_smem[ks, :])
-                    T.ptx.fence.proxy_async("shared::cta")
-                trans_done.arrive(ks, remote=0)
-
-            @T.inline
-            def trans_iter():
-                for k_tile in T.serial(K_TILES):
-                    transpose(trans_state.stage, k_tile)
-                    trans_state.advance()
-
-            while tile_scheduler.valid():
-                trans_iter()
-                tile_scheduler.next_tile()
+                    tile_scheduler.linear_idx = tile_scheduler.linear_idx + SM_NUMBER
+                    tile_scheduler.tile_count = tile_scheduler.tile_count + 1
         elif warp_id == 1 and cluster_rank == 0:
             SFA_smem_fp8 = SFA_smem.view("float8_e8m0fnu").view(
                 SMEM_DEPTH, BLK_SFA, 4 * K_ITERS, layout=SFA_smem_fp8_layout
@@ -380,79 +434,177 @@ def _kernel(
             SFB_smem_fp8 = SFB_smem.view("float8_e8m0fnu").view(
                 SMEM_DEPTH, BLK_SFB, 4 * K_ITERS, layout=SFB_smem_fp8_layout
             )
+            desc_a: T.uint64
+            desc_b: T.uint64
+            desc_i: T.uint32
+            runtime_desc_i: T.uint32
+            a_desc_lo: T.uint32
+            b_desc_lo: T.uint32
+            a_desc_base_lo: T.uint32
+            b_desc_base_lo: T.uint32
             tmem_idx: T.int32
             tmem_phase: T.int32
             mma_state = PipelineState(SMEM_DEPTH, 0)
-            accum: T.int32
 
-            @T.inline
-            def mma(ks, k_tile):
-                trans_done.wait(ks, mma_state.phase)
-                if k_tile % 4 == 0:
-                    Tx.copy_async(SFA_tmem[tmem_idx], SFA_smem_fp8[ks], cta_group=CTA_GROUP)
-                    Tx.copy_async(SFB_tmem[tmem_idx], SFB_smem_fp8[ks], cta_group=CTA_GROUP)
-                if SWAP_AB:
-                    Tx.gemm_async(
-                        acc[tmem_idx, :, :],
-                        B_smem[ks],
-                        A_smem[ks],
-                        SFA=SFB_tmem[tmem_idx],
-                        SFB=SFA_tmem[tmem_idx],
-                        accum=accum,
-                        dispatch="tcgen05",
-                        cta_group=CTA_GROUP,
-                    )
-                else:
-                    Tx.gemm_async(
-                        acc[tmem_idx, :, :],
-                        A_smem[ks],
-                        B_smem[ks],
-                        SFA=SFA_tmem[tmem_idx],
-                        SFB=SFB_tmem[tmem_idx],
-                        accum=accum,
-                        dispatch="tcgen05",
-                        cta_group=CTA_GROUP,
-                    )
-                accum = 1
-                smem_pipe.empty.arrive(ks, cta_group=CTA_GROUP, cta_mask=3)
-
-            @T.inline
-            def mma_iter():
-                if T.ptx.elect_sync():
-                    tmem_idx = tile_scheduler.tile_idx % TMEM_DEPTH
-                    tmem_phase = tile_scheduler.tile_idx // TMEM_DEPTH & 1
-                    tmem_pipe.empty.wait(tmem_idx, tmem_phase)
-                    accum = 0
-                    for k_tile in T.serial(K_TILES):
-                        mma(mma_state.stage, k_tile)
-                        mma_state.advance()
-                    tmem_pipe.full.arrive(tmem_idx, cta_group=CTA_GROUP, cta_mask=3)
-
+            T.ptx.tcgen05.encode_instr_descriptor_block_scaled(
+                T.address_of(desc_i),
+                d_dtype="float32",
+                a_dtype="float8_e4m3fn",
+                b_dtype="float8_e4m3fn",
+                sfa_dtype="float8_e8m0fnu",
+                sfb_dtype="float8_e8m0fnu",
+                sfa_tmem_addr=SFA_tmem.allocated_addr[0],
+                sfb_tmem_addr=SFB_tmem.allocated_addr[0],
+                M=128 * CTA_GROUP,
+                N=MMA_N,
+                K=MMA_K,
+                trans_a=False,
+                trans_b=False,
+                n_cta_groups=CTA_GROUP,
+            )
+            T.ptx.tcgen05.encode_matrix_descriptor(
+                T.address_of(desc_a), A_smem.ptr_to([0, 0, 0]), ldo=0, sdo=64, swizzle=3
+            )
+            T.ptx.tcgen05.encode_matrix_descriptor(
+                T.address_of(desc_b), B_smem.ptr_to([0, 0, 0]), ldo=0, sdo=64, swizzle=3
+            )
+            a_desc_lo = T.Select(
+                lane_id < SMEM_DEPTH,
+                T.cast(T.bitwise_and(desc_a, T.uint64(0xFFFFFFFF)), "uint32")
+                + T.cast(lane_id * (BLK_M * BLK_K // 16), "uint32"),
+                T.uint32(0),
+            )
+            b_desc_lo = T.Select(
+                lane_id < SMEM_DEPTH,
+                T.cast(T.bitwise_and(desc_b, T.uint64(0xFFFFFFFF)), "uint32")
+                + T.cast(lane_id * (BLK_N * BLK_K // 16), "uint32"),
+                T.uint32(0),
+            )
+            tile_scheduler.linear_idx = bx
+            tile_scheduler.tile_count = 0
             while tile_scheduler.valid():
-                mma_iter()
-                tile_scheduler.next_tile()
+                tile_scheduler.update_current_m_n_idx(tile_scheduler.linear_idx)
+                tmem_idx = tile_scheduler.tile_idx % TMEM_DEPTH
+                tmem_phase = tile_scheduler.tile_idx // TMEM_DEPTH & 1
+                tmem_empty_barriers.wait(tmem_idx, tmem_phase)
+                T.ptx.tcgen05.fence.after_thread_sync()
+                for k_tile in T.serial(K_TILES, unroll=4):
+                    ks = mma_state.stage
+                    with_sf_full_barriers.wait(ks, mma_state.phase)
+                    T.ptx.tcgen05.fence.after_thread_sync()
+                    a_desc_base_lo = T.tvm_warp_shuffle(T.uint32(0xFFFFFFFF), a_desc_lo, ks, 32, 32)
+                    b_desc_base_lo = T.tvm_warp_shuffle(T.uint32(0xFFFFFFFF), b_desc_lo, ks, 32, 32)
+                    if T.ptx.elect_sync():
+                        if k_tile % 4 == 0:
+                            Tx.copy_async(SFA_tmem, SFA_smem_fp8[ks], cta_group=CTA_GROUP)
+                            Tx.copy_async(SFB_tmem, SFB_smem_fp8[ks], cta_group=CTA_GROUP)
+                        for ki in T.unroll(K_ITERS):
+                            runtime_desc_i = _runtime_instr_desc_with_sf_id(
+                                desc_i, k_tile % 4, k_tile % 4
+                            )
+                            desc_a = _advance_umma_desc_lo(desc_a, a_desc_base_lo, ki * MMA_K)
+                            desc_b = _advance_umma_desc_lo(desc_b, b_desc_base_lo, ki * MMA_K)
+                            if SWAP_AB:
+                                T.ptx.tcgen05.mma.block_scale(
+                                    tmem_idx * MMA_N,
+                                    desc_b,
+                                    desc_a,
+                                    SFB_tmem.allocated_addr[0],
+                                    SFA_tmem.allocated_addr[0],
+                                    runtime_desc_i,
+                                    d_dtype="float32",
+                                    a_dtype="float8_e4m3fn",
+                                    b_dtype="float8_e4m3fn",
+                                    sfa_dtype="float8_e8m0fnu",
+                                    sfb_dtype="float8_e8m0fnu",
+                                    use_a_tmem=False,
+                                    cta_group=CTA_GROUP,
+                                    enable_input_d=T.Or(k_tile > 0, ki > 0),
+                                )
+                            else:
+                                T.ptx.tcgen05.mma.block_scale(
+                                    tmem_idx * MMA_N,
+                                    desc_a,
+                                    desc_b,
+                                    SFA_tmem.allocated_addr[0],
+                                    SFB_tmem.allocated_addr[0],
+                                    runtime_desc_i,
+                                    d_dtype="float32",
+                                    a_dtype="float8_e4m3fn",
+                                    b_dtype="float8_e4m3fn",
+                                    sfa_dtype="float8_e8m0fnu",
+                                    sfb_dtype="float8_e8m0fnu",
+                                    use_a_tmem=False,
+                                    cta_group=CTA_GROUP,
+                                    enable_input_d=T.Or(k_tile > 0, ki > 0),
+                                )
+                    T.cuda.warp_sync()
+                    if T.ptx.elect_sync():
+                        empty_barriers.arrive(ks, cta_group=CTA_GROUP, cta_mask=3)
+                    if k_tile == K_TILES - 1:
+                        if T.ptx.elect_sync():
+                            tmem_full_barriers.arrive(tmem_idx, cta_group=CTA_GROUP, cta_mask=3)
+                    T.cuda.warp_sync()
+                    mma_state.advance()
+                tile_scheduler.linear_idx = tile_scheduler.linear_idx + SM_NUMBER
+                tile_scheduler.tile_count = tile_scheduler.tile_count + 1
+
+            final_iter = tile_scheduler.tile_idx - 1
+            if final_iter >= 0:
+                final_phase = final_iter // TMEM_DEPTH & 1
+                tmem_empty_barriers.wait(final_iter % TMEM_DEPTH, final_phase ^ 1)
+        elif warp_id == 2:
+            trans_state = PipelineState(SMEM_DEPTH, 0)
+
+            @T.inline
+            def transpose(ks, k_tile):
+                full_barriers.wait(ks, trans_state.phase)
+                if k_tile % 4 == 0:
+                    for chunk in T.unroll(BLK_SFA // 128):
+                        _transpose_sf_chunk(SFA_smem, ks, chunk, lane_id)
+                    T.ptx.fence.proxy_async("shared::cta")
+                if k_tile % 4 == 0:
+                    for chunk in T.unroll(BLK_SFB // 128):
+                        _transpose_sf_chunk(SFB_smem, ks, chunk, lane_id)
+                    T.ptx.fence.proxy_async("shared::cta")
+                with_sf_full_barriers.arrive(ks, remote=0)
+
+            @T.inline
+            def trans_iter():
+                for k_tile in T.serial(K_TILES):
+                    transpose(trans_state.stage, k_tile)
+                    trans_state.advance()
+
+            tile_scheduler.linear_idx = bx
+            tile_scheduler.tile_count = 0
+            while tile_scheduler.valid():
+                tile_scheduler.update_current_m_n_idx(tile_scheduler.linear_idx)
+                trans_iter()
+                tile_scheduler.linear_idx = tile_scheduler.linear_idx + SM_NUMBER
+                tile_scheduler.tile_count = tile_scheduler.tile_count + 1
     elif wg_id == 1:
         tmem_idx: T.int32
         tmem_phase: T.int32
+        tma_stage_idx: T.int32
+        store_iter: T.int32
 
         # Stream acc -> D_smem -> TMA in EPI-wide slices. SWAP_AB only changes the
         # acc -> D_smem step (stmatrix transpose vs straight copy) and the tiling.
-        EPI = T.meta_var(16 if SWAP_AB else EPI_TILE)
+        EPI = T.meta_var(16 if SWAP_AB else D_SMEM_N)
         STORE_TILES = T.meta_var(MMA_N // EPI)
         D_TILE_M = T.meta_var(16 if SWAP_AB else DG_BLOCK_M)
-        D_TILE_N = T.meta_var(DG_BLOCK_N if SWAP_AB else EPI_TILE)
+        D_TILE_N = T.meta_var(DG_BLOCK_N if SWAP_AB else D_SMEM_N)
 
         @T.inline
         def epilogue():
             swap_frag = T.alloc_tcgen05_ldst_frag("16x256b", (128, 8), "float32")
             swap_bf16 = T.alloc_cast_frag(swap_frag, "bfloat16")
             for ot in T.unroll(STORE_TILES):
-                store_iter: T.let = tile_scheduler.tile_idx * STORE_TILES + ot
-                stage = store_iter % TMEM_DEPTH
+                stage = tma_stage_idx
                 if store_iter >= TMEM_DEPTH:
                     if warp_id == 0:
                         T.ptx.cp_async.bulk.wait_group(TMEM_DEPTH - 1)
-                    T.cuda.warpgroup_sync(10)
+                    T.cuda.warpgroup_sync(8)
                 if SWAP_AB:
                     for atom_m in T.unroll(2):
                         col_st: T.let = ot * 16 + atom_m * 8
@@ -466,9 +618,9 @@ def _kernel(
                             dispatch="ldstmatrix",
                         )
                 else:
-                    for ki in T.unroll(EPI_TILE // TMEM_LD_SIZE):
+                    for ki in T.unroll(D_SMEM_N // TMEM_LD_SIZE):
                         Dreg = T.wg_reg_tile(TMEM_LD_SIZE)
-                        acc_n = T.meta_var(ot * EPI_TILE + ki * TMEM_LD_SIZE)
+                        acc_n = T.meta_var(ot * D_SMEM_N + ki * TMEM_LD_SIZE)
                         Tx.wg.copy_async(Dreg, acc[tmem_idx, :, acc_n : acc_n + TMEM_LD_SIZE])
                         T.ptx.tcgen05.wait.ld()
                         Dreg_bf16 = T.wg_reg_tile(TMEM_LD_SIZE, dtype="bfloat16")
@@ -477,11 +629,12 @@ def _kernel(
                             D_smem[stage, :, ki * TMEM_LD_SIZE : (ki + 1) * TMEM_LD_SIZE], Dreg_bf16
                         )
                 if ot == STORE_TILES - 1:
-                    tmem_pipe.empty.arrive(tmem_idx, remote=0)
+                    T.ptx.tcgen05.fence.before_thread_sync()
+                    tmem_empty_barriers.arrive(tmem_idx, remote=0)
                 T.ptx.fence.proxy_async("shared::cta")
-                T.cuda.warpgroup_sync(10)
+                T.cuda.warpgroup_sync(8)
                 d_m: T.let = m_idx * DG_BLOCK_M + (ot * 16 if SWAP_AB else 0)
-                d_n: T.let = n_idx * DG_BLOCK_N + (0 if SWAP_AB else ot * EPI_TILE)
+                d_n: T.let = n_idx * DG_BLOCK_N + (0 if SWAP_AB else ot * D_SMEM_N)
                 if warp_id == 0:
                     if T.ptx.elect_sync():
                         Tx.copy_async(
@@ -491,20 +644,28 @@ def _kernel(
                             prefetch_tensormap=True,
                         )
                         T.ptx.cp_async.bulk.commit_group()
+                T.cuda.warp_sync()
+                tma_stage_idx = tma_stage_idx ^ 1
+                store_iter = store_iter + 1
 
         T.cuda.trap_when_assert_failed(tmem_pool.addr == 0)
+        tma_stage_idx = 0
+        store_iter = 0
+        tile_scheduler.linear_idx = bx
+        tile_scheduler.tile_count = 0
         while tile_scheduler.valid():
+            tile_scheduler.update_current_m_n_idx(tile_scheduler.linear_idx)
             tmem_idx = tile_scheduler.tile_idx % TMEM_DEPTH
             tmem_phase = tile_scheduler.tile_idx // TMEM_DEPTH & 1
-            tmem_pipe.full.wait(tmem_idx, tmem_phase)
+            tmem_full_barriers.wait(tmem_idx, tmem_phase)
+            T.ptx.tcgen05.fence.after_thread_sync()
             epilogue()
-            tile_scheduler.next_tile()
-        if tid_in_wg == 0:
-            T.ptx.cp_async.bulk.wait_group(0)
-        T.cuda.warpgroup_sync(10)
+            tile_scheduler.linear_idx = tile_scheduler.linear_idx + SM_NUMBER
+            tile_scheduler.tile_count = tile_scheduler.tile_count + 1
     # The epilogue warpgroup and peer CTA must finish all TMEM reads first.
-    T.cuda.cluster_sync()
-    tmem_pool.dealloc()
+    _cluster_sync_relaxed()
+    if wg_id == 0 and warp_id == 0:
+        T.ptx.tcgen05.dealloc(T.uint32(0), n_cols=512, cta_group=CTA_GROUP)
 
 
 def tir_kernel(M: int, N: int, K: int):
