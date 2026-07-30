@@ -140,7 +140,7 @@ independent streams that each execute the guarded body concurrently; ordering
 between them requires explicit sync (typically `wg_sync`).
 
 `set_maxnreg(n)` emits `Stmt::SetMaxNReg`, a `setmaxnreg` directive for the
-enclosing warpgroup(s). It is simulation metadata only — register pressure is
+enclosing warp(s). It is simulation metadata only — register pressure is
 not modeled — carried in the IR so codegen can emit the PTX directive.
 
 ### Static thread filters

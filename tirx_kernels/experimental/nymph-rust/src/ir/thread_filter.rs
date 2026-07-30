@@ -243,6 +243,27 @@ pub fn static_thread_filter(cond: &ScalarValue, num_warps: u32) -> ThreadFilter 
     ThreadFilter::Known(ThreadSet { num_warps, bits })
 }
 
+/// Sound "at most one lane per warp" proof for the validator's
+/// `single_issue_scope` rule. True when the condition's true-set is PROVABLY
+/// a subset of a one-lane-per-warp set:
+/// - the whole condition statically evaluates to such a set, or
+/// - it is an `And`/`Mul` chain (boolean product = set intersection) with at
+///   least one such operand — the remaining operands only narrow the set, so
+///   the bound holds even when they are runtime (e.g. `(~kept) & (tid == 0)`).
+/// This is analysis of explicit IR conditions, never invention of a guard.
+pub fn proves_single_lane_per_warp(cond: &ScalarValue, num_warps: u32) -> bool {
+    if let ThreadFilter::Known(set) = static_thread_filter(cond, num_warps) {
+        return !set.is_empty() && set.count() == set.warps_touched().len();
+    }
+    match cond {
+        ScalarValue::Expr(e) if matches!(e.op, ScalarOp::And | ScalarOp::Mul) => e
+            .args
+            .iter()
+            .any(|a| proves_single_lane_per_warp(a, num_warps)),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,5 +374,40 @@ mod tests {
         let both = wg.known().unwrap().intersect(lane0.known().unwrap());
         assert_eq!(both.count(), 4);
         assert_eq!(both.warps_touched(), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn single_lane_proof_through_and_chains() {
+        // Plain elected / tid==0 forms.
+        assert!(proves_single_lane_per_warp(
+            &eq(scope(ScopeValueKind::LaneId), 0),
+            4
+        ));
+        assert!(proves_single_lane_per_warp(
+            &eq(scope(ScopeValueKind::TidInWg), 0),
+            4
+        ));
+        // A full warp is NOT single-lane.
+        assert!(!proves_single_lane_per_warp(
+            &eq(scope(ScopeValueKind::WarpId), 0),
+            4
+        ));
+        // Runtime-only conditions prove nothing.
+        assert!(!proves_single_lane_per_warp(&runtime_var(), 4));
+        // `(~kept) & (tid == 0)`: the runtime operand only narrows the
+        // one-lane set — the bound holds (the flash_bwd s2cluster form).
+        let and_form = and(runtime_var(), eq(scope(ScopeValueKind::TidInWg), 0));
+        assert!(proves_single_lane_per_warp(&and_form, 4));
+        // Same through a Mul (boolean product = intersection).
+        let mul_form = ScalarValue::expr(
+            ScalarOp::Mul,
+            vec![runtime_var(), eq(scope(ScopeValueKind::LaneId), 0)],
+        );
+        assert!(proves_single_lane_per_warp(&mul_form, 4));
+        // Two runtime operands: no bound.
+        assert!(!proves_single_lane_per_warp(
+            &and(runtime_var(), runtime_var()),
+            4
+        ));
     }
 }

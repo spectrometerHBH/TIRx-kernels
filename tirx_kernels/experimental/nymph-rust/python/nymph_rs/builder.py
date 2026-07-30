@@ -722,10 +722,11 @@ class IRBuilder:
             yield
 
     def set_maxnreg(self, nreg: int) -> None:
-        """`setmaxnreg` directive for the enclosing warpgroup(s); sim metadata.
+        """`setmaxnreg` directive for the enclosing warp(s); sim metadata.
 
         Validation requires the enclosing branch to statically cover whole
-        warpgroups and `nreg` to be a positive multiple of 8.
+        warps (a .sync.aligned warp collective) and `nreg` to be a positive
+        multiple of 8.
         """
         self._append(SetMaxNReg(nreg=nreg))
 

@@ -1,43 +1,44 @@
 //! Rust codegen: lower a nymph `ir::Kernel` to a TVMScript (`tvm.script.tirx`)
 //! source string. Ported from the Role-model codegen (PR #18) onto the
 //! warp-model IR: the `Role`/`KernelInit`/`KernelFinalize` nodes are gone —
-//! thread dispatch is plain `Stmt::If` over scalar predicates — so the
-//! emission decisions are re-derived from the *condition stack* instead of
-//! the node type:
+//! thread dispatch is plain `Stmt::If` over scalar predicates.
 //!
-//! - The thread scope of a body comes from the static evaluation of the
-//!   enclosing `If` conditions (`static_thread_filter`): a full-CTA set is
-//!   `Function` scope (CTA-wide `cta_sync` legal, mbarrier-init guards with
-//!   `T.cuda.thread_rank() == 0`), exactly one full warp is `Warp` scope
-//!   (single-issue guard `T.ptx.elect_sync()`), exactly one full warpgroup is
-//!   `Warpgroup` scope (`tid_in_wg == 0`), and a set with at most one lane per
-//!   warp is `Elected` (single-issue ops emit bare — the guard already elects
-//!   one thread per warp). An unknown (runtime) condition inherits the parent
-//!   scope. This replaces `Scope::issue_guard`'s role-driven split 1:1.
-//! - The `if_elected` sugar (`lane_id == 0`) emits as `if T.ptx.elect_sync():`
-//!   (canon's guard), narrowed to `if T.cuda.thread_rank() == 0:` when the
-//!   enclosed thread set is exactly CTA thread 0 (the prologue's
-//!   warp-0-elected form — canon's grouped-init block). A leading
-//!   `ClusterBarrierWait` inside an elect-form `If` is peeled out of the elect
-//!   (warp-collective; the elected-lane wait deadlocks on hardware).
-//! - Role dispatch chaining (`chain_top_level_ifs`): a run of >=2 ADJACENT
-//!   TOP-LEVEL `If`s whose conditions are warp/warpgroup equalities re-nests
-//!   into canon's if/else decision tree, partitioned by warpgroup exactly like
-//!   #18's `chain_top_level_roles` (a warpgroup-equality `If` is its group's
-//!   prefix; warp-equality `If`s chain behind it; duplicate conditions merge
-//!   bodies — all flat-equivalent). The R2UR-sensitive fp16 dispatch shape
-//!   depends on this (docs/perf-methodology.md §5).
+//! ZERO-INFERENCE guard rule (user-mandated): codegen NEVER synthesizes an
+//! emission guard from the statically-computed thread scope. Every guard in
+//! the output comes from the IR:
+//! - Every `Stmt::If` prints its scalar predicate literally. In particular,
+//!   `lane_id == 0` remains `lane_id == 0`; codegen never substitutes
+//!   `elect_sync()` or `thread_rank() == 0`. The `if_elected` SUGAR is its own
+//!   IR predicate (`ScopeValueKind::Elected`), printed as the
+//!   `T.ptx.elect_sync()` intrinsic — canon's exact elected-region form.
+//! - Hardware single-issue ops (TmaLoad/TmaStore/CpAsyncBulkS2Cluster,
+//!   Tcgen05Mma/Tcgen05Cp/Tcgen05Commit, MBarrierInit, ClcTryCancel) are
+//!   legal ONLY under an explicit single-lane `If` — the validator's
+//!   `single_issue_scope` rule rejects anything else at build, and
+//!   `emit_single_issue` hard-errors as the codegen-side defense. (Before
+//!   this rule codegen wrapped them in a scope-inferred `elect_sync` /
+//!   `tid_in_wg == 0` — exactly the inference the rule bans.)
+//! - Per-thread ops (mbarrier arrive / expect_tx / arrive_expect_tx,
+//!   store_scalar, async-proxy fences) emit PER-THREAD, matching the
+//!   interpreter (one application per executing lane) — an inferred guard
+//!   undercounts arrivals / tx bytes / drops lane-varying stores (the gdn
+//!   gate_ready deadlock class).
+//! - The thread scope of a body is still CLASSIFIED from the enclosing `If`
+//!   conditions (`static_thread_filter`) — but only for legality checks
+//!   (CTA-wide `cta_sync` at function scope, warp-collective forms) and for
+//!   legality checks, never to invent or rewrite a guard.
+//! - Control-flow structure is preserved exactly: sibling IR `If`s emit as
+//!   sibling TVMScript `if`s, nested IR `If`s emit nested, and source order is
+//!   unchanged. Codegen never merges conditions, synthesizes role-dispatch
+//!   parents, or re-nests sibling branches.
 //! - `KernelInit`'s two side duties survive as structural rules: the single
 //!   TMEM view buffer (`tmem`) + SF views are declared at function scope right
-//!   after the top-level statement containing the first `TmemAlloc`, and the
-//!   prologue mbarrier-init group merges under one
-//!   `if T.cuda.thread_rank() == 0:` (the guard merge is annotation-driven,
-//!   never text-driven).
+//!   after the top-level statement containing the first `TmemAlloc`.
 //!
 //! Everything else is the #18 pass unchanged: full-K `gemm_async` at the IR's
 //! own granularity, runtime `accum` scalar, TmemOperand/SfView TMEM views,
-//! leader-routed TMA barriers (peer `try_wait` is illegal and skipped), the
-//! structured emitter (guard merge + `fill_empty_blocks`), the pow2/trunc
+//! exact per-operation `MBarRef` lowering, the structured emitter
+//! (`fill_empty_blocks`), the pow2/trunc
 //! strength reduction gated on the provable-nonneg analysis, and fail-closed
 //! exhaustiveness: every `Stmt` variant either has a lowering arm below or an
 //! explicit `Err` — no `..` catch-all, never a silent different-semantics
@@ -46,163 +47,64 @@
 use super::dtype::{DType, MemorySpace, ScalarOp, ScopeValueKind, Swizzle, VarBinding};
 use super::kernel::Kernel;
 use super::scalar::{ScalarExpr, ScalarInitial, ScalarValue, Var};
-use super::stmt::{LdStShape, RegOperand, Stmt};
-use super::tensor::{Layout, MmaOperand, Tensor, TensorSlice, TmemOperand};
+use super::stmt::{
+    LdStShape, MatrixDType, MatrixShape, RegLiteral, RegOperand, RegUnaryOp, Rounding, Stmt,
+};
+use super::tcgen05_layout::{
+    resolve_tcgen05_cp, resolve_tcgen05_mma, tcgen05_cp_source_bits, CpLaneLayout, CpSmemLayout,
+    TmemDatapath,
+};
+use super::tensor::{
+    Layout, MmaAOperand, MmaElemFormat, ScaleFormat, SmemTile, Tensor, TensorSlice, TmemAForm,
+    TmemAddr,
+};
 use super::thread_filter::{static_thread_filter, ThreadSet};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// The imports the emitted source needs (prepended so the file is self-contained).
 const HEADER_IMPORTS: &str = "\
-import tvm
-from tvm.ir.type import PointerType, PrimType
+from tvm.backend.cuda.operator.tile_primitive.gemm_async.tcgen05 import sf_tmem_layout
+from tvm.backend.cuda.operator.tile_primitive.tma_utils import SwizzleMode
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.layout import ComposeLayout, R, S, TCol, TileLayout, TLane
-from tvm.tirx.layout import tid_in_wg as axis_tid_in_wg
+from tvm.tirx.layout import tmem_datapath_layout, tmem_mma_operand_layout
 ";
 
-/// Vendored `mma_shared_layout(dtype, swizzle_mode, shape)` — a faithful port of
-/// TVM's `tile_primitive.tma_utils.mma_shared_layout`, emitted into the source so
-/// the generated file depends only on the PUBLIC `tvm.tirx.layout` algebra
-/// (`ComposeLayout`/`TileLayout`/`S`), not the TVM-private
-/// `tvm.tirx.cuda.operator.tile_primitive.tma_utils` import path. Same
-/// swizzle-atom math: the no-swizzle mode is the packed-16B atom; modes 1/2/3
-/// tile the (8, 256/512/1024-bit) MMA atom over the tile via `tile_to`.
-const MMA_SHARED_LAYOUT_HELPER: &str = r#"
-def mma_shared_layout(dtype, swizzle_mode, shape):
-    """MMA-compatible shared-memory layout for shape and dtype (vendored from
-    tvm.tirx.cuda.operator.tile_primitive.tma_utils so the emitted source has
-    no TVM-private import). Same default tiling of the TMA atom layout."""
-    bits = tvm.DataType(dtype).bits
-    if swizzle_mode == 0:
-        # No-swizzle MMA smem is the packed-16B atom: offset e16*m +
-        # M*e16*(k//e16) + k%e16 (e16=128/bits); plain tile if K % e16 != 0.
-        e16 = 128 // bits
-        m, k = int(shape[-2]), int(shape[-1])
-        if k % e16 == 0:
-            lead = [int(s) for s in shape[:-2]]
-            extents = [*lead, m, k // e16, e16]
-            strides = []
-            stride = m * k
-            for e in reversed(lead):
-                strides.insert(0, stride)
-                stride *= e
-            strides += [e16, m * e16, 1]
-            return TileLayout(S[tuple(extents) : tuple(strides)]).canonicalize()
-        return TileLayout(S[tuple(shape)]).canonicalize()
-    # The (8, 256/512/1024-bit) swizzle atom for modes 1/2/3, in element units.
-    atom_shape = {1: [8, 256], 2: [8, 512], 3: [8, 1024]}[swizzle_mode]
-    atom_shape[-1] //= bits
-    atom_shape = [1] * (len(shape) - len(atom_shape)) + atom_shape
-    per_element = (128 // bits).bit_length() - 1
-    period = 1 << (per_element + swizzle_mode + 3)
-    layout = ComposeLayout(per_element, swizzle_mode, 3, TileLayout(S[(period,)]))
-    tile_to_shape = list(atom_shape)
-    tile_to_shape[-2] = shape[-2]
-    return layout.tile_to(tile_to_shape, atom_shape).tile_to(shape, tile_to_shape).canonicalize()
+/// Apply an explicit physical TMEM `(lane, 32-bit column)` offset to a
+/// statement-local non-owning buffer view.  The base layout's TCol unit is the
+/// buffer element, so callers convert physical columns to elements before
+/// invoking this helper.
+const TMEM_VIEW_LAYOUT_HELPER: &str = r#"
+def tmem_view_layout(layout, lane_offset, col_offset):
+    offset = dict(layout.offset)
+    offset[TLane] = offset.get(TLane, 0) + lane_offset
+    offset[TCol] = offset.get(TCol, 0) + col_offset
+    return TileLayout.from_iters(layout.shard, layout.replica, offset)
 "#;
-
-/// SF SMEM/GMEM physical layout, computed HERE from the fixed nvfp4 SF formula
-/// (128-row super-blocks, epc=4) instead of importing TVM's `sf_smem_layout`.
-/// Emits the same `TileLayout(S[...])` nymph already emits for the SF *TMEM*
-/// side, so the codegen is self-contained — no external SF-layout helper.
-///
-/// Mirrors `sf_smem_layout(rows, sf_k, sf_per_mma, pipe_depth)`: the SF is read
-/// in 128-row super-blocks of 32 lanes; a logical `(rows, sf_k)` tile decomposes
-/// as `M_super x M_SF_INNER(4) x LANE(32) x K_outer x sf_per_mma x in_lane_K`,
-/// size-1 dims dropped, optional pipe-depth outer prepended.
-fn sf_smem_tile_layout(
-    rows: usize,
-    sf_k: usize,
-    sf_per_mma: usize,
-    pipe_depth: Option<usize>,
-) -> String {
-    const EPC: usize = 4;
-    const M_SUPER_ROWS: usize = 128;
-    const LANE: usize = 32;
-    let m_sf_inner = M_SUPER_ROWS / LANE; // 4
-    let in_lane_k = EPC / sf_per_mma; // 1 for nvfp4 (sf_per_mma=4)
-    let k_outer = sf_k / EPC;
-    let m_super = rows / M_SUPER_ROWS;
-    let lane_bytes = EPC * m_sf_inner; // 16
-    let super_bytes = lane_bytes * LANE; // 512
-    let k_total_bytes = super_bytes * k_outer;
-    let stage_bytes = k_total_bytes * m_super;
-
-    let raw_shape = [m_super, m_sf_inner, LANE, k_outer, sf_per_mma, in_lane_k];
-    let raw_strides = [k_total_bytes, EPC, lane_bytes, super_bytes, in_lane_k, 1];
-    let mut shape: Vec<usize> = Vec::new();
-    let mut strides: Vec<usize> = Vec::new();
-    for (s, st) in raw_shape.iter().zip(raw_strides.iter()) {
-        if *s != 1 {
-            shape.push(*s);
-            strides.push(*st);
-        }
-    }
-    if let Some(p) = pipe_depth {
-        shape.insert(0, p);
-        strides.insert(0, stage_bytes);
-    }
-    let sh = shape
-        .iter()
-        .map(|x| x.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let st = strides
-        .iter()
-        .map(|x| x.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("TileLayout(S[({sh}) : ({st})])")
-}
 
 /// The thread scope of the enclosing `If`-condition stack, derived per body
 /// from `static_thread_filter` (see `classify_scope`). It plays the role the
-/// Role node's warp/warpgroup/elected fields played in #18: it decides (a)
-/// whether a CTA-wide `cta_sync` may be emitted (only at function scope, where
-/// all CTA threads converge), (b) whether a single-thread async issue
-/// (`mbarrier`/`TMA`/`MMA`/`commit`) still needs a guard, and (c) which guard
-/// that is.
+/// Role node's warp/warpgroup/elected fields played in #18, but only as a
+/// fail-closed legality check for hardware collectives and single-issue ops.
+/// It never changes, deletes, or supplements the IR's control flow.
 ///
-/// The single-issue guard is the crux of the cross-CTA mailbox handshake: one
-/// warp's elected lane is exactly 1 thread of a 1-warp branch, but a
-/// *warpgroup* branch spans 4 warps, so `elect.sync` inside it is true for 4
-/// threads (one per warp) — a single-issue `mbarrier.arrive` under it would
-/// arrive FOUR times, over-counting the barrier. A warpgroup branch must elect
-/// `tid_in_wg == 0` (thread 0 of the whole 128-thread warpgroup) instead.
+/// A single-issue operation is printed bare only when the enclosing explicit
+/// IR predicates prove an elected scope. Otherwise codegen returns an error;
+/// it never invents the missing predicate.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Scope {
-    /// Function scope (no narrowing condition, or a full-CTA one). CTA-wide
-    /// sync is legal here.
+    /// Function scope (no narrowing condition, or a full-CTA one).
     Function,
     /// Inside a one-full-warp branch (`if warp_id == w:`).
     Warp,
     /// Inside a one-full-warpgroup branch (`if wg_id == g:`).
     Warpgroup,
-    /// Inside a branch with at most one lane per warp (an elect guard, a
-    /// single-thread branch, ...): single-issue ops emit with NO further
-    /// per-op guard (canon's `if elect_sync(): while ...:` loops).
+    /// Inside an explicit branch with at most one lane per warp (or one
+    /// statically identified thread). Single-issue ops emit in place.
     Elected,
-}
-
-impl Scope {
-    /// True at function scope: all CTA threads converge, so `cta_sync` is legal.
-    fn is_function(self) -> bool {
-        self == Scope::Function
-    }
-    /// The predicate electing the single thread that issues a single-issue async
-    /// op. Warp / function scope elect ONE lane PER WARP via the hardware
-    /// `elect.sync` (canon's exact guard — no `% 32` recompute per site).
-    /// Warpgroup scope MUST stay `tid_in_wg == 0` (see the enum note).
-    fn issue_guard(self) -> &'static str {
-        match self {
-            Scope::Warpgroup => "tid_in_wg == 0",
-            Scope::Warp | Scope::Function => "T.ptx.elect_sync()",
-            // Already single-threaded; `emit_guarded` skips the guard here.
-            Scope::Elected => "True",
-        }
-    }
 }
 
 /// The scope plus the static thread set it was classified from (kept so nested
@@ -221,9 +123,6 @@ impl ScopeInfo {
             scope: Scope::Function,
             set: Some(ThreadSet::full(num_warps)),
         }
-    }
-    fn is_function(&self) -> bool {
-        self.scope.is_function()
     }
 }
 
@@ -273,63 +172,12 @@ fn child_scope_info(cond: &ScalarValue, parent: &ScopeInfo, num_warps: u32) -> S
     classify_scope(set, parent)
 }
 
-/// The `if_elected` sugar condition: `lane_id == 0` (either operand order).
-fn as_lane_zero_equality(cond: &ScalarValue) -> bool {
-    let ScalarValue::Expr(e) = cond else {
-        return false;
-    };
-    if e.op != ScalarOp::Eq || e.args.len() != 2 {
-        return false;
-    }
-    e.args
-        .iter()
-        .any(|a| matches!(a, ScalarValue::Scope(ScopeValueKind::LaneId)))
-        && e.args.iter().any(|a| matches!(a, ScalarValue::Int(0)))
-}
-
-/// True when any statement in the body is (or contains) a persistent loop —
-/// used to keep the prologue `thread_rank() == 0` guard off hot worker loops.
-fn body_has_loop(body: &[Stmt]) -> bool {
-    body.iter().any(|s| {
-        matches!(
-            s,
-            Stmt::ForLoop { .. }
-                | Stmt::Loop { .. }
-                | Stmt::ForEachTask { .. }
-                | Stmt::SchedulerImpl { .. }
-        ) || s.child_bodies().iter().any(|b| body_has_loop(b))
-    })
-}
-
-/// A warp/warpgroup equality condition (`warp_id == w` / `wg_id == g`, either
-/// operand order) — the chainable top-level dispatch predicate.
-fn as_scope_equality(cond: &ScalarValue) -> Option<(ScopeValueKind, i64)> {
-    let ScalarValue::Expr(e) = cond else {
-        return None;
-    };
-    if e.op != ScalarOp::Eq || e.args.len() != 2 {
-        return None;
-    }
-    for (a, b) in [(&e.args[0], &e.args[1]), (&e.args[1], &e.args[0])] {
-        if let (ScalarValue::Scope(kind), ScalarValue::Int(v)) = (a, b) {
-            if matches!(kind, ScopeValueKind::WarpId | ScopeValueKind::WarpgroupId) {
-                return Some((*kind, *v));
-            }
-        }
-    }
-    None
-}
-
 /// Per-kernel naming + lookup context built once, then read while walking the body.
 struct Ctx {
     /// Tensor id -> emitted Python name.
     names: HashMap<u32, String>,
-    /// mbar id -> emitted Python name of its `T.alloc_shared` buffer.
+    /// mbar id -> emitted Python name of its dynamic-pool buffer view.
     mbar_names: HashMap<u32, String>,
-    /// mbar id of the one mbar that has a peer (remote_coord) reference -> peer name.
-    peer_names: HashMap<u32, String>,
-    /// mbar id -> declared stage count (a multi-stage mbar allocs `[stages]`).
-    mbar_stages: HashMap<u32, u32>,
     /// Loop var id -> emitted Python name.
     var_names: HashMap<u32, String>,
     /// Scalar var id (binding == Scalar) -> emitted Python name. Scalar vars emit as SSA
@@ -340,37 +188,16 @@ struct Ctx {
     cta_group: u8,
     /// CTA warp count (the thread-filter geometry).
     num_warps: u32,
-    /// Column span of the single TMEM view buffer: the largest
-    /// `base_col + n_cols` over the kernel's `TmemAlloc`s. The view is one
-    /// `decl_buffer((128, cols), allocated_addr=0)` — TMEM is not a tensor, so
-    /// every TMEM instruction references it by absolute column slice.
-    tmem_view_cols: Option<usize>,
-    /// Per-REG-tensor declared width: the fragment is declared `T.alloc_local(8)`
-    /// in the nymph IR (instruction granularity); the wide read/cast/store band
-    /// needs it sized to the full column band. id -> width.
-    reg_widths: HashMap<u32, usize>,
-    /// mbar ids of the TMA-load completion barriers (`smem_full`, `sf_full`, ...)
-    /// flagged `leader_routed` by the IR. In cluster mode the canonical pattern
-    /// routes BOTH CTAs' TMA completions to the LEADER CTA's barrier (a
-    /// `map_shared_rank(.., 0)` view used uniformly by both CTAs): each CTA's
-    /// `Tx.copy_async` signals it, the leader (cbx==0) issues one
-    /// `arrive.expect_tx` for the full cluster byte count, and the leader's MMA
-    /// waits its own LOCAL barrier (which both CTAs fill). This replaces the
-    /// illegal peer `try_wait` AND is the prerequisite for multicast TMA loads
-    /// (the per-destination transaction count of a `multicast::cluster` copy
-    /// must land on the single leader barrier, accounted via the `* cta_group`
-    /// factor in the leader expect_tx). Empty when no mbar is flagged.
-    tma_leader_mbars: std::collections::HashSet<u32>,
+    /// REG tensors that need a non-owning u32 reinterpret for packed b16
+    /// physical instruction operands.
+    reg_u32_views: HashSet<u32>,
     /// Number of launched clusters (`launch_cta_count / cta_group`) — the grid stride
     /// for a `ForEachTask` grid-stride scheduler loop.
     num_clusters: usize,
-    /// NVFP4 e4m3 scale-factor TMEM views (SFA_tmem, SFB_tmem), keyed by the
-    /// operand's absolute physical base column; declared via `decl_buffer`
-    /// right after the `tmem` view.
-    sf_views: Vec<SfView>,
-    /// Usage-derived scale-factor tensor ids (see `collect_sf_ids`) — the ONLY
-    /// authority on "is this tensor a scale factor"; dtype is never consulted.
-    sf: SfIds,
+    /// Deterministic statement-local TMEM view suffix.  Each tcgen05 statement
+    /// declares only the non-owning views it consumes; there is no kernel-wide
+    /// TMEM buffer, cache, or hoisting pass.
+    tmem_view_index: Cell<usize>,
     /// Var ids provably non-negative (see `collect_nonneg_vars`) — the ONLY
     /// authority `is_nonneg` consults for `ScalarValue::Var`: ForLoop induction
     /// vars with a non-negative-literal start and positive-literal step, plus
@@ -380,43 +207,18 @@ struct Ctx {
     nonneg_vars: std::collections::HashSet<u32>,
 }
 
-/// One NVFP4 e4m3 scale-factor TMEM view (`SFA_tmem`/`SFB_tmem`). The IR's SF
-/// operands are absolute physical TMEM addresses; the view re-materializes
-/// canon's logical `(rows, SF_K)` `decl_buffer` at that column so the
-/// block-scaled `Tx.gemm_async`/`Tx.copy_async` emission is unchanged.
-#[derive(Clone)]
-struct SfView {
-    name: String,
-    /// Absolute physical base column of the SF band.
-    col: usize,
-    /// Logical rows: the scaled-row count rounded up to whole 128-lane
-    /// super-blocks (a 256-row SFB band folds into 2 column super-blocks).
-    logical_rows: usize,
-    /// Logical cols: the per-row scale-block count (nvfp4 `k/16`).
-    logical_cols: usize,
-}
-
-impl Ctx {
-    /// The `map_shared_rank(.., 0)` (leader CTA-0) DSMEM view name for a TMA-load
-    /// barrier, e.g. `smem_full_cta0`. Used by the cluster TMA load + expect_tx.
-    fn tma_leader_view_for(&self, id: u32) -> Option<String> {
-        if !self.tma_leader_mbars.contains(&id) {
-            return None;
-        }
-        let base = self.mbar_names.get(&id)?;
-        Some(format!("{base}_cta0"))
-    }
-    fn is_tma_leader_mbar(&self, id: u32) -> bool {
-        self.tma_leader_mbars.contains(&id)
-    }
-}
-
 impl Ctx {
     fn tensor_name(&self, id: u32) -> Result<&str, String> {
         self.names
             .get(&id)
             .map(|s| s.as_str())
             .ok_or_else(|| format!("codegen: no name for tensor id {id}"))
+    }
+
+    fn next_tmem_view_index(&self) -> usize {
+        let index = self.tmem_view_index.get();
+        self.tmem_view_index.set(index + 1);
+        index
     }
 }
 
@@ -440,47 +242,13 @@ fn dtype_str(dtype: super::dtype::DType) -> &'static str {
     }
 }
 
-/// `Swizzle` -> mma_shared_layout swizzle mode (B128 -> 3).
-fn swizzle_mode(sw: Swizzle) -> u8 {
+/// `Swizzle` -> the exact TIRx allocator enum member.
+fn swizzle_mode_name(sw: Swizzle) -> &'static str {
     match sw {
-        Swizzle::None => 0,
-        Swizzle::B32 => 1,
-        Swizzle::B64 => 2,
-        Swizzle::B128 => 3,
-    }
-}
-
-/// Element byte width of a dtype.
-fn dtype_bytes(dt: super::dtype::DType) -> usize {
-    use super::dtype::DType::*;
-    match dt {
-        Bool | I8 | U8 | F8E4M3 => 1,
-        I16 | U16 | F16 | Bf16 => 2,
-        I32 | U32 | F32 => 4,
-        I64 | U64 => 8,
-    }
-}
-
-/// Integer dtype predicate (the I32 scheduler mailbox vs the f16/bf16 data rings).
-fn is_int_dtype(dt: super::dtype::DType) -> bool {
-    use super::dtype::DType::*;
-    matches!(dt, I8 | U8 | I16 | U16 | I32 | U32 | I64 | U64 | Bool)
-}
-
-/// Pick the MMA-shared swizzle atom matching a tile row's byte width — mirrors the
-/// canonical kernel's `_swizzle_for_row_bytes`. Used for the D writeback ring, whose
-/// layout the value model leaves implicit.
-fn swizzle_for_row_bytes(row_bytes: usize) -> u8 {
-    // The atom row must FIT in and DIVIDE the tile row (mirrors the canonical
-    // `_suggest_swizzle_for_row_bytes`: `row_bytes >= atom && row_bytes % atom == 0`).
-    if row_bytes >= 128 && row_bytes % 128 == 0 {
-        3
-    } else if row_bytes >= 64 && row_bytes % 64 == 0 {
-        2
-    } else if row_bytes >= 32 && row_bytes % 32 == 0 {
-        1
-    } else {
-        0
+        Swizzle::None => "SWIZZLE_NONE",
+        Swizzle::B32 => "SWIZZLE_32B_ATOM",
+        Swizzle::B64 => "SWIZZLE_64B_ATOM",
+        Swizzle::B128 => "SWIZZLE_128B_ATOM",
     }
 }
 
@@ -510,12 +278,28 @@ fn arg_name(i: usize) -> String {
     format!("arg{i}")
 }
 
+/// Render a Python tuple shape. A one-dimensional shape needs its trailing
+/// comma: `(4,)`, not the parenthesized scalar `(4)` that `SMEMPool.alloc`
+/// rejects.
+fn python_shape(shape: &[usize]) -> String {
+    let dims = shape
+        .iter()
+        .map(|d| d.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if shape.len() == 1 {
+        format!("({dims},)")
+    } else {
+        format!("({dims})")
+    }
+}
+
 pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
     let ctx = build_ctx(k)?;
     let mut out = Emitter::new();
 
     out.push_str(HEADER_IMPORTS);
-    out.push_str(MMA_SHARED_LAYOUT_HELPER);
+    out.push_str(TMEM_VIEW_LAYOUT_HELPER);
     out.push('\n');
 
     // Argument tensors, named by position (A, B, C, D, …). The fp16/bootstrap GEMM
@@ -524,70 +308,6 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
     if k.args.is_empty() {
         return Err("codegen: kernel has no args".to_string());
     }
-
-    // SMEM tensor layout helper vars (mma_shared_layout(...)) — declared above the
-    // prim_func so the parser sees plain Python values. Every f16/bf16 SMEM buffer
-    // (A/B operand rings AND D writeback rings) gets an MMA-compatible swizzled
-    // layout. The D ring carries no explicit layout in the IR (the value model is
-    // layout-agnostic), so we synthesize the swizzle from the row byte width — the
-    // canonical kernel's `_swizzle_for_row_bytes(EPI_N * elem_bytes)`. The plain I32
-    // mailbox (task_smem) takes no layout (a flat row-major buffer).
-    for t in collect_tensors(k) {
-        // Layout-less SMEM = the flat i32/u32 scheduler mailbox + mbar buffers. Packed
-        // fp4 operands (u8) DO get a swizzle, and e4m3 SF buffers get sf_smem_layout.
-        if t.space != MemorySpace::Smem || (is_int_dtype(t.dtype) && t.dtype != DType::U8) {
-            continue;
-        }
-        let name = ctx.tensor_name(t.id)?;
-        let shape_tuple = t
-            .shape
-            .iter()
-            .map(|d| d.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        // SF-usage SMEM (a tcgen05.cp source ring) → canon's sf_smem_layout(rows,
-        // sf_k, sf_per_mma=4, pipe_depth). The TMA lands the bytes in cp-ready
-        // order. Classified by USAGE, not dtype — a plain fp8 DATA ring is also
-        // e4m3 but must take the normal MMA swizzle below.
-        if ctx.sf.smem.contains(&t.id) {
-            if t.dtype != DType::F8E4M3 {
-                return Err(format!(
-                    "codegen: SF SMEM tensor {name} must be e4m3 (got {:?})",
-                    t.dtype
-                ));
-            }
-            let (rows, sf_k, pipe) = if t.shape.len() == 3 {
-                (t.shape[1], t.shape[2], Some(t.shape[0]))
-            } else {
-                (t.shape[0], t.shape[1], None)
-            };
-            let layout = sf_smem_tile_layout(rows, sf_k, 4, pipe);
-            out.push_str(&format!("{name}_layout = {layout}\n"));
-            continue;
-        }
-        // The swizzle atom row (128/64/32 B for mode 3/2/1) must DIVIDE the tile row
-        // width, else `mma_shared_layout` tiles a too-wide atom over a narrower row and
-        // `Layout.tile_to` lowers to a `floormod`-by-zero ("Divide by zero"). The IR's
-        // A/B operand rings carry a fixed `Swizzle::B128`, but a small `blk_k` (e.g.
-        // blk_k=32 f16 -> 64-byte rows) cannot host the 128-byte atom. So clamp the
-        // requested swizzle DOWN to the largest atom the row width supports — never
-        // upgrade past the IR's intent. (The D ring carries no layout; its mode comes
-        // straight from the row byte width, same helper.)
-        let row_bytes = t.shape[t.shape.len() - 1] * dtype_bytes(t.dtype);
-        let row_mode = swizzle_for_row_bytes(row_bytes);
-        let mode = match &t.layout {
-            Some(Layout::Swizzle(sw)) => swizzle_mode(sw.swizzle).min(row_mode),
-            _ => row_mode,
-        };
-        out.push_str(&format!(
-            "{name}_layout = mma_shared_layout(\"{dt}\", {mode}, ({shape_tuple}))\n",
-            name = name,
-            dt = dtype_str(t.dtype),
-            mode = mode,
-            shape_tuple = shape_tuple,
-        ));
-    }
-    out.push('\n');
 
     // ---- prim_func header ----
     out.push_str("@T.prim_func\n");
@@ -601,25 +321,15 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
     out.push_str(&format!("def main({sig}) -> None:\n"));
     let ind = 1;
     for (i, t) in k.args.iter().enumerate() {
-        let dims = t
-            .shape
-            .iter()
-            .map(|d| d.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        // SF-usage GMEM args (the TMA sources of an SF SMEM ring): lay them out with
-        // canon's sf_smem_layout(rows, sf_k, sf_per_mma=4) so the TMA reads cp-ready
-        // bytes. Usage-derived — a plain fp8 GMEM data arg keeps its natural layout.
-        let layout = if ctx.sf.gmem.contains(&t.id) && t.shape.len() == 2 {
-            format!(
-                ", layout={}",
-                sf_smem_tile_layout(t.shape[0], t.shape[1], 4, None)
-            )
-        } else {
-            String::new()
-        };
+        let dims = python_shape(&t.shape);
+        if t.layout.is_some() {
+            return Err(format!(
+                "codegen: GMEM tensor {} cannot carry a layout",
+                t.id
+            ));
+        }
         out.push_str(&format!(
-            "{p}{name} = T.match_buffer({name}_ptr, ({dims}), \"{dt}\"{layout})\n",
+            "{p}{name} = T.match_buffer({name}_ptr, {dims}, \"{dt}\")\n",
             p = pad(ind),
             name = arg_name(i),
             dims = dims,
@@ -662,10 +372,18 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
             "codegen: cluster_shape dims must be positive (got [{cx}, {cy}])"
         ));
     }
-    out.push_str(&format!(
-        "{p}cbx, cby = T.cta_id_in_cluster([{cx}, {cy}], preferred=[{cx}, {cy}])\n",
-        p = pad(ind)
-    ));
+    if cx == 1 && cy == 1 {
+        // A cluster-1 kernel (gdn): a (1, 1) `cta_id_in_cluster` bind collapses
+        // to a constant and the scope resolver cannot find `clusterCtaIdx.x`
+        // downstream — emit the constants directly (semantically exact for a
+        // single-CTA cluster).
+        out.push_str(&format!("{p}cbx, cby = 0, 0\n", p = pad(ind)));
+    } else {
+        out.push_str(&format!(
+            "{p}cbx, cby = T.cta_id_in_cluster([{cx}, {cy}], preferred=[{cx}, {cy}])\n",
+            p = pad(ind)
+        ));
+    }
     // The kernel→cta axis extent is the TOTAL launched CTA count, NOT the cluster
     // group size. The persistent grid launches `num_clusters * cta_group` CTAs; a
     // hardcoded `[2]` declares only 2 CTAs, so a multi-cluster launch (e.g. 4 CTAs)
@@ -689,12 +407,8 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
         p = pad(ind),
         wg_threads = WG_THREADS
     ));
-    // Lane within the warp. Single-issue async ops (mbarrier / TMA / MMA / commit)
-    // run under a single-warp branch, so the per-thread guard must be lane 0 of that
-    // warp (`T.ptx.elect_sync()`) — NOT `tid_in_wg == 0`, which is thread 0 of the
-    // whole *warpgroup* and is never true for a warp whose lanes map to tid_in_wg
-    // 32..63 (e.g. warp 5 in warpgroup 1), so the issue would never fire and the MMA
-    // would deadlock. Mirrors the canonical kernels' `elect_sync` guard.
+    // Lane within the warp. Kernel IR uses this value directly in any
+    // single-lane predicate it requires; codegen preserves that predicate.
     out.push_str(&format!(
         "{p}lane_id = T.lane_id([{warp_lanes}])\n",
         p = pad(ind),
@@ -702,308 +416,102 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
     ));
     out.push('\n');
 
-    // ---- SMEM buffers (N-D; the swizzled rings + the plain I32 mailbox) ----
-    // Two emission forms, selected by `k.smem_pool`:
-    //   * STATIC (default, the big-shape path): each SMEM data buffer is its own
-    //     `T.alloc_buffer(scope="shared")`. TVM sizes the static SMEM footprint as
-    //     the sum of the per-buffer extents.
-    //   * DYNAMIC POOL (the small-shape variant): canon's `T.SMEMPool()` form — ONE
-    //     dynamic `alloc_buffer([0], "uint8", scope="shared.dyn")` that every data
-    //     buffer aliases into via `pool.alloc(..., data=pool.ptr, byte_offset=...)`.
-    //     The buffers carry the IR's own `byte_offset`, so `pool.move_base_to(off)`
-    //     places each at exactly the offset the static form used (byte-for-byte the
-    //     same physical layout) — but now as `shared.dyn`, cutting the STATIC SMEM
-    //     footprint toward canon's shape. The mbar/tmem_addr buffers stay in the
-    //     pool too (mixing a static `shared` region with `shared.dyn` pushes the
-    //     dynamic base off its 1024-byte boundary and the swizzled buffers fault).
-    if k.smem_pool {
-        out.push_str(&format!("{p}pool = T.SMEMPool()\n", p = pad(ind)));
-    }
+    // ---- one physical dynamic-SMEM pool ----
+    // Tensor views, mbar cells, and the optional TMEM-address cell all carry
+    // absolute byte offsets in the IR. Codegen never derives a metadata base
+    // from tensor ids, declaration order, or an allocator cursor.
+    out.push_str(&format!("{p}pool = T.SMEMPool()\n", p = pad(ind)));
     for t in collect_tensors(k) {
         if t.space != MemorySpace::Smem {
             continue;
         }
         let name = ctx.tensor_name(t.id)?;
-        let dims = t
-            .shape
-            .iter()
-            .map(|d| d.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let is_mailbox = is_int_dtype(t.dtype) && t.dtype != DType::U8;
-        if k.smem_pool {
-            // Alias into the dynamic pool at the IR's computed byte offset. `move_base_to`
-            // sets the exact offset, then `pool.alloc` rounds it UP to `align` — the data
-            // buffers' IR offsets are already 1024-aligned, so the offset is unchanged, but
-            // the `align=1024` is REQUIRED: it sets the buffer's data-alignment attribute,
-            // which the swizzled-SMEM / TMA-descriptor codegen assumes (canon's
-            // `pool.alloc(..., align=1024)` / `alloc_mma(..., align=1024)`). With `align=0`
-            // the swizzle atom indexing computes a misaligned address and the kernel faults
-            // (cudaErrorMisalignedAddress) — even though the byte offset is identical. The
-            // mailbox (flat row-major int, no layout) takes no alignment.
-            let off = t
-                .byte_offset
-                .ok_or_else(|| format!("codegen: smem_pool tensor {name} has no byte_offset"))?;
-            out.push_str(&format!(
-                "{p}pool.move_base_to({off})\n",
-                p = pad(ind),
-                off = off,
-            ));
-            let (layout, align) = if is_mailbox {
-                (String::new(), 0)
-            } else {
-                (format!(", layout={name}_layout"), 1024)
-            };
-            out.push_str(&format!(
-                "{p}{name} = pool.alloc(({dims}), \"{dt}\", scope=\"shared.dyn\", align={align}{layout})\n",
+        let dims = python_shape(&t.shape);
+        // `move_base_to` is exact because validate has already proved every
+        // explicitly aligned tensor offset satisfies the same alignment
+        // codegen requests here. No silent allocator round-up is permitted.
+        let off = t
+            .byte_offset
+            .ok_or_else(|| format!("codegen: smem tensor {name} has no byte_offset"))?;
+        out.push_str(&format!(
+            "{p}pool.move_base_to({off})\n",
+            p = pad(ind),
+            off = off,
+        ));
+        match t.layout {
+            Some(Layout::Swizzle(layout)) => out.push_str(&format!(
+                "{p}{name} = pool.alloc_tcgen05_mma_AB({dims}, \"{dt}\", \
+                 swizzle_mode=SwizzleMode.{mode}, align=1024)\n",
                 p = pad(ind),
                 name = name,
                 dims = dims,
                 dt = dtype_str(t.dtype),
-                align = align,
-                layout = layout,
-            ));
-        } else if is_mailbox {
-            // The scheduler mailbox: a flat row-major shared buffer (no swizzle).
-            out.push_str(&format!(
-                "{p}{name} = T.alloc_buffer(({dims}), \"{dt}\", scope=\"shared\")\n",
+                mode = swizzle_mode_name(layout.swizzle),
+            )),
+            None => out.push_str(&format!(
+                "{p}{name} = pool.alloc({dims}, \"{dt}\", scope=\"shared.dyn\")\n",
                 p = pad(ind),
                 name = name,
                 dims = dims,
                 dt = dtype_str(t.dtype),
-            ));
-        } else {
-            out.push_str(&format!(
-                "{p}{name} = T.alloc_buffer(({dims}), \"{dt}\", scope=\"shared\", layout={name}_layout)\n",
-                p = pad(ind),
-                name = name,
-                dims = dims,
-                dt = dtype_str(t.dtype),
-            ));
+            )),
         }
     }
     // ---- mbar shared buffers + tmem_addr ----
     // A multi-stage mbarrier allocates `[stages]` slots; each op indexes the slot it
     // uses. A single-stage mbar keeps the bootstrap's `[1]` form.
-    //
-    // In the dynamic-pool variant these buffers ALSO come from the pool (canon's
-    // `TMABar(pool, ...)` / `pool.alloc([1], "uint32", align=4)`). They MUST NOT be a
-    // separate static `T.alloc_shared(scope="shared")`: mixing a static `shared`
-    // region (the mbars) with the `shared.dyn` pool pushes the dynamic base off its
-    // 1024-byte boundary by the static region's size, so every swizzled pool buffer
-    // ends up misaligned and the kernel faults (cudaErrorMisalignedAddress). Putting
-    // them in the pool keeps the whole shared window one dynamic allocation, exactly
-    // like canon. Emitted before `pool.commit()` so they're inside the pool's extent.
-    if k.smem_pool {
-        for s in &k.body {
-            if let Stmt::MBarDef { mbar } = s {
-                let name = ctx
-                    .mbar_names
-                    .get(&mbar.id)
-                    .ok_or_else(|| format!("codegen: no name for mbar {}", mbar.id))?;
-                let stages = ctx.mbar_stages.get(&mbar.id).copied().unwrap_or(1).max(1);
-                // mbarriers are 8 B (uint64); align=8 keeps each slot naturally aligned.
-                out.push_str(&format!(
-                    "{p}{name} = pool.alloc([{stages}], \"uint64\", scope=\"shared.dyn\", align=8)\n",
-                    p = pad(ind),
-                    name = name,
-                    stages = stages,
-                ));
-            }
-        }
+    for mbar in collect_mbars(k) {
+        let name = ctx
+            .mbar_names
+            .get(&mbar.id)
+            .ok_or_else(|| format!("codegen: no name for mbar {}", mbar.id))?;
+        out.push_str(&format!(
+            "{p}pool.move_base_to({off})\n",
+            p = pad(ind),
+            off = mbar.byte_offset,
+        ));
+        out.push_str(&format!(
+            "{p}{name} = pool.alloc([{stages}], \"uint64\", scope=\"shared.dyn\", align=8)\n",
+            p = pad(ind),
+            name = name,
+            stages = mbar.stages,
+        ));
+    }
+    if let Some(off) = tmem_addr_byte_offset(k)? {
+        out.push_str(&format!("{p}pool.move_base_to({off})\n", p = pad(ind),));
         out.push_str(&format!(
             "{p}tmem_addr = pool.alloc([1], \"uint32\", scope=\"shared.dyn\", align=4)\n",
             p = pad(ind)
         ));
-        // Seal the dynamic pool: emit the `tirx.pool_max_bytes` size annotation from
-        // the allocator high-water mark (the whole shared window: data buffers + mbars).
-        out.push_str(&format!("{p}pool.commit()\n", p = pad(ind)));
-    } else {
-        for s in &k.body {
-            if let Stmt::MBarDef { mbar } = s {
-                let name = ctx
-                    .mbar_names
-                    .get(&mbar.id)
-                    .ok_or_else(|| format!("codegen: no name for mbar {}", mbar.id))?;
-                let stages = ctx.mbar_stages.get(&mbar.id).copied().unwrap_or(1).max(1);
-                out.push_str(&format!(
-                    "{p}{name} = T.alloc_shared([{stages}], \"uint64\")\n",
-                    p = pad(ind),
-                    name = name,
-                    stages = stages,
-                ));
-            }
-        }
-        out.push_str(&format!(
-            "{p}tmem_addr = T.alloc_shared([1], \"uint32\")\n",
-            p = pad(ind)
-        ));
     }
+    // `smem_size_bytes` is the physical extent of the complete pool, including
+    // explicit padding and metadata tail.
+    out.push_str(&format!(
+        "{p}pool.commit(size={size})\n",
+        p = pad(ind),
+        size = k.smem_size_bytes,
+    ));
 
-    // peer mbar (remote_coord) decl — find the referenced mbar id. The peer view
-    // spans the full stage count so a multi-stage peer wait can index its slot.
-    // Emitted in a stable (id-sorted) order — `peer_names` is a HashMap, so iterating
-    // it directly made the emitted source nondeterministic across runs (the decls were
-    // reordered run-to-run). Sort by mbar id to match the leader_ids block below.
-    let mut peer_entries: Vec<(&u32, &String)> = ctx.peer_names.iter().collect();
-    peer_entries.sort_unstable_by_key(|(id, _)| **id);
-    for (mbar_id, peer_name) in peer_entries {
-        let base = ctx
-            .mbar_names
-            .get(mbar_id)
-            .ok_or_else(|| format!("codegen: peer references unknown mbar {mbar_id}"))?;
-        let stages = ctx.mbar_stages.get(mbar_id).copied().unwrap_or(1).max(1);
-        let ptr_var = format!("{peer_name}_ptr");
-        // The `T.let` annotation binds the ptr as a Var typed by the exact
-        // PointerType from `T.reinterpret` (a bare expr is not a Var, which
-        // `decl_buffer(data=)` rejects).
-        out.push_str(&format!(
-            "{p}{ptr_var}: T.let = T.reinterpret(PointerType(PrimType(\"uint64\")), T.ptx.map_shared_rank({base}.ptr_to([0]), 1))\n",
-            p = pad(ind),
-            ptr_var = ptr_var,
-            base = base,
-        ));
-        out.push_str(&format!(
-            "{p}{peer} = T.decl_buffer([{stages}], \"uint64\", data={ptr_var}, scope=\"shared\")\n",
-            p = pad(ind),
-            peer = peer_name,
-            stages = stages,
-        ));
-    }
-
-    // Leader (CTA-0) DSMEM view of each TMA-load barrier, used uniformly by BOTH CTAs to
-    // route every TMA completion to the leader's single barrier (the canonical
-    // cta_group=2 pattern; replaces the illegal peer try_wait). `map_shared_rank(.., 0)`
-    // is identity on CTA 0 and the cross-CTA remap on CTA 1, so one form serves both.
-    // Emitted in a stable (id-sorted) order so the source is deterministic.
-    let mut leader_ids: Vec<u32> = ctx.tma_leader_mbars.iter().copied().collect();
-    leader_ids.sort_unstable();
-    for id in leader_ids {
-        let view = ctx
-            .tma_leader_view_for(id)
-            .ok_or_else(|| format!("codegen: tma leader references unknown mbar {id}"))?;
-        let base = ctx
-            .mbar_names
-            .get(&id)
-            .ok_or_else(|| format!("codegen: tma leader references unknown mbar {id}"))?;
-        let stages = ctx.mbar_stages.get(&id).copied().unwrap_or(1).max(1);
-        let ptr_var = format!("{view}_ptr");
-        out.push_str(&format!(
-            "{p}{ptr_var}: T.let = T.reinterpret(PointerType(PrimType(\"uint64\")), T.ptx.map_shared_rank({base}.ptr_to([0]), 0))\n",
-            p = pad(ind),
-            ptr_var = ptr_var,
-            base = base,
-        ));
-        out.push_str(&format!(
-            "{p}{view} = T.decl_buffer([{stages}], \"uint64\", data={ptr_var}, scope=\"shared\")\n",
-            p = pad(ind),
-            view = view,
-            stages = stages,
-        ));
-    }
-
-    // ---- REG fragments (epilogue) ----
-    // Each is a warpgroup-collective `(128, width)` register tile (`T.wg_reg_tile`): the 128
-    // threads of the warpgroup own one row each. These are emitted INLINE at their TensorDef
-    // site (inside the epilogue task loop), NOT hoisted here — see the TensorDef arm in
-    // emit_stmt: a function-scope tile is whole-kernel-lived and ptxas spills it to local
-    // memory, while a loop-local declaration (like canon's) promotes to registers.
+    // REG tensors are emitted inline at their TensorDef sites as per-thread
+    // `T.alloc_local` arrays with exactly the IR shape and dtype.
     out.push('\n');
 
     // ---- walk the body ----
-    // Adjacent TOP-LEVEL warp/warpgroup-equality `If`s are re-nested into canon's
-    // if/else role-dispatch chain for emission (pure CUDA branch layout; the IR
-    // the interpreter consumes stays flat). The single TMEM view + SF views are
-    // declared at function scope right after the top-level statement carrying
-    // the first `TmemAlloc` (#18 declared them right after `KernelInit`).
-    let units = chain_top_level_ifs(&k.body);
+    // Emit top-level statements 1:1 in IR order. TMEM views are statement-local
+    // declarations emitted immediately beside the physical instruction that
+    // consumes them; nothing is hoisted to function scope or inserted after a
+    // different IR statement.
     let fn_scope = ScopeInfo::function(k.num_warps);
-    let mut tmem_declared = ctx.tmem_view_cols.is_none();
-    for unit in &units {
-        emit_top_unit(&mut out, unit, ind, &ctx, &fn_scope)?;
-        if !tmem_declared && unit_contains_tmem_alloc(unit) {
-            emit_tmem_view_decls(&mut out, ind, &ctx);
-            tmem_declared = true;
-        }
-    }
-    if !tmem_declared {
-        // The view decl anchors to the alloc site; an alloc buried where the walk
-        // cannot see it (validate requires lifecycle ops top-level) would leave
-        // `tmem` undeclared for the tcgen05 arms — fail closed.
-        return Err(
-            "codegen: no top-level TmemAlloc found for the TMEM view declaration".to_string(),
-        );
-    }
+    emit_body(&mut out, &k.body, ind, &ctx, &fn_scope)?;
 
-    Ok(render_lines(fill_empty_blocks(merge_guards(out.finish()))))
-}
-
-/// Declare the single TMEM view buffer (+ the NVFP4 SF views) at function scope.
-/// `tmem` is visible to the MMA + epilogue, so it must NOT be nested under the
-/// warp-0 alloc guard. TMEM is not a tensor: one (128, cols) f32 view over the
-/// whole allocated band, addressed everywhere by absolute column slices.
-/// allocated_addr=0 (not tmem_addr[0], the SMEM-stored alloc result): the single
-/// tcgen05.alloc always bases at TMEM column 0, so the view address is a
-/// compile-time constant — exactly canon's form; pinning it to 0 cuts the
-/// epilogue address math (VIADD/LOP3/LDS) roughly in half.
-fn emit_tmem_view_decls(out: &mut Emitter, ind: usize, ctx: &Ctx) {
-    let Some(cols) = ctx.tmem_view_cols else {
-        return;
-    };
-    out.push_str(&format!(
-        "{p}tmem = T.decl_buffer(({wg_threads}, {cols}), \"float32\", scope=\"tmem\", allocated_addr=0, layout=TileLayout(S[({wg_threads}, {cols}) : (1 @ TLane, 1 @ TCol)]))\n",
-        p = pad(ind),
-        wg_threads = WG_THREADS,
-    ));
-    // NVFP4 e4m3 scale-factor TMEM views (canon's tmem_pool.alloc_sf(...,
-    // sf_per_mma=4)). The TileLayout follows `sf_tmem_layout(rows, SF_K,
-    // sf_per_mma=4)`: S[(M, 32, 4, 4) : (4 @ TCol, 1 @ TLane, M*4 @ TCol,
-    // 1 @ TCol)] + R[4:32 @ TLane], M = rows // 32. The view's logical
-    // (rows, SF_K) re-materializes the folded physical band the IR operand
-    // addresses directly (a 256-row SFB folds into 2 column super-blocks).
-    for view in &ctx.sf_views {
-        let m_super = view.logical_rows / 32;
-        out.push_str(&format!(
-            "{p}{name} = T.decl_buffer(({rows}, {cols}), \"float8_e4m3fn\", scope=\"tmem\", layout=TileLayout(S[({m_super}, 32, 4, 4) : (4 @ TCol, 1 @ TLane, {m_stride} @ TCol, 1 @ TCol)] + R[4:32 @ TLane]), allocated_addr={col})\n",
-            p = pad(ind),
-            name = view.name,
-            rows = view.logical_rows,
-            cols = view.logical_cols,
-            m_super = m_super,
-            m_stride = m_super * 4,
-            col = view.col,
-        ));
-    }
-}
-
-/// Does this top-level unit (a plain stmt or a chained `If` tree) contain a
-/// `TmemAlloc` anywhere?
-fn unit_contains_tmem_alloc(unit: &TopUnit) -> bool {
-    fn stmt_has_alloc(s: &Stmt) -> bool {
-        matches!(s, Stmt::TmemAlloc { .. })
-            || s.child_bodies()
-                .iter()
-                .any(|b| b.iter().any(stmt_has_alloc))
-    }
-    match unit {
-        TopUnit::Stmt(s) => stmt_has_alloc(s),
-        TopUnit::Chain(c) => {
-            fn chain_has_alloc(c: &IfChain) -> bool {
-                c.body.iter().any(stmt_has_alloc)
-                    || c.inner.as_ref().is_some_and(|i| chain_has_alloc(i))
-                    || c.else_.as_ref().is_some_and(|e| chain_has_alloc(e))
-            }
-            chain_has_alloc(c)
-        }
-    }
+    Ok(render_lines(fill_empty_blocks(out.finish())))
 }
 
 /// Every emitted block opener (`if`/`else`/`for`/`while`/`def` …) must own at
 /// least one body line: an empty If/guard body otherwise renders a header with
 /// no indented statement — invalid Python. Fill the gap with `pass`,
-/// generically at the structured-line level (covers empty `else` arms, an
-/// elected branch whose body was fully peeled as leading ClusterBarrierWaits,
-/// and empty guard blocks alike) — a per-construct validator ban would have to
+/// generically at the structured-line level (covers empty `else` arms and
+/// empty guard blocks alike) — a per-construct validator ban would have to
 /// enumerate every one of these sites.
 fn fill_empty_blocks(lines: Vec<Line>) -> Vec<Line> {
     let is_opener = |text: &str| {
@@ -1037,198 +545,24 @@ fn fill_empty_blocks(lines: Vec<Line>) -> Vec<Line> {
             out.push(Line {
                 indent: line.indent + 1,
                 text: "pass".into(),
-                guard: None,
             });
         }
     }
     out
 }
 
-/// One node of the emission-time if/else decision tree `chain_top_level_ifs`
-/// builds (the warp-model analog of #18's role `else_body` chains).
-struct IfChain {
-    cond: ScalarValue,
-    body: Vec<Stmt>,
-    /// A warp-level chain nested INSIDE this branch (emitted at the end of
-    /// `body`, one level deeper): #18 nested the chained warp roles in the
-    /// warpgroup role's body; the warp-model `If` has no else/body split, so
-    /// the nesting is explicit here.
-    inner: Option<Box<IfChain>>,
-    /// The next group, emitted under `else:`.
-    else_: Option<Box<IfChain>>,
-}
-
-/// A top-level emission unit after chaining: an untouched statement, or a
-/// chained decision tree of warp/warpgroup-equality `If`s.
-enum TopUnit {
-    Stmt(Stmt),
-    Chain(IfChain),
-}
-
-/// Emission-time re-nesting of ADJACENT TOP-LEVEL warp/warpgroup-equality `If`s
-/// into canon's if/else role-dispatch chain (`if wg_id == 2 { … } else { if
-/// wg_id == 0 { … } else { … } }`). This is the warp-model port of #18's
-/// `chain_top_level_roles`: purely a CUDA branch-layout transform — the
-/// interpreter always consumes the FLAT list, and the chained form is
-/// guard-equivalent (the branches are mutually exclusive, so an if/else
-/// decision tree runs exactly the same bodies on the same threads). The flat
-/// form's per-branch overhead measurably inflates whole-function SASS, which
-/// on fp16 1024 is what tips ptxas's uniform-register placement (R2UR 13.5K
-/// vs canon 1.8K — docs/perf-methodology.md §5).
-///
-/// Grouping (unchanged from #18): a run of >=2 consecutive top-level equality
-/// `If`s partitions by warpgroup (`warp w -> w / 4`, `wg g -> g`). Within a
-/// group, at most one warpgroup-equality `If` (its body is the group prefix)
-/// plus the warp-equality `If`s chained behind it in source order; groups
-/// chain in first-occurrence order. Duplicate conditions merge their bodies
-/// (same threads, same order — flat-equivalent). A run containing any other
-/// statement stays flat.
-fn chain_top_level_ifs(body: &[Stmt]) -> Vec<TopUnit> {
-    struct IfParts<'a> {
-        cond: &'a ScalarValue,
-        body: &'a [Stmt],
-        /// Warp id (a warp-level branch), or None for a warpgroup-level branch.
-        warp: Option<i64>,
-    }
-
-    /// Chain a group's warp-level `If`s behind one another (else-nested).
-    /// Duplicate warp ids merge their bodies (concatenation — same threads).
-    fn chain_warp_ifs(members: &[&IfParts<'_>]) -> Option<Box<IfChain>> {
-        let mut merged: Vec<(i64, Vec<Stmt>, ScalarValue)> = Vec::new();
-        for m in members.iter().filter(|m| m.warp.is_some()) {
-            let w = m.warp.unwrap();
-            if let Some(e) = merged.iter_mut().find(|e| e.0 == w) {
-                e.1.extend_from_slice(m.body);
-                continue;
-            }
-            merged.push((w, m.body.to_vec(), m.cond.clone()));
-        }
-        let mut chain: Option<Box<IfChain>> = None;
-        for (_, b, cond) in merged.into_iter().rev() {
-            chain = Some(Box::new(IfChain {
-                cond,
-                body: b,
-                inner: None,
-                else_: chain.take(),
-            }));
-        }
-        chain
-    }
-
-    fn chain_if_run(run: &[Stmt]) -> Option<IfChain> {
-        let mut groups: Vec<(i64, Vec<IfParts<'_>>)> = Vec::new();
-        for s in run {
-            let Stmt::If { cond, then_body } = s else {
-                return None;
-            };
-            let (kind, v) = as_scope_equality(cond)?;
-            let (warp, group) = match kind {
-                ScopeValueKind::WarpId => (Some(v), v.div_euclid(WG_WARPS as i64)),
-                _ => (None, v),
-            };
-            let parts = IfParts {
-                cond,
-                body: then_body,
-                warp,
-            };
-            if let Some((_, members)) = groups.iter_mut().find(|(g, _)| *g == group) {
-                members.push(parts);
-            } else {
-                groups.push((group, vec![parts]));
-            }
-        }
-        let mut else_: Option<Box<IfChain>> = None;
-        for (g, members) in groups.into_iter().rev() {
-            let refs: Vec<&IfParts<'_>> = members.iter().collect();
-            let (wg_ifs, warp_ifs): (Vec<&IfParts<'_>>, Vec<&IfParts<'_>>) =
-                refs.into_iter().partition(|m| m.warp.is_none());
-            // The warp-level chain nests INSIDE the group branch (after the
-            // group prefix body), exactly like #18 nested chained warp roles in
-            // the warpgroup role's body.
-            let inner = chain_warp_ifs(&warp_ifs);
-            let (cond, body) = if let Some(first) = wg_ifs.first() {
-                // The warpgroup-level branch is the group prefix: its body (all
-                // duplicate wg-`If` bodies concatenated) runs first.
-                let mut body = Vec::new();
-                for m in &wg_ifs {
-                    body.extend_from_slice(m.body);
-                }
-                (first.cond.clone(), body)
-            } else {
-                // No warpgroup-level `If` in this group: synthesize the group
-                // guard (`wg_id == g`) so the warp chain lands on its warpgroup.
-                (
-                    ScalarValue::expr(
-                        ScalarOp::Eq,
-                        vec![
-                            ScalarValue::Scope(ScopeValueKind::WarpgroupId),
-                            ScalarValue::Int(g),
-                        ],
-                    ),
-                    Vec::new(),
-                )
-            };
-            else_ = Some(Box::new(IfChain {
-                cond,
-                body,
-                inner,
-                else_: else_.take(),
-            }));
-        }
-        else_.map(|e| *e)
-    }
-
-    let mut out: Vec<TopUnit> = Vec::with_capacity(body.len());
-    let mut i = 0;
-    while i < body.len() {
-        let is_eq_if =
-            |s: &Stmt| matches!(s, Stmt::If { cond, .. } if as_scope_equality(cond).is_some());
-        if !is_eq_if(&body[i]) {
-            out.push(TopUnit::Stmt(body[i].clone()));
-            i += 1;
-            continue;
-        }
-        let mut j = i;
-        while j < body.len() && is_eq_if(&body[j]) {
-            j += 1;
-        }
-        let run = &body[i..j];
-        // Runs of >=2 chain; a lone equality `If` emits flat (its plain form
-        // is already the canonical one-branch tree).
-        if run.len() >= 2 {
-            if let Some(chained) = chain_if_run(run) {
-                out.push(TopUnit::Chain(chained));
-                i = j;
-                continue;
-            }
-        }
-        for s in run {
-            out.push(TopUnit::Stmt(s.clone()));
-        }
-        i = j;
-    }
-    out
-}
-
-/// One emitted source line: its indent in 4-space units, its text WITHOUT the
-/// leading pad, and an optional single-issue-guard annotation. The annotation
-/// is set at the emission site when the line opens a `if tid_in_wg == 0:` /
-/// `if T.ptx.elect_sync():` single-issue guard block — it is what the guard
-/// merge keys on, so a textually identical line from an IR `If` (or any other
-/// construct) is never mistaken for a single-issue guard.
+/// One emitted source line: its indent in 4-space units and its text WITHOUT
+/// the leading pad.
 #[derive(Clone, PartialEq, Eq)]
 struct Line {
     indent: usize,
     text: String,
-    guard: Option<&'static str>,
 }
 
-/// The emission sink: accumulates the source as STRUCTURED lines (not one flat
-/// string) so the guard merge works on the (indent, guard-annotation) line
-/// structure instead of re-parsing text (fragile to blank lines and to
-/// guard-looking non-guard lines). `push_str` keeps the call sites
-/// string-shaped; the sink splits into lines and records each line's indent
-/// (all padding goes through `pad()` = 4-space units).
+/// The emission sink accumulates source as structured lines so empty blocks
+/// can receive `pass` without reparsing or changing the IR's control-flow
+/// nesting. `push_str` keeps call sites string-shaped; the sink splits lines
+/// and records their indentation (all padding uses `pad()` = 4-space units).
 struct Emitter {
     lines: Vec<Line>,
     /// A line started but not yet `\n`-terminated (a push_str may split mid-line).
@@ -1268,15 +602,7 @@ impl Emitter {
         self.lines.push(Line {
             indent,
             text: text.trim_start().to_string(),
-            guard: None,
         });
-    }
-
-    /// Annotate the line just completed as a single-issue guard head.
-    fn mark_guard(&mut self, guard: &'static str) {
-        if let Some(last) = self.lines.last_mut() {
-            last.guard = Some(guard);
-        }
     }
 
     fn finish(mut self) -> Vec<Line> {
@@ -1285,53 +611,6 @@ impl Emitter {
         }
         self.lines
     }
-}
-
-/// Merge ADJACENT identical single-issue guard blocks (the annotated
-/// `if tid_in_wg == 0:` / `if T.ptx.elect_sync():` lines) into one block.
-/// Canon writes the epilogue trio as `if tid%128==0: fence; store; commit`
-/// under ONE guard; emitting each op with its own guard costs a BSSY/BSYNC
-/// reconvergence pair per block in SASS. Both guard predicates are invariant
-/// across adjacent blocks (tid constant; elect.sync re-elects the same leader
-/// with no divergence in between), so folding is semantics-preserving.
-/// Conservative: only exactly-adjacent lines (no blank/other line between).
-/// Structured: the merge keys on the emission-site guard annotation and the
-/// numeric indent, never on the line text, so a non-guard line that merely
-/// reads the same is untouched.
-fn merge_guards(lines: Vec<Line>) -> Vec<Line> {
-    let mut out: Vec<Line> = Vec::new();
-    let mut i = 0usize;
-    while i < lines.len() {
-        let line = &lines[i];
-        if let Some(guard) = line.guard {
-            let indent = line.indent;
-            out.push(line.clone());
-            i += 1;
-            loop {
-                // copy the guard's body: lines strictly deeper than the guard
-                while i < lines.len() {
-                    let l = &lines[i];
-                    if l.text.is_empty() || l.indent <= indent {
-                        break;
-                    }
-                    out.push(l.clone());
-                    i += 1;
-                }
-                // absorb an immediately-following identical guard at the same depth
-                let dup =
-                    i < lines.len() && lines[i].guard == Some(guard) && lines[i].indent == indent;
-                if dup {
-                    i += 1; // drop the duplicate guard line; keep copying its body
-                } else {
-                    break;
-                }
-            }
-        } else {
-            out.push(line.clone());
-            i += 1;
-        }
-    }
-    out
 }
 
 /// Render the structured lines back to source text: re-pad each line from its
@@ -1348,67 +627,6 @@ fn render_lines(lines: Vec<Line>) -> String {
         }
     }
     s
-}
-
-/// Collect every tensor referenced anywhere (args + defs + slices), deduped by id,
-/// in a deterministic (id-sorted) order.
-/// Scale-factor tensor ids derived from USAGE, not dtype. A tensor is a scale
-/// factor iff it feeds the block-scaled MMA datapath on its way INTO TMEM: an
-/// endpoint of a `tcgen05.cp` (the SMEM→TMEM SF staging copy), or the GMEM
-/// source of a `TmaLoad` that fills an SF SMEM ring. dtype alone proves
-/// nothing — a plain fp8 DATA tensor is also e4m3, and laying it out as SF
-/// bytes would silently corrupt it. (The TMEM side of the SF path is a
-/// `TmemOperand` — physical addresses, no tensor ids; see `sf_views`.)
-#[derive(Default)]
-struct SfIds {
-    smem: HashSet<u32>,
-    gmem: HashSet<u32>,
-}
-
-fn collect_sf_ids(k: &Kernel) -> SfIds {
-    fn walk(stmts: &[Stmt], f: &mut dyn FnMut(&Stmt)) {
-        for s in stmts {
-            f(s);
-            for body in s.child_bodies() {
-                walk(body, f);
-            }
-        }
-    }
-    let mut ids = SfIds::default();
-    // Pass 1: tcgen05.cp sources (SMEM).
-    walk(&k.body, &mut |s| {
-        if let Stmt::Tcgen05Cp {
-            dst: _,
-            src,
-            cta_group: _,
-        } = s
-        {
-            ids.smem.insert(src.tensor.id);
-        }
-    });
-    // Pass 2: GMEM sources of the TMA loads that fill an SF SMEM ring (one level —
-    // SF bytes flow gmem -> smem -> tmem, there are no longer chains).
-    walk(&k.body, &mut |s| {
-        if let Stmt::TmaLoad {
-            dst,
-            src,
-            mbar: _,
-            coords: _,
-            shape: _,
-            gmem_shape: _,
-            mbar_stage: _,
-            multicast_cta_mask: _,
-            cache_hint: _,
-            prefetch_tensormap: _,
-            cta_group: _,
-        } = s
-        {
-            if ids.smem.contains(&dst.tensor.id) {
-                ids.gmem.insert(src.id);
-            }
-        }
-    });
-    ids
 }
 
 fn collect_tensors(k: &Kernel) -> Vec<Arc<Tensor>> {
@@ -1428,6 +646,62 @@ fn collect_tensors(k: &Kernel) -> Vec<Arc<Tensor>> {
     let mut v: Vec<_> = map.into_values().collect();
     v.sort_by_key(|t| t.id);
     v
+}
+
+/// Collect physical mbar objects in source declaration order. Their ids remain
+/// identity only; physical placement comes exclusively from `byte_offset`.
+fn collect_mbars(k: &Kernel) -> Vec<Arc<super::mbar::MBar>> {
+    fn walk(stmts: &[Stmt], seen: &mut HashSet<u32>, out: &mut Vec<Arc<super::mbar::MBar>>) {
+        for stmt in stmts {
+            if let Stmt::MBarDef { mbar } = stmt {
+                if seen.insert(mbar.id) {
+                    out.push(mbar.clone());
+                }
+            }
+            for body in stmt.child_bodies() {
+                walk(body, seen, out);
+            }
+        }
+    }
+
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    walk(&k.body, &mut seen, &mut out);
+    out
+}
+
+/// Return the one physical SMEM cell used to receive the TMEM allocation
+/// address. Multiple sequential `TmemAlloc` statements may reuse that cell,
+/// but distinct offsets cannot be represented by the single `tmem_addr` view
+/// consumed by `TmemDealloc`.
+fn tmem_addr_byte_offset(k: &Kernel) -> Result<Option<usize>, String> {
+    fn walk(stmts: &[Stmt], offset: &mut Option<usize>) -> Result<(), String> {
+        for stmt in stmts {
+            if let Stmt::TmemAlloc {
+                addr_byte_offset, ..
+            } = stmt
+            {
+                match offset {
+                    Some(existing) if *existing != *addr_byte_offset => {
+                        return Err(format!(
+                            "codegen: TmemAlloc addr_byte_offset {addr_byte_offset} \
+                             differs from the kernel tmem_addr offset {existing}"
+                        ));
+                    }
+                    None => *offset = Some(*addr_byte_offset),
+                    _ => {}
+                }
+            }
+            for body in stmt.child_bodies() {
+                walk(body, offset)?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut offset = None;
+    walk(&k.body, &mut offset)?;
+    Ok(offset)
 }
 
 fn note_tensor(t: &Arc<Tensor>, map: &mut HashMap<u32, Arc<Tensor>>) {
@@ -1475,35 +749,29 @@ fn collect_from_stmt(s: &Stmt, map: &mut HashMap<u32, Arc<Tensor>>) {
             dst: _,
             a,
             b,
-            m: _,
-            n: _,
-            k: _,
+            mma_m: _,
+            mma_n: _,
+            format: _,
+            block_scale: _,
             accum: _,
             trans_a: _,
             trans_b: _,
+            ws: _,
             cta_group: _,
-            sfa: _,
-            sfb: _,
-            sf_byte: _,
-            sf_e4m3: _,
-            sf_block: _,
-            a_fp4: _,
-            b_fp4: _,
-            lane_align: _,
         } => {
-            // TMEM operands (dst/sfa/sfb, TmemOperand-form a/b) carry no tensor.
-            for op in [a, b] {
-                if let MmaOperand::Slice(s) = op {
-                    note_slice(s, map);
-                }
+            if let MmaAOperand::Smem(tile) = a {
+                note_tensor(&tile.tensor, map);
             }
+            note_tensor(&b.tensor, map);
         }
         Tcgen05Cp {
             dst: _,
             src,
+            shape: _,
+            multicast: _,
             cta_group: _,
         } => {
-            note_slice(src, map);
+            note_tensor(&src.tensor, map);
         }
         Tcgen05Ld {
             dst,
@@ -1547,7 +815,6 @@ fn as_int(sv: &ScalarValue) -> Option<i64> {
 fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
     let mut names: HashMap<u32, String> = HashMap::new();
     let mut tensors: HashMap<u32, Arc<Tensor>> = HashMap::new();
-    let sf = collect_sf_ids(k);
     for (i, t) in k.args.iter().enumerate() {
         names.insert(t.id, arg_name(i));
         tensors.insert(t.id, t.clone());
@@ -1564,6 +831,7 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
     let mut reg_idx = 0usize;
     let mut ab_idx = 0usize;
     let mut d_idx = 0usize;
+    let mut task_idx = 0usize;
     for t in collect_tensors(k) {
         tensors.entry(t.id).or_insert_with(|| t.clone());
         if names.contains_key(&t.id) {
@@ -1584,11 +852,17 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
                 );
                 // u8 = packed-fp4 operand ring (NOT the i32/u32 mailbox); give it a
                 // unique ab_smem name so two operands don't collide on "task_smem".
-                if is_int && t.dtype != DType::U8 {
-                    "task_smem".to_string()
-                } else if t.dtype == DType::U8 || t.layout.is_some() {
+                if t.layout.is_some() || t.dtype == DType::U8 {
                     let n = format!("ab_smem{ab_idx}");
                     ab_idx += 1;
+                    n
+                } else if is_int {
+                    let n = if task_idx == 0 {
+                        "task_smem".to_string()
+                    } else {
+                        format!("task_smem{task_idx}")
+                    };
+                    task_idx += 1;
                     n
                 } else {
                     let n = format!("d_smem{d_idx}");
@@ -1619,10 +893,9 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
         names.insert(t.id, name);
     }
 
-    // mbar names + peer names + stage counts.
+    // Mbar names come only from their definitions. Remote addressing stays on
+    // each MBarRef and is rendered at the instruction that consumes it.
     let mut mbar_names: HashMap<u32, String> = HashMap::new();
-    let mut peer_names: HashMap<u32, String> = HashMap::new();
-    let mut mbar_stages: HashMap<u32, u32> = HashMap::new();
     let mut mbar_idx = 0usize;
     // The bootstrap names its two single-stage mbars smem_full / mma_done; the full
     // kernel has six (smem ring, tmem accumulator pipe, task mailbox). Naming them by
@@ -1638,8 +911,6 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
     fn walk_mbars(
         stmts: &[Stmt],
         mbar_names: &mut HashMap<u32, String>,
-        peer_names: &mut HashMap<u32, String>,
-        mbar_stages: &mut HashMap<u32, u32>,
         mbar_idx: &mut usize,
         mbar_default: &[&str],
     ) {
@@ -1651,144 +922,23 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| format!("mbar{}", *mbar_idx));
                     mbar_names.insert(mbar.id, n);
-                    mbar_stages.insert(mbar.id, mbar.stages.max(1));
                     *mbar_idx += 1;
                 }
             }
-            // discover peer references
-            for mref in stmt_mbar_refs(s) {
-                if mref.remote_coord.is_some() {
-                    peer_names
-                        .entry(mref.mbar.id)
-                        .or_insert_with(|| format!("peer_{}", mref.mbar.id));
-                }
-            }
             for body in s.child_bodies() {
-                walk_mbars(
-                    body,
-                    mbar_names,
-                    peer_names,
-                    mbar_stages,
-                    mbar_idx,
-                    mbar_default,
-                );
+                walk_mbars(body, mbar_names, mbar_idx, mbar_default);
             }
         }
     }
-    walk_mbars(
-        &k.body,
-        &mut mbar_names,
-        &mut peer_names,
-        &mut mbar_stages,
-        &mut mbar_idx,
-        &mbar_default,
-    );
-    // Give peers stable readable names derived from their base mbar name.
-    let peer_names: HashMap<u32, String> = peer_names
-        .into_keys()
-        .map(|id| {
-            let base = mbar_names.get(&id).cloned().unwrap_or_default();
-            (id, format!("peer_{base}"))
-        })
-        .collect();
+    walk_mbars(&k.body, &mut mbar_names, &mut mbar_idx, &mbar_default);
 
     // cta_group from the cluster size (the bootstrap is cta_group=2).
     let cta_group = k.cluster_shape.iter().product::<usize>().max(1) as u8;
 
-    // The TMA-load completion barriers to leader-route, from the IR's explicit
-    // `MBar::leader_routed` flag (validate has already checked each carries a
-    // peer reference and is only used by TmaLoad/expect_tx). Routing both CTAs'
-    // TMA to the leader's copy of each barrier (and waiting only the local
-    // copy) is the legal substitute for the peer wait, AND the prerequisite for
-    // multicast loads — a `multicast::cluster` copy's per-destination
-    // transaction count must accumulate on the single leader barrier (the
-    // `* cta_group` leader expect_tx accounts for it).
-    let mut tma_leader_mbars: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    fn find_leader_mbars(stmts: &[Stmt], out: &mut std::collections::HashSet<u32>) {
-        for s in stmts {
-            if let Stmt::MBarDef { mbar } = s {
-                if mbar.leader_routed {
-                    out.insert(mbar.id);
-                }
-            }
-            for body in s.child_bodies() {
-                find_leader_mbars(body, out);
-            }
-        }
-    }
-    find_leader_mbars(&k.body, &mut tma_leader_mbars);
-
-    // The single TMEM view buffer spans every allocated column band:
-    // `max(base_col + n_cols)` over the kernel's TmemAllocs.
-    let mut tmem_view_cols: Option<usize> = None;
-    fn find_tmem_view_cols(stmts: &[Stmt], out: &mut Option<usize>) {
-        for s in stmts {
-            if let Stmt::TmemAlloc {
-                base_col,
-                n_cols,
-                cta_group: _,
-            } = s
-            {
-                let end = (*base_col + *n_cols) as usize;
-                *out = Some(out.map_or(end, |e: usize| e.max(end)));
-            }
-            for body in s.child_bodies() {
-                find_tmem_view_cols(body, out);
-            }
-        }
-    }
-    find_tmem_view_cols(&k.body, &mut tmem_view_cols);
-
-    // NVFP4 SF TMEM views, keyed by the operands' physical base columns.
-    let mut sf_views: Vec<SfView> = Vec::new();
-    collect_sf_views(&k.body, &mut sf_views)?;
-
-    // Per-REG-tensor width. Walk the bodies and record, for each REG fragment,
-    // `max(offset + width)` over every slice — the band a single `.view(...)`
-    // alias must span. (A capped drain writes the 256-wide output reg in two
-    // 128-col groups, so the FULL extent comes from offset+width, not the
-    // per-op width alone.)
-    let mut reg_widths: HashMap<u32, usize> = HashMap::new();
-    fn note_reg_width(s: &TensorSlice, widths: &mut HashMap<u32, usize>) {
-        if s.tensor.space == MemorySpace::Reg {
-            let off = s.offsets.first().and_then(as_int).unwrap_or(0).max(0) as usize;
-            let w = s.shape.first().and_then(as_int).unwrap_or(0).max(0) as usize;
-            let e = widths.entry(s.tensor.id).or_insert(0);
-            *e = (*e).max(off + w);
-        }
-    }
-    fn walk_reg_widths(stmts: &[Stmt], widths: &mut HashMap<u32, usize>) {
-        for s in stmts {
-            match s {
-                Stmt::Tcgen05Ld {
-                    dst,
-                    src: _,
-                    shape: _,
-                    num,
-                } => {
-                    if dst.tensor.space == MemorySpace::Reg {
-                        let off = dst.offsets.first().and_then(as_int).unwrap_or(0).max(0) as usize;
-                        let e = widths.entry(dst.tensor.id).or_insert(0);
-                        *e = (*e).max(off + *num as usize);
-                    }
-                }
-                Stmt::RegCvt {
-                    dst,
-                    src,
-                    rounding: _,
-                } => {
-                    note_reg_width(dst, widths);
-                    note_reg_width(src, widths);
-                }
-                Stmt::RegStore { dst: _, src } => note_reg_width(src, widths),
-                _ => {}
-            }
-            for body in s.child_bodies() {
-                walk_reg_widths(body, widths);
-            }
-        }
-    }
-    walk_reg_widths(&k.body, &mut reg_widths);
+    // Packed b16 physical instructions address the same local REG storage
+    // through a non-owning u32 reinterpret.
+    let mut reg_u32_views = HashSet::new();
+    collect_reg_u32_views(&k.body, &mut reg_u32_views);
 
     // Scalar var names. Every `ScalarDef` introduces an SSA register var
     // (`NAME: T.int32 = init`, read as `NAME`). Var ids are globally unique, so
@@ -1826,138 +976,51 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
     Ok(Ctx {
         names,
         mbar_names,
-        peer_names,
-        mbar_stages,
         var_names: HashMap::new(),
         scalar_names,
         cta_group,
         num_warps: k.num_warps,
-        tmem_view_cols,
-        reg_widths,
-        tma_leader_mbars,
+        reg_u32_views,
         num_clusters: (k.launch_cta_count() / (cta_group as usize).max(1)).max(1),
-        sf_views,
-        sf,
+        tmem_view_index: Cell::new(0),
         nonneg_vars: collect_nonneg_vars(k),
     })
 }
 
-/// Register one SF view per physical base column, in first-use order
-/// (`SFA_tmem`, `SFB_tmem`, then `sf_tmem{i}`). `rows` is the scaled-row count
-/// of this use; the view's logical rows round it up to whole 128-lane
-/// super-blocks — exactly canon's `(128 * n_chunks, SF_K)` decl_buffer.
-fn note_sf_view(
-    views: &mut Vec<SfView>,
-    op: &TmemOperand,
-    rows: usize,
-    nblocks: usize,
-) -> Result<(), String> {
-    let Some(col) = as_int(&op.col) else {
-        return Err(
-            "codegen: SF TMEM operand base column must be a compile-time constant".to_string(),
-        );
-    };
-    if col < 0 {
-        return Err("codegen: SF TMEM operand base column is negative".to_string());
-    }
-    let col = col as usize;
-    // The logical rows round up to whole TMEM-lane (128-row) super-blocks.
-    let logical_rows = rows.div_ceil(WG_THREADS) * WG_THREADS;
-    let logical_cols = nblocks;
-    if let Some(v) = views.iter().find(|v| v.col == col) {
-        if v.logical_rows != logical_rows || v.logical_cols != logical_cols {
-            return Err(format!(
-                "codegen: SF TMEM views at col {col} disagree on the logical shape"
-            ));
-        }
-        return Ok(());
-    }
-    let name = match views.len() {
-        0 => "SFA_tmem".to_string(),
-        1 => "SFB_tmem".to_string(),
-        i => format!("sf_tmem{i}"),
-    };
-    views.push(SfView {
-        name,
-        col,
-        logical_rows,
-        logical_cols,
-    });
-    Ok(())
-}
-
-fn collect_sf_views(stmts: &[Stmt], views: &mut Vec<SfView>) -> Result<(), String> {
+/// Record REG tensors whose packed b16 physical instructions require a u32
+/// reinterpret. Every REG tensor still owns exactly one `T.alloc_local`.
+fn collect_reg_u32_views(stmts: &[Stmt], views: &mut HashSet<u32>) {
     for s in stmts {
         match s {
-            Stmt::Tcgen05Mma {
-                dst: _,
-                a: _,
-                b: _,
-                m,
-                n,
-                k,
-                accum: _,
-                trans_a: _,
-                trans_b: _,
-                cta_group,
-                sfa: Some(sfa),
-                sfb: Some(sfb),
-                sf_byte: _,
-                sf_e4m3: _,
-                sf_block,
-                a_fp4: _,
-                b_fp4: _,
-                lane_align: _,
-            } => {
-                let nblocks = if *sf_block == 0 {
-                    1
-                } else {
-                    (*k / *sf_block) as usize
-                };
-                let a_rows = (if *cta_group == 1 { *m } else { *m / 2 }) as usize;
-                note_sf_view(views, sfa, a_rows, nblocks)?;
-                note_sf_view(views, sfb, *n as usize, nblocks)?;
+            Stmt::Tcgen05Ld { dst, .. } => {
+                if matches!(dst.tensor.dtype, DType::F16 | DType::Bf16) {
+                    views.insert(dst.tensor.id);
+                }
             }
-            Stmt::Tcgen05Cp {
-                dst,
-                src,
-                cta_group: _,
-            } if dst.dtype == DType::F8E4M3 => {
-                // The src is the staged SF SMEM tile (..., rows, SF_CTA_K); its
-                // trailing dims are the view's logical (rows, cols).
-                let (Some(rows), Some(sf_k)) = (
-                    src.shape
-                        .get(src.shape.len().saturating_sub(2))
-                        .and_then(as_int),
-                    src.shape.last().and_then(as_int),
-                ) else {
-                    return Err(
-                        "codegen: tcgen05_cp src shape must be static for the SF view".to_string(),
-                    );
-                };
-                note_sf_view(views, dst, rows.max(0) as usize, sf_k.max(0) as usize)?;
+            Stmt::Tcgen05St { src, .. } => {
+                if matches!(src.tensor.dtype, DType::F16 | DType::Bf16) {
+                    views.insert(src.tensor.id);
+                }
+            }
+            Stmt::LdMatrix { dst, .. } => {
+                if matches!(dst.tensor.dtype, DType::F16 | DType::Bf16) {
+                    views.insert(dst.tensor.id);
+                }
+            }
+            Stmt::StMatrix { src, .. } => {
+                if matches!(src.tensor.dtype, DType::F16 | DType::Bf16) {
+                    views.insert(src.tensor.id);
+                }
             }
             _ => {}
         }
         for body in s.child_bodies() {
-            collect_sf_views(body, views)?;
+            collect_reg_u32_views(body, views);
         }
     }
-    Ok(())
 }
 
-/// The declared (full) width of a REG fragment's wg tile = its spanned band width.
-fn reg_view_width(t: &Arc<Tensor>, ctx: &Ctx) -> usize {
-    ctx.reg_widths
-        .get(&t.id)
-        .copied()
-        .filter(|w| *w > 0)
-        .unwrap_or_else(|| t.shape.first().copied().unwrap_or(0))
-}
-
-/// Column-sliced expression on a REG wg tile: `name[:, off:off+width]` (or
-/// `name[:, :]` when it spans the whole tile). The fragment is a `T.wg_reg_tile`,
-/// i.e. already a 2D `(128, full)` warpgroup tile — no `.view()` indirection.
+/// Slice a rank-1 per-thread local REG array.
 fn emit_reg_view_slice(
     _out: &mut Emitter,
     _p: &str,
@@ -1967,72 +1030,237 @@ fn emit_reg_view_slice(
     ctx: &Ctx,
 ) -> Result<String, String> {
     let name = ctx.tensor_name(t.id)?.to_string();
-    let full = reg_view_width(t, ctx);
-    if as_int(off) == Some(0) && width == full {
-        Ok(format!("{name}[:, :]"))
+    let full = t.shape.first().copied().unwrap_or(0);
+    let all = as_int(off) == Some(0) && width == full;
+    if all {
+        Ok(format!("{name}[:]"))
     } else {
         let off_s = emit_scalar(off, ctx)?;
-        Ok(format!("{name}[:, {off_s}:{off_s} + {width}]"))
+        Ok(format!("{name}[{off_s}:{off_s} + {width}]"))
     }
 }
 
-/// Every MBarRef a statement names (for peer discovery).
-fn stmt_mbar_refs(s: &Stmt) -> Vec<&super::mbar::MBarRef> {
-    use Stmt::*;
-    match s {
-        MBarrierInit {
-            mbar,
-            count: _,
-            stage: _,
-        }
-        | MBarrierArrive {
-            mbar,
-            stage: _,
-            count: _,
-        }
-        | MBarrierWait {
-            mbar,
-            stage: _,
-            phase: _,
-        }
-        | MBarrierExpectTx {
-            mbar,
-            bytes: _,
-            stage: _,
-        }
-        | MBarrierArriveExpectTx {
-            mbar,
-            bytes: _,
-            stage: _,
-        }
-        | Tcgen05Commit {
-            mbar,
-            stage: _,
-            cta_group: _,
-            multicast_cta_mask: _,
-        } => vec![mbar],
-        TmaLoad {
-            dst: _,
-            src: _,
-            mbar,
-            coords: _,
-            shape: _,
-            gmem_shape: _,
-            mbar_stage: _,
-            multicast_cta_mask: _,
-            cache_hint: _,
-            prefetch_tensormap: _,
-            cta_group: _,
-        } => vec![mbar],
-        ClcTryCancel {
-            scheduler: _,
-            handle: _,
-            mbar,
-            stage: _,
-            cta_group: _,
-        } => vec![mbar],
-        _ => vec![],
+/// A rank-1 REG slice decomposed for view emission: (tensor, offset, static
+/// width). Every nymph REG tensor is a per-thread 1-D vector — anything else
+/// has no lowering.
+fn reg_slice_parts(s: &TensorSlice) -> Result<(&Arc<Tensor>, &ScalarValue, usize), String> {
+    if s.offsets.len() != 1 || s.shape.len() != 1 {
+        return Err(format!(
+            "codegen: REG slice of tensor {} must be rank-1 (got {} offsets, {} shape dims)",
+            s.tensor.id,
+            s.offsets.len(),
+            s.shape.len()
+        ));
     }
+    let w = match as_int(&s.shape[0]) {
+        Some(w) if w > 0 => w as usize,
+        other => {
+            return Err(format!(
+                "codegen: REG slice of tensor {} needs a static positive width (got {other:?})",
+                s.tensor.id
+            ))
+        }
+    };
+    Ok((&s.tensor, &s.offsets[0], w))
+}
+
+/// A `T.<dtype>(value)` scalar literal for thread-local REG operands (a bare number
+/// has no dtype; the literal takes the DST tensor's dtype, exactly the
+/// interpreter's `literal_array`).
+fn typed_scalar(dtype: DType, l: RegLiteral) -> Result<String, String> {
+    match dtype {
+        DType::F16 | DType::Bf16 | DType::F32 => {
+            Ok(format!("T.{}({})", dtype_str(dtype), l.as_f32()))
+        }
+        DType::I8
+        | DType::U8
+        | DType::I16
+        | DType::U16
+        | DType::I32
+        | DType::U32
+        | DType::I64
+        | DType::U64 => Ok(format!("T.{}({})", dtype_str(dtype), l.as_i64())),
+        other => Err(format!(
+            "codegen: no typed scalar literal for dtype {other:?}"
+        )),
+    }
+}
+
+/// One operand arm of a `Tx.thread.*` elementwise call: a local slice, or a typed
+/// scalar for a literal. Slice operands must share the dst dtype — the
+/// interpreter coerces per-op, so a genuinely mixed-dtype op must say so with
+/// an explicit RegCvt instead of being silently coerced here.
+fn emit_reg_operand(
+    op: &RegOperand,
+    dst_dtype: DType,
+    out: &mut Emitter,
+    p: &str,
+    ctx: &Ctx,
+) -> Result<String, String> {
+    match op {
+        RegOperand::Slice(s) => {
+            let (t, off, w) = reg_slice_parts(s)?;
+            if t.dtype != dst_dtype {
+                return Err(format!(
+                    "codegen: reg operand dtype {:?} != dst dtype {dst_dtype:?} — \
+                     the interpreter coerces operands per-op; use an explicit RegCvt",
+                    t.dtype
+                ));
+            }
+            emit_reg_view_slice(out, p, t, off, w, ctx)
+        }
+        RegOperand::Literal(l) => typed_scalar(dst_dtype, *l),
+    }
+}
+
+/// The owning per-thread local storage name for a REG tensor.
+fn reg_name(t: &Arc<Tensor>, ctx: &Ctx) -> Result<String, String> {
+    Ok(ctx.tensor_name(t.id)?.to_string())
+}
+
+/// `off + i` text for flat-view indices (simplified when the base is 0).
+fn flat_add(off_s: &str, i: usize) -> String {
+    if off_s == "0" {
+        i.to_string()
+    } else {
+        format!("{off_s} + {i}")
+    }
+}
+
+/// Python bool literal.
+fn py_bool(b: bool) -> &'static str {
+    if b {
+        "True"
+    } else {
+        "False"
+    }
+}
+
+/// Validate the ldmatrix/stmatrix SMEM operand: one contiguous 8-element b16
+/// row. Owning SMEM tensors may carry explicit leading stage/tile axes, so
+/// those axes remain in the slice as extent-one point dimensions.
+fn check_matrix_smem_row(s: &TensorSlice, label: &str) -> Result<(), String> {
+    if s.shape.is_empty()
+        || as_int(s.shape.last().expect("non-empty")) != Some(8)
+        || s.shape[..s.shape.len() - 1]
+            .iter()
+            .any(|extent| as_int(extent) != Some(1))
+    {
+        return Err(format!(
+            "codegen: {label} SMEM operand must end in one contiguous row of eight b16 elements \
+             (got shape {:?})",
+            s.shape
+        ));
+    }
+    if !matches!(s.tensor.dtype, DType::F16 | DType::Bf16) {
+        return Err(format!(
+            "codegen: {label} SMEM operand dtype {:?} must be a 16-bit type (b16 matrix)",
+            s.tensor.dtype
+        ));
+    }
+    Ok(())
+}
+
+fn emit_matrix_smem_ptr(s: &TensorSlice, ctx: &Ctx) -> Result<String, String> {
+    let name = ctx.tensor_name(s.tensor.id)?;
+    let offsets = s
+        .offsets
+        .iter()
+        .map(|offset| emit_scalar(offset, ctx))
+        .collect::<Result<Vec<_>, _>>()?
+        .join(", ");
+    Ok(format!("{name}.ptr_to([{offsets}])"))
+}
+
+/// Shared lowering for `RegAdd`/`RegSub`/`RegMul` on per-thread local arrays.
+/// `rounding=rm` (the interpreter's post-op floor) has no TIRx elementwise
+/// form — fail closed rather than silently skip the floor.
+fn emit_reg_binary(
+    out: &mut Emitter,
+    p: &str,
+    dst: &TensorSlice,
+    lhs: &RegOperand,
+    rhs: &RegOperand,
+    rounding: Rounding,
+    op: &str,
+    ctx: &Ctx,
+) -> Result<(), String> {
+    if rounding != Rounding::Rn {
+        return Err(format!(
+            "codegen: Reg{op} rounding=rm has no TIRx lowering (the elementwise \
+             ops carry no post-op floor; rn only)"
+        ));
+    }
+    let (t, off, w) = reg_slice_parts(dst)?;
+    if !matches!(t.dtype, DType::F16 | DType::Bf16 | DType::F32) {
+        return Err(format!(
+            "codegen: Reg{op} dst dtype {:?} has no lowering (float dsts only)",
+            t.dtype
+        ));
+    }
+    let dst_s = emit_reg_view_slice(out, p, t, off, w, ctx)?;
+    let lhs_s = emit_reg_operand(lhs, t.dtype, out, p, ctx)?;
+    let rhs_s = emit_reg_operand(rhs, t.dtype, out, p, ctx)?;
+    out.push_str(&format!("{p}Tx.thread.{op}({dst_s}, {lhs_s}, {rhs_s})\n"));
+    Ok(())
+}
+
+/// Render the physical b32 register tuple carried by one tcgen05.ld/st
+/// instruction.  The IR's REG slice is in dtype elements; a 16-bit fragment
+/// therefore contributes two elements per physical register and is addressed
+/// through its uint32 reinterpret view.
+fn emit_tcgen05_reg_tuple(
+    slice: &TensorSlice,
+    shape: LdStShape,
+    num: u32,
+    ctx: &Ctx,
+) -> Result<(String, bool), String> {
+    let (tensor, offset, width) = reg_slice_parts(slice)?;
+    let register_count = shape.register_count(num).ok_or_else(|| {
+        format!(
+            "codegen: invalid tcgen05.ld/st shape={} num={num}",
+            shape.as_str()
+        )
+    })?;
+    let is_b16 = matches!(tensor.dtype, DType::F16 | DType::Bf16);
+    if !is_b16 && !matches!(tensor.dtype, DType::F32 | DType::I32 | DType::U32) {
+        return Err(format!(
+            "codegen: tcgen05.ld/st REG dtype {:?} has no physical b32 register form",
+            tensor.dtype
+        ));
+    }
+    let expected_width = register_count * if is_b16 { 2 } else { 1 };
+    if width != expected_width {
+        return Err(format!(
+            "codegen: tcgen05.ld/st shape={} num={num} needs {expected_width} \
+             REG elements of dtype {:?}, got {width}",
+            shape.as_str(),
+            tensor.dtype
+        ));
+    }
+
+    let name = ctx.tensor_name(tensor.id)?;
+    let (view, base) = if is_b16 {
+        let Some(offset) = as_int(offset) else {
+            return Err(
+                "codegen: packed 16-bit tcgen05.ld/st REG offset must be static".to_string(),
+            );
+        };
+        if offset < 0 || offset % 2 != 0 {
+            return Err(format!(
+                "codegen: packed 16-bit tcgen05.ld/st REG offset {offset} \
+                 must be non-negative and even"
+            ));
+        }
+        (format!("{name}_u32"), (offset / 2).to_string())
+    } else {
+        (name.to_string(), emit_scalar(offset, ctx)?)
+    };
+    let regs = (0..register_count)
+        .map(|index| format!("{view}[{}]", flat_add(&base, index)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok((regs, is_b16))
 }
 
 // ===========================================================================
@@ -2063,6 +1291,9 @@ fn scope_name(kind: ScopeValueKind) -> &'static str {
         CtaidInCluster => "cbx",
         CtaId => "cta_id",
         NvshmemMyPe => "nvshmem_my_pe",
+        // `Elected` never reaches scope_name: emit_scalar_prec special-cases
+        // it to the `T.ptx.elect_sync()` intrinsic.
+        Elected => "elected",
     }
 }
 
@@ -2095,6 +1326,10 @@ fn emit_scalar_prec(sv: &ScalarValue, ctx: &Ctx, parent_prec: u8) -> Result<Stri
     match sv {
         ScalarValue::Int(i) => Ok(i.to_string()),
         ScalarValue::Var(v) => Ok(var_ref(ctx, v)),
+        // The `if_elected` predicate is the elect.sync intrinsic itself
+        // (canon's `if T.ptx.elect_sync():` — one elected lane per warp,
+        // single-issue ops inside emit bare).
+        ScalarValue::Scope(ScopeValueKind::Elected) => Ok("T.ptx.elect_sync()".to_string()),
         ScalarValue::Scope(k) => Ok(scope_name(*k).to_string()),
         ScalarValue::Expr(e) => emit_expr(e, ctx, parent_prec),
     }
@@ -2366,9 +1601,14 @@ fn emit_expr(e: &ScalarExpr, ctx: &Ctx, parent_prec: u8) -> Result<String, Strin
             emit_scalar_prec(&e.args[0], ctx, 0)?,
             emit_scalar_prec(&e.args[1], ctx, 0)?
         ),
+        ScalarOp::Xor => format!(
+            "T.bitwise_xor({}, {})",
+            emit_scalar_prec(&e.args[0], ctx, 0)?,
+            emit_scalar_prec(&e.args[1], ctx, 0)?
+        ),
         _ => {
             let Some(sym) = binop_symbol(e.op) else {
-                // An op with no TVMScript lowering (e.g. `Xor`) must not leak a
+                // An op with no TVMScript lowering must not leak a
                 // placeholder literal into the emitted Python source (a syntax
                 // error at best) — fail closed like every other unsupported node.
                 return Err(format!(
@@ -2442,28 +1682,319 @@ fn emit_smem_tile(s: &TensorSlice, ctx: &Ctx) -> Result<String, String> {
     Ok(format!("{name}[{}]", dims.join(", ")))
 }
 
-/// Emit a warpgroup-collective SMEM store DST tile: like `emit_smem_tile`, but a
-/// size-1 dim whose offset is the per-thread `tid_in_wg` lane axis becomes a full
-/// span `:` (the 128-row warpgroup tile) — the value model writes that row per
-/// thread, but `Tx.wg.copy` takes the whole tile and the layout maps lanes to rows.
-/// (Canonical: `Tx.wg.copy(Dsmem[0, db, :, c0:c1], ...)`.)
-fn emit_smem_wg_store_tile(s: &TensorSlice, ctx: &Ctx) -> Result<String, String> {
+/// Emit a literal BufferRegion for a generic synchronous `Tx.copy`. Every IR
+/// dimension remains an explicit range, including extent-one dimensions, so
+/// the printer never turns a one-element region into a scalar BufferLoad.
+fn emit_buffer_region(s: &TensorSlice, ctx: &Ctx) -> Result<String, String> {
     let name = ctx.tensor_name(s.tensor.id)?;
-    let mut dims = Vec::new();
-    for (off, ext) in s.offsets.iter().zip(s.shape.iter()) {
-        let is_lane_axis = matches!(off, ScalarValue::Scope(ScopeValueKind::TidInWg));
-        if is_lane_axis {
-            // per-thread row -> the full warpgroup row span
-            dims.push(":".to_string());
-        } else if as_int(ext) == Some(1) {
-            dims.push(emit_scalar(off, ctx)?); // size-1 ring index: drop the axis
+    let dims = s
+        .offsets
+        .iter()
+        .zip(&s.shape)
+        .map(|(offset, extent)| {
+            let lo = emit_scalar(offset, ctx)?;
+            let hi = add_bound(offset, extent, ctx)?;
+            Ok(format!("{lo}:{hi}"))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(format!("{name}[{}]", dims.join(", ")))
+}
+
+/// Emit the exact rank-2 SMEM tile carried by a physical tcgen05 statement.
+/// Leading axes are explicit point indices; only the final row/column axes are
+/// ranges.  No shape or stage axis is inferred here.
+fn emit_named_smem_tile(tile: &SmemTile, name: &str, ctx: &Ctx) -> Result<String, String> {
+    let mut dims = tile
+        .prefix_indices
+        .iter()
+        .map(|index| emit_scalar(index, ctx))
+        .collect::<Result<Vec<_>, _>>()?;
+    let row_lo = emit_scalar(&tile.row_offset, ctx)?;
+    let row_hi = add_bound(
+        &tile.row_offset,
+        &ScalarValue::Int(i64::from(tile.rows)),
+        ctx,
+    )?;
+    let col_lo = emit_scalar(&tile.col_offset, ctx)?;
+    let col_hi = add_bound(
+        &tile.col_offset,
+        &ScalarValue::Int(i64::from(tile.cols)),
+        ctx,
+    )?;
+    dims.push(format!("{row_lo}:{row_hi}"));
+    dims.push(format!("{col_lo}:{col_hi}"));
+    Ok(format!("{name}[{}]", dims.join(", ")))
+}
+
+fn emit_explicit_smem_tile(tile: &SmemTile, ctx: &Ctx) -> Result<String, String> {
+    emit_named_smem_tile(tile, ctx.tensor_name(tile.tensor.id)?, ctx)
+}
+
+/// Emit an MMA SMEM operand.  F4 is physically backed by U8 in Nymph, so the
+/// explicit byte offsets/extents become twice as many logical e2m1 elements
+/// after the buffer-level view; every other format uses the tile verbatim.
+fn emit_mma_smem_tile(tile: &SmemTile, format: MmaElemFormat, ctx: &Ctx) -> Result<String, String> {
+    if format != MmaElemFormat::F4E2M1 {
+        return emit_explicit_smem_tile(tile, ctx);
+    }
+    let name = ctx.tensor_name(tile.tensor.id)?;
+    let mut dims = tile
+        .prefix_indices
+        .iter()
+        .map(|index| emit_scalar(index, ctx))
+        .collect::<Result<Vec<_>, _>>()?;
+    let row_lo = emit_scalar(&tile.row_offset, ctx)?;
+    let row_hi = add_bound(
+        &tile.row_offset,
+        &ScalarValue::Int(i64::from(tile.rows)),
+        ctx,
+    )?;
+    let col_lo = emit_scalar_prec(&tile.col_offset, ctx, 4)?;
+    let col_hi = add_bound(
+        &tile.col_offset,
+        &ScalarValue::Int(i64::from(tile.cols)),
+        ctx,
+    )?;
+    dims.push(format!("{row_lo}:{row_hi}"));
+    dims.push(format!("({col_lo}) * 2:({col_hi}) * 2"));
+    Ok(format!(
+        "{name}.view(\"float4_e2m1fn\")[{}]",
+        dims.join(", ")
+    ))
+}
+
+fn mma_format_dtype(format: MmaElemFormat) -> &'static str {
+    match format {
+        MmaElemFormat::F16 => "float16",
+        MmaElemFormat::BF16 => "bfloat16",
+        MmaElemFormat::F8E4M3 => "float8_e4m3fn",
+        MmaElemFormat::F4E2M1 => "float4_e2m1fn",
+    }
+}
+
+fn mma_format_bits(format: MmaElemFormat) -> u32 {
+    match format {
+        MmaElemFormat::F16 | MmaElemFormat::BF16 => 16,
+        MmaElemFormat::F8E4M3 => 8,
+        MmaElemFormat::F4E2M1 => 4,
+    }
+}
+
+fn scale_format_dtype(format: ScaleFormat) -> &'static str {
+    match format {
+        ScaleFormat::E8M0FNU => "float8_e8m0fnu",
+        ScaleFormat::E4M3FN => "float8_e4m3fn",
+    }
+}
+
+fn bool_py(value: bool) -> &'static str {
+    if value {
+        "True"
+    } else {
+        "False"
+    }
+}
+
+/// Physical TMEM coordinates become offsets on the statement-local buffer
+/// layout. `elements_per_cell` converts the IR's 32-bit column unit into the
+/// declared buffer dtype's TCol element unit.
+fn emit_tmem_layout_offsets(
+    addr: &TmemAddr,
+    elements_per_cell: u32,
+    extra_col_elements: u32,
+    ctx: &Ctx,
+) -> Result<(String, String), String> {
+    let lane = emit_scalar(&addr.row, ctx)?;
+    let expr = if let Some(col) = as_int(&addr.col) {
+        col.checked_mul(i64::from(elements_per_cell))
+            .and_then(|value| value.checked_add(i64::from(extra_col_elements)))
+            .ok_or_else(|| "codegen: TMEM column offset overflows i64".to_string())?
+            .to_string()
+    } else {
+        let col = emit_scalar_prec(&addr.col, ctx, 4)?;
+        let scaled = if elements_per_cell == 1 {
+            col
         } else {
-            let lo = emit_scalar(off, ctx)?;
-            let hi = add_bound(off, ext, ctx)?;
-            dims.push(format!("{lo}:{hi}"));
+            format!("({col}) * {elements_per_cell}")
+        };
+        if extra_col_elements == 0 {
+            scaled
+        } else {
+            format!("({scaled}) + {extra_col_elements}")
+        }
+    };
+    Ok((lane, expr))
+}
+
+fn datapath_name(datapath: TmemDatapath) -> &'static str {
+    match datapath {
+        TmemDatapath::A => "A",
+        TmemDatapath::B => "B",
+        TmemDatapath::D => "D",
+        TmemDatapath::E => "E",
+        TmemDatapath::F => "F",
+    }
+}
+
+fn emit_cp_tmem_layout(lane_layout: CpLaneLayout, rows: u32, cols: u32) -> Result<String, String> {
+    let layout = match lane_layout {
+        CpLaneLayout::Identity => {
+            if rows % 128 != 0 {
+                return Err(format!(
+                    "codegen: identity tcgen05.cp rows {rows} are not divisible by 128"
+                ));
+            }
+            format!(
+                "TileLayout(S[({}, 128, {cols}) : ({cols} @ TCol, 1 @ TLane, 1 @ TCol)])",
+                rows / 128
+            )
+        }
+        CpLaneLayout::Quadrant4 => {
+            if rows % 4 != 0 {
+                return Err(format!(
+                    "codegen: 4x tcgen05.cp rows {rows} are not divisible by 4"
+                ));
+            }
+            format!(
+                "TileLayout(S[({}, 4, {cols}) : (1 @ TLane, 32 @ TLane, 1 @ TCol)])",
+                rows / 4
+            )
+        }
+        CpLaneLayout::Warp2_02_13 => {
+            if rows % 64 != 0 {
+                return Err(format!(
+                    "codegen: 64x tcgen05.cp rows {rows} are not divisible by 64"
+                ));
+            }
+            format!(
+                "TileLayout(S[({}, 64, {cols}) : ({cols} @ TCol, 1 @ TLane, 1 @ TCol)] + R[2:64 @ TLane])",
+                rows / 64
+            )
+        }
+        CpLaneLayout::Warp2_01_23 => {
+            if rows % 64 != 0 {
+                return Err(format!(
+                    "codegen: 64x tcgen05.cp rows {rows} are not divisible by 64"
+                ));
+            }
+            format!(
+                "TileLayout(S[({}, 2, 32, {cols}) : ({cols} @ TCol, 64 @ TLane, 1 @ TLane, 1 @ TCol)] + R[2:32 @ TLane])",
+                rows / 64
+            )
+        }
+        CpLaneLayout::Warp4 => {
+            if rows % 32 != 0 {
+                return Err(format!(
+                    "codegen: 32x tcgen05.cp rows {rows} are not divisible by 32"
+                ));
+            }
+            format!(
+                "TileLayout(S[({}, 32, {cols}) : ({cols} @ TCol, 1 @ TLane, 1 @ TCol)] + R[4:32 @ TLane])",
+                rows / 32
+            )
+        }
+    };
+    Ok(layout)
+}
+
+fn emit_cp_smem_layout(layout: CpSmemLayout, shape: &[usize], bits: u32) -> Result<String, String> {
+    let shape_s = python_shape(shape);
+    match layout {
+        CpSmemLayout::Plain16B => {
+            let rows = shape[0];
+            let cols = shape[1];
+            Ok(format!("TileLayout(S[({rows}, {cols}) : ({cols}, 1)])"))
+        }
+        CpSmemLayout::Swizzle32B => {
+            let elements_per_128b = 128 / bits;
+            if !elements_per_128b.is_power_of_two() || shape.len() != 2 {
+                return Err(
+                    "codegen: invalid B32 tcgen05.cp source dtype or tensor rank".to_string(),
+                );
+            }
+            let per_element = elements_per_128b.ilog2();
+            let period = 1u32
+                .checked_shl(per_element + 1 + 3)
+                .ok_or_else(|| "codegen: B32 tcgen05.cp layout period overflows".to_string())?;
+            let atom_shape = vec![8, (256 / bits) as usize];
+            let mut tile_shape = atom_shape.clone();
+            tile_shape[0] = shape[0];
+            Ok(format!(
+                "ComposeLayout({per_element}, 1, 3, \
+                 TileLayout(S[{}])).tile_to({}, {}).tile_to({shape_s}, {}).canonicalize()",
+                python_shape(&[period as usize]),
+                python_shape(&tile_shape),
+                python_shape(&atom_shape),
+                python_shape(&tile_shape),
+            ))
         }
     }
-    Ok(format!("{name}[{}]", dims.join(", ")))
+}
+
+fn emit_cp_smem_elem_offset(
+    layout: CpSmemLayout,
+    tile: &SmemTile,
+    bits: u32,
+    ctx: &Ctx,
+) -> Result<String, String> {
+    let byte_offset = tile
+        .tensor
+        .byte_offset
+        .ok_or_else(|| "codegen: Tcgen05Cp source has no absolute byte_offset".to_string())?;
+    let base_bits = byte_offset
+        .checked_mul(8)
+        .ok_or_else(|| "codegen: Tcgen05Cp source byte_offset overflows".to_string())?;
+    if base_bits % bits as usize != 0 {
+        return Err(format!(
+            "codegen: Tcgen05Cp source byte_offset {byte_offset} is not element aligned"
+        ));
+    }
+    let base_elements = base_bits / bits as usize;
+    let rank = tile.tensor.shape.len();
+    let mut prefix_linear = "0".to_string();
+    for (index, extent) in tile
+        .prefix_indices
+        .iter()
+        .zip(tile.tensor.shape[..rank - 2].iter())
+    {
+        let index = emit_scalar_prec(index, ctx, 4)?;
+        prefix_linear = format!("({prefix_linear}) * {extent} + ({index})");
+    }
+    let rows = tile.tensor.shape[rank - 2];
+    let cols = tile.tensor.shape[rank - 1];
+    let physical = match layout {
+        CpSmemLayout::Plain16B => {
+            let row = emit_scalar_prec(&tile.row_offset, ctx, 4)?;
+            let col = emit_scalar_prec(&tile.col_offset, ctx, 4)?;
+            format!("((({prefix_linear}) * {rows} + ({row})) * {cols} + ({col}))")
+        }
+        CpSmemLayout::Swizzle32B => {
+            let row = as_int(&tile.row_offset)
+                .ok_or_else(|| "codegen: B32 Tcgen05Cp row_offset is not static".to_string())?;
+            let col = as_int(&tile.col_offset)
+                .ok_or_else(|| "codegen: B32 Tcgen05Cp col_offset is not static".to_string())?;
+            let atom_cols = i64::from(256 / bits);
+            let col_block = col / atom_cols;
+            let row_block = row / 8;
+            format!(
+                "(({prefix_linear}) * {} + {col_block} * {} + {row_block} * {})",
+                rows * cols,
+                rows * atom_cols as usize,
+                8 * atom_cols as usize,
+            )
+        }
+    };
+    Ok(format!("{base_elements} + {physical}"))
+}
+
+fn cp_multicast_config(multicast: super::stmt::Tcgen05CpMulticast) -> &'static str {
+    use super::stmt::Tcgen05CpMulticast::*;
+    match multicast {
+        None => "",
+        Warp2_02_13 => "warpx2::02_13",
+        Warp2_01_23 => "warpx2::01_23",
+        Warp4 => "warpx4",
+    }
 }
 
 /// A scalar element address into the SMEM mailbox: every dim is a size-1 index, so
@@ -2485,66 +2016,12 @@ fn emit_scalar_load(s: &TensorSlice, ctx: &Ctx) -> Result<String, String> {
     emit_scalar_addr(s, ctx)
 }
 
-/// The MMA accumulator dst: an absolute column slice of the single `tmem`
-/// view — `tmem[:, col:col+n]`. The accumulator is lane-anchored at row 0, so
-/// the lane axis spans all 128 lanes; the column band is the operand's
-/// absolute physical base plus the MMA's n.
-fn emit_tmem_dst(op: &TmemOperand, n: u32, ctx: &Ctx) -> Result<String, String> {
-    let col_s = emit_scalar(&op.col, ctx)?;
-    let hi = add_bound(&op.col, &ScalarValue::Int(i64::from(n)), ctx)?;
-    Ok(format!("tmem[:, {col_s}:{hi}]"))
-}
-
 // ===========================================================================
 // statement walk
 // ===========================================================================
 
-/// Emit one top-level unit (a plain stmt or a chained decision tree).
-fn emit_top_unit(
-    out: &mut Emitter,
-    unit: &TopUnit,
-    indent: usize,
-    ctx: &Ctx,
-    scope: &ScopeInfo,
-) -> Result<(), String> {
-    match unit {
-        TopUnit::Stmt(s) => emit_stmt(out, s, indent, ctx, scope, false),
-        TopUnit::Chain(c) => emit_if_chain(out, c, indent, ctx, scope),
-    }
-}
-
-/// Emit a chained if/else decision tree of warp/warpgroup-equality branches
-/// (canon's role-dispatch shape). The `else` arm nests the next chain link; a
-/// branch's warp-level `inner` chain emits at the end of its body.
-fn emit_if_chain(
-    out: &mut Emitter,
-    chain: &IfChain,
-    indent: usize,
-    ctx: &Ctx,
-    scope: &ScopeInfo,
-) -> Result<(), String> {
-    let p = pad(indent);
-    let child = child_scope_info(&chain.cond, scope, ctx.num_warps);
-    out.push_str(&format!("{p}if {}:\n", emit_scalar(&chain.cond, ctx)?));
-    emit_body(out, &chain.body, indent + 1, ctx, &child)?;
-    if let Some(inner) = &chain.inner {
-        emit_if_chain(out, inner, indent + 1, ctx, &child)?;
-    }
-    if let Some(e) = &chain.else_ {
-        out.push_str(&format!("{p}else:\n"));
-        emit_if_chain(out, e, indent + 1, ctx, scope)?;
-    }
-    Ok(())
-}
-
-/// Emit a statement list. Every body walk goes through here so the run-level
-/// coalescings below apply uniformly at any nesting depth.
-///
-/// Coalesces the fence/sync that follows a run of consecutive `MBarrierWait`s:
-/// the template issues all the `try_wait`s, then ONE
-/// `tcgen05.fence.after_thread_sync()` + ONE `T.cuda.cta_sync()` — and only at
-/// function scope (inside a single-warp/wg branch not all CTA threads reach a
-/// CTA-wide `__syncthreads`).
+/// Emit a statement list exactly in IR order. No statement is skipped,
+/// coalesced, or supplemented with code that is absent from the IR.
 fn emit_body(
     out: &mut Emitter,
     stmts: &[Stmt],
@@ -2552,133 +2029,39 @@ fn emit_body(
     ctx: &Ctx,
     scope: &ScopeInfo,
 ) -> Result<(), String> {
-    let p = pad(indent);
-    let mut i = 0;
-    while i < stmts.len() {
-        if matches!(stmts[i], Stmt::MBarrierWait { .. }) {
-            // Emit every `try_wait` in the run, then one fence. The
-            // `T.cuda.cta_sync()` (a CTA-wide `__syncthreads`) is only emitted at
-            // function scope: inside a single-warp / single-warpgroup branch not
-            // all CTA threads reach it, so the barrier would deadlock / raise an
-            // illegal instruction. Within one branch the threads are already
-            // lockstep and the mbarrier wait gives the async-engine ordering.
-            //
-            // A *peer* wait (remote_coord set, i.e. a `try_wait` on a
-            // `map_shared_rank`-remapped DSMEM address) is SKIPPED:
-            // `mbarrier.try_wait` is only legal on a local shared address, so
-            // the remapped form raises `cudaErrorIllegalInstruction` on sm_100
-            // (verified). The peer CTA's TMA completion is instead ordered by
-            // routing BOTH CTAs' TMA loads to the leader CTA's single barrier
-            // (the canonical cta_group=2 pattern): each CTA's `Tx.copy_async`
-            // signals the leader's barrier via `map_shared_rank(.., 0)`, the
-            // leader issues one `arrive.expect_tx` for the FULL cluster byte
-            // count, and waits its OWN local barrier (which both CTAs fill).
-            // See `TmaLoad` / `MBarrierArriveExpectTx`.
-            let mut j = i;
-            let mut emitted_any = false;
-            while j < stmts.len() && matches!(stmts[j], Stmt::MBarrierWait { .. }) {
-                if let Stmt::MBarrierWait { mbar, phase, stage } = &stmts[j] {
-                    if mbar.remote_coord.is_none() {
-                        let slot_ptr = mbar_slot_ptr(mbar, stage, ctx)?;
-                        let phase_s = phase
-                            .as_ref()
-                            .map(|ph| emit_scalar(ph, ctx))
-                            .transpose()?
-                            .unwrap_or_else(|| "0".to_string());
-                        out.push_str(&format!(
-                            "{p}T.ptx.mbarrier.try_wait({slot_ptr}, {phase_s})\n"
-                        ));
-                        emitted_any = true;
-                    }
-                }
-                j += 1;
-            }
-            if emitted_any && scope.is_function() {
-                // Fence + cta_sync ONLY at function (prologue) scope, where the mbarrier-init
-                // visibility ordering across the whole CTA needs it. In branch scope (the hot
-                // MMA / loader / epilogue loops) the mbarrier handshake alone orders the async
-                // engines (TMA→smem_full→MMA, MMA→tmem_full→epilogue) — exactly as the canonical
-                // kernel does, which emits ZERO `tcgen05.fence.after_thread_sync()` after its
-                // loop waits. Emitting one per wait over-fenced the hot loop: the FENCE/MEMBAR
-                // serialized MMA issue and left the tensor core idle, the exact bench gap.
-                out.push_str(&format!("{p}T.ptx.tcgen05.fence.after_thread_sync()\n"));
-                out.push_str(&format!("{p}T.cuda.cta_sync()\n"));
-            }
-            i = j;
-            continue;
-        }
-        // Single-issue guard coalescing: a maximal run of adjacent stmts that
-        // each emit as `if {guard}: <body>` under the SAME single-issue guard is
-        // emitted under ONE `if {guard}:` block, with every body indented inside
-        // it. The prologue mbarrier inits are ~18 such adjacent stmts; one shared
-        // guard collapses 18 `elect.sync` + 18 predicated branches into 1. This
-        // is a generic peephole keyed ONLY on guard-string identity (a structural
-        // property of the emitted stream), not on any kernel/shape/op.
-        if let Some(guard) = single_issue_guard(&stmts[i], scope, ctx) {
-            let mut j = i;
-            while j < stmts.len() && single_issue_guard(&stmts[j], scope, ctx) == Some(guard) {
-                j += 1;
-            }
-            if j - i >= 2 {
-                out.push_str(&format!("{p}if {guard}:\n"));
-                out.mark_guard(guard);
-                for s in &stmts[i..j] {
-                    emit_stmt(out, s, indent + 1, ctx, scope, true)?;
-                }
-                i = j;
-                continue;
-            }
-        }
-        emit_stmt(out, &stmts[i], indent, ctx, scope, false)?;
-        i += 1;
+    for stmt in stmts {
+        emit_stmt(out, stmt, indent, ctx, scope)?;
     }
     Ok(())
 }
 
-/// The single-issue guard string for a stmt that emits as `if {guard}: <one body>` under
-/// `scope`, or `None` if the stmt is not a coalescable single-issue op (already
-/// single-threaded under `Elected`, or not a single-issue op at all). Drives the
-/// run coalescing in `emit_body`. The leader-routed `arrive.expect_tx` (extra
-/// `cbx == 0` nesting) and warpgroup-collective stores are NOT coalescable here
-/// (they return `None`), so they keep their own emission path. Generic: the
-/// guard comes from `scope.issue_guard`, the same string every single-issue op uses.
-fn single_issue_guard(stmt: &Stmt, scope: &ScopeInfo, ctx: &Ctx) -> Option<&'static str> {
-    use Stmt::*;
+/// ZERO-INFERENCE guard rule (user-mandated): codegen NEVER synthesizes a
+/// single-issue guard from the statically-computed thread scope. Hardware
+/// single-issue ops — TmaLoad/TmaStore/CpAsyncBulkS2Cluster (the TMA issue
+/// family), Tcgen05Mma/Tcgen05Cp/Tcgen05Commit, MBarrierInit (an unguarded
+/// init is a double-init error in both models), ClcTryCancel (stream-level in
+/// the interpreter) — are legal ONLY under an explicit single-lane `If` in
+/// the IR (the `if_elected` sugar or a provably one-lane-per-warp predicate);
+/// the validator enforces that at build (`single_issue_scope`), and this
+/// helper is the codegen-side defense: bare under `Elected`, a hard error
+/// anywhere else. Per-thread ops (mbarrier arrive/expect_tx, store_scalar)
+/// emit per-thread — the interpreter applies them once per executing lane.
+fn emit_single_issue(
+    out: &mut Emitter,
+    p: &str,
+    scope: &ScopeInfo,
+    op: &str,
+    body: &str,
+) -> Result<(), String> {
     if scope.scope == Scope::Elected {
-        return None;
-    }
-    match stmt {
-        // The leader expect_tx nests under `cbx == 0` first — not a plain single guard.
-        MBarrierArriveExpectTx {
-            mbar,
-            bytes: _,
-            stage: _,
-        } if ctx.is_tma_leader_mbar(mbar.mbar.id) => None,
-        // mbarrier.init at FUNCTION scope (the prologue): guard with
-        // `T.cuda.thread_rank() == 0` — canon's exact prologue form (a CTA-thread-0
-        // predicate, no elect.sync). The run coalescing below then folds a whole
-        // contiguous init group into ONE guarded block (canon's grouped inits), instead
-        // of one `elect.sync` + branch per barrier. Only at function scope: inside a
-        // warp/warpgroup branch the CTA thread 0 may not be in the branch's mask, so
-        // the scope guard stays.
-        MBarrierInit { .. } if scope.is_function() => Some("T.cuda.thread_rank() == 0"),
-        MBarrierInit { .. }
-        | MBarrierArriveExpectTx { .. }
-        | MBarrierExpectTx { .. }
-        | MBarrierArrive { .. }
-        | StoreScalar { .. }
-        | TmaLoad { .. }
-        // Tcgen05Cp MUST coalesce with the adjacent Tcgen05Mma/Commit under ONE elect
-        // block: each tcgen05 op (cp SFA, cp SFB, gemm, commit) in its OWN `if elect_sync()`
-        // forces a warp reconvergence between them, which on Blackwell breaks the tcgen05
-        // async issue stream and STALLS the block-scaled MMA (a GPU deadlock — the nvfp4
-        // cluster gemm never retires, so tmem_full is never committed). Coalescing all the
-        // consecutive same-guard tcgen05 ops into one elect (canon's `if elect_sync(): cp;
-        // cp; gemm`) keeps the single issuing lane converged across the whole issue burst.
-        | Tcgen05Cp { .. }
-        | Tcgen05Mma { .. }
-        | Tcgen05Commit { .. } => Some(scope.scope.issue_guard()),
-        _ => None,
+        out.push_str(&format!("{p}{body}\n"));
+        Ok(())
+    } else {
+        Err(format!(
+            "codegen: {op} is a hardware single-issue op but its scope is not \
+             single-lane — wrap it in an explicit elected `If` (the validator's \
+             single_issue_scope rule rejects this at build)"
+        ))
     }
 }
 
@@ -2688,100 +2071,38 @@ fn emit_stmt(
     indent: usize,
     ctx: &Ctx,
     scope: &ScopeInfo,
-    // When true, the caller already opened the single-issue `if {guard}:` block
-    // (run coalescing) and `indent` is the inner level: the single-issue
-    // guarded arms emit ONLY their inner body, skipping their own `if {guard}:`.
-    // False = standalone emission (each guarded arm opens its own guard).
-    bare: bool,
 ) -> Result<(), String> {
     use Stmt::*;
     let p = pad(indent);
-    // Emit a single-issue guarded op's body. Standalone (`bare == false`): open the
-    // `if {guard}:` here and indent the body once. Coalesced (`bare == true`): the caller
-    // already opened the shared guard at `indent - 1`, so emit the body at `indent` with no
-    // guard. `body` is the inner line(s) WITHOUT leading indent or trailing newline.
-    let emit_guarded = |out: &mut Emitter, body: &str| {
-        if bare || scope.scope == Scope::Elected {
-            // Coalesced under a shared guard, or the branch is already
-            // single-threaded — emit the single-issue body directly with no
-            // per-op `if guard:`.
-            out.push_str(&format!("{p}{body}\n"));
-        } else {
-            let guard = scope.scope.issue_guard();
-            out.push_str(&format!("{p}if {guard}:\n"));
-            out.mark_guard(guard);
-            out.push_str(&format!("{p}    {body}\n"));
-        }
-    };
     match stmt {
-        // ---- REG fragments: emit INLINE at the TensorDef site (canon's loop-local
-        // `T.wg_reg_tile(...)`), NOT hoisted to function scope. A function-scope register
-        // tile is whole-kernel-lived and ptxas keeps it in LOCAL memory (the LDL/STL spill);
-        // declared inside the consuming loop it is task-local and promotes to registers. ----
+        // REG storage is exactly the tensor declared by the IR: one per-thread
+        // local array with the IR shape and dtype, emitted at the TensorDef site.
         TensorDef { tensor } if tensor.space == MemorySpace::Reg => {
             let name = ctx.tensor_name(tensor.id)?.to_string();
-            let width = ctx
-                .reg_widths
-                .get(&tensor.id)
-                .copied()
-                .filter(|w| *w > 0)
-                .unwrap_or_else(|| tensor.shape.first().copied().unwrap_or(0));
-            match &tensor.reg_frag {
-                // STMATRIX epilogue datapath (canon's nvfp4 epilogue): the reg frag is
-                // a `tcgen05.{ld,st}`-atom fragment, not a plain thread-axis tile, so the
-                // reg->smem store lowers to STSM/stmatrix (vs the thread-axis tile's plain
-                // STS, which carries 5.4x the SMEM bank conflicts). The read frag is
-                // `alloc_tcgen05_ldst_frag(instr_shape, (128, W), dtype)`; the cast (output)
-                // frag is `alloc_cast_frag(<read_frag>, dtype)`, inheriting the read frag's
-                // (lane, register) layout so the f32->bf16 cast is a per-thread no-movement op.
-                Some(super::tensor::RegFrag::Stmatrix {
-                    instr_shape,
-                    cast_of,
-                }) => match cast_of {
-                    None => {
-                        out.push_str(&format!(
-                            "{p}{name} = T.alloc_tcgen05_ldst_frag(\"{instr_shape}\", ({wg_threads}, {width}), \"{dt}\")\n",
-                            p = pad(indent),
-                            wg_threads = WG_THREADS,
-                            dt = dtype_str(tensor.dtype),
-                        ));
-                    }
-                    Some(src_id) => {
-                        let src_name = ctx.tensor_name(*src_id)?.to_string();
-                        out.push_str(&format!(
-                            "{p}{name} = T.alloc_cast_frag({src_name}, \"{dt}\")\n",
-                            p = pad(indent),
-                            dt = dtype_str(tensor.dtype),
-                        ));
-                    }
-                },
-                None => {
-                    out.push_str(&format!(
-                        "{p}{name} = T.wg_reg_tile({width}, dtype=\"{dt}\")\n",
-                        p = pad(indent),
-                        dt = dtype_str(tensor.dtype),
-                    ));
-                }
+            let shape = python_shape(&tensor.shape);
+            out.push_str(&format!(
+                "{p}{name} = T.alloc_local({shape}, \"{dt}\")\n",
+                dt = dtype_str(tensor.dtype),
+            ));
+            if ctx.reg_u32_views.contains(&tensor.id) {
+                out.push_str(&format!("{p}{name}_u32 = {name}.view(\"uint32\")\n"));
             }
             Ok(())
         }
         // ---- definitions handled in the header; skip in the body walk ----
         TensorDef { .. } | MBarDef { .. } => Ok(()),
 
-        // ---- TMEM alloc / dealloc / relinquish (already under the prologue's
-        // warp==0 guard) ----
-        // The generated code carries exactly ONE TMEM view buffer (`tmem`) based at
-        // column 0, one alloc writing `tmem_addr`, and one dealloc of `tmem_addr[0]`
-        // — validate has already proven the kernel fits that shape (base_col==0, one
-        // live band at a time, alloc only before relinquish, and the kernel-level
-        // cta_group on every op). The arms below still check the fields they cannot
-        // honor instead of dropping them: codegen is reachable without validate, and
-        // a silently-dropped field is how "validate one semantics, run another" used
-        // to happen here.
+        // ---- TMEM alloc / dealloc / relinquish ----
+        // TMEM data views are declared statement-locally by the instructions
+        // that consume them; only the explicit SMEM address cell is shared by
+        // alloc/dealloc. Validation proves the lifecycle is base-0, balanced,
+        // and uses the kernel CTA group. These arms recheck fields they cannot
+        // honor because codegen is also callable without validation.
         TmemAlloc {
             base_col,
             n_cols,
             cta_group,
+            addr_byte_offset: _,
         } => {
             if *base_col != 0 {
                 return Err(format!(
@@ -2838,45 +2159,6 @@ fn emit_stmt(
         // ---- structural ----
         If { cond, then_body } => {
             let child = child_scope_info(cond, scope, ctx.num_warps);
-            // The `if_elected` sugar (`lane_id == 0`) emits canon's hardware
-            // forms instead of the naive `lane_id == 0` predicate: normally
-            // `T.ptx.elect_sync()` (one elected lane per warp, no modulo
-            // recompute per site); when the enclosed set is exactly CTA thread
-            // {(0, 0)} (an elect nested in the warp-0 prologue branch), the
-            // CTA-uniform `T.cuda.thread_rank() == 0` — canon's prologue form.
-            if as_lane_zero_equality(cond) {
-                // The thread_rank form is canon's PROLOGUE guard (one-time init
-                // code). A warp-0 elected region that CONTAINS a persistent loop
-                // (a worker role that happens to live on warp 0 — the nvfp4 MMA
-                // warp) is a hot loop guard, and canon writes `elect_sync()`
-                // there: the thread_rank predicate (a %tid.x read + compare on
-                // the vector path) measurably degrades ptxas's handling of the
-                // loop (nvfp4 1024: 6.26 -> 5.22 us on the guard form alone).
-                // So the narrowing applies only to loop-free (one-time) bodies.
-                let thread_rank0 = !body_has_loop(then_body)
-                    && child.set.as_ref().and_then(|s| s.single_thread()) == Some((0, 0));
-                // `barrier.cluster.wait` is WARP-COLLECTIVE and deadlocks when
-                // only the elected lane waits: peel any leading
-                // ClusterBarrierWaits out of the elect to the enclosing (warp)
-                // scope, exactly like #18 peeled them out of an elected Role.
-                let n_lead = then_body
-                    .iter()
-                    .take_while(|s| matches!(s, Stmt::ClusterBarrierWait))
-                    .count();
-                for _ in 0..n_lead {
-                    out.push_str(&format!(
-                        "{p}T.ptx.barrier.cluster.wait(acquire=True, aligned=False)\n"
-                    ));
-                }
-                let guard = if thread_rank0 {
-                    "T.cuda.thread_rank() == 0"
-                } else {
-                    "T.ptx.elect_sync()"
-                };
-                out.push_str(&format!("{p}if {guard}:\n"));
-                emit_body(out, &then_body[n_lead..], indent + 1, ctx, &child)?;
-                return Ok(());
-            }
             out.push_str(&format!("{p}if {}:\n", emit_scalar(cond, ctx)?));
             emit_body(out, then_body, indent + 1, ctx, &child)?;
             Ok(())
@@ -3015,8 +2297,8 @@ fn emit_stmt(
         }
         // CLC async work-steal issue: 1:1 to `clusterlaunchcontrol.try_cancel`. The
         // 16B response lands in `handle`; the second arg is the mbar it completes-tx
-        // (the kernel's own `sched_arr` full barrier). Single-issue (the enclosing
-        // elect guard), exactly like canon's `if T.ptx.elect_sync(): clc_try_cancel(...)`.
+        // (the kernel's own `sched_arr` full barrier). The enclosing explicit
+        // single-lane IR branch provides its single-issue scope.
         ClcTryCancel {
             scheduler: _, // sim-only metadata (keys the CLC handle slot; no emission arg)
             handle,
@@ -3051,12 +2333,15 @@ fn emit_stmt(
                 .map(|s| emit_scalar(s, ctx))
                 .transpose()?
                 .unwrap_or_else(|| "0".to_string());
-            emit_guarded(
+            emit_single_issue(
                 out,
+                &p,
+                scope,
+                "clc_try_cancel",
                 &format!(
                     "T.ptx.clc_try_cancel(T.address_of({handle_name}[0]), T.address_of({mbar_name}[{slot}]))"
                 ),
-            );
+            )?;
             Ok(())
         }
         // CLC handle decode: 1:1 to `clusterlaunchcontrol.query_cancel`, DEFINING the
@@ -3110,135 +2395,86 @@ fn emit_stmt(
             ));
             Ok(())
         }
-        // Mailbox write: `task_smem[stage, field] = <scalar>`. Single-issue (one
-        // elected thread of the enclosing branch) — the value is uniform, so one
-        // writer suffices and avoids 32 redundant STS to the same address.
+        // Mailbox write: `task_smem[stage, field] = <scalar>`. PER-THREAD (the
+        // interpreter writes once per executing lane); a uniform value makes the
+        // redundant STS harmless, and a lane-varying value is exactly what the
+        // IR asked for — no single-issue guard may be inferred.
         StoreScalar { dst, value } => {
             let dst_s = emit_scalar_addr(dst, ctx)?;
-            emit_guarded(out, &format!("{dst_s} = {}", emit_scalar(value, ctx)?));
+            out.push_str(&format!("{p}{dst_s} = {}\n", emit_scalar(value, ctx)?));
             Ok(())
         }
 
         // ---- mbarrier (every op carries an optional `stage` -> slot index) ----
+        // init is effectively single-issue: an unguarded init is a double-init
+        // error in the interpreter AND on hardware, so it must sit under an
+        // explicit single-lane `If` (validator `single_issue_scope`) — codegen
+        // emits bare there and fails closed everywhere else (zero-inference).
         MBarrierInit { mbar, count, stage } => {
             let slot_ptr = mbar_slot_ptr(mbar, stage, ctx)?;
-            if scope.is_function() && !bare {
-                // Function scope (the prologue): canon's grouped-init form —
-                // `if T.cuda.thread_rank() == 0:` (a CTA-thread-0 predicate, no
-                // elect.sync). The coalesced run (bare) shares this same guard string
-                // via `single_issue_guard`.
-                let guard = "T.cuda.thread_rank() == 0";
-                out.push_str(&format!("{p}if {guard}:\n"));
-                out.mark_guard(guard);
-                out.push_str(&format!(
-                    "{p}    T.ptx.mbarrier.init({slot_ptr}, {count})\n"
-                ));
-            } else {
-                emit_guarded(out, &format!("T.ptx.mbarrier.init({slot_ptr}, {count})"));
-            }
-            Ok(())
+            emit_single_issue(
+                out,
+                &p,
+                scope,
+                "mbarrier.init",
+                &format!("T.ptx.mbarrier.init({slot_ptr}, {count})"),
+            )
         }
         MBarrierArriveExpectTx { mbar, bytes, stage } => {
-            // Cluster TMA barrier (leader-routed): issue ONE expect_tx on the leader's
-            // (CTA-0) barrier for the FULL cluster byte count (both CTAs' loads land
-            // here), and only on the leader CTA (cbx==0) so it is counted once. The IR's
-            // `bytes` is the per-CTA byte count, so multiply by cta_group.
-            if let Some(view) = ctx.tma_leader_view_for(mbar.mbar.id) {
-                let slot = stage
-                    .as_ref()
-                    .map(|s| emit_scalar(s, ctx))
-                    .transpose()?
-                    .unwrap_or_else(|| "0".to_string());
-                let total_bytes = *bytes as u64 * ctx.cta_group as u64;
-                // Nest the CTA selector and the single-issue guard as separate `if`s
-                // rather than `(cbx == 0) and (guard)`: the warp/function guard is now
-                // `T.ptx.elect_sync()`, which returns a uint32 (not bool), and `tirx.And`
-                // requires both operands be bool. `cbx == 0` is warp-uniform, so nesting
-                // is equivalent (all lanes take the same branch, then elect one).
-                out.push_str(&format!("{p}if cbx == 0:\n"));
-                if scope.scope == Scope::Elected {
-                    out.push_str(&format!(
-                        "{p}    T.ptx.mbarrier.arrive.expect_tx({view}.ptr_to([{slot}]), {total_bytes})\n"
-                    ));
-                } else {
-                    let guard = scope.scope.issue_guard();
-                    out.push_str(&format!("{p}    if {guard}:\n"));
-                    out.mark_guard(guard);
-                    out.push_str(&format!(
-                        "{p}        T.ptx.mbarrier.arrive.expect_tx({view}.ptr_to([{slot}]), {total_bytes})\n"
-                    ));
-                }
-                return Ok(());
-            }
-            let slot_ptr = mbar_slot_ptr(mbar, stage, ctx)?;
-            emit_guarded(
-                out,
-                &format!("T.ptx.mbarrier.arrive.expect_tx({slot_ptr}, {bytes})"),
-            );
+            // The MBarRef is the complete address authority. A remote ref uses
+            // the intrinsic's explicit cluster target; bytes stay literal.
+            let slot_ptr = local_mbar_slot_ptr(mbar, stage, ctx)?;
+            let remote = mbar
+                .remote_coord
+                .as_ref()
+                .map(|coord| emit_scalar(coord, ctx))
+                .transpose()?;
+            let args = remote
+                .map(|coord| format!(", remote={coord}, pred=True"))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "{p}T.ptx.mbarrier.arrive.expect_tx({slot_ptr}, {bytes}{args})\n"
+            ));
             Ok(())
         }
+        // expect_tx is PER-THREAD like arrive (the interpreter applies it once
+        // per executing lane) — emit per-thread, no inferred guard.
         MBarrierExpectTx { mbar, bytes, stage } => {
             let slot_ptr = mbar_slot_ptr(mbar, stage, ctx)?;
-            emit_guarded(
-                out,
-                &format!("T.ptx.mbarrier.expect_tx({slot_ptr}, {bytes})"),
-            );
+            out.push_str(&format!(
+                "{p}T.ptx.mbarrier.expect_tx({slot_ptr}, {bytes})\n"
+            ));
             Ok(())
         }
         MBarrierArrive { mbar, count, stage } => {
-            // Two arrive forms:
-            //   * LOCAL (remote_coord=None): the implicit count-of-1 form
-            //     `T.ptx.mbarrier.arrive(bar)`. (The 2nd positional arg is `remote`,
-            //     NOT a count — so a count must never be passed positionally here.)
-            //   * CROSS-CTA (remote_coord=Some(c)): the cluster form on the LOCAL
-            //     barrier of CTA `c`: `T.ptx.mbarrier.arrive(bar, remote=c, pred=True)`
-            //     — the canonical `tmem_pipe.empty.arrive(slot, remote=0, pred=True)`.
-            //     This is NOT the map_shared_rank peer view; the cluster arrive remaps
-            //     to CTA c internally, so we use the local mbar name + cta_id.
-            //
-            // The guard elects ONE issuing thread of the enclosing branch. A warpgroup
-            // branch MUST elect `tid_in_wg == 0` (not one lane per warp, which is 4
-            // threads across the group's 4 warps): 4× over-arrival corrupts the
-            // barrier phase. It is latent on a single task (the reused slot is never
-            // re-waited) but deadlocks the moment a slot is reused across tasks.
-            let body = if let Some(remote) = &mbar.remote_coord {
-                // Use the LOCAL barrier name (not the peer reinterpret view).
-                let local_name = ctx
-                    .mbar_names
-                    .get(&mbar.mbar.id)
-                    .cloned()
-                    .ok_or_else(|| format!("codegen: no name for mbar {}", mbar.mbar.id))?;
-                let slot = stage
-                    .as_ref()
-                    .map(|s| emit_scalar(s, ctx))
-                    .transpose()?
-                    .unwrap_or_else(|| "0".to_string());
-                format!(
-                    "T.ptx.mbarrier.arrive({local_name}.ptr_to([{slot}]), remote={cta}, pred=True)",
-                    cta = emit_scalar(remote, ctx)?,
-                )
+            // `mbarrier.arrive` is a PER-THREAD instruction: the interpreter
+            // arrives once per executing lane, and the barrier's expected count
+            // equals the number of lanes reaching the site (gdn's 128/32-lane
+            // thread barriers, canon's 256 all-thread arrivals). Emitting it
+            // under a single-issue guard (elect/tid_in_wg==0) UNDERCOUNTS —
+            // one arrival on a count-32/128/256 barrier never completes a
+            // phase (the gdn gate_ready deadlock). Sites needing a single
+            // arrival are single-thread in the IR already (an elected/single-
+            // thread If narrows the executing lanes); the checker rejects any
+            // over-arrival, so an unguarded per-thread emission cannot exceed
+            // the validated count.
+            let slot_ptr = local_mbar_slot_ptr(mbar, stage, ctx)?;
+            let count_arg = if as_int(count) == Some(1) {
+                String::new()
             } else {
-                let slot_ptr = mbar_slot_ptr(mbar, stage, ctx)?;
-                let cnt = as_int(count).unwrap_or(1);
-                if cnt == 1 {
-                    format!("T.ptx.mbarrier.arrive({slot_ptr})")
-                } else {
-                    // A local arrive with an explicit count>1 has no implicit form;
-                    // none occur in this kernel. Emit the count via the cluster form on
-                    // the local CTA (cta_id read from the runtime scope).
-                    format!("T.ptx.mbarrier.arrive({slot_ptr}, remote=cbx, pred=True, count={cnt})")
-                }
+                format!(", count={}", emit_scalar(count, ctx)?)
             };
-            emit_guarded(out, &body);
+            let body = match &mbar.remote_coord {
+                Some(remote) => format!(
+                    "T.ptx.mbarrier.arrive({slot_ptr}{count_arg}, remote={cta}, pred=True)",
+                    cta = emit_scalar(remote, ctx)?,
+                ),
+                None => format!("T.ptx.mbarrier.arrive({slot_ptr}{count_arg})"),
+            };
+            out.push_str(&format!("{p}{body}\n"));
             Ok(())
         }
         MBarrierWait { mbar, phase, stage } => {
-            // A peer (remote_coord) wait is skipped — illegal on a remapped DSMEM
-            // address; the peer's TMA is ordered via the leader-routed smem_full instead
-            // (see the coalescing note in `emit_body`). A local wait emits try_wait.
-            if mbar.remote_coord.is_some() {
-                return Ok(());
-            }
             let slot_ptr = mbar_slot_ptr(mbar, stage, ctx)?;
             let phase_s = phase
                 .as_ref()
@@ -3281,20 +2517,8 @@ fn emit_stmt(
                     cta_group, ctx.cta_group
                 ));
             }
-            // The completion mbarrier indexes the ring slot it signals. In cluster mode
-            // the TMA-load barrier is leader-routed: BOTH CTAs signal the LEADER's
-            // (CTA-0) barrier via its `_cta0` map_shared_rank(.., 0) view (identity on
-            // CTA 0, the remap on CTA 1), so the leader's MMA can wait its own local
-            // barrier instead of an (illegal) peer try_wait.
-            let mbar_name = ctx
-                .tma_leader_view_for(mbar.mbar.id)
-                .map(Ok)
-                .unwrap_or_else(|| mbar_buf_name(mbar, ctx))?;
-            let mbar_slot = mbar_stage
-                .as_ref()
-                .map(|s| emit_scalar(s, ctx))
-                .transpose()?
-                .unwrap_or_else(|| "0".to_string());
+            // The TMA completion target is exactly the MBarRef stored in IR.
+            let mbar_ptr = mbar_slot_ptr(mbar, mbar_stage, ctx)?;
             // The SMEM dst is a staged tile (a leading size-1 ring dim): drop it to an
             // integer index so the operand rank matches the 2D GMEM region.
             let dst_s = emit_smem_tile(dst, ctx)?;
@@ -3303,8 +2527,7 @@ fn emit_stmt(
             // SMEM of EVERY CTA in the mask (canon's `cta_mask=pair_mask` for the shared
             // SFB scale band), so the cluster shares ONE load instead of each CTA reading
             // the full band (halving the L2/TMA traffic). The completion's transaction
-            // count is added per multicast destination to the (leader-routed) barrier,
-            // which the `* cta_group` factor in the leader expect_tx already accounts for.
+            // count lands on exactly the mbar address carried by this operation.
             let cta_mask = match multicast_cta_mask {
                 Some(mask) => format!(", cta_mask={mask}"),
                 None => String::new(),
@@ -3325,13 +2548,16 @@ fn emit_stmt(
             } else {
                 ""
             };
-            emit_guarded(
+            emit_single_issue(
                 out,
+                &p,
+                scope,
+                "tma_load",
                 &format!(
-                    "Tx.copy_async({dst_s}, {src_s}, dispatch=\"tma_auto\", mbar={mbar_name}.ptr_to([{mbar_slot}]), cta_group={cg}{cta_mask}{cache_hint_kw}{prefetch_kw})",
+                    "Tx.copy_async({dst_s}, {src_s}, dispatch=\"tma_auto\", mbar={mbar_ptr}, cta_group={cg}{cta_mask}{cache_hint_kw}{prefetch_kw})",
                     cg = ctx.cta_group,
                 ),
-            );
+            )?;
             Ok(())
         }
 
@@ -3340,209 +2566,242 @@ fn emit_stmt(
             dst,
             a,
             b,
-            m,
-            n,
-            k,
+            mma_m,
+            mma_n,
+            format,
+            block_scale,
             accum,
-            sfa,
-            sfb,
-            a_fp4,
-            b_fp4,
             trans_a,
             trans_b,
+            ws,
             cta_group,
-            sf_byte,
-            sf_e4m3,
-            sf_block,
-            lane_align,
         } => {
-            // `Tx.gemm_async` fixes the operand convention the slices are emitted in:
-            // A=(M,K), B=(N,K), full-datapath accumulator, kernel-level cta_group. Any
-            // IR field the emitted form cannot represent is rejected — the validator
-            // and value model honor these fields, so dropping one here would run a
-            // different semantics than was verified. (`m/n/k` vs the operand slice
-            // shapes is already enforced by the validator, incl. the trans variants.)
-            if *trans_a || *trans_b {
-                return Err(
-                    "codegen: Tcgen05Mma trans_a/trans_b have no gemm_async lowering".to_string(),
-                );
-            }
-            if *lane_align != 0 {
-                return Err(
-                    "codegen: Tcgen05Mma lane_align != 0 (m=64 Layout F) not supported".to_string(),
-                );
-            }
             if *cta_group != ctx.cta_group {
                 return Err(format!(
                     "codegen: Tcgen05Mma cta_group={} != kernel cta_group={}",
                     cta_group, ctx.cta_group
                 ));
             }
-            if *a_fp4 != *b_fp4 {
-                return Err("codegen: Tcgen05Mma a_fp4/b_fp4 must match".to_string());
-            }
-            match (sfa.as_ref(), sfb.as_ref()) {
-                // Block-scaled path: the emitted SFA/SFB slice form is the NVFP4
-                // block-16 e4m3 layout (BASE_SF_K=16, byte 0..k/16 per cell) — the
-                // only mode the SF slice math below encodes.
-                (Some(_), Some(_)) => {
-                    if !*sf_e4m3 || *sf_block != 16 || *sf_byte != 0 {
-                        return Err(format!(
-                            "codegen: block-scaled Tcgen05Mma supports only the NVFP4 mode \
-                             (sf_e4m3=true, sf_block=16, sf_byte=0); got sf_e4m3={sf_e4m3}, \
-                             sf_block={sf_block}, sf_byte={sf_byte}"
-                        ));
-                    }
-                }
-                (None, None) => {
-                    if *a_fp4 {
-                        return Err("codegen: fp4 Tcgen05Mma operands require sfa/sfb".to_string());
-                    }
-                }
-                _ => {
-                    return Err("codegen: Tcgen05Mma sfa/sfb must be set together".to_string());
-                }
-            }
-            let dst_s = emit_tmem_dst(dst, *n, ctx)?;
-            // The A/B operands are staged SMEM tiles: drop the leading ring index so
-            // the operand is the 2D `(M, K)` / `(N, K)` MMA tile (canonical
-            // `Asmem[stage, warp_id]` / `Bsmem[stage]`). A TMEM operand (the GDN
-            // accumulator-readback) is an absolute (lane, col) slice of the single
-            // `tmem` view.
-            let emit_ab = |op: &MmaOperand, rows: u32| -> Result<String, String> {
-                match op {
-                    MmaOperand::Slice(s) => emit_smem_tile(s, ctx),
-                    MmaOperand::Tmem(t) => {
-                        let row_s = emit_scalar(&t.row, ctx)?;
-                        let col_s = emit_scalar(&t.col, ctx)?;
-                        let row_hi = add_bound(&t.row, &ScalarValue::Int(i64::from(rows)), ctx)?;
-                        let cells = match t.dtype {
-                            DType::F16 | DType::Bf16 => *k as i64 / 2,
-                            _ => i64::from(*k),
-                        };
-                        let col_hi = add_bound(&t.col, &ScalarValue::Int(cells), ctx)?;
-                        Ok(format!("tmem[{row_s}:{row_hi}, {col_s}:{col_hi}]"))
-                    }
+            let resolved = resolve_tcgen05_mma(
+                dst,
+                a,
+                b,
+                *mma_m,
+                *mma_n,
+                *format,
+                block_scale.as_ref(),
+                *trans_a,
+                *trans_b,
+                *ws,
+                *cta_group,
+            )
+            .map_err(|error| format!("codegen: {error}"))?;
+            let view_index = ctx.next_tmem_view_index();
+
+            // D is a statement-local, non-owning view at the address carried
+            // by this exact IR operation. No kernel-wide TMEM cache exists.
+            let d_name = format!("mma_d{view_index}");
+            let (d_lane, d_col) = emit_tmem_layout_offsets(dst, 1, 0, ctx)?;
+            let d_layout = format!(
+                "tmem_view_layout(tmem_datapath_layout(\"{}\", {}, {}), {d_lane}, {d_col})",
+                datapath_name(resolved.datapath),
+                resolved.d.logical.rows,
+                resolved.d.logical.cols,
+            );
+            out.push_str(&format!(
+                "{p}{d_name} = T.decl_buffer(({}, {}), \"float32\", scope=\"tmem\", \
+                 allocated_addr={}, layout={d_layout})\n",
+                resolved.d.logical.rows, resolved.d.logical.cols, dst.tensor.start_col,
+            ));
+            let dst_s = format!("{d_name}[:, :]");
+
+            let a_s = match a {
+                MmaAOperand::Smem(tile) => emit_mma_smem_tile(tile, *format, ctx)?,
+                MmaAOperand::Tmem { addr, form } => {
+                    let footprint = resolved.a_tmem.as_ref().ok_or_else(|| {
+                        "codegen: resolver omitted the Tcgen05Mma TMEM A footprint".to_string()
+                    })?;
+                    let a_name = format!("mma_a{view_index}");
+                    let elements_per_cell = 32 / mma_format_bits(*format);
+                    let (a_lane, a_col) =
+                        emit_tmem_layout_offsets(addr, elements_per_cell, 0, ctx)?;
+                    let (shape_s, region_s) = match form {
+                        TmemAForm::Flat => (
+                            format!("({}, {})", footprint.logical.rows, footprint.logical.cols),
+                            format!("{a_name}[:, :]"),
+                        ),
+                        TmemAForm::BankBatched => (
+                            format!(
+                                "(2, {}, {})",
+                                footprint.logical.rows, footprint.logical.cols
+                            ),
+                            format!("{a_name}[:, :, :]"),
+                        ),
+                    };
+                    let a_layout = format!(
+                        "tmem_view_layout(tmem_mma_operand_layout(\"A\", {shape_s}, \
+                         \"{}\", M={}, cta_group={}, ws={}), {a_lane}, {a_col})",
+                        mma_format_dtype(*format),
+                        mma_m,
+                        cta_group,
+                        bool_py(*ws),
+                    );
+                    out.push_str(&format!(
+                        "{p}{a_name} = T.decl_buffer({shape_s}, \"{}\", scope=\"tmem\", \
+                         allocated_addr={}, layout={a_layout})\n",
+                        mma_format_dtype(*format),
+                        addr.tensor.start_col,
+                    ));
+                    region_s
                 }
             };
-            let a_rows = if *cta_group == 1 { *m } else { *m / 2 };
-            let b_rows = if *cta_group == 1 { *n } else { *n / 2 };
-            let mut a_s = emit_ab(a, a_rows)?;
-            let mut b_s = emit_ab(b, b_rows)?;
-            // Runtime accum flag: literal 0/1 keep the old True/False form (every
-            // existing kernel); a real scalar expr (canon's loop-carried accum cell)
-            // emits as-is — `Tx.gemm_async` takes a runtime accum predicate.
+            let b_s = emit_mma_smem_tile(b, *format, ctx)?;
             let accum_s = match accum {
                 ScalarValue::Int(0) => "False".to_string(),
                 ScalarValue::Int(1) => "True".to_string(),
                 other => emit_scalar(other, ctx)?,
             };
-            if let (Some(sfa), Some(sfb)) = (sfa.as_ref(), sfb.as_ref()) {
-                // NVFP4 block-scaled: view the packed-u8 operand BUFFER as e2m1 fp4 (the
-                // last dim doubles: bytes -> fp4 elems), then slice — `.view` is on the
-                // buffer, not a region (canon: A_smem = A_smem_packed.view(...); A_smem[stage]).
-                if *a_fp4 {
-                    let view = |op: &MmaOperand| -> Result<String, String> {
-                        let MmaOperand::Slice(s) = op else {
-                            return Err(
-                                "codegen: fp4 Tcgen05Mma operands must be SMEM slices".to_string()
-                            );
-                        };
-                        let buf = ctx.tensor_name(s.tensor.id)?;
-                        let stage =
-                            emit_scalar(s.offsets.first().unwrap_or(&ScalarValue::Int(0)), ctx)?;
-                        let rows = s.shape.get(1).and_then(as_int).unwrap_or(0);
-                        let cols = s.shape.get(2).and_then(as_int).unwrap_or(0) * 2;
-                        Ok(format!(
-                            "{buf}.view(\"float4_e2m1fn\")[{stage}, 0:{rows}, 0:{cols}]"
-                        ))
-                    };
-                    a_s = view(a)?;
-                    b_s = view(b)?;
-                }
-                // Emit the SF operands as EXPLICIT logical slices `[0:rows, 0:cols]`
-                // of their views, exactly like canon (`SFA_tmem[0:128, 0:16]`,
-                // `SFB_tmem[0:256, 0:16]`) — the view at the operand's physical base
-                // column re-materializes the folded logical shape.
-                let sf_slice = |op: &TmemOperand| -> Result<String, String> {
-                    let Some(col) = as_int(&op.col) else {
-                        return Err(
-                            "codegen: SF TMEM operand col must be a compile-time constant"
-                                .to_string(),
-                        );
-                    };
-                    let view = ctx
-                        .sf_views
-                        .iter()
-                        .find(|v| v.col as i64 == col)
-                        .ok_or_else(|| format!("codegen: no SF TMEM view at col {col}"))?;
-                    Ok(format!(
-                        "{}[0:{}, 0:{}]",
-                        view.name, view.logical_rows, view.logical_cols
-                    ))
-                };
-                let sfa_s = sf_slice(sfa)?;
-                let sfb_s = sf_slice(sfb)?;
-                emit_guarded(
-                    out,
-                    &format!(
-                        "Tx.gemm_async({dst_s}, {a_s}, {b_s}, SFA={sfa_s}, SFB={sfb_s}, accum={accum_s}, dispatch=\"tcgen05\", cta_group={cg})",
-                        cg = ctx.cta_group,
-                    ),
+
+            let call = if let Some(spec) = block_scale {
+                let sfa = resolved.sfa.as_ref().ok_or_else(|| {
+                    "codegen: resolver omitted the Tcgen05Mma SFA footprint".to_string()
+                })?;
+                let sfb = resolved.sfb.as_ref().ok_or_else(|| {
+                    "codegen: resolver omitted the Tcgen05Mma SFB footprint".to_string()
+                })?;
+                let sfa_name = format!("mma_sfa{view_index}");
+                let sfb_name = format!("mma_sfb{view_index}");
+                let sfa_extra = sfa.cell_delta * 4 + u32::from(sfa.subbyte);
+                let sfb_extra = sfb.cell_delta * 4 + u32::from(sfb.subbyte);
+                let (sfa_lane, sfa_col) = emit_tmem_layout_offsets(&spec.sfa, 4, sfa_extra, ctx)?;
+                let (sfb_lane, sfb_col) = emit_tmem_layout_offsets(&spec.sfb, 4, sfb_extra, ctx)?;
+                let sfa_layout = format!(
+                    "tmem_view_layout(sf_tmem_layout({}, SF_K={}, sf_per_mma={}, \
+                     sf_reuse={}), {sfa_lane}, {sfa_col})",
+                    sfa.footprint.logical.rows, sfa.sf_k, spec.sf_per_mma, spec.sf_reuse,
                 );
+                let sfb_layout = format!(
+                    "tmem_view_layout(sf_tmem_layout({}, SF_K={}, sf_per_mma={}, \
+                     sf_reuse={}), {sfb_lane}, {sfb_col})",
+                    sfb.footprint.logical.rows, sfb.sf_k, spec.sf_per_mma, spec.sf_reuse,
+                );
+                out.push_str(&format!(
+                    "{p}{sfa_name} = T.decl_buffer(({}, {}), \"{}\", scope=\"tmem\", \
+                     allocated_addr={}, layout={sfa_layout})\n",
+                    sfa.footprint.logical.rows,
+                    sfa.logical_last,
+                    scale_format_dtype(spec.scale_format),
+                    spec.sfa.tensor.start_col,
+                ));
+                out.push_str(&format!(
+                    "{p}{sfb_name} = T.decl_buffer(({}, {}), \"{}\", scope=\"tmem\", \
+                     allocated_addr={}, layout={sfb_layout})\n",
+                    sfb.footprint.logical.rows,
+                    sfb.logical_last,
+                    scale_format_dtype(spec.scale_format),
+                    spec.sfb.tensor.start_col,
+                ));
+                format!(
+                    "Tx.gemm_async({dst_s}, {a_s}, {b_s}, \
+                     SFA={sfa_name}[:, :], SFB={sfb_name}[:, :], accum={accum_s}, \
+                     transA={}, transB={}, dispatch=\"tcgen05\", cta_group={}, \
+                     mma_m={}, mma_n={}, weight_stationary={})",
+                    bool_py(*trans_a),
+                    bool_py(*trans_b),
+                    cta_group,
+                    mma_m,
+                    mma_n,
+                    bool_py(*ws),
+                )
             } else {
-                emit_guarded(
-                    out,
-                    &format!(
-                        "Tx.gemm_async({dst_s}, {a_s}, {b_s}, accum={accum_s}, dispatch=\"tcgen05\", cta_group={cg})",
-                        cg = ctx.cta_group,
-                    ),
-                );
-            }
+                format!(
+                    "Tx.gemm_async({dst_s}, {a_s}, {b_s}, accum={accum_s}, \
+                     transA={}, transB={}, dispatch=\"tcgen05\", cta_group={}, \
+                     mma_m={}, mma_n={}, weight_stationary={})",
+                    bool_py(*trans_a),
+                    bool_py(*trans_b),
+                    cta_group,
+                    mma_m,
+                    mma_n,
+                    bool_py(*ws),
+                )
+            };
+            emit_single_issue(out, &p, scope, "tcgen05_mma", &call)?;
             Ok(())
         }
-        // NVFP4 scale-factor copy SMEM -> e4m3 TMEM (canon's Tx.copy_async(SFA_tmem,
-        // SFA_smem[stage], cta_group=2)). Single-issue, like the MMA/commit.
+        // One physical tcgen05.cp IR statement becomes one Tx.copy_async.
+        // The explicit source tile, shape, multicast, and CTA group select the
+        // statement-local physical source/destination views.
         Tcgen05Cp {
             dst,
             src,
+            shape,
+            multicast,
             cta_group,
         } => {
-            // Emit canon's EXACT cp form: `Tx.copy_async(SFB_tmem[0:256, 0:16],
-            // SFB_smem[stage, 0:256, 0:16], cta_group=2)` — explicit logical slices
-            // on BOTH ends. The dst's view comes from its physical base column;
-            // the src is the staged SF SMEM `(rows, SF_CTA_K)`.
-            let Some(col) = as_int(&dst.col) else {
-                return Err(
-                    "codegen: tcgen05_cp dst col must be a compile-time constant".to_string(),
-                );
+            if *cta_group != ctx.cta_group {
+                return Err(format!(
+                    "codegen: Tcgen05Cp cta_group={} != kernel cta_group={}",
+                    cta_group, ctx.cta_group
+                ));
+            }
+            let resolved = resolve_tcgen05_cp(dst, src, *shape, *multicast, *cta_group)
+                .map_err(|error| format!("codegen: {error}"))?;
+            let bits = tcgen05_cp_source_bits(src);
+            if bits > 32 || 32 % bits != 0 {
+                return Err(format!(
+                    "codegen: Tcgen05Cp source dtype {:?} must divide one 32-bit TMEM cell",
+                    src.tensor.dtype
+                ));
+            }
+
+            let view_index = ctx.next_tmem_view_index();
+            let dst_name = format!("cp_dst{view_index}");
+            let src_name = format!("cp_src{view_index}");
+            let elements_per_cell = 32 / bits;
+            let (dst_lane, dst_col) = emit_tmem_layout_offsets(dst, elements_per_cell, 0, ctx)?;
+            let base_layout = emit_cp_tmem_layout(
+                resolved.lane_layout,
+                resolved.source.rows,
+                resolved.source.cols,
+            )?;
+            let src_owner = ctx.tensor_name(src.tensor.id)?;
+            let src_view_rows = if resolved.source_layout == CpSmemLayout::Swizzle32B {
+                resolved.source.rows.div_ceil(8) * 8
+            } else {
+                resolved.source.rows
             };
-            let view = ctx
-                .sf_views
-                .iter()
-                .find(|v| v.col as i64 == col)
-                .ok_or_else(|| format!("codegen: no SF TMEM view at col {col}"))?;
-            let src_name = ctx.tensor_name(src.tensor.id)?;
-            let stage = emit_scalar(src.offsets.first().unwrap_or(&ScalarValue::Int(0)), ctx)?;
-            // src is a staged SF SMEM tile `(SMEM_DEPTH, rows, SF_CTA_K)`; its full
-            // (rows, SF_CTA_K) at this stage — the trailing slice dims.
-            let (Some(r), Some(c)) = (
-                src.shape
-                    .get(src.shape.len().saturating_sub(2))
-                    .and_then(as_int),
-                src.shape.last().and_then(as_int),
-            ) else {
-                return Err("codegen: tcgen05_cp src shape must be static".to_string());
-            };
-            emit_guarded(
-                out,
-                &format!(
-                    "Tx.copy_async({name}[0:{rows}, 0:{cols}], {src_name}[{stage}, 0:{r}, 0:{c}], cta_group={cta_group})",
-                    name = view.name,
-                    rows = view.logical_rows,
-                    cols = view.logical_cols,
-                ),
+            let src_view_shape = [src_view_rows as usize, resolved.source.cols as usize];
+            let src_layout = emit_cp_smem_layout(resolved.source_layout, &src_view_shape, bits)?;
+            let src_elem_offset = emit_cp_smem_elem_offset(resolved.source_layout, src, bits, ctx)?;
+            out.push_str(&format!(
+                "{p}{src_name} = T.decl_buffer({}, \"{}\", data={src_owner}.data, \
+                 elem_offset={src_elem_offset}, \
+                 scope=\"shared.dyn\", layout={src_layout})\n",
+                python_shape(&src_view_shape),
+                dtype_str(src.tensor.dtype),
+            ));
+            let src_s = format!(
+                "{src_name}[0:{}, 0:{}]",
+                resolved.source.rows, resolved.source.cols
             );
+            let dst_layout = format!("tmem_view_layout({base_layout}, {dst_lane}, {dst_col})");
+            out.push_str(&format!(
+                "{p}{dst_name} = T.decl_buffer(({}, {}), \"{}\", scope=\"tmem\", \
+                 allocated_addr={}, layout={dst_layout})\n",
+                resolved.source.rows,
+                resolved.source.cols,
+                dtype_str(src.tensor.dtype),
+                dst.tensor.start_col,
+            ));
+            let call = format!(
+                "Tx.copy_async({dst_name}[:, :], {src_s}, shape=\"{}\", \
+                 multicast=\"{}\", cta_group={})",
+                shape.as_str(),
+                cp_multicast_config(*multicast),
+                cta_group,
+            );
+            emit_single_issue(out, &p, scope, "tcgen05_cp", &call)?;
             Ok(())
         }
         Tcgen05Commit {
@@ -3559,70 +2818,36 @@ fn emit_stmt(
             }
             let slot_ptr = mbar_slot_ptr(mbar, stage, ctx)?;
             let mask = multicast_cta_mask.unwrap_or(0);
-            emit_guarded(
+            emit_single_issue(
                 out,
+                &p,
+                scope,
+                "tcgen05_commit",
                 &format!(
                     "T.ptx.tcgen05.commit({slot_ptr}, cta_group={cg}, cta_mask={mask})",
                     cg = ctx.cta_group,
                 ),
-            );
+            )?;
             Ok(())
         }
 
-        // ---- epilogue: tcgen05_ld -> Tx.wg.copy_async, wait_ld, reg_cvt -> Tx.wg.cast,
-        // reg_store -> Tx.copy. Whole warpgroup participates (no per-thread guard). ----
+        // ---- epilogue physical load + per-thread register operations ----
         Tcgen05Ld {
             dst,
             src,
             shape,
             num,
         } => {
-            // Fail closed on every field the emission cannot honor — the
-            // `Tx.wg.copy_async` below reads the single base-0 (128, cols) f32
-            // `tmem` view, so:
-            //   * shape: only .32x32b addresses exactly the (all-128-lanes,
-            //     num-col) window the emission encodes. A .16x*b atom reads
-            //     col_factor*num columns from a 16-lane half-slab — emitting the
-            //     SAME text for it would validate one semantics and run another.
-            //   * dtype: the tmem view is f32 and TIRx requires the fragment
-            //     dtype to equal it.
-            //   * row: the lane base of the read. The view always starts at
-            //     lane 0, and for .32x32b row must be 0 anyway (the atom spans
-            //     each warp's whole 32-lane subpartition) — anything else reads
-            //     different lanes in the interpreter than on silicon.
-            if *shape != LdStShape::B32x32 {
-                return Err(format!(
-                    "codegen: Tcgen05Ld shape={} has no lowering (only 32x32b)",
-                    shape.as_str()
-                ));
-            }
-            if src.dtype != DType::F32 {
-                return Err(format!(
-                    "codegen: Tcgen05Ld dtype {:?} has no lowering (the TMEM view is f32)",
-                    src.dtype
-                ));
-            }
-            if as_int(&src.row) != Some(0) {
-                return Err(
-                    "codegen: Tcgen05Ld row must be a static 0 (the TMEM view bases at lane 0)"
-                        .to_string(),
-                );
-            }
-            // dst is the f32 reg fragment (read as a wg view of `num` cols); src is the
-            // tmem band at the operand's absolute physical `col`. The fragment is
-            // filled from column 0 (scratch reused per drain group), so the view
-            // slice starts at 0.
-            let width = *num as usize;
-            let col_s = emit_scalar(&src.col, ctx)?;
-            // Read this atom into its sub-slice of the (wide) read fragment: the
-            // epilogue issues a whole band's atoms into distinct slices, THEN a
-            // single wait_ld (matching the canonical fence structure). A legacy
-            // single-atom drain passes offset 0, so this is unchanged for it.
-            let zero = ScalarValue::Int(0);
-            let dst_off = dst.offsets.first().unwrap_or(&zero);
-            let frag_s = emit_reg_view_slice(out, &p, &dst.tensor, dst_off, width, ctx)?;
+            let (regs, pack) = emit_tcgen05_reg_tuple(dst, *shape, *num, ctx)?;
+            let row = emit_scalar(&src.row, ctx)?;
+            let col = emit_scalar(&src.col, ctx)?;
             out.push_str(&format!(
-                "{p}Tx.wg.copy_async({frag_s}, tmem[:, {col_s}:{col_s} + {width}])\n"
+                "{p}T.ptx.tcgen05.ld(T.uint32({}), {regs}, shape=\"{}\", num={}, \
+                 row={row}, col={col}, pack={})\n",
+                src.tensor.start_col,
+                shape.as_str(),
+                num,
+                bool_py(pack),
             ));
             Ok(())
         }
@@ -3630,84 +2855,47 @@ fn emit_stmt(
             out.push_str(&format!("{p}T.ptx.tcgen05.wait.ld()\n"));
             Ok(())
         }
-        RegCvt {
-            dst,
-            src,
-            // Inert on both sides today: the interpreter's cvt path coerces to the
-            // dst dtype without consulting `rounding`, and `Tx.wg.cast` carries no
-            // rounding argument. Listed explicitly so a future rounding-aware cvt
-            // must touch both sides (and validate) at once.
-            rounding: _,
-        } => {
-            // Cast a band of the f32 read fragment to the matching band of the wide
-            // output reg. Both bands are sliced by their (offset, width) so a capped
-            // (≤128-col) drain group writes the right slice of the 256-wide output reg.
-            let zero = ScalarValue::Int(0);
-            let dst_off = dst.offsets.first().unwrap_or(&zero);
-            let src_off = src.offsets.first().unwrap_or(&zero);
-            let dst_w = dst.shape.first().and_then(as_int).unwrap_or(0).max(0) as usize;
-            let src_w = src.shape.first().and_then(as_int).unwrap_or(0).max(0) as usize;
-            let dst_s = emit_reg_view_slice(out, &p, &dst.tensor, dst_off, dst_w, ctx)?;
-            let src_s = emit_reg_view_slice(out, &p, &src.tensor, src_off, src_w, ctx)?;
-            out.push_str(&format!("{p}Tx.wg.cast({dst_s}, {src_s})\n"));
+        RegCvt { dst, src, rounding } => {
+            if *rounding != Rounding::Rn {
+                return Err(
+                    "codegen: RegCvt rounding=rm has no Tx.thread.cast lowering".to_string()
+                );
+            }
+            let (dt, doff, dw) = reg_slice_parts(dst)?;
+            let (st, soff, sw) = reg_slice_parts(src)?;
+            if sw != 1 && sw != dw {
+                return Err(format!(
+                    "codegen: RegCvt src width {sw} must be 1 or the dst width {dw}"
+                ));
+            }
+            let dst_s = emit_reg_view_slice(out, &p, dt, doff, dw, ctx)?;
+            let src_s = emit_reg_view_slice(out, &p, st, soff, sw, ctx)?;
+            out.push_str(&format!("{p}Tx.thread.cast({dst_s}, {src_s})\n"));
             Ok(())
         }
-        // SF-permute load (nvfp4 dev permute warp): read an SMEM scale-cell band into
-        // a per-lane register fragment, symmetric to the SMEM branch of `RegStore`. The
-        // byte permutation itself is below the value model — codegen only materializes
-        // the buffer read into the fragment via the warpgroup-collective copy (the
-        // matching `RegStore` writes it back). REG-source loads (an alias/copy between
-        // two register tiles) are a structural no-op at the source level.
+        // Register transfers preserve the explicit IR slices one-for-one.
         RegLoad { dst, src } => {
-            if src.tensor.space == MemorySpace::Smem {
-                let src_s = emit_smem_wg_store_tile(src, ctx)?;
-                let zero = ScalarValue::Int(0);
-                let dst_off = dst.offsets.first().unwrap_or(&zero);
-                let width = dst.shape.first().and_then(as_int).unwrap_or(0).max(0) as usize;
-                let dst_s = emit_reg_view_slice(out, &p, &dst.tensor, dst_off, width, ctx)?;
-                out.push_str(&format!("{p}Tx.wg.copy({dst_s}, {src_s})\n"));
-            }
+            let (tensor, offset, width) = reg_slice_parts(dst)?;
+            let dst_s = emit_reg_view_slice(out, &p, tensor, offset, width, ctx)?;
+            let src_s = if src.tensor.space == MemorySpace::Reg {
+                let (tensor, offset, width) = reg_slice_parts(src)?;
+                emit_reg_view_slice(out, &p, tensor, offset, width, ctx)?
+            } else {
+                emit_buffer_region(src, ctx)?
+            };
+            out.push_str(&format!("{p}Tx.copy({dst_s}, {src_s})\n"));
             Ok(())
         }
         RegStore { dst, src } => {
-            // Two store shapes, distinguished by the dst memory space:
-            //   * GMEM dst (bootstrap direct epilogue): `Tx.copy(C[row, c0:c1], reg[:])`
-            //     — each thread writes its own C row from its private fragment.
-            //   * SMEM dst (smem-staged epilogue): `Tx.wg.copy(d_smem[db, :, c0:c1],
-            //     reg_view[:, b0:b1])` — the warpgroup-collective reg->smem store that
-            //     feeds the subsequent TMA store. The reg src is the wide `out_wide`
-            //     band, read through its wg view (sliced by column).
-            if dst.tensor.space == MemorySpace::Smem {
-                let dst_s = emit_smem_wg_store_tile(dst, ctx)?;
-                let zero = ScalarValue::Int(0);
-                let src_off = src.offsets.first().unwrap_or(&zero);
-                let width = src.shape.first().and_then(as_int).unwrap_or(0).max(0) as usize;
-                let src_s = emit_reg_view_slice(out, &p, &src.tensor, src_off, width, ctx)?;
-                // STMATRIX epilogue: a `tcgen05.{ld,st}`-atom src frag stores reg->smem via
-                // `dispatch="ldstmatrix"` (canon's `regs_to_smem`), lowering to STSM. The
-                // kernel slices the store in 16-col chunks (stmatrix.x4 granularity). A plain
-                // thread-axis frag (reg_frag=None) keeps the default `Tx.wg.copy` (STS).
-                let dispatch = if src.tensor.reg_frag.is_some() {
-                    ", dispatch=\"ldstmatrix\""
-                } else {
-                    ""
-                };
-                out.push_str(&format!("{p}Tx.wg.copy({dst_s}, {src_s}{dispatch})\n"));
+            let (src_tensor, src_offset, src_width) = reg_slice_parts(src)?;
+            let src_s = emit_reg_view_slice(out, &p, src_tensor, src_offset, src_width, ctx)?;
+            let dst_s = if dst.tensor.space == MemorySpace::Reg {
+                let (tensor, offset, width) = reg_slice_parts(dst)?;
+                emit_reg_view_slice(out, &p, tensor, offset, width, ctx)?
             } else {
-                // GMEM store (bootstrap direct epilogue): the warpgroup-collective
-                // `Tx.wg.copy(C[row:row+128, c0:c1], reg[:, :])`. The reg fragment is a
-                // `wg_reg_tile` (thread-axis layout), so the copy MUST be warpgroup-
-                // scoped — a thread-scoped `Tx.copy` falls to the scalar fallback,
-                // which does a direct thread-axis BufferLoad and is rejected by
-                // LowerTIRxCleanup. The dst row offset carries a per-thread
-                // `tid_in_wg` term in the value model; for the wg-collective store it
-                // becomes the 128-row band (the layout maps lanes to rows).
-                let dst_s = emit_gmem_row_store(dst, ctx)?;
-                let zero = ScalarValue::Int(0);
-                let w = src.shape.first().and_then(as_int).unwrap_or(0).max(0) as usize;
-                let src_s = emit_reg_view_slice(out, &p, &src.tensor, &zero, w, ctx)?;
-                out.push_str(&format!("{p}Tx.wg.copy({dst_s}, {src_s})\n"));
-            }
+                emit_buffer_region(dst, ctx)?
+            };
+            out.push_str(&format!("{p}Tx.copy({dst_s}, {src_s})\n"));
             Ok(())
         }
 
@@ -3748,12 +2936,15 @@ fn emit_stmt(
             } else {
                 ""
             };
-            emit_guarded(
+            emit_single_issue(
                 out,
+                &p,
+                scope,
+                "tma_store",
                 &format!(
                     "Tx.copy_async({dst_s}, {src_s}, dispatch=\"tma_auto\"{cache_hint_kw}{prefetch_kw})"
                 ),
-            );
+            )?;
             Ok(())
         }
         CpAsyncBulkCommitGroup => {
@@ -3813,13 +3004,11 @@ fn emit_stmt(
                         FenceScope::Cluster => "shared::cluster",
                         FenceScope::Gpu => "",
                     };
-                    if scope.is_function() || scope.scope == Scope::Elected {
-                        out.push_str(&format!("{p}T.ptx.fence.proxy_async(\"{space}\")\n"));
-                    } else {
-                        out.push_str(&format!("{p}if tid_in_wg == 0:\n"));
-                        out.mark_guard("tid_in_wg == 0");
-                        out.push_str(&format!("{p}    T.ptx.fence.proxy_async(\"{space}\")\n"));
-                    }
+                    // PER-THREAD: a proxy fence orders only the EXECUTING lane's
+                    // prior writes — guarding it to one lane would leave every
+                    // other lane's writes unordered (zero-inference; hardware
+                    // fence is a per-thread instruction, so this is exact).
+                    out.push_str(&format!("{p}T.ptx.fence.proxy_async(\"{space}\")\n"));
                 }
                 // Memory/View fences are sim-only ordering markers — the interpreter
                 // folds them into trace `Generic` events and there is no TIRx
@@ -3832,12 +3021,25 @@ fn emit_stmt(
             }
             Ok(())
         }
-        CtaSync => {
-            // Suppress CTA-wide cta_sync inside a single-warp/wg branch (not
-            // all CTA threads reach it → illegal __syncthreads).
-            if scope.is_function() {
-                out.push_str(&format!("{p}T.cuda.cta_sync()\n"));
+        GridDepControl { action } => {
+            // PDL hint (sm_90+): `launch_dependents` lowers to SASS PREEXIT,
+            // letting the dependent grid's prologue overlap this grid's drain.
+            use super::stmt::GridDepAction;
+            match action {
+                GridDepAction::LaunchDependents => {
+                    out.push_str(&format!("{p}T.ptx.griddepcontrol.launch_dependents()\n"));
+                }
+                GridDepAction::Wait => {
+                    out.push_str(&format!("{p}T.ptx.griddepcontrol.wait()\n"));
+                }
             }
+            Ok(())
+        }
+        CtaSync => {
+            // The validator rejects statically narrowed CTA barriers. Codegen
+            // must still print the statement at its exact IR position; it may
+            // not silently delete or hoist control-dependent synchronization.
+            out.push_str(&format!("{p}T.cuda.cta_sync()\n"));
             Ok(())
         }
         ClusterSync => {
@@ -3860,15 +3062,13 @@ fn emit_stmt(
             // it. If only the elected lane waits, the overlap path DEADLOCKS on
             // hardware (verified on 1024/2048) while the protocol checker still
             // passes (it models the wait as collective regardless of the codegen
-            // elect context). The elect-form `If` arm hoists a leading
-            // ClusterBarrierWait out of the elect to warp scope; reaching here
-            // under `Scope::Elected` means that hoist was bypassed — fail LOUDLY
-            // instead of emitting a silently-hanging kernel.
+            // elect context). Fail loudly instead of changing its IR scope or
+            // emitting a silently-hanging kernel.
             if matches!(scope.scope, Scope::Elected) {
                 return Err(
                     "codegen: ClusterBarrierWait under elect scope would emit a single-thread \
-                     barrier.cluster.wait (hardware deadlock). It must be hoisted to warp scope \
-                     (all threads of the warp), like canon's pre-elect cluster.wait."
+                     barrier.cluster.wait (hardware deadlock). Put it explicitly at warp scope \
+                     (all threads of the warp) in the IR."
                         .to_string(),
                 );
             }
@@ -3877,7 +3077,15 @@ fn emit_stmt(
             ));
             Ok(())
         }
-        WarpSync => Ok(()),
+        // `bar.warp.sync` — full warp execution + memory-order barrier (the
+        // gate warp's SMEM cumsum and the WY-inverse merges read lanes' SMEM
+        // writes from the previous phase; dropping it lets lanes read stale
+        // cells — the cumsum/gateway corruption. The checker validates the
+        // site is warp-converged; emit it bare everywhere it appears.
+        WarpSync => {
+            out.push_str(&format!("{p}T.cuda.warp_sync()\n"));
+            Ok(())
+        }
         WgSync { barrier_id } => {
             out.push_str(&format!("{p}T.cuda.warpgroup_sync({barrier_id})\n"));
             Ok(())
@@ -3911,38 +3119,100 @@ fn emit_stmt(
         // semaphore, or DSMEM cluster-copy lowering machinery, and no smoke-test kernel
         // (nvfp4 / fp16) exercises them. Fail closed with `Err` (a PyValueError through
         // the wrapper) like every other unsupported node — never panic. ----
-        WarpMma { .. } => Err("codegen: WarpMma not yet supported".to_string()),
+        // `mma.sync.aligned.m16n8k{8,16}.row.col.f32.{ab}.{ab}.f32` — one IR
+        // WarpMma prints one non-legacy `T.ptx.mma` call. Operand register
+        // handles come directly from the explicit local tensor slices;
+        // LdMatrix defines the packed A/B word representation.
+        WarpMma {
+            d,
+            a,
+            b,
+            c,
+            m,
+            n,
+            k,
+            ab_dtype,
+        } => {
+            if !matches!((*m, *n, *k), (16, 8, 8) | (16, 8, 16)) {
+                return Err(format!(
+                    "codegen: WarpMma m{m}n{n}k{k} has no lowering (only m16n8k8/m16n8k16)"
+                ));
+            }
+            if !matches!(ab_dtype, DType::F16 | DType::Bf16) {
+                return Err(format!(
+                    "codegen: WarpMma ab_dtype {ab_dtype:?} has no lowering (bf16/f16 only)"
+                ));
+            }
+            let (dt, doff, dw) = reg_slice_parts(d)?;
+            let (ct, coff, cw) = reg_slice_parts(c)?;
+            let (at, aoff, aw) = reg_slice_parts(a)?;
+            let (bt, boff, bw) = reg_slice_parts(b)?;
+            if dt.dtype != DType::F32 || ct.dtype != DType::F32 {
+                return Err(format!(
+                    "codegen: WarpMma D/C dtypes {:?}/{:?} must both be f32",
+                    dt.dtype, ct.dtype
+                ));
+            }
+            if !matches!(at.dtype, DType::U32 | DType::I32)
+                || !matches!(bt.dtype, DType::U32 | DType::I32)
+            {
+                return Err(
+                    "codegen: WarpMma A/B fragments must be u32/i32 packed words \
+                     (ldmatrix output; the bf16/f16 element form has no lowering)"
+                        .to_string(),
+                );
+            }
+            let len_a = (*m * *k / 64) as usize;
+            let len_b = (*n * *k / 64) as usize;
+            let len_cd = (*m * *n / 32) as usize;
+            for (off, w, want, label) in [
+                (doff, dw, len_cd, "D"),
+                (coff, cw, len_cd, "C"),
+                (aoff, aw, len_a, "A"),
+                (boff, bw, len_b, "B"),
+            ] {
+                if w != want {
+                    return Err(format!(
+                        "codegen: WarpMma {label} fragment must span exactly {want} b32 \
+                         registers (got off={off:?}, width {w})"
+                    ));
+                }
+            }
+            let ptrs = |tensor: &Arc<Tensor>,
+                        offset: &ScalarValue,
+                        count: usize|
+             -> Result<String, String> {
+                let flat = reg_name(tensor, ctx)?;
+                let base = emit_scalar(offset, ctx)?;
+                Ok(format!(
+                    "[{}]",
+                    (0..count)
+                        .map(|index| { format!("{flat}.ptr_to([{}])", flat_add(&base, index)) })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            };
+            let d_ptrs = ptrs(dt, doff, len_cd)?;
+            let c_ptrs = ptrs(ct, coff, len_cd)?;
+            let a_ptrs = ptrs(at, aoff, len_a)?;
+            let b_ptrs = ptrs(bt, boff, len_b)?;
+            let ab_s = dtype_str(*ab_dtype);
+            out.push_str(&format!(
+                "{p}T.ptx.mma(\"m{m}n{n}k{k}\", \"row\", \"col\", \"float32\", \
+                 \"{ab_s}\", \"{ab_s}\", \"float32\", {d_ptrs}, {a_ptrs}, \
+                 {b_ptrs}, {c_ptrs})\n"
+            ));
+            Ok(())
+        }
         GmemAtomicAdd { .. } => Err("codegen: GmemAtomicAdd not yet supported".to_string()),
         GmemWaitEq { .. } => Err("codegen: GmemWaitEq not yet supported".to_string()),
         CpAsyncBulkS2Cluster { .. } => {
             Err("codegen: CpAsyncBulkS2Cluster not yet supported".to_string())
         }
-        // Carries the `Log2`/`Exp2`/`Rcp`/`Neg` RegUnaryOp; applied over flash
-        // reg fragments (no GEMM-codegen reg-view path).
-        RegUnary { .. } => Err("codegen: RegUnary not yet supported".to_string()),
 
-        // NVFP4 epilogue alpha rescale: Tx.wg.mul(frag, frag, alpha). lhs is a reg slice,
-        // rhs the alpha literal (or vice versa).
+        // NVFP4 epilogue alpha rescale.
         RegMul { dst, lhs, rhs } => {
-            let zero = ScalarValue::Int(0);
-            let reg_op = |op: &RegOperand, out: &mut Emitter| -> Result<String, String> {
-                match op {
-                    RegOperand::Slice(s) => {
-                        let off = s.offsets.first().unwrap_or(&zero);
-                        let w = s.shape.first().and_then(as_int).unwrap_or(0).max(0) as usize;
-                        emit_reg_view_slice(out, &p, &s.tensor, off, w, ctx)
-                    }
-                    // wg.mul needs a typed scalar (a bare int literal has no .dtype).
-                    RegOperand::Literal(l) => Ok(format!("T.float32({})", l.as_f32())),
-                }
-            };
-            let dst_off = dst.offsets.first().unwrap_or(&zero);
-            let dst_w = dst.shape.first().and_then(as_int).unwrap_or(0).max(0) as usize;
-            let dst_s = emit_reg_view_slice(out, &p, &dst.tensor, dst_off, dst_w, ctx)?;
-            let lhs_s = reg_op(lhs, out)?;
-            let rhs_s = reg_op(rhs, out)?;
-            out.push_str(&format!("{p}Tx.wg.mul({dst_s}, {lhs_s}, {rhs_s})\n"));
-            Ok(())
+            emit_reg_binary(out, &p, dst, lhs, rhs, Rounding::Rn, "mul", ctx)
         }
         // ---- Fail closed, per variant (no catch-all): every Stmt variant is
         // either lowered above or rejected HERE with an explicit Err, so adding
@@ -3950,21 +3220,313 @@ fn emit_stmt(
         // and never a silent different-semantics emission. The flash-attention /
         // flash-bwd datapath set has no GEMM-codegen lowering yet.
         SchedNext { .. } => Err("codegen: SchedNext not yet supported".to_string()),
-        // sim-only (the flash/gdn datapaths write TMEM from REG fragments); a
-        // future lowering must honor dst's (row, col, dtype) like Tcgen05Ld does.
+        // tcgen05.st — REG fragment -> TMEM, the mirror of Tcgen05Ld: same
+        // validations (row/shape/dtype), same `.32x32b` wg-view path. The
+        // `.16x*b` atoms would need an atom-layout src fragment — no gdn use,
+        // fail closed. For fp16/bf16 dsts the TMEM band is DENSE-PACKED (two
+        // elements per 32-bit cell): the IR slice counts b32 registers (num),
+        // the interpreter reads 2*num elements, and the emission goes through
+        // the `tmem_f16`/`tmem_bf16` packed views at twice the element window.
         Tcgen05St {
-            dst: _,
-            src: _,
-            shape: _,
-            num: _,
-        } => Err("codegen: Tcgen05St not yet supported".to_string()),
-        Tcgen05WaitSt => Err("codegen: Tcgen05WaitSt not yet supported".to_string()),
-        LdMatrix { .. } => Err("codegen: LdMatrix not yet supported".to_string()),
-        StMatrix { .. } => Err("codegen: StMatrix not yet supported".to_string()),
-        RegFill { .. } => Err("codegen: RegFill not yet supported".to_string()),
-        RegAdd { .. } => Err("codegen: RegAdd not yet supported".to_string()),
-        RegSub { .. } => Err("codegen: RegSub not yet supported".to_string()),
-        RegFma { .. } => Err("codegen: RegFma not yet supported".to_string()),
+            dst,
+            src,
+            shape,
+            num,
+        } => {
+            let (regs, _) = emit_tcgen05_reg_tuple(src, *shape, *num, ctx)?;
+            let row = emit_scalar(&dst.row, ctx)?;
+            let col = emit_scalar(&dst.col, ctx)?;
+            out.push_str(&format!(
+                "{p}T.ptx.tcgen05.st(T.uint32({}), {regs}, shape=\"{}\", num={}, \
+                 row={row}, col={col}, unpack={})\n",
+                dst.tensor.start_col,
+                shape.as_str(),
+                num,
+                bool_py(false),
+            ));
+            Ok(())
+        }
+        Tcgen05WaitSt => {
+            out.push_str(&format!("{p}T.ptx.tcgen05.wait.st()\n"));
+            Ok(())
+        }
+        // `ldmatrix.sync.aligned.m8n8.xN.b16` — SMEM row-addresses -> packed
+        // REG words. The IR src slice is the PER-THREAD row start (8 b16
+        // elements); lanes 0..7N contribute addresses (PTX), exactly the
+        // interpreter's row_address_lane model. The dst is N u32 words in the
+        // flat view (ptr_to per register — the documented dst-handle form).
+        LdMatrix {
+            dst,
+            src,
+            shape,
+            num,
+            trans,
+            dtype,
+        } => {
+            if *shape != MatrixShape::M8N8 || *dtype != MatrixDType::B16 {
+                return Err(
+                    "codegen: LdMatrix supports only m8n8.x{1,2,4}.b16 (the interpreter's \
+                     matrix model)"
+                        .to_string(),
+                );
+            }
+            let (dt, doff, dw) = reg_slice_parts(dst)?;
+            check_matrix_smem_row(src, "LdMatrix")?;
+            let doff_s = emit_scalar(doff, ctx)?;
+            let handles: String = match dt.dtype {
+                DType::U32 | DType::I32 => {
+                    if dw != *num as usize {
+                        return Err(format!(
+                            "codegen: LdMatrix dst width {dw} != num {num} (the dst spans \
+                             num b32 registers)"
+                        ));
+                    }
+                    let dflat = reg_name(dt, ctx)?;
+                    (0..*num as usize)
+                        .map(|i| format!("{dflat}.ptr_to([{}])", flat_add(&doff_s, i)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+                // A b16 fragment dst: the xN words are written through the
+                // `_u32` reinterpret — consecutive b16 pairs ARE the b32
+                // registers (the mirror of the StMatrix b16 src form).
+                DType::F16 | DType::Bf16 => {
+                    if dw != 2 * *num as usize {
+                        return Err(format!(
+                            "codegen: LdMatrix b16 dst width {dw} != 2*num {} (the dst \
+                             spans num packed b16x2 registers)",
+                            2 * *num as usize
+                        ));
+                    }
+                    let Some(word_off) = as_int(doff) else {
+                        return Err(
+                            "codegen: LdMatrix b16 dst offset must be static (the u32 word \
+                             index is offset/2)"
+                                .to_string(),
+                        );
+                    };
+                    if word_off % 2 != 0 {
+                        return Err(format!(
+                            "codegen: LdMatrix b16 dst offset {word_off} is odd (a packed \
+                             b16x2 register starts at an even element)"
+                        ));
+                    }
+                    let name = ctx.tensor_name(dt.id)?;
+                    (0..*num as usize)
+                        .map(|i| format!("{name}_u32.ptr_to([{}])", word_off / 2 + i as i64))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+                _ => {
+                    return Err(format!(
+                        "codegen: LdMatrix dst dtype {:?} has no lowering (u32/i32 packed \
+                         words or an f16/bf16 fragment)",
+                        dt.dtype
+                    ))
+                }
+            };
+            let src_ptr = emit_matrix_smem_ptr(src, ctx)?;
+            out.push_str(&format!(
+                "{p}T.ptx.ldmatrix({}, {num}, \".b16\", {src_ptr}, {handles})\n",
+                py_bool(*trans),
+            ));
+            Ok(())
+        }
+        // `stmatrix.sync.aligned.m8n8.xN.b16` — REG words -> SMEM. Mirror of
+        // LdMatrix; a bf16/f16 src fragment reads through the `_u32`
+        // reinterpret (consecutive b16 pairs ARE the words, matching the
+        // interpreter's pack).
+        StMatrix {
+            dst,
+            src,
+            shape,
+            num,
+            trans,
+            dtype,
+        } => {
+            if *shape != MatrixShape::M8N8 || *dtype != MatrixDType::B16 {
+                return Err(
+                    "codegen: StMatrix supports only m8n8.x{1,2,4}.b16 (the interpreter's \
+                     matrix model)"
+                        .to_string(),
+                );
+            }
+            check_matrix_smem_row(dst, "StMatrix")?;
+            let (st, soff, sw) = reg_slice_parts(src)?;
+            let soff_s = emit_scalar(soff, ctx)?;
+            let name = ctx.tensor_name(st.id)?;
+            let handles: String = match st.dtype {
+                DType::U32 | DType::I32 => {
+                    if sw != *num as usize {
+                        return Err(format!(
+                            "codegen: StMatrix src width {sw} != num {num} (the src spans \
+                             num b32 registers)"
+                        ));
+                    }
+                    let flat = reg_name(st, ctx)?;
+                    (0..*num as usize)
+                        .map(|i| format!("{flat}.ptr_to([{}])", flat_add(&soff_s, i)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+                DType::F16 | DType::Bf16 => {
+                    if sw != 2 * *num as usize {
+                        return Err(format!(
+                            "codegen: StMatrix b16 src width {sw} != 2*num {} (the src spans \
+                             num packed b16x2 registers)",
+                            2 * *num as usize
+                        ));
+                    }
+                    let Some(word_off) = as_int(soff) else {
+                        return Err(
+                            "codegen: StMatrix b16 src offset must be static (the u32 word \
+                             index is offset/2)"
+                                .to_string(),
+                        );
+                    };
+                    if word_off % 2 != 0 {
+                        return Err(format!(
+                            "codegen: StMatrix b16 src offset {word_off} is odd (a packed \
+                             b16x2 register starts at an even element)"
+                        ));
+                    }
+                    (0..*num as usize)
+                        .map(|i| format!("{name}_u32.ptr_to([{}])", word_off / 2 + i as i64))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+                other => {
+                    return Err(format!(
+                        "codegen: StMatrix src dtype {other:?} has no lowering (u32/i32 \
+                         words or a b16 fragment)"
+                    ))
+                }
+            };
+            let dst_ptr = emit_matrix_smem_ptr(dst, ctx)?;
+            out.push_str(&format!(
+                "{p}T.ptx.stmatrix({}, {num}, \".b16\", {dst_ptr}, {handles})\n",
+                py_bool(*trans),
+            ));
+            Ok(())
+        }
+        // Per-thread elementwise fill/copy.
+        RegFill { dst, value } => {
+            let (t, off, w) = reg_slice_parts(dst)?;
+            let dst_s = emit_reg_view_slice(out, &p, t, off, w, ctx)?;
+            match value {
+                RegOperand::Literal(literal) => {
+                    let value_s = typed_scalar(t.dtype, *literal)?;
+                    out.push_str(&format!("{p}Tx.thread.fill({dst_s}, {value_s})\n"));
+                }
+                RegOperand::Slice(src) => {
+                    let (st, soff, sw) = reg_slice_parts(src)?;
+                    if st.dtype != t.dtype {
+                        return Err(format!(
+                            "codegen: RegFill src dtype {:?} != dst dtype {:?}",
+                            st.dtype, t.dtype
+                        ));
+                    }
+                    if sw != 1 && sw != w {
+                        return Err(format!(
+                            "codegen: RegFill src width {sw} must be 1 or dst width {w}"
+                        ));
+                    }
+                    let src_s = emit_reg_view_slice(out, &p, st, soff, sw, ctx)?;
+                    out.push_str(&format!("{p}Tx.thread.copy({dst_s}, {src_s})\n"));
+                }
+            }
+            Ok(())
+        }
+        RegAdd {
+            dst,
+            lhs,
+            rhs,
+            rounding,
+        } => emit_reg_binary(out, &p, dst, lhs, rhs, *rounding, "add", ctx),
+        RegSub {
+            dst,
+            lhs,
+            rhs,
+            rounding,
+        } => emit_reg_binary(out, &p, dst, lhs, rhs, *rounding, "sub", ctx),
+        // dst = a * b + c elementwise (the interpreter's unfused f32 mul+add;
+        // the TIRx fma may fuse — a 1-ulp difference the GPU gates tolerate).
+        RegFma { dst, a, b, c } => {
+            let (t, off, w) = reg_slice_parts(dst)?;
+            if !matches!(t.dtype, DType::F16 | DType::Bf16 | DType::F32) {
+                return Err(format!(
+                    "codegen: RegFma dst dtype {:?} has no lowering (float dsts only)",
+                    t.dtype
+                ));
+            }
+            let dst_s = emit_reg_view_slice(out, &p, t, off, w, ctx)?;
+            let a_s = emit_reg_operand(a, t.dtype, out, &p, ctx)?;
+            let b_s = emit_reg_operand(b, t.dtype, out, &p, ctx)?;
+            let c_s = emit_reg_operand(c, t.dtype, out, &p, ctx)?;
+            out.push_str(&format!("{p}Tx.thread.fma({dst_s}, {a_s}, {b_s}, {c_s})\n"));
+            Ok(())
+        }
+        // Elementwise unary over an f32 local array maps directly to Tx.thread.
+        RegUnary { dst, src, op } => {
+            let (t, off, w) = reg_slice_parts(dst)?;
+            if t.dtype != DType::F32 {
+                return Err(format!(
+                    "codegen: RegUnary {} dst dtype {:?} has no lowering — the \
+                     interpreter computes unary ops in f32 and rounds; the TIRx \
+                     16-bit elementwise path computes in 16 bits (f32 dst only)",
+                    op.as_str(),
+                    t.dtype
+                ));
+            }
+            let folded = match (src, op) {
+                (RegOperand::Literal(l), RegUnaryOp::Exp2) => Some(l.as_f32().exp2()),
+                (RegOperand::Literal(l), RegUnaryOp::Log2) => Some(l.as_f32().log2()),
+                (RegOperand::Literal(l), RegUnaryOp::Rcp) => Some(1.0 / l.as_f32()),
+                (RegOperand::Literal(l), RegUnaryOp::Neg) => Some(-l.as_f32()),
+                (RegOperand::Slice(_), _) => None,
+            };
+            if let Some(v) = folded {
+                let dst_s = emit_reg_view_slice(out, &p, t, off, w, ctx)?;
+                out.push_str(&format!("{p}Tx.thread.fill({dst_s}, T.float32({v}))\n"));
+                return Ok(());
+            }
+            let RegOperand::Slice(src) = src else {
+                return Err("codegen: RegUnary src must be a slice or literal".to_string());
+            };
+            let (st, soff, sw) = reg_slice_parts(src)?;
+            if st.dtype != DType::F32 {
+                return Err(format!(
+                    "codegen: RegUnary {} src dtype {:?} has no lowering (f32 only)",
+                    op.as_str(),
+                    st.dtype
+                ));
+            }
+            if sw != 1 && sw != w {
+                return Err(format!(
+                    "codegen: RegUnary src width {sw} must be 1 or the dst width {w} \
+                     (the interpreter matches the dst or broadcasts one element per thread)"
+                ));
+            }
+            let dst_s = emit_reg_view_slice(out, &p, t, off, w, ctx)?;
+            let src_s = emit_reg_view_slice(out, &p, st, soff, sw, ctx)?;
+            match op {
+                RegUnaryOp::Exp2 => {
+                    out.push_str(&format!("{p}Tx.thread.exp2({dst_s}, {src_s})\n"));
+                }
+                RegUnaryOp::Log2 => {
+                    out.push_str(&format!("{p}Tx.thread.log2({dst_s}, {src_s})\n"));
+                }
+                RegUnaryOp::Rcp => {
+                    out.push_str(&format!("{p}Tx.thread.reciprocal({dst_s}, {src_s})\n"));
+                }
+                RegUnaryOp::Neg => {
+                    out.push_str(&format!(
+                        "{p}Tx.thread.mul({dst_s}, {src_s}, T.float32(-1))\n"
+                    ));
+                }
+            }
+            Ok(())
+        }
         RegMax { .. } => Err("codegen: RegMax not yet supported".to_string()),
         RegMin { .. } => Err("codegen: RegMin not yet supported".to_string()),
         RegBitwise { .. } => Err("codegen: RegBitwise not yet supported".to_string()),
@@ -3978,33 +3540,41 @@ fn emit_stmt(
     }
 }
 
-/// mbar buffer name, picking the peer name if remote_coord is set.
-fn mbar_buf_name(mref: &super::mbar::MBarRef, ctx: &Ctx) -> Result<String, String> {
-    if mref.remote_coord.is_some() {
-        if let Some(n) = ctx.peer_names.get(&mref.mbar.id) {
-            return Ok(n.clone());
-        }
-    }
-    ctx.mbar_names
-        .get(&mref.mbar.id)
-        .cloned()
-        .ok_or_else(|| format!("codegen: no name for mbar {}", mref.mbar.id))
-}
-
-/// `NAME.ptr_to([slot])` for an mbar op — the slot is the op's `stage` scalar (a
-/// multi-stage ring barrier), or `0` for a single-stage mbar.
-fn mbar_slot_ptr(
+/// Local `NAME.ptr_to([slot])` for the mbar object named by a reference.
+fn local_mbar_slot_ptr(
     mref: &super::mbar::MBarRef,
     stage: &Option<ScalarValue>,
     ctx: &Ctx,
 ) -> Result<String, String> {
-    let name = mbar_buf_name(mref, ctx)?;
+    let name = ctx
+        .mbar_names
+        .get(&mref.mbar.id)
+        .cloned()
+        .ok_or_else(|| format!("codegen: no name for mbar {}", mref.mbar.id))?;
     let slot = stage
         .as_ref()
         .map(|s| emit_scalar(s, ctx))
         .transpose()?
         .unwrap_or_else(|| "0".to_string());
     Ok(format!("{name}.ptr_to([{slot}])"))
+}
+
+/// Pointer for the exact MBarRef carried by an operation. A local ref is the
+/// local buffer pointer; a remote ref maps that same slot to its explicit
+/// `remote_coord`. No mbar-id-based routing or cached peer identity exists.
+fn mbar_slot_ptr(
+    mref: &super::mbar::MBarRef,
+    stage: &Option<ScalarValue>,
+    ctx: &Ctx,
+) -> Result<String, String> {
+    let local = local_mbar_slot_ptr(mref, stage, ctx)?;
+    match &mref.remote_coord {
+        Some(remote) => Ok(format!(
+            "T.reinterpret(\"handle\", T.ptx.map_shared_rank({local}, {coord}))",
+            coord = emit_scalar(remote, ctx)?,
+        )),
+        None => Ok(local),
+    }
 }
 
 /// Build the GMEM TMA region from src tensor + coords + the GMEM tile extents.
@@ -4042,47 +3612,6 @@ fn gmem_extents<'a>(gmem_shape: &'a Option<Vec<usize>>, shape: &'a [usize]) -> &
     gmem_shape.as_deref().unwrap_or(shape)
 }
 
-/// Strip a `+ tid_in_wg` addend from a row-offset expr (the per-thread lane term of
-/// a value-model store), returning the warpgroup tile base. Returns None if the expr
-/// has no such addend.
-fn strip_tid_in_wg(sv: &ScalarValue) -> Option<ScalarValue> {
-    if let ScalarValue::Expr(e) = sv {
-        if e.op == ScalarOp::Add && e.args.len() == 2 {
-            for (i, a) in e.args.iter().enumerate() {
-                if matches!(a, ScalarValue::Scope(ScopeValueKind::TidInWg)) {
-                    return Some(e.args[1 - i].clone());
-                }
-            }
-        }
-    }
-    None
-}
-
-/// reg_store dst (GMEM) -> the warpgroup-collective row band `C[base:base+128,
-/// col:col+w]`. The value model's row offset is `base + tid_in_wg` (one row per
-/// thread); the wg-collective `Tx.copy` takes the whole 128-row tile, so the lane
-/// term is stripped and the row becomes a 128-wide range (WG_THREADS rows = one
-/// row per warpgroup thread, a hardware constant).
-fn emit_gmem_row_store(dst: &TensorSlice, ctx: &Ctx) -> Result<String, String> {
-    let name = ctx.tensor_name(dst.tensor.id)?;
-    if dst.offsets.len() != 2 {
-        return Err("codegen: reg_store dst must be 2D".to_string());
-    }
-    let clo = emit_scalar(&dst.offsets[1], ctx)?;
-    let chi = add_bound(&dst.offsets[1], &dst.shape[1], ctx)?;
-    let wg_rows = ScalarValue::Int(WG_THREADS as i64);
-    if let Some(base) = strip_tid_in_wg(&dst.offsets[0]) {
-        let lo = emit_scalar(&base, ctx)?;
-        let hi = add_bound(&base, &wg_rows, ctx)?;
-        Ok(format!("{name}[{lo}:{hi}, {clo}:{chi}]"))
-    } else {
-        // No lane term (already a tile base): emit a 128-row band from the offset.
-        let lo = emit_scalar(&dst.offsets[0], ctx)?;
-        let hi = add_bound(&dst.offsets[0], &wg_rows, ctx)?;
-        Ok(format!("{name}[{lo}:{hi}, {clo}:{chi}]"))
-    }
-}
-
 // ===========================================================================
 // tests
 // ===========================================================================
@@ -4092,6 +3621,7 @@ mod tests {
     use super::*;
     use crate::ir::dtype::ScalarDType;
     use crate::ir::scalar::VarId;
+    use crate::ir::stmt::{Tcgen05CpMulticast, Tcgen05CpShape};
     use crate::ir::tensor::Tensor;
 
     fn gmem_arg(id: u32) -> Arc<Tensor> {
@@ -4102,7 +3632,6 @@ mod tests {
             shape: vec![16, 16],
             layout: None,
             byte_offset: None,
-            reg_frag: None,
         })
     }
 
@@ -4116,10 +3645,9 @@ mod tests {
             args: vec![gmem_arg(0)],
             body,
             num_warps,
-            smem_size_bytes: 0,
+            smem_size_bytes: 1 << 20,
             launch_shape: vec![2],
             cluster_shape: vec![2],
-            smem_pool: false,
         }
     }
 
@@ -4151,32 +3679,24 @@ mod tests {
         }
     }
 
-    /// `if lane_id == 0: body` — the `if_elected` sugar.
+    /// `if T.ptx.elect_sync(): body` — the `if_elected` sugar's own predicate.
     fn elected_if(body: Vec<Stmt>) -> Stmt {
         Stmt::If {
-            cond: ScalarValue::expr(
-                ScalarOp::Eq,
-                vec![
-                    ScalarValue::Scope(ScopeValueKind::LaneId),
-                    ScalarValue::Int(0),
-                ],
-            ),
+            cond: ScalarValue::Scope(ScopeValueKind::Elected),
             then_body: body,
         }
     }
 
-    /// A scalar op with no TVMScript lowering (Xor) must fail closed with a
-    /// codegen `Err` — never leak an `<unsupported op …>` placeholder into the
-    /// emitted Python source (that was a syntax error at exec time).
+    /// Scalar XOR is emitted directly as the TIR builtin.
     #[test]
-    fn unsupported_scalar_op_is_an_err_not_source_text() {
+    fn scalar_xor_is_direct_bitwise_xor() {
         let cond = ScalarValue::expr(
             ScalarOp::Xor,
             vec![ScalarValue::Int(1), ScalarValue::Int(2)],
         );
         let k = kernel(vec![Stmt::BreakIf { cond }]);
-        let err = kernel_to_tirx_source(&k).unwrap_err();
-        assert!(err.contains("no TVMScript lowering"), "{err}");
+        let src = kernel_to_tirx_source(&k).unwrap();
+        assert!(src.contains("if T.bitwise_xor(1, 2):"), "{src}");
     }
 
     /// `ForLoop { unroll: false }` pins the rolled `T.serial(N, unroll=False)`
@@ -4229,16 +3749,15 @@ mod tests {
 
     /// The cluster-scope ids derive from the kernel's `cluster_shape` (a 1-D
     /// (n,) is the x extent with y=1); a rank>2 cluster has no emission form
-    /// and fails closed.
+    /// and fails closed. A cluster-1 kernel gets constants: the (1, 1) axis
+    /// bind collapses and the scope resolver loses `clusterCtaIdx.x`.
     #[test]
     fn cluster_ids_derive_from_cluster_shape() {
         let mut k = kernel(vec![]);
         k.cluster_shape = vec![1];
         let src = kernel_to_tirx_source(&k).unwrap();
-        assert!(
-            src.contains("cbx, cby = T.cta_id_in_cluster([1, 1], preferred=[1, 1])"),
-            "{src}"
-        );
+        assert!(src.contains("cbx, cby = 0, 0"), "{src}");
+        assert!(!src.contains("cta_id_in_cluster"), "{src}");
 
         k.cluster_shape = vec![2, 2];
         let src = kernel_to_tirx_source(&k).unwrap();
@@ -4276,7 +3795,6 @@ mod tests {
             shape: vec![1],
             layout: None,
             byte_offset: Some(0),
-            reg_frag: None,
         });
         let load = TensorSlice {
             tensor: mailbox.clone(),
@@ -4351,141 +3869,73 @@ mod tests {
         assert!(!src.contains("s0 ="), "{src}");
     }
 
-    /// The structured guard merge keys on the emission-site annotation, not the
-    /// line text: adjacent single-issue guards coalesce, but an IR `If` whose
-    /// condition happens to read like a guard (`tid_in_wg == 0`) is NOT merged
-    /// into them — the old text peephole could not tell the two apart.
+    /// Top-level IR `If`s remain top-level siblings, in source order. Codegen
+    /// must not synthesize parent guards, merge duplicate predicates, or turn
+    /// sibling branches into an if/else tree.
     #[test]
-    fn guard_merge_uses_the_annotation_not_the_text() {
-        use super::super::dtype::MBarKind;
-        use super::super::mbar::{MBar, MBarRef};
-        let mbar = Arc::new(MBar {
-            id: 5,
-            kind: MBarKind::Thread,
-            stages: 1,
-            arrive_count: None,
-            leader_routed: false,
-        });
-        let init = || Stmt::MBarrierInit {
-            mbar: MBarRef {
-                mbar: mbar.clone(),
-                remote_coord: None,
-            },
-            count: 1,
-            stage: None,
-        };
-        // wg branch body: single-issue init, then an IR If with a guard-looking
-        // condition, then another single-issue init. (8 warps: warpgroup 0 is a
-        // proper subset of the CTA, so the scope is Warpgroup, not Function.)
+    fn top_level_ifs_preserve_structure_and_order() {
         let body = vec![
-            init(),
-            Stmt::If {
-                cond: ScalarValue::expr(
-                    ScalarOp::Eq,
-                    vec![
-                        ScalarValue::Scope(ScopeValueKind::TidInWg),
-                        ScalarValue::Int(0),
-                    ],
-                ),
-                then_body: vec![Stmt::WgSync { barrier_id: 0 }],
-            },
-            init(),
-        ];
-        let src = kernel_to_tirx_source(&kernel_n(
-            vec![Stmt::MBarDef { mbar: mbar.clone() }, wg_if(0, body)],
-            8,
-        ))
-        .unwrap();
-        // Two annotated single-issue guard blocks (the If splits the run) —
-        // the merge must NOT fold the If into them, so `if tid_in_wg == 0:`
-        // appears exactly 3 times: two guards + the IR If.
-        let count = src.matches("if tid_in_wg == 0:").count();
-        assert_eq!(count, 3, "{src}");
-        // And the two adjacent inits inside ONE guard when the If is absent.
-        let src2 = kernel_to_tirx_source(&kernel_n(
-            vec![
-                Stmt::MBarDef { mbar: mbar.clone() },
-                wg_if(0, vec![init(), init()]),
-            ],
-            8,
-        ))
-        .unwrap();
-        assert_eq!(src2.matches("if tid_in_wg == 0:").count(), 1, "{src2}");
-        assert_eq!(src2.matches("mbarrier.init").count(), 2, "{src2}");
-    }
-
-    /// Adjacent top-level warp/warpgroup-equality `If`s re-nest into the if/else
-    /// dispatch tree (canon's role dispatch), partitioned by warpgroup: warp
-    /// branches chain inside their warpgroup branch, groups chain in
-    /// first-occurrence order. Non-adjacent Ifs stay flat.
-    #[test]
-    fn top_level_equality_ifs_chain_by_warpgroup() {
-        // 8 warps. [warp 5, warp 4, wg 0]: warps 4/5 are group 1, wg 0 is
-        // group 0. First-occurrence order: group 1, then group 0.
-        let body = vec![
-            warp_if(5, vec![Stmt::WarpSync]),
+            wg_if(1, vec![Stmt::SetMaxNReg { nreg: 232 }]),
             warp_if(4, vec![Stmt::WarpSync]),
-            wg_if(0, vec![Stmt::WarpSync]),
+            warp_if(5, vec![Stmt::WarpSync]),
+            warp_if(4, vec![Stmt::WgSync { barrier_id: 7 }]),
         ];
         let src = kernel_to_tirx_source(&kernel_n(body, 8)).unwrap();
         let expected = "\
     if wg_id == 1:
-        if warp_id == 5:
-            pass
-        else:
-            if warp_id == 4:
-                pass
-    else:
-        if wg_id == 0:
-            pass
+        T.ptx.setmaxnreg(True, 232)
+    if warp_id == 4:
+        T.cuda.warp_sync()
+    if warp_id == 5:
+        T.cuda.warp_sync()
+    if warp_id == 4:
+        T.cuda.warpgroup_sync(7)
 ";
         assert!(src.contains(expected), "{src}");
+        assert!(!src.contains("    else:"), "{src}");
+        assert_eq!(src.matches("    if warp_id == 4:\n").count(), 2, "{src}");
+    }
 
-        // A warpgroup-equality `If` in the same group is the group PREFIX: its
-        // body runs first, the warp chain nests inside the same branch.
-        let body = vec![
-            wg_if(1, vec![Stmt::WgSync { barrier_id: 3 }]),
-            warp_if(5, vec![Stmt::WgSync { barrier_id: 4 }]),
-        ];
+    /// Nesting is emitted only when nesting exists in the IR.
+    #[test]
+    fn nested_ifs_preserve_structure() {
+        let body = vec![wg_if(1, vec![warp_if(5, vec![Stmt::WarpSync])])];
         let src = kernel_to_tirx_source(&kernel_n(body, 8)).unwrap();
         let expected = "\
     if wg_id == 1:
-        T.cuda.warpgroup_sync(3)
         if warp_id == 5:
-            T.cuda.warpgroup_sync(4)
+            T.cuda.warp_sync()
 ";
         assert!(src.contains(expected), "{src}");
-        // No else arm — every warpgroup was covered by the one group.
-        assert!(!src.contains("else:"), "{src}");
     }
 
-    /// A lone equality `If` (or a run broken by a non-equality stmt) stays flat.
     #[test]
-    fn broken_if_runs_stay_flat() {
-        let body = vec![
-            warp_if(0, vec![Stmt::WarpSync]),
-            Stmt::CtaSync,
-            warp_if(1, vec![Stmt::WarpSync]),
-        ];
-        let src = kernel_to_tirx_source(&kernel(body)).unwrap();
-        assert!(src.contains("if warp_id == 0:"), "{src}");
-        assert!(src.contains("if warp_id == 1:"), "{src}");
-        assert!(!src.contains("else:"), "{src}");
+    fn codegen_never_deletes_a_sync_from_its_ir_branch() {
+        // This shape is rejected by validation because a CTA barrier cannot be
+        // reached by one warp. The codegen-side contract is nevertheless
+        // structural: if invoked directly, it prints the statement exactly
+        // where the IR put it instead of silently suppressing or hoisting it.
+        let body = vec![warp_if(1, vec![Stmt::CtaSync])];
+        let src = kernel_to_tirx_source(&kernel_n(body, 8)).unwrap();
+        let expected = "\
+    if warp_id == 1:
+        T.cuda.cta_sync()
+";
+        assert!(src.contains(expected), "{src}");
     }
 
-    /// The `if_elected` sugar emits `if T.ptx.elect_sync():` inside a warp
-    /// branch, narrowed to `if T.cuda.thread_rank() == 0:` for the warp-0
-    /// prologue elect (thread set exactly {(0, 0)} — canon's prologue form).
+    /// An elected predicate is still an ordinary IR `If`: its exact scalar
+    /// expression and nesting are preserved for prologues and loops alike.
     #[test]
-    fn elected_if_emits_the_hardware_forms() {
+    fn elected_if_preserves_literal_predicate_and_nesting() {
         use super::super::dtype::MBarKind;
         use super::super::mbar::{MBar, MBarRef};
         let mbar = Arc::new(MBar {
             id: 3,
             kind: MBarKind::Thread,
             stages: 1,
+            byte_offset: 800_024,
             arrive_count: None,
-            leader_routed: false,
         });
         let init = || Stmt::MBarrierInit {
             mbar: MBarRef {
@@ -4495,25 +3945,55 @@ mod tests {
             count: 1,
             stage: None,
         };
-        // Prologue: warp-0 branch + elected init -> thread_rank guard.
+        // Prologue: warp-0 branch + elected branch remain nested literally.
         let src = kernel_to_tirx_source(&kernel(vec![
             Stmt::MBarDef { mbar: mbar.clone() },
             warp_if(0, vec![elected_if(vec![init()])]),
         ]))
         .unwrap();
-        assert!(src.contains("if T.cuda.thread_rank() == 0:"), "{src}");
-        assert!(!src.contains("if T.ptx.elect_sync():"), "{src}");
-        // Non-zero warp: the same sugar emits elect_sync.
+        assert!(
+            src.contains("if warp_id == 0:\n        if T.ptx.elect_sync():"),
+            "{src}"
+        );
+        assert!(!src.contains("if lane_id == 0:"), "{src}");
+        assert!(!src.contains("if T.cuda.thread_rank() == 0:"), "{src}");
+
+        // A non-zero warp uses the identical literal nested predicate.
         let src = kernel_to_tirx_source(&kernel(vec![
             Stmt::MBarDef { mbar: mbar.clone() },
             warp_if(2, vec![elected_if(vec![init()])]),
         ]))
         .unwrap();
-        assert!(src.contains("if T.ptx.elect_sync():"), "{src}");
+        assert!(
+            src.contains("if warp_id == 2:\n        if T.ptx.elect_sync():"),
+            "{src}"
+        );
+        assert!(!src.contains("if lane_id == 0:"), "{src}");
         assert!(!src.contains("if T.cuda.thread_rank() == 0:"), "{src}");
-        // A warp-0 elected region CONTAINING a persistent loop (a worker role
-        // on warp 0, e.g. the nvfp4 MMA warp) is a hot-loop guard, not the
-        // prologue: it emits elect_sync, not thread_rank.
+
+        // A HAND-WRITTEN `lane_id == 0` predicate stays a literal compare
+        // (faithful translation: only the `if_elected` sugar is elect.sync).
+        let lane0_if = Stmt::If {
+            cond: ScalarValue::expr(
+                ScalarOp::Eq,
+                vec![
+                    ScalarValue::Scope(ScopeValueKind::LaneId),
+                    ScalarValue::Int(0),
+                ],
+            ),
+            then_body: vec![init()],
+        };
+        let src = kernel_to_tirx_source(&kernel(vec![
+            Stmt::MBarDef { mbar: mbar.clone() },
+            warp_if(0, vec![lane0_if]),
+        ]))
+        .unwrap();
+        assert!(
+            src.contains("if warp_id == 0:\n        if lane_id == 0:"),
+            "{src}"
+        );
+
+        // A loop does not authorize a different spelling or structure.
         let loop_body = vec![Stmt::ForLoop {
             var: crate::ir::scalar::Var {
                 id: crate::ir::scalar::VarId(90),
@@ -4531,30 +4011,51 @@ mod tests {
             warp_if(0, vec![elected_if(loop_body)]),
         ]))
         .unwrap();
-        assert!(src.contains("if T.ptx.elect_sync():"), "{src}");
+        assert!(
+            src.contains("if warp_id == 0:\n        if T.ptx.elect_sync():"),
+            "{src}"
+        );
+        assert!(!src.contains("if lane_id == 0:"), "{src}");
         assert!(!src.contains("if T.cuda.thread_rank() == 0:"), "{src}");
     }
 
-    /// A `ClusterBarrierWait` directly inside an elect-form `If` peels out of
-    /// the elect (warp-collective; the elected-lane wait deadlocks). Any other
-    /// position under single-thread scope fails closed.
+    /// A warp-collective `ClusterBarrierWait` under an elect-form `If` fails
+    /// closed wherever it appears. Codegen must not hoist it out of the IR
+    /// branch to make the program legal.
     #[test]
-    fn cluster_barrier_wait_peels_out_of_the_elect() {
-        let peeled = kernel_to_tirx_source(&kernel(vec![warp_if(
-            1,
-            vec![elected_if(vec![Stmt::ClusterBarrierWait, Stmt::WarpSync])],
-        )]))
-        .unwrap();
-        let wait = peeled.find("T.ptx.barrier.cluster.wait").unwrap();
-        let elect = peeled.find("if T.ptx.elect_sync():").unwrap();
-        assert!(wait < elect, "{peeled}");
+    fn cluster_barrier_wait_under_elect_is_not_hoisted() {
+        for body in [
+            vec![Stmt::ClusterBarrierWait, Stmt::WarpSync],
+            vec![Stmt::WarpSync, Stmt::ClusterBarrierWait],
+        ] {
+            let nested = kernel(vec![warp_if(1, vec![elected_if(body)])]);
+            let err = kernel_to_tirx_source(&nested).unwrap_err();
+            assert!(err.contains("Put it explicitly at warp scope"), "{err}");
+        }
+    }
 
-        let nested = kernel(vec![warp_if(
-            1,
-            vec![elected_if(vec![Stmt::WarpSync, Stmt::ClusterBarrierWait])],
-        )]);
-        let err = kernel_to_tirx_source(&nested).unwrap_err();
-        assert!(err.contains("deadlock"), "{err}");
+    /// PDL hint: both `griddepcontrol` actions lower 1:1 at their exact IR
+    /// position, at any scope (the statement is a scope-free leaf).
+    #[test]
+    fn grid_dep_control_lowers_to_griddepcontrol_ptx() {
+        use crate::ir::GridDepAction;
+        let k = kernel(vec![
+            Stmt::GridDepControl {
+                action: GridDepAction::LaunchDependents,
+            },
+            warp_if(
+                4,
+                vec![Stmt::GridDepControl {
+                    action: GridDepAction::Wait,
+                }],
+            ),
+        ]);
+        let src = kernel_to_tirx_source(&k).unwrap();
+        assert!(
+            src.contains("T.ptx.griddepcontrol.launch_dependents()"),
+            "{src}"
+        );
+        assert!(src.contains("T.ptx.griddepcontrol.wait()"), "{src}");
     }
 
     // ------------------------------------------------------------------
@@ -4569,6 +4070,7 @@ mod tests {
             base_col,
             n_cols,
             cta_group,
+            addr_byte_offset: 900_000,
         }
     }
 
@@ -4610,11 +4112,9 @@ mod tests {
             src.contains("T.ptx.tcgen05.relinquish_alloc_permit(cta_group=2)"),
             "{src}"
         );
-        // The TMEM view decl lands at function scope right after the prologue
-        // alloc branch (the KernelInit-era position), before any role body.
-        let alloc_if = src.find("if warp_id == 0:").unwrap();
-        let view = src.find("tmem = T.decl_buffer").unwrap();
-        assert!(alloc_if < view, "{src}");
+        // Physical instruction operands declare their own non-owning views;
+        // allocation alone must not invent a kernel-global TMEM buffer.
+        assert!(!src.contains("tmem = T.decl_buffer"), "{src}");
 
         // A nonzero base band used to silently generate the SAME base-0 code.
         let k = tmem_kernel(vec![warp_if(1, vec![tmem_alloc(64, 64, 2)])], vec![]);
@@ -4629,39 +4129,44 @@ mod tests {
     }
 
     fn reg_frag_tensor(id: u32) -> Arc<Tensor> {
+        reg_frag_tensor_w(id, 8)
+    }
+
+    fn reg_frag_tensor_w(id: u32, w: usize) -> Arc<Tensor> {
+        reg_frag_tensor_dtype_w(id, DType::F32, w)
+    }
+
+    fn reg_frag_tensor_dtype_w(id: u32, dtype: DType, w: usize) -> Arc<Tensor> {
         Arc::new(Tensor {
             id,
             space: MemorySpace::Reg,
-            dtype: DType::F32,
-            shape: vec![8],
+            dtype,
+            shape: vec![w],
             layout: None,
             byte_offset: None,
-            reg_frag: None,
         })
     }
 
-    fn tcgen05_ld(row: i64, shape: LdStShape, dtype: DType) -> Stmt {
-        Stmt::Tcgen05Ld {
-            dst: TensorSlice {
-                tensor: reg_frag_tensor(7),
-                offsets: vec![ScalarValue::Int(0)],
-                shape: vec![ScalarValue::Int(8)],
-            },
-            src: TmemOperand {
-                row: ScalarValue::Int(row),
-                col: ScalarValue::Int(0),
-                dtype,
-            },
-            shape,
-            num: 8,
+    fn tmem_addr(start_col: u32, row: i64, col: i64) -> TmemAddr {
+        TmemAddr {
+            tensor: super::super::tensor::TmemTensor { start_col },
+            row: ScalarValue::Int(row),
+            col: ScalarValue::Int(col),
         }
     }
 
     fn epilogue_kernel(ld: Stmt) -> Kernel {
+        let tensor = match &ld {
+            Stmt::Tcgen05Ld { dst, .. } => dst.tensor.clone(),
+            Stmt::Tcgen05St { src, .. } => src.tensor.clone(),
+            _ => reg_frag_tensor(7),
+        };
+        epilogue_kernel_t(ld, tensor)
+    }
+
+    fn epilogue_kernel_t(ld: Stmt, tensor: Arc<Tensor>) -> Kernel {
         let mut body = vec![warp_if(0, vec![tmem_alloc(0, 512, 2)])];
-        body.push(Stmt::TensorDef {
-            tensor: reg_frag_tensor(7),
-        });
+        body.push(Stmt::TensorDef { tensor });
         body.push(wg_if(0, vec![ld]));
         body.push(warp_if(
             0,
@@ -4675,40 +4180,1088 @@ mod tests {
     }
 
     #[test]
-    fn tcgen05_ld_dropped_fields_are_rejected() {
-        // row=0 / 32x32b / f32: lowered (and the two row variants no longer
-        // share one emission).
-        let ok = kernel_to_tirx_source(&epilogue_kernel(tcgen05_ld(
+    fn tcgen05_ld_preserves_physical_fields() {
+        let f32 = reg_frag_tensor_dtype_w(7, DType::F32, 8);
+        let ld = Stmt::Tcgen05Ld {
+            dst: TensorSlice {
+                tensor: f32.clone(),
+                offsets: vec![ScalarValue::Int(2)],
+                shape: vec![ScalarValue::Int(4)],
+            },
+            src: tmem_addr(37, 16, 9),
+            shape: LdStShape::B16x64,
+            num: 4,
+        };
+        let src = kernel_to_tirx_source(&epilogue_kernel_t(ld, f32)).unwrap();
+        assert!(
+            src.contains("accum_frag = T.alloc_local((8,), \"float32\")"),
+            "{src}"
+        );
+        assert_eq!(src.matches("T.ptx.tcgen05.ld(").count(), 1, "{src}");
+        assert!(src.contains("T.ptx.tcgen05.ld(T.uint32(37), "), "{src}");
+        assert!(
+            src.contains("shape=\"16x64b\", num=4, row=16, col=9, pack=False)"),
+            "{src}"
+        );
+        assert!(!src.contains("Tx.wg.copy_async"), "{src}");
+
+        // A packed b16 instruction still carries the same physical fields, and
+        // addresses its b32 register tuple through the explicit u32 view.
+        let bf16 = reg_frag_tensor_dtype_w(8, DType::Bf16, 12);
+        let ld = Stmt::Tcgen05Ld {
+            dst: TensorSlice {
+                tensor: bf16.clone(),
+                offsets: vec![ScalarValue::Int(2)],
+                shape: vec![ScalarValue::Int(8)],
+            },
+            src: tmem_addr(211, 31, 17),
+            shape: LdStShape::B16x128,
+            num: 2,
+        };
+        let src = kernel_to_tirx_source(&epilogue_kernel_t(ld, bf16)).unwrap();
+        assert!(
+            src.contains("accum_frag = T.alloc_local((12,), \"bfloat16\")"),
+            "{src}"
+        );
+        assert!(
+            src.contains("accum_frag_u32 = accum_frag.view(\"uint32\")"),
+            "{src}"
+        );
+        assert!(src.contains("T.ptx.tcgen05.ld(T.uint32(211), "), "{src}");
+        assert!(
+            src.contains("shape=\"16x128b\", num=2, row=31, col=17, pack=True)"),
+            "{src}"
+        );
+
+        // The only rejected case here is a physically wrong register tuple
+        // width; row, col, instruction shape, and 16-bit packing are all
+        // representable and therefore emitted literally.
+        let bad_num = Stmt::Tcgen05Ld {
+            dst: TensorSlice {
+                tensor: reg_frag_tensor_w(7, 8),
+                offsets: vec![ScalarValue::Int(0)],
+                shape: vec![ScalarValue::Int(8)],
+            },
+            src: tmem_addr(0, 0, 0),
+            shape: LdStShape::B16x256,
+            num: 8,
+        };
+        let err = kernel_to_tirx_source(&epilogue_kernel(bad_num)).unwrap_err();
+        assert!(err.contains("num"), "{err}");
+    }
+
+    #[test]
+    fn tcgen05_st_preserves_physical_fields() {
+        let f32 = reg_frag_tensor_dtype_w(7, DType::F32, 12);
+        let st = Stmt::Tcgen05St {
+            dst: tmem_addr(73, 48, 19),
+            src: TensorSlice {
+                tensor: f32.clone(),
+                offsets: vec![ScalarValue::Int(3)],
+                shape: vec![ScalarValue::Int(8)],
+            },
+            shape: LdStShape::B16x256,
+            num: 2,
+        };
+        let src = kernel_to_tirx_source(&epilogue_kernel_t(st, f32)).unwrap();
+        assert!(
+            src.contains("accum_frag = T.alloc_local((12,), \"float32\")"),
+            "{src}"
+        );
+        assert_eq!(src.matches("T.ptx.tcgen05.st(").count(), 1, "{src}");
+        assert!(src.contains("T.ptx.tcgen05.st(T.uint32(73), "), "{src}");
+        assert!(
+            src.contains("shape=\"16x256b\", num=2, row=48, col=19, unpack=False)"),
+            "{src}"
+        );
+        assert!(!src.contains("Tx.wg.copy_async"), "{src}");
+
+        let bad_width = Stmt::Tcgen05St {
+            dst: tmem_addr(0, 0, 0),
+            src: TensorSlice {
+                tensor: reg_frag_tensor_w(7, 4),
+                offsets: vec![ScalarValue::Int(0)],
+                shape: vec![ScalarValue::Int(4)],
+            },
+            shape: LdStShape::B32x32,
+            num: 8,
+        };
+        let err = kernel_to_tirx_source(&epilogue_kernel(bad_width)).unwrap_err();
+        assert!(err.contains("num"), "{err}");
+    }
+
+    #[test]
+    fn tcgen05_st_packed_half_and_wait() {
+        let bf = Arc::new(Tensor {
+            id: 8,
+            space: MemorySpace::Reg,
+            dtype: DType::Bf16,
+            shape: vec![16],
+            layout: None,
+            byte_offset: None,
+        });
+        let mut body = vec![warp_if(0, vec![tmem_alloc(0, 512, 2)])];
+        body.push(Stmt::TensorDef {
+            tensor: reg_frag_tensor(7),
+        });
+        body.push(Stmt::TensorDef { tensor: bf.clone() });
+        body.push(wg_if(
             0,
-            LdStShape::B32x32,
-            DType::F32,
-        )))
+            vec![
+                Stmt::Tcgen05St {
+                    dst: tmem_addr(128, 7, 11),
+                    src: TensorSlice {
+                        tensor: bf,
+                        offsets: vec![ScalarValue::Int(0)],
+                        shape: vec![ScalarValue::Int(16)],
+                    },
+                    shape: LdStShape::B32x32,
+                    num: 8,
+                },
+                Stmt::Tcgen05WaitSt,
+            ],
+        ));
+        body.push(warp_if(
+            0,
+            vec![Stmt::TmemDealloc {
+                base_col: 0,
+                n_cols: 512,
+                cta_group: 2,
+            }],
+        ));
+        let src = kernel_to_tirx_source(&kernel(body)).unwrap();
+        assert!(
+            src.contains("out_frag = T.alloc_local((16,), \"bfloat16\")"),
+            "{src}"
+        );
+        assert!(
+            src.contains("out_frag_u32 = out_frag.view(\"uint32\")"),
+            "{src}"
+        );
+        assert!(src.contains("T.ptx.tcgen05.st(T.uint32(128), "), "{src}");
+        assert!(
+            src.contains("shape=\"32x32b\", num=8, row=7, col=11, unpack=False)"),
+            "{src}"
+        );
+        assert!(src.contains("T.ptx.tcgen05.wait.st()"), "{src}");
+    }
+
+    fn smem_tensor(id: u32, dtype: DType, shape: &[usize]) -> Arc<Tensor> {
+        Arc::new(Tensor {
+            id,
+            space: MemorySpace::Smem,
+            dtype,
+            shape: shape.to_vec(),
+            layout: None,
+            byte_offset: Some(0),
+        })
+    }
+
+    #[test]
+    fn dense_tcgen05_mma_is_one_explicit_gemm_async() {
+        let a = smem_tensor(10, DType::F16, &[64, 64]);
+        let b = smem_tensor(11, DType::F16, &[64, 64]);
+        let tile = |tensor: Arc<Tensor>| SmemTile {
+            tensor,
+            prefix_indices: vec![],
+            row_offset: ScalarValue::Int(0),
+            col_offset: ScalarValue::Int(0),
+            rows: 64,
+            cols: 64,
+        };
+        let mma = Stmt::Tcgen05Mma {
+            dst: tmem_addr(32, 0, 0),
+            a: MmaAOperand::Smem(tile(a.clone())),
+            b: tile(b.clone()),
+            mma_m: 128,
+            mma_n: 64,
+            format: MmaElemFormat::F16,
+            block_scale: None,
+            accum: ScalarValue::Int(1),
+            trans_a: false,
+            trans_b: false,
+            ws: false,
+            cta_group: 2,
+        };
+        let src = kernel_to_tirx_source(&kernel(vec![
+            Stmt::TensorDef { tensor: a },
+            Stmt::TensorDef { tensor: b },
+            warp_if(0, vec![tmem_alloc(0, 512, 2)]),
+            warp_if(1, vec![elected_if(vec![mma])]),
+        ]))
         .unwrap();
-        assert!(ok.contains("Tx.wg.copy_async"), "{ok}");
 
-        let err = kernel_to_tirx_source(&epilogue_kernel(tcgen05_ld(
-            16,
-            LdStShape::B32x32,
-            DType::F32,
-        )))
+        assert_eq!(src.matches("Tx.gemm_async(").count(), 1, "{src}");
+        assert!(
+            src.contains(
+                "dispatch=\"tcgen05\", cta_group=2, mma_m=128, mma_n=64, \
+                 weight_stationary=False)"
+            ),
+            "{src}"
+        );
+        assert!(
+            src.contains(
+                "mma_d0 = T.decl_buffer((64, 128), \"float32\", scope=\"tmem\", \
+                 allocated_addr=32"
+            ),
+            "{src}"
+        );
+        assert_eq!(src.matches("T.decl_buffer(").count(), 1, "{src}");
+        assert!(!src.contains("\n    tmem = T.decl_buffer"), "{src}");
+        assert!(
+            src.find("mma_d0 = T.decl_buffer").unwrap() < src.find("Tx.gemm_async(").unwrap(),
+            "{src}"
+        );
+    }
+
+    #[test]
+    fn tcgen05_cp_is_one_explicit_copy_async() {
+        let sf = smem_tensor(10, DType::F8E4M3, &[32, 16]);
+        let cp = Stmt::Tcgen05Cp {
+            dst: tmem_addr(200, 0, 0),
+            src: SmemTile {
+                tensor: sf.clone(),
+                prefix_indices: vec![],
+                row_offset: ScalarValue::Int(0),
+                col_offset: ScalarValue::Int(0),
+                rows: 32,
+                cols: 16,
+            },
+            shape: Tcgen05CpShape::B32x128,
+            multicast: Tcgen05CpMulticast::Warp4,
+            cta_group: 2,
+        };
+        let src = kernel_to_tirx_source(&kernel(vec![
+            Stmt::TensorDef { tensor: sf },
+            warp_if(0, vec![tmem_alloc(0, 512, 2)]),
+            warp_if(1, vec![elected_if(vec![cp])]),
+        ]))
+        .unwrap();
+
+        assert_eq!(src.matches("Tx.copy_async(").count(), 1, "{src}");
+        assert!(
+            src.contains("shape=\"32x128b\", multicast=\"warpx4\", cta_group=2)"),
+            "{src}"
+        );
+        assert!(
+            src.contains(
+                "cp_dst0 = T.decl_buffer((32, 16), \"float8_e4m3fn\", scope=\"tmem\", \
+                 allocated_addr=200"
+            ),
+            "{src}"
+        );
+        assert!(
+            src.contains(
+                "cp_src0 = T.decl_buffer((32, 16), \"float8_e4m3fn\", \
+                 data=d_smem0.data, elem_offset="
+            ),
+            "{src}"
+        );
+        assert!(
+            src.contains("scope=\"shared.dyn\", layout=TileLayout(S[(32, 16) : (16, 1)]))"),
+            "{src}"
+        );
+        assert!(
+            src.contains("Tx.copy_async(cp_dst0[:, :], cp_src0[0:32, 0:16]"),
+            "{src}"
+        );
+        assert_eq!(src.matches("T.decl_buffer(").count(), 2, "{src}");
+        assert!(!src.contains("\n    tmem = T.decl_buffer"), "{src}");
+        assert!(
+            src.find("cp_dst0 = T.decl_buffer").unwrap() < src.find("Tx.copy_async(").unwrap(),
+            "{src}"
+        );
+    }
+
+    #[test]
+    fn two_explicit_u32_swizzles_are_unique_and_not_flat_mailboxes() {
+        let tensor0 = Arc::new(Tensor {
+            id: 10,
+            space: MemorySpace::Smem,
+            dtype: DType::U32,
+            shape: vec![128, 8],
+            layout: Some(Layout::Swizzle(super::super::SmemSwizzleLayout {
+                swizzle: Swizzle::B32,
+            })),
+            byte_offset: Some(0),
+        });
+        let tensor1 = Arc::new(Tensor {
+            id: 11,
+            space: MemorySpace::Smem,
+            dtype: DType::U32,
+            shape: vec![128, 8],
+            layout: Some(Layout::Swizzle(super::super::SmemSwizzleLayout {
+                swizzle: Swizzle::B32,
+            })),
+            byte_offset: Some(4096),
+        });
+        let src = kernel_to_tirx_source(&kernel(vec![
+            Stmt::TensorDef { tensor: tensor0 },
+            Stmt::TensorDef { tensor: tensor1 },
+        ]))
+        .unwrap();
+        assert!(
+            src.contains(
+                "ab_smem0 = pool.alloc_tcgen05_mma_AB((128, 8), \"uint32\", \
+                 swizzle_mode=SwizzleMode.SWIZZLE_32B_ATOM, align=1024)"
+            ),
+            "{src}"
+        );
+        assert!(
+            src.contains(
+                "ab_smem1 = pool.alloc_tcgen05_mma_AB((128, 8), \"uint32\", \
+                 swizzle_mode=SwizzleMode.SWIZZLE_32B_ATOM, align=1024)"
+            ),
+            "{src}"
+        );
+        assert!(!src.contains("mma_shared_layout"), "{src}");
+        assert!(!src.contains("task_smem"), "{src}");
+    }
+
+    #[test]
+    fn multiple_layoutless_integer_smem_views_have_unique_names() {
+        let tensor0 = Arc::new(Tensor {
+            id: 10,
+            space: MemorySpace::Smem,
+            dtype: DType::U32,
+            shape: vec![5, 128],
+            layout: None,
+            byte_offset: Some(0),
+        });
+        let tensor1 = Arc::new(Tensor {
+            id: 11,
+            space: MemorySpace::Smem,
+            dtype: DType::U32,
+            shape: vec![5, 128],
+            layout: None,
+            byte_offset: Some(2560),
+        });
+        let src = kernel_to_tirx_source(&kernel(vec![
+            Stmt::TensorDef { tensor: tensor0 },
+            Stmt::TensorDef { tensor: tensor1 },
+        ]))
+        .unwrap();
+        assert!(
+            src.contains("task_smem = pool.alloc((5, 128), \"uint32\", scope=\"shared.dyn\")"),
+            "{src}"
+        );
+        assert!(
+            src.contains("task_smem1 = pool.alloc((5, 128), \"uint32\", scope=\"shared.dyn\")"),
+            "{src}"
+        );
+    }
+
+    #[test]
+    fn ldmatrix_stmatrix_lowering() {
+        let imm_a = reg_tensor(10, DType::U32, 2);
+        let tile = reg_tensor(11, DType::Bf16, 2);
+        let sm = smem_tensor(12, DType::Bf16, &[64, 64]);
+        let smem_row = |off0: ScalarValue, off1: ScalarValue| TensorSlice {
+            tensor: sm.clone(),
+            offsets: vec![off0, off1],
+            shape: vec![ScalarValue::Int(1), ScalarValue::Int(8)],
+        };
+        let lane_row = ScalarValue::expr(
+            ScalarOp::Add,
+            vec![
+                ScalarValue::Int(8),
+                ScalarValue::expr(
+                    ScalarOp::Mod,
+                    vec![
+                        ScalarValue::Scope(ScopeValueKind::LaneId),
+                        ScalarValue::Int(8),
+                    ],
+                ),
+            ],
+        );
+        let body = vec![
+            Stmt::TensorDef { tensor: sm.clone() },
+            Stmt::TensorDef {
+                tensor: imm_a.clone(),
+            },
+            Stmt::TensorDef {
+                tensor: tile.clone(),
+            },
+            wg_if(
+                0,
+                vec![
+                    Stmt::LdMatrix {
+                        dst: reg_slice(&imm_a, 0, 1),
+                        src: smem_row(lane_row.clone(), ScalarValue::Int(16)),
+                        shape: MatrixShape::M8N8,
+                        num: 1,
+                        trans: false,
+                        dtype: MatrixDType::B16,
+                    },
+                    Stmt::StMatrix {
+                        dst: smem_row(lane_row.clone(), ScalarValue::Int(32)),
+                        src: reg_slice(&tile, 0, 2),
+                        shape: MatrixShape::M8N8,
+                        num: 1,
+                        trans: true,
+                        dtype: MatrixDType::B16,
+                    },
+                ],
+            ),
+        ];
+        let src = kernel_to_tirx_source(&kernel(body)).unwrap();
+        assert!(
+            src.contains(
+                "T.ptx.ldmatrix(False, 1, \".b16\", d_smem0.ptr_to([8 + ((lane_id) & 7), 16]), accum_frag.ptr_to([0]))"
+            ),
+            "{src}"
+        );
+        assert!(
+            src.contains(
+                "T.ptx.stmatrix(True, 1, \".b16\", d_smem0.ptr_to([8 + ((lane_id) & 7), 32]), out_frag_u32.ptr_to([0]))"
+            ),
+            "{src}"
+        );
+
+        // Explicit stage/tile axes remain part of the physical pointer. Only
+        // the final eight-element row is consumed by the instruction.
+        let staged = smem_tensor(14, DType::Bf16, &[3, 16, 128]);
+        let src = kernel_to_tirx_source(&kernel(vec![
+            Stmt::TensorDef {
+                tensor: staged.clone(),
+            },
+            Stmt::TensorDef {
+                tensor: tile.clone(),
+            },
+            wg_if(
+                0,
+                vec![Stmt::StMatrix {
+                    dst: TensorSlice {
+                        tensor: staged,
+                        offsets: vec![ScalarValue::Int(2), lane_row.clone(), ScalarValue::Int(32)],
+                        shape: vec![
+                            ScalarValue::Int(1),
+                            ScalarValue::Int(1),
+                            ScalarValue::Int(8),
+                        ],
+                    },
+                    src: reg_slice(&tile, 0, 2),
+                    shape: MatrixShape::M8N8,
+                    num: 1,
+                    trans: true,
+                    dtype: MatrixDType::B16,
+                }],
+            ),
+        ]))
+        .unwrap();
+        assert!(
+            src.contains("ptr_to([2, 8 + ((lane_id) & 7), 32])"),
+            "{src}"
+        );
+
+        // dst width must equal num (b32 words).
+        let err = kernel_to_tirx_source(&kernel(vec![
+            Stmt::TensorDef { tensor: sm.clone() },
+            Stmt::TensorDef {
+                tensor: imm_a.clone(),
+            },
+            wg_if(
+                0,
+                vec![Stmt::LdMatrix {
+                    dst: reg_slice(&imm_a, 0, 2),
+                    src: smem_row(lane_row.clone(), ScalarValue::Int(0)),
+                    shape: MatrixShape::M8N8,
+                    num: 1,
+                    trans: false,
+                    dtype: MatrixDType::B16,
+                }],
+            ),
+        ]))
         .unwrap_err();
-        assert!(err.contains("row"), "{err}");
-
-        let err = kernel_to_tirx_source(&epilogue_kernel(tcgen05_ld(
-            0,
-            LdStShape::B16x256,
-            DType::F32,
-        )))
-        .unwrap_err();
-        assert!(err.contains("32x32b"), "{err}");
-
-        let err = kernel_to_tirx_source(&epilogue_kernel(tcgen05_ld(
-            0,
-            LdStShape::B32x32,
-            DType::F16,
-        )))
+        assert!(err.contains("num"), "{err}");
+        // an f32 SMEM operand is not a b16 matrix.
+        let sm32 = smem_tensor(13, DType::F32, &[64, 64]);
+        let err = kernel_to_tirx_source(&kernel(vec![
+            Stmt::TensorDef {
+                tensor: sm32.clone(),
+            },
+            Stmt::TensorDef {
+                tensor: imm_a.clone(),
+            },
+            wg_if(
+                0,
+                vec![Stmt::LdMatrix {
+                    dst: reg_slice(&imm_a, 0, 1),
+                    src: TensorSlice {
+                        tensor: sm32,
+                        offsets: vec![lane_row, ScalarValue::Int(0)],
+                        shape: vec![ScalarValue::Int(1), ScalarValue::Int(8)],
+                    },
+                    shape: MatrixShape::M8N8,
+                    num: 1,
+                    trans: false,
+                    dtype: MatrixDType::B16,
+                }],
+            ),
+        ]))
         .unwrap_err();
         assert!(err.contains("dtype"), "{err}");
+    }
+
+    #[test]
+    fn warp_mma_lowering_and_rejects() {
+        let imm_a = reg_tensor(10, DType::U32, 2);
+        let imm_b = reg_tensor(11, DType::U32, 1);
+        let acc = reg_tensor(12, DType::F32, 4);
+        let defs = vec![
+            Stmt::TensorDef {
+                tensor: imm_a.clone(),
+            },
+            Stmt::TensorDef {
+                tensor: imm_b.clone(),
+            },
+            Stmt::TensorDef {
+                tensor: acc.clone(),
+            },
+        ];
+        let mma = |d: TensorSlice, c: TensorSlice| Stmt::WarpMma {
+            d,
+            a: reg_slice(&imm_a, 0, 2),
+            b: reg_slice(&imm_b, 0, 1),
+            c,
+            m: 16,
+            n: 8,
+            k: 8,
+            ab_dtype: DType::Bf16,
+        };
+        let body = {
+            let mut b = defs.clone();
+            b.push(wg_if(
+                0,
+                vec![mma(reg_slice(&acc, 0, 4), reg_slice(&acc, 0, 4))],
+            ));
+            b
+        };
+        let src = kernel_to_tirx_source(&kernel(body)).unwrap();
+        assert!(
+            src.contains(
+                "T.ptx.mma(\"m16n8k8\", \"row\", \"col\", \"float32\", \"bfloat16\", \
+                 \"bfloat16\", \"float32\", [reg2.ptr_to([0]), reg2.ptr_to([1]), \
+                 reg2.ptr_to([2]), reg2.ptr_to([3])], [accum_frag.ptr_to([0]), \
+                 accum_frag.ptr_to([1])], [out_frag.ptr_to([0])], \
+                 [reg2.ptr_to([0]), reg2.ptr_to([1]), reg2.ptr_to([2]), \
+                 reg2.ptr_to([3])])"
+            ),
+            "{src}"
+        );
+        assert!(!src.contains("mma.legacy"), "{src}");
+
+        // A/B in a bf16 element dtype (not packed words): no lowering.
+        let ab16 = reg_tensor(13, DType::Bf16, 4);
+        let err = kernel_to_tirx_source(&kernel(vec![
+            Stmt::TensorDef {
+                tensor: ab16.clone(),
+            },
+            Stmt::TensorDef {
+                tensor: acc.clone(),
+            },
+            wg_if(
+                0,
+                vec![Stmt::WarpMma {
+                    d: reg_slice(&acc, 0, 4),
+                    a: reg_slice(&ab16, 0, 4),
+                    b: reg_slice(&ab16, 0, 2),
+                    c: reg_slice(&acc, 0, 4),
+                    m: 16,
+                    n: 8,
+                    k: 8,
+                    ab_dtype: DType::Bf16,
+                }],
+            ),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("packed words"), "{err}");
+        // Unsupported shape.
+        let err = kernel_to_tirx_source(&kernel({
+            let mut b = defs.clone();
+            b.push(wg_if(
+                0,
+                vec![Stmt::WarpMma {
+                    d: reg_slice(&acc, 0, 4),
+                    a: reg_slice(&imm_a, 0, 2),
+                    b: reg_slice(&imm_b, 0, 1),
+                    c: reg_slice(&acc, 0, 4),
+                    m: 8,
+                    n: 8,
+                    k: 8,
+                    ab_dtype: DType::Bf16,
+                }],
+            ));
+            b
+        }))
+        .unwrap_err();
+        assert!(err.contains("m8n8k8"), "{err}");
+    }
+
+    #[test]
+    fn mbarrier_arrive_emits_bare_per_thread() {
+        use super::super::dtype::MBarKind;
+        use super::super::mbar::{MBar, MBarRef};
+        let mbar = Arc::new(MBar {
+            id: 3,
+            kind: MBarKind::Thread,
+            stages: 1,
+            byte_offset: 800_024,
+            arrive_count: None,
+        });
+        let mref = || MBarRef {
+            mbar: mbar.clone(),
+            remote_coord: None,
+        };
+        // wg scope: bare per-thread arrive (no `if elect_sync():` guard) — the
+        // interpreter arrives once per executing lane and the barrier count is
+        // sized for exactly that (an elect undercounts and deadlocks — the gdn
+        // gate_ready bug).
+        let src = kernel_to_tirx_source(&kernel(vec![
+            Stmt::MBarDef { mbar: mbar.clone() },
+            wg_if(
+                0,
+                vec![Stmt::MBarrierArrive {
+                    mbar: mref(),
+                    count: ScalarValue::Int(1),
+                    stage: None,
+                }],
+            ),
+        ]))
+        .unwrap();
+        assert!(
+            src.contains("T.ptx.mbarrier.arrive(smem_full.ptr_to([0]))"),
+            "{src}"
+        );
+        assert!(!src.contains("if T.ptx.elect_sync():"), "{src}");
+        assert!(!src.contains("if tid_in_wg == 0:"), "{src}");
+    }
+
+    /// The per-thread emission INVARIANT, pinned for the whole per-thread op
+    /// family: expect_tx / arrive_expect_tx / store_scalar / async-proxy fence
+    /// at warpgroup scope emit BARE (one application per executing lane,
+    /// matching the interpreter) — any guard codegen might synthesize would
+    /// undercount arrivals/tx bytes or drop lane-varying stores.
+    #[test]
+    fn per_thread_ops_emit_bare_at_warpgroup_scope() {
+        use super::super::dtype::{FenceKind, FenceScope, MBarKind};
+        use super::super::mbar::{MBar, MBarRef};
+        let mbar = Arc::new(MBar {
+            id: 4,
+            kind: MBarKind::Tma,
+            stages: 1,
+            byte_offset: 800_032,
+            arrive_count: None,
+        });
+        let mref = || MBarRef {
+            mbar: mbar.clone(),
+            remote_coord: None,
+        };
+        let g = Arc::new(Tensor {
+            id: 0,
+            space: MemorySpace::Gmem,
+            dtype: DType::I32,
+            shape: vec![4],
+            layout: None,
+            byte_offset: None,
+        });
+        let point = |v: i64| TensorSlice {
+            tensor: g.clone(),
+            offsets: vec![ScalarValue::Int(v)],
+            shape: vec![ScalarValue::Int(1)],
+        };
+        let src = kernel_to_tirx_source(&kernel(vec![
+            Stmt::MBarDef { mbar: mbar.clone() },
+            wg_if(
+                0,
+                vec![
+                    Stmt::MBarrierExpectTx {
+                        mbar: mref(),
+                        bytes: 64,
+                        stage: None,
+                    },
+                    Stmt::MBarrierArriveExpectTx {
+                        mbar: mref(),
+                        bytes: 64,
+                        stage: None,
+                    },
+                    Stmt::StoreScalar {
+                        dst: point(0),
+                        value: ScalarValue::Int(7),
+                    },
+                    Stmt::Fence {
+                        kind: FenceKind::AsyncProxy,
+                        scope: FenceScope::Cta,
+                    },
+                ],
+            ),
+        ]))
+        .unwrap();
+        for line in [
+            "T.ptx.mbarrier.expect_tx(smem_full.ptr_to([0]), 64)",
+            "T.ptx.mbarrier.arrive.expect_tx(smem_full.ptr_to([0]), 64)",
+            "T.ptx.fence.proxy_async(\"shared::cta\")",
+        ] {
+            assert!(src.contains(line), "{line} missing from {src}");
+        }
+        // no synthesized guard anywhere around them
+        assert!(!src.contains("if T.ptx.elect_sync():"), "{src}");
+        assert!(!src.contains("if tid_in_wg == 0:"), "{src}");
+        assert!(!src.contains("if T.cuda.thread_rank() == 0:"), "{src}");
+    }
+
+    /// Each MBarRef is its own complete address. Codegen must preserve both
+    /// remote coordinates literally, without mbar-id routing or byte scaling.
+    #[test]
+    fn mbar_refs_lower_remote_coords_without_inference() {
+        use super::super::dtype::MBarKind;
+        use super::super::mbar::{MBar, MBarRef};
+        let mbar = Arc::new(MBar {
+            id: 4,
+            kind: MBarKind::Tma,
+            stages: 1,
+            byte_offset: 800_032,
+            arrive_count: None,
+        });
+        let src = kernel_to_tirx_source(&kernel(vec![
+            Stmt::MBarDef { mbar: mbar.clone() },
+            wg_if(
+                0,
+                vec![elected_if(vec![
+                    Stmt::MBarrierArriveExpectTx {
+                        mbar: MBarRef {
+                            mbar: mbar.clone(),
+                            remote_coord: Some(ScalarValue::Int(0)),
+                        },
+                        bytes: 64,
+                        stage: None,
+                    },
+                    Stmt::MBarrierWait {
+                        mbar: MBarRef {
+                            mbar,
+                            remote_coord: Some(ScalarValue::Int(1)),
+                        },
+                        phase: Some(ScalarValue::Int(0)),
+                        stage: None,
+                    },
+                ])],
+            ),
+        ]))
+        .unwrap();
+
+        assert!(
+            src.contains(
+                "T.ptx.mbarrier.arrive.expect_tx(smem_full.ptr_to([0]), 64, remote=0, pred=True)"
+            ),
+            "{src}"
+        );
+        assert!(
+            src.contains(
+                "T.ptx.mbarrier.try_wait(T.reinterpret(\"handle\", \
+                 T.ptx.map_shared_rank(smem_full.ptr_to([0]), 1)), 0)"
+            ),
+            "{src}"
+        );
+        assert!(!src.contains("if cbx == 0:"), "{src}");
+    }
+
+    #[test]
+    fn reg_transfer_forms_lowering() {
+        let r1 = reg_tensor(10, DType::F32, 1);
+        let frag = reg_tensor(11, DType::F32, 4);
+        let sm = smem_tensor(12, DType::F32, &[64, 64]);
+        let g = Arc::new(Tensor {
+            id: 0,
+            space: MemorySpace::Gmem,
+            dtype: DType::F32,
+            shape: vec![4, 4, 64, 128],
+            layout: None,
+            byte_offset: None,
+        });
+        let tid_row = ScalarValue::Scope(ScopeValueKind::TidInWg);
+        let body = vec![
+            Stmt::TensorDef { tensor: sm.clone() },
+            Stmt::TensorDef { tensor: r1.clone() },
+            Stmt::TensorDef {
+                tensor: frag.clone(),
+            },
+            wg_if(
+                0,
+                vec![
+                    // per-thread point load: r1 = sm[tid, 3]
+                    Stmt::RegLoad {
+                        dst: reg_slice(&r1, 0, 1),
+                        src: TensorSlice {
+                            tensor: sm.clone(),
+                            offsets: vec![tid_row.clone(), ScalarValue::Int(3)],
+                            shape: vec![ScalarValue::Int(1), ScalarValue::Int(1)],
+                        },
+                    },
+                    // per-thread point store: sm[tid, 5] = r1
+                    Stmt::RegStore {
+                        dst: TensorSlice {
+                            tensor: sm,
+                            offsets: vec![tid_row.clone(), ScalarValue::Int(5)],
+                            shape: vec![ScalarValue::Int(1), ScalarValue::Int(1)],
+                        },
+                        src: reg_slice(&r1, 0, 1),
+                    },
+                    // REG->REG copy: frag[1] = frag[0]
+                    Stmt::RegStore {
+                        dst: reg_slice(&frag, 1, 1),
+                        src: reg_slice(&frag, 0, 1),
+                    },
+                    // per-thread GMEM row run: g[1, 2, tid, 16:80] = frag
+                    Stmt::RegStore {
+                        dst: TensorSlice {
+                            tensor: g,
+                            offsets: vec![
+                                ScalarValue::Int(1),
+                                ScalarValue::Int(2),
+                                tid_row,
+                                ScalarValue::Int(16),
+                            ],
+                            shape: vec![
+                                ScalarValue::Int(1),
+                                ScalarValue::Int(1),
+                                ScalarValue::Int(1),
+                                ScalarValue::Int(4),
+                            ],
+                        },
+                        src: reg_slice(&frag, 0, 4),
+                    },
+                ],
+            ),
+        ];
+        let src = kernel_to_tirx_source(&kernel(body)).unwrap();
+        assert!(
+            src.contains("accum_frag = T.alloc_local((1,), \"float32\")"),
+            "{src}"
+        );
+        assert!(
+            src.contains("out_frag = T.alloc_local((4,), \"float32\")"),
+            "{src}"
+        );
+        assert!(
+            src.contains("Tx.copy(accum_frag[:], d_smem0[tid_in_wg:tid_in_wg + 1, 3:4])"),
+            "{src}"
+        );
+        assert!(
+            src.contains("Tx.copy(d_smem0[tid_in_wg:tid_in_wg + 1, 5:6], accum_frag[:])"),
+            "{src}"
+        );
+        assert!(
+            src.contains("Tx.copy(out_frag[1:1 + 1], out_frag[0:0 + 1])"),
+            "{src}"
+        );
+        assert!(
+            src.contains("Tx.copy(A[1:2, 2:3, tid_in_wg:tid_in_wg + 1, 16:20], out_frag[:])"),
+            "{src}"
+        );
+        assert!(!src.contains("Tx.wg."), "{src}");
+    }
+
+    fn reg_tensor(id: u32, dtype: DType, width: i64) -> Arc<Tensor> {
+        Arc::new(Tensor {
+            id,
+            space: MemorySpace::Reg,
+            dtype,
+            shape: vec![width as usize],
+            layout: None,
+            byte_offset: None,
+        })
+    }
+
+    fn reg_slice(t: &Arc<Tensor>, off: i64, w: i64) -> TensorSlice {
+        TensorSlice {
+            tensor: t.clone(),
+            offsets: vec![ScalarValue::Int(off)],
+            shape: vec![ScalarValue::Int(w)],
+        }
+    }
+
+    fn reg_kernel(body: Vec<Stmt>) -> Kernel {
+        kernel(body)
+    }
+
+    #[test]
+    fn reg_elementwise_family_lowering() {
+        let r1 = reg_tensor(10, DType::F32, 1);
+        let r2 = reg_tensor(11, DType::F32, 1);
+        let rb = reg_tensor(12, DType::Bf16, 2);
+        let body = vec![
+            Stmt::TensorDef { tensor: r1.clone() },
+            Stmt::TensorDef { tensor: r2.clone() },
+            Stmt::TensorDef { tensor: rb.clone() },
+            wg_if(
+                0,
+                vec![
+                    Stmt::RegFill {
+                        dst: reg_slice(&r1, 0, 1),
+                        value: RegOperand::Literal(RegLiteral::Int(0)),
+                    },
+                    Stmt::RegAdd {
+                        dst: reg_slice(&r1, 0, 1),
+                        lhs: RegOperand::Slice(reg_slice(&r1, 0, 1)),
+                        rhs: RegOperand::Slice(reg_slice(&r2, 0, 1)),
+                        rounding: Rounding::Rn,
+                    },
+                    Stmt::RegSub {
+                        dst: reg_slice(&r1, 0, 1),
+                        lhs: RegOperand::Slice(reg_slice(&r1, 0, 1)),
+                        rhs: RegOperand::Literal(RegLiteral::Int(-1)),
+                        rounding: Rounding::Rn,
+                    },
+                    Stmt::RegFma {
+                        dst: reg_slice(&r1, 0, 1),
+                        a: RegOperand::Slice(reg_slice(&r1, 0, 1)),
+                        b: RegOperand::Slice(reg_slice(&r2, 0, 1)),
+                        c: RegOperand::Slice(reg_slice(&r1, 0, 1)),
+                    },
+                    Stmt::RegUnary {
+                        dst: reg_slice(&r1, 0, 1),
+                        src: RegOperand::Slice(reg_slice(&r2, 0, 1)),
+                        op: RegUnaryOp::Exp2,
+                    },
+                    Stmt::RegUnary {
+                        dst: reg_slice(&r1, 0, 1),
+                        src: RegOperand::Slice(reg_slice(&r2, 0, 1)),
+                        op: RegUnaryOp::Rcp,
+                    },
+                    Stmt::RegUnary {
+                        dst: reg_slice(&r1, 0, 1),
+                        src: RegOperand::Slice(reg_slice(&r2, 0, 1)),
+                        op: RegUnaryOp::Neg,
+                    },
+                    Stmt::RegUnary {
+                        dst: reg_slice(&r1, 0, 1),
+                        src: RegOperand::Slice(reg_slice(&r2, 0, 1)),
+                        op: RegUnaryOp::Log2,
+                    },
+                    Stmt::RegFill {
+                        dst: reg_slice(&rb, 0, 2),
+                        value: RegOperand::Literal(RegLiteral::Int(1)),
+                    },
+                    Stmt::RegAdd {
+                        dst: reg_slice(&rb, 0, 2),
+                        lhs: RegOperand::Slice(reg_slice(&rb, 0, 2)),
+                        rhs: RegOperand::Slice(reg_slice(&rb, 0, 2)),
+                        rounding: Rounding::Rn,
+                    },
+                ],
+            ),
+        ];
+        let src = kernel_to_tirx_source(&reg_kernel(body)).unwrap();
+        assert!(
+            src.contains("accum_frag = T.alloc_local((1,), \"float32\")"),
+            "{src}"
+        );
+        assert!(
+            src.contains("out_frag = T.alloc_local((1,), \"float32\")"),
+            "{src}"
+        );
+        assert!(
+            src.contains("reg2 = T.alloc_local((2,), \"bfloat16\")"),
+            "{src}"
+        );
+        assert!(
+            src.contains("Tx.thread.fill(accum_frag[:], T.float32(0))"),
+            "{src}"
+        );
+        assert!(
+            src.contains("Tx.thread.add(accum_frag[:], accum_frag[:], out_frag[:])"),
+            "{src}"
+        );
+        assert!(
+            src.contains("Tx.thread.sub(accum_frag[:], accum_frag[:], T.float32(-1))"),
+            "{src}"
+        );
+        assert!(
+            src.contains("Tx.thread.fma(accum_frag[:], accum_frag[:], out_frag[:], accum_frag[:])"),
+            "{src}"
+        );
+        assert!(
+            src.contains("Tx.thread.exp2(accum_frag[:], out_frag[:])"),
+            "{src}"
+        );
+        assert!(
+            src.contains("Tx.thread.reciprocal(accum_frag[:], out_frag[:])"),
+            "{src}"
+        );
+        assert!(
+            src.contains("Tx.thread.mul(accum_frag[:], out_frag[:], T.float32(-1))"),
+            "{src}"
+        );
+        assert!(
+            src.contains("Tx.thread.log2(accum_frag[:], out_frag[:])"),
+            "{src}"
+        );
+        assert!(
+            src.contains("Tx.thread.fill(reg2[:], T.bfloat16(1))"),
+            "{src}"
+        );
+        assert!(
+            src.contains("Tx.thread.add(reg2[:], reg2[:], reg2[:])"),
+            "{src}"
+        );
+        assert!(!src.contains("Tx.wg."), "{src}");
+    }
+
+    #[test]
+    fn reg_elementwise_dropped_fields_are_rejected() {
+        let r1 = reg_tensor(10, DType::F32, 1);
+        let ri = reg_tensor(11, DType::I32, 1);
+        let mk = |stmts: Vec<Stmt>| {
+            let mut body = vec![
+                Stmt::TensorDef { tensor: r1.clone() },
+                Stmt::TensorDef { tensor: ri.clone() },
+            ];
+            body.push(wg_if(0, stmts));
+            kernel_to_tirx_source(&reg_kernel(body))
+        };
+        // rounding=rm has no lowering (the elementwise ops carry no floor).
+        let err = mk(vec![Stmt::RegAdd {
+            dst: reg_slice(&r1, 0, 1),
+            lhs: RegOperand::Literal(RegLiteral::Int(1)),
+            rhs: RegOperand::Literal(RegLiteral::Int(2)),
+            rounding: Rounding::Rm,
+        }])
+        .unwrap_err();
+        assert!(err.contains("rm"), "{err}");
+        // int dst for the binary family: no lowering.
+        let err = mk(vec![Stmt::RegSub {
+            dst: reg_slice(&ri, 0, 1),
+            lhs: RegOperand::Literal(RegLiteral::Int(1)),
+            rhs: RegOperand::Literal(RegLiteral::Int(2)),
+            rounding: Rounding::Rn,
+        }])
+        .unwrap_err();
+        assert!(err.contains("dtype"), "{err}");
+        // 16-bit unary dst: the interpreter computes in f32 and rounds; the
+        // TIRx 16-bit elementwise path would compute in 16 bits.
+        let rb = reg_tensor(12, DType::Bf16, 1);
+        let err = kernel_to_tirx_source(&reg_kernel(vec![
+            Stmt::TensorDef { tensor: rb.clone() },
+            wg_if(
+                0,
+                vec![Stmt::RegUnary {
+                    dst: reg_slice(&rb, 0, 1),
+                    src: RegOperand::Slice(reg_slice(&rb, 0, 1)),
+                    op: RegUnaryOp::Exp2,
+                }],
+            ),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("dtype"), "{err}");
+        // a mixed-dtype operand is NOT silently coerced.
+        let err = mk(vec![Stmt::RegAdd {
+            dst: reg_slice(&r1, 0, 1),
+            lhs: RegOperand::Slice(reg_slice(&ri, 0, 1)),
+            rhs: RegOperand::Literal(RegLiteral::Int(2)),
+            rounding: Rounding::Rn,
+        }])
+        .unwrap_err();
+        assert!(err.contains("RegCvt"), "{err}");
     }
 
     #[test]
@@ -4767,13 +5320,16 @@ mod tests {
         }
     }
 
-    /// A cta_sync is emitted at function scope and suppressed inside a
-    /// warp/warpgroup branch (a CTA-wide `__syncthreads` not all threads reach).
+    /// Codegen preserves a CTA sync even in an invalid nested branch; the
+    /// validator, not codegen, is responsible for rejecting that program.
     #[test]
-    fn cta_sync_is_function_scope_only() {
+    fn cta_sync_is_never_deleted_or_hoisted() {
         let src = kernel_to_tirx_source(&kernel(vec![Stmt::CtaSync])).unwrap();
         assert!(src.contains("T.cuda.cta_sync()"), "{src}");
         let src = kernel_to_tirx_source(&kernel(vec![warp_if(1, vec![Stmt::CtaSync])])).unwrap();
-        assert!(!src.contains("T.cuda.cta_sync()"), "{src}");
+        assert!(
+            src.contains("if warp_id == 1:\n        T.cuda.cta_sync()"),
+            "{src}"
+        );
     }
 }
