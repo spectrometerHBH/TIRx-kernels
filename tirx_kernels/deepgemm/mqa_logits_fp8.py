@@ -304,36 +304,6 @@ def _mqa_fp8_wrelu_reduce_src(num_heads: int) -> str:
     )
 
 
-def _mqa_fp8_tmem_load_src(num_heads: int) -> str:
-    """Load one FP8 MQA accumulator row from an already-flat TMEM column address."""
-    if num_heads not in (32, 64):
-        raise ValueError(f"Unsupported FP8 MQA TMEM load width: {num_heads}")
-
-    def emit_x32(dst_base: int, addr_expr: str) -> str:
-        registers = ", ".join(f"%{i}" for i in range(32))
-        outputs = ", ".join(
-            f'"=r"(reinterpret_cast<uint32_t*>(dst)[{dst_base + i}])' for i in range(32)
-        )
-        return (
-            "    asm volatile(\n"
-            f'        "tcgen05.ld.sync.aligned.32x32b.x32.b32 {{{registers}}}, [%32];\\n"\n'
-            f"        : {outputs}\n"
-            f'        : "r"({addr_expr})\n'
-            "    );\n"
-            '    asm volatile("tcgen05.wait::ld.sync.aligned;" ::);\n'
-        )
-
-    body = emit_x32(0, "tmem_addr")
-    if num_heads == 64:
-        body += emit_x32(32, "tmem_addr + 32")
-    return (
-        f"__forceinline__ __device__ void tvm_builtin_mqa_fp8_tmem_load_{num_heads}("
-        "float* dst, uint32_t tmem_addr) {\n"
-        f"{body}"
-        "}"
-    )
-
-
 def get_kernel(**kwargs: Any):
     from tvm.backend.cuda.operator.tile_primitive.tma_utils import SwizzleMode, mma_shared_layout
     from tvm.script import tirx as T
@@ -726,16 +696,20 @@ def get_kernel(**kwargs: Any):
                         tmem_stage_base: T.uint32 = tmem_stage_idx * T.uint32(umma_n)
                         for q_inner_i in T.unroll(0, block_q):
                             tmem_addr: T.uint32 = tmem_stage_base + T.uint32(q_inner_i * num_heads)
-                            # This is already a flat TMEM column. Avoid the generic
-                            # (base,row,col) encoder and issue DeepGEMM's two x32 loads.
-                            T.evaluate(
-                                cuda_func_call(
-                                    f"tvm_builtin_mqa_fp8_tmem_load_{num_heads}",
-                                    T.address_of(accum[0]),
-                                    tmem_addr,
-                                    source_code=_mqa_fp8_tmem_load_src(num_heads),
-                                )
+                            # Use the already-flat TMEM column as the intrinsic's
+                            # base address so row=col=0 remains an identity mapping.
+                            T.ptx.tcgen05.ld(
+                                tmem_addr, *[accum[i] for i in range(32)], shape="32x32b", num=32
                             )
+                            T.ptx.tcgen05.wait.ld()
+                            if num_heads == 64:
+                                T.ptx.tcgen05.ld(
+                                    tmem_addr + T.uint32(32),
+                                    *[accum[i] for i in range(32, 64)],
+                                    shape="32x32b",
+                                    num=32,
+                                )
+                                T.ptx.tcgen05.wait.ld()
                             # Weighted-ReLU reduce via inline CUDA (see _mqa_fp8_wrelu_reduce_src).
                             reduced: T.float32 = cuda_func_call(
                                 f"tvm_builtin_mqa_fp8_wrelu_reduce_{num_heads}",
