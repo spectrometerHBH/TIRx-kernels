@@ -11,7 +11,6 @@ import torch
 from flashinfer import SfLayout, nvfp4_quantize
 
 import tvm
-from tvm.backend.cuda.op import cuda_func_call
 from tvm.backend.cuda.operator.tile_primitive.gemm_async.tcgen05 import sf_smem_layout
 from tvm.backend.cuda.operator.tile_primitive.tma_utils import SwizzleMode
 from tvm.script import tirx as T
@@ -19,103 +18,6 @@ from tvm.script.tirx import tile as Tx
 from tvm.tirx.bench import bench
 from tvm.tirx.lang.pipeline import MBarrier, PipelineState, TCGen05Bar, TMABar
 from tvm.tirx.lang.tile_scheduler import ClusterLaunchControlScheduler, ClusterPersistentScheduler2D
-
-_NVFP4_COPY_SCALE_AND_MMA_K256_2CTA_SRC = r"""
-__forceinline__ __device__ void tirx_nvfp4_copy_scale_and_mma_k256_2cta(
-    uint32_t d_tmem_addr,
-    void* a_smem,
-    void* b_smem,
-    void* sfa_smem,
-    void* sfb_smem,
-    uint32_t accum) {
-    constexpr uint64_t mma_desc_hi = uint64_t{0x40004040} << 32;
-    constexpr uint64_t cp_desc_hi = uint64_t{0x00004008} << 32;
-    constexpr uint32_t instr_desc = 0x10400480;
-    uint64_t a_desc =
-        mma_desc_hi | ((__cvta_generic_to_shared(a_smem) >> 4) & uint32_t{0x3fff});
-    uint64_t b_desc =
-        mma_desc_hi | ((__cvta_generic_to_shared(b_smem) >> 4) & uint32_t{0x3fff});
-    uint64_t sfa_desc =
-        cp_desc_hi | ((__cvta_generic_to_shared(sfa_smem) >> 4) & uint32_t{0x3fff});
-    uint64_t sfb_desc =
-        cp_desc_hi | ((__cvta_generic_to_shared(sfb_smem) >> 4) & uint32_t{0x3fff});
-    asm volatile(
-        "{\n"
-        ".reg .pred p;\n"
-        ".reg .b64 ad, bd, sad, sbd;\n"
-        ".reg .b32 sfat, sfbt;\n"
-        "mov.b64 ad, %1;\n"
-        "mov.b64 bd, %2;\n"
-        "mov.b64 sad, %3;\n"
-        "mov.b64 sbd, %4;\n"
-        "mov.b32 sfat, 448;\n"
-        "tcgen05.cp.cta_group::2.32x128b.warpx4 [sfat], sad;\n"
-        "add.u32 sfat, sfat, 4;\n"
-        "add.u64 sad, sad, 32;\n"
-        "tcgen05.cp.cta_group::2.32x128b.warpx4 [sfat], sad;\n"
-        "add.u32 sfat, sfat, 4;\n"
-        "add.u64 sad, sad, 32;\n"
-        "tcgen05.cp.cta_group::2.32x128b.warpx4 [sfat], sad;\n"
-        "add.u32 sfat, sfat, 4;\n"
-        "add.u64 sad, sad, 32;\n"
-        "tcgen05.cp.cta_group::2.32x128b.warpx4 [sfat], sad;\n"
-        "mov.b32 sfbt, 464;\n"
-        "tcgen05.cp.cta_group::2.32x128b.warpx4 [sfbt], sbd;\n"
-        "add.u32 sfbt, sfbt, 8;\n"
-        "add.u64 sbd, sbd, 32;\n"
-        "tcgen05.cp.cta_group::2.32x128b.warpx4 [sfbt], sbd;\n"
-        "add.u32 sfbt, sfbt, 8;\n"
-        "add.u64 sbd, sbd, 32;\n"
-        "tcgen05.cp.cta_group::2.32x128b.warpx4 [sfbt], sbd;\n"
-        "add.u32 sfbt, sfbt, 8;\n"
-        "add.u64 sbd, sbd, 32;\n"
-        "tcgen05.cp.cta_group::2.32x128b.warpx4 [sfbt], sbd;\n"
-        "add.u64 sbd, sbd, 32;\n"
-        "mov.b32 sfbt, 468;\n"
-        "tcgen05.cp.cta_group::2.32x128b.warpx4 [sfbt], sbd;\n"
-        "add.u32 sfbt, sfbt, 8;\n"
-        "add.u64 sbd, sbd, 32;\n"
-        "tcgen05.cp.cta_group::2.32x128b.warpx4 [sfbt], sbd;\n"
-        "add.u32 sfbt, sfbt, 8;\n"
-        "add.u64 sbd, sbd, 32;\n"
-        "tcgen05.cp.cta_group::2.32x128b.warpx4 [sfbt], sbd;\n"
-        "add.u32 sfbt, sfbt, 8;\n"
-        "add.u64 sbd, sbd, 32;\n"
-        "tcgen05.cp.cta_group::2.32x128b.warpx4 [sfbt], sbd;\n"
-        "mov.b32 sfat, 448;\n"
-        "mov.b32 sfbt, 464;\n"
-        "setp.ne.b32 p, %6, 0;\n"
-        "tcgen05.mma.cta_group::2.kind::mxf4nvf4.block_scale.scale_vec::4X "
-        "[%0], ad, bd, %5, [sfat], [sfbt], p;\n"
-        "add.u64 ad, ad, 2;\n"
-        "add.u64 bd, bd, 2;\n"
-        "add.u32 sfat, sfat, 4;\n"
-        "add.u32 sfbt, sfbt, 8;\n"
-        "tcgen05.mma.cta_group::2.kind::mxf4nvf4.block_scale.scale_vec::4X "
-        "[%0], ad, bd, %5, [sfat], [sfbt], 1;\n"
-        "add.u64 ad, ad, 2;\n"
-        "add.u64 bd, bd, 2;\n"
-        "add.u32 sfat, sfat, 4;\n"
-        "add.u32 sfbt, sfbt, 8;\n"
-        "tcgen05.mma.cta_group::2.kind::mxf4nvf4.block_scale.scale_vec::4X "
-        "[%0], ad, bd, %5, [sfat], [sfbt], 1;\n"
-        "add.u64 ad, ad, 2;\n"
-        "add.u64 bd, bd, 2;\n"
-        "add.u32 sfat, sfat, 4;\n"
-        "add.u32 sfbt, sfbt, 8;\n"
-        "tcgen05.mma.cta_group::2.kind::mxf4nvf4.block_scale.scale_vec::4X "
-        "[%0], ad, bd, %5, [sfat], [sfbt], 1;\n"
-        "}\n"
-        :
-        : "r"(d_tmem_addr),
-          "l"(a_desc),
-          "l"(b_desc),
-          "l"(sfa_desc),
-          "l"(sfb_desc),
-          "r"(instr_desc),
-          "r"(accum));
-}
-"""
 
 
 class WarpRole(IntEnum):
@@ -383,7 +285,6 @@ def _kernel(
     MERGE_TMA_BARRIERS: T.constexpr = False,
     EARLY_TMEM_TEARDOWN: T.constexpr = False,
     DIRECT_EPI: T.constexpr = False,
-    FUSED_SCALE_MMA: T.constexpr = False,
 ):
     # Derived shapes (formulas, so they track the params above).
     CLUSTER_SIZE = T.meta_var(CLUSTER_M * CLUSTER_N)
@@ -684,32 +585,18 @@ def _kernel(
             else:
                 scale_full_bar.wait(mma_smem.stage, mma_smem.phase)
                 tile_full_bar.wait(mma_smem.stage, mma_smem.phase)
-            if FUSED_SCALE_MMA:
-                T.evaluate(
-                    cuda_func_call(
-                        "tirx_nvfp4_copy_scale_and_mma_k256_2cta",
-                        tmem.allocated_addr[0],
-                        A_smem.ptr_to([stage, 0, 0]),
-                        B_smem.ptr_to([stage, 0, 0]),
-                        SFA_smem.ptr_to([stage, 0, 0]),
-                        SFB_smem.ptr_to([stage, 0, 0]),
-                        accum,
-                        source_code=_NVFP4_COPY_SCALE_AND_MMA_K256_2CTA_SRC,
-                    )
-                )
-            else:
-                Tx.copy_async(SFA_tmem, SFA_smem[stage], cta_group=CTA_GROUP)
-                Tx.copy_async(SFB_tmem, SFB_smem[stage], cta_group=CTA_GROUP)
-                Tx.gemm_async(
-                    tmem[:, 0:MMA_N],
-                    A_smem[stage],
-                    B_smem[stage],
-                    SFA=SFA_tmem,
-                    SFB=SFB_tmem,
-                    accum=accum,
-                    dispatch="tcgen05",
-                    cta_group=CTA_GROUP,
-                )
+            Tx.copy_async(SFA_tmem, SFA_smem[stage], cta_group=CTA_GROUP)
+            Tx.copy_async(SFB_tmem, SFB_smem[stage], cta_group=CTA_GROUP)
+            Tx.gemm_async(
+                tmem[:, 0:MMA_N],
+                A_smem[stage],
+                B_smem[stage],
+                SFA=SFA_tmem,
+                SFB=SFB_tmem,
+                accum=accum,
+                dispatch="tcgen05",
+                cta_group=CTA_GROUP,
+            )
             accum = 1
             smem_empty.arrive(mma_smem.stage, cta_group=CTA_GROUP, cta_mask=pair_mask)
 
@@ -952,7 +839,6 @@ TIRX_CONFIGS = {
         "LOAD_CACHE_HINT": None,
         "MERGE_TMA_BARRIERS": True,
         "DIRECT_EPI": True,
-        "FUSED_SCALE_MMA": True,
     },
     (16384, 16384, 16384): {
         "SM_COUNT": 148,
@@ -964,7 +850,6 @@ TIRX_CONFIGS = {
         "OVERLAP_EPI": False,
         "LOAD_CACHE_HINT": "evict_normal",
         "DIRECT_EPI": True,
-        "FUSED_SCALE_MMA": True,
     },
 }
 
