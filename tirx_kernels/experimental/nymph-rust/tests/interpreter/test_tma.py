@@ -17,13 +17,13 @@ def test_tma_load_rejects_non_multicast_mbar_target_mismatch():
     for cluster_shape, remote_coord, cta_group in [((2,), 1, 1), ((4,), 2, 2)]:
         b = builder(
             "tma_load_mbar_target_mismatch",
-            smem_size_bytes=4,
+            smem_size_bytes=8,
             launch_shape=cluster_shape,
             cluster_shape=cluster_shape,
         )
         dst = smem_tensor(b, dtype=nr.DType.F32, shape=(1,), byte_offset=0)
         src = gmem_arg(b, dtype=nr.DType.F32, shape=(1,))
-        mbar = b.mbar(kind=nr.MBarKind.TMA)
+        mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
         # tma_load is a single-thread issue instruction now: elect one thread,
         # so the mbar-target check (not the issue-mask gate) is what fires.
         with b.if_warp(0), b.if_elected():
@@ -47,7 +47,7 @@ def test_tma_load_store_value_mode_roundtrips_and_preserves_gmem_cells():
     dump = gmem_arg(b, shape=(8,))
     smem = smem_tensor(b, shape=(4,), byte_offset=0)
     reg = reg_tensor(b, shape=(8,))
-    mbar = b.mbar(kind=nr.MBarKind.TMA)
+    mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
 
     # mbarrier.init is per-thread now: issue it from a single elected thread.
     with b.if_warp(0), b.if_elected():
@@ -71,7 +71,7 @@ def test_tma_value_mode_uses_explicit_full_rank_gmem_shape():
     dump = gmem_arg(b, shape=(1, 2, 2, 4))
     smem = smem_tensor(b, shape=(4, 4), byte_offset=0)
     reg = reg_tensor(b, shape=(1, 2, 2, 4))
-    mbar = b.mbar(kind=nr.MBarKind.TMA)
+    mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
 
     # mbarrier.init is per-thread now: issue it from a single elected thread.
     with b.if_warp(0), b.if_elected():
@@ -102,7 +102,7 @@ def test_tma_multicast_writes_each_cta_smem():
     out = gmem_arg(b, shape=(2,))
     smem = smem_tensor(b, shape=(4,), byte_offset=0)
     reg = reg_tensor(b)
-    mbar = b.mbar(kind=nr.MBarKind.TMA)
+    mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
     even_mbar = b.mbar_ref(mbar, remote_coord=0)
 
     # mbarrier.init is per-thread now: issue it from a single elected thread.
@@ -155,7 +155,7 @@ def test_tma_load_gmem_region_is_per_row_rectangle():
     b = builder("tma_region_rect", smem_size_bytes=64)
     source = gmem_arg(b, dtype=nr.DType.U8, shape=(4, 16))
     smem = smem_tensor(b, dtype=nr.DType.U8, shape=(2, 4), byte_offset=0)
-    mbar = b.mbar(kind=nr.MBarKind.TMA)
+    mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
     # init/arrive_expect_tx are per-thread and tma_load is single-thread issue:
     # run the whole sequence on one elected thread.
     with b.if_warp(0), b.if_elected():
@@ -177,7 +177,7 @@ def test_tma_load_gmem_region_clamps_partial_tile():
     b = builder("tma_region_clamp", smem_size_bytes=64)
     source = gmem_arg(b, dtype=nr.DType.U8, shape=(4, 16))
     smem = smem_tensor(b, dtype=nr.DType.U8, shape=(2, 8), byte_offset=0)
-    mbar = b.mbar(kind=nr.MBarKind.TMA)
+    mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
     # init/arrive_expect_tx are per-thread and tma_load is single-thread issue:
     # run the whole sequence on one elected thread.
     with b.if_warp(0), b.if_elected():
@@ -220,8 +220,8 @@ def _tma_load_fake_release_kernel(wait_tma):
     source = gmem_arg(b, dtype=nr.DType.F32, shape=(4, 4))
     smem = smem_tensor(b, dtype=nr.DType.F32, shape=(4, 4), byte_offset=0)
     frag = reg_tensor(b, dtype=nr.DType.F32, shape=(4,))
-    tma_mbar = b.mbar(kind=nr.MBarKind.TMA)
-    ready = b.mbar(kind=nr.MBarKind.THREAD)
+    tma_mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
+    ready = b.mbar(kind=nr.MBarKind.THREAD, byte_offset=0)
     # Per-thread init on one elected thread; the cta_sync publishes the
     # initialized cells to warp 4.
     with b.if_warp(0), b.if_elected():

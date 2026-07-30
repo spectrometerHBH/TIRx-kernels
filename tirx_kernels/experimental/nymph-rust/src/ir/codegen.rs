@@ -10,9 +10,8 @@
 //!   (canon's guard), narrowed to `if T.cuda.thread_rank() == 0:` when the
 //!   enclosed thread set is provably exactly CTA thread 0 AND the body is
 //!   loop-free (canon's prologue form — the same one thread, an emission
-//!   spelling change only). A leading `ClusterBarrierWait` inside an
-//!   elect-form `If` is peeled out of the elect (warp-collective; the
-//!   elected-lane wait deadlocks on hardware).
+//!   spelling change only). A warp-collective `ClusterBarrierWait` nested
+//!   under this single-lane scope fails closed; codegen never hoists it.
 //! - Hardware single-issue ops (TmaLoad/TmaStore/CpAsyncBulkS2Cluster,
 //!   Tcgen05Mma/Tcgen05Cp/Tcgen05Commit, MBarrierInit, ClcTryCancel) are
 //!   legal ONLY under an explicit single-lane `If` — the validator's
@@ -29,24 +28,18 @@
 //!   conditions (`static_thread_filter`) — but only for legality checks
 //!   (CTA-wide `cta_sync` at function scope, warp-collective forms) and for
 //!   the `Elected` recognition above, never to invent a guard.
-//! - Role dispatch chaining (`chain_top_level_ifs`): a run of >=2 ADJACENT
-//!   TOP-LEVEL `If`s whose conditions are warp/warpgroup equalities re-nests
-//!   into canon's if/else decision tree, partitioned by warpgroup exactly like
-//!   #18's `chain_top_level_roles` (a warpgroup-equality `If` is its group's
-//!   prefix; warp-equality `If`s chain behind it; duplicate conditions merge
-//!   bodies). Only order-preserving runs chain: a group mixing a warp-level
-//!   `If` BEFORE its warpgroup-level `If` stays flat — chaining would reorder
-//!   independent statements (the TMA-after-wait deadlock probe). The
-//!   R2UR-sensitive fp16 dispatch shape depends on the canonical form
-//!   (docs/perf-methodology.md §5).
+//! - Control-flow structure is preserved exactly: sibling IR `If`s emit as
+//!   sibling TVMScript `if`s, nested IR `If`s emit nested, and source order is
+//!   unchanged. Codegen never merges conditions, synthesizes role-dispatch
+//!   parents, or re-nests sibling branches.
 //! - `KernelInit`'s two side duties survive as structural rules: the single
 //!   TMEM view buffer (`tmem`) + SF views are declared at function scope right
 //!   after the top-level statement containing the first `TmemAlloc`.
 //!
 //! Everything else is the #18 pass unchanged: full-K `gemm_async` at the IR's
 //! own granularity, runtime `accum` scalar, TmemOperand/SfView TMEM views,
-//! leader-routed TMA barriers (peer `try_wait` is illegal and skipped), the
-//! structured emitter (`fill_empty_blocks`), the pow2/trunc
+//! exact per-operation `MBarRef` lowering, the structured emitter
+//! (`fill_empty_blocks`), the pow2/trunc
 //! strength reduction gated on the provable-nonneg analysis, and fail-closed
 //! exhaustiveness: every `Stmt` variant either has a lowering arm below or an
 //! explicit `Err` — no `..` catch-all, never a silent different-semantics
@@ -301,35 +294,12 @@ fn body_has_loop(body: &[Stmt]) -> bool {
     })
 }
 
-/// A warp/warpgroup equality condition (`warp_id == w` / `wg_id == g`, either
-/// operand order) — the chainable top-level dispatch predicate.
-fn as_scope_equality(cond: &ScalarValue) -> Option<(ScopeValueKind, i64)> {
-    let ScalarValue::Expr(e) = cond else {
-        return None;
-    };
-    if e.op != ScalarOp::Eq || e.args.len() != 2 {
-        return None;
-    }
-    for (a, b) in [(&e.args[0], &e.args[1]), (&e.args[1], &e.args[0])] {
-        if let (ScalarValue::Scope(kind), ScalarValue::Int(v)) = (a, b) {
-            if matches!(kind, ScopeValueKind::WarpId | ScopeValueKind::WarpgroupId) {
-                return Some((*kind, *v));
-            }
-        }
-    }
-    None
-}
-
 /// Per-kernel naming + lookup context built once, then read while walking the body.
 struct Ctx {
     /// Tensor id -> emitted Python name.
     names: HashMap<u32, String>,
-    /// mbar id -> emitted Python name of its `T.alloc_shared` buffer.
+    /// mbar id -> emitted Python name of its dynamic-pool buffer view.
     mbar_names: HashMap<u32, String>,
-    /// mbar id of the one mbar that has a peer (remote_coord) reference -> peer name.
-    peer_names: HashMap<u32, String>,
-    /// mbar id -> declared stage count (a multi-stage mbar allocs `[stages]`).
-    mbar_stages: HashMap<u32, u32>,
     /// Loop var id -> emitted Python name.
     var_names: HashMap<u32, String>,
     /// Scalar var id (binding == Scalar) -> emitted Python name. Scalar vars emit as SSA
@@ -370,18 +340,6 @@ struct Ctx {
     /// breaks the tma_auto shared-chain stride rule; these take swizzle
     /// mode 0 (a plain 16B-atom tile the chain slices cleanly).
     tma_partial_smem: std::collections::HashSet<u32>,
-    /// mbar ids of the TMA-load completion barriers (`smem_full`, `sf_full`, ...)
-    /// flagged `leader_routed` by the IR. In cluster mode the canonical pattern
-    /// routes BOTH CTAs' TMA completions to the LEADER CTA's barrier (a
-    /// `map_shared_rank(.., 0)` view used uniformly by both CTAs): each CTA's
-    /// `Tx.copy_async` signals it, the leader (cbx==0) issues one
-    /// `arrive.expect_tx` for the full cluster byte count, and the leader's MMA
-    /// waits its own LOCAL barrier (which both CTAs fill). This replaces the
-    /// illegal peer `try_wait` AND is the prerequisite for multicast TMA loads
-    /// (the per-destination transaction count of a `multicast::cluster` copy
-    /// must land on the single leader barrier, accounted via the `* cta_group`
-    /// factor in the leader expect_tx). Empty when no mbar is flagged.
-    tma_leader_mbars: std::collections::HashSet<u32>,
     /// Number of launched clusters (`launch_cta_count / cta_group`) — the grid stride
     /// for a `ForEachTask` grid-stride scheduler loop.
     num_clusters: usize,
@@ -438,18 +396,6 @@ struct RegAuxViews {
     flat_u32: bool,
     /// bf16/f16 reinterpret `{name}_flat_ab` (WarpMma A/B operand elements).
     flat_ab: Option<DType>,
-}
-
-impl Ctx {
-    /// The `map_shared_rank(.., 0)` (leader CTA-0) DSMEM view name for a TMA-load
-    /// barrier, e.g. `smem_full_cta0`. Used by the cluster TMA load + expect_tx.
-    fn tma_leader_view_for(&self, id: u32) -> Option<String> {
-        if !self.tma_leader_mbars.contains(&id) {
-            return None;
-        }
-        let base = self.mbar_names.get(&id)?;
-        Some(format!("{base}_cta0"))
-    }
 }
 
 impl Ctx {
@@ -549,6 +495,22 @@ fn arg_name(i: usize) -> String {
         return ((b'A' + i as u8) as char).to_string();
     }
     format!("arg{i}")
+}
+
+/// Render a Python tuple shape. A one-dimensional shape needs its trailing
+/// comma: `(4,)`, not the parenthesized scalar `(4)` that `SMEMPool.alloc`
+/// rejects.
+fn python_shape(shape: &[usize]) -> String {
+    let dims = shape
+        .iter()
+        .map(|d| d.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if shape.len() == 1 {
+        format!("({dims},)")
+    } else {
+        format!("({dims})")
+    }
 }
 
 pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
@@ -654,12 +616,7 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
     out.push_str(&format!("def main({sig}) -> None:\n"));
     let ind = 1;
     for (i, t) in k.args.iter().enumerate() {
-        let dims = t
-            .shape
-            .iter()
-            .map(|d| d.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let dims = python_shape(&t.shape);
         // SF-usage GMEM args (the TMA sources of an SF SMEM ring): lay them out with
         // canon's sf_smem_layout(rows, sf_k, sf_per_mma=4) so the TMA reads cp-ready
         // bytes. Usage-derived — a plain fp8 GMEM data arg keeps its natural layout.
@@ -672,7 +629,7 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
             String::new()
         };
         out.push_str(&format!(
-            "{p}{name} = T.match_buffer({name}_ptr, ({dims}), \"{dt}\"{layout})\n",
+            "{p}{name} = T.match_buffer({name}_ptr, {dims}, \"{dt}\"{layout})\n",
             p = pad(ind),
             name = arg_name(i),
             dims = dims,
@@ -763,205 +720,83 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
     ));
     out.push('\n');
 
-    // ---- SMEM buffers (N-D; the swizzled rings + the plain I32 mailbox) ----
-    // Two emission forms, selected by `k.smem_pool`:
-    //   * STATIC (default, the big-shape path): each SMEM data buffer is its own
-    //     `T.alloc_buffer(scope="shared")`. TVM sizes the static SMEM footprint as
-    //     the sum of the per-buffer extents.
-    //   * DYNAMIC POOL (the small-shape variant): canon's `T.SMEMPool()` form — ONE
-    //     dynamic `alloc_buffer([0], "uint8", scope="shared.dyn")` that every data
-    //     buffer aliases into via `pool.alloc(..., data=pool.ptr, byte_offset=...)`.
-    //     The buffers carry the IR's own `byte_offset`, so `pool.move_base_to(off)`
-    //     places each at exactly the offset the static form used (byte-for-byte the
-    //     same physical layout) — but now as `shared.dyn`, cutting the STATIC SMEM
-    //     footprint toward canon's shape. The mbar/tmem_addr buffers stay in the
-    //     pool too (mixing a static `shared` region with `shared.dyn` pushes the
-    //     dynamic base off its 1024-byte boundary and the swizzled buffers fault).
-    if k.smem_pool {
-        out.push_str(&format!("{p}pool = T.SMEMPool()\n", p = pad(ind)));
-    }
+    // ---- one physical dynamic-SMEM pool ----
+    // Tensor views, mbar cells, and the optional TMEM-address cell all carry
+    // absolute byte offsets in the IR. Codegen never derives a metadata base
+    // from tensor ids, declaration order, or an allocator cursor.
+    out.push_str(&format!("{p}pool = T.SMEMPool()\n", p = pad(ind)));
     for t in collect_tensors(k) {
         if t.space != MemorySpace::Smem {
             continue;
         }
         let name = ctx.tensor_name(t.id)?;
-        let dims = t
-            .shape
-            .iter()
-            .map(|d| d.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let dims = python_shape(&t.shape);
         let is_mailbox = (is_int_dtype(t.dtype) && t.dtype != DType::U8) || t.shape.len() < 2;
-        if k.smem_pool {
-            // Alias into the dynamic pool at the IR's computed byte offset. `move_base_to`
-            // sets the exact offset, then `pool.alloc` rounds it UP to `align` — the data
-            // buffers' IR offsets are already 1024-aligned, so the offset is unchanged, but
-            // the `align=1024` is REQUIRED: it sets the buffer's data-alignment attribute,
-            // which the swizzled-SMEM / TMA-descriptor codegen assumes (canon's
-            // `pool.alloc(..., align=1024)` / `alloc_mma(..., align=1024)`). With `align=0`
-            // the swizzle atom indexing computes a misaligned address and the kernel faults
-            // (cudaErrorMisalignedAddress) — even though the byte offset is identical. The
-            // mailbox (flat row-major int, no layout) takes no alignment.
-            let off = t
-                .byte_offset
-                .ok_or_else(|| format!("codegen: smem_pool tensor {name} has no byte_offset"))?;
-            out.push_str(&format!(
-                "{p}pool.move_base_to({off})\n",
-                p = pad(ind),
-                off = off,
-            ));
-            let (layout, align) = if is_mailbox {
-                (String::new(), 0)
-            } else {
-                (format!(", layout={name}_layout"), 1024)
-            };
-            out.push_str(&format!(
-                "{p}{name} = pool.alloc(({dims}), \"{dt}\", scope=\"shared.dyn\", align={align}{layout})\n",
-                p = pad(ind),
-                name = name,
-                dims = dims,
-                dt = dtype_str(t.dtype),
-                align = align,
-                layout = layout,
-            ));
-        } else if is_mailbox {
-            // The scheduler mailbox: a flat row-major shared buffer (no swizzle).
-            out.push_str(&format!(
-                "{p}{name} = T.alloc_buffer(({dims}), \"{dt}\", scope=\"shared\")\n",
-                p = pad(ind),
-                name = name,
-                dims = dims,
-                dt = dtype_str(t.dtype),
-            ));
+        // `move_base_to` is exact because validate has already proved every
+        // explicitly aligned tensor offset satisfies the same alignment
+        // codegen requests here. No silent allocator round-up is permitted.
+        let off = t
+            .byte_offset
+            .ok_or_else(|| format!("codegen: smem tensor {name} has no byte_offset"))?;
+        out.push_str(&format!(
+            "{p}pool.move_base_to({off})\n",
+            p = pad(ind),
+            off = off,
+        ));
+        let (layout, align) = if is_mailbox {
+            (String::new(), 0)
         } else {
-            out.push_str(&format!(
-                "{p}{name} = T.alloc_buffer(({dims}), \"{dt}\", scope=\"shared\", layout={name}_layout)\n",
-                p = pad(ind),
-                name = name,
-                dims = dims,
-                dt = dtype_str(t.dtype),
-            ));
-        }
+            let align = if matches!(t.layout, Some(Layout::Swizzle(_))) {
+                1024
+            } else {
+                128
+            };
+            (format!(", layout={name}_layout"), align)
+        };
+        out.push_str(&format!(
+            "{p}{name} = pool.alloc({dims}, \"{dt}\", scope=\"shared.dyn\", align={align}{layout})\n",
+            p = pad(ind),
+            name = name,
+            dims = dims,
+            dt = dtype_str(t.dtype),
+            align = align,
+            layout = layout,
+        ));
     }
     // ---- mbar shared buffers + tmem_addr ----
     // A multi-stage mbarrier allocates `[stages]` slots; each op indexes the slot it
     // uses. A single-stage mbar keeps the bootstrap's `[1]` form.
-    //
-    // In the dynamic-pool variant these buffers ALSO come from the pool (canon's
-    // `TMABar(pool, ...)` / `pool.alloc([1], "uint32", align=4)`). They MUST NOT be a
-    // separate static `T.alloc_shared(scope="shared")`: mixing a static `shared`
-    // region (the mbars) with the `shared.dyn` pool pushes the dynamic base off its
-    // 1024-byte boundary by the static region's size, so every swizzled pool buffer
-    // ends up misaligned and the kernel faults (cudaErrorMisalignedAddress). Putting
-    // them in the pool keeps the whole shared window one dynamic allocation, exactly
-    // like canon. Emitted before `pool.commit()` so they're inside the pool's extent.
-    if k.smem_pool {
-        for s in &k.body {
-            if let Stmt::MBarDef { mbar } = s {
-                let name = ctx
-                    .mbar_names
-                    .get(&mbar.id)
-                    .ok_or_else(|| format!("codegen: no name for mbar {}", mbar.id))?;
-                let stages = ctx.mbar_stages.get(&mbar.id).copied().unwrap_or(1).max(1);
-                // mbarriers are 8 B (uint64); align=8 keeps each slot naturally aligned.
-                out.push_str(&format!(
-                    "{p}{name} = pool.alloc([{stages}], \"uint64\", scope=\"shared.dyn\", align=8)\n",
-                    p = pad(ind),
-                    name = name,
-                    stages = stages,
-                ));
-            }
-        }
+    for mbar in collect_mbars(k) {
+        let name = ctx
+            .mbar_names
+            .get(&mbar.id)
+            .ok_or_else(|| format!("codegen: no name for mbar {}", mbar.id))?;
+        out.push_str(&format!(
+            "{p}pool.move_base_to({off})\n",
+            p = pad(ind),
+            off = mbar.byte_offset,
+        ));
+        out.push_str(&format!(
+            "{p}{name} = pool.alloc([{stages}], \"uint64\", scope=\"shared.dyn\", align=8)\n",
+            p = pad(ind),
+            name = name,
+            stages = mbar.stages,
+        ));
+    }
+    if let Some(off) = tmem_addr_byte_offset(k)? {
+        out.push_str(&format!("{p}pool.move_base_to({off})\n", p = pad(ind),));
         out.push_str(&format!(
             "{p}tmem_addr = pool.alloc([1], \"uint32\", scope=\"shared.dyn\", align=4)\n",
             p = pad(ind)
         ));
-        // Seal the dynamic pool: emit the `tirx.pool_max_bytes` size annotation from
-        // the allocator high-water mark (the whole shared window: data buffers + mbars).
-        out.push_str(&format!("{p}pool.commit()\n", p = pad(ind)));
-    } else {
-        for s in &k.body {
-            if let Stmt::MBarDef { mbar } = s {
-                let name = ctx
-                    .mbar_names
-                    .get(&mbar.id)
-                    .ok_or_else(|| format!("codegen: no name for mbar {}", mbar.id))?;
-                let stages = ctx.mbar_stages.get(&mbar.id).copied().unwrap_or(1).max(1);
-                out.push_str(&format!(
-                    "{p}{name} = T.alloc_shared([{stages}], \"uint64\")\n",
-                    p = pad(ind),
-                    name = name,
-                    stages = stages,
-                ));
-            }
-        }
-        out.push_str(&format!(
-            "{p}tmem_addr = T.alloc_shared([1], \"uint32\")\n",
-            p = pad(ind)
-        ));
     }
-
-    // peer mbar (remote_coord) decl — find the referenced mbar id. The peer view
-    // spans the full stage count so a multi-stage peer wait can index its slot.
-    // Emitted in a stable (id-sorted) order — `peer_names` is a HashMap, so iterating
-    // it directly made the emitted source nondeterministic across runs (the decls were
-    // reordered run-to-run). Sort by mbar id to match the leader_ids block below.
-    let mut peer_entries: Vec<(&u32, &String)> = ctx.peer_names.iter().collect();
-    peer_entries.sort_unstable_by_key(|(id, _)| **id);
-    for (mbar_id, peer_name) in peer_entries {
-        let base = ctx
-            .mbar_names
-            .get(mbar_id)
-            .ok_or_else(|| format!("codegen: peer references unknown mbar {mbar_id}"))?;
-        let stages = ctx.mbar_stages.get(mbar_id).copied().unwrap_or(1).max(1);
-        let ptr_var = format!("{peer_name}_ptr");
-        // The `T.let` annotation binds the ptr as a Var typed by the exact
-        // PointerType from `T.reinterpret` (a bare expr is not a Var, which
-        // `decl_buffer(data=)` rejects).
-        out.push_str(&format!(
-            "{p}{ptr_var}: T.let = T.reinterpret(PointerType(PrimType(\"uint64\")), T.ptx.map_shared_rank({base}.ptr_to([0]), 1))\n",
-            p = pad(ind),
-            ptr_var = ptr_var,
-            base = base,
-        ));
-        out.push_str(&format!(
-            "{p}{peer} = T.decl_buffer([{stages}], \"uint64\", data={ptr_var}, scope=\"shared\")\n",
-            p = pad(ind),
-            peer = peer_name,
-            stages = stages,
-        ));
-    }
-
-    // Leader (CTA-0) DSMEM view of each TMA-load barrier, used uniformly by BOTH CTAs to
-    // route every TMA completion to the leader's single barrier (the canonical
-    // cta_group=2 pattern; replaces the illegal peer try_wait). `map_shared_rank(.., 0)`
-    // is identity on CTA 0 and the cross-CTA remap on CTA 1, so one form serves both.
-    // Emitted in a stable (id-sorted) order so the source is deterministic.
-    let mut leader_ids: Vec<u32> = ctx.tma_leader_mbars.iter().copied().collect();
-    leader_ids.sort_unstable();
-    for id in leader_ids {
-        let view = ctx
-            .tma_leader_view_for(id)
-            .ok_or_else(|| format!("codegen: tma leader references unknown mbar {id}"))?;
-        let base = ctx
-            .mbar_names
-            .get(&id)
-            .ok_or_else(|| format!("codegen: tma leader references unknown mbar {id}"))?;
-        let stages = ctx.mbar_stages.get(&id).copied().unwrap_or(1).max(1);
-        let ptr_var = format!("{view}_ptr");
-        out.push_str(&format!(
-            "{p}{ptr_var}: T.let = T.reinterpret(PointerType(PrimType(\"uint64\")), T.ptx.map_shared_rank({base}.ptr_to([0]), 0))\n",
-            p = pad(ind),
-            ptr_var = ptr_var,
-            base = base,
-        ));
-        out.push_str(&format!(
-            "{p}{view} = T.decl_buffer([{stages}], \"uint64\", data={ptr_var}, scope=\"shared\")\n",
-            p = pad(ind),
-            view = view,
-            stages = stages,
-        ));
-    }
+    // `smem_size_bytes` is the physical extent of the complete pool, including
+    // explicit padding and metadata tail.
+    out.push_str(&format!(
+        "{p}pool.commit(size={size})\n",
+        p = pad(ind),
+        size = k.smem_size_bytes,
+    ));
 
     // ---- REG fragments (epilogue) ----
     // Each is a warpgroup-collective `(128, width)` register tile (`T.wg_reg_tile`): the 128
@@ -972,17 +807,15 @@ pub fn kernel_to_tirx_source(k: &Kernel) -> Result<String, String> {
     out.push('\n');
 
     // ---- walk the body ----
-    // Adjacent TOP-LEVEL warp/warpgroup-equality `If`s are re-nested into canon's
-    // if/else role-dispatch chain for emission (pure CUDA branch layout; the IR
-    // the interpreter consumes stays flat). The single TMEM view + SF views are
-    // declared at function scope right after the top-level statement carrying
-    // the first `TmemAlloc` (#18 declared them right after `KernelInit`).
-    let units = chain_top_level_ifs(&k.body);
+    // Emit top-level statements 1:1 in IR order. The single TMEM view + SF
+    // views are declared at function scope right after the top-level statement
+    // carrying the first `TmemAlloc` (#18 declared them right after
+    // `KernelInit`).
     let fn_scope = ScopeInfo::function(k.num_warps);
     let mut tmem_declared = ctx.tmem_view_cols.is_none();
-    for unit in &units {
-        emit_top_unit(&mut out, unit, ind, &ctx, &fn_scope)?;
-        if !tmem_declared && unit_contains_tmem_alloc(unit) {
+    for stmt in &k.body {
+        emit_stmt(&mut out, stmt, ind, &ctx, &fn_scope)?;
+        if !tmem_declared && stmt_contains_tmem_alloc(stmt) {
             emit_tmem_view_decls(&mut out, ind, &ctx);
             tmem_declared = true;
         }
@@ -1065,34 +898,20 @@ fn emit_tmem_view_decls(out: &mut Emitter, ind: usize, ctx: &Ctx) {
     }
 }
 
-/// Does this top-level unit (a plain stmt or a chained `If` tree) contain a
-/// `TmemAlloc` anywhere?
-fn unit_contains_tmem_alloc(unit: &TopUnit) -> bool {
-    fn stmt_has_alloc(s: &Stmt) -> bool {
-        matches!(s, Stmt::TmemAlloc { .. })
-            || s.child_bodies()
-                .iter()
-                .any(|b| b.iter().any(stmt_has_alloc))
-    }
-    match unit {
-        TopUnit::Stmt(s) => stmt_has_alloc(s),
-        TopUnit::Chain(c) => {
-            fn chain_has_alloc(c: &IfChain) -> bool {
-                c.body.iter().any(stmt_has_alloc)
-                    || c.inner.as_ref().is_some_and(|i| chain_has_alloc(i))
-                    || c.else_.as_ref().is_some_and(|e| chain_has_alloc(e))
-            }
-            chain_has_alloc(c)
-        }
-    }
+/// Does this top-level statement contain a `TmemAlloc` anywhere?
+fn stmt_contains_tmem_alloc(stmt: &Stmt) -> bool {
+    matches!(stmt, Stmt::TmemAlloc { .. })
+        || stmt
+            .child_bodies()
+            .iter()
+            .any(|body| body.iter().any(stmt_contains_tmem_alloc))
 }
 
 /// Every emitted block opener (`if`/`else`/`for`/`while`/`def` …) must own at
 /// least one body line: an empty If/guard body otherwise renders a header with
 /// no indented statement — invalid Python. Fill the gap with `pass`,
-/// generically at the structured-line level (covers empty `else` arms, an
-/// elected branch whose body was fully peeled as leading ClusterBarrierWaits,
-/// and empty guard blocks alike) — a per-construct validator ban would have to
+/// generically at the structured-line level (covers empty `else` arms and
+/// empty guard blocks alike) — a per-construct validator ban would have to
 /// enumerate every one of these sites.
 fn fill_empty_blocks(lines: Vec<Line>) -> Vec<Line> {
     let is_opener = |text: &str| {
@@ -1128,205 +947,6 @@ fn fill_empty_blocks(lines: Vec<Line>) -> Vec<Line> {
                 text: "pass".into(),
             });
         }
-    }
-    out
-}
-
-/// One node of the emission-time if/else decision tree `chain_top_level_ifs`
-/// builds (the warp-model analog of #18's role `else_body` chains).
-struct IfChain {
-    cond: ScalarValue,
-    body: Vec<Stmt>,
-    /// A warp-level chain nested INSIDE this branch (emitted at the end of
-    /// `body`, one level deeper): #18 nested the chained warp roles in the
-    /// warpgroup role's body; the warp-model `If` has no else/body split, so
-    /// the nesting is explicit here.
-    inner: Option<Box<IfChain>>,
-    /// The next group, emitted under `else:`.
-    else_: Option<Box<IfChain>>,
-}
-
-/// A top-level emission unit after chaining: an untouched statement, or a
-/// chained decision tree of warp/warpgroup-equality `If`s.
-enum TopUnit {
-    Stmt(Stmt),
-    Chain(IfChain),
-}
-
-/// Emission-time re-nesting of ADJACENT TOP-LEVEL warp/warpgroup-equality `If`s
-/// into canon's if/else role-dispatch chain (`if wg_id == 2 { … } else { if
-/// wg_id == 0 { … } else { … } }`). This is the warp-model port of #18's
-/// `chain_top_level_roles`: purely a CUDA branch-layout transform — the
-/// interpreter always consumes the FLAT list, and the chained form is
-/// guard-equivalent (the branches are mutually exclusive, so an if/else
-/// decision tree runs exactly the same bodies on the same threads). The flat
-/// form's per-branch overhead measurably inflates whole-function SASS, which
-/// on fp16 1024 is what tips ptxas's uniform-register placement (R2UR 13.5K
-/// vs canon 1.8K — docs/perf-methodology.md §5).
-///
-/// Grouping (unchanged from #18): a run of >=2 consecutive top-level equality
-/// `If`s partitions by warpgroup (`warp w -> w / 4`, `wg g -> g`). Within a
-/// group, at most one warpgroup-equality `If` (its body is the group prefix)
-/// plus the warp-equality `If`s chained behind it in source order; groups
-/// chain in first-occurrence order. Duplicate conditions merge their bodies
-/// (same threads, same order — flat-equivalent). A run containing any other
-/// statement stays flat — and so does a run whose group mixes a warp-level
-/// `If` BEFORE its warpgroup-level `If`: chaining would run the warpgroup
-/// body first, REORDERING independent statements (observed miscompile: a
-/// warp-1 TMA issue moved after the warpgroup's mbarrier wait → GPU
-/// deadlock). Only the canonical wg-prefix-then-warp-roles order chains.
-fn chain_top_level_ifs(body: &[Stmt]) -> Vec<TopUnit> {
-    struct IfParts<'a> {
-        cond: &'a ScalarValue,
-        body: &'a [Stmt],
-        /// Warp id (a warp-level branch), or None for a warpgroup-level branch.
-        warp: Option<i64>,
-    }
-
-    /// Chain a group's warp-level `If`s behind one another (else-nested).
-    /// Duplicate warp ids merge their bodies (concatenation — same threads).
-    fn chain_warp_ifs(members: &[&IfParts<'_>]) -> Option<Box<IfChain>> {
-        let mut merged: Vec<(i64, Vec<Stmt>, ScalarValue)> = Vec::new();
-        for m in members.iter().filter(|m| m.warp.is_some()) {
-            let w = m.warp.unwrap();
-            if let Some(e) = merged.iter_mut().find(|e| e.0 == w) {
-                e.1.extend_from_slice(m.body);
-                continue;
-            }
-            merged.push((w, m.body.to_vec(), m.cond.clone()));
-        }
-        let mut chain: Option<Box<IfChain>> = None;
-        for (_, b, cond) in merged.into_iter().rev() {
-            chain = Some(Box::new(IfChain {
-                cond,
-                body: b,
-                inner: None,
-                else_: chain.take(),
-            }));
-        }
-        chain
-    }
-
-    fn chain_if_run(run: &[Stmt]) -> Option<IfChain> {
-        struct Numbered<'a> {
-            parts: IfParts<'a>,
-            index: usize,
-        }
-        let mut groups: Vec<(i64, Vec<Numbered<'_>>)> = Vec::new();
-        for (index, s) in run.iter().enumerate() {
-            let Stmt::If { cond, then_body } = s else {
-                return None;
-            };
-            let (kind, v) = as_scope_equality(cond)?;
-            let (warp, group) = match kind {
-                ScopeValueKind::WarpId => (Some(v), v.div_euclid(WG_WARPS as i64)),
-                _ => (None, v),
-            };
-            let parts = IfParts {
-                cond,
-                body: then_body,
-                warp,
-            };
-            if let Some((_, members)) = groups.iter_mut().find(|(g, _)| *g == group) {
-                members.push(Numbered { parts, index });
-            } else {
-                groups.push((group, vec![Numbered { parts, index }]));
-            }
-        }
-        // Soundness: the chained tree runs each group's warpgroup-level prefix
-        // BEFORE its warp-level branches. That is only the source order when
-        // every warpgroup-level `If` of a group precedes all its warp-level
-        // `If`s — otherwise chaining REORDERS independent statements (a TMA
-        // issue before a warpgroup wait was moved after it → deadlock). Decline
-        // to chain in that case; the run emits flat (source order, always
-        // sound).
-        for (_, members) in &groups {
-            let wg_last = members
-                .iter()
-                .filter(|m| m.parts.warp.is_none())
-                .map(|m| m.index)
-                .max();
-            let warp_first = members
-                .iter()
-                .filter(|m| m.parts.warp.is_some())
-                .map(|m| m.index)
-                .min();
-            if let (Some(wg), Some(w)) = (wg_last, warp_first) {
-                if wg > w {
-                    return None;
-                }
-            }
-        }
-        let mut else_: Option<Box<IfChain>> = None;
-        for (g, members) in groups.into_iter().rev() {
-            let members: Vec<IfParts<'_>> = members.into_iter().map(|m| m.parts).collect();
-            let refs: Vec<&IfParts<'_>> = members.iter().collect();
-            let (wg_ifs, warp_ifs): (Vec<&IfParts<'_>>, Vec<&IfParts<'_>>) =
-                refs.into_iter().partition(|m| m.warp.is_none());
-            // The warp-level chain nests INSIDE the group branch (after the
-            // group prefix body), exactly like #18 nested chained warp roles in
-            // the warpgroup role's body.
-            let inner = chain_warp_ifs(&warp_ifs);
-            let (cond, body) = if let Some(first) = wg_ifs.first() {
-                // The warpgroup-level branch is the group prefix: its body (all
-                // duplicate wg-`If` bodies concatenated) runs first.
-                let mut body = Vec::new();
-                for m in &wg_ifs {
-                    body.extend_from_slice(m.body);
-                }
-                (first.cond.clone(), body)
-            } else {
-                // No warpgroup-level `If` in this group: synthesize the group
-                // guard (`wg_id == g`) so the warp chain lands on its warpgroup.
-                (
-                    ScalarValue::expr(
-                        ScalarOp::Eq,
-                        vec![
-                            ScalarValue::Scope(ScopeValueKind::WarpgroupId),
-                            ScalarValue::Int(g),
-                        ],
-                    ),
-                    Vec::new(),
-                )
-            };
-            else_ = Some(Box::new(IfChain {
-                cond,
-                body,
-                inner,
-                else_: else_.take(),
-            }));
-        }
-        else_.map(|e| *e)
-    }
-
-    let mut out: Vec<TopUnit> = Vec::with_capacity(body.len());
-    let mut i = 0;
-    while i < body.len() {
-        let is_eq_if =
-            |s: &Stmt| matches!(s, Stmt::If { cond, .. } if as_scope_equality(cond).is_some());
-        if !is_eq_if(&body[i]) {
-            out.push(TopUnit::Stmt(body[i].clone()));
-            i += 1;
-            continue;
-        }
-        let mut j = i;
-        while j < body.len() && is_eq_if(&body[j]) {
-            j += 1;
-        }
-        let run = &body[i..j];
-        // Runs of >=2 chain; a lone equality `If` emits flat (its plain form
-        // is already the canonical one-branch tree).
-        if run.len() >= 2 {
-            if let Some(chained) = chain_if_run(run) {
-                out.push(TopUnit::Chain(chained));
-                i = j;
-                continue;
-            }
-        }
-        for s in run {
-            out.push(TopUnit::Stmt(s.clone()));
-        }
-        i = j;
     }
     out
 }
@@ -1397,8 +1017,6 @@ impl Emitter {
     }
 }
 
-/// Merge ADJACENT identical single-issue guard blocks (the annotated
-/// `if tid_in_wg == 0:` / `if T.ptx.elect_sync():` lines) into one block.
 /// Render the structured lines back to source text: re-pad each line from its
 /// numeric indent, join with newlines, terminate the final line.
 fn render_lines(lines: Vec<Line>) -> String {
@@ -1493,6 +1111,62 @@ fn collect_tensors(k: &Kernel) -> Vec<Arc<Tensor>> {
     let mut v: Vec<_> = map.into_values().collect();
     v.sort_by_key(|t| t.id);
     v
+}
+
+/// Collect physical mbar objects in source declaration order. Their ids remain
+/// identity only; physical placement comes exclusively from `byte_offset`.
+fn collect_mbars(k: &Kernel) -> Vec<Arc<super::mbar::MBar>> {
+    fn walk(stmts: &[Stmt], seen: &mut HashSet<u32>, out: &mut Vec<Arc<super::mbar::MBar>>) {
+        for stmt in stmts {
+            if let Stmt::MBarDef { mbar } = stmt {
+                if seen.insert(mbar.id) {
+                    out.push(mbar.clone());
+                }
+            }
+            for body in stmt.child_bodies() {
+                walk(body, seen, out);
+            }
+        }
+    }
+
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    walk(&k.body, &mut seen, &mut out);
+    out
+}
+
+/// Return the one physical SMEM cell used to receive the TMEM allocation
+/// address. Multiple sequential `TmemAlloc` statements may reuse that cell,
+/// but distinct offsets cannot be represented by the single `tmem_addr` view
+/// consumed by `TmemDealloc`.
+fn tmem_addr_byte_offset(k: &Kernel) -> Result<Option<usize>, String> {
+    fn walk(stmts: &[Stmt], offset: &mut Option<usize>) -> Result<(), String> {
+        for stmt in stmts {
+            if let Stmt::TmemAlloc {
+                addr_byte_offset, ..
+            } = stmt
+            {
+                match offset {
+                    Some(existing) if *existing != *addr_byte_offset => {
+                        return Err(format!(
+                            "codegen: TmemAlloc addr_byte_offset {addr_byte_offset} \
+                             differs from the kernel tmem_addr offset {existing}"
+                        ));
+                    }
+                    None => *offset = Some(*addr_byte_offset),
+                    _ => {}
+                }
+            }
+            for body in stmt.child_bodies() {
+                walk(body, offset)?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut offset = None;
+    walk(&k.body, &mut offset)?;
+    Ok(offset)
 }
 
 fn note_tensor(t: &Arc<Tensor>, map: &mut HashMap<u32, Arc<Tensor>>) {
@@ -1684,10 +1358,9 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
         names.insert(t.id, name);
     }
 
-    // mbar names + peer names + stage counts.
+    // Mbar names come only from their definitions. Remote addressing stays on
+    // each MBarRef and is rendered at the instruction that consumes it.
     let mut mbar_names: HashMap<u32, String> = HashMap::new();
-    let mut peer_names: HashMap<u32, String> = HashMap::new();
-    let mut mbar_stages: HashMap<u32, u32> = HashMap::new();
     let mut mbar_idx = 0usize;
     // The bootstrap names its two single-stage mbars smem_full / mma_done; the full
     // kernel has six (smem ring, tmem accumulator pipe, task mailbox). Naming them by
@@ -1703,8 +1376,6 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
     fn walk_mbars(
         stmts: &[Stmt],
         mbar_names: &mut HashMap<u32, String>,
-        peer_names: &mut HashMap<u32, String>,
-        mbar_stages: &mut HashMap<u32, u32>,
         mbar_idx: &mut usize,
         mbar_default: &[&str],
     ) {
@@ -1716,72 +1387,18 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| format!("mbar{}", *mbar_idx));
                     mbar_names.insert(mbar.id, n);
-                    mbar_stages.insert(mbar.id, mbar.stages.max(1));
                     *mbar_idx += 1;
                 }
             }
-            // discover peer references
-            for mref in stmt_mbar_refs(s) {
-                if mref.remote_coord.is_some() {
-                    peer_names
-                        .entry(mref.mbar.id)
-                        .or_insert_with(|| format!("peer_{}", mref.mbar.id));
-                }
-            }
             for body in s.child_bodies() {
-                walk_mbars(
-                    body,
-                    mbar_names,
-                    peer_names,
-                    mbar_stages,
-                    mbar_idx,
-                    mbar_default,
-                );
+                walk_mbars(body, mbar_names, mbar_idx, mbar_default);
             }
         }
     }
-    walk_mbars(
-        &k.body,
-        &mut mbar_names,
-        &mut peer_names,
-        &mut mbar_stages,
-        &mut mbar_idx,
-        &mbar_default,
-    );
-    // Give peers stable readable names derived from their base mbar name.
-    let peer_names: HashMap<u32, String> = peer_names
-        .into_keys()
-        .map(|id| {
-            let base = mbar_names.get(&id).cloned().unwrap_or_default();
-            (id, format!("peer_{base}"))
-        })
-        .collect();
+    walk_mbars(&k.body, &mut mbar_names, &mut mbar_idx, &mbar_default);
 
     // cta_group from the cluster size (the bootstrap is cta_group=2).
     let cta_group = k.cluster_shape.iter().product::<usize>().max(1) as u8;
-
-    // The TMA-load completion barriers to leader-route, from the IR's explicit
-    // `MBar::leader_routed` flag (validate has already checked each carries a
-    // peer reference and is only used by TmaLoad/expect_tx). Routing both CTAs'
-    // TMA to the leader's copy of each barrier (and waiting only the local
-    // copy) is the legal substitute for the peer wait, AND the prerequisite for
-    // multicast loads — a `multicast::cluster` copy's per-destination
-    // transaction count must accumulate on the single leader barrier (the
-    // `* cta_group` leader expect_tx accounts for it).
-    let mut tma_leader_mbars: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    fn find_leader_mbars(stmts: &[Stmt], out: &mut std::collections::HashSet<u32>) {
-        for s in stmts {
-            if let Stmt::MBarDef { mbar } = s {
-                if mbar.leader_routed {
-                    out.insert(mbar.id);
-                }
-            }
-            for body in s.child_bodies() {
-                find_leader_mbars(body, out);
-            }
-        }
-    }
-    find_leader_mbars(&k.body, &mut tma_leader_mbars);
 
     // The single TMEM view buffer spans every allocated column band:
     // `max(base_col + n_cols)` over the kernel's TmemAllocs.
@@ -1792,6 +1409,7 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
                 base_col,
                 n_cols,
                 cta_group: _,
+                addr_byte_offset: _,
             } = s
             {
                 let end = (*base_col + *n_cols) as usize;
@@ -1974,8 +1592,6 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
     Ok(Ctx {
         names,
         mbar_names,
-        peer_names,
-        mbar_stages,
         var_names: HashMap::new(),
         scalar_names,
         cta_group,
@@ -1986,7 +1602,6 @@ fn build_ctx(k: &Kernel) -> Result<Ctx, String> {
         tmem_16_views,
         needs_tmem_f,
         tma_partial_smem,
-        tma_leader_mbars,
         num_clusters: (k.launch_cta_count() / (cta_group as usize).max(1)).max(1),
         sf_views,
         sf,
@@ -2670,65 +2285,6 @@ fn atom_frag_cols(shape: &str, width: usize, dtype: DType) -> Result<usize, Stri
     Ok(k)
 }
 
-/// Every MBarRef a statement names (for peer discovery).
-fn stmt_mbar_refs(s: &Stmt) -> Vec<&super::mbar::MBarRef> {
-    use Stmt::*;
-    match s {
-        MBarrierInit {
-            mbar,
-            count: _,
-            stage: _,
-        }
-        | MBarrierArrive {
-            mbar,
-            stage: _,
-            count: _,
-        }
-        | MBarrierWait {
-            mbar,
-            stage: _,
-            phase: _,
-        }
-        | MBarrierExpectTx {
-            mbar,
-            bytes: _,
-            stage: _,
-        }
-        | MBarrierArriveExpectTx {
-            mbar,
-            bytes: _,
-            stage: _,
-        }
-        | Tcgen05Commit {
-            mbar,
-            stage: _,
-            cta_group: _,
-            multicast_cta_mask: _,
-        } => vec![mbar],
-        TmaLoad {
-            dst: _,
-            src: _,
-            mbar,
-            coords: _,
-            shape: _,
-            gmem_shape: _,
-            mbar_stage: _,
-            multicast_cta_mask: _,
-            cache_hint: _,
-            prefetch_tensormap: _,
-            cta_group: _,
-        } => vec![mbar],
-        ClcTryCancel {
-            scheduler: _,
-            handle: _,
-            mbar,
-            stage: _,
-            cta_group: _,
-        } => vec![mbar],
-        _ => vec![],
-    }
-}
-
 // ===========================================================================
 // scalar / slice sub-printers
 // ===========================================================================
@@ -3197,52 +2753,8 @@ fn emit_tmem_dst(op: &TmemOperand, n: u32, m: u32, ctx: &Ctx) -> Result<String, 
 // statement walk
 // ===========================================================================
 
-/// Emit one top-level unit (a plain stmt or a chained decision tree).
-fn emit_top_unit(
-    out: &mut Emitter,
-    unit: &TopUnit,
-    indent: usize,
-    ctx: &Ctx,
-    scope: &ScopeInfo,
-) -> Result<(), String> {
-    match unit {
-        TopUnit::Stmt(s) => emit_stmt(out, s, indent, ctx, scope),
-        TopUnit::Chain(c) => emit_if_chain(out, c, indent, ctx, scope),
-    }
-}
-
-/// Emit a chained if/else decision tree of warp/warpgroup-equality branches
-/// (canon's role-dispatch shape). The `else` arm nests the next chain link; a
-/// branch's warp-level `inner` chain emits at the end of its body.
-fn emit_if_chain(
-    out: &mut Emitter,
-    chain: &IfChain,
-    indent: usize,
-    ctx: &Ctx,
-    scope: &ScopeInfo,
-) -> Result<(), String> {
-    let p = pad(indent);
-    let child = child_scope_info(&chain.cond, scope, ctx.num_warps);
-    out.push_str(&format!("{p}if {}:\n", emit_scalar(&chain.cond, ctx)?));
-    emit_body(out, &chain.body, indent + 1, ctx, &child)?;
-    if let Some(inner) = &chain.inner {
-        emit_if_chain(out, inner, indent + 1, ctx, &child)?;
-    }
-    if let Some(e) = &chain.else_ {
-        out.push_str(&format!("{p}else:\n"));
-        emit_if_chain(out, e, indent + 1, ctx, scope)?;
-    }
-    Ok(())
-}
-
-/// Emit a statement list. Every body walk goes through here so the run-level
-/// coalescings below apply uniformly at any nesting depth.
-///
-/// Coalesces the fence/sync that follows a run of consecutive `MBarrierWait`s:
-/// the template issues all the `try_wait`s, then ONE
-/// `tcgen05.fence.after_thread_sync()` + ONE `T.cuda.cta_sync()` — and only at
-/// function scope (inside a single-warp/wg branch not all CTA threads reach a
-/// CTA-wide `__syncthreads`).
+/// Emit a statement list exactly in IR order. No statement is skipped,
+/// coalesced, or supplemented with code that is absent from the IR.
 fn emit_body(
     out: &mut Emitter,
     stmts: &[Stmt],
@@ -3250,63 +2762,8 @@ fn emit_body(
     ctx: &Ctx,
     scope: &ScopeInfo,
 ) -> Result<(), String> {
-    let p = pad(indent);
-    let mut i = 0;
-    while i < stmts.len() {
-        if matches!(stmts[i], Stmt::MBarrierWait { .. }) {
-            // Emit every `try_wait` in the run, then one fence. The
-            // `T.cuda.cta_sync()` (a CTA-wide `__syncthreads`) is only emitted at
-            // function scope: inside a single-warp / single-warpgroup branch not
-            // all CTA threads reach it, so the barrier would deadlock / raise an
-            // illegal instruction. Within one branch the threads are already
-            // lockstep and the mbarrier wait gives the async-engine ordering.
-            //
-            // A *peer* wait (remote_coord set, i.e. a `try_wait` on a
-            // `map_shared_rank`-remapped DSMEM address) is SKIPPED:
-            // `mbarrier.try_wait` is only legal on a local shared address, so
-            // the remapped form raises `cudaErrorIllegalInstruction` on sm_100
-            // (verified). The peer CTA's TMA completion is instead ordered by
-            // routing BOTH CTAs' TMA loads to the leader CTA's single barrier
-            // (the canonical cta_group=2 pattern): each CTA's `Tx.copy_async`
-            // signals the leader's barrier via `map_shared_rank(.., 0)`, the
-            // leader issues one `arrive.expect_tx` for the FULL cluster byte
-            // count, and waits its OWN local barrier (which both CTAs fill).
-            // See `TmaLoad` / `MBarrierArriveExpectTx`.
-            let mut j = i;
-            let mut emitted_any = false;
-            while j < stmts.len() && matches!(stmts[j], Stmt::MBarrierWait { .. }) {
-                if let Stmt::MBarrierWait { mbar, phase, stage } = &stmts[j] {
-                    if mbar.remote_coord.is_none() {
-                        let slot_ptr = mbar_slot_ptr(mbar, stage, ctx)?;
-                        let phase_s = phase
-                            .as_ref()
-                            .map(|ph| emit_scalar(ph, ctx))
-                            .transpose()?
-                            .unwrap_or_else(|| "0".to_string());
-                        out.push_str(&format!(
-                            "{p}T.ptx.mbarrier.try_wait({slot_ptr}, {phase_s})\n"
-                        ));
-                        emitted_any = true;
-                    }
-                }
-                j += 1;
-            }
-            if emitted_any && scope.is_function() {
-                // Fence + cta_sync ONLY at function (prologue) scope, where the mbarrier-init
-                // visibility ordering across the whole CTA needs it. In branch scope (the hot
-                // MMA / loader / epilogue loops) the mbarrier handshake alone orders the async
-                // engines (TMA→smem_full→MMA, MMA→tmem_full→epilogue) — exactly as the canonical
-                // kernel does, which emits ZERO `tcgen05.fence.after_thread_sync()` after its
-                // loop waits. Emitting one per wait over-fenced the hot loop: the FENCE/MEMBAR
-                // serialized MMA issue and left the tensor core idle, the exact bench gap.
-                out.push_str(&format!("{p}T.ptx.tcgen05.fence.after_thread_sync()\n"));
-                out.push_str(&format!("{p}T.cuda.cta_sync()\n"));
-            }
-            i = j;
-            continue;
-        }
-        emit_stmt(out, &stmts[i], indent, ctx, scope)?;
-        i += 1;
+    for stmt in stmts {
+        emit_stmt(out, stmt, indent, ctx, scope)?;
     }
     Ok(())
 }
@@ -3459,6 +2916,7 @@ fn emit_stmt(
             base_col,
             n_cols,
             cta_group,
+            addr_byte_offset: _,
         } => {
             if *base_col != 0 {
                 return Err(format!(
@@ -3532,26 +2990,13 @@ fn emit_stmt(
                 // So the narrowing applies only to loop-free (one-time) bodies.
                 let thread_rank0 = !body_has_loop(then_body)
                     && child.set.as_ref().and_then(|s| s.single_thread()) == Some((0, 0));
-                // `barrier.cluster.wait` is WARP-COLLECTIVE and deadlocks when
-                // only the elected lane waits: peel any leading
-                // ClusterBarrierWaits out of the elect to the enclosing (warp)
-                // scope, exactly like #18 peeled them out of an elected Role.
-                let n_lead = then_body
-                    .iter()
-                    .take_while(|s| matches!(s, Stmt::ClusterBarrierWait))
-                    .count();
-                for _ in 0..n_lead {
-                    out.push_str(&format!(
-                        "{p}T.ptx.barrier.cluster.wait(acquire=True, aligned=False)\n"
-                    ));
-                }
                 let guard = if thread_rank0 {
                     "T.cuda.thread_rank() == 0"
                 } else {
                     "T.ptx.elect_sync()"
                 };
                 out.push_str(&format!("{p}if {guard}:\n"));
-                emit_body(out, &then_body[n_lead..], indent + 1, ctx, &child)?;
+                emit_body(out, then_body, indent + 1, ctx, &child)?;
                 return Ok(());
             }
             out.push_str(&format!("{p}if {}:\n", emit_scalar(cond, ctx)?));
@@ -3816,36 +3261,19 @@ fn emit_stmt(
             )
         }
         MBarrierArriveExpectTx { mbar, bytes, stage } => {
-            // Cluster TMA barrier (leader-routed): issue ONE expect_tx on the leader's
-            // (CTA-0) barrier for the FULL cluster byte count (both CTAs' loads land
-            // here), and only on the leader CTA (cbx==0) so it is counted once. The IR's
-            // `bytes` is the per-CTA byte count, so multiply by cta_group. The `cbx == 0`
-            // selection is IR-driven (the mbar's `leader_routed` flag), not inferred;
-            // the single-lane issue itself must come from an explicit elected `If`.
-            if let Some(view) = ctx.tma_leader_view_for(mbar.mbar.id) {
-                let slot = stage
-                    .as_ref()
-                    .map(|s| emit_scalar(s, ctx))
-                    .transpose()?
-                    .unwrap_or_else(|| "0".to_string());
-                let total_bytes = *bytes as u64 * ctx.cta_group as u64;
-                out.push_str(&format!("{p}if cbx == 0:\n"));
-                return emit_single_issue(
-                    out,
-                    &format!("{p}    "),
-                    scope,
-                    "mbarrier.arrive.expect_tx (leader-routed)",
-                    &format!(
-                        "T.ptx.mbarrier.arrive.expect_tx({view}.ptr_to([{slot}]), {total_bytes})"
-                    ),
-                );
-            }
-            // Local (non-leader) expect_tx is PER-THREAD (the interpreter arrives
-            // and adds tx once per executing lane; the gdn kernel elects one lane
-            // explicitly). No guard may be inferred.
-            let slot_ptr = mbar_slot_ptr(mbar, stage, ctx)?;
+            // The MBarRef is the complete address authority. A remote ref uses
+            // the intrinsic's explicit cluster target; bytes stay literal.
+            let slot_ptr = local_mbar_slot_ptr(mbar, stage, ctx)?;
+            let remote = mbar
+                .remote_coord
+                .as_ref()
+                .map(|coord| emit_scalar(coord, ctx))
+                .transpose()?;
+            let args = remote
+                .map(|coord| format!(", remote={coord}, pred=True"))
+                .unwrap_or_default();
             out.push_str(&format!(
-                "{p}T.ptx.mbarrier.arrive.expect_tx({slot_ptr}, {bytes})\n"
+                "{p}T.ptx.mbarrier.arrive.expect_tx({slot_ptr}, {bytes}{args})\n"
             ));
             Ok(())
         }
@@ -3859,16 +3287,6 @@ fn emit_stmt(
             Ok(())
         }
         MBarrierArrive { mbar, count, stage } => {
-            // Two arrive forms:
-            //   * LOCAL (remote_coord=None): the implicit count-of-1 form
-            //     `T.ptx.mbarrier.arrive(bar)`. (The 2nd positional arg is `remote`,
-            //     NOT a count — so a count must never be passed positionally here.)
-            //   * CROSS-CTA (remote_coord=Some(c)): the cluster form on the LOCAL
-            //     barrier of CTA `c`: `T.ptx.mbarrier.arrive(bar, remote=c, pred=True)`
-            //     — the canonical `tmem_pipe.empty.arrive(slot, remote=0, pred=True)`.
-            //     This is NOT the map_shared_rank peer view; the cluster arrive remaps
-            //     to CTA c internally, so we use the local mbar name + cta_id.
-            //
             // `mbarrier.arrive` is a PER-THREAD instruction: the interpreter
             // arrives once per executing lane, and the barrier's expected count
             // equals the number of lanes reaching the site (gdn's 128/32-lane
@@ -3880,44 +3298,23 @@ fn emit_stmt(
             // thread If narrows the executing lanes); the checker rejects any
             // over-arrival, so an unguarded per-thread emission cannot exceed
             // the validated count.
-            let body = if let Some(remote) = &mbar.remote_coord {
-                // Use the LOCAL barrier name (not the peer reinterpret view).
-                let local_name = ctx
-                    .mbar_names
-                    .get(&mbar.mbar.id)
-                    .cloned()
-                    .ok_or_else(|| format!("codegen: no name for mbar {}", mbar.mbar.id))?;
-                let slot = stage
-                    .as_ref()
-                    .map(|s| emit_scalar(s, ctx))
-                    .transpose()?
-                    .unwrap_or_else(|| "0".to_string());
-                format!(
-                    "T.ptx.mbarrier.arrive({local_name}.ptr_to([{slot}]), remote={cta}, pred=True)",
-                    cta = emit_scalar(remote, ctx)?,
-                )
+            let slot_ptr = local_mbar_slot_ptr(mbar, stage, ctx)?;
+            let count_arg = if as_int(count) == Some(1) {
+                String::new()
             } else {
-                let slot_ptr = mbar_slot_ptr(mbar, stage, ctx)?;
-                let cnt = as_int(count).unwrap_or(1);
-                if cnt == 1 {
-                    format!("T.ptx.mbarrier.arrive({slot_ptr})")
-                } else {
-                    // A local arrive with an explicit count>1 has no implicit form;
-                    // none occur in this kernel. Emit the count via the cluster form on
-                    // the local CTA (cta_id read from the runtime scope).
-                    format!("T.ptx.mbarrier.arrive({slot_ptr}, remote=cbx, pred=True, count={cnt})")
-                }
+                format!(", count={}", emit_scalar(count, ctx)?)
+            };
+            let body = match &mbar.remote_coord {
+                Some(remote) => format!(
+                    "T.ptx.mbarrier.arrive({slot_ptr}{count_arg}, remote={cta}, pred=True)",
+                    cta = emit_scalar(remote, ctx)?,
+                ),
+                None => format!("T.ptx.mbarrier.arrive({slot_ptr}{count_arg})"),
             };
             out.push_str(&format!("{p}{body}\n"));
             Ok(())
         }
         MBarrierWait { mbar, phase, stage } => {
-            // A peer (remote_coord) wait is skipped — illegal on a remapped DSMEM
-            // address; the peer's TMA is ordered via the leader-routed smem_full instead
-            // (see the coalescing note in `emit_body`). A local wait emits try_wait.
-            if mbar.remote_coord.is_some() {
-                return Ok(());
-            }
             let slot_ptr = mbar_slot_ptr(mbar, stage, ctx)?;
             let phase_s = phase
                 .as_ref()
@@ -3960,20 +3357,8 @@ fn emit_stmt(
                     cta_group, ctx.cta_group
                 ));
             }
-            // The completion mbarrier indexes the ring slot it signals. In cluster mode
-            // the TMA-load barrier is leader-routed: BOTH CTAs signal the LEADER's
-            // (CTA-0) barrier via its `_cta0` map_shared_rank(.., 0) view (identity on
-            // CTA 0, the remap on CTA 1), so the leader's MMA can wait its own local
-            // barrier instead of an (illegal) peer try_wait.
-            let mbar_name = ctx
-                .tma_leader_view_for(mbar.mbar.id)
-                .map(Ok)
-                .unwrap_or_else(|| mbar_buf_name(mbar, ctx))?;
-            let mbar_slot = mbar_stage
-                .as_ref()
-                .map(|s| emit_scalar(s, ctx))
-                .transpose()?
-                .unwrap_or_else(|| "0".to_string());
+            // The TMA completion target is exactly the MBarRef stored in IR.
+            let mbar_ptr = mbar_slot_ptr(mbar, mbar_stage, ctx)?;
             // The SMEM dst is a staged tile (a leading size-1 ring dim): drop it to an
             // integer index so the operand rank matches the 2D GMEM region.
             let dst_s = emit_smem_tile(dst, ctx)?;
@@ -3982,8 +3367,7 @@ fn emit_stmt(
             // SMEM of EVERY CTA in the mask (canon's `cta_mask=pair_mask` for the shared
             // SFB scale band), so the cluster shares ONE load instead of each CTA reading
             // the full band (halving the L2/TMA traffic). The completion's transaction
-            // count is added per multicast destination to the (leader-routed) barrier,
-            // which the `* cta_group` factor in the leader expect_tx already accounts for.
+            // count lands on exactly the mbar address carried by this operation.
             let cta_mask = match multicast_cta_mask {
                 Some(mask) => format!(", cta_mask={mask}"),
                 None => String::new(),
@@ -4010,7 +3394,7 @@ fn emit_stmt(
                 scope,
                 "tma_load",
                 &format!(
-                    "Tx.copy_async({dst_s}, {src_s}, dispatch=\"tma_auto\", mbar={mbar_name}.ptr_to([{mbar_slot}]), cta_group={cg}{cta_mask}{cache_hint_kw}{prefetch_kw})",
+                    "Tx.copy_async({dst_s}, {src_s}, dispatch=\"tma_auto\", mbar={mbar_ptr}, cta_group={cg}{cta_mask}{cache_hint_kw}{prefetch_kw})",
                     cg = ctx.cta_group,
                 ),
             )?;
@@ -4893,15 +4277,13 @@ fn emit_stmt(
             // it. If only the elected lane waits, the overlap path DEADLOCKS on
             // hardware (verified on 1024/2048) while the protocol checker still
             // passes (it models the wait as collective regardless of the codegen
-            // elect context). The elect-form `If` arm hoists a leading
-            // ClusterBarrierWait out of the elect to warp scope; reaching here
-            // under `Scope::Elected` means that hoist was bypassed — fail LOUDLY
-            // instead of emitting a silently-hanging kernel.
+            // elect context). Fail loudly instead of changing its IR scope or
+            // emitting a silently-hanging kernel.
             if matches!(scope.scope, Scope::Elected) {
                 return Err(
                     "codegen: ClusterBarrierWait under elect scope would emit a single-thread \
-                     barrier.cluster.wait (hardware deadlock). It must be hoisted to warp scope \
-                     (all threads of the warp), like canon's pre-elect cluster.wait."
+                     barrier.cluster.wait (hardware deadlock). Put it explicitly at warp scope \
+                     (all threads of the warp) in the IR."
                         .to_string(),
                 );
             }
@@ -5483,33 +4865,41 @@ fn emit_stmt(
     }
 }
 
-/// mbar buffer name, picking the peer name if remote_coord is set.
-fn mbar_buf_name(mref: &super::mbar::MBarRef, ctx: &Ctx) -> Result<String, String> {
-    if mref.remote_coord.is_some() {
-        if let Some(n) = ctx.peer_names.get(&mref.mbar.id) {
-            return Ok(n.clone());
-        }
-    }
-    ctx.mbar_names
-        .get(&mref.mbar.id)
-        .cloned()
-        .ok_or_else(|| format!("codegen: no name for mbar {}", mref.mbar.id))
-}
-
-/// `NAME.ptr_to([slot])` for an mbar op — the slot is the op's `stage` scalar (a
-/// multi-stage ring barrier), or `0` for a single-stage mbar.
-fn mbar_slot_ptr(
+/// Local `NAME.ptr_to([slot])` for the mbar object named by a reference.
+fn local_mbar_slot_ptr(
     mref: &super::mbar::MBarRef,
     stage: &Option<ScalarValue>,
     ctx: &Ctx,
 ) -> Result<String, String> {
-    let name = mbar_buf_name(mref, ctx)?;
+    let name = ctx
+        .mbar_names
+        .get(&mref.mbar.id)
+        .cloned()
+        .ok_or_else(|| format!("codegen: no name for mbar {}", mref.mbar.id))?;
     let slot = stage
         .as_ref()
         .map(|s| emit_scalar(s, ctx))
         .transpose()?
         .unwrap_or_else(|| "0".to_string());
     Ok(format!("{name}.ptr_to([{slot}])"))
+}
+
+/// Pointer for the exact MBarRef carried by an operation. A local ref is the
+/// local buffer pointer; a remote ref maps that same slot to its explicit
+/// `remote_coord`. No mbar-id-based routing or cached peer identity exists.
+fn mbar_slot_ptr(
+    mref: &super::mbar::MBarRef,
+    stage: &Option<ScalarValue>,
+    ctx: &Ctx,
+) -> Result<String, String> {
+    let local = local_mbar_slot_ptr(mref, stage, ctx)?;
+    match &mref.remote_coord {
+        Some(remote) => Ok(format!(
+            "T.reinterpret(\"handle\", T.ptx.map_shared_rank({local}, {coord}))",
+            coord = emit_scalar(remote, ctx)?,
+        )),
+        None => Ok(local),
+    }
 }
 
 /// Build the GMEM TMA region from src tensor + coords + the GMEM tile extents.
@@ -5621,10 +5011,9 @@ mod tests {
             args: vec![gmem_arg(0)],
             body,
             num_warps,
-            smem_size_bytes: 0,
+            smem_size_bytes: 1 << 20,
             launch_shape: vec![2],
             cluster_shape: vec![2],
-            smem_pool: false,
         }
     }
 
@@ -5855,80 +5244,44 @@ mod tests {
         assert!(!src.contains("s0 ="), "{src}");
     }
 
-    /// Adjacent top-level warp/warpgroup-equality `If`s re-nest into the if/else
-    /// dispatch tree (canon's role dispatch), partitioned by warpgroup: warp
-    /// branches chain inside their warpgroup branch, groups chain in
-    /// first-occurrence order. Non-adjacent Ifs stay flat.
+    /// Top-level IR `If`s remain top-level siblings, in source order. Codegen
+    /// must not synthesize parent guards, merge duplicate predicates, or turn
+    /// sibling branches into an if/else tree.
     #[test]
-    fn top_level_equality_ifs_chain_by_warpgroup() {
-        // 8 warps. [warp 5, warp 4, wg 0]: warps 4/5 are group 1, wg 0 is
-        // group 0. First-occurrence order: group 1, then group 0.
+    fn top_level_ifs_preserve_structure_and_order() {
         let body = vec![
-            warp_if(5, vec![Stmt::WarpSync]),
+            wg_if(1, vec![Stmt::SetMaxNReg { nreg: 232 }]),
             warp_if(4, vec![Stmt::WarpSync]),
-            wg_if(0, vec![Stmt::WarpSync]),
+            warp_if(5, vec![Stmt::WarpSync]),
+            warp_if(4, vec![Stmt::WgSync { barrier_id: 7 }]),
         ];
+        let src = kernel_to_tirx_source(&kernel_n(body, 8)).unwrap();
+        let expected = "\
+    if wg_id == 1:
+        T.ptx.setmaxnreg(True, 232)
+    if warp_id == 4:
+        T.cuda.warp_sync()
+    if warp_id == 5:
+        T.cuda.warp_sync()
+    if warp_id == 4:
+        T.cuda.warpgroup_sync(7)
+";
+        assert!(src.contains(expected), "{src}");
+        assert!(!src.contains("    else:"), "{src}");
+        assert_eq!(src.matches("    if warp_id == 4:\n").count(), 2, "{src}");
+    }
+
+    /// Nesting is emitted only when nesting exists in the IR.
+    #[test]
+    fn nested_ifs_preserve_structure() {
+        let body = vec![wg_if(1, vec![warp_if(5, vec![Stmt::WarpSync])])];
         let src = kernel_to_tirx_source(&kernel_n(body, 8)).unwrap();
         let expected = "\
     if wg_id == 1:
         if warp_id == 5:
             T.cuda.warp_sync()
-        else:
-            if warp_id == 4:
-                T.cuda.warp_sync()
-    else:
-        if wg_id == 0:
-            T.cuda.warp_sync()
 ";
         assert!(src.contains(expected), "{src}");
-
-        // A warpgroup-equality `If` in the same group is the group PREFIX: its
-        // body runs first, the warp chain nests inside the same branch.
-        let body = vec![
-            wg_if(1, vec![Stmt::WgSync { barrier_id: 3 }]),
-            warp_if(5, vec![Stmt::WgSync { barrier_id: 4 }]),
-        ];
-        let src = kernel_to_tirx_source(&kernel_n(body, 8)).unwrap();
-        let expected = "\
-    if wg_id == 1:
-        T.cuda.warpgroup_sync(3)
-        if warp_id == 5:
-            T.cuda.warpgroup_sync(4)
-";
-        assert!(src.contains(expected), "{src}");
-        // No else arm — every warpgroup was covered by the one group.
-        assert!(!src.contains("else:"), "{src}");
-    }
-
-    /// A lone equality `If` (or a run broken by a non-equality stmt) stays flat.
-    #[test]
-    fn broken_if_runs_stay_flat() {
-        let body = vec![
-            warp_if(0, vec![Stmt::WarpSync]),
-            Stmt::CtaSync,
-            warp_if(1, vec![Stmt::WarpSync]),
-        ];
-        let src = kernel_to_tirx_source(&kernel(body)).unwrap();
-        assert!(src.contains("if warp_id == 0:"), "{src}");
-        assert!(src.contains("if warp_id == 1:"), "{src}");
-        assert!(!src.contains("else:"), "{src}");
-    }
-
-    /// A run whose group mixes a warp-level `If` BEFORE its warpgroup-level
-    /// `If` must NOT chain — chaining would reorder the warpgroup body ahead
-    /// of the warp body (observed: TMA issue moved after the mbarrier wait →
-    /// deadlock). The run emits flat, preserving source order.
-    #[test]
-    fn warp_before_warpgroup_run_stays_flat() {
-        let body = vec![
-            warp_if(1, vec![Stmt::WarpSync]),
-            wg_if(0, vec![Stmt::WgSync { barrier_id: 3 }]),
-        ];
-        let src = kernel_to_tirx_source(&kernel_n(body, 8)).unwrap();
-        let warp_pos = src.find("if warp_id == 1:").unwrap();
-        let wg_pos = src.find("if wg_id == 0:").unwrap();
-        assert!(warp_pos < wg_pos, "{src}");
-        assert!(!src.contains("else:"), "{src}");
     }
 
     /// The `if_elected` sugar emits `if T.ptx.elect_sync():` inside a warp
@@ -5942,8 +5295,8 @@ mod tests {
             id: 3,
             kind: MBarKind::Thread,
             stages: 1,
+            byte_offset: 800_024,
             arrive_count: None,
-            leader_routed: false,
         });
         let init = || Stmt::MBarrierInit {
             mbar: MBarRef {
@@ -5993,26 +5346,19 @@ mod tests {
         assert!(!src.contains("if T.cuda.thread_rank() == 0:"), "{src}");
     }
 
-    /// A `ClusterBarrierWait` directly inside an elect-form `If` peels out of
-    /// the elect (warp-collective; the elected-lane wait deadlocks). Any other
-    /// position under single-thread scope fails closed.
+    /// A warp-collective `ClusterBarrierWait` under an elect-form `If` fails
+    /// closed wherever it appears. Codegen must not hoist it out of the IR
+    /// branch to make the program legal.
     #[test]
-    fn cluster_barrier_wait_peels_out_of_the_elect() {
-        let peeled = kernel_to_tirx_source(&kernel(vec![warp_if(
-            1,
-            vec![elected_if(vec![Stmt::ClusterBarrierWait, Stmt::WarpSync])],
-        )]))
-        .unwrap();
-        let wait = peeled.find("T.ptx.barrier.cluster.wait").unwrap();
-        let elect = peeled.find("if T.ptx.elect_sync():").unwrap();
-        assert!(wait < elect, "{peeled}");
-
-        let nested = kernel(vec![warp_if(
-            1,
-            vec![elected_if(vec![Stmt::WarpSync, Stmt::ClusterBarrierWait])],
-        )]);
-        let err = kernel_to_tirx_source(&nested).unwrap_err();
-        assert!(err.contains("deadlock"), "{err}");
+    fn cluster_barrier_wait_under_elect_is_not_hoisted() {
+        for body in [
+            vec![Stmt::ClusterBarrierWait, Stmt::WarpSync],
+            vec![Stmt::WarpSync, Stmt::ClusterBarrierWait],
+        ] {
+            let nested = kernel(vec![warp_if(1, vec![elected_if(body)])]);
+            let err = kernel_to_tirx_source(&nested).unwrap_err();
+            assert!(err.contains("Put it explicitly at warp scope"), "{err}");
+        }
     }
 
     // ------------------------------------------------------------------
@@ -6027,6 +5373,7 @@ mod tests {
             base_col,
             n_cols,
             cta_group,
+            addr_byte_offset: 900_000,
         }
     }
 
@@ -6383,7 +5730,7 @@ mod tests {
             dtype,
             shape: shape.to_vec(),
             layout: None,
-            byte_offset: None,
+            byte_offset: Some(0),
             reg_frag: None,
         })
     }
@@ -6612,8 +5959,8 @@ mod tests {
             id: 3,
             kind: MBarKind::Thread,
             stages: 1,
+            byte_offset: 800_024,
             arrive_count: None,
-            leader_routed: false,
         });
         let mref = || MBarRef {
             mbar: mbar.clone(),
@@ -6656,8 +6003,8 @@ mod tests {
             id: 4,
             kind: MBarKind::Tma,
             stages: 1,
+            byte_offset: 800_032,
             arrive_count: None,
-            leader_routed: false,
         });
         let mref = || MBarRef {
             mbar: mbar.clone(),
@@ -6715,6 +6062,61 @@ mod tests {
         assert!(!src.contains("if T.ptx.elect_sync():"), "{src}");
         assert!(!src.contains("if tid_in_wg == 0:"), "{src}");
         assert!(!src.contains("if T.cuda.thread_rank() == 0:"), "{src}");
+    }
+
+    /// Each MBarRef is its own complete address. Codegen must preserve both
+    /// remote coordinates literally, without mbar-id routing or byte scaling.
+    #[test]
+    fn mbar_refs_lower_remote_coords_without_inference() {
+        use super::super::dtype::MBarKind;
+        use super::super::mbar::{MBar, MBarRef};
+        let mbar = Arc::new(MBar {
+            id: 4,
+            kind: MBarKind::Tma,
+            stages: 1,
+            byte_offset: 800_032,
+            arrive_count: None,
+        });
+        let src = kernel_to_tirx_source(&kernel(vec![
+            Stmt::MBarDef { mbar: mbar.clone() },
+            wg_if(
+                0,
+                vec![elected_if(vec![
+                    Stmt::MBarrierArriveExpectTx {
+                        mbar: MBarRef {
+                            mbar: mbar.clone(),
+                            remote_coord: Some(ScalarValue::Int(0)),
+                        },
+                        bytes: 64,
+                        stage: None,
+                    },
+                    Stmt::MBarrierWait {
+                        mbar: MBarRef {
+                            mbar,
+                            remote_coord: Some(ScalarValue::Int(1)),
+                        },
+                        phase: Some(ScalarValue::Int(0)),
+                        stage: None,
+                    },
+                ])],
+            ),
+        ]))
+        .unwrap();
+
+        assert!(
+            src.contains(
+                "T.ptx.mbarrier.arrive.expect_tx(smem_full.ptr_to([0]), 64, remote=0, pred=True)"
+            ),
+            "{src}"
+        );
+        assert!(
+            src.contains(
+                "T.ptx.mbarrier.try_wait(T.reinterpret(\"handle\", \
+                 T.ptx.map_shared_rank(smem_full.ptr_to([0]), 1)), 0)"
+            ),
+            "{src}"
+        );
+        assert!(!src.contains("if cbx == 0:"), "{src}");
     }
 
     #[test]

@@ -80,6 +80,10 @@ def _ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
+def _align(value: int, alignment: int) -> int:
+    return (value + alignment - 1) // alignment * alignment
+
+
 def _sl(t, offs, shape):
     return TensorSlice(tensor=t, offsets=offs, shape=shape)
 
@@ -178,11 +182,7 @@ PROTOCOL_CONFIGS = [
 # (1- and 2-chunk) keep the dev-loop gate fast — the full-shape protocol sweep
 # runs in the value-sim's own extended tier, not on every dev iteration.
 CONFIGS_SUPPORTED = [
-    {"num_seqs": ns, "seqlen": T, "label": f"ns{ns}_t{T}"}
-    for ns, T in [
-        (1, 64),
-        (1, 128),
-    ]
+    {"num_seqs": ns, "seqlen": T, "label": f"ns{ns}_t{T}"} for ns, T in [(1, 64), (1, 128)]
 ]
 
 # Head configs = flashinfer test_prefill_delta_rule.py num_q/k/v_heads (head_dim=128).
@@ -285,8 +285,61 @@ def build_gdn_prefill(config: GdnPrefillConfig = GdnPrefillConfig()) -> Kernel:
     # _read128_vnew writes NV into vnewt; ainv (8KB) fits in vnewt (16KB).
     offs["ainv"] = offs["vnewt"]
 
+    # mbarrier.arrive is PER-THREAD: each producer thread arrives once after its
+    # own rows/reads land, so a completed phase proves every arriving lane finished
+    # without a producer-side sync (the fa4 audit pattern). Counts = number of arriving lanes.
+    CG0_T = 128  # CG0 arrives are warpgroup-wide (warps 0-3)
+    CG1_T = 128  # CG1 arrives are warpgroup-wide (warps 4-7)
+    GATE_T = 32  # gate warp arrives warp-wide (each lane signs off its gcs/beta lanes)
+    # (barrier name -> (kind, arrival count)) for the 12-warp producer/consumer pipeline.
+    KSTAGES = 2  # K is double-buffered (flashinfer smem_k_stages=2): prefetch next chunk
+    bar_spec = {
+        "tk": (MBarKind.TMA, 1, KSTAGES),  # K full (2 stages)
+        # K empty: armed by the MMA PIPELINE (tcgen05_commit after GEMM7) — a
+        # thread arrive right after the issue would release the stage while the
+        # engine may still be reading it (the fp16 gemm operand-release rule).
+        "k_free": (MBarKind.TCGEN05, 1, KSTAGES),
+        "tq": (MBarKind.TMA, 1),
+        "tv": (MBarKind.TMA, 1),
+        "tg": (MBarKind.TMA, 1),
+        "tb": (MBarKind.TMA, 1),
+        "d_kk": (MBarKind.TCGEN05, 1),
+        "d_qk": (MBarKind.TCGEN05, 1),
+        "d_ks": (MBarKind.TCGEN05, 1),
+        "d_qs": (MBarKind.TCGEN05, 1),
+        "d_nv": (MBarKind.TCGEN05, 1),
+        "d_oi": (MBarKind.TCGEN05, 1),
+        "d_ds": (MBarKind.TCGEN05, 1),
+        "gate_ready0": (MBarKind.THREAD, GATE_T),
+        "gate_ready1": (MBarKind.THREAD, GATE_T),
+        "ainv_ready": (MBarKind.THREAD, CG0_T),
+        "qkv_ready": (MBarKind.THREAD, CG0_T),
+        "sT_ready": (MBarKind.THREAD, CG1_T),
+        "delta_ready": (MBarKind.THREAD, CG1_T),
+        "vnew_ready": (MBarKind.THREAD, CG1_T),
+        "ktvng_ready": (MBarKind.THREAD, CG1_T),
+        "o_ready": (MBarKind.THREAD, CG1_T),
+        "f_kk": (MBarKind.THREAD, CG0_T),
+        "f_qk": (MBarKind.THREAD, CG0_T),
+        "f_ks": (MBarKind.THREAD, CG1_T),
+        "f_qs": (MBarKind.THREAD, CG1_T),
+        "f_nv": (MBarKind.THREAD, CG1_T),
+        "f_oi": (MBarKind.THREAD, CG1_T),
+        "chunk_free": (MBarKind.THREAD, CG1_T + 1),
+    }
+    cursor = _align(off, 8)
+    bar_offsets = {}
+    for name, spec in bar_spec.items():
+        bar_offsets[name] = cursor
+        cursor += (spec[2] if len(spec) > 2 else 1) * 8
+    tmem_addr_offset = _align(cursor, 4)
+    smem_size_bytes = tmem_addr_offset + 4
+
     k = IRBuilder(
-        "nymph_gdn_prefill", num_warps=NUM_WARPS, smem_size_bytes=off, launch_shape=launch_shape
+        "nymph_gdn_prefill",
+        num_warps=NUM_WARPS,
+        smem_size_bytes=smem_size_bytes,
+        launch_shape=launch_shape,
     )
 
     q_g = k.arg(space=MemorySpace.GMEM, dtype=iod, shape=(total_t, H_Q, K_DIM))
@@ -390,53 +443,10 @@ def build_gdn_prefill(config: GdnPrefillConfig = GdnPrefillConfig()) -> Kernel:
     dexp2 = reg(DType.F32, (2,))
     kgate2 = reg(DType.F32, (2,))
 
-    # mbarrier.arrive is PER-THREAD: each producer thread arrives once after its
-    # own rows/reads land, so a completed phase proves every arriving lane finished
-    # without a producer-side sync (the fa4 audit pattern). Counts = number of arriving lanes.
-    CG0_T = 128  # CG0 arrives are warpgroup-wide (warps 0-3)
-    CG1_T = 128  # CG1 arrives are warpgroup-wide (warps 4-7)
-    GATE_T = 32  # gate warp arrives warp-wide (each lane signs off its gcs/beta lanes)
-    # (barrier name -> (kind, arrival count)) for the 12-warp producer/consumer pipeline.
-    KSTAGES = 2  # K is double-buffered (flashinfer smem_k_stages=2): prefetch next chunk
-    bar_spec = {
-        "tk": (MBarKind.TMA, 1, KSTAGES),  # K full (2 stages)
-        # K empty: armed by the MMA PIPELINE (tcgen05_commit after GEMM7) — a
-        # thread arrive right after the issue would release the stage while the
-        # engine may still be reading it (the fp16 gemm operand-release rule).
-        "k_free": (MBarKind.TCGEN05, 1, KSTAGES),
-        "tq": (MBarKind.TMA, 1),
-        "tv": (MBarKind.TMA, 1),
-        "tg": (MBarKind.TMA, 1),
-        "tb": (MBarKind.TMA, 1),
-        "d_kk": (MBarKind.TCGEN05, 1),
-        "d_qk": (MBarKind.TCGEN05, 1),
-        "d_ks": (MBarKind.TCGEN05, 1),
-        "d_qs": (MBarKind.TCGEN05, 1),
-        "d_nv": (MBarKind.TCGEN05, 1),
-        "d_oi": (MBarKind.TCGEN05, 1),
-        "d_ds": (MBarKind.TCGEN05, 1),
-        "gate_ready0": (MBarKind.THREAD, GATE_T),
-        "gate_ready1": (MBarKind.THREAD, GATE_T),  # gate->CG0 / gate->CG1
-        "ainv_ready": (MBarKind.THREAD, CG0_T),  # CG0 -> MMA
-        "qkv_ready": (MBarKind.THREAD, CG0_T),  # CG0 -> MMA
-        "sT_ready": (MBarKind.THREAD, CG1_T),  # CG1 -> MMA (GEMM3/4)
-        "delta_ready": (MBarKind.THREAD, CG1_T),  # CG1 -> MMA (GEMM5)
-        "vnew_ready": (MBarKind.THREAD, CG1_T),  # CG1 -> MMA (GEMM6)
-        "ktvng_ready": (MBarKind.THREAD, CG1_T),  # CG1 -> MMA (GEMM7)
-        "o_ready": (MBarKind.THREAD, CG1_T),  # CG1 -> epilogue(11)
-        # per-GEMM acc-free (reader -> MMA, so the shared acc_tmem can be reused)
-        "f_kk": (MBarKind.THREAD, CG0_T),
-        "f_qk": (MBarKind.THREAD, CG0_T),
-        "f_ks": (MBarKind.THREAD, CG1_T),
-        "f_qs": (MBarKind.THREAD, CG1_T),
-        "f_nv": (MBarKind.THREAD, CG1_T),
-        "f_oi": (MBarKind.THREAD, CG1_T),
-        # CG1 (128 per-thread arrives) + epilogue (1 elected/lane-0 arrive) both
-        # free the chunk-c buffers.
-        "chunk_free": (MBarKind.THREAD, CG1_T + 1),
-    }
     bars = {
-        nm: k.mbar(kind=spec[0], stages=(spec[2] if len(spec) > 2 else 1))
+        nm: k.mbar(
+            kind=spec[0], byte_offset=bar_offsets[nm], stages=(spec[2] if len(spec) > 2 else 1)
+        )
         for nm, spec in bar_spec.items()
     }
 
@@ -445,7 +455,7 @@ def build_gdn_prefill(config: GdnPrefillConfig = GdnPrefillConfig()) -> Kernel:
     with k.if_warp(0):
         # tmem_alloc is warp-collective (full warp 0); mbarrier.init is
         # per-thread, so exactly one elected thread runs every init.
-        k.tmem_alloc(0, N_COLS_TMEM, 1)
+        k.tmem_alloc(0, N_COLS_TMEM, addr_byte_offset=tmem_addr_offset, cta_group=1)
         with k.if_elected():
             for nm, spec in bar_spec.items():
                 stg = spec[2] if len(spec) > 2 else 1
@@ -773,9 +783,13 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                     )  # GEMM1 W_kk -> stage 0
                     k.mbarrier_wait(bars["f_kk"], phase=ph(gc))
                     k.mbarrier_wait(bars["tq"], phase=ph(gc))
-                    issue(acc_s1, q_s, k_s, BT, BT, K_DIM, "d_qk", b_stg=kstg)  # GEMM2 W_qk -> stage 1
+                    issue(
+                        acc_s1, q_s, k_s, BT, BT, K_DIM, "d_qk", b_stg=kstg
+                    )  # GEMM2 W_qk -> stage 1
                     k.mbarrier_wait(bars["f_qk"], phase=ph(gc))
-                    with k.if_(c > 0):  # chunk 0: S_prev=0, skip GEMM3/4 (flashinfer is_first_chunk)
+                    with k.if_(
+                        c > 0
+                    ):  # chunk 0: S_prev=0, skip GEMM3/4 (flashinfer is_first_chunk)
                         # GEMM3/4 read the fp16 s_s (SMEM) as B=Sᵀ (trans_b); GEMM4 → q_state.
                         k.mbarrier_wait(bars["sT_ready"], phase=ph(gc_pos))
                         issue(
@@ -788,7 +802,9 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                         k.mbarrier_wait(bars["f_qs"], phase=ph(gc_pos))
                     k.mbarrier_wait(bars["ainv_ready"], phase=ph(gc))
                     k.mbarrier_wait(bars["delta_ready"], phase=ph(gc))
-                    with k.if_(c.eq(0)):  # chunk 0: S=0 → delta=v; read v_s directly (vᵀ via trans_b)
+                    with k.if_(
+                        c.eq(0)
+                    ):  # chunk 0: S=0 → delta=v; read v_s directly (vᵀ via trans_b)
                         issue(acc_tmem, ainv_s, v_s, BT, V_DIM, BT, "d_nv", trans_b=True)
                     with k.if_(c > 0):
                         issue(
@@ -1149,7 +1165,9 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                         )
                         k.cp_async_bulk_commit_group()
                         k.cp_async_bulk_wait_group_read(0)
-                        k.mbarrier_arrive(bars["chunk_free"])  # out_s freed for next chunk's o_inter
+                        k.mbarrier_arrive(
+                            bars["chunk_free"]
+                        )  # out_s freed for next chunk's o_inter
                         k.scalar_store(gc, gc + 1)
         else:
             # varlen: the partial last chunk's OOB rows must NOT be stored (they'd overrun
@@ -1226,10 +1244,7 @@ def _read128_delta(
                     _sl(v_frag, (32 * blk + 16 * va + 8 * half,), (8,)),
                     _sl(
                         v_s,
-                        (
-                            16 * warp + 8 * va + lane % 8,
-                            blk * 64 + 32 * half + 8 * (lane // 8),
-                        ),
+                        (16 * warp + 8 * va + lane % 8, blk * 64 + 32 * half + 8 * (lane // 8)),
                         (1, 8),
                     ),
                     num=4,
@@ -1409,10 +1424,7 @@ def _flashinfer_callable(data: dict, num_seqs: int, neff: int = HV):
 
 
 def _compile_nymph(
-    seq_lens: list[int],
-    io_dtype: str = "bfloat16",
-    num_q_heads: int = HQK,
-    num_v_heads: int = HV,
+    seq_lens: list[int], io_dtype: str = "bfloat16", num_q_heads: int = HQK, num_v_heads: int = HV
 ):
     """kernel_to_tirx_source -> tvm.compile, mirroring nvfp4's _compile_nymph.
 
@@ -1563,11 +1575,7 @@ def run_bench(
             f"(cos_out={cos_o:.4f} cos_state={cos_s:.4f}, need >= {_CORRECTNESS_COSINE})"
         )
     return bench(
-        {"tir": fi_run, "tirx": nymph_run},
-        warmup=warmup,
-        repeat=repeat,
-        timer=timer,
-        **kwargs,
+        {"tir": fi_run, "tirx": nymph_run}, warmup=warmup, repeat=repeat, timer=timer, **kwargs
     )
 
 

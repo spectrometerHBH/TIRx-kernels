@@ -1570,12 +1570,12 @@ pub struct PyMBar(pub Arc<ir::MBar>);
 #[pymethods]
 impl PyMBar {
     #[new]
-    #[pyo3(signature = (kind, stages = 1, arrive_count = None, leader_routed = false))]
+    #[pyo3(signature = (kind, byte_offset, stages = 1, arrive_count = None))]
     fn new(
         kind: PyMBarKind,
+        byte_offset: usize,
         stages: u32,
         arrive_count: Option<u32>,
-        leader_routed: bool,
     ) -> PyResult<Self> {
         // Validate eagerly, like Python's MBar.__post_init__.
         if stages < 1 {
@@ -1594,8 +1594,8 @@ impl PyMBar {
             id: fresh_mbar_id(),
             kind: kind.into(),
             stages,
+            byte_offset,
             arrive_count,
-            leader_routed,
         })))
     }
     #[getter]
@@ -1607,12 +1607,12 @@ impl PyMBar {
         self.0.stages
     }
     #[getter]
-    fn arrive_count(&self) -> Option<u32> {
-        self.0.arrive_count
+    fn byte_offset(&self) -> usize {
+        self.0.byte_offset
     }
     #[getter]
-    fn leader_routed(&self) -> bool {
-        self.0.leader_routed
+    fn arrive_count(&self) -> Option<u32> {
+        self.0.arrive_count
     }
     #[getter]
     fn id(&self) -> u32 {
@@ -1637,6 +1637,14 @@ impl PyMBarRef {
     #[getter]
     fn mbar(&self) -> PyMBar {
         PyMBar(self.0.mbar.clone())
+    }
+    #[getter]
+    fn remote_coord(&self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+        self.0
+            .remote_coord
+            .as_ref()
+            .map(|coord| scalar_to_py(py, coord))
+            .transpose()
     }
 }
 
@@ -1824,7 +1832,23 @@ impl PyStmt {
             _ => Err(PyAttributeError::new_err("barrier_id")),
         }
     }
-    /// The mbar id of an mbarrier statement (init/arrive/expect_tx/wait).
+    /// The exact mbar reference carried by an mbarrier/TMA statement.
+    #[getter]
+    fn mbar(&self) -> PyResult<PyMBarRef> {
+        match &self.0 {
+            ir::Stmt::MBarrierInit { mbar, .. }
+            | ir::Stmt::MBarrierArrive { mbar, .. }
+            | ir::Stmt::MBarrierExpectTx { mbar, .. }
+            | ir::Stmt::MBarrierArriveExpectTx { mbar, .. }
+            | ir::Stmt::MBarrierWait { mbar, .. }
+            | ir::Stmt::TmaLoad { mbar, .. }
+            | ir::Stmt::ClcTryCancel { mbar, .. }
+            | ir::Stmt::CpAsyncBulkS2Cluster { mbar, .. }
+            | ir::Stmt::Tcgen05Commit { mbar, .. } => Ok(PyMBarRef(mbar.clone())),
+            _ => Err(PyAttributeError::new_err("mbar")),
+        }
+    }
+    /// The mbar id of an mbarrier/TMA statement.
     #[getter]
     fn mbar_id(&self) -> PyResult<u32> {
         match &self.0 {
@@ -1832,7 +1856,11 @@ impl PyStmt {
             | ir::Stmt::MBarrierArrive { mbar, .. }
             | ir::Stmt::MBarrierExpectTx { mbar, .. }
             | ir::Stmt::MBarrierArriveExpectTx { mbar, .. }
-            | ir::Stmt::MBarrierWait { mbar, .. } => Ok(mbar.mbar.id),
+            | ir::Stmt::MBarrierWait { mbar, .. }
+            | ir::Stmt::TmaLoad { mbar, .. }
+            | ir::Stmt::ClcTryCancel { mbar, .. }
+            | ir::Stmt::CpAsyncBulkS2Cluster { mbar, .. }
+            | ir::Stmt::Tcgen05Commit { mbar, .. } => Ok(mbar.mbar.id),
             _ => Err(PyAttributeError::new_err("mbar_id")),
         }
     }
@@ -1881,6 +1909,15 @@ impl PyStmt {
             | ir::Stmt::TmaLoad { cta_group, .. }
             | ir::Stmt::Tcgen05Commit { cta_group, .. } => Ok(*cta_group),
             _ => Err(PyAttributeError::new_err("cta_group")),
+        }
+    }
+    #[getter]
+    fn addr_byte_offset(&self) -> PyResult<usize> {
+        match &self.0 {
+            ir::Stmt::TmemAlloc {
+                addr_byte_offset, ..
+            } => Ok(*addr_byte_offset),
+            _ => Err(PyAttributeError::new_err("addr_byte_offset")),
         }
     }
     #[getter]
@@ -2002,12 +2039,13 @@ fn tensor_def(tensor: PyTensor) -> PyStmt {
     PyStmt(ir::Stmt::TensorDef { tensor: tensor.0 })
 }
 #[pyfunction]
-#[pyo3(name = "TmemAlloc", signature = (base_col, n_cols, cta_group = 1))]
-fn tmem_alloc(base_col: u32, n_cols: u32, cta_group: u8) -> PyStmt {
+#[pyo3(name = "TmemAlloc", signature = (base_col, n_cols, addr_byte_offset, cta_group = 1))]
+fn tmem_alloc(base_col: u32, n_cols: u32, addr_byte_offset: usize, cta_group: u8) -> PyStmt {
     PyStmt(ir::Stmt::TmemAlloc {
         base_col,
         n_cols,
         cta_group,
+        addr_byte_offset,
     })
 }
 #[pyfunction]
@@ -2839,7 +2877,7 @@ pub struct PyKernel(pub ir::Kernel);
 #[pymethods]
 impl PyKernel {
     #[new]
-    #[pyo3(signature = (name, args = None, body = None, num_warps = 12, smem_size_bytes = 0, launch_shape = None, cluster_shape = None, smem_pool = false))]
+    #[pyo3(signature = (name, args = None, body = None, num_warps = 12, smem_size_bytes = 0, launch_shape = None, cluster_shape = None))]
     fn new(
         name: String,
         args: Option<Bound<'_, PyAny>>,
@@ -2848,7 +2886,6 @@ impl PyKernel {
         smem_size_bytes: usize,
         launch_shape: Option<Vec<usize>>,
         cluster_shape: Option<Vec<usize>>,
-        smem_pool: bool,
     ) -> PyResult<Self> {
         let kernel = ir::Kernel {
             name,
@@ -2861,7 +2898,6 @@ impl PyKernel {
             smem_size_bytes,
             launch_shape: launch_shape.unwrap_or_else(|| vec![1]),
             cluster_shape: cluster_shape.unwrap_or_else(|| vec![1]),
-            smem_pool,
         };
         kernel
             .validate()
@@ -2900,10 +2936,6 @@ impl PyKernel {
     #[getter]
     fn cluster_shape(&self) -> Vec<usize> {
         self.0.cluster_shape.clone()
-    }
-    #[getter]
-    fn smem_pool(&self) -> bool {
-        self.0.smem_pool
     }
     fn launch_cta_count(&self) -> usize {
         self.0.launch_cta_count()

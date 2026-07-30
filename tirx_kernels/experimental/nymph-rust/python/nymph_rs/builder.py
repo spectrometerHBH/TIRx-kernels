@@ -208,14 +208,12 @@ class IRBuilder:
         smem_size_bytes: int = 0,
         launch_shape: LaunchShape = (1,),
         cluster_shape: ClusterShape = (1,),
-        smem_pool: bool = False,
     ):
         self.name = name
         self.num_warps = num_warps
         self.smem_size_bytes = smem_size_bytes
         self.launch_shape = launch_shape
         self.cluster_shape = cluster_shape
-        self.smem_pool = smem_pool
         self._args: list[Tensor] = []
         self._body: list[Stmt] = []
         self._body_stack: list[list[Stmt]] = [self._body]
@@ -229,7 +227,6 @@ class IRBuilder:
             smem_size_bytes=self.smem_size_bytes,
             launch_shape=self.launch_shape,
             cluster_shape=self.cluster_shape,
-            smem_pool=self.smem_pool,
         )
 
     @property
@@ -275,7 +272,9 @@ class IRBuilder:
         self._append(TensorDef(tensor))
         return tensor
 
-    def tmem_alloc(self, base_col: int, n_cols: int, cta_group: Literal[1, 2] = 1) -> None:
+    def tmem_alloc(
+        self, base_col: int, n_cols: int, addr_byte_offset: int, cta_group: Literal[1, 2] = 1
+    ) -> None:
         """Allocate the TMEM column band [base_col, base_col + n_cols). The IR's
         lifecycle is deliberately narrower than raw PTX (validate enforces it,
         because codegen lowers the band as ONE base-0 view): a single live
@@ -283,7 +282,14 @@ class IRBuilder:
         every lifecycle op carries the kernel-level cta_group, no alloc after
         `tmem_relinquish` (PTX §9.7.17.7.1), and lifecycle ops are top-level
         only — never inside a loop/conditional body."""
-        self._append(TmemAlloc(base_col=base_col, n_cols=n_cols, cta_group=cta_group))
+        self._append(
+            TmemAlloc(
+                base_col=base_col,
+                n_cols=n_cols,
+                cta_group=cta_group,
+                addr_byte_offset=addr_byte_offset,
+            )
+        )
 
     def tmem_dealloc(self, base_col: int, n_cols: int, cta_group: Literal[1, 2] = 1) -> None:
         """Free the live band [base_col, base_col + n_cols) (must exactly match an
@@ -365,22 +371,9 @@ class IRBuilder:
         return ScopeValue(kind="nvshmem_my_pe")
 
     def mbar(
-        self,
-        *,
-        kind: MBarKind,
-        stages: int = 1,
-        arrive_count: int | None = None,
-        leader_routed: bool = False,
+        self, *, kind: MBarKind, byte_offset: int, stages: int = 1, arrive_count: int | None = None
     ) -> MBar:
-        """``leader_routed=True`` marks a cluster TMA-completion barrier: BOTH
-        CTAs' TMA loads signal the LEADER CTA's (CTA-0) copy of this barrier
-        (the canonical cta_group=2 pattern — the legal substitute for a peer
-        ``try_wait``, and the prerequisite for multicast loads, whose per-
-        destination tx counts must accumulate on the single leader barrier).
-        Validate requires a peer reference and TMA-load/expect_tx-only use."""
-        mbar = MBar(
-            kind=kind, stages=stages, arrive_count=arrive_count, leader_routed=leader_routed
-        )
+        mbar = MBar(kind=kind, stages=stages, byte_offset=byte_offset, arrive_count=arrive_count)
         self._append(MBarDef(mbar))
         return mbar
 

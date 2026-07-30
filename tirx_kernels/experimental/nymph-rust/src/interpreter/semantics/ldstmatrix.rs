@@ -304,7 +304,10 @@ fn write_reg_words(
             let dtype = resolved.tensor.dtype;
             let (lanes, num) = words.dim();
             let out = Array2::from_shape_fn((lanes, 2 * num), |(t, e)| {
-                decode_b16(dtype, ((words[[t, e / 2]] >> (16 * (e % 2))) & 0xffff) as u16)
+                decode_b16(
+                    dtype,
+                    ((words[[t, e / 2]] >> (16 * (e % 2))) & 0xffff) as u16,
+                )
             });
             ValueArray2::from_f32_compute(out, dtype)
         }

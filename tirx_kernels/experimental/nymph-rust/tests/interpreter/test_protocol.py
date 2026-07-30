@@ -34,10 +34,10 @@ def _pass_status(report, name):
 
 
 def test_protocol_trace_scheduler_scalar_bridge_passes():
-    b = builder("protocol_scheduler_scalar_bridge", smem_size_bytes=8)
+    b = builder("protocol_scheduler_scalar_bridge", smem_size_bytes=16)
     task_smem = smem_tensor(b, dtype=nr.DType.I32, shape=(2,), byte_offset=0)
-    full = b.mbar(kind=nr.MBarKind.THREAD, stages=2)
-    empty = b.mbar(kind=nr.MBarKind.THREAD, stages=2)
+    full = b.mbar(kind=nr.MBarKind.THREAD, byte_offset=0, stages=2)
+    empty = b.mbar(kind=nr.MBarKind.THREAD, byte_offset=0, stages=2)
     sched = b.scheduler(b.task_space(grid=(2,), fields=("task",)), policy="custom")
 
     def stage_of(var):
@@ -119,7 +119,7 @@ def test_protocol_deadlock_freedom_rejects_wait_group_without_commit():
 
 def test_protocol_deadlock_freedom_accepts_mixed_supported_blockers():
     b = builder("protocol_deadlock_mixed_supported")
-    mbar = b.mbar(kind=nr.MBarKind.THREAD)
+    mbar = b.mbar(kind=nr.MBarKind.THREAD, byte_offset=0)
 
     # mbarrier init/arrive are per-thread now: keep the whole mbar handshake on
     # one elected thread (count=1 must see exactly one arrival); the loose
@@ -184,7 +184,7 @@ def test_protocol_wait_group_read_zero_drains_retained_async_source():
 
 def test_protocol_deadlock_returns_failed_report():
     b = builder("protocol_deadlock")
-    mbar = b.mbar(kind=nr.MBarKind.TMA)
+    mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
     # mbarrier.init is per-thread now: issue it from a single elected thread.
     with b.if_warp(0), b.if_elected():
         b.mbarrier_init(mbar, count=1)
@@ -204,7 +204,7 @@ def test_protocol_blocked_mbar_wait_emits_completion_event():
     b = builder("protocol_blocked_mbar_wait_event", smem_size_bytes=16)
     source = gmem_arg(b, shape=(4,))
     smem = smem_tensor(b, shape=(4,), byte_offset=0)
-    mbar = b.mbar(kind=nr.MBarKind.TMA)
+    mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
 
     # New model: the ISSUING thread (warp 1) arms expect_tx right before its own
     # tma_load; warp 0 only waits. cta_sync publishes the per-thread init. The
@@ -232,11 +232,33 @@ def test_protocol_blocked_mbar_wait_emits_completion_event():
     assert wait["stmt_kind"] == "MBarrierWait"
 
 
+def test_protocol_tma_complete_tx_may_precede_expect_tx():
+    b = builder("protocol_complete_before_expect", smem_size_bytes=16)
+    source = gmem_arg(b, shape=(4,))
+    smem = smem_tensor(b, shape=(4,), byte_offset=0)
+    mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
+
+    with b.if_warp(0), b.if_elected():
+        b.mbarrier_init(mbar, count=1)
+        # Canonical fp16 TIRx issues its TMA copies before the matching
+        # arrive.expect_tx. Hardware permits complete-tx to make the signed
+        # transaction count negative until expect_tx adds it back.
+        b.tma_load(smem, source, mbar=mbar, coords=(0,), shape=(4,))
+        b.mbarrier_arrive_expect_tx(mbar, bytes=16)
+        b.mbarrier_wait(mbar, phase=0)
+
+    report = nr.check_protocol(b.build(), include_events=True)
+    assert report["status"] == "Passed"
+    kinds = [event["kind"] for event in report["events"]]
+    assert kinds.index("mbar_complete_tx") < kinds.index("mbar_expect_tx")
+    assert kinds.index("mbar_expect_tx") < kinds.index("mbar_wait")
+
+
 def test_protocol_payload_control_bridge_is_inconclusive():
-    b = builder("protocol_payload_bridge", smem_size_bytes=4)
+    b = builder("protocol_payload_bridge", smem_size_bytes=8)
     source = gmem_arg(b, shape=(1,))
     smem = smem_tensor(b, shape=(1,), byte_offset=0)
-    mbar = b.mbar(kind=nr.MBarKind.TMA)
+    mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
     # mbarrier.init is per-thread now: issue it from a single elected thread.
     with b.if_warp(0), b.if_elected():
         b.mbarrier_init(mbar, count=1)
@@ -251,10 +273,10 @@ def test_protocol_payload_control_bridge_is_inconclusive():
 
 
 def test_protocol_skipped_bulk_write_invalidates_prior_scalar_cell():
-    b = builder("protocol_payload_invalidates_scalar", smem_size_bytes=4)
+    b = builder("protocol_payload_invalidates_scalar", smem_size_bytes=8)
     source = gmem_arg(b, shape=(1,))
     smem = smem_tensor(b, shape=(1,), byte_offset=0)
-    mbar = b.mbar(kind=nr.MBarKind.TMA)
+    mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
     # mbarrier.init is per-thread now: issue it from a single elected thread.
     with b.if_warp(0), b.if_elected():
         b.mbarrier_init(mbar, count=1)
@@ -302,10 +324,10 @@ def test_protocol_tmem_mma_layout_f_emits_union_boxes():
     dst = tmem_band(dtype=nr.DType.F32)
 
     with b.if_warp(0):
-        b.tmem_alloc(0, 32)
+        b.tmem_alloc(0, 32, addr_byte_offset=0)
     # tcgen05_mma is a single-thread issue instruction now; issue it from warp
     # 0's elected lane so alloc -> mma -> dealloc stay ordered on one stream.
-    done = b.mbar(kind=nr.MBarKind.TCGEN05)
+    done = b.mbar(kind=nr.MBarKind.TCGEN05, byte_offset=0)
     with b.if_warp(0), b.if_elected():
         b.mbarrier_init(done, count=1)
     b.cta_sync()
@@ -349,9 +371,9 @@ def _tmem_teardown_kernel(*, drain: bool):
     a_s = smem_tensor(b, dtype=nr.DType.F16, shape=(m, k), byte_offset=0)
     b_s = smem_tensor(b, dtype=nr.DType.F16, shape=(n, k), byte_offset=a_bytes)
     dst = tmem_band(dtype=nr.DType.F32)
-    done = b.mbar(kind=nr.MBarKind.TCGEN05)
+    done = b.mbar(kind=nr.MBarKind.TCGEN05, byte_offset=0)
     with b.if_warp(0):
-        b.tmem_alloc(0, 32)
+        b.tmem_alloc(0, 32, addr_byte_offset=0)
         with b.if_elected():
             b.mbarrier_init(done, count=1)
     b.cta_sync()
@@ -386,7 +408,7 @@ def test_protocol_tmem_async_overlap_fails_before_wait():
     reg = reg_tensor(b, dtype=nr.DType.F32, shape=(1,))
 
     with b.if_warp(0):
-        b.tmem_alloc(0, 32)
+        b.tmem_alloc(0, 32, addr_byte_offset=0)
     with b.if_warp(0):
         b.tcgen05_st(tmem.at(0, 0), reg, shape="32x32b", num=1)
         b.tcgen05_st(tmem.at(0, 0), reg, shape="32x32b", num=1)

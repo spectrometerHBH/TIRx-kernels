@@ -183,7 +183,6 @@ def inject_dumps(kernel, specs: list[DumpSpec]):
         smem_size_bytes=kernel.smem_size_bytes,
         launch_shape=list(kernel.launch_shape),
         cluster_shape=list(kernel.cluster_shape),
-        smem_pool=kernel.smem_pool,
     )
     return instrumented, specs
 

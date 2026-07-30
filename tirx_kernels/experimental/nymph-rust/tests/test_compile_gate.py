@@ -10,7 +10,12 @@ import importlib.util
 
 import nymph_rs as nr
 import pytest
-from nymph_rs.kernels import build_bootstrap_gemm, build_fp16_bf16_gemm, build_nvfp4_gemm
+from nymph_rs.kernels import (
+    Fp16Bf16GemmConfig,
+    build_bootstrap_gemm,
+    build_fp16_bf16_gemm,
+    build_nvfp4_gemm,
+)
 from nymph_rs.kernels.gdn_prefill import GdnPrefillConfig, build_gdn_prefill
 
 tvm = pytest.importorskip("tvm", reason="tvm not importable in this environment")
@@ -19,9 +24,17 @@ pytestmark = pytest.mark.codegen
 
 BUILDERS = {
     "bootstrap_gemm": build_bootstrap_gemm,
-    "fp16_bf16_gemm": build_fp16_bf16_gemm,
     "nvfp4_gemm": build_nvfp4_gemm,
     "gdn_prefill": lambda: build_gdn_prefill(GdnPrefillConfig(num_seqs=1, seqlen=128)),
+    **{
+        f"{dtype_name}_gemm_{size}": (
+            lambda dtype=dtype, size=size: build_fp16_bf16_gemm(
+                Fp16Bf16GemmConfig(m=size, n=size, k=size, dtype=dtype)
+            )
+        )
+        for dtype_name, dtype in (("fp16", nr.DType.F16), ("bf16", nr.DType.BF16))
+        for size in (1024, 4096)
+    },
 }
 
 
@@ -72,7 +85,7 @@ def test_single_issue_scope_negative():
         dst_s = b.tensor(
             space=nr.MemorySpace.SMEM, dtype=nr.DType.BF16, shape=(64, 64), byte_offset=0
         )
-        mbar = b.mbar(kind=nr.MBarKind.TMA, stages=1)
+        mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0, stages=1)
         with b.if_warp(0):
             if with_elected:
                 with b.if_elected():

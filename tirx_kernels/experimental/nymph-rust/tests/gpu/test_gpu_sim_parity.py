@@ -131,13 +131,17 @@ def test_nvfp4_gemm_gpu_matches_sim_bitwise():
     _assert_bit_equal(gpu, sim, "nvfp4 1024^3")
 
 
-def test_fp16_gemm_gpu_matches_sim_bitwise():
-    # fp16 1024 config (GEMM_CONFIGS[1024]: mma_n=64, overlap epilogue, CLC
+@pytest.mark.parametrize(
+    "dtype, torch_dtype, label",
+    [(nr.DType.F16, torch.float16, "fp16"), (nr.DType.BF16, torch.bfloat16, "bf16")],
+)
+def test_fp16_bf16_gemm_gpu_matches_sim_bitwise(dtype, torch_dtype, label):
+    # 1024 config (GEMM_CONFIGS[1024]: mma_n=64, overlap epilogue, CLC
     # scheduler). Integer inputs in [-2, 2]: products <= 4, K=1024 partial sums
     # stay integers |s| <= 4096 < 2^24 — exact in f32 regardless of accumulation
-    # order; the single f32->f16 rounding at the store is RNE on both sides.
+    # order; the single f32->f16/bf16 rounding at the store is RNE on both sides.
     m = n = k = 1024
-    cfg = Fp16Bf16GemmConfig(m=m, n=n, k=k, dtype=nr.DType.F16)
+    cfg = Fp16Bf16GemmConfig(m=m, n=n, k=k, dtype=dtype)
     kernel = build_fp16_bf16_gemm(cfg)
     a_t, b_t, c_t = kernel.args
     rng = np.random.default_rng(0)
@@ -145,14 +149,15 @@ def test_fp16_gemm_gpu_matches_sim_bitwise():
     b = rng.integers(-2, 3, size=(n, k)).astype(np.float32)
     out = nr.interpret(kernel, {a_t: a, b_t: b})
     sim = np.asarray(out[c_t.id]).reshape(m, n)
-    assert sim.dtype == np.float16
+    assert sim.dtype == (np.float16 if dtype == nr.DType.F16 else np.float32)
 
-    fn = _compile_tirx(kernel, "fp16_sim_parity")
-    c_gpu = torch.empty((m, n), dtype=torch.float16, device="cuda")
+    fn = _compile_tirx(kernel, f"{label}_sim_parity")
+    c_gpu = torch.empty((m, n), dtype=torch_dtype, device="cuda")
     fn(
-        torch.from_numpy(a.astype(np.float16)).cuda(),
-        torch.from_numpy(b.astype(np.float16)).cuda(),
+        torch.from_numpy(a).to(torch_dtype).cuda(),
+        torch.from_numpy(b).to(torch_dtype).cuda(),
         c_gpu,
     )
     torch.cuda.synchronize()
-    _assert_bit_equal(c_gpu.cpu().numpy(), sim, "fp16 1024^3")
+    gpu = c_gpu.cpu().numpy() if dtype == nr.DType.F16 else c_gpu.to(torch.float32).cpu().numpy()
+    _assert_bit_equal(gpu, sim, f"{label} 1024^3")

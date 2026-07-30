@@ -550,7 +550,8 @@ fn barrier_cycle_audit(cx: &mut CheckerCx<'_>) -> CheckResult {
                         Some(event),
                     ));
                 }
-                cycle.pending_tx += *bytes;
+                cycle.pending_tx -= *bytes;
+                let _ = cycle.complete_if_ready();
             }
             TraceEventKind::MbarCompleteTx { target, bytes, .. } => {
                 let key = MbarKey::from_target(target);
@@ -561,14 +562,17 @@ fn barrier_cycle_audit(cx: &mut CheckerCx<'_>) -> CheckResult {
                         Some(event),
                     ));
                 };
-                if *bytes < 0 || cycle.pending_tx < *bytes {
+                if *bytes < 0 {
                     return Err(cx.fail(
-                        "barrier_cycle_tx_underflow",
-                        "mbarrier complete_tx exceeds pending bytes",
+                        "barrier_cycle_invalid_tx",
+                        "mbarrier complete_tx bytes must be non-negative",
                         Some(event),
                     ));
                 }
-                cycle.pending_tx -= *bytes;
+                // Hardware transaction counts are signed: expect_tx subtracts
+                // expected bytes and complete_tx adds actual bytes. Either may
+                // execute first.
+                cycle.pending_tx += *bytes;
                 let _ = cycle.complete_if_ready();
             }
             TraceEventKind::MbarArrive { target, count, .. } => {
@@ -3098,14 +3102,30 @@ fn collect_mbar_blockers(
                 mbars.insert(MbarKey::from_target(target), MbarCycle::new(*count));
             }
             TraceEventKind::MbarExpectTx { target, bytes, .. } => {
-                if let Some(cycle) = mbars.get_mut(&MbarKey::from_target(target)) {
-                    cycle.pending_tx += *bytes;
+                let key = MbarKey::from_target(target);
+                if let Some(cycle) = mbars.get_mut(&key) {
+                    cycle.pending_tx -= *bytes;
+                    if cycle.complete_if_ready() {
+                        let wait_key = MbarWaitKey {
+                            target: key,
+                            phase: cycle.parity ^ 1,
+                        };
+                        let releases = cycle.drain_release_events();
+                        if let Some(waiters) = pending_waits.remove(&wait_key) {
+                            for wait_idx in waiters {
+                                release_for_wait
+                                    .entry(wait_idx)
+                                    .or_insert_with(|| releases.clone());
+                            }
+                        }
+                        last_release.insert(wait_key, releases);
+                    }
                 }
             }
             TraceEventKind::MbarCompleteTx { target, bytes, .. } => {
                 let key = MbarKey::from_target(target);
                 if let Some(cycle) = mbars.get_mut(&key) {
-                    cycle.pending_tx -= *bytes;
+                    cycle.pending_tx += *bytes;
                     cycle.record_release_event(idx);
                     if cycle.complete_if_ready() {
                         let wait_key = MbarWaitKey {
@@ -3936,14 +3956,19 @@ impl OrderingAnalysis {
                     mbars.insert(MbarKey::from_target(target), MbarCycle::new(*count));
                 }
                 TraceEventKind::MbarExpectTx { target, bytes, .. } => {
-                    if let Some(cycle) = mbars.get_mut(&MbarKey::from_target(target)) {
-                        cycle.pending_tx += *bytes;
+                    let key = MbarKey::from_target(target);
+                    if let Some(cycle) = mbars.get_mut(&key) {
+                        cycle.pending_tx -= *bytes;
+                        if cycle.complete_if_ready() {
+                            let acc = mbar_release_acc.remove(&key).unwrap_or_default();
+                            last_release_clocks.insert(key, acc);
+                        }
                     }
                 }
                 TraceEventKind::MbarCompleteTx { target, bytes, .. } => {
                     let key = MbarKey::from_target(target);
                     if let Some(cycle) = mbars.get_mut(&key) {
-                        cycle.pending_tx -= *bytes;
+                        cycle.pending_tx += *bytes;
                         let published = states[stream_id].published(stream_id, mask, ordinal);
                         let acc = mbar_release_acc.entry(key).or_default();
                         join_clock(acc, &published);
@@ -4320,7 +4345,6 @@ mod tests {
             smem_size_bytes: 64,
             launch_shape: vec![1],
             cluster_shape: vec![1],
-            smem_pool: false,
         }
     }
 

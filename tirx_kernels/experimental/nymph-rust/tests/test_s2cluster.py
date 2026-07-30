@@ -34,7 +34,7 @@ def _build(with_wait: bool):
     sxchg = k.tensor(space=MemorySpace.SMEM, dtype=DType.F32, shape=(4,), byte_offset=0)
     s = k.tensor(space=MemorySpace.SMEM, dtype=DType.F32, shape=(4,), byte_offset=64)
     r = k.tensor(space=MemorySpace.REG, dtype=DType.F32, shape=(4,))
-    full = k.mbar(kind=MBarKind.TMA, stages=1)
+    full = k.mbar(kind=MBarKind.TMA, byte_offset=128, stages=1)
     # mbarrier.init is per-thread: one elected thread initializes; the peer CTA
     # arrives on this mbar remotely, so publish the init cluster-wide first.
     with k.if_warp(0), k.if_elected():

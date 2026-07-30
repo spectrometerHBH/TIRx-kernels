@@ -23,14 +23,16 @@ see `docs/ir.md`, `docs/interpreter.md`, `docs/interpreter-semantics.md`, and
   Thread dispatch re-derives from the `If`-condition stack (no Role nodes): the
   thread scope comes from `static_thread_filter` (full-CTA / one warp / one
   warpgroup / ≤1-lane-per-warp), `if_elected` emits `T.ptx.elect_sync()`
-  (`T.cuda.thread_rank() == 0` for the warp-0 prologue elect), and adjacent
-  top-level warp/warpgroup-equality `If`s re-nest into canon's if/else dispatch
-  tree (`chain_top_level_ifs`). TMEM is emitted as one base-0 `tmem` decl_buffer
-  (+ folded SF views), full-K `Tx.gemm_async` with a runtime `accum` scalar,
-  leader-routed TMA barriers, `ScalarLet` → `T.let`, CLC try/query-cancel,
-  split cluster barrier, `ForLoop(unroll=False)` → `T.serial(N, unroll=False)`,
-  and the dynamic `T.SMEMPool()` form via `Kernel.smem_pool`. Fail-closed
-  exhaustiveness: every `Stmt` variant has a lowering arm or an explicit `Err`.
+  (`T.cuda.thread_rank() == 0` for the warp-0 prologue elect). Control flow is
+  emitted 1:1: sibling IR `If`s stay siblings, nested `If`s stay nested, and
+  codegen never merges or re-nests role branches. TMEM is emitted as one base-0
+  `tmem` decl_buffer (+ folded SF views), full-K `Tx.gemm_async` with a runtime
+  `accum` scalar, leader-routed TMA barriers, `ScalarLet` → `T.let`, CLC
+  try/query-cancel, split cluster barrier, `ForLoop(unroll=False)` →
+  `T.serial(N, unroll=False)`, and one unconditional dynamic `T.SMEMPool()`
+  whose tensor, mbarrier, and TMEM-address views use explicit IR byte offsets.
+  Fail-closed exhaustiveness: every `Stmt` variant has a lowering arm or an
+  explicit `Err`.
   Compile-gated by `tests/test_compile_gate.py` (bootstrap / fp16 / nvfp4 all
   `tvm.compile(tir_pipeline="tirx")`).
 

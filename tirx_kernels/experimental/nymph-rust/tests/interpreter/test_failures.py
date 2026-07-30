@@ -64,7 +64,7 @@ def test_runtime_failure_message_includes_execution_anchor():
 
 def test_mbarrier_wait_rejects_divergent_phase():
     b = builder("mbarrier_wait_divergent_phase")
-    mbar = b.mbar(kind=nr.MBarKind.THREAD)
+    mbar = b.mbar(kind=nr.MBarKind.THREAD, byte_offset=0)
     with b.if_warp(0), b.if_elected():
         b.mbarrier_init(mbar, count=1)
     with b.if_warp(0):
@@ -76,14 +76,14 @@ def test_mbarrier_wait_rejects_divergent_phase():
 
 def test_tcgen05_commit_runtime_failures_are_closed():
     b = builder("tcgen05_commit_missing_mbar")
-    missing = b.mbar(kind=nr.MBarKind.TCGEN05)
+    missing = b.mbar(kind=nr.MBarKind.TCGEN05, byte_offset=0)
     with b.if_warp(0), b.if_elected():
         b.tcgen05_commit(missing)
     with expect_runtime_error("uninitialized_mbarrier"):
         run(b.build())
 
     b = builder("tcgen05_commit_overflow")
-    overflow = b.mbar(kind=nr.MBarKind.TCGEN05)
+    overflow = b.mbar(kind=nr.MBarKind.TCGEN05, byte_offset=0)
     # mbarrier.init is per-thread now: issue it from a single elected thread.
     with b.if_warp(0), b.if_elected():
         b.mbarrier_init(overflow, count=1)
@@ -99,8 +99,8 @@ def test_tcgen05_commit_runtime_failures_are_closed():
     # then CTA 0 runs off the end of its program; CTA 1 waits `go` and burns a
     # few filler statements so CTA 0's streams retire before the commit issues.
     b = builder("tcgen05_commit_peer_exited", launch_shape=(2,), cluster_shape=(2,))
-    peer_exited = b.mbar(kind=nr.MBarKind.TCGEN05)
-    go = b.mbar(kind=nr.MBarKind.THREAD)
+    peer_exited = b.mbar(kind=nr.MBarKind.TCGEN05, byte_offset=0)
+    go = b.mbar(kind=nr.MBarKind.THREAD, byte_offset=0)
     with b.if_warp(0), b.if_elected():
         b.mbarrier_init(peer_exited, count=1)
         with b.if_(b.ctaid_in_cluster().eq(1)):
@@ -118,7 +118,7 @@ def test_tcgen05_commit_runtime_failures_are_closed():
         run(b.build())
 
     b = builder("tcgen05_commit_mask_oob", launch_shape=(2,), cluster_shape=(2,))
-    mask_oob = b.mbar(kind=nr.MBarKind.TCGEN05)
+    mask_oob = b.mbar(kind=nr.MBarKind.TCGEN05, byte_offset=0)
     with b.if_warp(0), b.if_elected():
         b.mbarrier_init(mask_oob, count=1)
     with b.if_warp(0), b.if_elected():
