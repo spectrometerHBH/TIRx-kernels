@@ -2,7 +2,7 @@
 
 - Timestamp: `77`
 - Label:     `pr45-26631487-full-sgl044-torch213`
-- Git:       `{'tir': 'fb56ab11-dirty', 'tirx-kernels': '26631487-dirty', 'tirx-bench-ci': None}`
+- Git:       `{'tir': 'fb56ab11-dirty', 'tirx-kernels': '47eb8943-dirty', 'tirx-bench-ci': None}`
 - Workloads: 113 ok, 0 failed
 
 Grouped workloads show one row per config and one timing column per implementation. Single-TIR workloads show ref/ours against the fastest reference implementation.
@@ -27,8 +27,8 @@ Grouped workloads show one row per config and one timing column per implementati
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
 |---|---|---:|---|---:|---:|---|
-| `s2048_skv4096_h64_d128_f32_dense_cp` | tirx | 42.1491 | deepgemm | 39.3123 | 0.933 | — |
-| `s4096_skv8192_h64_d128_bf16_compressed_nocp` | tirx | 195.9240 | deepgemm | 183.3436 | 0.936 | — |
+| `s2048_skv4096_h64_d128_f32_dense_cp` | tirx | 37.5364 | deepgemm | 39.6249 | 1.056 | — |
+| `s4096_skv8192_h64_d128_bf16_compressed_nocp` | tirx | 181.3557 | deepgemm | 182.1154 | 1.004 | — |
 
 ## deepgemm_sm100_fp4_paged_mqa_logits
 
@@ -41,8 +41,8 @@ Grouped workloads show one row per config and one timing column per implementati
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
 |---|---|---:|---|---:|---:|---|
-| `s2048_skv4096_h64_d128_f32_dense_cp` | tirx | 39.0420 | deepgemm | 41.0418 | 1.051 | — |
-| `s4096_skv8192_h64_d128_bf16_compressed_nocp` | tirx | 192.7095 | deepgemm | 186.8664 | 0.970 | — |
+| `s2048_skv4096_h64_d128_f32_dense_cp` | tirx | 39.0773 | deepgemm | 40.9516 | 1.048 | — |
+| `s4096_skv8192_h64_d128_bf16_compressed_nocp` | tirx | 177.3463 | deepgemm | 187.7190 | 1.058 | — |
 
 ## deepgemm_sm100_fp8_paged_mqa_logits
 
@@ -106,15 +106,15 @@ Grouped workloads show one row per config and one timing column per implementati
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
 |---|---|---:|---|---:|---:|---|
 | `bf16_1024x1024x1024` | tir | 6.1857 | deepgemm-cublaslt | 5.8463 | 0.945 | deepgemm-bf16=6.7069, torch-cublas=5.8557 |
-| `bf16_16384x16384x16384` | tir | 5541.9210 | deepgemm-cublaslt | 5528.1810 | 0.998 | deepgemm-bf16=6625.7403, torch-cublas=5572.7584 |
+| `bf16_16384x16384x16384` | tir | 5479.8830 | deepgemm-cublaslt | 5368.2901 | 0.980 | deepgemm-bf16=5732.4577, torch-cublas=5460.5809 |
 | `bf16_2048x2048x2048` | tir | 15.8669 | deepgemm-cublaslt | 15.6621 | 0.987 | deepgemm-bf16=17.2149, torch-cublas=15.6718 |
 | `bf16_4096x4096x4096` | tir | 89.7640 | torch-cublas | 90.3669 | 1.007 | deepgemm-bf16=90.8218, deepgemm-cublaslt=90.7227 |
-| `bf16_8192x8192x8192` | tir | 700.8799 | torch-cublas | 722.3591 | 1.031 | deepgemm-bf16=739.7395, deepgemm-cublaslt=730.3039 |
+| `bf16_8192x8192x8192` | tir | 691.4334 | deepgemm-cublaslt | 699.1222 | 1.011 | deepgemm-bf16=739.1035, torch-cublas=704.2089 |
 | `fp16_1024x1024x1024` | tir | 6.2860 | torch-cublas | 5.8934 | 0.938 | — |
-| `fp16_16384x16384x16384` | tir | 6011.6638 | torch-cublas | 5900.7829 | 0.982 | — |
+| `fp16_16384x16384x16384` | tir | 5629.9235 | torch-cublas | 5912.1681 | 1.050 | — |
 | `fp16_2048x2048x2048` | tir | 16.1207 | torch-cublas | 15.7391 | 0.976 | — |
 | `fp16_4096x4096x4096` | tir | 92.0312 | torch-cublas | 92.2030 | 1.002 | — |
-| `fp16_8192x8192x8192` | tir | 750.1237 | torch-cublas | 759.7881 | 1.013 | — |
+| `fp16_8192x8192x8192` | tir | 736.3923 | torch-cublas | 751.9896 | 1.021 | — |
 
 ## fp8_blockwise_gemm
 
@@ -168,10 +168,10 @@ Grouped workloads show one row per config and one timing column per implementati
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
 |---|---|---:|---|---:|---:|---|
 | `1024x1024x1024` | tir | 4.6652 | cublaslt_nvfp4 | 4.5274 | 0.970 | flashinfer=4.5538 |
-| `16384x16384x16384` | tir | 1447.9414 | cublaslt_nvfp4 | 1430.7288 | 0.988 | flashinfer=1439.7707 |
+| `16384x16384x16384` | tir | 1453.5032 | flashinfer | 1412.6225 | 0.972 | cublaslt_nvfp4=1437.3283 |
 | `2048x2048x2048` | tir | 7.8846 | flashinfer | 7.4537 | 0.945 | cublaslt_nvfp4=7.7022 |
 | `4096x4096x4096` | tir | 28.5639 | cublaslt_nvfp4 | 27.8961 | 0.977 | flashinfer=29.0789 |
-| `8192x8192x8192` | tir | 183.2869 | flashinfer | 176.9837 | 0.966 | cublaslt_nvfp4=178.5887 |
+| `8192x8192x8192` | tir | 180.8918 | flashinfer | 177.1499 | 0.979 | cublaslt_nvfp4=178.1255 |
 
 ## sparse_flashmla_prefill_head128_phase1
 

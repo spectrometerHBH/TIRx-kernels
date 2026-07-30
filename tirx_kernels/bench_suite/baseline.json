@@ -3,12 +3,12 @@
   "label": "pr45-26631487-full-sgl044-torch213",
   "git": {
     "tir": "fb56ab11-dirty",
-    "tirx-kernels": "26631487-dirty",
+    "tirx-kernels": "47eb8943-dirty",
     "tirx-bench-ci": null
   },
   "kernel_tree": {
     "tir:python/tvm/tirx": "3a3b791f369a7f015127648bd0828954aeac1d4c",
-    "tirx-kernels:tirx_kernels": "bd20bce03f97388e50cd5b9f58892316df35d0ff"
+    "tirx-kernels:tirx_kernels": "54c1b18d65d556a246d970a473e44d2fc0c314ce"
   },
   "baselines": {
     "torch": {
@@ -46,10 +46,7 @@
       "git_sha": "00756db9"
     },
     "sglang": {
-      "importable": false,
-      "source_dir": "/home/bohanhou/kernel-libs/sglang/python/sglang",
-      "git_dir": "/home/bohanhou/kernel-libs/sglang",
-      "git_sha": "96a04cb1"
+      "installed": false
     },
     "cutlass": {
       "importable": true,
@@ -166,8 +163,8 @@
       "label": "s2048_skv4096_h64_d128_f32_dense_cp",
       "status": "ok",
       "impls": {
-        "tirx": 42.14905986632484,
-        "deepgemm": 39.31234895622046
+        "tirx": 37.53635068102547,
+        "deepgemm": 39.624945450758574
       },
       "aggregated": {
         "rounds": 5,
@@ -180,8 +177,8 @@
       "label": "s4096_skv8192_h64_d128_bf16_compressed_nocp",
       "status": "ok",
       "impls": {
-        "tirx": 195.92402933743648,
-        "deepgemm": 183.34362436591832
+        "tirx": 181.35573696722707,
+        "deepgemm": 182.115369968068
       },
       "aggregated": {
         "rounds": 5,
@@ -222,8 +219,8 @@
       "label": "s2048_skv4096_h64_d128_f32_dense_cp",
       "status": "ok",
       "impls": {
-        "tirx": 39.04200594112623,
-        "deepgemm": 41.04183419766108
+        "tirx": 39.07734243311309,
+        "deepgemm": 40.951638950453074
       },
       "aggregated": {
         "rounds": 5,
@@ -236,8 +233,8 @@
       "label": "s4096_skv8192_h64_d128_bf16_compressed_nocp",
       "status": "ok",
       "impls": {
-        "tirx": 192.70952113982827,
-        "deepgemm": 186.86641815892864
+        "tirx": 177.34630844353504,
+        "deepgemm": 187.7190485755989
       },
       "aggregated": {
         "rounds": 5,
@@ -856,10 +853,10 @@
       "label": "bf16_16384x16384x16384",
       "status": "ok",
       "impls": {
-        "tir": 5541.921021052632,
-        "torch-cublas": 5572.758357894737,
-        "deepgemm-cublaslt": 5528.180978947368,
-        "deepgemm-bf16": 6625.740333333333
+        "tir": 5479.8830233918125,
+        "torch-cublas": 5460.58092631579,
+        "deepgemm-cublaslt": 5368.290052631579,
+        "deepgemm-bf16": 5732.457711111111
       },
       "aggregated": {
         "rounds": 5,
@@ -904,10 +901,10 @@
       "label": "bf16_8192x8192x8192",
       "status": "ok",
       "impls": {
-        "tir": 700.8798920132052,
-        "torch-cublas": 722.3590688837695,
-        "deepgemm-cublaslt": 730.3039366906474,
-        "deepgemm-bf16": 739.7394826212967
+        "tir": 691.4333696243006,
+        "torch-cublas": 704.2088700481644,
+        "deepgemm-cublaslt": 699.1221588652483,
+        "deepgemm-bf16": 739.1035431291654
       },
       "aggregated": {
         "rounds": 5,
@@ -934,8 +931,8 @@
       "label": "fp16_16384x16384x16384",
       "status": "ok",
       "impls": {
-        "tir": 6011.663788888889,
-        "torch-cublas": 5900.782869934641
+        "tir": 5629.923488888889,
+        "torch-cublas": 5912.168144444445
       },
       "aggregated": {
         "rounds": 5,
@@ -976,8 +973,8 @@
       "label": "fp16_8192x8192x8192",
       "status": "ok",
       "impls": {
-        "tir": 750.1236863631556,
-        "torch-cublas": 759.7881037765717
+        "tir": 736.3922941190185,
+        "torch-cublas": 751.9896411914401
       },
       "aggregated": {
         "rounds": 5,
@@ -1411,9 +1408,9 @@
       "label": "16384x16384x16384",
       "status": "ok",
       "impls": {
-        "tir": 1447.9414098145635,
-        "flashinfer": 1439.7706599276346,
-        "cublaslt_nvfp4": 1430.7287594202899
+        "tir": 1453.5031739130436,
+        "flashinfer": 1412.6225359964883,
+        "cublaslt_nvfp4": 1437.3283419875777
       },
       "aggregated": {
         "rounds": 5,
@@ -1456,9 +1453,9 @@
       "label": "8192x8192x8192",
       "status": "ok",
       "impls": {
-        "tir": 183.28687396460919,
-        "flashinfer": 176.98365443979975,
-        "cublaslt_nvfp4": 178.58868849107097
+        "tir": 180.89180465150793,
+        "flashinfer": 177.1499040361822,
+        "cublaslt_nvfp4": 178.12551623899694
       },
       "aggregated": {
         "rounds": 5,
