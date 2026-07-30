@@ -353,9 +353,11 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
     k.fence(kind=FenceKind.ASYNC_PROXY, scope=FenceScope.CTA)
     k.fence(kind=FenceKind.MBARRIER_INIT)
 
-    # Cross-CTA prologue barrier.
+    # Cross-CTA prologue barrier. The split form must use release semantics:
+    # proxy-async and mbarrier-init fences are operation-restricted and cannot
+    # publish the preceding initialization through a relaxed arrival.
     if r.overlap:
-        k.cluster_barrier_arrive()
+        k.cluster_barrier_arrive(sem="release")
     else:
         k.cluster_sync()
 

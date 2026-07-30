@@ -381,12 +381,12 @@ impl MatrixDType {
 }
 
 /// Memory semantics of the split cluster barrier's ARRIVE side
-/// (`barrier.cluster.arrive sem`). Canon emits `.relaxed`: the arrival only
-/// UNBLOCKS the per-role waits (control order) — per PTX §9.7.14.3 it carries
-/// NO release ordering for the cohort's prior memory accesses (canon's memory
-/// order comes from `fence.mbarrier_init` / the mbarrier pipeline instead).
-/// `.release` additionally publishes the arriving cohort's prior accesses, so
-/// the protocol checker propagates a memory happens-before edge to the waits.
+/// (`barrier.cluster.arrive sem`). `.relaxed` only UNBLOCKS the per-role waits
+/// (control order) — per PTX §9.7.14.3 it carries NO release ordering for the
+/// cohort's prior memory accesses. `.release` additionally publishes the
+/// arriving cohort's prior accesses, so the protocol checker propagates a
+/// memory happens-before edge to the waits. Restricted proxy and mbarrier-init
+/// fences do not upgrade a relaxed arrival into a general release.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum ClusterBarrierSem {
     #[default]

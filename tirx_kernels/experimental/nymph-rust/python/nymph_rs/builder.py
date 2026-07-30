@@ -1117,11 +1117,11 @@ class IRBuilder:
     def cluster_barrier_arrive(self, sem: Literal["relaxed", "release"] = "relaxed") -> None:
         """Split cluster barrier — ARRIVE side. A non-blocking collective arrival
         (``barrier.cluster.arrive``, aligned) issued once at CTA scope after the
-        prologue init, paired with per-branch ``cluster_barrier_wait``s. Canon's
-        ``.relaxed`` (the default) unblocks the waits with NO memory happens-
-        before (the memory order comes from ``fence.mbarrier_init`` / the mbar
-        pipeline); ``.release`` additionally publishes the cohort's prior
-        accesses."""
+        prologue init, paired with per-branch ``cluster_barrier_wait``s.
+        ``.relaxed`` (the default) unblocks the waits with NO memory
+        happens-before; ``.release`` additionally publishes the cohort's prior
+        accesses. Restricted proxy and mbarrier-init fences do not upgrade a
+        relaxed arrival into a general release."""
         self._append(ClusterBarrierArrive(sem=sem))
 
     def cluster_barrier_wait(self) -> None:
