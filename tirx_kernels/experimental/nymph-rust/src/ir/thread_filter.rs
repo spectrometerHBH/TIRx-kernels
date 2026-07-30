@@ -190,6 +190,8 @@ fn eval_tri(value: &ScalarValue, warp: i64, lane: i64) -> Tri {
             ScopeValueKind::LaneId => Tri::Known(lane),
             ScopeValueKind::WarpId => Tri::Known(warp),
             ScopeValueKind::WarpgroupId => Tri::Known(warp / 4),
+            // elect.sync over a fully-active warp selects its lane 0.
+            ScopeValueKind::Elected => Tri::Known((lane == 0) as i64),
             ScopeValueKind::CtaidInCluster
             | ScopeValueKind::CtaId
             | ScopeValueKind::NvshmemMyPe => Tri::Unknown,

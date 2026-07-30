@@ -14,6 +14,7 @@ def builder(num_warps=8):
 
 def test_sugar_predicates_are_canonical_eq_shapes():
     b = builder()
+    b.arg(space=nr.MemorySpace.GMEM, dtype=nr.DType.U32, shape=(1,))
     with b.if_warp(3):
         pass
     with b.if_warpgroup(1):
@@ -23,12 +24,18 @@ def test_sugar_predicates_are_canonical_eq_shapes():
     with b.if_elected():
         pass
     kernel = b.build()
-    expected = [("warp_id", 3), ("warpgroup_id", 1), ("lane_id", 5), ("lane_id", 0)]
+    expected = [("warp_id", 3), ("warpgroup_id", 1), ("lane_id", 5), ("elected", None)]
     for stmt, (kind, value) in zip(kernel.body, expected, strict=True):
         cond = stmt.cond
-        assert cond.op == nr.ScalarOp.EQ
-        assert cond.args[0].kind == kind
-        assert cond.args[1] == value
+        if kind == "elected":
+            assert cond.kind == kind
+        else:
+            assert cond.op == nr.ScalarOp.EQ
+            assert cond.args[0].kind == kind
+            assert cond.args[1] == value
+
+    source = nr.kernel_to_tirx_source(kernel)
+    assert "T.ptx.elect_sync()" in source
 
 
 def test_setmaxnreg_nested_under_warpgroup_validates():

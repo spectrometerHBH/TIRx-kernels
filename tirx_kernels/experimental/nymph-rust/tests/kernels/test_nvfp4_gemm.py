@@ -114,3 +114,19 @@ def test_nvfp4_gemm_value_e4m3_sf_cell_exact(m, n, k, alpha):
     d = np.asarray(out[d_t.id], dtype=np.float32).reshape(m, n)
     assert np.isfinite(d).all()
     assert int((d != ref).sum()) == 0, f"{int((d != ref).sum())} mismatches"
+
+
+def test_nvfp4_gemm_tma_split_cell_exact():
+    # The A/B TMA sub-box split (tma_split > 1) validates, protocol-checks, and
+    # stays cell-exact — the 2048 bench config runs with tma_split=8.
+    kernel = build_nvfp4_gemm(
+        NvFp4GemmConfig(m=512, n=512, k=512, alpha=1.0, launch_shape=(2,), tma_split=4)
+    )
+    kernel.validate()
+    assert nr.check_protocol(kernel)["status"] == "Passed"
+    a_t, b_t, sfa_t, sfb_t, d_t = kernel.args
+    a_q, b_q, sfa, sfb, ref = _prepare(512, 512, 512, 1.0, seed=512 * 3)
+    out = nr.interpret(kernel, {a_t: a_q, b_t: b_q, sfa_t: sfa, sfb_t: sfb})
+    d = np.asarray(out[d_t.id], dtype=np.float32).reshape(512, 512)
+    assert np.isfinite(d).all()
+    assert int((d != ref).sum()) == 0, f"{int((d != ref).sum())} mismatches"

@@ -39,30 +39,35 @@ CLC_HANDLE_BYTES = CLC_HANDLE_WORDS * 4
 
 # Per-shape tuning knobs (selected by N), mirroring TIRx GEMM_CONFIGS. CTA_M=256 always.
 GEMM_CONFIGS = {
-    # 1024: mma_n=64 (16 N tiles × 4 M tiles = 64 cluster tasks on 74 clusters).
+    # 1024: mma_n=64 (16 N tiles × 4 M tiles = 64 cluster tasks). nvjet's shape: blk_k=64 with a deep 10-stage ring, and the STATIC scheduler — one launch tile per cluster, so the CLC steal machinery is pure overhead.
     1024: {
         "mma_n": 64,
-        "blk_k": 128,
+        "blk_k": 64,
         "l2_group_size": 4,
         "overlap_epilogue": True,
-        "pipe_depth": 5,
+        "pipe_depth": 10,
         "wb_pipe_depth": 2,
+        "scheduler": "static",
     },
     2048: {
         "mma_n": 256,
         "blk_k": 64,
-        "l2_group_size": 8,
+        # l2>=num_m_tiles => plain M-major raster (nvjet's order); beats the grouped swizzle here (0.984 -> 0.989).
+        "l2_group_size": 16,
         "overlap_epilogue": True,
-        "pipe_depth": 5,
-        # wb_pipe_depth=8 (EPI_N=32, not 64).
+        # depth 6 (nvjet's 64x6): bf16_2048 0.985 -> 1.002; fp16 stays 1.00.
+        "pipe_depth": 6,
+        # wb_pipe_depth=8 (EPI_N=32, not 64): measured better than canon's 4 (0.971 vs 0.921) — kept deliberately.
         "wb_pipe_depth": 8,
     },
+    # 4096: nvjet's shape — single consumer (OVERLAP) with a 6-stage ring (SMEM: (16+16)KB x 6 = 192KB); cublas/tirx 0.969 (2-cons depth-4) -> 0.983 here.
     4096: {
         "mma_n": 256,
         "blk_k": 64,
-        "l2_group_size": 4,
-        "overlap_epilogue": False,
-        "pipe_depth": 4,
+        # l2>=num_m_tiles => plain M-major raster (nvjet's order): cublas/tirx 0.983 -> 1.006 fp16 / 1.002 bf16 measured.
+        "l2_group_size": 16,
+        "overlap_epilogue": True,
+        "pipe_depth": 6,
         "wb_pipe_depth": 8,
     },
     8192: {
@@ -76,11 +81,11 @@ GEMM_CONFIGS = {
     },
     16384: {
         "mma_n": 256,
-        # blk_k=128/pipe_depth=2 (same SMEM as 64/4).
-        "blk_k": 128,
-        "l2_group_size": 8,
+        # Canon verbatim: blk_k=64/pipe_depth=4 (was 128/2 "same SMEM"; fp16_16384 measured 0.959 there). l2_group_size=4 (not canon's 8): cublas-ratio 0.962 -> 0.992 measured; 16 collapses to 0.943.
+        "blk_k": 64,
+        "l2_group_size": 4,
         "overlap_epilogue": False,
-        "pipe_depth": 2,
+        "pipe_depth": 4,
         "wb_pipe_depth": 8,
     },
 }
@@ -108,6 +113,10 @@ class Fp16Bf16GemmConfig:
     l2_group_size: int | None = None
     overlap_epilogue: bool | None = None
     launch_shape: LaunchShape | None = None
+    # "clc" (default) or "static" (no CLC: one launch tile per cluster).
+    scheduler: str | None = None
+    # Teardown form: None=canon handshake+dealloc; "dealloc_only" skips the tmem_fin cluster handshake; "none" exits immediately (nvjet's form — the HW frees TMEM at CTA exit).
+    teardown: str | None = None
 
 
 class _Resolved:
@@ -129,6 +138,7 @@ class _Resolved:
         "pair_tasks",
         "pipe_depth",
         "producer_wg_base",
+        "scheduler",
         "tmem_slots",
         "wb_pipe_depth",
     )
@@ -146,6 +156,7 @@ class _Resolved:
         self.wb_pipe_depth = pick("wb_pipe_depth", knob["wb_pipe_depth"])
         self.l2_group_size = pick("l2_group_size", knob["l2_group_size"])
         self.overlap = pick("overlap_epilogue", knob["overlap_epilogue"])
+        self.scheduler = pick("scheduler", knob.get("scheduler", "clc"))
 
         self.num_consumer = 1 if self.overlap else 2
         # OVERLAP double-buffers the single consumer's TMEM (MMA_PIPE=2).
@@ -199,6 +210,8 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
     tmem_fin_off = metadata_cursor if r.overlap else None
     if r.overlap:
         metadata_cursor += 8
+    alloc_done_off = metadata_cursor
+    metadata_cursor += 8
     tmem_addr_off = (metadata_cursor + 3) // 4 * 4
     smem_size_bytes = tmem_addr_off + 4
 
@@ -231,11 +244,19 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
         layout=ab_layout,
         byte_offset=b_off,
     )
+    # Swizzle the epilogue write-back tile as wide as its row allows (canon's `_swizzle_for_row_bytes(EPI_N * elem)`): the per-thread row stores otherwise land on the same bank group — the measured 96x SMEM store-bank-conflict gap at 2048³.
+    d_row_bytes = r.epi_n * elem
+    d_layout = None
+    for swizzle, atom in ((Swizzle.B128, 128), (Swizzle.B64, 64), (Swizzle.B32, 32)):
+        if d_row_bytes >= atom and d_row_bytes % atom == 0:
+            d_layout = SmemSwizzleLayout(swizzle)
+            break
     d_smem = tuple(
         k.tensor(
             space=MemorySpace.SMEM,
             dtype=config.dtype,
             shape=(r.num_d_tiles, BLK_M, r.epi_n),
+            layout=d_layout,
             byte_offset=off,
         )
         for off in d_offsets
@@ -266,6 +287,8 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
     tmem_fin = (
         k.mbar(kind=MBarKind.THREAD, byte_offset=tmem_fin_off, stages=1) if r.overlap else None
     )
+    # alloc_done: warp 0 arrives after the pair's tcgen05.alloc; the MMA warps wait it before their first tcgen05 op (see the prologue reorder below).
+    alloc_done = k.mbar(kind=MBarKind.THREAD, byte_offset=alloc_done_off, stages=1)
     # No sched_sync rendezvous.
     tmem_empty_leader = k.mbar_ref(tmem_empty, remote_coord=0)
 
@@ -274,18 +297,27 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
     # Per-cluster identity: cluster_id is this cluster's launch tile.
     cluster_id = cta_id // CTA_GROUP
 
-    # Per-role task source: the CLC consume loop (each worker steals tiles via the handle).
-    def task_loop(wg_bar=None, warp_sync=False):
-        return _clc_worker_loop(
-            k,
-            sched,
-            clc_handle,
-            sched_arr_full,
-            sched_fin_leader,
-            cluster_id,
-            wg_bar=wg_bar,
-            warp_sync=warp_sync,
-        )
+    # Per-role task source: the CLC consume loop (each worker steals tiles via the handle), or STATIC — this cluster's own launch tile (nvjet's scheme: zero scheduler traffic when the grid already has one task per cluster).
+    static_sched = r.scheduler == "static"
+    if static_sched:
+
+        @contextmanager
+        def task_loop(wg_bar=None, warp_sync=False):
+            yield k.let(cluster_id), k.let(0)
+
+    else:
+
+        def task_loop(wg_bar=None, warp_sync=False):
+            return _clc_worker_loop(
+                k,
+                sched,
+                clc_handle,
+                sched_arr_full,
+                sched_fin_leader,
+                cluster_id,
+                wg_bar=wg_bar,
+                warp_sync=warp_sync,
+            )
 
     def work_coords(task_id):
         """ClusterLaunchControlScheduler group-major L2 raster (cluster_m=cluster_n=1)."""
@@ -298,12 +330,13 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
         n_idx = within // r.l2_group_size
         return m_idx, n_idx
 
-    with k.if_warp(0):
-        # tmem_alloc is warp-collective (full warp 0).
-        k.tmem_alloc(0, N_COLS_TMEM, addr_byte_offset=tmem_addr_off, cta_group=CTA_GROUP)
+    # mbarrier inits are split across warps 1/2 (halves the serial init chain on the cluster-barrier critical path). alloc_done is initialized by warp 0 below, so its init and the matching arrive stay on the same per-CTA stream as tcgen05.alloc.
+    with k.if_warp(1):
         with k.if_elected():
             _init_stages(k, smem_full, stages=r.pipe_depth, count=1)
             _init_stages(k, smem_empty, stages=r.pipe_depth, count=r.num_consumer)
+    with k.if_warp(2):
+        with k.if_elected():
             _init_stages(k, tmem_full, stages=r.tmem_slots, count=1)
             _init_stages(k, tmem_empty, stages=r.tmem_slots, count=CTA_GROUP)
             # CLC handshake (canon's barrier set).
@@ -311,6 +344,10 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
             _init_stages(k, sched_fin, stages=1, count=finish_arrivals)
             if r.overlap:
                 _init_stages(k, tmem_fin, stages=1, count=1)  # canon's tmem_fin (init_full=1)
+
+    # alloc_done must be initialized by warp 0's elected lane: the same CTA's warp 0 later performs the pair's alloc and arrives this local gate. Keep the init in the initialization epoch, before every fence, cluster barrier, and tcgen05.alloc.
+    with k.if_warp(0), k.if_elected():
+        _init_stages(k, alloc_done, stages=1, count=1)
 
     # Seal the mbarrier-init epoch.
     k.fence(kind=FenceKind.ASYNC_PROXY, scope=FenceScope.CTA)
@@ -322,34 +359,44 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
     else:
         k.cluster_sync()
 
+    # tmem_alloc AFTER the prologue barrier (warp-collective on full warp 0): the producers' first TMA flights overlap the pair's ~0.9us tcgen05.alloc rendezvous instead of serializing behind it (nvjet hides it too — its UTCATOMSWS atomic is effectively free). alloc_done releases the MMA warps. Alloc only what the accumulator slots actually span (mma_n x tmem_slots columns; 1024's 2x64=128 vs the full 512 pool — a smaller FIND_AND_SET window shortens the pair-collective latency the MMA warp waits on).
+    tmem_cols = max(32, r.tmem_slots * r.mma_n)
+    with k.if_warp(0):
+        k.tmem_alloc(0, tmem_cols, addr_byte_offset=tmem_addr_off, cta_group=CTA_GROUP)
+        with k.if_elected():
+            k.mbarrier_arrive(alloc_done, stage=0)
+
     # Producer warpgroup register reduction.
     with k.if_warpgroup(r.num_consumer):
         k.set_maxnreg(PRODUCER_MAXNREG)
 
-        # ---- CLC scheduler warp.
-        with k.if_warp(r.producer_wg_base + 2):
-            # cluster_barrier_wait is WARP-COLLECTIVE.
-            if r.overlap:
-                k.cluster_barrier_wait()
-            with k.if_elected():
-                with k.scheduler_impl(sched):
-                    sf_phase = k.scalar(initial=1, dtype=ScalarDType.I32)
-                    sa_phase = k.scalar(initial=0, dtype=ScalarDType.I32)
-                    sched_done = k.scalar(initial=0, dtype=ScalarDType.I32)
-                    with k.loop():
-                        k.break_if(sched_done.ne(0))
-                        with k.if_(cta_rank.eq(0)):
-                            k.mbarrier_wait(sched_fin, stage=0, phase=sf_phase)
-                            k.scalar_store(sf_phase, (sf_phase + 1) % 2)
-                        k.mbarrier_arrive_expect_tx(sched_arr_full, bytes=CLC_HANDLE_BYTES, stage=0)
-                        with k.if_(cta_rank.eq(0)):
-                            k.clc_try_cancel(sched, clc_handle, sched_arr_full, stage=0)
-                        k.mbarrier_wait(sched_arr_full, stage=0, phase=sa_phase)
-                        k.scalar_store(sa_phase, (sa_phase + 1) % 2)
-                        raw = k.clc_query_cancel(sched, clc_handle)
-                        k.mbarrier_arrive(sched_fin_leader, stage=0)
-                        with k.if_(raw < 0):
-                            k.scalar_store(sched_done, 1)
+        # ---- CLC scheduler warp (skipped under the static scheduler: there is exactly one launch tile per cluster, nothing to steal).
+        if not static_sched:
+            with k.if_warp(r.producer_wg_base + 2):
+                # cluster_barrier_wait is WARP-COLLECTIVE.
+                if r.overlap:
+                    k.cluster_barrier_wait()
+                with k.if_elected():
+                    with k.scheduler_impl(sched):
+                        sf_phase = k.scalar(initial=1, dtype=ScalarDType.I32)
+                        sa_phase = k.scalar(initial=0, dtype=ScalarDType.I32)
+                        sched_done = k.scalar(initial=0, dtype=ScalarDType.I32)
+                        with k.loop():
+                            k.break_if(sched_done.ne(0))
+                            with k.if_(cta_rank.eq(0)):
+                                k.mbarrier_wait(sched_fin, stage=0, phase=sf_phase)
+                                k.scalar_store(sf_phase, (sf_phase + 1) % 2)
+                            k.mbarrier_arrive_expect_tx(
+                                sched_arr_full, bytes=CLC_HANDLE_BYTES, stage=0
+                            )
+                            with k.if_(cta_rank.eq(0)):
+                                k.clc_try_cancel(sched, clc_handle, sched_arr_full, stage=0)
+                            k.mbarrier_wait(sched_arr_full, stage=0, phase=sa_phase)
+                            k.scalar_store(sa_phase, (sa_phase + 1) % 2)
+                            raw = k.clc_query_cancel(sched, clc_handle)
+                            k.mbarrier_arrive(sched_fin_leader, stage=0)
+                            with k.if_(raw < 0):
+                                k.scalar_store(sched_done, 1)
 
         # ---- TMA loader (TIRx producer-wg warp 3) — single-elect.
         with k.if_warp(r.producer_wg_base + 3):
@@ -409,6 +456,8 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
             with k.if_warp(r.producer_wg_base + c):
                 if r.overlap:
                     k.cluster_barrier_wait()
+                # The tcgen05.alloc (post-barrier, on warp 0) must land before this warp's first tcgen05 op — see the prologue reorder.
+                k.mbarrier_wait(alloc_done, stage=0, phase=0)
                 with k.if_elected():
                     with k.if_(cta_rank.eq(0)):
                         # Loop-carried SMEM-ring induction counter.
@@ -504,10 +553,10 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
                             space=MemorySpace.REG, dtype=config.dtype, shape=(r.epi_n,)
                         )
                         store_iter = local_iter * r.wb_pipe_depth + ot
+                        # The ring-guard wait+sync is needed ONLY when the d_smem ring actually wraps (store_iter >= depth) — an unconditional per-band sync is pure latency at wb_pipe_depth <= num_d_tiles (e.g. 1024's 2 bands).
                         with k.if_(store_iter >= r.num_d_tiles):
                             k.cp_async_bulk_wait_group_read(r.num_d_tiles - 1)
-                        # The wg_sync rides OUTSIDE the runtime store_iter branch.
-                        k.wg_sync(barrier_id=wg_bar)
+                            k.wg_sync(barrier_id=wg_bar)
                         # Fold the D-smem buffer index the same way the SMEM ring does.
                         db = _ring_index(local_iter, ot, r.wb_pipe_depth, r.num_d_tiles)[0]
                         # Read the EPI_N band in read_w=32 chunks.
@@ -617,24 +666,30 @@ def build_fp16_bf16_gemm(config: Fp16Bf16GemmConfig = Fp16Bf16GemmConfig()) -> K
                         k.cp_async_bulk_commit_group()
                     with k.if_(k.tid_in_wg().eq(0)):
                         k.mbarrier_arrive(tmem_empty_leader, stage=slot)
-            # Drain in-flight TMA stores once after the persistent loop.
-            k.cp_async_bulk_wait_group_read(0)
-            k.wg_sync(barrier_id=wg_bar)
+            # No-overlap keeps the drain before its cluster-wide teardown; the overlap path drops it — the last task's TMA stores drain on the HW side at kernel exit (D visibility is completion-ordered), so the pair's dealloc rendezvous below overlaps the final store flight instead of serializing behind a full drain (nvjet's PREEXIT-style tail).
+            if not r.overlap:
+                k.cp_async_bulk_wait_group_read(0)
+                k.wg_sync(barrier_id=wg_bar)
 
     # Cluster-wide barrier before freeing TMEM.
+    teardown = config.teardown or GEMM_CONFIGS.get(config.n, {}).get("teardown")
     if r.overlap:
-        # canon's tmem_fin teardown.
-        with k.if_warp(0):
-            with k.if_elected():
-                k.mbarrier_arrive(k.mbar_ref(tmem_fin, remote_coord=1 - cta_rank), stage=0)
-            k.mbarrier_wait(tmem_fin, stage=0, phase=0)
-            k.tmem_relinquish(CTA_GROUP)
-            k.tmem_dealloc(0, N_COLS_TMEM, CTA_GROUP)
+        if teardown != "none":
+            if teardown != "dealloc_only":
+                # canon's tmem_fin teardown.
+                with k.if_warp(0):
+                    with k.if_elected():
+                        k.mbarrier_arrive(k.mbar_ref(tmem_fin, remote_coord=1 - cta_rank), stage=0)
+                    k.mbarrier_wait(tmem_fin, stage=0, phase=0)
+            with k.if_warp(0):
+                k.tmem_relinquish(CTA_GROUP)
+                k.tmem_dealloc(0, tmem_cols, CTA_GROUP)
+        # "none": nvjet's form — plain EXIT, the HW frees TMEM at CTA exit.
     else:
         k.cluster_sync()
         with k.if_warp(0):
             k.tmem_relinquish(CTA_GROUP)
-            k.tmem_dealloc(0, N_COLS_TMEM, CTA_GROUP)
+            k.tmem_dealloc(0, tmem_cols, CTA_GROUP)
 
     return k.build()
 
@@ -725,6 +780,8 @@ def _validate_config(config: Fp16Bf16GemmConfig, r: _Resolved) -> None:
         raise ValueError("fp16_bf16_gemm num_m_tiles must be a multiple of l2_group_size")
     if r.pair_tasks < 1:
         raise ValueError("fp16_bf16_gemm resolves to zero tiles; check m/n vs the tile sizes")
+    if r.scheduler not in ("clc", "static"):
+        raise ValueError("fp16_bf16_gemm scheduler must be 'clc' or 'static'")
 
 
 def _validate_launch_shape(launch_shape: LaunchShape) -> None:
@@ -780,13 +837,22 @@ def run_bench(dtype, M, N, K, *, warmup=None, repeat=None, timer=None, **kwargs)
     canon = compile_kernel(tir_kernel(dtype, M, N, K))
     nymph = _compile_nymph(dtype, M, N, K)
     a, b, c = prepare_data(dtype, M, N, K)
-    oc, on = torch.zeros_like(c, device="cuda"), torch.zeros_like(c, device="cuda")
-    funcs = {"tir": lambda: canon(a, b, oc), "tirx": lambda: nymph(a, b, on)}
+    oc, on, obl = (
+        torch.zeros_like(c, device="cuda"),
+        torch.zeros_like(c, device="cuda"),
+        torch.zeros_like(c, device="cuda"),
+    )
+    funcs = {
+        "tir": lambda: canon(a, b, oc),
+        "tirx": lambda: nymph(a, b, on),
+        # cuBLAS as a first-class impl (pure launch, preallocated out).
+        "cublas": lambda: torch.matmul(a, b.T, out=obl),
+    }
     for fn in funcs.values():
         fn()
     torch.cuda.synchronize()
     ref = torch.mm(a, b.T)
-    for name, out in (("tir", oc), ("tirx", on)):
+    for name, out in (("tir", oc), ("tirx", on), ("cublas", obl)):
         cos = torch.nn.functional.cosine_similarity(
             out.float().flatten(), ref.float().flatten(), dim=0
         )

@@ -28,6 +28,7 @@ from .nymph_rs import (
     ForLoop,
     GmemAtomicAdd,
     GmemWaitEq,
+    GridDepControl,
     If,
     Kernel,
     LaunchShape,
@@ -709,12 +710,15 @@ class IRBuilder:
 
     @contextmanager
     def if_elected(self) -> Iterator[None]:
-        """Lane 0 of EVERY warp in context (`lane_id() == 0`).
+        """One elected lane of EVERY warp in context (``T.ptx.elect_sync()``).
 
-        For one thread per warpgroup use `if_(tid_in_wg().eq(0))`; for one
-        thread per CTA nest this under `if_warp(w)`.
+        The IR predicate is the elect.sync intrinsic itself (printed as
+        canon's ``if T.ptx.elect_sync():``); a literal ``lane_id() == 0``
+        compare is what ``if_lane(0)`` spells. For one thread per warpgroup
+        use `if_(tid_in_wg().eq(0))`; for one thread per CTA nest this under
+        `if_warp(w)`.
         """
-        with self.if_(self.lane_id().eq(0)):
+        with self.if_(ScopeValue(kind="elected")):
             yield
 
     def set_maxnreg(self, nreg: int) -> None:
@@ -1124,6 +1128,15 @@ class IRBuilder:
         branch's warp(group) must execute it (an elected-lane wait deadlocks on
         hardware). Blocks until every CTA of the cluster has arrived."""
         self._append(ClusterBarrierWait())
+
+    def grid_dep_control(self, action: Literal["launch_dependents", "wait"]) -> None:
+        """Programmatic dependent launch — ``griddepcontrol.<action>`` (sm_90+).
+        A cross-grid launch hint with NO intra-kernel semantics (sim no-op):
+        ``launch_dependents`` (SASS PREEXIT) lets the next grid's prologue
+        overlap this grid's drain; ``wait`` blocks until the prerequisite
+        grid's memory is visible. Only effective when the kernel is launched
+        with ``tirx.use_programtic_dependent_launch``."""
+        self._append(GridDepControl(action=action))
 
     def _append(self, stmt: Stmt) -> None:
         self._body_stack[-1].append(stmt)

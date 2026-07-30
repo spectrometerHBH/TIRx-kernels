@@ -261,6 +261,37 @@ fn tmem_cta_group2_collective_success_populates_peer_scratchpads() {
 }
 
 #[test]
+fn grid_dep_control_is_a_noop_in_value_and_trace_modes() {
+    let kernel = Kernel {
+        name: "grid_dep_noop".into(),
+        args: vec![],
+        body: vec![
+            Stmt::GridDepControl {
+                action: GridDepAction::LaunchDependents,
+            },
+            Stmt::GridDepControl {
+                action: GridDepAction::Wait,
+            },
+        ],
+        num_warps: 4,
+        smem_size_bytes: 0,
+        launch_shape: vec![1],
+        cluster_shape: vec![1],
+    };
+    assert!(kernel.validate().is_ok(), "{:?}", kernel.validate());
+    let value = run_value_kernel(&kernel, HashMap::new());
+    assert!(value.completed, "failed: {:?}", value.failure_reason);
+    let trace = run_trace_kernel(&kernel, HashMap::new());
+    assert!(trace.completed, "failed: {:?}", trace.failure_reason);
+    // No TraceEventKind exists for it: the statement emits nothing.
+    assert!(
+        trace_events(&trace).is_empty(),
+        "{:?}",
+        trace_events(&trace)
+    );
+}
+
+#[test]
 fn bad_input_metadata_fail_closed_is_rust_internal() {
     let input = gmem_tensor(303, DType::U32, vec![4]);
     let empty_kernel = Kernel {

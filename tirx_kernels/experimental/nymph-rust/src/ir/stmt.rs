@@ -411,6 +411,36 @@ impl ClusterBarrierSem {
     }
 }
 
+/// Which `griddepcontrol` operation a `Stmt::GridDepControl` performs
+/// (sm_90+ programmatic dependent launch).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum GridDepAction {
+    /// `griddepcontrol.launch_dependents` (SASS `PREEXIT`) — lets the
+    /// dependent grid begin its pre-`wait` prologue before this grid drains.
+    #[default]
+    LaunchDependents,
+    /// `griddepcontrol.wait` — blocks until the prerequisite grid has
+    /// completed and its memory operations are visible to this grid.
+    Wait,
+}
+
+impl GridDepAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GridDepAction::LaunchDependents => "launch_dependents",
+            GridDepAction::Wait => "wait",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "launch_dependents" => Some(GridDepAction::LaunchDependents),
+            "wait" => Some(GridDepAction::Wait),
+            _ => None,
+        }
+    }
+}
+
 /// `Stmt` — one statement of the kernel body. `cta_group` fields are 1 or 2;
 /// `*_mask` are 16-bit CTA masks.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -898,6 +928,14 @@ pub enum Stmt {
     /// of the cluster have executed `ClusterBarrierArrive`. Allowed inside a warp
     /// branch (unlike `ClusterSync`).
     ClusterBarrierWait,
+    /// Programmatic dependent launch — `griddepcontrol.<action>` (sm_90+). A
+    /// launch-scheduling hint between CONSECUTIVE GRIDS, with no intra-kernel
+    /// memory or control semantics: the interpreter steps over it (trace no-op)
+    /// and the checker needs no happens-before for it (the cross-grid ordering
+    /// contract is the dependent kernel's, enforced by hardware).
+    GridDepControl {
+        action: GridDepAction,
+    },
 }
 
 impl Stmt {
