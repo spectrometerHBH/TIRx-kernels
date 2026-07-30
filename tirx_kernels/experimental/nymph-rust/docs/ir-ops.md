@@ -161,8 +161,8 @@ tracks every prior async op of the warp, so a later commit covers the
 access again and any one of those cells' waits counts) — with ONE such
 drain happens-before the generation's dealloc (cross-stream edges must
 come from
-real synchronization — mbar handshakes, fused cta/cluster syncs, a
-fence-sealed split cluster barrier — recorded in `OrderingAnalysis`; the
+real synchronization — mbar handshakes, fused cta/cluster syncs, or a
+release split cluster barrier — recorded in `OrderingAnalysis`; the
 sampled epoch interleaving alone proves nothing). The rule is uniform:
 no kernel-teardown exception, and a generation's dealloc must also be
 happens-before-after its own alloc. Missing edges fail
@@ -321,14 +321,14 @@ waiting any one of those barriers suffices.
   engine's real timing envelope is owned entirely by the checker's
   async-window passes (`async_group_lifetime`, `tcgen05_async_hazard`)
   rather than by the values.
-- **`fence.mbarrier_init` seals, but nothing requires it.** The op exists
-  (`FenceKind::MbarrierInit`) and the checker treats it as a release-side
-  fence: it seals its executing lanes so a later relaxed cluster-barrier
-  arrive by those lanes publishes. What is NOT checked is the obligation
-  itself — a kernel that initializes barrier cells and lets a peer use them
-  with no such fence is accepted, because `MbarInit` is an ordinary event on
-  its stream and no pass demands publication of the barrier OBJECT (as
-  opposed to the data a barrier hands over).
+- **`fence.mbarrier_init` is operation-restricted.** On hardware it publishes
+  prior `mbarrier.init` operations, but it is not a general release fence and
+  the checker does not let it upgrade a later relaxed cluster-barrier arrival.
+  What is NOT checked is the publication obligation itself — a kernel that
+  initializes barrier cells and lets a peer use them with no such fence is
+  accepted, because `MbarInit` is an ordinary event on its stream and no pass
+  demands publication of the barrier OBJECT (as opposed to the data a barrier
+  hands over).
 - **A new trace event kind orders nothing by default.** The scan that builds
   the clock decides acquires and releases with `match` arms that end in a
 

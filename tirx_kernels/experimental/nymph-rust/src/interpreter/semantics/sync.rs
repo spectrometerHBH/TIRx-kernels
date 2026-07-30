@@ -52,11 +52,10 @@ fn cluster_barrier_key(first: &ThreadId) -> SyncKey {
 /// matching per-warp `ClusterBarrierWait`s block until the set is complete.
 /// Modeled as a one-shot collective (the prologue issues it exactly once before
 /// the warp branches diverge). The arrive emits a `ClusterBarrierArrive` trace
-/// event carrying the stmt's memory `sem`: canon's `.relaxed` carries NO
-/// release ordering (PTX §9.7.14.3), so the checker's ordering analysis only
-/// publishes a memory happens-before edge for `.release` (or a fence-sealed
-/// relaxed arrive); the deadlock graph witnesses the waits against the arrival
-/// set either way (control order).
+/// event carrying the stmt's memory `sem`: `.relaxed` carries NO release
+/// ordering (PTX §9.7.14.3), so the checker's ordering analysis only publishes
+/// a memory happens-before edge for `.release`; the deadlock graph witnesses
+/// the waits against the arrival set either way (control order).
 fn execute_cluster_barrier_arrive<'a, 'k>(
     ctx: &mut WarpContext<'a, 'k>,
     stmt: &'k Stmt,

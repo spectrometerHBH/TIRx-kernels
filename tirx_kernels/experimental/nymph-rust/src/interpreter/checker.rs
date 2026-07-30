@@ -3868,27 +3868,12 @@ impl OrderingAnalysis {
         // into `cb_arrival`; once every cluster thread has arrived the join
         // becomes `cb_release`, which each passing ClusterBarrierWait acquires.
         //
-        // FENCE-SEALED relaxed arrive (canon's actual memory-order mechanism):
-        // the prologue emits `fence.proxy_async` and `fence.mbarrier_init` (a
-        // cluster-scope release fence, PTX `fence.mbarrier_init.release.cluster`)
-        // BEFORE the relaxed arrive — fence-synchronization (release-side
-        // fence, the relaxed atomic arrive on the barrier state, the wait's
-        // built-in acquire) DOES establish memory HB. So a relaxed arrival
-        // whose stream executed a release-side fence (ProxyAsync / MbarrierInit)
-        // publishes exactly like a release one; an unfenced relaxed arrival
-        // publishes nothing. (hb_control vs hb_memory: the deadlock/wait
-        // witnesses in `DeadlockGraph` are event-presence based — the control
-        // relation — while every `happens_before` consumer below is a MEMORY
-        // check: races, async windows, TMEM lifetime. So the single clock
-        // relation is exactly hb_memory.)
+        // Restricted fences do not upgrade a relaxed arrival:
+        // `fence.mbarrier_init` orders only prior mbarrier.init operations, and
+        // a proxy fence orders accesses across proxies. Neither is a general
+        // memory release for an arbitrary later barrier arrival.
         let mut cb_arrival: HashMap<usize, Clock> = HashMap::new();
         let mut cb_release: HashMap<usize, Clock> = HashMap::new();
-        // Lanes that executed a release-side fence (fence.proxy_async /
-        // fence.mbarrier_init) so far in trace order, as a per-stream lane
-        // bitmask. A fence releases the accesses of the thread that EXECUTES
-        // it, so one lane's fence does not seal its warp-mates: a relaxed
-        // arrive publishes only for arriving lanes that fenced themselves.
-        let mut fenced_lanes: HashMap<usize, u32> = HashMap::new();
         let mut pending_tmem_collectives: HashMap<TmemCollectiveKey, usize> = HashMap::new();
         for event in events.iter() {
             let Some(scope) = event_scope(&event.payload) else {
@@ -3936,10 +3921,9 @@ impl OrderingAnalysis {
                         states[stream_id].acquire(mask, release_clock);
                     }
                 }
-                // acquire: the split cluster barrier's wait joins the cluster's full
-                // arrival clock — published only by `.release` (or fence-sealed
-                // relaxed) arrivals (a bare relaxed barrier publishes nothing, so
-                // the wait acquires nothing either).
+                // Acquire: the split cluster barrier's wait joins the cluster's
+                // arrival clock published by `.release` arrivals. A relaxed
+                // barrier publishes nothing, so the wait acquires nothing.
                 TraceEventKind::ClusterBarrierWait { .. } => {
                     if let Some(rel) = cb_release.get(&scope.cluster_id) {
                         states[stream_id].acquire(mask, rel);
@@ -4100,30 +4084,20 @@ impl OrderingAnalysis {
                         states[stream_id].published(stream_id, mask, ordinal),
                     );
                 }
-                // split cluster barrier arrive: a `.release` arrival publishes this
-                // stream's clock into the cluster accumulator; once every cluster
-                // thread has arrived the join becomes the release the per-warp
-                // waits acquire. A `.relaxed` arrival publishes ONLY when its
-                // stream is fence-sealed (canon's prologue fence.proxy_async /
-                // fence.mbarrier_init — the release-side fence of the
-                // fence-synchronization pattern); a bare relaxed arrival publishes
-                // NOTHING (PTX §9.7.14.3: no visibility guarantee for pre-arrive
-                // accesses) — the wait still unblocks (control order,
-                // deadlock-witnessed) but no memory happens-before edge forms.
+                // Split cluster barrier arrive: a `.release` arrival publishes
+                // this stream's clock into the cluster accumulator; once every
+                // cluster thread has arrived the join becomes the release the
+                // per-warp waits acquire. A `.relaxed` arrival publishes nothing
+                // (PTX §9.7.14.3); it still unblocks control-order waits tracked by
+                // the deadlock pass.
                 TraceEventKind::ClusterBarrierArrive {
                     thread_count,
                     count,
                     sem,
                     ..
                 } => {
-                    let publish_mask = if *sem == super::protocol::ClusterBarrierSemEvent::Release {
-                        mask
-                    } else {
-                        mask & fenced_lanes.get(&stream_id).copied().unwrap_or(0)
-                    };
-                    if publish_mask != 0 {
-                        let published =
-                            states[stream_id].published(stream_id, publish_mask, ordinal);
+                    if *sem == super::protocol::ClusterBarrierSemEvent::Release {
+                        let published = states[stream_id].published(stream_id, mask, ordinal);
                         let acc = cb_arrival.entry(scope.cluster_id).or_default();
                         join_clock(acc, &published);
                     }
@@ -4137,19 +4111,6 @@ impl OrderingAnalysis {
                             cb_release.insert(scope.cluster_id, acc.clone());
                         }
                     }
-                }
-                // release-side fence (fence.proxy_async / fence.mbarrier_init):
-                // seal the executing LANES — a later RELAXED cluster-barrier
-                // arrive by a sealed lane fence-synchronizes (publishes that
-                // lane's clock). The sim-only Generic markers seal nothing.
-                TraceEventKind::Fence { fence_kind, .. }
-                    if matches!(
-                        fence_kind,
-                        super::protocol::FenceEventKind::ProxyAsync
-                            | super::protocol::FenceEventKind::MbarrierInit
-                    ) =>
-                {
-                    *fenced_lanes.entry(stream_id).or_insert(0) |= mask;
                 }
                 _ => {}
             }
@@ -6488,13 +6449,15 @@ mod tests {
         );
     }
 
-    /// canon's prologue seal: `fence.mbarrier_init` (a cluster-scope release
-    /// fence) executed by the arriving warps before the relaxed arrive.
-    fn seal_fence(stream: usize, cta: usize) -> TraceEvent {
+    fn restricted_fence(
+        stream: usize,
+        cta: usize,
+        fence_kind: super::super::protocol::FenceEventKind,
+    ) -> TraceEvent {
         event(
             9,
             TraceEventKind::Fence {
-                fence_kind: super::super::protocol::FenceEventKind::MbarrierInit,
+                fence_kind,
                 fence_scope: FenceScope::Cta,
                 scope: scope_cta(stream, cta, 0),
             },
@@ -6502,168 +6465,36 @@ mod tests {
     }
 
     #[test]
-    fn fenced_relaxed_cluster_barrier_arrive_creates_memory_hb() {
-        // POSITIVE (canon's prologue shape): BOTH CTAs fence before their relaxed
-        // arrivals — fence-synchronization (release-side fence + relaxed atomic
-        // arrive + the wait's acquire) publishes the stream clocks, so the
-        // cross-CTA write->read is ordered. idx: fences=0,1 write=2 arrives=3,4
-        // wait=5 read=6.
-        let kernel = empty_kernel("cluster_barrier_fenced_relaxed", vec![]);
-        let mut events = vec![seal_fence(0, 0), seal_fence(1, 1)];
-        events.extend(cluster_barrier_peer_smem_events(
-            super::super::protocol::ClusterBarrierSemEvent::Relaxed,
-        ));
-        let ordering = OrderingAnalysis::new(&events);
-        assert!(ordering.happens_before(2, 6));
-        let report = run_offline_checkers(
-            &kernel,
-            ProtocolReport::new(ProtocolStatus::Passed),
-            &events,
-        );
-        assert_eq!(
-            pass_status(&report, "memory_race_check"),
-            ProtocolStatus::Passed
-        );
-    }
-
-    /// A one-lane scope on `stream`/`cta`: the elected-lane shape a real
-    /// prologue uses for per-thread ops.
-    fn scope_lane(
-        stream_id: usize,
-        cta_id: usize,
-        lane: u8,
-    ) -> super::super::protocol::AccessScope {
-        super::super::protocol::AccessScope {
-            stream_id,
-            cluster_id: cta_id,
-            cta_id,
-            ctaid_in_cluster: cta_id,
-            lane_count: 1,
-            warp_id: 0,
-            active_lanes: 1u32 << lane,
+    fn restricted_fences_do_not_release_relaxed_cluster_barrier() {
+        // Both fence kinds are narrower than a general release fence:
+        // mbarrier-init orders only prior mbarrier.init operations, and the
+        // proxy fence orders accesses across proxies. Neither publishes a later
+        // generic SMEM write through a relaxed barrier arrival.
+        for fence_kind in [
+            super::super::protocol::FenceEventKind::MbarrierInit,
+            super::super::protocol::FenceEventKind::ProxyAsync,
+        ] {
+            let kernel = empty_kernel("cluster_barrier_restricted_fence", vec![]);
+            let mut events = vec![
+                restricted_fence(0, 0, fence_kind),
+                restricted_fence(1, 1, fence_kind),
+            ];
+            events.extend(cluster_barrier_peer_smem_events(
+                super::super::protocol::ClusterBarrierSemEvent::Relaxed,
+            ));
+            let ordering = OrderingAnalysis::new(&events);
+            assert!(!ordering.happens_before(2, 6));
+            let report = run_offline_checkers(
+                &kernel,
+                ProtocolReport::new(ProtocolStatus::Passed),
+                &events,
+            );
+            assert_eq!(
+                pass_status(&report, "memory_race_check"),
+                ProtocolStatus::Failed
+            );
+            assert!(diagnostic_codes(&report).contains("memory_data_race"));
         }
-    }
-
-    #[test]
-    fn one_lanes_fence_does_not_seal_its_warp_mates() {
-        // NEGATIVE: lane 0 of CTA0 fences; lane 1 of the SAME warp performs the
-        // relaxed arrive. A fence releases the executing THREAD's accesses, so
-        // lane 1's arrival is unsealed and publishes nothing — the peer-SMEM
-        // write it would otherwise carry stays unordered against CTA1's read.
-        let kernel = empty_kernel("cluster_barrier_foreign_lane_fence", vec![]);
-        let mut events = vec![event(
-            9,
-            TraceEventKind::Fence {
-                fence_kind: super::super::protocol::FenceEventKind::MbarrierInit,
-                fence_scope: FenceScope::Cta,
-                scope: scope_lane(0, 0, 0),
-            },
-        )];
-        events.push(event(
-            10,
-            TraceEventKind::Write {
-                region: smem_region(1, 0, 64),
-                proxy: MemoryProxy::Generic,
-                access_kind: MemoryAccessKind::Tensor(TensorAccessKind::Generic),
-                scope: scope_lane(0, 0, 1),
-            },
-        ));
-        events.push(event(
-            11,
-            TraceEventKind::ClusterBarrierArrive {
-                thread_count: 64,
-                count: 32,
-                sem: super::super::protocol::ClusterBarrierSemEvent::Relaxed,
-                scope: scope_lane(0, 0, 1),
-            },
-        ));
-        events.push(event(
-            11,
-            TraceEventKind::ClusterBarrierArrive {
-                thread_count: 64,
-                count: 64,
-                sem: super::super::protocol::ClusterBarrierSemEvent::Relaxed,
-                scope: scope_cta(1, 1, 0),
-            },
-        ));
-        events.push(event(
-            12,
-            TraceEventKind::ClusterBarrierWait {
-                scope: scope_cta(1, 1, 0),
-            },
-        ));
-        events.push(event(
-            13,
-            TraceEventKind::Read {
-                region: smem_region(1, 0, 64),
-                proxy: MemoryProxy::Generic,
-                access_kind: MemoryAccessKind::Tensor(TensorAccessKind::Generic),
-                scope: scope_cta(1, 1, 0),
-            },
-        ));
-        let ordering = OrderingAnalysis::new(&events);
-        assert!(!ordering.happens_before(1, 5));
-        let report = run_offline_checkers(
-            &kernel,
-            ProtocolReport::new(ProtocolStatus::Passed),
-            &events,
-        );
-        assert_eq!(
-            pass_status(&report, "memory_race_check"),
-            ProtocolStatus::Failed
-        );
-        assert!(diagnostic_codes(&report).contains("memory_data_race"));
-    }
-
-    #[test]
-    fn fence_seal_is_per_thread_unfenced_arriver_publishes_nothing() {
-        // NEGATIVE: only CTA1 (the READER) fenced. Fence-synchronization
-        // releases the accesses of the thread that executes the fence, so
-        // CTA0's own relaxed arrival is unfenced and its peer-SMEM write never
-        // enters the barrier's release — the cross-CTA write->read stays
-        // unordered.
-        let kernel = empty_kernel("cluster_barrier_unfenced_writer", vec![]);
-        let mut events = vec![seal_fence(1, 1)];
-        events.extend(cluster_barrier_peer_smem_events(
-            super::super::protocol::ClusterBarrierSemEvent::Relaxed,
-        ));
-        let ordering = OrderingAnalysis::new(&events);
-        assert!(!ordering.happens_before(1, 5));
-        let report = run_offline_checkers(
-            &kernel,
-            ProtocolReport::new(ProtocolStatus::Passed),
-            &events,
-        );
-        assert_eq!(
-            pass_status(&report, "memory_race_check"),
-            ProtocolStatus::Failed
-        );
-        assert!(diagnostic_codes(&report).contains("memory_data_race"));
-    }
-
-    #[test]
-    fn fence_seal_is_per_thread_fenced_writer_publishes_alone() {
-        // POSITIVE: only CTA0 (the WRITER) fenced. Its release-side fence plus
-        // the relaxed atomic arrive head a release sequence that the waiter's
-        // built-in acquire reads, so the write is delivered — whether or not
-        // the CONSUMER CTA fenced, and whether or not the arrival that
-        // completes the barrier publishes anything of its own.
-        let kernel = empty_kernel("cluster_barrier_fenced_writer", vec![]);
-        let mut events = vec![seal_fence(0, 0)];
-        events.extend(cluster_barrier_peer_smem_events(
-            super::super::protocol::ClusterBarrierSemEvent::Relaxed,
-        ));
-        let ordering = OrderingAnalysis::new(&events);
-        assert!(ordering.happens_before(1, 5));
-        let report = run_offline_checkers(
-            &kernel,
-            ProtocolReport::new(ProtocolStatus::Passed),
-            &events,
-        );
-        assert_eq!(
-            pass_status(&report, "memory_race_check"),
-            ProtocolStatus::Passed
-        );
     }
 
     // ===================== TMEM generation intervals =====================

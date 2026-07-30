@@ -67,11 +67,11 @@ only after that balance and the pending-arrival count are both exactly zero.
 - **No inferred warp convergence**: an explicit `WarpSync` lowers to
   `T.cuda.warp_sync()`, but codegen never inserts one from thread-scope
   analysis. Any proof that needs convergence must keep the operation in IR.
-- **`fence.mbarrier_init` seals but is not required**: the checker treats it
-  as a release-side fence (it seals its executing lanes for a later relaxed
-  cluster-barrier arrive), but no pass demands that a kernel publish its
+- **`fence.mbarrier_init` publication is not required**: the trace records this
+  operation-restricted fence, but no pass demands that a kernel publish its
   mbarrier OBJECTS with one — barrier cells initialized and handed to a peer
-  without it are accepted.
+  without it are accepted. It is not a general release fence and does not
+  upgrade a later relaxed cluster barrier.
 
 ## sim-only ops (no codegen lowering — sim-green means nothing for silicon)
 

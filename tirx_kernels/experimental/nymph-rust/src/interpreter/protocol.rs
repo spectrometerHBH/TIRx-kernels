@@ -481,11 +481,9 @@ impl TmemAsyncKind {
 pub enum FenceEventKind {
     Generic,
     ProxyAsync,
-    /// `fence.mbarrier_init` — a cluster-scope RELEASE fence (PTX
-    /// `fence.mbarrier_init.release.cluster`): canon's release-side fence before
-    /// the relaxed prologue cluster-barrier arrive. Distinct from `Generic`
-    /// (which carries the sim-only Memory/View markers) because it seals a
-    /// relaxed `barrier.cluster.arrive` into a fence-synchronized release.
+    /// `fence.mbarrier_init.release.cluster`. Its synchronizing effect is
+    /// restricted to prior `mbarrier.init` operations; it is not a general
+    /// memory release fence.
     MbarrierInit,
 }
 
