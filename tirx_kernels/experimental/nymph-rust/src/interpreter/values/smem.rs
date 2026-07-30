@@ -452,6 +452,28 @@ impl SmemScratchpad {
         self.read_indices(tensor, &indices)
     }
 
+    /// Read a logical tensor block as its exact row-major storage bytes.
+    ///
+    /// Physical bit-copy instructions such as `tcgen05.cp` must preserve raw
+    /// encodings (including NaN payloads), so decoding through `ValueArray1`
+    /// and re-encoding is not sufficient.
+    pub fn read_block_bytes(
+        &self,
+        tensor: &Tensor,
+        offsets: &[usize],
+        slice_shape: &[usize],
+    ) -> IResult<Vec<u8>> {
+        let indices = block_indices(tensor, offsets, slice_shape)?;
+        let elem_bytes = dtype_size_bytes(tensor.dtype);
+        let mut out = Vec::with_capacity(indices.len() * elem_bytes);
+        for flat in indices {
+            let range = self.byte_range(tensor, flat)?;
+            self.check_valid(range.clone())?;
+            out.extend_from_slice(&self.bytes[range]);
+        }
+        Ok(out)
+    }
+
     pub fn write_block(
         &mut self,
         tensor: &Tensor,
@@ -599,7 +621,7 @@ impl SmemScratchpad {
     /// is stored packed: a `U8` tensor whose innermost dim is the byte count
     /// (K/2 bytes for K fp4 elements), exactly mirroring TIRx's
     /// `uint8[M, K//2]` + `.view("float4_e2m1fn")`. Each byte holds two e2m1
-    /// values — low nibble = element 2i, high nibble = element 2i+1 — so a slice
+    /// values — high nibble = element 2i, low nibble = element 2i+1 — so a slice
     /// of `cols` bytes yields `2*cols` f32 in element order. `slice_shape`'s
     /// innermost extent is in bytes (the packed K/2), like the SMEM tensor.
     pub fn append_f32_block_fp4(
@@ -622,8 +644,8 @@ impl SmemScratchpad {
             out.reserve(ranges.len() * cols * 2);
             for range in &ranges {
                 for &byte in &self.bytes[range.clone()] {
-                    out.push(decode_e2m1(byte & 0x0F));
                     out.push(decode_e2m1(byte >> 4));
+                    out.push(decode_e2m1(byte & 0x0F));
                 }
             }
             return Ok(());
@@ -632,8 +654,8 @@ impl SmemScratchpad {
         out.reserve(indices.len() * 2);
         for flat in indices {
             let b = self.read_bytes::<1>(tensor, flat)?[0];
-            out.push(decode_e2m1(b & 0x0F));
             out.push(decode_e2m1(b >> 4));
+            out.push(decode_e2m1(b & 0x0F));
         }
         Ok(())
     }
@@ -934,7 +956,6 @@ mod tests {
             shape,
             layout: None,
             byte_offset: Some(byte_offset),
-            reg_frag: None,
         }
     }
 
@@ -960,7 +981,7 @@ mod tests {
     #[test]
     fn fp4_operand_unpacks_two_e2m1_per_byte_in_element_order() {
         // packed u8[2, 3]: row 0 bytes [0x21, 0x43, 0x65], row 1 [0x07, 0x12, 0xA9].
-        // byte 0x21 -> low nibble 1 (0.5), high nibble 2 (1.0); etc.
+        // byte 0x21 -> high nibble 2 (1.0), low nibble 1 (0.5); etc.
         let t = smem_tensor(1, DType::U8, vec![2, 3], 0);
         let mut pool = SmemScratchpad::new(6);
         let bytes: [u8; 6] = [0x21, 0x43, 0x65, 0x07, 0x12, 0xA9];
@@ -978,24 +999,26 @@ mod tests {
         assert_eq!(
             out,
             vec![
-                d(1),
                 d(2),
-                d(3),
+                d(1),
                 d(4),
+                d(3),
+                d(6),
                 d(5),
-                d(6), // row 0
-                d(7),
+                // row 0
                 d(0),
-                d(2),
+                d(7),
                 d(1),
+                d(2),
+                d(0xA),
                 d(9),
-                d(0xA), // row 1: 0x07,0x12,0xA9
+                // row 1: 0x07,0x12,0xA9
             ]
         );
         // a sub-slice of the second row's last two bytes exercises the offset path
         let mut sub = Vec::new();
         pool.append_f32_block_fp4(&t, &[1, 1], &[1, 2], &mut sub)
             .unwrap();
-        assert_eq!(sub, vec![d(2), d(1), d(9), d(0xA)]);
+        assert_eq!(sub, vec![d(1), d(2), d(0xA), d(9)]);
     }
 }

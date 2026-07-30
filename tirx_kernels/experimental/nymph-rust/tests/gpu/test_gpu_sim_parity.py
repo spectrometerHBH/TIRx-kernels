@@ -36,7 +36,12 @@ torch = pytest.importorskip("torch")
 tvm = pytest.importorskip("tvm")
 
 import nymph_rs as nr  # noqa: E402
-from nymph_rs.kernels import build_fp16_bf16_gemm, build_nvfp4_gemm  # noqa: E402
+from nymph_rs.kernels import (  # noqa: E402
+    build_fp8_blockwise_gemm,
+    build_fp16_bf16_gemm,
+    build_nvfp4_gemm,
+)
+from nymph_rs.kernels.fp8_blockwise_gemm import Fp8BlockwiseGemmConfig  # noqa: E402
 from nymph_rs.kernels.fp16_bf16_gemm import Fp16Bf16GemmConfig  # noqa: E402
 from nymph_rs.kernels.nvfp4_gemm import NvFp4GemmConfig  # noqa: E402
 
@@ -44,6 +49,7 @@ from nymph_rs.kernels.nvfp4_gemm import NvFp4GemmConfig  # noqa: E402
 # dir; pytest's prepend import mode has not necessarily put it on sys.path when
 # this module is collected first).
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "kernels")))
+from test_fp8_blockwise_gemm import _prepare as _fp8_prepare  # noqa: E402
 from test_nvfp4_gemm import _prepare as _nvfp4_prepare  # noqa: E402
 
 pytestmark = [
@@ -79,29 +85,6 @@ def _assert_bit_equal(gpu: np.ndarray, sim: np.ndarray, what: str):
     raise AssertionError(f"{what}: {len(mism)} bitwise mismatches (first: {shown})")
 
 
-def _sf_gmem_bytes(sf: np.ndarray) -> np.ndarray:
-    """Plain (R, C) scale factors -> the GMEM byte order the emitted kernel's SF
-    arg declares (canon ``SfLayout.layout_128x4``, the emitted buffer's
-    ``TileLayout(S[(R//128, 4, 32, C//4, 4) : ((C//4)*512, 4, 16, 512, 1)])``):
-    128-row bands of (C//4) 512-byte atoms, an atom holding 128 rows x 4 cols as
-    ``(row%32)*16 + (row//32)*4 + col%4``. The sim takes the scales in plain
-    logical order; the silicon side needs the same VALUES at these byte
-    offsets."""
-    r, c = sf.shape
-    i = np.arange(r)[:, None]
-    j = np.arange(c)[None, :]
-    off = (
-        (i // 128) * ((c // 4) * 512)
-        + ((i // 32) % 4) * 4
-        + (i % 32) * 16
-        + (j // 4) * 512
-        + (j % 4)
-    )
-    flat = np.empty(r * c, dtype=sf.dtype)
-    flat[off.reshape(-1)] = sf.reshape(-1)  # off is a permutation of [0, r*c)
-    return flat.reshape(r, c)
-
-
 def test_nvfp4_gemm_gpu_matches_sim_bitwise():
     # The 1024 entry of NVFP4_CONFIGS_SUPPORTED with the same alpha and launch
     # the CPU cell-exact value test uses — sim-vs-numpy is already established
@@ -119,16 +102,42 @@ def test_nvfp4_gemm_gpu_matches_sim_bitwise():
     fn(
         torch.from_numpy(a_q).cuda(),
         torch.from_numpy(b_q).cuda(),
-        # f32 powers of two convert to e4m3 exactly — the same values the sim's
-        # f8e4m3 arg coercion produces. The GPU arg is declared in the 128x4-atom
-        # byte order (the sim reads the plain logical order), so permute first.
-        torch.tensor(_sf_gmem_bytes(sfa)).to(torch.float8_e4m3fn).cuda(),
-        torch.tensor(_sf_gmem_bytes(sfb)).to(torch.float8_e4m3fn).cuda(),
+        # _prepare already returns the explicit plain physical
+        # (rows//128, K//64, 32, 16) GMEM view consumed by both paths.
+        torch.from_numpy(sfa).to(torch.float8_e4m3fn).cuda(),
+        torch.from_numpy(sfb).to(torch.float8_e4m3fn).cuda(),
         d_gpu,
     )
     torch.cuda.synchronize()
     gpu = d_gpu.to(torch.float32).cpu().numpy()  # bf16 -> f32 is exact
     _assert_bit_equal(gpu, sim, "nvfp4 1024^3")
+
+
+@pytest.mark.parametrize(
+    ("m", "n", "k"),
+    [(1024, 1024, 1024), (2400, 512, 512)],
+    ids=["non_swap_1024", "swap_odd_epi_2400x512x512"],
+)
+def test_fp8_blockwise_gemm_gpu_matches_sim_bitwise(m, n, k):
+    cfg = Fp8BlockwiseGemmConfig(m=m, n=n, k=k, launch_shape=(2,))
+    kernel = build_fp8_blockwise_gemm(cfg)
+    a_t, b_t, sfa_t, sfb_t, d_t = kernel.args
+    a_q, b_q, sfa, sfb, _ref = _fp8_prepare(m, n, k)
+    out = nr.interpret(kernel, {a_t: a_q, b_t: b_q, sfa_t: sfa, sfb_t: sfb})
+    sim = np.asarray(out[d_t.id], dtype=np.float32).reshape(m, n)
+
+    fn = _compile_tirx(kernel, "fp8_sim_parity")
+    d_gpu = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
+    fn(
+        torch.from_numpy(a_q).to(torch.float8_e4m3fn).cuda(),
+        torch.from_numpy(b_q).to(torch.float8_e4m3fn).cuda(),
+        torch.from_numpy(sfa).cuda(),
+        torch.from_numpy(sfb).cuda(),
+        d_gpu,
+    )
+    torch.cuda.synchronize()
+    gpu = d_gpu.to(torch.float32).cpu().numpy()
+    _assert_bit_equal(gpu, sim, f"fp8 blockwise {m}x{n}x{k}")
 
 
 @pytest.mark.parametrize(

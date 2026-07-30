@@ -2598,16 +2598,13 @@ fn walk_tensors(body: &[Stmt], tensors: &mut HashMap<u32, TensorInfo>) {
                 record_slice(tensors, sem);
             }
             Stmt::Tcgen05Mma { a, b, .. } => {
-                // TMEM operands (dst/sfa/sfb, and a/b in TmemOperand form) carry
-                // no tensor — the checker's TMEM windows key on physical boxes.
-                for op in [a, b] {
-                    if let crate::ir::MmaOperand::Slice(s) = op {
-                        record_slice(tensors, s);
-                    }
+                if let crate::ir::MmaAOperand::Smem(tile) = a {
+                    record_tensor(tensors, &tile.tensor);
                 }
+                record_tensor(tensors, &b.tensor);
             }
             Stmt::Tcgen05Cp { src, .. } => {
-                record_slice(tensors, src);
+                record_tensor(tensors, &src.tensor);
             }
             Stmt::ClcTryCancel { handle, .. } => {
                 record_tensor(tensors, handle);
@@ -4358,7 +4355,6 @@ mod tests {
                 swizzle: Swizzle::None,
             })),
             byte_offset: Some(byte_offset),
-            reg_frag: None,
         })
     }
 

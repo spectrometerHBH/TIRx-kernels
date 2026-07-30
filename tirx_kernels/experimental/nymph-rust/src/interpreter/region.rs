@@ -1162,7 +1162,6 @@ mod tests {
                     swizzle: Swizzle::None,
                 })),
                 byte_offset: Some(byte_offset),
-                reg_frag: None,
             })
         };
         let cases: Vec<(Arc<Tensor>, Vec<Vec<i64>>, Vec<usize>)> = vec![
@@ -1228,7 +1227,6 @@ mod tests {
                 swizzle: Swizzle::None,
             })),
             byte_offset: Some(0),
-            reg_frag: None,
         });
         // Every lane at the same address: the region is uniform, so no lane
         // owns a part of it.

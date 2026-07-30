@@ -425,10 +425,13 @@ fn mbar_signal_targets(
         }
         return Ok(vec![base]);
     }
-    // cta_group == 2 multicast: pick the parity-matching CTA of each pair
+    // cta_group == 2 multicast: each destination contributes one completion
+    // transaction to the parity-selected barrier. Multiple destinations may
+    // intentionally resolve to the same remote leader cell; keep that
+    // multiplicity because hardware decrements the leader once per
+    // multicast destination.
     let parity = base.identity.ctaid_in_cluster & 1;
-    let mut targets = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    let mut targets = Vec::with_capacity(dst_ctas.len());
     for &c in dst_ctas {
         let target_cta = if c & 1 == parity {
             c
@@ -440,15 +443,14 @@ fn mbar_signal_targets(
                 "TmaLoad cta_group=2 peer CTA is outside the cluster",
             )?
         };
-        if seen.insert(target_cta) {
-            targets.push(retarget_mbar(base, target_cta));
-        }
+        targets.push(retarget_mbar(base, target_cta));
     }
     Ok(targets)
 }
 
-/// Complete-tx the target mbar cell(s) directly and return their keys (the runner
-/// re-checks each key's parked waiters). Duplicate targets coalesce.
+/// Complete-tx the target mbar cell(s) directly and return their unique keys
+/// (the runner re-checks each key's parked waiters). Duplicate targets retain
+/// their transaction multiplicity while the returned wake list stays unique.
 fn apply_mbar_complete_tx(
     ctx: &mut WarpContext,
     targets: &[MbarTarget],

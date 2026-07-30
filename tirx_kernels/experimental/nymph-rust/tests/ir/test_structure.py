@@ -17,22 +17,69 @@ def smem(shape, dtype=n.DType.F16):
 
 
 def test_mma_constructor_roundtrips_fields():
-    # m=128, n=256, k=16; dst is a TMEM f32 operand, operands SMEM/f16 — confirm
-    # nothing got swapped between dst/a/b or m/n/k.
-    dst = n.TmemOperand(0, 0, n.DType.F32)
-    a = smem([128, 16])[:, :]
-    b = smem([256, 16])[:, :]
-    mma = n.Tcgen05Mma(dst=dst, a=a, b=b, m=128, n=256, k=16, accum=1)
-    assert mma.m == 128
-    assert mma.n == 256
-    assert mma.k == 16
+    # The instruction carries only explicit physical operands and instruction
+    # parameters. Logical M/N/K are resolved from these fields, never inferred
+    # by the binding constructor.
+    tmem = n.TmemTensor(32)
+    dst = tmem.at(4, 8)
+    a_tile = n.SmemTile(smem([128, 16]), (), 0, 0, 128, 16)
+    b_tile = n.SmemTile(smem([256, 16]), (), 0, 0, 256, 16)
+    a = n.MmaAOperand.smem(a_tile)
+    mma = n.Tcgen05Mma(
+        dst=dst,
+        a=a,
+        b=b_tile,
+        mma_m=128,
+        mma_n=64,
+        format="f16",
+        block_scale=None,
+        accum=1,
+        trans_a=False,
+        trans_b=False,
+        ws=False,
+        cta_group=1,
+    )
+    assert mma.mma_m == 128
+    assert mma.mma_n == 64
+    assert mma.format == "f16"
     assert mma.accum == 1
     assert mma.cta_group == 1
-    assert mma.dst.dtype == n.DType.F32
-    assert mma.a.tensor.dtype == n.DType.F16
+    assert mma.dst.tensor.start_col == 32
+    assert mma.dst.row == 4
+    assert mma.dst.col == 8
+    assert mma.a.kind == "smem"
+    assert mma.a.tile.tensor.dtype == n.DType.F16
     assert mma.b.tensor.dtype == n.DType.F16
-    assert mma.a.tensor.shape == [128, 16]
+    assert mma.a.tile.tensor.shape == [128, 16]
     assert mma.b.tensor.shape == [256, 16]
+    assert mma.b.rows == 256
+    assert mma.b.cols == 16
+
+
+def test_tmem_a_and_block_scale_roundtrip():
+    data = n.TmemTensor(128)
+    scales = n.TmemTensor(400)
+    a = n.MmaAOperand.tmem(data.at(0, 4), "bank_batched")
+    scale = n.BlockScaleSpec(
+        sfa=scales.at(0, 0),
+        sfb=scales.at(0, 8),
+        sfa_k_offset=5,
+        sfb_k_offset=9,
+        scale_format="e4m3_fn",
+        sf_per_mma=4,
+        sf_reuse=1,
+    )
+
+    assert a.kind == "tmem"
+    assert a.addr.tensor.start_col == 128
+    assert a.form == "bank_batched"
+    assert scale.sfa.tensor.start_col == 400
+    assert scale.sfb.col == 8
+    assert scale.sfa_k_offset == 5
+    assert scale.sfb_k_offset == 9
+    assert scale.scale_format == "e4m3_fn"
+    assert scale.sf_per_mma == 4
+    assert scale.sf_reuse == 1
 
 
 def test_operator_builds_correct_expr_tree():
@@ -116,3 +163,18 @@ def test_store_scalar_roundtrips_destination():
 
     assert stmt.dst.tensor.id == dst.id
     assert stmt.dst.offsets[0] == 0
+
+
+def test_layout_is_only_valid_for_smem_swizzle():
+    layout = n.SmemSwizzleLayout(n.Swizzle.B128)
+    tensor = n.Tensor(
+        space=n.MemorySpace.SMEM, dtype=n.DType.F16, shape=[128, 64], layout=layout, byte_offset=0
+    )
+    assert tensor.layout.swizzle == n.Swizzle.B128
+
+    with pytest.raises(ValueError, match="only valid for SMEM"):
+        n.Tensor(space=n.MemorySpace.GMEM, dtype=n.DType.F16, shape=[128, 64], layout=layout)
+
+    assert not hasattr(n, "ScaleFactorLayout")
+    assert not hasattr(n, "sf_smem_layout")
+    assert not hasattr(n, "fp8_sf_packed_u32_layout")

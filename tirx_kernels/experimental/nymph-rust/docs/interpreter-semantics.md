@@ -6,7 +6,10 @@ ordering, latency, cache, descriptor, or compiler-lowering semantics.
 
 Structural control statements are interpreter core: `If`, `ForLoop`,
 `ForEachTask`, `SchedulerImpl`, `Loop`, and `BreakIf`. All thread dispatch is
-`If` over per-thread scalar predicates. Leaf-style operation statements execute through built-in
+`If` over per-thread scalar predicates. The same structure is authoritative
+for codegen: predicates are printed literally, sibling/nested structure is
+preserved, and no `lane_id == 0` condition is replaced with `elect_sync()` or
+`thread_rank() == 0`. Leaf-style operation statements execute through built-in
 executors. Unsupported statements fail closed with `unsupported_stmt`.
 
 Each execution stream is one warp, and a statement executes over the stream's
@@ -37,6 +40,13 @@ Passed, Failed, and Inconclusive outcomes; failed value runs return no payload.
 The normalized trace data structures and per-statement event emissions are
 documented in [Protocol Trace](protocol-trace.md).
 
+Every mbarrier operation resolves the `MBarRef` it directly contains. A
+missing `remote_coord` means the current CTA; a present coordinate means that
+exact peer CTA. Arrive, expect/arrive-expect, wait, TMA completion, and
+tcgen05 commit do not infer a target from mbar id, producer/consumer role, or
+statement ordering; an operation's explicit multicast mask may add only the
+targets that mask describes.
+
 ## Statement Families
 
 | Statement family | Status | Runtime behavior | Main fail-closed conditions |
@@ -51,13 +61,14 @@ documented in [Protocol Trace](protocol-trace.md).
 | `TmemAlloc`, `TmemDealloc` | Reviewed lifecycle | Issued by exactly one full warp (statically validated when the dispatch predicate resolves). `cta_group=1` acts on the issuing CTA. `cta_group=2` is a CTA-pair collective that blocks until the peer reaches the same collective occurrence. Allocation ensures a scratchpad; deallocation clears the physical range. | Invalid mask, missing peer, duplicate allocation, non-identical overlap, allocation order violation, missing/mismatched deallocation, leaked allocation. |
 | `MBarrierInit` | Reviewed phase | Initializes a mbar cell with expected arrivals, pending arrivals, zero pending tx bytes, and parity 0. Per-thread instruction: every executing thread would re-initialize the cell, so it must execute from a single-thread branch. | Multi-lane mask, duplicate init, invalid stage, remote CTA out of range, divergent target. |
 | `MBarrierArrive` | Reviewed phase | Per-thread: every executing thread arrives once with its own count; parity flips when arrivals and pending tx bytes reach zero. A phase can complete and re-arm partway through the lanes. The trace carries one event with the summed count. | Uninitialized cell, non-positive count, arrival underflow, invalid stage, divergent operands. |
-| `MBarrierExpectTx` | Reviewed phase | Per-thread: every executing thread adds its byte count to the current phase; the trace carries one event with the summed bytes. | Uninitialized cell, invalid stage, divergent target. |
-| `MBarrierArriveExpectTx` | Reviewed phase | Per-thread: each executing thread applies expect-tx, then one arrival, in the value model. | Uninitialized cell, arrival overflow/underflow, invalid stage, divergent target. |
+| `MBarrierExpectTx` | Reviewed phase | Per-thread: every executing thread subtracts its expected byte count from the current phase's signed transaction balance; the trace carries one event with the summed bytes. A later engine completion adds actual bytes, but completion is equally allowed to occur first and leave a positive balance. Either order may be the operation that returns the balance to zero. | Uninitialized cell, invalid stage, divergent target. |
+| `MBarrierArriveExpectTx` | Reviewed phase | Per-thread: each executing thread subtracts its expected bytes, then applies one arrival. Phase completion requires both the signed byte balance and pending arrivals to be exactly zero. | Uninitialized cell, arrival overflow/underflow, invalid stage, divergent target. |
 | `MBarrierWait` | Reviewed phase | Blocks while the requested phase is current. Phase-less waits park on the current parity through a precise `WakeCondition::Mbar` and advance without re-running when parity flips. | Uninitialized cell, invalid phase, invalid stage, divergent target. |
-| `TmaLoad` | Reviewed tile copy | Single-thread issue. Copies a GMEM tile into SMEM in value mode and completes selected mbar tx bytes. Multicast writes all selected destination CTAs. Trace mode emits region events, completes mbar tx, and invalidates destination scalar cells without moving payload bytes. | Multi-thread issue, missing input in value mode, unsupported rank, OOB slice, byte-count mismatch, tx underflow, invalid multicast mask, missing peer, divergent operands. |
+| `TmaLoad` | Reviewed tile copy | Single-thread issue. Copies a GMEM tile into SMEM in value mode and adds its actual completion bytes to the signed balance resolved from the exact `MBarRef` plus any explicit multicast mask. Multicast writes all selected destination CTAs. Trace mode emits region events, completes mbar tx, and invalidates destination scalar cells without moving payload bytes. | Multi-thread issue, missing input in value mode, unsupported rank, OOB slice, byte-count mismatch, invalid multicast mask, missing peer, divergent operands. |
 | `TmaStore` | Reviewed tile store | Single-thread issue. Copies a current-CTA SMEM tile into GMEM in value mode. Existing GMEM values are preserved outside the tile. Trace mode emits region events and invalidates destination scalar cells without reading SMEM bytes. | Multi-thread issue, missing SMEM source in value mode, unsupported rank, OOB slice, metadata mismatch, divergent operands. |
 | `CpAsyncBulkCommitGroup`, `CpAsyncBulkWaitGroupRead` | Reviewed markers | Per-stream group markers only. Commit increments a stream counter; wait with `n=0` clears it. No tensor movement and no blocking in v1. | Nonzero wait count if it bypasses IR validation; trace limit. |
-| `Tcgen05Mma` | Reviewed value/trace | Single-thread issue. Value mode computes dense f16/bf16 MMA values into TMEM cells. Trace mode checks issue shape/range/allocation and emits SMEM-read/TMEM-write events without gathering SMEM operands or calling BLAS. Supports `cta_group=1` with `m=64/128` and `cta_group=2` with `m=128/256`; supported layouts are checked against B200 fixtures. | Multi-thread issue, unsupported shape/group, missing operands in value mode, missing accumulator/allocation, TMEM out of range. |
+| `Tcgen05Mma` | Reviewed value/trace | Single-thread issue. The statement explicitly carries D `(TmemTensor.start_col + row/col)`, A residency/form, B SMEM tile, `mma_m/mma_n`, element format, optional block-scale addresses/format/reuse, transpose, weight-stationary, accumulation, and CTA group. The shared physical resolver determines the exact D/A/SF footprints used by validation, value execution, trace, and codegen. Value mode computes supported dense or block-scaled combinations into those TMEM cells; trace mode emits the resolved regions without payload BLAS work. Every CTA that reaches the statement executes it—there is no implicit leader or odd-CTA no-op. | Multi-thread issue, unsupported format/shape/group/layout combination, missing operands in value mode, missing accumulator/allocation, TMEM out of range. |
+| `Tcgen05Cp` | Reviewed value/trace | Single-thread issue. The statement explicitly carries destination TMEM address, source two-dimensional SMEM tile, physical CP shape, multicast, and CTA group. The shared resolver maps that combination to the exact lane/column cells and reads the owning tensor's explicit physical bytes: 128-bit forms require a plain 16-byte row, while 256-bit forms require an explicit B32 `mma_operandAB` owner. | Multi-thread issue, unsupported shape/multicast combination, invalid source tile or owning layout, missing allocation, TMEM out of range. |
 | `Tcgen05Commit` | Reviewed mbar bookkeeping | Single-thread issue. Immediately applies one mbar arrival to selected targets. `cta_group=2` is a peer-active gate, not a matched-operation rendezvous. | Multi-thread issue, uninitialized mbar, arrival overflow, invalid stage, missing/exited peer, divergent operands. |
 | `Tcgen05Ld` | Reviewed value | Reads each active thread's datapath-assigned TMEM cells into register slices. Datapath arrays cover all supported shape/num configurations. | Non-full-warp issue, non-uniform or non-32-aligned row, dtype mismatch, wrong register count, out-of-range or unwritten TMEM cell. |
 | `Tcgen05St` | Reviewed value | Writes register slices into each active thread's datapath-assigned TMEM cells. Uses the same datapath as `Tcgen05Ld`, reversed. | Non-full-warp issue, non-uniform or non-32-aligned row, dtype mismatch, wrong register count, out-of-range cell, overlapping writes, missing scratchpad. |
@@ -82,3 +93,11 @@ latency, tensor-core exact accumulation order, cache effects, PTX memory
 ordering, descriptor encoding, or backend swizzle lowering. Checkers and
 hardware tests must consume the executed statement stream and runtime evidence
 to validate those properties separately.
+
+The codegen representation deliberately does not turn REG or TMEM metadata into
+an extra execution model. REG `TensorDef`s become exact-shape `T.alloc_local`
+arrays; supported register operations become `Tx.thread.*`, and transfers
+become `Tx.copy`. `tcgen05.ld/st`, `ldmatrix/stmatrix`, and warp MMA are direct
+`T.ptx.*` calls. A `Tcgen05Mma` or `Tcgen05Cp` gets statement-local, non-owning
+TMEM buffer declarations and exactly one `Tx.gemm_async` or `Tx.copy_async`
+call, respectively. `TmemTensor` itself stores only `start_col`.

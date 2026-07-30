@@ -14,8 +14,8 @@ use super::scalar::ScalarValue;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-/// `Layout` — only SMEM swizzle remains: TMEM is no longer a tensor and has no
-/// layout abstraction (see `TmemOperand`).
+/// A tensor's explicit physical layout. TMEM is no longer a regular tensor and
+/// has no tensor layout abstraction (see `TmemTensor`).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Layout {
     Swizzle(SmemSwizzleLayout),
@@ -27,52 +27,142 @@ pub struct SmemSwizzleLayout {
     pub swizzle: Swizzle,
 }
 
-/// A TMEM reference: absolute physical address + cell interpretation.
-///
-/// TMEM is a 128-lane x 512-column grid of 32-bit cells, allocated by column
-/// band (`TmemAlloc`); it is NOT a tensor and has no layout. Every TMEM
-/// instruction takes this explicit absolute physical `(lane, col)` base
-/// address plus the `dtype` that says how the addressed cells are (un)packed
-/// (f32/i32/u32 one value per cell; f16/bf16 two per cell, low half first;
-/// f8e4m3 one raw scale byte per cell). `row` is the lane in [0, 128), `col`
-/// the column in [0, 512).
+/// A logical view into TMEM. `start_col` is an absolute physical TMEM column;
+/// the view owns no storage (`TmemAlloc` remains the physical allocation
+/// statement).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TmemTensor {
+    pub start_col: u32,
+}
+
+impl TmemTensor {
+    pub fn at(self, row: ScalarValue, col: ScalarValue) -> TmemAddr {
+        TmemAddr {
+            tensor: self,
+            row,
+            col,
+        }
+    }
+}
+
+/// A TMEM address. Its effective physical address is
+/// `(row, tensor.start_col + col)`.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct TmemOperand {
+pub struct TmemAddr {
+    pub tensor: TmemTensor,
     pub row: ScalarValue,
     pub col: ScalarValue,
-    pub dtype: DType,
 }
 
-/// A `Tcgen05Mma` A/B operand: an SMEM tile (`TensorSlice`), or TMEM cells
-/// (`TmemOperand`) — the value model's accumulator-readback abstraction (the
-/// GDN state read straight out of TMEM).
+/// An explicit two-dimensional SMEM tile used by physical tcgen05 operations.
+/// Leading dimensions are fixed by `prefix_indices`; the final two dimensions
+/// start at (`row_offset`, `col_offset`) and have the literal `rows x cols`
+/// extent.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub enum MmaOperand {
-    Slice(TensorSlice),
-    Tmem(TmemOperand),
+pub struct SmemTile {
+    pub tensor: Arc<Tensor>,
+    pub prefix_indices: Vec<ScalarValue>,
+    pub row_offset: ScalarValue,
+    pub col_offset: ScalarValue,
+    pub rows: u32,
+    pub cols: u32,
 }
 
-/// Register-fragment physical layout for an epilogue REG tensor. `None` (the
-/// default) is the plain warpgroup thread-axis tile (`T.wg_reg_tile`): each of the
-/// 128 lanes owns one contiguous row. `Stmatrix` selects the `tcgen05.{ld,st}`-atom
-/// layout (`T.alloc_tcgen05_ldst_frag` / `T.alloc_cast_frag`) — the per-(lane,
-/// register) decomposition that the `Tx.copy(dispatch="ldstmatrix")` reg->smem store
-/// requires to lower to STSM/stmatrix instead of plain STS (canon's nvfp4 epilogue).
-///
-/// This is a CODEGEN-ONLY concern: the value model and protocol checker see a plain
-/// REG tensor either way (the physical register decomposition is below the value
-/// model). So the marker rides on the IR tensor purely to drive the emitted alloc +
-/// the reg->smem dispatch; it never changes interpreter/validate behaviour.
+/// Element format selected by a tcgen05 MMA instruction.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MmaElemFormat {
+    F16,
+    BF16,
+    F8E4M3,
+    F4E2M1,
+}
+
+impl MmaElemFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MmaElemFormat::F16 => "f16",
+            MmaElemFormat::BF16 => "bf16",
+            MmaElemFormat::F8E4M3 => "f8_e4m3",
+            MmaElemFormat::F4E2M1 => "f4_e2m1",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "f16" => Some(MmaElemFormat::F16),
+            "bf16" => Some(MmaElemFormat::BF16),
+            "f8_e4m3" => Some(MmaElemFormat::F8E4M3),
+            "f4_e2m1" => Some(MmaElemFormat::F4E2M1),
+            _ => None,
+        }
+    }
+}
+
+/// Scale-factor format selected by a block-scaled tcgen05 MMA instruction.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ScaleFormat {
+    E8M0FNU,
+    E4M3FN,
+}
+
+impl ScaleFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScaleFormat::E8M0FNU => "e8m0_fnu",
+            ScaleFormat::E4M3FN => "e4m3_fn",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "e8m0_fnu" => Some(ScaleFormat::E8M0FNU),
+            "e4m3_fn" => Some(ScaleFormat::E4M3FN),
+            _ => None,
+        }
+    }
+}
+
+/// Physical form of a TMEM-resident MMA A operand.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TmemAForm {
+    Flat,
+    BankBatched,
+}
+
+impl TmemAForm {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TmemAForm::Flat => "flat",
+            TmemAForm::BankBatched => "bank_batched",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "flat" => Some(TmemAForm::Flat),
+            "bank_batched" => Some(TmemAForm::BankBatched),
+            _ => None,
+        }
+    }
+}
+
+/// The A operand of a tcgen05 MMA. B is always an explicit `SmemTile`.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub enum RegFrag {
-    /// `tcgen05.{ld,st}`-atom fragment. `instr_shape` is the PTX atom shape
-    /// (canon's `"16x256b"`). `cast_of` links a cast (output) frag to its source
-    /// (read) frag by id: `None` = the read frag (`alloc_tcgen05_ldst_frag`),
-    /// `Some(src_id)` = a `alloc_cast_frag(<src>, dtype)` of that read frag.
-    Stmatrix {
-        instr_shape: String,
-        cast_of: Option<u32>,
-    },
+pub enum MmaAOperand {
+    Smem(SmemTile),
+    Tmem { addr: TmemAddr, form: TmemAForm },
+}
+
+/// Extra physical operands and format parameters for block-scaled MMA.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct BlockScaleSpec {
+    pub sfa: TmemAddr,
+    pub sfb: TmemAddr,
+    pub sfa_k_offset: u32,
+    pub sfb_k_offset: u32,
+    pub scale_format: ScaleFormat,
+    pub sf_per_mma: u32,
+    pub sf_reuse: u32,
 }
 
 /// `Tensor` — the data, plus a stable `id` for identity. Held by `Arc<Tensor>`
@@ -85,10 +175,6 @@ pub struct Tensor {
     pub shape: Vec<usize>,
     pub layout: Option<Layout>,
     pub byte_offset: Option<usize>,
-    /// Physical register-fragment layout for REG-space epilogue tensors (see
-    /// `RegFrag`). `None` for every non-REG tensor and for the default thread-axis
-    /// reg tile.
-    pub reg_frag: Option<RegFrag>,
 }
 
 // Identity = id only (so `Arc<Tensor>` comparisons reduce to id comparisons, and a
