@@ -11,13 +11,111 @@ import torch
 from flashinfer import SfLayout, nvfp4_quantize
 
 import tvm
+from tvm.backend.cuda.op import cuda_func_call
 from tvm.backend.cuda.operator.tile_primitive.gemm_async.tcgen05 import sf_smem_layout
 from tvm.backend.cuda.operator.tile_primitive.tma_utils import SwizzleMode
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.bench import bench
 from tvm.tirx.lang.pipeline import MBarrier, PipelineState, TCGen05Bar, TMABar
-from tvm.tirx.lang.tile_scheduler import ClusterPersistentScheduler2D
+from tvm.tirx.lang.tile_scheduler import ClusterLaunchControlScheduler, ClusterPersistentScheduler2D
+
+_NVFP4_COPY_SCALE_AND_MMA_K256_2CTA_SRC = r"""
+__forceinline__ __device__ void tirx_nvfp4_copy_scale_and_mma_k256_2cta(
+    uint32_t d_tmem_addr,
+    void* a_smem,
+    void* b_smem,
+    void* sfa_smem,
+    void* sfb_smem,
+    uint32_t accum) {
+    constexpr uint64_t mma_desc_hi = uint64_t{0x40004040} << 32;
+    constexpr uint64_t cp_desc_hi = uint64_t{0x00004008} << 32;
+    constexpr uint32_t instr_desc = 0x10400480;
+    uint64_t a_desc =
+        mma_desc_hi | ((__cvta_generic_to_shared(a_smem) >> 4) & uint32_t{0x3fff});
+    uint64_t b_desc =
+        mma_desc_hi | ((__cvta_generic_to_shared(b_smem) >> 4) & uint32_t{0x3fff});
+    uint64_t sfa_desc =
+        cp_desc_hi | ((__cvta_generic_to_shared(sfa_smem) >> 4) & uint32_t{0x3fff});
+    uint64_t sfb_desc =
+        cp_desc_hi | ((__cvta_generic_to_shared(sfb_smem) >> 4) & uint32_t{0x3fff});
+    asm volatile(
+        "{\n"
+        ".reg .pred p;\n"
+        ".reg .b64 ad, bd, sad, sbd;\n"
+        ".reg .b32 sfat, sfbt;\n"
+        "mov.b64 ad, %1;\n"
+        "mov.b64 bd, %2;\n"
+        "mov.b64 sad, %3;\n"
+        "mov.b64 sbd, %4;\n"
+        "mov.b32 sfat, 448;\n"
+        "tcgen05.cp.cta_group::2.32x128b.warpx4 [sfat], sad;\n"
+        "add.u32 sfat, sfat, 4;\n"
+        "add.u64 sad, sad, 32;\n"
+        "tcgen05.cp.cta_group::2.32x128b.warpx4 [sfat], sad;\n"
+        "add.u32 sfat, sfat, 4;\n"
+        "add.u64 sad, sad, 32;\n"
+        "tcgen05.cp.cta_group::2.32x128b.warpx4 [sfat], sad;\n"
+        "add.u32 sfat, sfat, 4;\n"
+        "add.u64 sad, sad, 32;\n"
+        "tcgen05.cp.cta_group::2.32x128b.warpx4 [sfat], sad;\n"
+        "mov.b32 sfbt, 464;\n"
+        "tcgen05.cp.cta_group::2.32x128b.warpx4 [sfbt], sbd;\n"
+        "add.u32 sfbt, sfbt, 8;\n"
+        "add.u64 sbd, sbd, 32;\n"
+        "tcgen05.cp.cta_group::2.32x128b.warpx4 [sfbt], sbd;\n"
+        "add.u32 sfbt, sfbt, 8;\n"
+        "add.u64 sbd, sbd, 32;\n"
+        "tcgen05.cp.cta_group::2.32x128b.warpx4 [sfbt], sbd;\n"
+        "add.u32 sfbt, sfbt, 8;\n"
+        "add.u64 sbd, sbd, 32;\n"
+        "tcgen05.cp.cta_group::2.32x128b.warpx4 [sfbt], sbd;\n"
+        "add.u64 sbd, sbd, 32;\n"
+        "mov.b32 sfbt, 468;\n"
+        "tcgen05.cp.cta_group::2.32x128b.warpx4 [sfbt], sbd;\n"
+        "add.u32 sfbt, sfbt, 8;\n"
+        "add.u64 sbd, sbd, 32;\n"
+        "tcgen05.cp.cta_group::2.32x128b.warpx4 [sfbt], sbd;\n"
+        "add.u32 sfbt, sfbt, 8;\n"
+        "add.u64 sbd, sbd, 32;\n"
+        "tcgen05.cp.cta_group::2.32x128b.warpx4 [sfbt], sbd;\n"
+        "add.u32 sfbt, sfbt, 8;\n"
+        "add.u64 sbd, sbd, 32;\n"
+        "tcgen05.cp.cta_group::2.32x128b.warpx4 [sfbt], sbd;\n"
+        "mov.b32 sfat, 448;\n"
+        "mov.b32 sfbt, 464;\n"
+        "setp.ne.b32 p, %6, 0;\n"
+        "tcgen05.mma.cta_group::2.kind::mxf4nvf4.block_scale.scale_vec::4X "
+        "[%0], ad, bd, %5, [sfat], [sfbt], p;\n"
+        "add.u64 ad, ad, 2;\n"
+        "add.u64 bd, bd, 2;\n"
+        "add.u32 sfat, sfat, 4;\n"
+        "add.u32 sfbt, sfbt, 8;\n"
+        "tcgen05.mma.cta_group::2.kind::mxf4nvf4.block_scale.scale_vec::4X "
+        "[%0], ad, bd, %5, [sfat], [sfbt], 1;\n"
+        "add.u64 ad, ad, 2;\n"
+        "add.u64 bd, bd, 2;\n"
+        "add.u32 sfat, sfat, 4;\n"
+        "add.u32 sfbt, sfbt, 8;\n"
+        "tcgen05.mma.cta_group::2.kind::mxf4nvf4.block_scale.scale_vec::4X "
+        "[%0], ad, bd, %5, [sfat], [sfbt], 1;\n"
+        "add.u64 ad, ad, 2;\n"
+        "add.u64 bd, bd, 2;\n"
+        "add.u32 sfat, sfat, 4;\n"
+        "add.u32 sfbt, sfbt, 8;\n"
+        "tcgen05.mma.cta_group::2.kind::mxf4nvf4.block_scale.scale_vec::4X "
+        "[%0], ad, bd, %5, [sfat], [sfbt], 1;\n"
+        "}\n"
+        :
+        : "r"(d_tmem_addr),
+          "l"(a_desc),
+          "l"(b_desc),
+          "l"(sfa_desc),
+          "l"(sfb_desc),
+          "r"(instr_desc),
+          "r"(accum));
+}
+"""
 
 
 class WarpRole(IntEnum):
@@ -255,7 +353,7 @@ def _kernel(
     B_packed: T.Buffer((N, K // 2), "uint8"),
     SFA_in: T.Buffer((M, K // 16), "uint8", layout=sf_smem_layout(M, K // 16, sf_per_mma=4)),
     SFB_in: T.Buffer((N, K // 16), "uint8", layout=sf_smem_layout(N, K // 16, sf_per_mma=4)),
-    alpha: T.Buffer((1,), "float32"),
+    alpha: T.float32,
     D: T.Buffer((M, N), "bfloat16"),
     *,
     M: T.constexpr,
@@ -277,6 +375,7 @@ def _kernel(
     PIPE_DEPTH: T.constexpr = 5,
     TMEM_PIPE_DEPTH: T.constexpr = 1,
     L2_GROUP_SIZE: T.constexpr = 8,
+    CLC_SCHEDULER: T.constexpr = False,
     NUM_WARPS: T.constexpr = 8,
     OVERLAP_EPI: T.constexpr = True,
     TMA_SPLIT: T.constexpr = 1,
@@ -284,6 +383,7 @@ def _kernel(
     MERGE_TMA_BARRIERS: T.constexpr = False,
     EARLY_TMEM_TEARDOWN: T.constexpr = False,
     DIRECT_EPI: T.constexpr = False,
+    FUSED_SCALE_MMA: T.constexpr = False,
 ):
     # Derived shapes (formulas, so they track the params above).
     CLUSTER_SIZE = T.meta_var(CLUSTER_M * CLUSTER_N)
@@ -309,24 +409,41 @@ def _kernel(
     T.device_entry()
     T.attr({"tirx.launch_bounds_min_blocks_per_sm": 1})
     cluster_rank = T.cta_id_in_cluster([CLUSTER_SIZE], preferred=[CLUSTER_SIZE])
-    cta_idx = T.cta_id([SM_COUNT])
+    cta_idx = T.cta_id(
+        [CLUSTER_M_TILES * CLUSTER_N_TILES * CLUSTER_SIZE if CLC_SCHEDULER else SM_COUNT]
+    )
     tid_in_cta = T.thread_id([NUM_WARPS * 32])
     lane_id = T.lane_id([32])
     tid_in_wg = T.thread_id_in_wg([128])
     wg_id = T.warpgroup_id([NUM_WARPS // 4])
     warp_id = T.warp_id([NUM_WARPS])
+    warp_id_in_wg = T.warp_id_in_wg([4])
     cb_m: T.let = cluster_rank % CLUSTER_M
     cb_n: T.let = cluster_rank // CLUSTER_M
     pair_id: T.let = cluster_rank // CTA_GROUP
     id_in_pair: T.let = cluster_rank % CTA_GROUP
     pair_leader_rank: T.let = pair_id * CTA_GROUP
-    tile_scheduler = ClusterPersistentScheduler2D(
-        "tile_scheduler",
-        num_m_tiles=CLUSTER_M_TILES,
-        num_n_tiles=CLUSTER_N_TILES,
-        num_clusters=NUM_CLUSTERS,
-        l2_group_size=L2_GROUP_SIZE,
-    )
+    pool = T.SMEMPool()
+    if CLC_SCHEDULER:
+        clc_sched = ClusterLaunchControlScheduler(
+            pool,
+            num_m_tiles=CLUSTER_M_TILES,
+            num_n_tiles=CLUSTER_N_TILES,
+            l2_group_size=L2_GROUP_SIZE,
+            cta_group=CTA_GROUP,
+            # scheduler (2 CTAs), A/B loaders (2), SF loaders (2),
+            # leader-CTA MMA (1), and epilogue warpgroups (2)
+            finish_arrivals=9,
+        )
+        tile_scheduler = clc_sched.worker("tile_scheduler")
+    else:
+        tile_scheduler = ClusterPersistentScheduler2D(
+            "tile_scheduler",
+            num_m_tiles=CLUSTER_M_TILES,
+            num_n_tiles=CLUSTER_N_TILES,
+            num_clusters=NUM_CLUSTERS,
+            l2_group_size=L2_GROUP_SIZE,
+        )
     tile_scheduler.init(cta_idx // CLUSTER_SIZE)
     m_idx = T.meta_var(tile_scheduler.m_idx)
     n_idx = T.meta_var(tile_scheduler.n_idx)
@@ -336,7 +453,6 @@ def _kernel(
     d_m = T.meta_var(cta_m * CTA_M)
     b_n = T.meta_var(cta_n * MMA_N + id_in_pair * CTA_N)
     d_n = T.meta_var(cta_n * MMA_N)
-    pool = T.SMEMPool()
     A_smem_packed = pool.alloc_tcgen05_mma_AB((PIPE_DEPTH, CTA_M, CTA_K // 2), "uint8")
     B_smem_packed = pool.alloc_tcgen05_mma_AB((PIPE_DEPTH, CTA_N, CTA_K // 2), "uint8")
     SFA_smem = pool.alloc(
@@ -416,6 +532,58 @@ def _kernel(
     epi_wb_state = PipelineState(WB_PIPE_DEPTH, 1)
     epi_store_iter: T.int32
     epi_store_iter = 0
+
+    @T.inline
+    def issue_scale_tma_load(k_tile: T.int32):
+        stage = tma_cur.stage
+        sf_k = T.meta_var(k_tile * SF_CTA_K)
+        sf_m = T.meta_var((a_m // 128) * 128)
+        sf_n = T.meta_var((d_n // 128) * 128)
+        smem_empty.wait(tma_cur.stage, tma_cur.phase)
+        if not MERGE_TMA_BARRIERS:
+            if id_in_pair == 0:
+                scale_bytes = T.meta_var(SFA_BYTES + SFB_BYTES)
+                T.ptx.mbarrier.arrive.expect_tx(
+                    scale_full_bar.ptr_to([stage]), scale_bytes, remote=pair_leader_rank, pred=True
+                )
+        single_cta_mask: T.int32 = 1 << id_in_pair
+        # SFA: each CTA loads its half (single_cta_mask). SFB: multicast to
+        # both CTAs (pair_mask).
+        if MERGE_TMA_BARRIERS:
+            sfa_copy = T.meta_var(
+                _tma_g2s_args(smem_full, stage, single_cta_mask, CTA_GROUP, LOAD_CACHE_HINT)
+            )
+        else:
+            sfa_copy = T.meta_var(
+                _tma_g2s_args(scale_full_bar, stage, single_cta_mask, CTA_GROUP, LOAD_CACHE_HINT)
+            )
+        Tx.copy_async(
+            SFA_smem[stage, 0:CTA_M, 0:SF_CTA_K],
+            SFA_in[sf_m : sf_m + CTA_M, sf_k : sf_k + SF_CTA_K],
+            **sfa_copy,
+        )
+        if MERGE_TMA_BARRIERS:
+            sfb_copy = T.meta_var(
+                _tma_g2s_args(smem_full, stage, pair_mask, CTA_GROUP, LOAD_CACHE_HINT)
+            )
+        else:
+            sfb_copy = T.meta_var(
+                _tma_g2s_args(scale_full_bar, stage, pair_mask, CTA_GROUP, LOAD_CACHE_HINT)
+            )
+        if SFB_N == 128:
+            if id_in_pair == 0:
+                Tx.copy_async(
+                    SFB_smem[stage, 0:SFB_N, 0:SF_CTA_K],
+                    SFB_in[sf_n : sf_n + SFB_N, sf_k : sf_k + SF_CTA_K],
+                    **sfb_copy,
+                )
+        else:
+            Tx.copy_async(
+                SFB_smem[stage, cb_m * 128 : cb_m * 128 + 128, 0:SF_CTA_K],
+                SFB_in[sf_n + cb_m * 128 : sf_n + cb_m * 128 + 128, sf_k : sf_k + SF_CTA_K],
+                **sfb_copy,
+            )
+
     if warp_id == int(WarpRole.TMA):
         if OVERLAP_EPI:
             T.ptx.barrier.cluster.wait(acquire=True, aligned=False)
@@ -474,73 +642,36 @@ def _kernel(
                 for k_tile in T.serial(K_TILES):
                     issue_tma_load(k_tile)
                     tma_cur.advance()
-                tile_scheduler.next_tile()
+                if CLC_SCHEDULER:
+                    tile_scheduler.consume()
+                    tile_scheduler.advance_coords()
+                    tile_scheduler.mark_done_if_drained()
+                else:
+                    tile_scheduler.next_tile()
     elif warp_id == int(WarpRole.TMA) + 1:
         if OVERLAP_EPI:
             T.ptx.barrier.cluster.wait(acquire=True, aligned=False)
-
-        @T.inline
-        def issue_scale_tma_load(k_tile: T.int32):
-            stage = tma_cur.stage
-            sf_k = T.meta_var(k_tile * SF_CTA_K)
-            sf_m = T.meta_var((a_m // 128) * 128)
-            sf_n = T.meta_var((d_n // 128) * 128)
-            smem_empty.wait(tma_cur.stage, tma_cur.phase)
-            if not MERGE_TMA_BARRIERS:
-                if id_in_pair == 0:
-                    scale_bytes = T.meta_var(SFA_BYTES + SFB_BYTES)
-                    T.ptx.mbarrier.arrive.expect_tx(
-                        scale_full_bar.ptr_to([stage]),
-                        scale_bytes,
-                        remote=pair_leader_rank,
-                        pred=True,
-                    )
-            single_cta_mask: T.int32 = 1 << id_in_pair
-            # SFA: each CTA loads its half (single_cta_mask). SFB: multicast to
-            # both CTAs (pair_mask).
-            if MERGE_TMA_BARRIERS:
-                sfa_copy = T.meta_var(
-                    _tma_g2s_args(smem_full, stage, single_cta_mask, CTA_GROUP, LOAD_CACHE_HINT)
-                )
-            else:
-                sfa_copy = T.meta_var(
-                    _tma_g2s_args(
-                        scale_full_bar, stage, single_cta_mask, CTA_GROUP, LOAD_CACHE_HINT
-                    )
-                )
-            Tx.copy_async(
-                SFA_smem[stage, 0:CTA_M, 0:SF_CTA_K],
-                SFA_in[sf_m : sf_m + CTA_M, sf_k : sf_k + SF_CTA_K],
-                **sfa_copy,
-            )
-            if MERGE_TMA_BARRIERS:
-                sfb_copy = T.meta_var(
-                    _tma_g2s_args(smem_full, stage, pair_mask, CTA_GROUP, LOAD_CACHE_HINT)
-                )
-            else:
-                sfb_copy = T.meta_var(
-                    _tma_g2s_args(scale_full_bar, stage, pair_mask, CTA_GROUP, LOAD_CACHE_HINT)
-                )
-            if SFB_N == 128:
-                if id_in_pair == 0:
-                    Tx.copy_async(
-                        SFB_smem[stage, 0:SFB_N, 0:SF_CTA_K],
-                        SFB_in[sf_n : sf_n + SFB_N, sf_k : sf_k + SF_CTA_K],
-                        **sfb_copy,
-                    )
-            else:
-                Tx.copy_async(
-                    SFB_smem[stage, cb_m * 128 : cb_m * 128 + 128, 0:SF_CTA_K],
-                    SFB_in[sf_n + cb_m * 128 : sf_n + cb_m * 128 + 128, sf_k : sf_k + SF_CTA_K],
-                    **sfb_copy,
-                )
-
         if T.ptx.elect_sync():
             while tile_scheduler.valid():
                 for k_tile in T.serial(K_TILES):
                     issue_scale_tma_load(k_tile)
                     tma_cur.advance()
-                tile_scheduler.next_tile()
+                if CLC_SCHEDULER:
+                    tile_scheduler.consume()
+                    tile_scheduler.advance_coords()
+                    tile_scheduler.mark_done_if_drained()
+                else:
+                    tile_scheduler.next_tile()
+    elif warp_id == int(WarpRole.MMA) + 1:
+        if CLC_SCHEDULER:
+            if OVERLAP_EPI:
+                T.ptx.barrier.cluster.wait(acquire=True, aligned=False)
+            clc_sched.run_scheduler(id_in_pair)
+            # Match nvjet's PREEXIT tail: once CLC has handed out every tile,
+            # let the next same-stream launch enter while the current launch's
+            # MMA/epilogue roles drain their final task.
+            if id_in_pair == 0:
+                T.ptx.griddepcontrol.launch_dependents()
     elif (warp_id == int(WarpRole.MMA)) & (id_in_pair == 0):
         if OVERLAP_EPI:
             T.ptx.barrier.cluster.wait(acquire=True, aligned=False)
@@ -553,23 +684,39 @@ def _kernel(
             else:
                 scale_full_bar.wait(mma_smem.stage, mma_smem.phase)
                 tile_full_bar.wait(mma_smem.stage, mma_smem.phase)
-            Tx.copy_async(SFA_tmem, SFA_smem[stage], cta_group=CTA_GROUP)
-            Tx.copy_async(SFB_tmem, SFB_smem[stage], cta_group=CTA_GROUP)
-            Tx.gemm_async(
-                tmem[:, 0:MMA_N],
-                A_smem[stage],
-                B_smem[stage],
-                SFA=SFA_tmem,
-                SFB=SFB_tmem,
-                accum=accum,
-                dispatch="tcgen05",
-                cta_group=CTA_GROUP,
-            )
+            if FUSED_SCALE_MMA:
+                T.evaluate(
+                    cuda_func_call(
+                        "tirx_nvfp4_copy_scale_and_mma_k256_2cta",
+                        tmem.allocated_addr[0],
+                        A_smem.ptr_to([stage, 0, 0]),
+                        B_smem.ptr_to([stage, 0, 0]),
+                        SFA_smem.ptr_to([stage, 0, 0]),
+                        SFB_smem.ptr_to([stage, 0, 0]),
+                        accum,
+                        source_code=_NVFP4_COPY_SCALE_AND_MMA_K256_2CTA_SRC,
+                    )
+                )
+            else:
+                Tx.copy_async(SFA_tmem, SFA_smem[stage], cta_group=CTA_GROUP)
+                Tx.copy_async(SFB_tmem, SFB_smem[stage], cta_group=CTA_GROUP)
+                Tx.gemm_async(
+                    tmem[:, 0:MMA_N],
+                    A_smem[stage],
+                    B_smem[stage],
+                    SFA=SFA_tmem,
+                    SFB=SFB_tmem,
+                    accum=accum,
+                    dispatch="tcgen05",
+                    cta_group=CTA_GROUP,
+                )
             accum = 1
             smem_empty.arrive(mma_smem.stage, cta_group=CTA_GROUP, cta_mask=pair_mask)
 
         if T.ptx.elect_sync():
             while tile_scheduler.valid():
+                if CLC_SCHEDULER:
+                    tile_scheduler.consume()
                 tmem_empty.wait(mma_tmem.stage, mma_tmem.phase)
                 accum = 0
                 for k_tile in T.serial(K_TILES):
@@ -577,12 +724,15 @@ def _kernel(
                     mma_smem.advance()
                 tmem_full.arrive(mma_tmem.stage, cta_group=CTA_GROUP, cta_mask=pair_mask)
                 mma_tmem.advance()
-                tile_scheduler.next_tile()
+                if CLC_SCHEDULER:
+                    tile_scheduler.mark_done_if_drained()
+                else:
+                    tile_scheduler.next_tile()
     elif warp_id >= int(WarpRole.EPILOGUE):
         if OVERLAP_EPI:
             T.ptx.barrier.cluster.wait(acquire=True, aligned=False)
         alpha_local: T.float32
-        alpha_local = alpha[0]
+        alpha_local = alpha
 
         @T.inline
         def regs_to_smem(reg_ldst_16b):
@@ -605,7 +755,7 @@ def _kernel(
                     )
 
         @T.inline
-        def epilogue():
+        def epilogue(d_m_cur, d_n_cur):
             tmem_full.wait(epi_cur.stage, epi_cur.phase)
 
             # Per-chunk store: R->S (stmatrix) then S->G (TMA). Shared by both schedules.
@@ -617,11 +767,11 @@ def _kernel(
                 regs_to_smem(reg_ldst_16b)
                 T.cuda.warpgroup_sync(1)
                 d_n_out: T.int32
-                d_n_out = d_n + linear_n
+                d_n_out = d_n_cur + linear_n
                 if tid_in_wg == 0:
                     T.ptx.fence.proxy_async("shared::cta")
                     Tx.copy_async(
-                        D[d_m : d_m + CTA_M, d_n_out : d_n_out + EPI_TILE],
+                        D[d_m_cur : d_m_cur + CTA_M, d_n_out : d_n_out + EPI_TILE],
                         output_smem[epi_wb_state.stage, 0:CTA_M, 0:EPI_TILE],
                         dispatch="tma_auto",
                         cache_hint="evict_first",
@@ -707,10 +857,22 @@ def _kernel(
                     ln = T.meta_var(no * EPI_TILE)
                     store_epi_chunk(reg_all_16b[:, ln : ln + EPI_TILE], ln)
 
-        while tile_scheduler.valid():
-            epilogue()
-            epi_cur.advance()
-            tile_scheduler.next_tile()
+        if CLC_SCHEDULER:
+            cur_d_m: T.int32
+            cur_d_n: T.int32
+            while tile_scheduler.valid():
+                cur_d_m = d_m
+                cur_d_n = d_n
+                tile_scheduler.consume_wg(wg_id, warp_id_in_wg, lane_id)
+                tile_scheduler.advance_coords()
+                epilogue(cur_d_m, cur_d_n)
+                epi_cur.advance()
+                tile_scheduler.mark_done_if_drained()
+        else:
+            while tile_scheduler.valid():
+                epilogue(d_m, d_n)
+                epi_cur.advance()
+                tile_scheduler.next_tile()
         if not EARLY_TMEM_TEARDOWN:
             if tid_in_wg == 0:
                 T.ptx.cp_async.bulk.wait_group(0, read=True)
@@ -785,9 +947,12 @@ TIRX_CONFIGS = {
         "EPI_TILE": 32,
         "PIPE_DEPTH": 5,
         "L2_GROUP_SIZE": 1,
+        "CLC_SCHEDULER": True,
         "OVERLAP_EPI": False,
         "LOAD_CACHE_HINT": None,
+        "MERGE_TMA_BARRIERS": True,
         "DIRECT_EPI": True,
+        "FUSED_SCALE_MMA": True,
     },
     (16384, 16384, 16384): {
         "SM_COUNT": 148,
@@ -795,9 +960,11 @@ TIRX_CONFIGS = {
         "EPI_TILE": 16,
         "PIPE_DEPTH": 5,
         "L2_GROUP_SIZE": 16,
+        "CLC_SCHEDULER": True,
         "OVERLAP_EPI": False,
-        "LOAD_CACHE_HINT": None,
+        "LOAD_CACHE_HINT": "evict_normal",
         "DIRECT_EPI": True,
+        "FUSED_SCALE_MMA": True,
     },
 }
 
@@ -819,13 +986,13 @@ def run_test(M=1024, N=1024, K=1024):
 
     kernel = tir_ws_kernel(M, N, K)
     A_fp4, B_fp4, A_sf, B_sf, alpha, C_ref = prepare_data(M, N, K)
-    alpha_tensor = torch.tensor([alpha], device="cuda", dtype=torch.float)
+    alpha_value = float(alpha.item())
     out = torch.empty_like(C_ref).to("cuda").to(torch.bfloat16)
     target = tvm.target.Target("cuda")
     with target:
         mod = tvm.IRModule({"main": kernel})
         ex = tvm.compile(mod, target=target, tir_pipeline="tirx")
-        ex.mod(A_fp4, B_fp4, A_sf, B_sf, alpha_tensor, out)
+        ex.mod(A_fp4, B_fp4, A_sf, B_sf, alpha_value, out)
     cosine_sim = F.cosine_similarity(
         out.reshape(-1).float(), C_ref.to("cuda").reshape(-1).float(), dim=0
     )
@@ -924,10 +1091,9 @@ def run_bench(M=1024, N=1024, K=1024, *, warmup=None, repeat=None, timer=None, *
     # Allocate inputs once, outside the timed region (Triton-standard pure launch).
     A_fp4, B_fp4, A_sf, B_sf, alpha, C_ref = prepare_data(M, N, K)
     alpha_value = float(alpha.item())
-    alpha_tensor = torch.tensor([alpha_value], device="cuda", dtype=torch.float)
     out_tir = torch.empty_like(C_ref).to("cuda").to(torch.bfloat16)
 
-    funcs = {"tir": lambda: ex.mod(A_fp4, B_fp4, A_sf, B_sf, alpha_tensor, out_tir)}
+    funcs = {"tir": lambda: ex.mod(A_fp4, B_fp4, A_sf, B_sf, alpha_value, out_tir)}
     flashinfer_backend = os.environ.get("TIRX_NVFP4_FLASHINFER_BACKEND", "auto")
     if flashinfer_backend not in {"auto", "cutlass"}:
         raise ValueError(

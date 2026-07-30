@@ -84,6 +84,25 @@ GEMM_CONFIGS = {
         "wb_pipe_depth": 8,
     },
 }
+_DTYPE_GEMM_CONFIGS = {
+    ("fp16", 8192): {
+        "overlap_epilogue": True,
+        "pipe_depth": 5,
+        "d_pipe_depth": 8,
+        "stmatrix_epilogue": True,
+    },
+    ("bf16", 8192): {"fused_no_overlap_epilogue": True, "stmatrix_epilogue": True},
+    ("fp16", 16384): {
+        "packed_no_overlap_epilogue": True,
+        "prestage_packed_chunk": True,
+        "stmatrix_epilogue": True,
+    },
+    ("bf16", 16384): {
+        "fused_no_overlap_epilogue": True,
+        "stmatrix_epilogue": True,
+        "smem_desc_mode": "recompute",
+    },
+}
 # Default config for shapes not in the table above.
 _DEFAULT_CONFIG = {
     "cta_n": 256,
@@ -112,9 +131,15 @@ def _kernel(
     BLK_K: T.constexpr,
     PIPE_DEPTH: T.constexpr,
     WB_PIPE_DEPTH: T.constexpr,
+    D_PIPE_DEPTH: T.constexpr,
     L2_GROUP_SIZE: T.constexpr,
     OVERLAP_EPILOGUE: T.constexpr,
     STATIC_SCHEDULER: T.constexpr,
+    STMATRIX_EPILOGUE: T.constexpr,
+    FUSED_NO_OVERLAP_EPILOGUE: T.constexpr,
+    PACKED_NO_OVERLAP_EPILOGUE: T.constexpr,
+    PRESTAGE_PACKED_CHUNK: T.constexpr,
+    SMEM_DESC_MODE: T.constexpr,
 ):
     # Named locals: knob-branching or heavily-reused geometry; single-use values and
     # constants (CTA_GROUP=2, the cluster grid, ...) are inlined at their use-sites.
@@ -122,7 +147,7 @@ def _kernel(
     MMA_PIPE = T.meta_var(2 if OVERLAP_EPILOGUE else 1)
     TMEM_SLOTS = T.meta_var(MMA_PIPE if OVERLAP_EPILOGUE else NUM_CONSUMER)
     TMEM_PHASE_DEPTH = T.meta_var(MMA_PIPE if OVERLAP_EPILOGUE else 1)
-    NUM_D_TILES = T.meta_var(2 if WB_PIPE_DEPTH > 1 else 1)
+    NUM_D_TILES = T.meta_var(D_PIPE_DEPTH)
     BLK_M = T.meta_var(128)  # CTA_M/2: per-CTA A rows (2-SM MMA combines the cluster)
     BLK_N = T.meta_var(MMA_N // 2)  # per-CTA B rows (cluster covers MMA_N)
     EPI_N = T.meta_var(MMA_N // WB_PIPE_DEPTH)  # epilogue N tile
@@ -283,6 +308,11 @@ def _kernel(
                         acquire=True, aligned=False
                     )  # split barrier (scheduler)
                 clc_sched.run_scheduler(cbx)
+                # CLC has no more tiles to hand out. Match nvjet's PREEXIT tail
+                # so a following same-stream launch can enter while the final
+                # MMA and epilogue work drains.
+                if cbx == 0:
+                    T.ptx.griddepcontrol.launch_dependents()
         elif (warp_id < NUM_CONSUMER) & (cbx == 0):
             # -------- MMA (tcgen05) --------
             mma_smem = PipelineState(PIPE_DEPTH, 0)
@@ -310,6 +340,7 @@ def _kernel(
                     accum=accum,
                     dispatch="tcgen05",
                     cta_group=2,
+                    smem_desc=SMEM_DESC_MODE,
                 )
                 accum = 1
                 smem_pipe.empty.arrive(mma_smem.stage, cta_group=2, cta_mask=3)
@@ -355,13 +386,17 @@ def _kernel(
             slot = T.meta_var(wb_buf.stage if OVERLAP_EPILOGUE else wg_id)
             tmem_pipe.full.wait(slot, wb_buf.phase)
             tmem_base = T.meta_var(slot * MMA_N)
-            if OVERLAP_EPILOGUE:
+            if OVERLAP_EPILOGUE or FUSED_NO_OVERLAP_EPILOGUE:
                 # Fused per-chunk load+store, overlapping the next MMA. Keep Dreg_16b
                 # exactly EPI_N wide: a wider frag drops STSM dispatch -> STS.128 and spills
                 # regs 38->255 (measured).
-                Dreg_16b = T.wg_reg_tile(EPI_N, dtype=ab_type)
-                for i in T.unroll(WB_PIPE_DEPTH):
+                if STMATRIX_EPILOGUE:
+                    Dreg = T.alloc_tcgen05_ldst_frag("16x256b", (128, EPI_N), "float32")
+                    Dreg_16b = T.alloc_cast_frag(Dreg, ab_type)
+                else:
                     Dreg = T.wg_reg_tile(EPI_N)
+                    Dreg_16b = T.wg_reg_tile(EPI_N, dtype=ab_type)
+                for i in T.unroll(WB_PIPE_DEPTH):
                     tn = T.meta_var(tmem_base + i * EPI_N)
                     Tx.wg.copy_async(Dreg, tmem[:, tn : tn + EPI_N])
                     T.ptx.tcgen05.wait.ld()
@@ -372,11 +407,32 @@ def _kernel(
                     if store_iter >= NUM_D_TILES:
                         T.ptx.cp_async.bulk.wait_group(NUM_D_TILES - 1, read=True)
                         T.cuda.warpgroup_sync(wg_id + 10)
-                    # consumer is wg_id==0 here; literal Dsmem[0,...] keeps STSM dispatch.
-                    for jv in T.unroll(EPI_N // 8):
-                        Tx.wg.copy(
-                            Dsmem[0, db, :, jv * 8 : jv * 8 + 8], Dreg_16b[:, jv * 8 : jv * 8 + 8]
-                        )
+                    if STMATRIX_EPILOGUE:
+                        for jv in T.unroll(EPI_N // 16):
+                            if OVERLAP_EPILOGUE:
+                                Tx.wg.copy(
+                                    Dsmem[0, db, :, jv * 16 : jv * 16 + 16],
+                                    Dreg_16b[:, jv * 16 : jv * 16 + 16],
+                                    dispatch="ldstmatrix",
+                                )
+                            else:
+                                Tx.wg.copy(
+                                    Dsmem[wg_id, db, :, jv * 16 : jv * 16 + 16],
+                                    Dreg_16b[:, jv * 16 : jv * 16 + 16],
+                                    dispatch="ldstmatrix",
+                                )
+                    else:
+                        for jv in T.unroll(EPI_N // 8):
+                            if OVERLAP_EPILOGUE:
+                                Tx.wg.copy(
+                                    Dsmem[0, db, :, jv * 8 : jv * 8 + 8],
+                                    Dreg_16b[:, jv * 8 : jv * 8 + 8],
+                                )
+                            else:
+                                Tx.wg.copy(
+                                    Dsmem[wg_id, db, :, jv * 8 : jv * 8 + 8],
+                                    Dreg_16b[:, jv * 8 : jv * 8 + 8],
+                                )
                     T.cuda.warpgroup_sync(wg_id + 10)
                     if (warp_id == 0) & (lane_id == 0):
                         # Proxy fence by the single TMA-issuing thread (warpgroup_sync above
@@ -384,13 +440,22 @@ def _kernel(
                         T.ptx.fence.proxy_async("shared::cta")
                         d_m = T.meta_var(((m_idx * 2 + cbx) * NUM_CONSUMER + wg_id) * BLK_M)
                         d_n = T.meta_var(n_idx * MMA_N + i * EPI_N)
-                        Tx.copy_async(
-                            D[d_m : d_m + BLK_M, d_n : d_n + EPI_N],
-                            Dsmem[0, db],
-                            dispatch="tma_auto",
-                            cache_hint="evict_first",  # evict-first L2 policy for the store
-                            prefetch_tensormap=True,  # prefetch the D tensormap
-                        )
+                        if OVERLAP_EPILOGUE:
+                            Tx.copy_async(
+                                D[d_m : d_m + BLK_M, d_n : d_n + EPI_N],
+                                Dsmem[0, db],
+                                dispatch="tma_auto",
+                                cache_hint="evict_first",
+                                prefetch_tensormap=True,
+                            )
+                        else:
+                            Tx.copy_async(
+                                D[d_m : d_m + BLK_M, d_n : d_n + EPI_N],
+                                Dsmem[wg_id, db],
+                                dispatch="tma_auto",
+                                cache_hint="evict_first",
+                                prefetch_tensormap=True,
+                            )
                     # commit_group collectively reconverges the warpgroup (no post-sync).
                     T.ptx.cp_async.bulk.commit_group()
                     store_iter = store_iter + 1
@@ -398,27 +463,40 @@ def _kernel(
                 # No-overlap: load+cast all chunks, free the accumulator, then store. Stage
                 # the tmem->reg f32 load in 16-col sub-chunks so the f32 footprint stays 16
                 # (not EPI_N), else the consumer spills (LDL/STL).
-                NOL = T.meta_var(16)
-                Dreg_16b = T.wg_reg_tile(MMA_N, dtype=ab_type)
-                for i in T.unroll(MMA_N // NOL):
+                NOL = T.meta_var(EPI_N if PACKED_NO_OVERLAP_EPILOGUE else 16)
+                if PACKED_NO_OVERLAP_EPILOGUE:
+                    Dreg = T.alloc_tcgen05_ldst_frag("16x256b", (128, NOL), "float32")
+                    Dreg_16b = T.meta_var(
+                        [
+                            T.alloc_cast_frag(Dreg, ab_type)
+                            for _ in range(
+                                WB_PIPE_DEPTH - 1 if PRESTAGE_PACKED_CHUNK else WB_PIPE_DEPTH
+                            )
+                        ]
+                    )
+                else:
                     Dreg = T.wg_reg_tile(NOL)
-                    tn = T.meta_var(tmem_base + i * NOL)
-                    Tx.wg.copy_async(Dreg, tmem[:, tn : tn + NOL])
-                    T.ptx.tcgen05.wait.ld()
-                    Tx.wg.cast(Dreg_16b[:, i * NOL : (i + 1) * NOL], Dreg)
-                tmem_pipe.empty.arrive(wg_id, remote=0, pred=True)
-                for i in T.unroll(WB_PIPE_DEPTH):
-                    db = T.meta_var(store_iter % NUM_D_TILES)
-                    if store_iter >= NUM_D_TILES:
-                        T.ptx.cp_async.bulk.wait_group(NUM_D_TILES - 1, read=True)
+                    Dreg_16b = T.wg_reg_tile(MMA_N, dtype=ab_type)
+
+                @T.inline
+                def stage_chunk(i, db, frag):
                     T.cuda.warpgroup_sync(wg_id + 10)
-                    # Store reg->smem in 8-bf16 (128b) sub-slices -> st.128 (one swizzle
-                    # chunk each), avoiding the scalar 16b loop / bank conflicts.
-                    for jv in T.unroll(EPI_N // 8):
-                        c0 = T.meta_var(i * EPI_N + jv * 8)
-                        Tx.wg.copy(
-                            Dsmem[wg_id, db, :, jv * 8 : jv * 8 + 8], Dreg_16b[:, c0 : c0 + 8]
-                        )
+                    if PACKED_NO_OVERLAP_EPILOGUE:
+                        for jv in T.unroll(EPI_N // 16):
+                            Tx.wg.copy(
+                                Dsmem[wg_id, db, :, jv * 16 : jv * 16 + 16],
+                                frag[:, jv * 16 : jv * 16 + 16],
+                                dispatch="ldstmatrix",
+                            )
+                    else:
+                        for jv in T.unroll(EPI_N // 8):
+                            c0 = T.meta_var(i * EPI_N + jv * 8)
+                            Tx.wg.copy(
+                                Dsmem[wg_id, db, :, jv * 8 : jv * 8 + 8], Dreg_16b[:, c0 : c0 + 8]
+                            )
+
+                @T.inline
+                def issue_staged_chunk(i, db):
                     T.cuda.warpgroup_sync(wg_id + 10)
                     if (warp_id == 0) & (lane_id == 0):
                         # Single-thread proxy fence after the CTA sync (see overlap path).
@@ -435,6 +513,75 @@ def _kernel(
                     # commit_group collectively reconverges the warpgroup (no post-sync).
                     T.ptx.cp_async.bulk.commit_group()
                     store_iter = store_iter + 1
+
+                @T.inline
+                def store_chunk(i, frag):
+                    db = T.meta_var(store_iter % NUM_D_TILES)
+                    if store_iter >= NUM_D_TILES:
+                        T.ptx.cp_async.bulk.wait_group(NUM_D_TILES - 1, read=True)
+                    stage_chunk(i, db, frag)
+                    issue_staged_chunk(i, db)
+
+                if PACKED_NO_OVERLAP_EPILOGUE:
+
+                    @T.inline
+                    def load_cast_chunk(i, frag_i):
+                        tn = T.meta_var(tmem_base + i * NOL)
+                        Tx.wg.copy_async(Dreg, tmem[:, tn : tn + NOL])
+                        T.ptx.tcgen05.wait.ld()
+                        Tx.wg.cast(frag_i, Dreg)
+
+                    if PRESTAGE_PACKED_CHUNK:
+                        pre_db = T.meta_var(store_iter % NUM_D_TILES)
+                        if store_iter >= NUM_D_TILES:
+                            T.ptx.cp_async.bulk.wait_group(NUM_D_TILES - 1, read=True)
+                        load_cast_chunk(0, Dreg_16b[0])
+                        stage_chunk(0, pre_db, Dreg_16b[0])
+
+                        @T.inline
+                        def load_remaining(i):
+                            if i < WB_PIPE_DEPTH:
+                                load_cast_chunk(i, Dreg_16b[i - 1])
+                                load_remaining(i + 1)
+
+                        load_remaining(1)
+                        tmem_pipe.empty.arrive(wg_id, remote=0, pred=True)
+                        issue_staged_chunk(0, pre_db)
+
+                        @T.inline
+                        def store_remaining(i):
+                            if i < WB_PIPE_DEPTH:
+                                store_chunk(i, Dreg_16b[i - 1])
+                                store_remaining(i + 1)
+
+                        store_remaining(1)
+                    else:
+
+                        @T.inline
+                        def load_chunks(i):
+                            if i < WB_PIPE_DEPTH:
+                                load_cast_chunk(i, Dreg_16b[i])
+                                load_chunks(i + 1)
+
+                        load_chunks(0)
+                        tmem_pipe.empty.arrive(wg_id, remote=0, pred=True)
+
+                        @T.inline
+                        def store_chunks(i):
+                            if i < WB_PIPE_DEPTH:
+                                store_chunk(i, Dreg_16b[i])
+                                store_chunks(i + 1)
+
+                        store_chunks(0)
+                else:
+                    for i in T.unroll(MMA_N // NOL):
+                        tn = T.meta_var(tmem_base + i * NOL)
+                        Tx.wg.copy_async(Dreg, tmem[:, tn : tn + NOL])
+                        T.ptx.tcgen05.wait.ld()
+                        Tx.wg.cast(Dreg_16b[:, i * NOL : (i + 1) * NOL], Dreg)
+                    tmem_pipe.empty.arrive(wg_id, remote=0, pred=True)
+                    for i in T.unroll(WB_PIPE_DEPTH):
+                        store_chunk(i, Dreg_16b)
 
         if STATIC_SCHEDULER:
             writeback(static_m, static_n)
@@ -477,7 +624,8 @@ def tir_kernel(dtype: str, M: int, N: int, K: int):
     if dtype not in _DTYPE_MAP:
         raise ValueError(f"Unsupported dtype: {dtype}")
     ab_type = _DTYPE_MAP[dtype]
-    cfg = GEMM_CONFIGS.get(N, _DEFAULT_CONFIG)
+    cfg = dict(GEMM_CONFIGS.get(N, _DEFAULT_CONFIG))
+    cfg.update(_DTYPE_GEMM_CONFIGS.get((dtype, N), {}))
     # Bind only the independent knobs; _kernel derives all geometry from these.
     return _kernel.specialize(
         M=M,
@@ -488,9 +636,15 @@ def tir_kernel(dtype: str, M: int, N: int, K: int):
         BLK_K=cfg["cta_k"],
         PIPE_DEPTH=cfg["pipe_depth"],
         WB_PIPE_DEPTH=cfg["wb_pipe_depth"],
+        D_PIPE_DEPTH=cfg.get("d_pipe_depth", 2 if cfg["wb_pipe_depth"] > 1 else 1),
         L2_GROUP_SIZE=cfg["l2_group_size"],
         OVERLAP_EPILOGUE=cfg["overlap_epilogue"],
         STATIC_SCHEDULER=cfg.get("scheduler", "clc") == "static",
+        STMATRIX_EPILOGUE=cfg.get("stmatrix_epilogue", False),
+        FUSED_NO_OVERLAP_EPILOGUE=cfg.get("fused_no_overlap_epilogue", False),
+        PACKED_NO_OVERLAP_EPILOGUE=cfg.get("packed_no_overlap_epilogue", False),
+        PRESTAGE_PACKED_CHUNK=cfg.get("prestage_packed_chunk", False),
+        SMEM_DESC_MODE=cfg.get("smem_desc_mode", "hoist"),
     )
 
 
