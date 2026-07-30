@@ -1180,6 +1180,7 @@ def run_bench(
         import cutlass.cute as cute
         import cutlass.torch as cutlass_torch
         from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
+        from flash_attn.cute.utils import AuxData
 
         Qi, Ki, Vi, _ = prepare_data(
             batch_size, seq_len, seq_len, num_qo_heads, num_kv_heads, head_dim
@@ -1214,6 +1215,7 @@ def run_bench(
         )
         _stream_fa = cutlass_torch.default_stream()
         _scale_fa = 1.0 / math.sqrt(head_dim)
+        _aux_data_fa = AuxData()
         compiled_fa = cute.compile(
             fa_fwd,
             q_t,
@@ -1232,7 +1234,7 @@ def run_bench(
             None,  # learnable_sink
             None,  # descale_tensors
             None,  # blocksparse_tensors
-            None,  # aux_tensors
+            _aux_data_fa,
             _stream_fa,  # stream (FA4 sm100 keeps stream as the LAST positional)
         )
 
@@ -1254,7 +1256,7 @@ def run_bench(
                 None,  # learnable_sink
                 None,  # descale_tensors
                 None,  # blocksparse_tensors
-                None,  # aux_tensors
+                _aux_data_fa,
                 _stream_fa,  # stream (FA4 sm100 keeps stream as the LAST positional)
             )
 
