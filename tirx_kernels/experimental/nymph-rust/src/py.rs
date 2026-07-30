@@ -1041,6 +1041,7 @@ fn scope_kind_from_str(kind: &str) -> PyResult<ir::ScopeValueKind> {
         "ctaid_in_cluster" => CtaidInCluster,
         "cta_id" => CtaId,
         "nvshmem_my_pe" => NvshmemMyPe,
+        "elected" => Elected,
         other => {
             return Err(PyTypeError::new_err(format!(
                 "unknown scope value kind: {other}"
@@ -1058,6 +1059,7 @@ fn scope_kind_str(kind: ir::ScopeValueKind) -> &'static str {
         CtaidInCluster => "ctaid_in_cluster",
         CtaId => "cta_id",
         NvshmemMyPe => "nvshmem_my_pe",
+        Elected => "elected",
     }
 }
 
@@ -1721,12 +1723,12 @@ pub struct PyMBar(pub Arc<ir::MBar>);
 #[pymethods]
 impl PyMBar {
     #[new]
-    #[pyo3(signature = (kind, stages = 1, arrive_count = None, leader_routed = false))]
+    #[pyo3(signature = (kind, byte_offset, stages = 1, arrive_count = None))]
     fn new(
         kind: PyMBarKind,
+        byte_offset: usize,
         stages: u32,
         arrive_count: Option<u32>,
-        leader_routed: bool,
     ) -> PyResult<Self> {
         // Validate eagerly, like Python's MBar.__post_init__.
         if stages < 1 {
@@ -1745,8 +1747,8 @@ impl PyMBar {
             id: fresh_mbar_id(),
             kind: kind.into(),
             stages,
+            byte_offset,
             arrive_count,
-            leader_routed,
         })))
     }
     #[getter]
@@ -1758,12 +1760,12 @@ impl PyMBar {
         self.0.stages
     }
     #[getter]
-    fn arrive_count(&self) -> Option<u32> {
-        self.0.arrive_count
+    fn byte_offset(&self) -> usize {
+        self.0.byte_offset
     }
     #[getter]
-    fn leader_routed(&self) -> bool {
-        self.0.leader_routed
+    fn arrive_count(&self) -> Option<u32> {
+        self.0.arrive_count
     }
     #[getter]
     fn id(&self) -> u32 {
@@ -1788,6 +1790,14 @@ impl PyMBarRef {
     #[getter]
     fn mbar(&self) -> PyMBar {
         PyMBar(self.0.mbar.clone())
+    }
+    #[getter]
+    fn remote_coord(&self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+        self.0
+            .remote_coord
+            .as_ref()
+            .map(|coord| scalar_to_py(py, coord))
+            .transpose()
     }
 }
 
@@ -1890,6 +1900,132 @@ pub struct PyStmt(pub ir::Stmt);
 // its fields" structure tests, not the full dataclass introspection surface.
 #[pymethods]
 impl PyStmt {
+    /// The statement variant name (snake_case, e.g. "mbarrier_arrive",
+    /// "wg_sync", "reg_load") — the discriminator the IR-pass tooling
+    /// (tests/tools/smidiff.py) matches injection sites on.
+    #[getter]
+    fn kind(&self) -> &'static str {
+        match &self.0 {
+            ir::Stmt::TensorDef { .. } => "tensor_def",
+            ir::Stmt::MBarDef { .. } => "mbar_def",
+            ir::Stmt::TmemAlloc { .. } => "tmem_alloc",
+            ir::Stmt::TmemDealloc { .. } => "tmem_dealloc",
+            ir::Stmt::TmemRelinquish { .. } => "tmem_relinquish",
+            ir::Stmt::ScalarDef { .. } => "scalar_def",
+            ir::Stmt::ScalarStore { .. } => "scalar_store",
+            ir::Stmt::ScalarLet { .. } => "scalar_let",
+            ir::Stmt::StoreScalar { .. } => "store_scalar",
+            ir::Stmt::RegFill { .. } => "reg_fill",
+            ir::Stmt::RegLoad { .. } => "reg_load",
+            ir::Stmt::RegStore { .. } => "reg_store",
+            ir::Stmt::RegAdd { .. } => "reg_add",
+            ir::Stmt::RegSub { .. } => "reg_sub",
+            ir::Stmt::RegMul { .. } => "reg_mul",
+            ir::Stmt::RegFma { .. } => "reg_fma",
+            ir::Stmt::RegMax { .. } => "reg_max",
+            ir::Stmt::RegMin { .. } => "reg_min",
+            ir::Stmt::RegBitwise { .. } => "reg_bitwise",
+            ir::Stmt::RegReduce { .. } => "reg_reduce",
+            ir::Stmt::RegCondRescale { .. } => "reg_cond_rescale",
+            ir::Stmt::RegSoftmaxRescale { .. } => "reg_softmax_rescale",
+            ir::Stmt::RegCausalMask { .. } => "reg_causal_mask",
+            ir::Stmt::RegCombineIntFracEx2 { .. } => "reg_combine_int_frac_ex2",
+            ir::Stmt::RegCvt { .. } => "reg_cvt",
+            ir::Stmt::RegUnary { .. } => "reg_unary",
+            ir::Stmt::ShuffleSync { .. } => "shuffle_sync",
+            ir::Stmt::MBarrierInit { .. } => "mbarrier_init",
+            ir::Stmt::MBarrierArrive { .. } => "mbarrier_arrive",
+            ir::Stmt::MBarrierExpectTx { .. } => "mbarrier_expect_tx",
+            ir::Stmt::MBarrierArriveExpectTx { .. } => "mbarrier_arrive_expect_tx",
+            ir::Stmt::MBarrierWait { .. } => "mbarrier_wait",
+            ir::Stmt::TmaLoad { .. } => "tma_load",
+            ir::Stmt::TmaStore { .. } => "tma_store",
+            ir::Stmt::CpAsyncBulkS2Cluster { .. } => "cp_async_bulk_s2cluster",
+            ir::Stmt::CpAsyncBulkCommitGroup => "cp_async_bulk_commit_group",
+            ir::Stmt::CpAsyncBulkWaitGroupRead { .. } => "cp_async_bulk_wait_group_read",
+            ir::Stmt::GmemAtomicAdd { .. } => "gmem_atomic_add",
+            ir::Stmt::GmemWaitEq { .. } => "gmem_wait_eq",
+            ir::Stmt::Tcgen05Mma { .. } => "tcgen05_mma",
+            ir::Stmt::Tcgen05Cp { .. } => "tcgen05_cp",
+            ir::Stmt::Tcgen05Commit { .. } => "tcgen05_commit",
+            ir::Stmt::Tcgen05Ld { .. } => "tcgen05_ld",
+            ir::Stmt::Tcgen05St { .. } => "tcgen05_st",
+            ir::Stmt::Tcgen05WaitLd { .. } => "tcgen05_wait_ld",
+            ir::Stmt::Tcgen05WaitSt { .. } => "tcgen05_wait_st",
+            ir::Stmt::LdMatrix { .. } => "ld_matrix",
+            ir::Stmt::StMatrix { .. } => "st_matrix",
+            ir::Stmt::WarpMma { .. } => "warp_mma",
+            ir::Stmt::CtaSync => "cta_sync",
+            ir::Stmt::WgSync { .. } => "wg_sync",
+            ir::Stmt::WarpSync => "warp_sync",
+            ir::Stmt::NamedBarrier { .. } => "named_barrier",
+            ir::Stmt::ClusterSync => "cluster_sync",
+            ir::Stmt::ClusterBarrierArrive { .. } => "cluster_barrier_arrive",
+            ir::Stmt::ClusterBarrierWait => "cluster_barrier_wait",
+            ir::Stmt::GridDepControl { .. } => "grid_dep_control",
+            ir::Stmt::Fence { .. } => "fence",
+            ir::Stmt::SetMaxNReg { .. } => "set_max_nreg",
+            ir::Stmt::If { .. } => "if",
+            ir::Stmt::ForLoop { .. } => "for_loop",
+            ir::Stmt::ForEachTask { .. } => "for_each_task",
+            ir::Stmt::Loop { .. } => "loop",
+            ir::Stmt::BreakIf { .. } => "break_if",
+            ir::Stmt::SchedulerImpl { .. } => "scheduler_impl",
+            ir::Stmt::SchedNext { .. } => "sched_next",
+            ir::Stmt::ClcTryCancel { .. } => "clc_try_cancel",
+            ir::Stmt::ClcQueryCancel { .. } => "clc_query_cancel",
+        }
+    }
+    /// The barrier id of a wg_sync / named_barrier statement.
+    #[getter]
+    fn barrier_id(&self) -> PyResult<u32> {
+        match &self.0 {
+            ir::Stmt::WgSync { barrier_id } | ir::Stmt::NamedBarrier { barrier_id, .. } => {
+                Ok((*barrier_id).into())
+            }
+            _ => Err(PyAttributeError::new_err("barrier_id")),
+        }
+    }
+    /// The exact mbar reference carried by an mbarrier/TMA statement.
+    #[getter]
+    fn mbar(&self) -> PyResult<PyMBarRef> {
+        match &self.0 {
+            ir::Stmt::MBarrierInit { mbar, .. }
+            | ir::Stmt::MBarrierArrive { mbar, .. }
+            | ir::Stmt::MBarrierExpectTx { mbar, .. }
+            | ir::Stmt::MBarrierArriveExpectTx { mbar, .. }
+            | ir::Stmt::MBarrierWait { mbar, .. }
+            | ir::Stmt::TmaLoad { mbar, .. }
+            | ir::Stmt::ClcTryCancel { mbar, .. }
+            | ir::Stmt::CpAsyncBulkS2Cluster { mbar, .. }
+            | ir::Stmt::Tcgen05Commit { mbar, .. } => Ok(PyMBarRef(mbar.clone())),
+            _ => Err(PyAttributeError::new_err("mbar")),
+        }
+    }
+    /// The mbar id of an mbarrier/TMA statement.
+    #[getter]
+    fn mbar_id(&self) -> PyResult<u32> {
+        match &self.0 {
+            ir::Stmt::MBarrierInit { mbar, .. }
+            | ir::Stmt::MBarrierArrive { mbar, .. }
+            | ir::Stmt::MBarrierExpectTx { mbar, .. }
+            | ir::Stmt::MBarrierArriveExpectTx { mbar, .. }
+            | ir::Stmt::MBarrierWait { mbar, .. }
+            | ir::Stmt::TmaLoad { mbar, .. }
+            | ir::Stmt::ClcTryCancel { mbar, .. }
+            | ir::Stmt::CpAsyncBulkS2Cluster { mbar, .. }
+            | ir::Stmt::Tcgen05Commit { mbar, .. } => Ok(mbar.mbar.id),
+            _ => Err(PyAttributeError::new_err("mbar_id")),
+        }
+    }
+    /// The tensor of a tensor_def statement.
+    #[getter]
+    fn tensor(&self) -> PyResult<PyTensor> {
+        match &self.0 {
+            ir::Stmt::TensorDef { tensor } => Ok(PyTensor(tensor.clone())),
+            _ => Err(PyAttributeError::new_err("tensor")),
+        }
+    }
     #[getter]
     fn mma_m(&self) -> PyResult<u32> {
         match &self.0 {
@@ -1958,6 +2094,15 @@ impl PyStmt {
             | ir::Stmt::TmaLoad { cta_group, .. }
             | ir::Stmt::Tcgen05Commit { cta_group, .. } => Ok(*cta_group),
             _ => Err(PyAttributeError::new_err("cta_group")),
+        }
+    }
+    #[getter]
+    fn addr_byte_offset(&self) -> PyResult<usize> {
+        match &self.0 {
+            ir::Stmt::TmemAlloc {
+                addr_byte_offset, ..
+            } => Ok(*addr_byte_offset),
+            _ => Err(PyAttributeError::new_err("addr_byte_offset")),
         }
     }
     #[getter]
@@ -2071,6 +2216,13 @@ impl PyStmt {
         }
     }
     #[getter]
+    fn unroll(&self) -> PyResult<bool> {
+        match &self.0 {
+            ir::Stmt::ForLoop { unroll, .. } => Ok(*unroll),
+            _ => Err(PyAttributeError::new_err("unroll")),
+        }
+    }
+    #[getter]
     fn body(&self) -> PyResult<Vec<PyStmt>> {
         match &self.0 {
             ir::Stmt::ForLoop { body, .. }
@@ -2105,12 +2257,13 @@ fn tensor_def(tensor: PyTensor) -> PyStmt {
     PyStmt(ir::Stmt::TensorDef { tensor: tensor.0 })
 }
 #[pyfunction]
-#[pyo3(name = "TmemAlloc", signature = (base_col, n_cols, cta_group = 1))]
-fn tmem_alloc(base_col: u32, n_cols: u32, cta_group: u8) -> PyStmt {
+#[pyo3(name = "TmemAlloc", signature = (base_col, n_cols, addr_byte_offset, cta_group = 1))]
+fn tmem_alloc(base_col: u32, n_cols: u32, addr_byte_offset: usize, cta_group: u8) -> PyStmt {
     PyStmt(ir::Stmt::TmemAlloc {
         base_col,
         n_cols,
         cta_group,
+        addr_byte_offset,
     })
 }
 #[pyfunction]
@@ -2926,6 +3079,15 @@ fn cluster_barrier_wait() -> PyStmt {
     PyStmt(ir::Stmt::ClusterBarrierWait)
 }
 
+#[pyfunction]
+#[pyo3(name = "GridDepControl", signature = (action = "launch_dependents"))]
+fn grid_dep_control(action: &str) -> PyResult<PyStmt> {
+    let action = ir::GridDepAction::parse(action).ok_or_else(|| {
+        PyRuntimeError::new_err("grid_dep_control action must be 'launch_dependents' or 'wait'")
+    })?;
+    Ok(PyStmt(ir::Stmt::GridDepControl { action }))
+}
+
 // ===========================================================================
 // chunk 7 — Kernel
 // ===========================================================================
@@ -2946,7 +3108,7 @@ pub struct PyKernel(pub ir::Kernel);
 #[pymethods]
 impl PyKernel {
     #[new]
-    #[pyo3(signature = (name, args = None, body = None, num_warps = 12, smem_size_bytes = 0, launch_shape = None, cluster_shape = None, smem_pool = false))]
+    #[pyo3(signature = (name, args = None, body = None, num_warps = 12, smem_size_bytes = 0, launch_shape = None, cluster_shape = None))]
     fn new(
         name: String,
         args: Option<Bound<'_, PyAny>>,
@@ -2955,7 +3117,6 @@ impl PyKernel {
         smem_size_bytes: usize,
         launch_shape: Option<Vec<usize>>,
         cluster_shape: Option<Vec<usize>>,
-        smem_pool: bool,
     ) -> PyResult<Self> {
         let kernel = ir::Kernel {
             name,
@@ -2968,7 +3129,6 @@ impl PyKernel {
             smem_size_bytes,
             launch_shape: launch_shape.unwrap_or_else(|| vec![1]),
             cluster_shape: cluster_shape.unwrap_or_else(|| vec![1]),
-            smem_pool,
         };
         kernel
             .validate()
@@ -3124,6 +3284,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(cluster_sync, m)?,
         wrap_pyfunction!(cluster_barrier_arrive, m)?,
         wrap_pyfunction!(cluster_barrier_wait, m)?,
+        wrap_pyfunction!(grid_dep_control, m)?,
     ] {
         m.add_function(f)?;
     }

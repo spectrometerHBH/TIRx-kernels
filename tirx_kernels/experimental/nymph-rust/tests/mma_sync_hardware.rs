@@ -7,9 +7,9 @@
 //! (A reg ru→tile (mt=ru%2,kt=ru/2), A[mt*8+g][kt*8+2t+h]; D[(ri/2)*8+g][2t+ri%2]) and
 //! checked cell-for-cell against the f32 reference matmul A·Bᵀ — so the interpreter's A/D
 //! fragment layout AND the bf16/f16 operand decode are verified against real hardware. (B
-//! is packed in the raw PTX `.col` direct-feed layout B[n=g][k=kt*8+2t+h]; the interpreter's
-//! post-`ldmatrix.trans` B layout is covered transitively by `ldstmatrix_hardware` +
-//! `test_warp_mma`'s ldmatrix.trans→mma round-trip.)
+//! is packed in the raw PTX `.col` direct-feed layout B[n=g][k=kt*8+2t+h] — the same
+//! layout `warpmma.rs` models; the ldmatrix coupling is covered transitively by
+//! `ldstmatrix_hardware` + `test_warp_mma`'s non-trans ldmatrix→mma round-trip.)
 //!
 //! Run on a Blackwell box with: `cargo test --test mma_sync_hardware -- --ignored`.
 //! Passing the warp-MMA's bf16 + f16 + (k16,k8) cases on a B200 (sm_100) was verified.
