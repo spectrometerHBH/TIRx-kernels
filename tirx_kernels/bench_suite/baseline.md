@@ -1,7 +1,7 @@
 # bench-suite baseline view: `baseline.json`
 
-- Timestamp: `77`
-- Label:     `pr45-26631487-full-sgl044-torch213`
+- Timestamp: `157`
+- Label:     `pr45-final`
 - Git:       `{'tir': 'fb56ab11-dirty', 'tirx-kernels': '47eb8943-dirty', 'tirx-bench-ci': None}`
 - Workloads: 113 ok, 0 failed
 
@@ -11,196 +11,196 @@ Grouped workloads show one row per config and one timing column per implementati
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
 |---|---|---:|---|---:|---:|---|
-| `tp1_m8192_n106496_k16384_fp16_dynamic` | tirx | 20347.1755 | cublas_nccl_cudagraph | 17985.0723 | 0.884 | cublasmp_split_p2p=18204.1503 |
-| `tp1_m8192_n24576_k4096_fp16_dynamic` | tirx | 1036.6108 | cublas_nccl_cudagraph | 1018.7519 | 0.983 | cublasmp_split_p2p=1063.6670 |
-| `tp1_m8192_n51200_k5120_fp16_dynamic` | tirx | 2825.9458 | cublas_nccl_cudagraph | 2707.5847 | 0.958 | cublasmp_split_p2p=2763.2361 |
-| `tp1_m8192_n57344_k8192_fp16_dynamic` | tirx | 5428.8352 | cublas_nccl_cudagraph | 4935.6822 | 0.909 | cublasmp_split_p2p=5015.3208 |
+| `tp1_m8192_n106496_k16384_fp16_dynamic` | tirx | 19035.4892 | cublas_nccl_cudagraph | 18121.0029 | 0.952 | cublasmp_split_p2p=18366.2004 |
+| `tp1_m8192_n24576_k4096_fp16_dynamic` | tirx | 1035.5806 | cublas_nccl_cudagraph | 1026.3873 | 0.991 | cublasmp_split_p2p=1072.1947 |
+| `tp1_m8192_n51200_k5120_fp16_dynamic` | tirx | 2865.6280 | cublas_nccl_cudagraph | 2728.9279 | 0.952 | cublasmp_split_p2p=2784.6971 |
+| `tp1_m8192_n57344_k8192_fp16_dynamic` | tirx | 5484.6730 | cublas_nccl_cudagraph | 4885.4983 | 0.891 | cublasmp_split_p2p=4974.1606 |
 
 ## deepgemm_fp8_fp4_mega_moe
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
 |---|---|---:|---|---:|---:|---|
-| `t64_m64_h7168_i3072_e384_k6_g1` | tirx | 1296.0000 | deepgemm | 1286.0000 | 0.992 | — |
-| `t8192_m8192_h7168_i3072_e384_k6_g1` | tirx | 3410.4000 | deepgemm | 3410.6000 | 1.000 | — |
+| `t64_m64_h7168_i3072_e384_k6_g1` | tirx | 1297.0000 | deepgemm | 1290.0000 | 0.995 | — |
+| `t8192_m8192_h7168_i3072_e384_k6_g1` | tirx | 3401.4000 | deepgemm | 3401.4000 | 1.000 | — |
 
 ## deepgemm_sm100_fp4_mqa_logits
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
 |---|---|---:|---|---:|---:|---|
-| `s2048_skv4096_h64_d128_f32_dense_cp` | tirx | 37.5364 | deepgemm | 39.6249 | 1.056 | — |
-| `s4096_skv8192_h64_d128_bf16_compressed_nocp` | tirx | 181.3557 | deepgemm | 182.1154 | 1.004 | — |
+| `s2048_skv4096_h64_d128_f32_dense_cp` | tirx | 37.4858 | deepgemm | 39.4054 | 1.051 | — |
+| `s4096_skv8192_h64_d128_bf16_compressed_nocp` | tirx | 182.1232 | deepgemm | 182.5651 | 1.002 | — |
 
 ## deepgemm_sm100_fp4_paged_mqa_logits
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
 |---|---|---:|---|---:|---:|---|
-| `b16_n1_mp128_ps64_h64_d128_bf16_fixed` | tirx | 6.3787 | deepgemm | 6.5043 | 1.020 | — |
-| `b1_n1_mp1_ps32_h64_d128_f32_fixed` | tirx | 4.0699 | deepgemm | 4.6242 | 1.136 | — |
+| `b16_n1_mp128_ps64_h64_d128_bf16_fixed` | tirx | 6.3685 | deepgemm | 6.5583 | 1.030 | — |
+| `b1_n1_mp1_ps32_h64_d128_f32_fixed` | tirx | 4.0776 | deepgemm | 4.9700 | 1.219 | — |
 
 ## deepgemm_sm100_fp8_mqa_logits
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
 |---|---|---:|---|---:|---:|---|
-| `s2048_skv4096_h64_d128_f32_dense_cp` | tirx | 39.0773 | deepgemm | 40.9516 | 1.048 | — |
-| `s4096_skv8192_h64_d128_bf16_compressed_nocp` | tirx | 177.3463 | deepgemm | 187.7190 | 1.058 | — |
+| `s2048_skv4096_h64_d128_f32_dense_cp` | tirx | 38.9846 | deepgemm | 40.9416 | 1.050 | — |
+| `s4096_skv8192_h64_d128_bf16_compressed_nocp` | tirx | 181.1184 | deepgemm | 187.9073 | 1.037 | — |
 
 ## deepgemm_sm100_fp8_paged_mqa_logits
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
 |---|---|---:|---|---:|---:|---|
-| `b16_n1_mp128_ps64_h64_d128_bf16_fixed` | tirx | 6.6487 | sglang_cutedsl | 6.8659 | 1.033 | deepgemm=6.9456 |
-| `b1_n1_mp1_ps64_h64_d128_f32_fixed` | tirx | 4.2997 | sglang_cutedsl | 4.5680 | 1.062 | deepgemm=4.9827 |
+| `b16_n1_mp128_ps64_h64_d128_bf16_fixed` | tirx | 6.7307 | sglang_cutedsl | 6.9280 | 1.029 | deepgemm=6.9418 |
+| `b1_n1_mp1_ps64_h64_d128_f32_fixed` | tirx | 4.5571 | sglang_cutedsl | 4.9052 | 1.076 | deepgemm=5.0422 |
 
 ## deepgemm_sm100_tf32_hc_prenorm_gemm
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
 |---|---|---:|---|---:|---:|---|
-| `m128_n24_k16384_s64` | tirx | 5.2594 | deepgemm | 5.1812 | 0.985 | — |
-| `m137_n24_k7680_s16` | tirx | 5.5257 | deepgemm | 5.4588 | 0.988 | — |
-| `m13_n24_k7168_s1` | tirx | 21.4789 | deepgemm | 20.8115 | 0.969 | — |
-| `m4096_n24_k28672_s16` | tirx | 57.9906 | deepgemm | 62.6236 | 1.080 | — |
-| `m4096_n24_k7168_s1` | tirx | 23.4001 | deepgemm | 23.7544 | 1.015 | — |
-| `m64_n24_k28672_s112` | tirx | 5.1281 | deepgemm | 5.1043 | 0.995 | — |
-| `m8192_n24_k16384_s1` | tirx | 50.6801 | deepgemm | 59.4274 | 1.173 | — |
-| `m8192_n24_k28672_s1` | tirx | 84.8203 | deepgemm | 92.8472 | 1.095 | — |
+| `m128_n24_k16384_s64` | tirx | 5.2831 | deepgemm | 5.1969 | 0.984 | — |
+| `m137_n24_k7680_s16` | tirx | 5.4653 | deepgemm | 5.4258 | 0.993 | — |
+| `m13_n24_k7168_s1` | tirx | 21.8838 | deepgemm | 21.3284 | 0.975 | — |
+| `m4096_n24_k28672_s16` | tirx | 57.9550 | deepgemm | 62.7717 | 1.083 | — |
+| `m4096_n24_k7168_s1` | tirx | 23.3083 | deepgemm | 23.5230 | 1.009 | — |
+| `m64_n24_k28672_s112` | tirx | 5.2852 | deepgemm | 5.2854 | 1.000 | — |
+| `m8192_n24_k16384_s1` | tirx | 50.7833 | deepgemm | 60.0844 | 1.183 | — |
+| `m8192_n24_k28672_s1` | tirx | 83.7081 | deepgemm | 91.6873 | 1.095 | — |
 
 ## flash_attention4
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
 |---|---|---:|---|---:|---:|---|
-| `s1024_h32kv16` | tir | 19.8064 | flashattn_sm100 | 20.1674 | 1.018 | — |
-| `s1024_h32kv16_causal` | tir | 20.4449 | flashattn_sm100 | 20.4744 | 1.001 | — |
-| `s1024_h32kv32` | tir | 20.2122 | flashattn_sm100 | 20.6242 | 1.020 | — |
-| `s1024_h32kv32_causal` | tir | 21.0007 | flashattn_sm100 | 21.3521 | 1.017 | — |
-| `s1024_h32kv4` | tir | 19.2721 | flashattn_sm100 | 20.0094 | 1.038 | — |
-| `s1024_h32kv4_causal` | tir | 18.7786 | flashattn_sm100 | 19.4542 | 1.036 | — |
-| `s1024_h32kv8` | tir | 19.6263 | flashattn_sm100 | 20.1915 | 1.029 | — |
-| `s1024_h32kv8_causal` | tir | 19.4163 | flashattn_sm100 | 19.8671 | 1.023 | — |
-| `s2048_h32kv16` | tir | 57.4676 | flashattn_sm100 | 57.6315 | 1.003 | — |
-| `s2048_h32kv16_causal` | tir | 36.5735 | flashattn_sm100 | 38.7478 | 1.059 | — |
-| `s2048_h32kv32` | tir | 59.2354 | flashattn_sm100 | 59.7353 | 1.008 | — |
-| `s2048_h32kv32_causal` | tir | 39.8546 | flashattn_sm100 | 40.5481 | 1.017 | — |
-| `s2048_h32kv4` | tir | 55.7974 | flashattn_sm100 | 55.9215 | 1.002 | — |
-| `s2048_h32kv4_causal` | tir | 35.3721 | flashattn_sm100 | 37.7387 | 1.067 | — |
-| `s2048_h32kv8` | tir | 56.5389 | flashattn_sm100 | 56.7749 | 1.004 | — |
-| `s2048_h32kv8_causal` | tir | 35.6759 | flashattn_sm100 | 38.1033 | 1.068 | — |
-| `s4096_h32kv16` | tir | 211.5813 | flashattn_sm100 | 215.3945 | 1.018 | — |
-| `s4096_h32kv16_causal` | tir | 112.4831 | flashattn_sm100 | 117.5787 | 1.045 | — |
-| `s4096_h32kv32` | tir | 217.5533 | flashattn_sm100 | 218.2915 | 1.003 | — |
-| `s4096_h32kv32_causal` | tir | 120.7237 | flashattn_sm100 | 121.6142 | 1.007 | — |
-| `s4096_h32kv4` | tir | 207.2906 | flashattn_sm100 | 207.2475 | 1.000 | — |
-| `s4096_h32kv4_causal` | tir | 109.8672 | flashattn_sm100 | 114.8975 | 1.046 | — |
-| `s4096_h32kv8` | tir | 211.3173 | flashattn_sm100 | 211.5027 | 1.001 | — |
-| `s4096_h32kv8_causal` | tir | 110.8674 | flashattn_sm100 | 116.5797 | 1.052 | — |
-| `s8192_h32kv16` | tir | 775.8115 | flashattn_sm100 | 776.4188 | 1.001 | — |
-| `s8192_h32kv16_causal` | tir | 421.6543 | flashattn_sm100 | 432.9106 | 1.027 | — |
-| `s8192_h32kv32` | tir | 780.2330 | flashattn_sm100 | 779.3744 | 0.999 | — |
-| `s8192_h32kv32_causal` | tir | 436.0053 | flashattn_sm100 | 434.5562 | 0.997 | — |
-| `s8192_h32kv4` | tir | 783.2991 | flashattn_sm100 | 768.1835 | 0.981 | — |
-| `s8192_h32kv4_causal` | tir | 415.9150 | flashattn_sm100 | 424.4983 | 1.021 | — |
-| `s8192_h32kv8` | tir | 773.2016 | flashattn_sm100 | 774.0533 | 1.001 | — |
-| `s8192_h32kv8_causal` | tir | 414.6564 | flashattn_sm100 | 421.4241 | 1.016 | — |
+| `s1024_h32kv16` | tir | 19.7023 | flashattn_sm100 | 20.2096 | 1.026 | — |
+| `s1024_h32kv16_causal` | tir | 19.9980 | flashattn_sm100 | 20.2722 | 1.014 | — |
+| `s1024_h32kv32` | tir | 20.5129 | flashattn_sm100 | 20.8115 | 1.015 | — |
+| `s1024_h32kv32_causal` | tir | 21.0046 | flashattn_sm100 | 21.4597 | 1.022 | — |
+| `s1024_h32kv4` | tir | 19.3340 | flashattn_sm100 | 19.9688 | 1.033 | — |
+| `s1024_h32kv4_causal` | tir | 19.0127 | flashattn_sm100 | 19.8612 | 1.045 | — |
+| `s1024_h32kv8` | tir | 19.4448 | flashattn_sm100 | 19.8315 | 1.020 | — |
+| `s1024_h32kv8_causal` | tir | 19.4614 | flashattn_sm100 | 20.0129 | 1.028 | — |
+| `s2048_h32kv16` | tir | 57.9021 | flashattn_sm100 | 57.8175 | 0.999 | — |
+| `s2048_h32kv16_causal` | tir | 36.3622 | flashattn_sm100 | 38.6221 | 1.062 | — |
+| `s2048_h32kv32` | tir | 59.4407 | flashattn_sm100 | 59.7029 | 1.004 | — |
+| `s2048_h32kv32_causal` | tir | 39.9642 | flashattn_sm100 | 40.5845 | 1.016 | — |
+| `s2048_h32kv4` | tir | 55.6885 | flashattn_sm100 | 55.8006 | 1.002 | — |
+| `s2048_h32kv4_causal` | tir | 35.4333 | flashattn_sm100 | 38.0078 | 1.073 | — |
+| `s2048_h32kv8` | tir | 56.8092 | flashattn_sm100 | 56.6679 | 0.998 | — |
+| `s2048_h32kv8_causal` | tir | 35.5016 | flashattn_sm100 | 37.8814 | 1.067 | — |
+| `s4096_h32kv16` | tir | 211.5064 | flashattn_sm100 | 213.3994 | 1.009 | — |
+| `s4096_h32kv16_causal` | tir | 112.0787 | flashattn_sm100 | 118.3730 | 1.056 | — |
+| `s4096_h32kv32` | tir | 218.1151 | flashattn_sm100 | 219.6977 | 1.007 | — |
+| `s4096_h32kv32_causal` | tir | 119.3250 | flashattn_sm100 | 119.8426 | 1.004 | — |
+| `s4096_h32kv4` | tir | 210.7095 | flashattn_sm100 | 209.0348 | 0.992 | — |
+| `s4096_h32kv4_causal` | tir | 111.5006 | flashattn_sm100 | 115.6392 | 1.037 | — |
+| `s4096_h32kv8` | tir | 210.0037 | flashattn_sm100 | 211.2078 | 1.006 | — |
+| `s4096_h32kv8_causal` | tir | 110.9455 | flashattn_sm100 | 116.8375 | 1.053 | — |
+| `s8192_h32kv16` | tir | 779.0893 | flashattn_sm100 | 776.9617 | 0.997 | — |
+| `s8192_h32kv16_causal` | tir | 413.0516 | flashattn_sm100 | 426.6270 | 1.033 | — |
+| `s8192_h32kv32` | tir | 783.1333 | flashattn_sm100 | 793.6872 | 1.013 | — |
+| `s8192_h32kv32_causal` | tir | 434.0619 | flashattn_sm100 | 433.0868 | 0.998 | — |
+| `s8192_h32kv4` | tir | 764.3664 | flashattn_sm100 | 768.0960 | 1.005 | — |
+| `s8192_h32kv4_causal` | tir | 418.1305 | flashattn_sm100 | 424.5940 | 1.015 | — |
+| `s8192_h32kv8` | tir | 771.5513 | flashattn_sm100 | 775.8581 | 1.006 | — |
+| `s8192_h32kv8_causal` | tir | 411.1461 | flashattn_sm100 | 422.1195 | 1.027 | — |
 
 ## fp16_bf16_gemm
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
 |---|---|---:|---|---:|---:|---|
-| `bf16_1024x1024x1024` | tir | 6.1857 | deepgemm-cublaslt | 5.8463 | 0.945 | deepgemm-bf16=6.7069, torch-cublas=5.8557 |
-| `bf16_16384x16384x16384` | tir | 5479.8830 | deepgemm-cublaslt | 5368.2901 | 0.980 | deepgemm-bf16=5732.4577, torch-cublas=5460.5809 |
-| `bf16_2048x2048x2048` | tir | 15.8669 | deepgemm-cublaslt | 15.6621 | 0.987 | deepgemm-bf16=17.2149, torch-cublas=15.6718 |
-| `bf16_4096x4096x4096` | tir | 89.7640 | torch-cublas | 90.3669 | 1.007 | deepgemm-bf16=90.8218, deepgemm-cublaslt=90.7227 |
-| `bf16_8192x8192x8192` | tir | 691.4334 | deepgemm-cublaslt | 699.1222 | 1.011 | deepgemm-bf16=739.1035, torch-cublas=704.2089 |
-| `fp16_1024x1024x1024` | tir | 6.2860 | torch-cublas | 5.8934 | 0.938 | — |
-| `fp16_16384x16384x16384` | tir | 5629.9235 | torch-cublas | 5912.1681 | 1.050 | — |
-| `fp16_2048x2048x2048` | tir | 16.1207 | torch-cublas | 15.7391 | 0.976 | — |
-| `fp16_4096x4096x4096` | tir | 92.0312 | torch-cublas | 92.2030 | 1.002 | — |
-| `fp16_8192x8192x8192` | tir | 736.3923 | torch-cublas | 751.9896 | 1.021 | — |
+| `bf16_1024x1024x1024` | tir | 6.2070 | deepgemm-cublaslt | 5.8917 | 0.949 | deepgemm-bf16=6.7480, torch-cublas=5.8918 |
+| `bf16_16384x16384x16384` | tir | 5452.0192 | torch-cublas | 5420.8317 | 0.994 | deepgemm-bf16=5812.4480, deepgemm-cublaslt=5439.5397 |
+| `bf16_2048x2048x2048` | tir | 15.9003 | torch-cublas | 15.6392 | 0.984 | deepgemm-bf16=17.2324, deepgemm-cublaslt=15.6399 |
+| `bf16_4096x4096x4096` | tir | 89.4518 | deepgemm-bf16 | 88.3152 | 0.987 | deepgemm-cublaslt=89.2192, torch-cublas=89.6141 |
+| `bf16_8192x8192x8192` | tir | 684.4459 | deepgemm-cublaslt | 702.8859 | 1.027 | deepgemm-bf16=708.4234, torch-cublas=703.9724 |
+| `fp16_1024x1024x1024` | tir | 6.2365 | torch-cublas | 5.9274 | 0.950 | — |
+| `fp16_16384x16384x16384` | tir | 5643.1590 | torch-cublas | 5920.7061 | 1.049 | — |
+| `fp16_2048x2048x2048` | tir | 16.1947 | torch-cublas | 15.6606 | 0.967 | — |
+| `fp16_4096x4096x4096` | tir | 92.1835 | torch-cublas | 93.0357 | 1.009 | — |
+| `fp16_8192x8192x8192` | tir | 720.7126 | torch-cublas | 727.5503 | 1.009 | — |
 
 ## fp8_blockwise_gemm
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
 |---|---|---:|---|---:|---:|---|
-| `deepgemm_m4096_n2112_k7168` | tir | 50.1107 | deepgemm | 49.1787 | 0.981 | — |
-| `deepgemm_m4096_n24576_k1536` | tir | 113.9351 | deepgemm | 113.8368 | 0.999 | — |
-| `deepgemm_m4096_n32768_k512` | tir | 68.9345 | deepgemm | 72.0699 | 1.045 | — |
-| `deepgemm_m4096_n4096_k7168` | tir | 82.2197 | deepgemm | 81.8118 | 0.995 | — |
-| `deepgemm_m4096_n576_k7168` | tir | 20.0859 | deepgemm | 19.0355 | 0.948 | — |
-| `deepgemm_m4096_n7168_k16384` | tir | 334.4252 | deepgemm | 325.6543 | 0.974 | — |
-| `deepgemm_m4096_n7168_k2048` | tir | 42.4870 | deepgemm | 42.1623 | 0.992 | — |
+| `deepgemm_m4096_n2112_k7168` | tir | 50.6205 | deepgemm | 49.6334 | 0.980 | — |
+| `deepgemm_m4096_n24576_k1536` | tir | 114.1395 | deepgemm | 113.9458 | 0.998 | — |
+| `deepgemm_m4096_n32768_k512` | tir | 67.9121 | deepgemm | 71.8083 | 1.057 | — |
+| `deepgemm_m4096_n4096_k7168` | tir | 82.2233 | deepgemm | 81.4473 | 0.991 | — |
+| `deepgemm_m4096_n576_k7168` | tir | 20.1080 | deepgemm | 19.0759 | 0.949 | — |
+| `deepgemm_m4096_n7168_k16384` | tir | 332.7540 | deepgemm | 336.6865 | 1.012 | — |
+| `deepgemm_m4096_n7168_k2048` | tir | 43.1168 | deepgemm | 42.3866 | 0.983 | — |
 
 ## gemm_reduce_scatter
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
 |---|---|---:|---|---:|---:|---|
-| `tp1_m8192_n16384_k53248_fp16_dynamic` | tirx | 9376.4720 | cublas_nccl_cudagraph | 9047.8146 | 0.965 | cublasmp_split_p2p=9854.3384 |
-| `tp1_m8192_n4096_k12288_fp16_dynamic` | tirx | 589.7098 | cublas_nccl_cudagraph | 565.0988 | 0.958 | cublasmp_split_p2p=751.8051 |
-| `tp1_m8192_n5120_k25600_fp16_dynamic` | tirx | 1533.3093 | cublas_nccl_cudagraph | 1464.3912 | 0.955 | cublasmp_split_p2p=1865.8576 |
-| `tp1_m8192_n8192_k28672_fp16_dynamic` | tirx | 2480.6625 | cublas_nccl_cudagraph | 2451.4849 | 0.988 | cublasmp_split_p2p=2887.7046 |
+| `tp1_m8192_n16384_k53248_fp16_dynamic` | tirx | 9493.3588 | cublas_nccl_cudagraph | 9314.3908 | 0.981 | cublasmp_split_p2p=10107.8418 |
+| `tp1_m8192_n4096_k12288_fp16_dynamic` | tirx | 595.6043 | cublas_nccl_cudagraph | 569.0537 | 0.955 | cublasmp_split_p2p=756.8610 |
+| `tp1_m8192_n5120_k25600_fp16_dynamic` | tirx | 1496.5997 | cublas_nccl_cudagraph | 1433.0416 | 0.958 | cublasmp_split_p2p=1836.6789 |
+| `tp1_m8192_n8192_k28672_fp16_dynamic` | tirx | 2501.2472 | cublas_nccl_cudagraph | 2461.8364 | 0.984 | cublasmp_split_p2p=2897.1493 |
 
 ## grouped_fp8_gemm_contiguous
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
 |---|---|---:|---|---:|---:|---|
-| `large_g4_m8192_n4096_k2048` | tir | 161.5973 | deepgemm | 166.7829 | 1.032 | — |
-| `large_g4_m8192_n4096_k4096` | tir | 362.2023 | deepgemm | 362.3270 | 1.000 | — |
-| `large_g4_m8192_n6144_k7168` | tir | 1017.2346 | deepgemm | 1030.7333 | 1.013 | — |
-| `large_g4_m8192_n7168_k3072` | tir | 497.7478 | deepgemm | 527.8830 | 1.061 | — |
-| `large_g8_m4096_n4096_k2048` | tir | 188.6174 | deepgemm | 194.2249 | 1.030 | — |
-| `large_g8_m4096_n4096_k4096` | tir | 355.1739 | deepgemm | 361.9487 | 1.019 | — |
-| `large_g8_m4096_n6144_k7168` | tir | 1077.3380 | deepgemm | 1093.9870 | 1.015 | — |
-| `large_g8_m4096_n7168_k3072` | tir | 506.5762 | deepgemm | 539.8993 | 1.066 | — |
+| `large_g4_m8192_n4096_k2048` | tir | 161.9885 | deepgemm | 165.7490 | 1.023 | — |
+| `large_g4_m8192_n4096_k4096` | tir | 364.0539 | deepgemm | 385.7832 | 1.060 | — |
+| `large_g4_m8192_n6144_k7168` | tir | 1006.3684 | deepgemm | 1024.2809 | 1.018 | — |
+| `large_g4_m8192_n7168_k3072` | tir | 503.5784 | deepgemm | 532.1796 | 1.057 | — |
+| `large_g8_m4096_n4096_k2048` | tir | 195.0866 | deepgemm | 199.8450 | 1.024 | — |
+| `large_g8_m4096_n4096_k4096` | tir | 361.5587 | deepgemm | 364.8858 | 1.009 | — |
+| `large_g8_m4096_n6144_k7168` | tir | 1097.2625 | deepgemm | 1105.4624 | 1.007 | — |
+| `large_g8_m4096_n7168_k3072` | tir | 523.3928 | deepgemm | 545.0444 | 1.041 | — |
 
 ## megakernel_moe
 
 | config | tir_static (µs) | tir_dynamic (µs) | tir_unfused (µs) | sglang_full (µs) | flashinfer_full (µs) |
 |---|---:|---:|---:|---:|---:|
-| `moe_a3b_bs1_all` | 33.3472 | 37.2991 | 32.4838 | 52.7438 | 61.4531 |
-| `moe_a3b_bs8_all` | 96.7169 | 100.6797 | 103.5047 | 129.6171 | 134.4403 |
-| `moe_a3b_bs32_all` | 191.0123 | 192.7385 | 196.8859 | 229.2989 | 217.7729 |
-| `moe_a3b_bs128_all` | 223.7852 | 220.0046 | 226.3990 | 244.6572 | 246.6854 |
-| `moe_a3b_bs512_all` | 236.0292 | 230.9385 | 243.4052 | 287.4995 | 275.3515 |
-| `moe_a3b_bs1024_all` | 257.9789 | 252.6093 | 273.5757 | 335.6316 | 314.2841 |
-| `moe_a3b_bs2048_all` | 328.7713 | 330.3569 | 345.5856 | 431.7734 | 393.3928 |
-| `moe_a3b_bs4096_all` | 533.4655 | 535.3281 | 546.4082 | 666.1293 | 604.3348 |
+| `moe_a3b_bs1_all` | 33.5470 | 37.2208 | 33.8733 | 55.4579 | 64.9824 |
+| `moe_a3b_bs8_all` | 96.1016 | 100.8926 | 101.7110 | 125.9085 | 130.2768 |
+| `moe_a3b_bs32_all` | 190.2761 | 192.7161 | 198.6271 | 227.4717 | 219.6533 |
+| `moe_a3b_bs128_all` | 223.4229 | 219.3805 | 226.4836 | 245.1133 | 248.4980 |
+| `moe_a3b_bs512_all` | 237.9336 | 230.3061 | 242.4455 | 287.7520 | 276.8443 |
+| `moe_a3b_bs1024_all` | 256.1143 | 249.9446 | 270.0376 | 338.1065 | 315.2151 |
+| `moe_a3b_bs2048_all` | 327.6949 | 329.4998 | 343.6046 | 430.7744 | 394.4439 |
+| `moe_a3b_bs4096_all` | 531.8767 | 545.7722 | 548.6232 | 665.2427 | 602.7492 |
 
 ## nvfp4_gemm
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
 |---|---|---:|---|---:|---:|---|
-| `1024x1024x1024` | tir | 4.6652 | cublaslt_nvfp4 | 4.5274 | 0.970 | flashinfer=4.5538 |
-| `16384x16384x16384` | tir | 1453.5032 | flashinfer | 1412.6225 | 0.972 | cublaslt_nvfp4=1437.3283 |
-| `2048x2048x2048` | tir | 7.8846 | flashinfer | 7.4537 | 0.945 | cublaslt_nvfp4=7.7022 |
-| `4096x4096x4096` | tir | 28.5639 | cublaslt_nvfp4 | 27.8961 | 0.977 | flashinfer=29.0789 |
-| `8192x8192x8192` | tir | 180.8918 | flashinfer | 177.1499 | 0.979 | cublaslt_nvfp4=178.1255 |
+| `1024x1024x1024` | tir | 4.6965 | flashinfer | 4.5039 | 0.959 | cublaslt_nvfp4=4.5309 |
+| `16384x16384x16384` | tir | 1436.6070 | cublaslt_nvfp4 | 1440.5255 | 1.003 | flashinfer=1442.6932 |
+| `2048x2048x2048` | tir | 7.9725 | flashinfer | 7.6929 | 0.965 | cublaslt_nvfp4=7.7367 |
+| `4096x4096x4096` | tir | 28.8581 | cublaslt_nvfp4 | 27.9019 | 0.967 | flashinfer=28.9719 |
+| `8192x8192x8192` | tir | 178.7241 | flashinfer | 175.0517 | 0.979 | cublaslt_nvfp4=177.0423 |
 
 ## sparse_flashmla_prefill_head128_phase1
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
 |---|---|---:|---|---:|---:|---|
-| `bench_regular_dqk512_hq128_s4096_kv32768_topk2048` | tirx | 1725.2833 | flashmla | 1761.1250 | 1.021 | — |
-| `bench_regular_dqk512_hq128_s4096_kv65536_topk2048` | tirx | 1893.8073 | flashmla | 1897.4448 | 1.002 | — |
-| `bench_regular_dqk512_hq128_s4096_kv8192_topk2048` | tirx | 1689.9636 | flashmla | 1704.5504 | 1.009 | — |
-| `bench_regular_dqk576_hq128_s4096_kv32768_topk2048` | tirx | 1817.3885 | flashmla | 1832.8135 | 1.008 | trtllm_gen=2053.5608 |
-| `bench_regular_dqk576_hq128_s4096_kv65536_topk2048` | tirx | 2003.1962 | flashmla | 1995.7244 | 0.996 | trtllm_gen=2182.7194 |
-| `bench_regular_dqk576_hq128_s4096_kv8192_topk2048` | tirx | 1823.7447 | flashmla | 1828.6868 | 1.003 | trtllm_gen=2056.8754 |
+| `bench_regular_dqk512_hq128_s4096_kv32768_topk2048` | tirx | 1745.6163 | flashmla | 1750.9986 | 1.003 | — |
+| `bench_regular_dqk512_hq128_s4096_kv65536_topk2048` | tirx | 1892.9687 | flashmla | 1879.0310 | 0.993 | — |
+| `bench_regular_dqk512_hq128_s4096_kv8192_topk2048` | tirx | 1701.6645 | flashmla | 1716.0421 | 1.008 | — |
+| `bench_regular_dqk576_hq128_s4096_kv32768_topk2048` | tirx | 1803.8346 | flashmla | 1831.1934 | 1.015 | trtllm_gen=2061.5866 |
+| `bench_regular_dqk576_hq128_s4096_kv65536_topk2048` | tirx | 2017.0968 | flashmla | 2004.5769 | 0.994 | trtllm_gen=2213.5642 |
+| `bench_regular_dqk576_hq128_s4096_kv8192_topk2048` | tirx | 1820.4899 | flashmla | 1834.8606 | 1.008 | trtllm_gen=2052.7717 |
 
 ## sparse_flashmla_prefill_head128_small_topk_phase1
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
 |---|---|---:|---|---:|---:|---|
-| `bench_smalltopk_dqk512_hq128_s4096_kv32768_topk1280` | tirx | 1153.7651 | flashmla | 1172.7877 | 1.016 | — |
-| `bench_smalltopk_dqk512_hq128_s4096_kv65536_topk1280` | tirx | 1206.1585 | flashmla | 1217.3493 | 1.009 | — |
-| `bench_smalltopk_dqk512_hq128_s4096_kv8192_topk1280` | tirx | 1153.2283 | flashmla | 1167.8016 | 1.013 | — |
+| `bench_smalltopk_dqk512_hq128_s4096_kv32768_topk1280` | tirx | 1155.1400 | flashmla | 1161.9437 | 1.006 | — |
+| `bench_smalltopk_dqk512_hq128_s4096_kv65536_topk1280` | tirx | 1196.2900 | flashmla | 1207.7541 | 1.010 | — |
+| `bench_smalltopk_dqk512_hq128_s4096_kv8192_topk1280` | tirx | 1135.0424 | flashmla | 1153.7119 | 1.016 | — |
 
 ## sparse_flashmla_prefill_head64_phase1
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
 |---|---|---:|---|---:|---:|---|
-| `bench_dqk512_hq64_s4096_kv32768_topk512` | tirx | 368.6787 | flashmla | 378.1364 | 1.026 | — |
-| `bench_dqk512_hq64_s4096_kv49152_topk512` | tirx | 370.8843 | flashmla | 382.8325 | 1.032 | — |
-| `bench_dqk512_hq64_s4096_kv65536_topk512` | tirx | 377.1894 | flashmla | 388.4326 | 1.030 | — |
-| `bench_dqk512_hq64_s4096_kv8192_topk512` | tirx | 364.0831 | flashmla | 372.9145 | 1.024 | — |
-| `bench_dqk576_hq64_s4096_kv32768_topk512` | tirx | 382.3995 | flashmla | 394.1750 | 1.031 | trtllm_gen=466.4023 |
-| `bench_dqk576_hq64_s4096_kv49152_topk512` | tirx | 390.5793 | flashmla | 403.2429 | 1.032 | trtllm_gen=475.7821 |
-| `bench_dqk576_hq64_s4096_kv65536_topk512` | tirx | 405.1353 | flashmla | 419.4723 | 1.035 | trtllm_gen=490.9278 |
-| `bench_dqk576_hq64_s4096_kv8192_topk512` | tirx | 374.3321 | flashmla | 382.3630 | 1.021 | trtllm_gen=462.9439 |
+| `bench_dqk512_hq64_s4096_kv32768_topk512` | tirx | 366.3225 | flashmla | 379.0269 | 1.035 | — |
+| `bench_dqk512_hq64_s4096_kv49152_topk512` | tirx | 371.9328 | flashmla | 381.2608 | 1.025 | — |
+| `bench_dqk512_hq64_s4096_kv65536_topk512` | tirx | 376.3476 | flashmla | 386.8558 | 1.028 | — |
+| `bench_dqk512_hq64_s4096_kv8192_topk512` | tirx | 365.2739 | flashmla | 373.4348 | 1.022 | — |
+| `bench_dqk576_hq64_s4096_kv32768_topk512` | tirx | 382.8646 | flashmla | 396.9808 | 1.037 | trtllm_gen=467.1347 |
+| `bench_dqk576_hq64_s4096_kv49152_topk512` | tirx | 389.0858 | flashmla | 404.9870 | 1.041 | trtllm_gen=473.4408 |
+| `bench_dqk576_hq64_s4096_kv65536_topk512` | tirx | 402.5077 | flashmla | 417.4860 | 1.037 | trtllm_gen=481.9321 |
+| `bench_dqk576_hq64_s4096_kv8192_topk512` | tirx | 374.5857 | flashmla | 383.2480 | 1.023 | trtllm_gen=462.7434 |
