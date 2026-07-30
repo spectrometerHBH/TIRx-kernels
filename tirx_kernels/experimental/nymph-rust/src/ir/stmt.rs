@@ -9,7 +9,9 @@ use super::dtype::{DType, FenceKind, FenceScope};
 use super::mbar::{MBar, MBarRef};
 use super::scalar::{ScalarInitial, ScalarValue, Var};
 use super::scheduler::Scheduler;
-use super::tensor::{MmaOperand, Tensor, TensorSlice, TmemOperand};
+use super::tensor::{
+    BlockScaleSpec, MmaAOperand, MmaElemFormat, SmemTile, Tensor, TensorSlice, TmemAddr,
+};
 use std::sync::Arc;
 
 /// RegCvt rounding mode (Python `Literal["rn"]` — only RN exists).
@@ -247,6 +249,69 @@ impl LdStShape {
     }
 }
 
+/// Physical tcgen05.cp instruction shape.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tcgen05CpShape {
+    B128x256,
+    B4x256,
+    B128x128,
+    B64x128,
+    B32x128,
+}
+
+impl Tcgen05CpShape {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Tcgen05CpShape::B128x256 => "128x256b",
+            Tcgen05CpShape::B4x256 => "4x256b",
+            Tcgen05CpShape::B128x128 => "128x128b",
+            Tcgen05CpShape::B64x128 => "64x128b",
+            Tcgen05CpShape::B32x128 => "32x128b",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "128x256b" => Some(Tcgen05CpShape::B128x256),
+            "4x256b" => Some(Tcgen05CpShape::B4x256),
+            "128x128b" => Some(Tcgen05CpShape::B128x128),
+            "64x128b" => Some(Tcgen05CpShape::B64x128),
+            "32x128b" => Some(Tcgen05CpShape::B32x128),
+            _ => None,
+        }
+    }
+}
+
+/// Physical tcgen05.cp multicast mode.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tcgen05CpMulticast {
+    None,
+    Warp2_02_13,
+    Warp2_01_23,
+    Warp4,
+}
+
+impl Tcgen05CpMulticast {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Tcgen05CpMulticast::None => "none",
+            Tcgen05CpMulticast::Warp2_02_13 => "warp2_02_13",
+            Tcgen05CpMulticast::Warp2_01_23 => "warp2_01_23",
+            Tcgen05CpMulticast::Warp4 => "warp4",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "none" => Some(Tcgen05CpMulticast::None),
+            "warp2_02_13" => Some(Tcgen05CpMulticast::Warp2_02_13),
+            "warp2_01_23" => Some(Tcgen05CpMulticast::Warp2_01_23),
+            "warp4" => Some(Tcgen05CpMulticast::Warp4),
+            _ => None,
+        }
+    }
+}
+
 /// Memory order of a `gmem_atomic_add` (`red.<order>.gpu.global.add.s32`).
 /// `Release` orders all prior writes before the publish (the semaphore
 /// "signal"); `Relaxed` is a bare RMW with no happens-before edge.
@@ -356,8 +421,8 @@ pub enum Stmt {
     },
     /// `tcgen05.alloc` — allocate the TMEM column band `[base_col, base_col +
     /// n_cols)`. TMEM is not a tensor: the allocation only declares the column
-    /// interval; every TMEM instruction addresses cells by absolute physical
-    /// (lane, col) via `TmemOperand`.
+    /// interval; every TMEM instruction addresses cells through an explicit
+    /// `TmemAddr`.
     TmemAlloc {
         base_col: u32,
         n_cols: u32,
@@ -617,65 +682,26 @@ pub enum Stmt {
 
     // ---- tcgen05 (tensor core + TMEM) ----
     Tcgen05Mma {
-        /// Accumulator destination: absolute physical TMEM address (lane, col)
-        /// + f32 cell interpretation. The accumulator's (rows, n) footprint is
-        /// implied by `m`/`n`/`cta_group`/`lane_align`; `row` must be 0 (the
-        /// full-datapath layouts are lane-anchored).
-        dst: TmemOperand,
-        a: MmaOperand,
-        b: MmaOperand,
-        m: u32,
-        n: u32,
-        k: u32,
-        /// Overwrite (0) vs accumulate (nonzero) the accumulator. A RUNTIME scalar so
-        /// a merged k-tile loop can carry canon's `accum` cell: 0 on the first k-tile
-        /// (overwrite), 1 after — one static MMA site instead of a peeled first tile
-        /// plus a rolled rest (the peel doubles the static MMA code, which on fp16 1024
-        /// tips ptxas's whole-function uniform placement — docs/perf-methodology.md §5).
-        /// Literal 0/1 fold to the old compile-time behavior everywhere else.
+        dst: TmemAddr,
+        a: MmaAOperand,
+        b: SmemTile,
+        mma_m: u32,
+        mma_n: u32,
+        format: MmaElemFormat,
+        block_scale: Option<BlockScaleSpec>,
         accum: ScalarValue,
         trans_a: bool,
         trans_b: bool,
+        ws: bool,
         cta_group: u8,
-        /// Block-scaled MMA scale vectors for A and B, held in TMEM as packed u32
-        /// cells (4 scale bytes each) or raw e4m3 bytes (nvfp4), addressed by
-        /// absolute physical (lane, col).
-        ///
-        /// Two scale modes share this field set:
-        /// * fp8 block-128 (UE8M0): one scale per operand row, constant over the
-        ///   whole k-slice. `sf_e4m3=false`, `sf_block=0` (per-row); `sf_byte`
-        ///   selects which of the 4 packed bytes applies, dequant `2^(byte-127)`.
-        /// * nvfp4 block-16 (e4m3): one scale per 16 contiguous k-elements.
-        ///   `sf_e4m3=true`, `sf_block=16`; this MMA's k spans
-        ///   `k/16` blocks whose scales are bytes `0..k/16` of the cell, each
-        ///   decoded as e4m3.
-        sfa: Option<TmemOperand>,
-        sfb: Option<TmemOperand>,
-        sf_byte: u8,
-        /// scale decode: e4m3 (nvfp4) when true, UE8M0 biased exponent (fp8) when false.
-        sf_e4m3: bool,
-        /// scale block width in operand elements; 0 = one scale per row (fp8).
-        sf_block: u32,
-        /// operands are packed fp4 (e2m1, 2 per u8 byte); materialize by unpacking.
-        a_fp4: bool,
-        b_fp4: bool,
-        /// d-tmem accumulator lane field (0 or 16): only the cta_group=1 m=64
-        /// (Layout F) accumulator uses 16 to place its second 64-row half at
-        /// lane 16+. A property of THIS MMA's accumulator write — hardware
-        /// D-lane placement, not a layout.
-        lane_align: u8,
     },
-    /// `tcgen05.cp` — bulk SMEM -> TMEM copy of packed u32 scale-factor cells
-    /// (or raw e4m3 scale bytes for nvfp4). `dst` is the absolute physical TMEM
-    /// base (lane 0, col); `src` stays an SMEM tile. With `cta_group=2` one
-    /// leader issue drives both CTAs' datapaths: each CTA copies from its own
-    /// SMEM into its own TMEM. Retirement is observed via `tcgen05_commit`,
-    /// like the MMA; in the value model the copy is applied at issue (the
-    /// tcgen05 engine executes its ops in issue order, so a same-stream MMA
-    /// reading the destination never observes a stale value).
+    /// One physical `tcgen05.cp` from an explicit SMEM tile to an explicit
+    /// TMEM address.
     Tcgen05Cp {
-        dst: TmemOperand,
-        src: TensorSlice,
+        dst: TmemAddr,
+        src: SmemTile,
+        shape: Tcgen05CpShape,
+        multicast: Tcgen05CpMulticast,
         cta_group: u8,
     },
     Tcgen05Commit {
@@ -684,19 +710,19 @@ pub enum Stmt {
         cta_group: u8,
         multicast_cta_mask: Option<u16>,
     },
-    /// `tcgen05.ld` — TMEM -> REG datapath read. `src` is the absolute physical
-    /// TMEM base address (lane, col) + cell dtype; `dst` the REG fragment.
+    /// `tcgen05.ld` — TMEM -> REG datapath read. The REG destination determines
+    /// the cell dtype.
     Tcgen05Ld {
         dst: TensorSlice,
-        src: TmemOperand,
+        src: TmemAddr,
         shape: LdStShape,
         num: u32,
     },
     Tcgen05WaitLd,
-    /// `tcgen05.st` — REG -> TMEM datapath write. `dst` is the absolute physical
-    /// TMEM base address (lane, col) + cell dtype; `src` the REG fragment.
+    /// `tcgen05.st` — REG -> TMEM datapath write. The REG source determines the
+    /// cell dtype.
     Tcgen05St {
-        dst: TmemOperand,
+        dst: TmemAddr,
         src: TensorSlice,
         shape: LdStShape,
         num: u32,

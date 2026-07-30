@@ -17,13 +17,13 @@ def test_tma_load_rejects_non_multicast_mbar_target_mismatch():
     for cluster_shape, remote_coord, cta_group in [((2,), 1, 1), ((4,), 2, 2)]:
         b = builder(
             "tma_load_mbar_target_mismatch",
-            smem_size_bytes=8,
+            smem_size_bytes=16,
             launch_shape=cluster_shape,
             cluster_shape=cluster_shape,
         )
         dst = smem_tensor(b, dtype=nr.DType.F32, shape=(1,), byte_offset=0)
         src = gmem_arg(b, dtype=nr.DType.F32, shape=(1,))
-        mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
+        mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=8)
         # tma_load is a single-thread issue instruction now: elect one thread,
         # so the mbar-target check (not the issue-mask gate) is what fires.
         with b.if_warp(0), b.if_elected():
@@ -41,13 +41,13 @@ def test_tma_load_rejects_non_multicast_mbar_target_mismatch():
 
 
 def test_tma_load_store_value_mode_roundtrips_and_preserves_gmem_cells():
-    b = builder("tma_roundtrip", smem_size_bytes=16)
+    b = builder("tma_roundtrip", smem_size_bytes=24)
     source = gmem_arg(b, shape=(4,))
     out = gmem_arg(b, shape=(8,))
     dump = gmem_arg(b, shape=(8,))
     smem = smem_tensor(b, shape=(4,), byte_offset=0)
     reg = reg_tensor(b, shape=(8,))
-    mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
+    mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=16)
 
     # mbarrier.init is per-thread now: issue it from a single elected thread.
     with b.if_warp(0), b.if_elected():
@@ -65,13 +65,13 @@ def test_tma_load_store_value_mode_roundtrips_and_preserves_gmem_cells():
 
 
 def test_tma_value_mode_uses_explicit_full_rank_gmem_shape():
-    b = builder("tma_rank_projected_roundtrip", smem_size_bytes=64)
+    b = builder("tma_rank_projected_roundtrip", smem_size_bytes=72)
     source = gmem_arg(b, shape=(1, 3, 2, 4))
     out = gmem_arg(b, shape=(1, 3, 2, 4))
     dump = gmem_arg(b, shape=(1, 2, 2, 4))
     smem = smem_tensor(b, shape=(4, 4), byte_offset=0)
     reg = reg_tensor(b, shape=(1, 2, 2, 4))
-    mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
+    mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=64)
 
     # mbarrier.init is per-thread now: issue it from a single elected thread.
     with b.if_warp(0), b.if_elected():
@@ -96,13 +96,13 @@ def test_tma_value_mode_uses_explicit_full_rank_gmem_shape():
 
 def test_tma_multicast_writes_each_cta_smem():
     b = builder(
-        "tma_multicast_cta_group2", smem_size_bytes=16, launch_shape=(2,), cluster_shape=(2,)
+        "tma_multicast_cta_group2", smem_size_bytes=24, launch_shape=(2,), cluster_shape=(2,)
     )
     source = gmem_arg(b, shape=(4,))
     out = gmem_arg(b, shape=(2,))
     smem = smem_tensor(b, shape=(4,), byte_offset=0)
     reg = reg_tensor(b)
-    mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
+    mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=16)
     even_mbar = b.mbar_ref(mbar, remote_coord=0)
 
     # mbarrier.init is per-thread now: issue it from a single elected thread.
@@ -110,17 +110,15 @@ def test_tma_multicast_writes_each_cta_smem():
         b.mbarrier_init(mbar, count=1)
 
     with b.if_warp(0), b.if_elected():
-        # The issuing thread arms expect_tx immediately before its own tma_load;
-        # then BOTH CTAs gate their reads on the load's mbarrier (CTA 1 waits
-        # it remotely). The load's mbar is the LOCAL ref: a cg2 multicast
-        # completes the tx once, on the leader's own cell (a peer-referenced
-        # mbar here is unmodelable and rejected at build time).
+        # One 16B multicast lands in two destination CTAs, so hardware applies
+        # two 16B complete-tx contributions to the shared leader barrier.
+        # Both CTAs then wait on that exact remote reference.
         with b.if_(cta_eq(b, 0)):
-            b.mbarrier_arrive_expect_tx(mbar, bytes=16)
+            b.mbarrier_arrive_expect_tx(even_mbar, bytes=32)
             b.tma_load(
                 smem,
                 source,
-                mbar=mbar,
+                mbar=even_mbar,
                 coords=(0,),
                 shape=(4,),
                 multicast_cta_mask=0b11,
@@ -155,7 +153,7 @@ def test_tma_load_gmem_region_is_per_row_rectangle():
     b = builder("tma_region_rect", smem_size_bytes=64)
     source = gmem_arg(b, dtype=nr.DType.U8, shape=(4, 16))
     smem = smem_tensor(b, dtype=nr.DType.U8, shape=(2, 4), byte_offset=0)
-    mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
+    mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=8)
     # init/arrive_expect_tx are per-thread and tma_load is single-thread issue:
     # run the whole sequence on one elected thread.
     with b.if_warp(0), b.if_elected():
@@ -177,7 +175,7 @@ def test_tma_load_gmem_region_clamps_partial_tile():
     b = builder("tma_region_clamp", smem_size_bytes=64)
     source = gmem_arg(b, dtype=nr.DType.U8, shape=(4, 16))
     smem = smem_tensor(b, dtype=nr.DType.U8, shape=(2, 8), byte_offset=0)
-    mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
+    mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=16)
     # init/arrive_expect_tx are per-thread and tma_load is single-thread issue:
     # run the whole sequence on one elected thread.
     with b.if_warp(0), b.if_elected():
@@ -216,12 +214,12 @@ def _tma_load_fake_release_kernel(wait_tma):
     """The producer issues a TMA load and signals a consumer via an UNRELATED
     thread barrier without anyone ever waiting the load's own mbarrier. On
     silicon the bulk copy is still in flight — the consumer's read races it."""
-    b = builder("tma_fake_release" + ("_wait" if wait_tma else ""), smem_size_bytes=64, num_warps=8)
+    b = builder("tma_fake_release" + ("_wait" if wait_tma else ""), smem_size_bytes=80, num_warps=8)
     source = gmem_arg(b, dtype=nr.DType.F32, shape=(4, 4))
     smem = smem_tensor(b, dtype=nr.DType.F32, shape=(4, 4), byte_offset=0)
     frag = reg_tensor(b, dtype=nr.DType.F32, shape=(4,))
-    tma_mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
-    ready = b.mbar(kind=nr.MBarKind.THREAD, byte_offset=0)
+    tma_mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=64)
+    ready = b.mbar(kind=nr.MBarKind.THREAD, byte_offset=72)
     # Per-thread init on one elected thread; the cta_sync publishes the
     # initialized cells to warp 4.
     with b.if_warp(0), b.if_elected():

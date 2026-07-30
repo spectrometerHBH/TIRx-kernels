@@ -17,24 +17,20 @@ use super::super::scalar_eval;
 use super::super::scheduler::CtaActivityStatus;
 use super::super::slice_indexing::ResolvedSlice;
 use super::super::values::arrays::ValueArray1;
-use super::super::values::dtypes::{decode_e4m3, encode_e4m3};
-use super::super::values::indexing::numel;
+use super::super::values::dtypes::{decode_e2m1, decode_e4m3};
 use super::super::values::mbars::{MbarCell, MbarCellKey};
 use super::super::values::tcgen05_datapath::{
     datapath_has_cell_aliases_cached, datapath_index_arrays_cached, datapath_index_summary_cached,
 };
 use super::super::values::tmem::{TMEM_COLS, TMEM_ROWS};
 use super::super::warp_context::WarpContext;
-use crate::ir::{DType, MemorySpace, MmaOperand, Stmt, TensorSlice, TmemOperand};
+use crate::ir::{
+    resolve_tcgen05_cp, resolve_tcgen05_mma, BlockScaleSpec, DType, MmaAOperand, MmaElemFormat,
+    ResolvedCp, ResolvedMma, ResolvedScaleFootprint, ScaleFormat, SmemTile, Stmt, TmemAddr,
+    TmemLayoutKind,
+};
 use ndarray::{Array1, Array2};
 use std::collections::HashMap;
-
-// Reusable per-MMA f32 operand scratch (no per-call alloc): each MMA gathers A/B from
-// the SMEM byte pool into these, then cblas reads the contiguous scratch.
-thread_local! {
-    static MMA_SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<f32>)> =
-        std::cell::RefCell::new((Vec::new(), Vec::new()));
-}
 
 pub fn register(reg: &mut StmtExecutorRegistry) {
     reg.register(StmtKind::Tcgen05Commit, execute_commit);
@@ -181,8 +177,7 @@ fn check_subpartition_span(row: i64, shape: &str, label: &str) -> IResult<()> {
 
 fn resolve_datapath(
     ctx: &WarpContext,
-    stmt_row: &crate::ir::ScalarValue,
-    stmt_col: &crate::ir::ScalarValue,
+    addr: &TmemAddr,
     shape: &str,
     num: u32,
     label: &str,
@@ -191,8 +186,7 @@ fn resolve_datapath(
         format!("tcgen05_{label}_mask"),
         format!("tcgen05_{label} must be issued by one or more full warps"),
     )?;
-    let row = ctx.eval_scalar_uniform(stmt_row, "tcgen05 row", "divergent_operands")?;
-    let col = ctx.eval_scalar_uniform(stmt_col, "tcgen05 col", "divergent_operands")?;
+    let (row, col) = eval_tmem_addr_i64(ctx, addr, "tcgen05 address")?;
     check_row_alignment(row, shape, label)?;
     check_subpartition_span(row, shape, label)?;
     let (lane_idx, col_idx) = datapath_index_arrays_cached(shape, num as usize)?;
@@ -220,8 +214,7 @@ fn resolve_datapath(
 
 fn resolve_datapath_bounds(
     ctx: &WarpContext,
-    stmt_row: &crate::ir::ScalarValue,
-    stmt_col: &crate::ir::ScalarValue,
+    addr: &TmemAddr,
     shape: &str,
     num: u32,
     label: &str,
@@ -230,8 +223,7 @@ fn resolve_datapath_bounds(
         format!("tcgen05_{label}_mask"),
         format!("tcgen05_{label} must be issued by one or more full warps"),
     )?;
-    let row = ctx.eval_scalar_uniform(stmt_row, "tcgen05 row", "divergent_operands")?;
-    let col = ctx.eval_scalar_uniform(stmt_col, "tcgen05 col", "divergent_operands")?;
+    let (row, col) = eval_tmem_addr_i64(ctx, addr, "tcgen05 address")?;
     check_row_alignment(row, shape, label)?;
     check_subpartition_span(row, shape, label)?;
     let summary = datapath_index_summary_cached(shape, num as usize)?;
@@ -274,8 +266,7 @@ fn resolve_datapath_bounds(
 
 fn trace_ldst_tmem_region(
     ctx: &WarpContext,
-    stmt_row: &crate::ir::ScalarValue,
-    stmt_col: &crate::ir::ScalarValue,
+    addr: &TmemAddr,
     shape: &str,
     num: u32,
     label: &str,
@@ -284,8 +275,7 @@ fn trace_ldst_tmem_region(
         format!("tcgen05_{label}_mask"),
         format!("tcgen05_{label} must be issued by one or more full warps"),
     )?;
-    let row = ctx.eval_scalar_uniform(stmt_row, "tcgen05 row", "divergent_operands")?;
-    let col = ctx.eval_scalar_uniform(stmt_col, "tcgen05 col", "divergent_operands")?;
+    let (row, col) = eval_tmem_addr_i64(ctx, addr, "tcgen05 address")?;
     check_row_alignment(row, shape, label)?;
     check_subpartition_span(row, shape, label)?;
     let summary = datapath_index_summary_cached(shape, num as usize)?;
@@ -345,21 +335,21 @@ fn execute_ld<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<
         } => (dst, src, shape_str(shape), *num),
         _ => unreachable!(),
     };
-    let (row, col) = (&src.row, &src.col);
+    let dtype = dst.tensor.dtype;
     if ctx.trace_mode() && !ctx.state.trace.records_events() {
         let t_resolve = super::super::runner::prof_now();
-        let bounds = resolve_datapath_bounds(ctx, row, col, shape, num, "ld")?;
+        let bounds = resolve_datapath_bounds(ctx, src, shape, num, "ld")?;
         super::super::runner::prof_end("TcLd:resolve", t_resolve);
         let t_dst = super::super::runner::prof_now();
         let dst_r = ctx.eval_slice(dst)?;
-        check_reg_fragment(&dst_r, src.dtype, bounds.reg_size, "ld")?;
-        if is_packed_tmem_dtype(src.dtype) {
+        check_reg_fragment(&dst_r, dtype, bounds.reg_size, "ld")?;
+        if is_packed_tmem_dtype(dtype) {
             let _ = packed_half_register_slice(&dst_r, bounds.reg_size, "ld")?;
         }
         super::super::runner::prof_end("TcLd:dst_check", t_dst);
         let t_alloc = super::super::runner::prof_now();
         if !tmem_col_range_allocated(ctx, ctx.stream.cta_id, bounds.col_start, bounds.col_end) {
-            let (_, cols, _) = resolve_datapath(ctx, row, col, shape, num, "ld")?;
+            let (_, cols, _) = resolve_datapath(ctx, src, shape, num, "ld")?;
             check_tmem_cells_allocated(ctx, ctx.stream.cta_id, cols.iter().copied(), "tcgen05_ld")?;
         }
         super::super::runner::prof_end("TcLd:alloc_check", t_alloc);
@@ -367,12 +357,12 @@ fn execute_ld<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<
     }
     if ctx.trace_mode() {
         let t_resolve = super::super::runner::prof_now();
-        let (region, reg_size) = trace_ldst_tmem_region(ctx, row, col, shape, num, "ld")?;
+        let (region, reg_size) = trace_ldst_tmem_region(ctx, src, shape, num, "ld")?;
         super::super::runner::prof_end("TcLd:resolve", t_resolve);
         let t_dst = super::super::runner::prof_now();
         let dst_r = ctx.eval_slice(dst)?;
-        check_reg_fragment(&dst_r, src.dtype, reg_size, "ld")?;
-        let packed_dst = if is_packed_tmem_dtype(src.dtype) {
+        check_reg_fragment(&dst_r, dtype, reg_size, "ld")?;
+        let packed_dst = if is_packed_tmem_dtype(dtype) {
             Some(packed_half_register_slice(&dst_r, reg_size, "ld")?)
         } else {
             None
@@ -392,12 +382,12 @@ fn execute_ld<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<
         return Ok(StepStatus::advance());
     }
     let t_resolve = super::super::runner::prof_now();
-    let (lanes, cols, reg_size) = resolve_datapath(ctx, row, col, shape, num, "ld")?;
+    let (lanes, cols, reg_size) = resolve_datapath(ctx, src, shape, num, "ld")?;
     super::super::runner::prof_end("TcLd:resolve", t_resolve);
     let t_dst = super::super::runner::prof_now();
     let dst_r = ctx.eval_slice(dst)?;
-    check_reg_fragment(&dst_r, src.dtype, reg_size, "ld")?;
-    let packed_dst = if is_packed_tmem_dtype(src.dtype) {
+    check_reg_fragment(&dst_r, dtype, reg_size, "ld")?;
+    let packed_dst = if is_packed_tmem_dtype(dtype) {
         Some(packed_half_register_slice(&dst_r, reg_size, "ld")?)
     } else {
         None
@@ -406,11 +396,11 @@ fn execute_ld<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<
     let flat_lanes: Vec<usize> = lanes.iter().copied().collect();
     let flat_cols: Vec<usize> = cols.iter().copied().collect();
     let a = ctx.lanes.len();
-    if is_packed_tmem_dtype(src.dtype) {
+    if is_packed_tmem_dtype(dtype) {
         let values = {
             let scratch = ctx.state.values.tmem.scratchpad_for(ctx.stream.cta_id)?;
             let timer = super::super::runner::prof_now();
-            let values = scratch.read_packed_half_cells(src.dtype, &flat_lanes, &flat_cols)?;
+            let values = scratch.read_packed_half_cells(dtype, &flat_lanes, &flat_cols)?;
             super::super::runner::prof_end("TcLd:tmem_read_cells", timer);
             values
         };
@@ -419,8 +409,8 @@ fn execute_ld<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<
             flat.push(lo);
             flat.push(hi);
         }
-        let native = ValueArray1::from_f32_compute(Array1::from(flat), src.dtype)
-            .reshape2((a, reg_size * 2))?;
+        let native =
+            ValueArray1::from_f32_compute(Array1::from(flat), dtype).reshape2((a, reg_size * 2))?;
         let timer = super::super::runner::prof_now();
         ctx.registers_write(packed_dst.as_ref().unwrap(), &native)?;
         super::super::runner::prof_end("TcLd:reg_write", timer);
@@ -428,7 +418,7 @@ fn execute_ld<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<
         let values = {
             let scratch = ctx.state.values.tmem.scratchpad_for(ctx.stream.cta_id)?;
             let timer = super::super::runner::prof_now();
-            let values = scratch.read_cells(src.dtype, &flat_lanes, &flat_cols)?;
+            let values = scratch.read_cells(dtype, &flat_lanes, &flat_cols)?;
             super::super::runner::prof_end("TcLd:tmem_read_cells", timer);
             values
         };
@@ -450,15 +440,15 @@ fn execute_st<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<
         } => (dst, src, shape_str(shape), *num),
         _ => unreachable!(),
     };
-    let (row, col) = (&dst.row, &dst.col);
+    let dtype = src.tensor.dtype;
     if ctx.trace_mode() && !ctx.state.trace.records_events() {
         let t_resolve = super::super::runner::prof_now();
-        let bounds = resolve_datapath_bounds(ctx, row, col, shape, num, "st")?;
+        let bounds = resolve_datapath_bounds(ctx, dst, shape, num, "st")?;
         super::super::runner::prof_end("TcSt:resolve", t_resolve);
         let t_src = super::super::runner::prof_now();
         let src_r = ctx.eval_slice(src)?;
-        check_reg_fragment(&src_r, dst.dtype, bounds.reg_size, "st")?;
-        if is_packed_tmem_dtype(dst.dtype) {
+        check_reg_fragment(&src_r, dtype, bounds.reg_size, "st")?;
+        if is_packed_tmem_dtype(dtype) {
             let _ = packed_half_register_slice(&src_r, bounds.reg_size, "st")?;
         }
         super::super::runner::prof_end("TcSt:src_check", t_src);
@@ -467,7 +457,7 @@ fn execute_st<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<
         super::super::runner::prof_end("TcSt:overlap", t_overlap);
         let t_alloc = super::super::runner::prof_now();
         if !tmem_col_range_allocated(ctx, ctx.stream.cta_id, bounds.col_start, bounds.col_end) {
-            let (_, cols, _) = resolve_datapath(ctx, row, col, shape, num, "st")?;
+            let (_, cols, _) = resolve_datapath(ctx, dst, shape, num, "st")?;
             check_tmem_cells_allocated(ctx, ctx.stream.cta_id, cols.iter().copied(), "tcgen05_st")?;
         }
         super::super::runner::prof_end("TcSt:alloc_check", t_alloc);
@@ -475,12 +465,12 @@ fn execute_st<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<
     }
     if ctx.trace_mode() {
         let t_resolve = super::super::runner::prof_now();
-        let (region, reg_size) = trace_ldst_tmem_region(ctx, row, col, shape, num, "st")?;
+        let (region, reg_size) = trace_ldst_tmem_region(ctx, dst, shape, num, "st")?;
         super::super::runner::prof_end("TcSt:resolve", t_resolve);
         let t_src = super::super::runner::prof_now();
         let src_r = ctx.eval_slice(src)?;
-        check_reg_fragment(&src_r, dst.dtype, reg_size, "st")?;
-        let packed_src = if is_packed_tmem_dtype(dst.dtype) {
+        check_reg_fragment(&src_r, dtype, reg_size, "st")?;
+        let packed_src = if is_packed_tmem_dtype(dtype) {
             Some(packed_half_register_slice(&src_r, reg_size, "st")?)
         } else {
             None
@@ -503,12 +493,12 @@ fn execute_st<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<
         return Ok(StepStatus::advance());
     }
     let t_resolve = super::super::runner::prof_now();
-    let (lanes, cols, reg_size) = resolve_datapath(ctx, row, col, shape, num, "st")?;
+    let (lanes, cols, reg_size) = resolve_datapath(ctx, dst, shape, num, "st")?;
     super::super::runner::prof_end("TcSt:resolve", t_resolve);
     let t_src = super::super::runner::prof_now();
     let src_r = ctx.eval_slice(src)?;
-    check_reg_fragment(&src_r, dst.dtype, reg_size, "st")?;
-    let packed_src = if is_packed_tmem_dtype(dst.dtype) {
+    check_reg_fragment(&src_r, dtype, reg_size, "st")?;
+    let packed_src = if is_packed_tmem_dtype(dtype) {
         Some(packed_half_register_slice(&src_r, reg_size, "st")?)
     } else {
         None
@@ -521,7 +511,7 @@ fn execute_st<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<
     let flat_lanes: Vec<usize> = lanes.iter().copied().collect();
     let flat_cols: Vec<usize> = cols.iter().copied().collect();
     super::super::runner::prof_end("TcSt:flatten", t_flat);
-    if is_packed_tmem_dtype(dst.dtype) {
+    if is_packed_tmem_dtype(dtype) {
         let timer = super::super::runner::prof_now();
         let packed_values =
             read_packed_half_register_pairs(ctx, packed_src.as_ref().unwrap(), reg_size)?;
@@ -540,7 +530,7 @@ fn execute_st<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<
                 )
             })?;
         let timer = super::super::runner::prof_now();
-        sp.write_packed_half_cells(dst.dtype, &flat_lanes, &flat_cols, &packed_values)?;
+        sp.write_packed_half_cells(dtype, &flat_lanes, &flat_cols, &packed_values)?;
         super::super::runner::prof_end("TcSt:tmem_write_cells", timer);
     } else {
         let timer = super::super::runner::prof_now();
@@ -560,7 +550,7 @@ fn execute_st<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<
                 )
             })?;
         let timer = super::super::runner::prof_now();
-        sp.write_cells(dst.dtype, &flat_lanes, &flat_cols, &flat_values)?;
+        sp.write_cells(dtype, &flat_lanes, &flat_cols, &flat_values)?;
         super::super::runner::prof_end("TcSt:tmem_write_cells", timer);
     }
     Ok(StepStatus::advance())
@@ -760,314 +750,656 @@ fn shape_str(shape: &crate::ir::LdStShape) -> &'static str {
 
 // ---- MMA ----
 
-fn execute_mma<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
-    #[allow(clippy::type_complexity)]
-    let (
-        dst,
-        a,
-        b,
-        m,
-        n,
-        k,
-        accum,
-        trans_a,
-        trans_b,
-        cta_group,
-        sfa,
-        sfb,
-        sf_byte,
-        sf_e4m3,
-        sf_block,
-        a_fp4,
-        b_fp4,
-        lane_align,
-    ) = match stmt {
-        Stmt::Tcgen05Mma {
-            dst,
-            a,
-            b,
-            m,
-            n,
-            k,
-            accum,
-            trans_a,
-            trans_b,
-            cta_group,
-            sfa,
-            sfb,
-            sf_byte,
-            sf_e4m3,
-            sf_block,
-            a_fp4,
-            b_fp4,
-            lane_align,
-        } => (
-            dst,
-            a,
-            b,
-            *m as usize,
-            *n as usize,
-            *k as usize,
-            accum,
-            *trans_a,
-            *trans_b,
-            *cta_group,
-            sfa.as_ref(),
-            sfb.as_ref(),
-            *sf_byte as usize,
-            *sf_e4m3,
-            *sf_block as usize,
-            *a_fp4,
-            *b_fp4,
-            *lane_align,
-        ),
-        _ => unreachable!(),
-    };
-    // tcgen05.mma is single-thread-ISSUE (unlike warp-collective mma.sync): 32
-    // executing lanes would initiate the MMA 32 times (the accumulator adds 32
-    // times — a wrong value, not just a perf bug). Hardware has no "the
-    // instruction elects lane 0" semantics, so canon issues it under
-    // `if elect_sync():`; the B200 tensor pipe requires exactly that form —
-    // per-op elect guards that reconverge the warp between consecutive tcgen05
-    // issues stall the async stream (a GPU deadlock).
-    ctx.check_single_thread_issue("tcgen05_mma_mask", "tcgen05_mma")?;
-
-    // The accumulator CTA(s): cta_group=2's even CTA computes the whole pair; odd is a no-op.
-    let cta_ids: Vec<usize> = if cta_group == 2 {
-        if m != 128 && m != 256 {
-            return Err(InterpreterError::new(
-                "tcgen05_mma_unsupported",
-                "tcgen05_mma cta_group=2 value model supports only m in {128, 256}",
-            ));
-        }
-        if ctx.lanes[0].ctaid_in_cluster & 1 == 1 {
-            return Ok(StepStatus::advance());
-        }
-        let peer_local = peer_ctaid_in_cluster(
-            ctx,
-            ctx.lanes[0].ctaid_in_cluster,
-            "tcgen05_mma_peer",
-            "mma peer out of range",
-        )?;
-        vec![ctx.stream.cta_id, ctx.global_cta_id(peer_local)]
-    } else {
-        if m != 64 && m != 128 {
-            return Err(InterpreterError::new(
-                "tcgen05_mma_unsupported",
-                "tcgen05_mma cta_group=1 value model supports only m in {64, 128}",
-            ));
-        }
-        vec![ctx.stream.cta_id]
-    };
-
-    // The runtime accum flag (canon's loop-carried accum cell): 0 = overwrite the
-    // accumulator, nonzero = accumulate. Uniform across the issuing cohort (a
-    // single elected lane or a whole warp), so one evaluation decides.
-    let accum = {
-        let v = if let Some(v) =
-            scalar_eval::eval_scalar_known_uniform(accum, &ctx.lanes, &ctx.state.values.scalars)?
-        {
-            v
-        } else {
-            scalar_eval::eval_scalar_at(accum, &ctx.lanes[0], &ctx.state.values.scalars)?
-        };
-        v != 0
-    };
-
-    if ctx.trace_mode() {
-        trace_mma(
-            ctx, dst, a, b, m, n, k, cta_group, accum, trans_a, trans_b, &cta_ids, sfa, sfb,
-            sf_block, a_fp4, b_fp4, lane_align,
-        )?;
-        return Ok(StepStatus::advance());
-    }
-    if dst.dtype != DType::F32 {
-        return Err(InterpreterError::new(
-            "tcgen05_mma_dtype",
-            "tcgen05_mma dst dtype must be f32",
-        ));
-    }
-    // A dense (no-sf) MMA with k = 16q means the q atomic k=16 MMAs accumulated
-    // in issue order (validate admits any positive multiple of 16; canon issues
-    // one full-K gemm_async per k-tile and TVM lowers it to the atom sequence).
-    // The value model computes the whole k-slice in one exact f32 sgemm: in exact
-    // arithmetic that equals the ordered atom-by-atom f32 accumulation, and the
-    // tcgen05 f32 accumulator add is itself order-exact per k=16 atom, so the
-    // collapsed and sliced forms are bit-identical here. Protocol-side, the one
-    // IR MMA is one async-engine issue drained by the next tcgen05_commit —
-    // exactly canon's one-issue/one-commit full-K tracking.
-    //
-    // Contiguous layouts (D: cta_group=1 m=128; A: cta_group=2 m=256). Non-transposed
-    // rank-2 SMEM operands take the in-place path: SMEM bytes are materialized into
-    // reusable f32 scratch, then sgemm writes f32 bits directly into TMEM cells.
-    let contiguous = (cta_group == 1 && m == 128) || (cta_group == 2 && m == 256);
-    let smem_slices = match (a, b) {
-        (MmaOperand::Slice(a_sl), MmaOperand::Slice(b_sl))
-            if a_sl.tensor.space == MemorySpace::Smem
-                && b_sl.tensor.space == MemorySpace::Smem
-                && a_sl.offsets.len() >= 2
-                && b_sl.offsets.len() >= 2 =>
-        {
-            Some((a_sl, b_sl))
-        }
-        _ => None,
-    };
-    let inplace_ok = contiguous && !trans_a && !trans_b && smem_slices.is_some();
-    if let (true, Some((a_sl, b_sl))) = (inplace_ok, smem_slices) {
-        let scales = match (sfa, sfb) {
-            (Some(sfa_op), Some(sfb_op)) => Some((sfa_op, sfb_op, sf_byte)),
-            _ => None,
-        };
-        accumulate_inplace(
-            ctx, dst, a_sl, b_sl, m, n, k, cta_group, accum, &cta_ids, scales, sf_e4m3, sf_block,
-            a_fp4, b_fp4, lane_align,
-        )?;
-        return Ok(StepStatus::advance());
-    }
-    if a_fp4 || b_fp4 {
-        // FP4 operand materialization lives only on the in-place path (the only
-        // path nvfp4's non-transposed rank-2 SMEM operands take); a transposed /
-        // non-rank-2 fp4 MMA would need the fallback to unpack too.
-        return Err(InterpreterError::new(
-            "tcgen05_mma_unsupported",
-            "fp4 tcgen05_mma requires the in-place datapath (non-transposed rank-2 SMEM operands)",
-        ));
-    }
-
-    let a_rows = if cta_group == 1 { m } else { m / 2 };
-    let b_rows = if cta_group == 1 { n } else { n / 2 };
-    let t_read = super::super::runner::prof_now();
-    let a = read_mma_operand_ctas(ctx, a, a_rows, k, trans_a, &cta_ids)?;
-    super::super::runner::prof_end("MMA:fallback_read_a", t_read);
-    let t_read = super::super::runner::prof_now();
-    let b = read_mma_operand_ctas(ctx, b, b_rows, k, trans_b, &cta_ids)?;
-    super::super::runner::prof_end("MMA:fallback_read_b", t_read);
-    check_mma_operand_shapes(&a, &b, m, n, k)?;
-    // Fallback for everything `accumulate_inplace` can't take (transposed or
-    // non-rank-2 operands): a full product then a per-cell scatter via the layout
-    // placement table, which handles every (m, cta_group) layout.
-    let t_matmul = super::super::runner::prof_now();
-    let mut product = matmul_f32(&a, &b);
-    super::super::runner::prof_end("MMA:fallback_matmul", t_matmul);
-    if let (Some(sfa_op), Some(sfb_op)) = (sfa, sfb) {
-        // Block-scaled MMA: D += (A . 2^(sfa[m]-127)) @ (B . 2^(sfb[n]-127))^T. The
-        // scales are per row and constant over this MMA's k-slice, so scaling the
-        // product is exact (powers of two). A's scales are split by M across the
-        // CTA pair like A itself; B's scales are duplicated per CTA and each CTA's
-        // M-half applies its own copy (what the 2-CTA datapath reads).
-        // Fallback handles fp8 only (UE8M0, one scale per row); fp4 is rejected
-        // before reaching here, so `nblocks=1` with the selected `sf_byte`.
-        let rows_per_cta = m / cta_ids.len();
-        let mut sa: Vec<f32> = Vec::with_capacity(m);
-        for &cta in cta_ids.iter() {
-            sa.extend(read_scale_blocks(
-                ctx,
-                sfa_op,
-                sf_byte,
-                1,
-                rows_per_cta,
-                false,
-                cta,
-            )?);
-        }
-        let mut sb: Vec<Vec<f32>> = Vec::with_capacity(cta_ids.len());
-        for &cta in cta_ids.iter() {
-            sb.push(read_scale_blocks(ctx, sfb_op, sf_byte, 1, n, false, cta)?);
-        }
-        for mm in 0..m {
-            let half = mm / rows_per_cta;
-            let s_a = sa[mm];
-            for nn in 0..n {
-                product[[mm, nn]] *= s_a * sb[half][nn];
-            }
-        }
-    }
-    let t_acc = super::super::runner::prof_now();
-    accumulate_blocks(
-        ctx, dst, &product, m, n, cta_group, accum, &cta_ids, lane_align,
-    )?;
-    super::super::runner::prof_end("MMA:fallback_accumulate", t_acc);
-    Ok(StepStatus::advance())
+fn layout_error(code: &'static str, error: crate::ir::Tcgen05LayoutError) -> InterpreterError {
+    InterpreterError::new(code, error.message)
 }
 
-#[allow(clippy::too_many_arguments)]
+fn eval_tmem_addr_i64(ctx: &WarpContext, addr: &TmemAddr, label: &str) -> IResult<(i64, i64)> {
+    let row = ctx.eval_scalar_uniform(&addr.row, label, "divergent_operands")?;
+    let relative_col = ctx.eval_scalar_uniform(&addr.col, label, "divergent_operands")?;
+    let col = i64::from(addr.tensor.start_col)
+        .checked_add(relative_col)
+        .ok_or_else(|| InterpreterError::new("tcgen05_address", "TMEM column overflows"))?;
+    Ok((row, col))
+}
+
+fn eval_tmem_addr(ctx: &WarpContext, addr: &TmemAddr, label: &str) -> IResult<(usize, usize)> {
+    let (row, col) = eval_tmem_addr_i64(ctx, addr, label)?;
+    if row < 0 || col < 0 {
+        return Err(InterpreterError::new(
+            "tcgen05_address",
+            format!("{label} is negative"),
+        ));
+    }
+    Ok((row as usize, col as usize))
+}
+
+fn eval_nonnegative(
+    ctx: &WarpContext,
+    value: &crate::ir::ScalarValue,
+    label: &str,
+) -> IResult<usize> {
+    let value = ctx.eval_scalar_uniform(value, label, "divergent_operands")?;
+    if value < 0 {
+        return Err(InterpreterError::new(
+            "tcgen05_tile_oob",
+            format!("{label} must be non-negative"),
+        ));
+    }
+    Ok(value as usize)
+}
+
+fn eval_smem_tile_against_shape(
+    ctx: &WarpContext,
+    tile: &SmemTile,
+    tensor_shape: &[usize],
+    label: &str,
+) -> IResult<(Vec<usize>, Vec<usize>)> {
+    let mut offsets = Vec::with_capacity(tile.prefix_indices.len() + 2);
+    for index in &tile.prefix_indices {
+        offsets.push(eval_nonnegative(ctx, index, label)?);
+    }
+    offsets.push(eval_nonnegative(ctx, &tile.row_offset, label)?);
+    offsets.push(eval_nonnegative(ctx, &tile.col_offset, label)?);
+
+    let mut shape = vec![1; tile.prefix_indices.len()];
+    shape.push(tile.rows as usize);
+    shape.push(tile.cols as usize);
+    if offsets.len() != tensor_shape.len()
+        || offsets.iter().zip(&shape).zip(tensor_shape).any(
+            |((&offset, &extent), &tensor_extent)| {
+                offset
+                    .checked_add(extent)
+                    .map_or(true, |end| end > tensor_extent)
+            },
+        )
+    {
+        return Err(InterpreterError::new(
+            "tcgen05_tile_oob",
+            format!("{label} exceeds its SMEM tensor"),
+        ));
+    }
+    Ok((offsets, shape))
+}
+
+fn eval_smem_tile(
+    ctx: &WarpContext,
+    tile: &SmemTile,
+    label: &str,
+) -> IResult<(Vec<usize>, Vec<usize>)> {
+    eval_smem_tile_against_shape(ctx, tile, &tile.tensor.shape, label)
+}
+
+fn eval_cp_smem_tile(
+    ctx: &WarpContext,
+    tile: &SmemTile,
+    label: &str,
+) -> IResult<(Vec<usize>, Vec<usize>)> {
+    eval_smem_tile(ctx, tile, label)
+}
+
+fn smem_tile_region(
+    ctx: &WarpContext,
+    tile: &SmemTile,
+    cta_id: usize,
+    label: &str,
+) -> IResult<Region> {
+    let (offsets, shape) = eval_smem_tile(ctx, tile, label)?;
+    region::tensor_region_from_uniform(&tile.tensor, cta_id, &offsets, &shape)
+}
+
+fn tmem_cells_region(
+    ctx: &WarpContext,
+    addr: &TmemAddr,
+    cta_id: usize,
+    label: &str,
+    cells: impl IntoIterator<Item = (u32, u32)>,
+) -> IResult<Region> {
+    let (row0, col0) = eval_tmem_addr(ctx, addr, label)?;
+    let mut absolute_cells = Vec::new();
+    for (lane, col) in cells {
+        let lane = row0.checked_add(lane as usize).ok_or_else(|| {
+            InterpreterError::new("tcgen05_out_of_range", format!("{label} lane overflows"))
+        })?;
+        let col = col0.checked_add(col as usize).ok_or_else(|| {
+            InterpreterError::new("tcgen05_out_of_range", format!("{label} column overflows"))
+        })?;
+        absolute_cells.push((lane, col));
+    }
+    region::tmem_region_from_cells(0, cta_id, absolute_cells)
+}
+
+fn mma_d_region(
+    ctx: &WarpContext,
+    dst: &TmemAddr,
+    resolved: &ResolvedMma,
+    cta_id: usize,
+) -> IResult<Region> {
+    let mut cells = Vec::new();
+    for row in 0..resolved.d.logical.rows {
+        for col in 0..resolved.d.logical.cols {
+            let cell = resolved.d_cell(row, col).ok_or_else(|| {
+                InterpreterError::new("tcgen05_mma_layout", "D coordinate is out of range")
+            })?;
+            cells.push((cell.lane, cell.col));
+        }
+    }
+    tmem_cells_region(ctx, dst, cta_id, "tcgen05_mma D", cells)
+}
+
+fn mma_a_region(
+    ctx: &WarpContext,
+    addr: &TmemAddr,
+    resolved: &ResolvedMma,
+    cta_id: usize,
+) -> IResult<Region> {
+    let footprint = resolved
+        .a_tmem
+        .ok_or_else(|| InterpreterError::new("tcgen05_mma_layout", "TMEM A has no footprint"))?;
+    let banks = match footprint.layout {
+        TmemLayoutKind::Replica2 | TmemLayoutKind::BankBatched => 2,
+        _ => 1,
+    };
+    let mut cells = Vec::new();
+    for bank in 0..banks {
+        for row in 0..footprint.logical.rows {
+            for k in 0..footprint.logical.cols {
+                let element = resolved.a_tmem_element(bank, row, k).ok_or_else(|| {
+                    InterpreterError::new("tcgen05_mma_layout", "TMEM A coordinate is out of range")
+                })?;
+                cells.push((element.lane, element.col));
+            }
+        }
+    }
+    tmem_cells_region(ctx, addr, cta_id, "tcgen05_mma A", cells)
+}
+
+fn mma_scale_region(
+    ctx: &WarpContext,
+    addr: &TmemAddr,
+    resolved: &ResolvedScaleFootprint,
+    cta_id: usize,
+    label: &str,
+) -> IResult<Region> {
+    let mut cells = Vec::new();
+    for row in 0..resolved.footprint.logical.rows {
+        for unique_scale in 0..resolved.sf_k {
+            let logical_scale = unique_scale
+                .checked_mul(match resolved.footprint.layout {
+                    TmemLayoutKind::ScaleFactor { sf_reuse, .. } => sf_reuse,
+                    _ => {
+                        return Err(InterpreterError::new(
+                            "tcgen05_mma_layout",
+                            "scale operand has a non-scale layout",
+                        ))
+                    }
+                })
+                .ok_or_else(|| {
+                    InterpreterError::new(
+                        "tcgen05_mma_layout",
+                        "scale logical coordinate overflows",
+                    )
+                })?;
+            for byte in resolved.physical_bytes(row, logical_scale).ok_or_else(|| {
+                InterpreterError::new("tcgen05_mma_layout", "scale coordinate is out of range")
+            })? {
+                cells.push((byte.lane, byte.col));
+            }
+        }
+    }
+    tmem_cells_region(ctx, addr, cta_id, label, cells)
+}
+
+fn tcgen_cta_ids(ctx: &WarpContext, cta_group: u8, label: &str) -> IResult<Vec<usize>> {
+    if cta_group == 1 {
+        return Ok(vec![ctx.stream.cta_id]);
+    }
+    let local = ctx.lanes[0].ctaid_in_cluster;
+    let peer_local = peer_ctaid_in_cluster(
+        ctx,
+        local,
+        &format!("{label}_peer"),
+        &format!("{label} peer out of range"),
+    )?;
+    let peer = ctx.global_cta_id(peer_local);
+    // A cta_group::2 instruction always addresses the same rank-ordered CTA
+    // pair.  Execution is controlled solely by the IR: if both CTAs reach the
+    // statement, both issue it; if the kernel wants one leader, it must carry
+    // an explicit ctaid_in_cluster branch.  Never make the odd CTA an implicit
+    // no-op here.
+    Ok(if local & 1 == 0 {
+        vec![ctx.stream.cta_id, peer]
+    } else {
+        vec![peer, ctx.stream.cta_id]
+    })
+}
+
+fn eval_accum(ctx: &WarpContext, accum: &crate::ir::ScalarValue) -> IResult<bool> {
+    let value = if let Some(value) =
+        scalar_eval::eval_scalar_known_uniform(accum, &ctx.lanes, &ctx.state.values.scalars)?
+    {
+        value
+    } else {
+        scalar_eval::eval_scalar_at(accum, &ctx.lanes[0], &ctx.state.values.scalars)?
+    };
+    Ok(value != 0)
+}
+
+fn read_smem_matrix(
+    ctx: &WarpContext,
+    tile: &SmemTile,
+    format: MmaElemFormat,
+    transpose: bool,
+    cta_id: usize,
+) -> IResult<Array2<f32>> {
+    if format == MmaElemFormat::F4E2M1 && transpose {
+        return Err(InterpreterError::new(
+            "tcgen05_mma_unsupported",
+            "transposed packed-f4 SMEM operands are unsupported",
+        ));
+    }
+    let (offsets, shape) = eval_smem_tile(ctx, tile, "tcgen05_mma operand")?;
+    let mut values = Vec::new();
+    let pool = ctx.state.values.smem.pool_for(cta_id)?;
+    if format == MmaElemFormat::F4E2M1 {
+        pool.append_f32_block_fp4(&tile.tensor, &offsets, &shape, &mut values)?;
+    } else {
+        pool.append_f32_block(&tile.tensor, &offsets, &shape, &mut values)?;
+    }
+    let rows = tile.rows as usize;
+    let cols = if format == MmaElemFormat::F4E2M1 {
+        tile.cols as usize * 2
+    } else {
+        tile.cols as usize
+    };
+    let matrix = Array2::from_shape_vec((rows, cols), values).map_err(|_| {
+        InterpreterError::new(
+            "tcgen05_mma_shape",
+            "SMEM operand values do not match its explicit tile",
+        )
+    })?;
+    Ok(if transpose {
+        matrix.t().to_owned()
+    } else {
+        matrix
+    })
+}
+
+fn read_tmem_matrix_bank(
+    ctx: &WarpContext,
+    addr: &TmemAddr,
+    resolved: &ResolvedMma,
+    cta_id: usize,
+    bank: u32,
+) -> IResult<Array2<f32>> {
+    resolved.a_tmem.as_ref().ok_or_else(|| {
+        InterpreterError::new("tcgen05_mma_operand", "TMEM A has no resolved footprint")
+    })?;
+    let (row0, col0) = eval_tmem_addr(ctx, addr, "tcgen05_mma A")?;
+    let rows = resolved.per_cta.m as usize;
+    let cols = resolved.k as usize;
+    let scratch = ctx.state.values.tmem.scratchpad_for(cta_id)?;
+    let mut out = Vec::with_capacity(rows * cols);
+    for row in 0..rows {
+        for k in 0..cols {
+            let element = resolved
+                .a_tmem_element(bank, row as u32, k as u32)
+                .ok_or_else(|| {
+                    InterpreterError::new(
+                        "tcgen05_mma_operand",
+                        "TMEM A element is outside its resolved layout",
+                    )
+                })?;
+            let lane = row0 + element.lane as usize;
+            let col = col0 + element.col as usize;
+            let value = match resolved.format {
+                MmaElemFormat::F16 | MmaElemFormat::BF16 => {
+                    let dtype = if resolved.format == MmaElemFormat::F16 {
+                        DType::F16
+                    } else {
+                        DType::Bf16
+                    };
+                    let [(lo, hi)] = scratch
+                        .read_packed_half_cells(dtype, &[lane], &[col])?
+                        .try_into()
+                        .map_err(|_| {
+                            InterpreterError::new(
+                                "tcgen05_mma_operand",
+                                "packed half read returned the wrong element count",
+                            )
+                        })?;
+                    match element.bit_offset {
+                        0 => lo,
+                        16 => hi,
+                        _ => {
+                            return Err(InterpreterError::new(
+                                "tcgen05_mma_layout",
+                                "half TMEM A has a non-half-aligned bit offset",
+                            ))
+                        }
+                    }
+                }
+                MmaElemFormat::F8E4M3 => {
+                    if element.bit_offset % 8 != 0 {
+                        return Err(InterpreterError::new(
+                            "tcgen05_mma_layout",
+                            "F8 TMEM A has a non-byte-aligned bit offset",
+                        ));
+                    }
+                    decode_e4m3(scratch.read_cell_byte(lane, col, element.bit_offset / 8)?)
+                }
+                MmaElemFormat::F4E2M1 => {
+                    if element.bit_offset % 4 != 0 {
+                        return Err(InterpreterError::new(
+                            "tcgen05_mma_layout",
+                            "F4 TMEM A has a non-nibble-aligned bit offset",
+                        ));
+                    }
+                    let byte = scratch.read_cell_byte(lane, col, element.bit_offset / 8)?;
+                    let nibble = if element.bit_offset % 8 == 0 {
+                        byte >> 4
+                    } else {
+                        byte & 0x0f
+                    };
+                    decode_e2m1(nibble)
+                }
+            };
+            out.push(value);
+        }
+    }
+    Array2::from_shape_vec((rows, cols), out).map_err(|_| {
+        InterpreterError::new(
+            "tcgen05_mma_shape",
+            "TMEM A values do not match its resolved footprint",
+        )
+    })
+}
+
+fn read_local_a(
+    ctx: &WarpContext,
+    operand: &MmaAOperand,
+    format: MmaElemFormat,
+    transpose: bool,
+    resolved: &ResolvedMma,
+    cta_id: usize,
+) -> IResult<Vec<Array2<f32>>> {
+    let banks = match operand {
+        MmaAOperand::Smem(tile) => vec![read_smem_matrix(ctx, tile, format, transpose, cta_id)?],
+        MmaAOperand::Tmem { addr, .. } => {
+            let count = if resolved
+                .a_tmem
+                .is_some_and(|footprint| footprint.layout == TmemLayoutKind::BankBatched)
+            {
+                2
+            } else {
+                1
+            };
+            (0..count)
+                .map(|bank| read_tmem_matrix_bank(ctx, addr, resolved, cta_id, bank))
+                .collect::<IResult<Vec<_>>>()?
+        }
+    };
+    for bank in &banks {
+        if bank.dim() != (resolved.per_cta.m as usize, resolved.k as usize) {
+            return Err(InterpreterError::new(
+                "tcgen05_mma_shape",
+                "A operand does not match the resolver's per-CTA MxK",
+            ));
+        }
+    }
+    Ok(banks)
+}
+
+fn read_global_b(
+    ctx: &WarpContext,
+    tile: &SmemTile,
+    format: MmaElemFormat,
+    transpose: bool,
+    resolved: &ResolvedMma,
+    cta_ids: &[usize],
+) -> IResult<Array2<f32>> {
+    let matrices: Vec<Array2<f32>> = cta_ids
+        .iter()
+        .map(|&cta| read_smem_matrix(ctx, tile, format, transpose, cta))
+        .collect::<IResult<_>>()?;
+    let matrix = if matrices.len() == 1 {
+        matrices.into_iter().next().unwrap()
+    } else {
+        let views: Vec<_> = matrices.iter().map(|matrix| matrix.view()).collect();
+        ndarray::concatenate(ndarray::Axis(0), &views).map_err(|_| {
+            InterpreterError::new("tcgen05_mma_shape", "B operand CTA concatenation failed")
+        })?
+    };
+    if matrix.dim() != (resolved.n as usize, resolved.k as usize) {
+        return Err(InterpreterError::new(
+            "tcgen05_mma_shape",
+            "B operand does not match the resolver's NxK",
+        ));
+    }
+    Ok(matrix)
+}
+
+fn decode_e8m0_fnu(byte: u8) -> f32 {
+    if byte == u8::MAX {
+        f32::NAN
+    } else {
+        ((i32::from(byte) - 127) as f32).exp2()
+    }
+}
+
+fn read_scale_values(
+    ctx: &WarpContext,
+    addr: &TmemAddr,
+    resolved: &ResolvedScaleFootprint,
+    scale_format: ScaleFormat,
+    cta_id: usize,
+) -> IResult<Vec<f32>> {
+    let (row0, col0) = eval_tmem_addr(ctx, addr, "tcgen05_mma scale")?;
+    let rows = resolved.footprint.logical.rows as usize;
+    let sf_k = resolved.sf_k as usize;
+    let sf_reuse = match resolved.footprint.layout {
+        TmemLayoutKind::ScaleFactor { sf_reuse, .. } => sf_reuse,
+        _ => {
+            return Err(InterpreterError::new(
+                "tcgen05_mma_layout",
+                "scale operand has a non-scale layout",
+            ))
+        }
+    };
+    let scratch = ctx.state.values.tmem.scratchpad_for(cta_id)?;
+    let mut out = Vec::with_capacity(rows * sf_k);
+    for row in 0..rows {
+        for unique_scale in 0..sf_k {
+            let logical_scale = (unique_scale as u32).checked_mul(sf_reuse).ok_or_else(|| {
+                InterpreterError::new("tcgen05_mma_layout", "scale logical coordinate overflows")
+            })?;
+            let byte_coord = resolved
+                .physical_byte(row as u32, logical_scale)
+                .ok_or_else(|| {
+                    InterpreterError::new("tcgen05_mma_scale", "scale coordinate is out of bounds")
+                })?;
+            let byte = scratch.read_cell_byte(
+                row0 + byte_coord.lane as usize,
+                col0 + byte_coord.col as usize,
+                byte_coord.subbyte,
+            )?;
+            out.push(match scale_format {
+                ScaleFormat::E8M0FNU => decode_e8m0_fnu(byte),
+                ScaleFormat::E4M3FN => decode_e4m3(byte),
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn apply_resolved_scales(
+    matrix: &mut Array2<f32>,
+    scales: &[f32],
+    resolved_scale: &ResolvedScaleFootprint,
+    resolved_mma: &ResolvedMma,
+) -> IResult<()> {
+    let k = resolved_mma.k as usize;
+    let mma_k = resolved_mma.mma_k as usize;
+    let sf_per_mma = match resolved_scale.footprint.layout {
+        TmemLayoutKind::ScaleFactor { sf_per_mma, .. } => sf_per_mma as usize,
+        _ => unreachable!(),
+    };
+    let sf_reuse = match resolved_scale.footprint.layout {
+        TmemLayoutKind::ScaleFactor { sf_reuse, .. } => sf_reuse as usize,
+        _ => unreachable!(),
+    };
+    let scale_width = mma_k / sf_per_mma;
+    if scale_width == 0 {
+        return Err(InterpreterError::new(
+            "tcgen05_mma_scale",
+            "scale width resolved to zero",
+        ));
+    }
+    let sf_k = resolved_scale.sf_k as usize;
+    let expected = (resolved_scale.footprint.logical.rows as usize)
+        .checked_mul(sf_k)
+        .ok_or_else(|| InterpreterError::new("tcgen05_mma_scale", "scale size overflows"))?;
+    if matrix.nrows() != resolved_scale.operand_rows as usize
+        || scales.len() != expected
+        || matrix.ncols() != k
+    {
+        return Err(InterpreterError::new(
+            "tcgen05_mma_scale",
+            "scale values do not match the resolved operand shape",
+        ));
+    }
+    for row in 0..matrix.nrows() {
+        for col in 0..k {
+            let mma_iter = col / mma_k;
+            let group = mma_iter / sf_reuse;
+            let within_mma = (col % mma_k) / scale_width;
+            let scale_index = group
+                .checked_mul(sf_per_mma)
+                .and_then(|value| value.checked_add(within_mma))
+                .ok_or_else(|| {
+                    InterpreterError::new("tcgen05_mma_scale", "scale index overflows")
+                })?;
+            let scale = scales.get(row * sf_k + scale_index).ok_or_else(|| {
+                InterpreterError::new("tcgen05_mma_scale", "resolved scale index is out of bounds")
+            })?;
+            matrix[[row, col]] *= scale;
+        }
+    }
+    Ok(())
+}
+
+fn local_product(a_banks: &[Array2<f32>], b: &Array2<f32>) -> IResult<Array2<f32>> {
+    if a_banks.len() == 1 {
+        return Ok(matmul_f32(&a_banks[0], b));
+    }
+    if a_banks.len() != 2 || b.nrows() % 2 != 0 {
+        return Err(InterpreterError::new(
+            "tcgen05_mma_shape",
+            "bank-batched A requires two banks and an even N",
+        ));
+    }
+    let half = b.nrows() / 2;
+    let mut out = Array2::<f32>::zeros((a_banks[0].nrows(), b.nrows()));
+    for (bank, a) in a_banks.iter().enumerate() {
+        let b_half = b
+            .slice(ndarray::s![bank * half..(bank + 1) * half, ..])
+            .to_owned();
+        let product = matmul_f32(a, &b_half);
+        out.slice_mut(ndarray::s![.., bank * half..(bank + 1) * half])
+            .assign(&product);
+    }
+    Ok(out)
+}
+
+fn accumulate_local_product(
+    ctx: &mut WarpContext,
+    dst: &TmemAddr,
+    resolved: &ResolvedMma,
+    cta_id: usize,
+    product: &Array2<f32>,
+    accum: bool,
+) -> IResult<()> {
+    let (row, col) = eval_tmem_addr(ctx, dst, "tcgen05_mma dst")?;
+    let scratch = ctx
+        .state
+        .values
+        .tmem
+        .by_cta
+        .get_mut(&cta_id)
+        .ok_or_else(|| {
+            InterpreterError::new(
+                "missing_tmem_scratchpad",
+                "tcgen05_mma writes a missing TMEM scratchpad",
+            )
+        })?;
+    let m = resolved.per_cta.m as usize;
+    let n = resolved.n as usize;
+    if product.dim() != (m, n) {
+        return Err(InterpreterError::new(
+            "tcgen05_mma_shape",
+            "MMA product does not match the resolver's per-CTA output shape",
+        ));
+    }
+    let mut lanes = Vec::with_capacity(m * n);
+    let mut cols = Vec::with_capacity(m * n);
+    let mut values = Vec::with_capacity(m * n);
+    for logical_row in 0..m {
+        for logical_col in 0..n {
+            let cell = resolved
+                .d_cell(logical_row as u32, logical_col as u32)
+                .ok_or_else(|| {
+                    InterpreterError::new(
+                        "tcgen05_mma_layout",
+                        "D coordinate is outside its resolved layout",
+                    )
+                })?;
+            lanes.push(row + cell.lane as usize);
+            cols.push(col + cell.col as usize);
+            values.push(product[[logical_row, logical_col]]);
+        }
+    }
+    scratch.accumulate_f32_cells(&lanes, &cols, &values, accum)?;
+    Ok(())
+}
+
 fn trace_mma(
     ctx: &mut WarpContext,
-    dst: &TmemOperand,
-    a: &MmaOperand,
-    b: &MmaOperand,
-    m: usize,
-    n: usize,
-    k: usize,
-    cta_group: u8,
-    accum: bool,
-    trans_a: bool,
-    trans_b: bool,
+    dst: &TmemAddr,
+    a: &MmaAOperand,
+    b: &SmemTile,
+    block_scale: Option<&BlockScaleSpec>,
+    resolved: &ResolvedMma,
     cta_ids: &[usize],
-    sfa: Option<&TmemOperand>,
-    sfb: Option<&TmemOperand>,
-    sf_block: usize,
-    a_fp4: bool,
-    b_fp4: bool,
-    lane_align: u8,
+    accum: bool,
 ) -> IResult<()> {
-    // SMEM operands carry their tile as a slice; a TMEM operand's tile extent is
-    // implied by m/n/k (the operand is just the physical base address).
-    let check_slice_eff =
-        |sl: &TensorSlice, transpose: bool, want: (usize, usize)| -> IResult<()> {
-            let r = ctx.eval_slice(sl)?;
-            let eff = trace_mma_effective_shape(&r.shape, transpose, cta_ids.len())?;
-            if eff != want {
-                return Err(InterpreterError::new(
-                    "tcgen05_mma_shape",
-                    "tcgen05_mma operand shape does not match m/n/k",
-                ));
-            }
-            Ok(())
-        };
-    // fp4 operands are packed 2 e2m1 per byte, so the byte-extent is k/2.
-    let a_k = if a_fp4 { k / 2 } else { k };
-    let b_k = if b_fp4 { k / 2 } else { k };
-    let a_rows = if cta_group == 1 { m } else { m / 2 };
-    let b_rows = if cta_group == 1 { n } else { n / 2 };
-    if let MmaOperand::Slice(sl) = a {
-        check_slice_eff(sl, trans_a, (m, a_k))?;
-    }
-    if let MmaOperand::Slice(sl) = b {
-        check_slice_eff(sl, trans_b, (n, b_k))?;
-    }
-    let dst_row = ctx.eval_scalar_uniform(&dst.row, "mma dst row", "divergent_operands")?;
-    if dst_row != 0 {
-        return Err(InterpreterError::new(
-            "tcgen05_mma_dst_offset",
-            "mma dst row offset must be 0",
-        ));
-    }
-    let dst_col = ctx.eval_scalar_uniform(&dst.col, "mma dst col", "divergent_operands")?;
-    if dst_col < 0 {
-        return Err(InterpreterError::new(
-            "tcgen05_mma_out_of_range",
-            "tcgen05_mma addresses a TMEM cell out of range",
-        ));
-    }
-    let blocks = mma_blocks(
-        m,
-        n,
-        cta_group,
-        lane_align,
-        dst_col as usize,
-        TMEM_ROWS,
-        TMEM_COLS,
-    )?;
-    let regions = tmem_regions_from_mma_blocks(cta_ids, &blocks)?;
-    for region in &regions {
-        check_tmem_region_allocated(ctx, region, "tcgen05_mma")?;
-    }
     let scope = ctx.access_scope();
-    let operand_regions = mma_operand_regions(ctx, a, a_rows, k, trans_a, cta_ids)?
-        .into_iter()
-        .chain(mma_operand_regions(ctx, b, b_rows, k, trans_b, cta_ids)?);
-    for region in operand_regions {
+    match a {
+        MmaAOperand::Smem(tile) => {
+            for &cta in cta_ids {
+                let region = smem_tile_region(ctx, tile, cta, "tcgen05_mma A")?;
+                ctx.emit(TraceEventKind::Read {
+                    region,
+                    proxy: MemoryProxy::Async,
+                    access_kind: MemoryAccessKind::Tensor(TensorAccessKind::Tcgen05Mma),
+                    scope: scope.clone(),
+                })?;
+            }
+        }
+        MmaAOperand::Tmem { addr, .. } => {
+            for &cta in cta_ids {
+                let region = mma_a_region(ctx, addr, resolved, cta)?;
+                check_tmem_region_allocated(ctx, &region, "tcgen05_mma A")?;
+                ctx.emit(TraceEventKind::Read {
+                    region,
+                    proxy: MemoryProxy::Async,
+                    access_kind: MemoryAccessKind::Tmem(TmemAsyncKind::Mma),
+                    scope: scope.clone(),
+                })?;
+            }
+        }
+    }
+    for &cta in cta_ids {
+        let region = smem_tile_region(ctx, b, cta, "tcgen05_mma B")?;
         ctx.emit(TraceEventKind::Read {
             region,
             proxy: MemoryProxy::Async,
@@ -1075,34 +1407,29 @@ fn trace_mma(
             scope: scope.clone(),
         })?;
     }
-    // Block-scaled MMA reads its UE8M0/e4m3 scale vectors from every CTA in the pair
-    // (A's scales split by M like A; B's duplicated per CTA): a TMEM read window
-    // of the MMA, drained by tcgen05_commit like the accumulator access. The window
-    // is the exact folded footprint the value-side read_scale_blocks touches:
-    // ceil(rows/128) super-blocks of `nblocks` columns.
-    let nblocks = if sf_block == 0 { 1 } else { k / sf_block };
-    for (sf, rows) in [(sfa, a_rows), (sfb, n)] {
-        let Some(sf) = sf else { continue };
-        let sf_cols = rows.div_ceil(TMEM_ROWS) * nblocks;
-        let (sf_row, sf_col) = eval_tmem_operand(ctx, sf, "mma scale operand")?;
-        if sf_row != 0 {
-            return Err(InterpreterError::new(
-                "tcgen05_mma_scale",
-                "mma scale operand row (lane) must be 0",
-            ));
-        }
-        for &cta in cta_ids {
-            let region = region::tmem_region_from_rects(0, cta, [(0, TMEM_ROWS, sf_col, sf_cols)])?;
-            check_tmem_region_allocated(ctx, &region, "tcgen05_mma scale")?;
-            ctx.emit(TraceEventKind::Read {
-                region,
-                proxy: MemoryProxy::Async,
-                access_kind: MemoryAccessKind::Tmem(TmemAsyncKind::Mma),
-                scope: scope.clone(),
+    if let Some(spec) = block_scale {
+        for (addr, footprint, label) in [
+            (&spec.sfa, resolved.sfa.as_ref(), "tcgen05_mma SFA"),
+            (&spec.sfb, resolved.sfb.as_ref(), "tcgen05_mma SFB"),
+        ] {
+            let footprint = footprint.ok_or_else(|| {
+                InterpreterError::new("tcgen05_mma_scale", "scale operand has no footprint")
             })?;
+            for &cta in cta_ids {
+                let region = mma_scale_region(ctx, addr, footprint, cta, label)?;
+                check_tmem_region_allocated(ctx, &region, label)?;
+                ctx.emit(TraceEventKind::Read {
+                    region,
+                    proxy: MemoryProxy::Async,
+                    access_kind: MemoryAccessKind::Tmem(TmemAsyncKind::Mma),
+                    scope: scope.clone(),
+                })?;
+            }
         }
     }
-    for region in regions {
+    for &cta in cta_ids {
+        let region = mma_d_region(ctx, dst, resolved, cta)?;
+        check_tmem_region_allocated(ctx, &region, "tcgen05_mma D")?;
         if accum {
             ctx.emit(TraceEventKind::Read {
                 region: region.clone(),
@@ -1121,174 +1448,148 @@ fn trace_mma(
     Ok(())
 }
 
-/// Evaluate a TMEM operand's absolute (lane, col) base uniformly.
-fn eval_tmem_operand(ctx: &WarpContext, op: &TmemOperand, label: &str) -> IResult<(usize, usize)> {
-    let row = ctx.eval_scalar_uniform(&op.row, label, "divergent_operands")?;
-    let col = ctx.eval_scalar_uniform(&op.col, label, "divergent_operands")?;
-    if row < 0 || col < 0 {
-        return Err(InterpreterError::new(
-            "trace_region_oob",
-            "TMEM operand address is negative",
-        ));
+fn execute_mma<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
+    let (dst, a, b, mma_m, mma_n, format, block_scale, accum, trans_a, trans_b, ws, cta_group) =
+        match stmt {
+            Stmt::Tcgen05Mma {
+                dst,
+                a,
+                b,
+                mma_m,
+                mma_n,
+                format,
+                block_scale,
+                accum,
+                trans_a,
+                trans_b,
+                ws,
+                cta_group,
+            } => (
+                dst,
+                a,
+                b,
+                *mma_m,
+                *mma_n,
+                *format,
+                block_scale.as_ref(),
+                accum,
+                *trans_a,
+                *trans_b,
+                *ws,
+                *cta_group,
+            ),
+            _ => unreachable!(),
+        };
+    let resolved = resolve_tcgen05_mma(
+        dst,
+        a,
+        b,
+        mma_m,
+        mma_n,
+        format,
+        block_scale,
+        trans_a,
+        trans_b,
+        ws,
+        cta_group,
+    )
+    .map_err(|error| layout_error("tcgen05_mma_layout", error))?;
+    ctx.check_single_thread_issue("tcgen05_mma_mask", "tcgen05_mma")?;
+    let cta_ids = tcgen_cta_ids(ctx, cta_group, "tcgen05_mma")?;
+    let accum = eval_accum(ctx, accum)?;
+    if ctx.trace_mode() {
+        trace_mma(ctx, dst, a, b, block_scale, &resolved, &cta_ids, accum)?;
+        return Ok(StepStatus::advance());
     }
-    Ok((row as usize, col as usize))
+
+    let b_base = read_global_b(ctx, b, format, trans_b, &resolved, &cta_ids)?;
+    for &cta_id in &cta_ids {
+        let mut a_banks = read_local_a(ctx, a, format, trans_a, &resolved, cta_id)?;
+        let mut b_values = b_base.clone();
+        if let Some(spec) = block_scale {
+            let sfa = resolved.sfa.as_ref().ok_or_else(|| {
+                InterpreterError::new("tcgen05_mma_scale", "SFA has no resolved footprint")
+            })?;
+            let sfb = resolved.sfb.as_ref().ok_or_else(|| {
+                InterpreterError::new("tcgen05_mma_scale", "SFB has no resolved footprint")
+            })?;
+            let a_scales = read_scale_values(ctx, &spec.sfa, sfa, spec.scale_format, cta_id)?;
+            let b_scales = read_scale_values(ctx, &spec.sfb, sfb, spec.scale_format, cta_id)?;
+            for bank in &mut a_banks {
+                apply_resolved_scales(bank, &a_scales, sfa, &resolved)?;
+            }
+            apply_resolved_scales(&mut b_values, &b_scales, sfb, &resolved)?;
+        }
+        let product = local_product(&a_banks, &b_values)?;
+        accumulate_local_product(ctx, dst, &resolved, cta_id, &product, accum)?;
+    }
+    Ok(StepStatus::advance())
 }
 
-/// Read per-(row, block) block scales from a packed-u32 (fp8/UE8M0) or raw-byte
-/// (nvfp4 e4m3) scale-vector TMEM operand on one CTA. Logical row r sits at cell
-/// (lane = r % 128, col = col + r / 128) for the packed-u32 path; within the cell,
-/// block `bi` reads byte `byte_base + bi`. The e4m3 path folds 128-row
-/// super-blocks into `nblocks`-wide column bands: logical row r, block b -> cell
-/// (lane = r % 128, col = col + (r / 128) * nblocks + b). Decode is either e4m3
-/// (nvfp4) or UE8M0 biased exponent `2^(byte-127)` (fp8). Returns `rows *
-/// nblocks` scales, row-major (a row's blocks contiguous). fp8 calls this with
-/// `nblocks=1` (one scale per row).
-fn read_scale_blocks(
+fn matmul_f32(a: &Array2<f32>, b: &Array2<f32>) -> Array2<f32> {
+    let (m, k) = (a.nrows(), a.ncols());
+    let n = b.nrows();
+    let a = a.as_standard_layout();
+    let b = b.as_standard_layout();
+    let mut c = vec![0.0f32; m * n];
+    super::super::blas::sgemm_nt(
+        m,
+        n,
+        k,
+        a.as_slice().unwrap(),
+        b.as_slice().unwrap(),
+        &mut c,
+        0.0,
+    );
+    Array2::from_shape_vec((m, n), c).unwrap()
+}
+
+fn cp_target_region(
     ctx: &WarpContext,
-    op: &TmemOperand,
-    byte_base: usize,
-    nblocks: usize,
-    rows: usize,
-    e4m3: bool,
+    dst: &TmemAddr,
+    resolved: &ResolvedCp,
     cta_id: usize,
-) -> IResult<Vec<f32>> {
-    let (row0, col0) = eval_tmem_operand(ctx, op, "mma scale operand")?;
-    if row0 != 0 {
-        return Err(InterpreterError::new(
-            "tcgen05_mma_scale",
-            "mma scale operand row (lane) must be 0",
-        ));
-    }
-    // nvfp4 e4m3 SF datapath: one e4m3 byte per (lane, col) cell (laid out by
-    // execute_cp's F8E4M3 branch). `nblocks` is one scale per 16-K block (k/16).
-    if op.dtype == DType::F8E4M3 {
-        if !e4m3 {
-            return Err(InterpreterError::new(
-                "tcgen05_mma_scale",
-                "f8e4m3 scale tensor requires the e4m3 decode path",
-            ));
-        }
-        let sp = ctx.state.values.tmem.scratchpad_for(cta_id)?;
-        let mut out = Vec::with_capacity(rows * nblocks);
-        // Rows ≥ 128 fold into column super-blocks (execute_cp's write folding): logical
-        // row r -> lane = r % 128, col = col0 + (r // 128) * nblocks + b. For SFA (≤128
-        // rows) this is the identity; for a 256-row SFB the second 128-row super-block
-        // reads from the next SF_CTA_K column band.
-        for r in 0..rows {
-            let lane = r % 128;
-            let super_col = col0 + (r / 128) * nblocks;
-            for b in 0..nblocks {
-                out.push(decode_e4m3(sp.read_sf_byte(lane, super_col + b)?));
+) -> IResult<Region> {
+    let (row0, col0) = eval_tmem_addr(ctx, dst, "tcgen05_cp dst")?;
+    let mut rects = Vec::new();
+    for row in 0..resolved.source.rows {
+        for col in 0..resolved.source_row_cells {
+            let cells = resolved.target_cells(row, col).ok_or_else(|| {
+                InterpreterError::new("tcgen05_cp_layout", "CP source coordinate is out of range")
+            })?;
+            for cell in cells {
+                rects.push((row0 + cell.lane as usize, 1, col0 + cell.col as usize, 1));
             }
         }
-        return Ok(out);
     }
-    if op.dtype != DType::U32 {
-        return Err(InterpreterError::new(
-            "tcgen05_mma_scale",
-            "mma scale tensor dtype must be u32",
-        ));
-    }
-    if byte_base + nblocks > 4 {
-        return Err(InterpreterError::new(
-            "tcgen05_mma_scale",
-            "mma scale block range exceeds the 4 bytes of a packed u32 cell",
-        ));
-    }
-    let sp = ctx.state.values.tmem.scratchpad_for(cta_id)?;
-    let mut lanes = Vec::with_capacity(rows);
-    let mut cols = Vec::with_capacity(rows);
-    for r in 0..rows {
-        lanes.push(r % 128);
-        cols.push(col0 + r / 128);
-    }
-    let packed = sp.read_cells(DType::U32, &lanes, &cols)?;
-    let ValueArray1::U32(packed) = packed else {
-        return Err(InterpreterError::new(
-            "tcgen05_mma_scale",
-            "mma scale tensor dtype must be u32",
-        ));
-    };
-    let mut out = Vec::with_capacity(rows * nblocks);
-    for &cell in packed.iter() {
-        for bi in 0..nblocks {
-            let byte = ((cell >> (8 * (byte_base + bi))) & 0xFF) as u8;
-            out.push(if e4m3 {
-                decode_e4m3(byte)
-            } else {
-                ((byte as i32 - 127) as f32).exp2()
-            });
-        }
-    }
-    Ok(out)
+    region::tmem_region_from_rects(0, cta_id, rects)
 }
 
-/// `tcgen05.cp` — copy packed u32 scale cells (or raw e4m3 scale bytes) from
-/// SMEM into TMEM. One leader issue drives every CTA in the group: each CTA
-/// copies from its OWN SMEM into its OWN TMEM (element r of the flat src tile
-/// lands at cell (lane = r % 128, col = dst.col + r / 128); the e4m3 path folds
-/// 128-row super-blocks into nblocks-wide column bands — the IR operand already
-/// carries the folded physical base column). The value lands at issue: the
-/// tcgen05 pipe executes its ops in issue order, so a later same-stream MMA
-/// read can never observe a stale cell; retirement toward other streams is
-/// observed through `tcgen05_commit` (the trace records an async `Tmem(Cp)`
-/// write window drained by the commit).
 fn execute_cp<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<StepStatus> {
-    // Single-thread issue, like the MMA (PTX; canon emits it under `elect_sync`).
-    ctx.check_single_thread_issue("tcgen05_cp_mask", "tcgen05_cp")?;
-    let (dst, src, cta_group) = match stmt {
+    let (dst, src, shape, multicast, cta_group) = match stmt {
         Stmt::Tcgen05Cp {
             dst,
             src,
+            shape,
+            multicast,
             cta_group,
-        } => (dst, src, *cta_group),
+        } => (dst, src, *shape, *multicast, *cta_group),
         _ => unreachable!(),
     };
-    let cta_ids: Vec<usize> = if cta_group == 2 {
-        if ctx.lanes[0].ctaid_in_cluster & 1 == 1 {
-            return Ok(StepStatus::advance());
-        }
-        let peer_local = peer_ctaid_in_cluster(
-            ctx,
-            ctx.lanes[0].ctaid_in_cluster,
-            "tcgen05_cp_peer",
-            "cp peer out of range",
-        )?;
-        vec![ctx.stream.cta_id, ctx.global_cta_id(peer_local)]
-    } else {
-        vec![ctx.stream.cta_id]
-    };
-    let src_off = eval_uniform_usize(ctx, &src.offsets, "tcgen05_cp src offset")?;
-    let src_r = ctx.eval_slice(src)?;
-    let (dst_row, col0) = eval_tmem_operand(ctx, dst, "tcgen05_cp dst")?;
-    if dst_row != 0 {
-        return Err(InterpreterError::new(
-            "tcgen05_cp_shape",
-            "tcgen05_cp dst row (lane) must be 0",
-        ));
-    }
-    let count = numel(&src_r.shape);
-    let cp_cols = count.div_ceil(TMEM_ROWS);
-    if col0 + cp_cols > TMEM_COLS {
-        return Err(InterpreterError::new(
-            "tcgen05_cp_out_of_range",
-            "tcgen05_cp addresses a TMEM cell outside the scratchpad",
-        ));
-    }
-    let mut lanes = Vec::with_capacity(count);
-    let mut cols = Vec::with_capacity(count);
-    for r in 0..count {
-        lanes.push(r % 128);
-        cols.push(col0 + r / 128);
-    }
+    let resolved = resolve_tcgen05_cp(dst, src, shape, multicast, cta_group)
+        .map_err(|error| layout_error("tcgen05_cp_layout", error))?;
+    ctx.check_single_thread_issue("tcgen05_cp_mask", "tcgen05_cp")?;
+    let cta_ids = tcgen_cta_ids(ctx, cta_group, "tcgen05_cp")?;
+    let (offsets, tile_shape) = eval_cp_smem_tile(ctx, src, "tcgen05_cp src")?;
+    let (row0, col0) = eval_tmem_addr(ctx, dst, "tcgen05_cp dst")?;
+    let row_bytes = resolved.source_row_cells as usize * 4;
     let scope = ctx.access_scope();
-    for &cta in &cta_ids {
+    for &cta_id in &cta_ids {
+        let dst_region = cp_target_region(ctx, dst, &resolved, cta_id)?;
+        check_tmem_region_allocated(ctx, &dst_region, "tcgen05_cp")?;
         if ctx.trace_mode() {
             let src_region =
-                region::tensor_region_from_uniform(&src_r.tensor, cta, &src_off, &src_r.shape)?;
-            let dst_region =
-                region::tmem_region_from_rects(0, cta, [(0, TMEM_ROWS, col0, cp_cols)])?;
-            check_tmem_region_allocated(ctx, &dst_region, "tcgen05_cp")?;
+                region::tensor_region_from_uniform(&src.tensor, cta_id, &offsets, &tile_shape)?;
             ctx.emit(TraceEventKind::Read {
                 region: src_region,
                 proxy: MemoryProxy::Async,
@@ -1303,854 +1604,46 @@ fn execute_cp<'a, 'k>(ctx: &mut WarpContext<'a, 'k>, stmt: &'k Stmt) -> IResult<
             })?;
             continue;
         }
-        let flat = ctx.state.values.smem.pool_for(cta)?.read_block(
-            &src_r.tensor,
-            &src_off,
-            &src_r.shape,
-        )?;
-        let sp = ctx.state.values.tmem.by_cta.get_mut(&cta).ok_or_else(|| {
-            InterpreterError::new(
-                "missing_tmem_scratchpad",
-                "tcgen05_cp writes a missing TMEM scratchpad",
-            )
-        })?;
-        match &flat {
-            // fp8/UE8M0 datapath: packed-u32 scale cells (4 e4m3/UE8M0 bytes per
-            // cell), one cell per (lane, col) — the typed write_cells path.
-            ValueArray1::U32(_) => {
-                sp.write_cells(dst.dtype, &lanes, &cols, &flat)?;
-            }
-            // nvfp4 datapath: the SF is an f8e4m3 (rows, K//16) tile — one e4m3
-            // scale byte per 16-K block. Store it row-major as one byte per TMEM
-            // cell (lane = row, col = col0 + block), the layout read_scale_blocks
-            // reads back. (read_block decodes e4m3 to f32; re-encoding round-trips
-            // every finite e4m3 byte exactly.)
-            //
-            // `nblocks` is the SF blocks PER LOGICAL ROW — the src tile's innermost
-            // dim (SF_CTA_K). Rows ≥ 128 FOLD into column super-blocks (TMEM is
-            // physically 128 lanes): logical row r -> lane = r % 128, and the
-            // super-block s = r // 128 shifts the column by `s * nblocks` — the
-            // dst operand's col is the already-folded physical base.
-            ValueArray1::F8E4M3(vals) => {
-                let nblocks = *src_r.shape.last().unwrap_or(&cp_cols);
-                for (e, &v) in vals.iter().enumerate() {
-                    let row = e / nblocks;
-                    let blk = e % nblocks;
-                    let lane = row % 128;
-                    let col = col0 + (row / 128) * nblocks + blk;
-                    sp.write_sf_byte(lane, col, encode_e4m3(v))?;
+        let smem = ctx.state.values.smem.pool_for(cta_id)?;
+        let raw = smem.read_block_bytes(&src.tensor, &offsets, &tile_shape)?;
+        if raw.len() != resolved.source.rows as usize * row_bytes {
+            return Err(InterpreterError::new(
+                "tcgen05_cp_shape",
+                "CP source byte count does not match the resolved shape",
+            ));
+        }
+        let scratch = ctx
+            .state
+            .values
+            .tmem
+            .by_cta
+            .get_mut(&cta_id)
+            .ok_or_else(|| {
+                InterpreterError::new(
+                    "missing_tmem_scratchpad",
+                    "tcgen05_cp writes a missing TMEM scratchpad",
+                )
+            })?;
+        for row in 0..resolved.source.rows {
+            for col in 0..resolved.source_row_cells {
+                let begin = row as usize * row_bytes + col as usize * 4;
+                let bits = u32::from_le_bytes(raw[begin..begin + 4].try_into().unwrap());
+                for cell in resolved.target_cells(row, col).ok_or_else(|| {
+                    InterpreterError::new(
+                        "tcgen05_cp_layout",
+                        "CP source coordinate is out of range",
+                    )
+                })? {
+                    scratch.write_raw_cell(
+                        row0 + cell.lane as usize,
+                        col0 + cell.col as usize,
+                        bits,
+                    )?;
                 }
-            }
-            _ => {
-                return Err(InterpreterError::new(
-                    "tcgen05_cp_dtype",
-                    "tcgen05_cp moves packed u32 or e4m3 scale cells",
-                ));
             }
         }
     }
     Ok(StepStatus::advance())
-}
-
-/// THE definition of which pools a pair-MMA operand read touches: for an SMEM
-/// slice, the same (offsets, shape) box — per-row runs, never one linear
-/// interval — in EVERY CTA of `cta_ids`; for a TMEM operand, the physical
-/// (lane, col) box its m/n/k extent implies. cta_group=2 operands are split
-/// across the pair's pools; cta_group=1 degenerates to the issuing CTA. The
-/// trace events iterate this list and the value reads
-/// (`read_mma_operand_ctas`, `accumulate_inplace`) iterate the same `cta_ids`
-/// — deriving the CTA set independently per path is how peer-SMEM reads went
-/// unrecorded.
-fn mma_operand_regions(
-    ctx: &WarpContext,
-    operand: &MmaOperand,
-    rows_per_cta: usize,
-    k_cols: usize,
-    transpose: bool,
-    cta_ids: &[usize],
-) -> IResult<Vec<Region>> {
-    match operand {
-        MmaOperand::Slice(slice) => {
-            let resolved = ctx.eval_slice(slice)?;
-            let offsets = eval_uniform_usize(ctx, &slice.offsets, "mma operand offset")?;
-            let mut regions = Vec::with_capacity(cta_ids.len());
-            for &cta in cta_ids {
-                regions.push(region::tensor_region_from_uniform(
-                    &resolved.tensor,
-                    cta,
-                    &offsets,
-                    &resolved.shape,
-                )?);
-            }
-            Ok(regions)
-        }
-        MmaOperand::Tmem(op) => {
-            let (row, col) = eval_tmem_operand(ctx, op, "mma operand")?;
-            // Stored tile: `rows` lanes x `elems` logical columns, packed per dtype.
-            let (rows, elems) = if transpose {
-                (k_cols, rows_per_cta)
-            } else {
-                (rows_per_cta, k_cols)
-            };
-            let cells = match op.dtype {
-                DType::F16 | DType::Bf16 => {
-                    if elems % 2 != 0 {
-                        return Err(InterpreterError::new(
-                            "tcgen05_mma_operand",
-                            "packed-half TMEM operand needs an even column extent",
-                        ));
-                    }
-                    elems / 2
-                }
-                _ => elems,
-            };
-            if row + rows > TMEM_ROWS || col + cells > TMEM_COLS {
-                return Err(InterpreterError::new(
-                    "tcgen05_mma_out_of_range",
-                    "tcgen05_mma addresses a TMEM cell out of range",
-                ));
-            }
-            let mut regions = Vec::with_capacity(cta_ids.len());
-            for &cta in cta_ids {
-                let region = region::tmem_region_from_rects(0, cta, [(row, rows, col, cells)])?;
-                check_tmem_region_allocated(ctx, &region, "tcgen05_mma operand")?;
-                regions.push(region);
-            }
-            Ok(regions)
-        }
-    }
-}
-
-fn trace_mma_effective_shape(
-    shape: &[usize],
-    transpose: bool,
-    cta_count: usize,
-) -> IResult<(usize, usize)> {
-    let lead = shape.len().saturating_sub(2);
-    if shape.len() < 2 || shape[..lead].iter().any(|&d| d != 1) {
-        return Err(InterpreterError::new(
-            "tcgen05_mma_shape",
-            "tcgen05_mma operand shape does not match m/n/k",
-        ));
-    }
-    let (rows, cols) = (shape[lead], shape[lead + 1]);
-    if transpose {
-        Ok((cols * cta_count, rows))
-    } else {
-        Ok((rows * cta_count, cols))
-    }
-}
-
-/// One TMEM block of an MMA accumulator: the output sub-rectangle
-/// `[m_lo, m_lo+rows) x [n_lo, n_lo+cols)` maps element-for-element onto the contiguous
-/// TMEM rectangle on `cta_ids[cta_idx]` at lanes `[lane_start, +rows)`, cols
-/// `[col_start, +cols)` (element `(mi, ni)` → lane `lane_start + (mi - m_lo)`, col
-/// `col_start + (ni - n_lo)`). Every supported MMA layout is 1–4 such blocks — there is
-/// no per-element scatter.
-#[derive(Debug)]
-struct MmaBlock {
-    cta_idx: usize,
-    m_lo: usize,
-    rows: usize,
-    n_lo: usize,
-    cols: usize,
-    lane_start: usize,
-    col_start: usize,
-}
-
-/// Closed-form block decomposition of an MMA accumulator layout (replaces the per-element
-/// `mma_placement`/`mma_scatter_plan` table). `dst_col` is the accumulator's absolute
-/// physical base column (the IR operand carries it directly).
-fn mma_blocks(
-    m: usize,
-    n: usize,
-    cta_group: u8,
-    lane_align: u8,
-    dst_col: usize,
-    n_lanes: usize,
-    n_cols: usize,
-) -> IResult<Vec<MmaBlock>> {
-    let oob = || {
-        InterpreterError::new(
-            "tcgen05_mma_out_of_range",
-            "tcgen05_mma addresses a TMEM cell out of range",
-        )
-    };
-    let la = lane_align as usize;
-    let base_col = dst_col;
-    let mut blocks: Vec<MmaBlock> = Vec::new();
-    if cta_group == 1 && m == 64 {
-        // Layout F: four lane-runs of 16 at stride 32, plus the lane-align offset;
-        // columns are the full n, contiguous.
-        for g in 0..(m / 16) {
-            blocks.push(MmaBlock {
-                cta_idx: 0,
-                m_lo: g * 16,
-                rows: 16,
-                n_lo: 0,
-                cols: n,
-                lane_start: 32 * g + la,
-                col_start: base_col,
-            });
-        }
-    } else if la != 0 {
-        return Err(InterpreterError::new(
-            "tcgen05_mma_lane_align",
-            "tcgen05_mma lane_align is only valid for the cta_group=1 m=64 (Layout F) accumulator",
-        ));
-    } else if cta_group == 1 && m == 128 {
-        // Identity (Layout D): one contiguous block.
-        blocks.push(MmaBlock {
-            cta_idx: 0,
-            m_lo: 0,
-            rows: 128,
-            n_lo: 0,
-            cols: n,
-            lane_start: 0,
-            col_start: base_col,
-        });
-    } else if cta_group == 2 && m == 256 {
-        // Layout A: split m across the CTA pair; each half is contiguous.
-        for c in 0..2 {
-            blocks.push(MmaBlock {
-                cta_idx: c,
-                m_lo: c * 128,
-                rows: 128,
-                n_lo: 0,
-                cols: n,
-                lane_start: 0,
-                col_start: base_col,
-            });
-        }
-    } else if cta_group == 2 && m == 128 {
-        // Layout B: split m across the CTA pair, and split n in half — the second n-half
-        // stacks into the upper 64 lanes (the "top/bottom" split).
-        let half = (n / 2).max(1);
-        for c in 0..2 {
-            for h in 0..2 {
-                let n_lo = h * half;
-                if n_lo >= n {
-                    continue;
-                }
-                blocks.push(MmaBlock {
-                    cta_idx: c,
-                    m_lo: c * 64,
-                    rows: 64,
-                    n_lo,
-                    cols: (n - n_lo).min(half),
-                    lane_start: h * 64,
-                    col_start: base_col,
-                });
-            }
-        }
-    } else {
-        return Err(InterpreterError::new(
-            "tcgen05_mma_unsupported",
-            "unsupported MMA layout",
-        ));
-    }
-    for b in &blocks {
-        if b.lane_start + b.rows > n_lanes || b.col_start + b.cols > n_cols {
-            return Err(oob());
-        }
-    }
-    Ok(blocks)
-}
-
-fn tmem_regions_from_mma_blocks(cta_ids: &[usize], blocks: &[MmaBlock]) -> IResult<Vec<Region>> {
-    let mut rects_by_cta: HashMap<usize, Vec<(usize, usize, usize, usize)>> = HashMap::new();
-    for block in blocks {
-        let Some(&cta_id) = cta_ids.get(block.cta_idx) else {
-            return Err(InterpreterError::new(
-                "tcgen05_mma_unsupported",
-                "tcgen05_mma block has no destination CTA",
-            ));
-        };
-        rects_by_cta.entry(cta_id).or_default().push((
-            block.lane_start,
-            block.rows,
-            block.col_start,
-            block.cols,
-        ));
-    }
-    rects_by_cta
-        .into_iter()
-        .map(|(cta_id, rects)| region::tmem_region_from_rects(0, cta_id, rects))
-        .collect()
-}
-
-/// (offsets, shape) of a staged operand box with its leading unit dims kept:
-/// returns the FULL-rank offsets (for the pool's rect path) plus the trailing
-/// (rows, cols) of the box, after checking the leading extents are all 1.
-fn squeeze_operand(
-    ctx: &WarpContext,
-    sl: &TensorSlice,
-) -> IResult<(Vec<usize>, Vec<usize>, usize, usize)> {
-    let off = eval_uniform_usize(ctx, &sl.offsets, "mma operand offset")?;
-    let shape = eval_uniform_usize(ctx, &sl.shape, "mma operand shape")?;
-    let lead = shape.len().saturating_sub(2);
-    if shape.len() < 2 || shape[..lead].iter().any(|&d| d != 1) {
-        return Err(InterpreterError::new(
-            "tcgen05_mma_shape",
-            "tcgen05_mma operand shape does not match m/n/k",
-        ));
-    }
-    let rows = shape[lead];
-    let cols = shape[lead + 1];
-    Ok((off, shape, rows, cols))
-}
-
-/// Scale a materialized operand buffer in place by per-row, per-block scale
-/// factors. The buffer is `rows × k` row-major; each row is split into `nblocks`
-/// contiguous column blocks of width `k/nblocks`, block `bi` of row r multiplied
-/// by `scales[r*nblocks + bi]`. fp8 uses `nblocks=1` (one scale over the whole
-/// row); nvfp4 uses `nblocks = k/16` (one per 16-element block).
-fn apply_block_scales(buf: &mut [f32], scales: &[f32], k: usize, nblocks: usize) {
-    let blockw = k / nblocks;
-    for (row, chunk) in buf.chunks_exact_mut(k).enumerate() {
-        for bi in 0..nblocks {
-            let s = scales[row * nblocks + bi];
-            if s != 1.0 {
-                for v in &mut chunk[bi * blockw..(bi + 1) * blockw] {
-                    *v *= s;
-                }
-            }
-        }
-    }
-}
-
-/// In-place contiguous accumulate: for each accumulator CTA, `sgemm(beta)` reads its
-/// A tile and each B segment from SMEM f32 compute slices (base+lda) and writes the
-/// result into the column-major TMEM grid. cta_group=2's B spans both CTAs' SMEM,
-/// so each B half maps to one n-column range; the CTA set is the same `cta_ids`
-/// the trace regions (`mma_operand_regions`) cover.
-#[allow(clippy::too_many_arguments)]
-fn accumulate_inplace(
-    ctx: &mut WarpContext,
-    dst: &TmemOperand,
-    a_sl: &TensorSlice,
-    b_sl: &TensorSlice,
-    m: usize,
-    n: usize,
-    k: usize,
-    cta_group: u8,
-    accum: bool,
-    cta_ids: &[usize],
-    scales: Option<(&TmemOperand, &TmemOperand, usize)>,
-    sf_e4m3: bool,
-    sf_block: usize,
-    a_fp4: bool,
-    b_fp4: bool,
-    lane_align: u8,
-) -> IResult<()> {
-    let (a_off, a_box, a_rows, a_cols) = squeeze_operand(ctx, a_sl)?;
-    let (b_off, b_box, b_rows, b_cols) = squeeze_operand(ctx, b_sl)?;
-    let rows_per_cta = if cta_group == 1 { m } else { m / 2 };
-    let n_seg = if cta_group == 1 { n } else { n / 2 };
-    // fp4 operands are packed 2 e2m1 per byte, so the slice's inner byte extent is k/2.
-    let a_inner = if a_fp4 { k / 2 } else { k };
-    let b_inner = if b_fp4 { k / 2 } else { k };
-    if [a_rows, a_cols] != [rows_per_cta, a_inner] || [b_rows, b_cols] != [n_seg, b_inner] {
-        return Err(InterpreterError::new(
-            "tcgen05_mma_shape",
-            "tcgen05_mma operand shape does not match m/n/k",
-        ));
-    }
-    // Scale vectors: A's split by M across the pair like A itself. nvfp4
-    // (sf_block=16) applies a per-16-column-block e4m3 scale; fp8 (sf_block=0)
-    // one UE8M0 scale per row. Scaling the materialized operand rows commutes
-    // bit-for-bit with product scaling.
-    //
-    // The B scales are held FULL-band (duplicated) in every CTA's sfb tensor for
-    // BOTH datapaths: fp8 holds the full N-band's UE8M0 row scales, and nvfp4's
-    // e4m3 sfb holds the full MMA_N-wide band (canon's SFB_N==128 multicast — the
-    // B operand is N-split across the pair, but its scales are not). So each acc
-    // half reads `n` rows (the full band) from its own copy. (A's scales, like A,
-    // ARE split by M across the pair: rows_per_cta rows per CTA.)
-    let nblocks = if sf_block == 0 { 1 } else { k / sf_block };
-    let (sa_scales, sb_scales) = match scales {
-        Some((sfa_sl, sfb_sl, sf_byte)) => {
-            let byte_base = if sf_block == 0 { sf_byte } else { 0 };
-            let mut sa = Vec::with_capacity(cta_ids.len());
-            let mut sb: Vec<Vec<f32>> = Vec::with_capacity(cta_ids.len());
-            for &cta in cta_ids {
-                sa.push(read_scale_blocks(
-                    ctx,
-                    sfa_sl,
-                    byte_base,
-                    nblocks,
-                    rows_per_cta,
-                    sf_e4m3,
-                    cta,
-                )?);
-                sb.push(read_scale_blocks(
-                    ctx, sfb_sl, byte_base, nblocks, n, sf_e4m3, cta,
-                )?);
-            }
-            (sa, sb)
-        }
-        None => (Vec::new(), Vec::new()),
-    };
-    let (c0, _) = inplace_geometry(ctx, dst, cta_group, lane_align)?;
-    let beta = if accum { 1.0 } else { 0.0 };
-    let stride = super::super::values::tmem::TMEM_COLS;
-
-    let n_total = n_seg * cta_ids.len();
-    if rows_per_cta > TMEM_ROWS
-        || match c0.checked_add(n_total) {
-            Some(end) => end > TMEM_COLS,
-            None => true,
-        }
-    {
-        return Err(InterpreterError::new(
-            "tcgen05_mma_out_of_range",
-            "tcgen05_mma addresses a TMEM cell out of range",
-        ));
-    }
-    for &cta_id in cta_ids {
-        if !ctx.state.values.tmem.by_cta.contains_key(&cta_id) {
-            return Err(InterpreterError::new(
-                "missing_tmem_scratchpad",
-                "tcgen05_mma writes a missing TMEM scratchpad",
-            ));
-        }
-    }
-    // accum=true reads the accumulator's CURRENT cells: they must have been
-    // written (an earlier MMA/st). The fallback path fails closed with
-    // missing_tmem_value on unwritten cells; the in-place path must agree —
-    // silently accumulating from zeroed cells is how a missing prologue MMA
-    // went undetected.
-    if accum {
-        for &cta_id in cta_ids {
-            let sp = ctx.state.values.tmem.scratchpad_for(cta_id)?;
-            let region = sp
-                .valid
-                .slice(ndarray::s![0..rows_per_cta, c0..c0 + n_total]);
-            if !region.iter().all(|&v| v) {
-                return Err(InterpreterError::new(
-                    "missing_tmem_value",
-                    "tcgen05_mma accum reads an unwritten TMEM accumulator cell",
-                ));
-            }
-        }
-    }
-    MMA_SCRATCH.with(|sc| -> IResult<()> {
-        let mut g = sc.borrow_mut();
-        let (sa, sb) = &mut *g;
-        if scales.is_none() {
-            // Unscaled: B is identical for every acc half — materialize once.
-            sb.clear();
-            for &b_cta in cta_ids {
-                let pool = ctx.state.values.smem.pool_for(b_cta)?;
-                if b_fp4 {
-                    pool.append_f32_block_fp4(&b_sl.tensor, &b_off, &b_box, sb)?;
-                } else {
-                    pool.append_f32_block(&b_sl.tensor, &b_off, &b_box, sb)?;
-                }
-            }
-        }
-        for (acc_idx, &acc_cta) in cta_ids.iter().enumerate() {
-            if scales.is_some() {
-                // Scaled: each acc half applies ITS OWN SFB copy, so the B
-                // scratch is rebuilt (and block-scaled) per half.
-                sb.clear();
-                for &b_cta in cta_ids {
-                    let pool = ctx.state.values.smem.pool_for(b_cta)?;
-                    if b_fp4 {
-                        pool.append_f32_block_fp4(&b_sl.tensor, &b_off, &b_box, sb)?;
-                    } else {
-                        pool.append_f32_block(&b_sl.tensor, &b_off, &b_box, sb)?;
-                    }
-                }
-                apply_block_scales(sb, &sb_scales[acc_idx], k, nblocks);
-            }
-            sa.clear();
-            {
-                let pool = ctx.state.values.smem.pool_for(acc_cta)?;
-                if a_fp4 {
-                    pool.append_f32_block_fp4(&a_sl.tensor, &a_off, &a_box, sa)?;
-                } else {
-                    pool.append_f32_block(&a_sl.tensor, &a_off, &a_box, sa)?;
-                }
-            }
-            if scales.is_some() {
-                apply_block_scales(sa, &sa_scales[acc_idx], k, nblocks);
-            }
-            let sp = ctx
-                .state
-                .values
-                .tmem
-                .by_cta
-                .get_mut(&acc_cta)
-                .ok_or_else(|| {
-                    InterpreterError::new(
-                        "missing_tmem_scratchpad",
-                        "tcgen05_mma writes a missing TMEM scratchpad",
-                    )
-                })?;
-            let grid = sp.data_as_f32_mut();
-            let mut col_off = 0usize;
-            for seg_idx in 0..cta_ids.len() {
-                super::super::blas::sgemm_nt_strided(
-                    rows_per_cta,
-                    n_seg,
-                    k,
-                    sa,
-                    0,
-                    k,
-                    sb,
-                    seg_idx * n_seg * k,
-                    k,
-                    grid,
-                    c0 + col_off,
-                    stride,
-                    beta,
-                );
-                col_off += n_seg;
-            }
-            sp.valid
-                .slice_mut(ndarray::s![0..rows_per_cta, c0..c0 + n_total])
-                .fill(true);
-        }
-        Ok(())
-    })
-}
-
-fn eval_uniform_usize(
-    ctx: &WarpContext,
-    vals: &[crate::ir::ScalarValue],
-    label: &str,
-) -> IResult<Vec<usize>> {
-    vals.iter()
-        .map(|v| {
-            ctx.eval_scalar_uniform(v, label, "divergent_operands")
-                .map(|x| x as usize)
-        })
-        .collect()
-}
-
-fn matmul_f32(a: &Array2<f32>, b: &Array2<f32>) -> Array2<f32> {
-    // D[m,n] = A[m,k] @ B[n,k]ᵀ via OpenBLAS sgemm (non-contiguous F/B path).
-    let (m, k) = (a.nrows(), a.ncols());
-    let n = b.nrows();
-    let a_s = a.as_standard_layout();
-    let b_s = b.as_standard_layout();
-    let mut c = vec![0.0f32; m * n];
-    super::super::blas::sgemm_nt(
-        m,
-        n,
-        k,
-        a_s.as_slice().unwrap(),
-        b_s.as_slice().unwrap(),
-        &mut c,
-        0.0,
-    );
-    Array2::from_shape_vec((m, n), c).unwrap()
-}
-
-fn check_mma_operand_shapes(
-    a: &Array2<f32>,
-    b: &Array2<f32>,
-    m: usize,
-    n: usize,
-    k: usize,
-) -> IResult<()> {
-    if a.dim() != (m, k) || b.dim() != (n, k) {
-        return Err(InterpreterError::new(
-            "tcgen05_mma_shape",
-            "tcgen05_mma operand shape does not match m/n/k",
-        ));
-    }
-    Ok(())
-}
-
-fn read_operand(
-    ctx: &WarpContext,
-    sl: &TensorSlice,
-    transpose: bool,
-    cta_id: usize,
-) -> IResult<Array2<f32>> {
-    let _tr = super::super::runner::prof_now();
-    let offsets: Vec<usize> = sl
-        .offsets
-        .iter()
-        .map(|o| {
-            ctx.eval_scalar_uniform(o, "mma operand offset", "divergent_operands")
-                .map(|x| x as usize)
-        })
-        .collect::<IResult<_>>()?;
-    let shape: Vec<usize> = sl
-        .shape
-        .iter()
-        .map(|s| {
-            ctx.eval_scalar_uniform(s, "mma operand shape", "divergent_operands")
-                .map(|x| x as usize)
-        })
-        .collect::<IResult<_>>()?;
-    // Staged operands arrive as (1, ..., rows, k) boxes of a stage-major
-    // tensor (runtime pipeline stage in the leading offset); squeeze the
-    // leading unit dims down to the rank-2 (rows, k) tile the MMA consumes.
-    let lead = shape.len().saturating_sub(2);
-    if shape.len() < 2 || shape[..lead].iter().any(|&d| d != 1) {
-        return Err(InterpreterError::new(
-            "tcgen05_mma_shape",
-            "tcgen05_mma operand shape does not match m/n/k",
-        ));
-    }
-    let shape2 = [shape[lead], shape[lead + 1]];
-    super::super::runner::prof_end("O:resolve", _tr);
-    let _td = super::super::runner::prof_now();
-    let flat = match sl.tensor.space {
-        MemorySpace::Smem => {
-            let t_read = super::super::runner::prof_now();
-            let flat = ctx
-                .state
-                .values
-                .smem
-                .pool_for(cta_id)?
-                .read_block(&sl.tensor, &offsets, &shape)?;
-            super::super::runner::prof_end("MMA:smem_read_block", t_read);
-            flat
-        }
-        _ => {
-            return Err(InterpreterError::new(
-                "tcgen05_mma_operand_space",
-                "tcgen05_mma slice operands must be SMEM in value mode",
-            ))
-        }
-    };
-    let t_convert = super::super::runner::prof_now();
-    let mat = flat
-        .to_f32_compute()
-        .into_shape_with_order((shape2[0], shape2[1]))
-        .unwrap();
-    let out = if transpose { mat.t().to_owned() } else { mat };
-    super::super::runner::prof_end("MMA:operand_to_f32", t_convert);
-    super::super::runner::prof_end("C:mma_operand_read", _td);
-    Ok(out)
-}
-
-/// Read a TMEM A/B operand tile: the logical (rows, cols) element tile at the
-/// operand's absolute physical base, unpacked per the operand dtype (f16/bf16
-/// pack two elements per cell, low half first). This is the value model's
-/// accumulator-readback abstraction (the GDN state read straight out of TMEM).
-fn read_tmem_operand(
-    ctx: &WarpContext,
-    op: &TmemOperand,
-    rows: usize,
-    cols: usize,
-    transpose: bool,
-    cta_id: usize,
-) -> IResult<Array2<f32>> {
-    // A transposed operand is physically stored (k_cols, rows) and read back
-    // transposed to (rows, k_cols) — the same extent swap mma_operand_regions
-    // makes for the trace region (this fn is its value-side mirror).
-    let (phys_rows, phys_cols) = if transpose {
-        (cols, rows)
-    } else {
-        (rows, cols)
-    };
-    let (row0, col0) = eval_tmem_operand(ctx, op, "mma operand")?;
-    let oob = || {
-        InterpreterError::new(
-            "tcgen05_mma_out_of_range",
-            "tcgen05_mma addresses a TMEM cell out of range",
-        )
-    };
-    if row0 + phys_rows > TMEM_ROWS {
-        return Err(oob());
-    }
-    let sp = ctx.state.values.tmem.scratchpad_for(cta_id)?;
-    let mat = if is_packed_tmem_dtype(op.dtype) {
-        if phys_cols % 2 != 0 {
-            return Err(InterpreterError::new(
-                "tcgen05_mma_operand",
-                "packed-half TMEM operand needs an even column extent",
-            ));
-        }
-        let cell_cols = phys_cols / 2;
-        if col0 + cell_cols > TMEM_COLS {
-            return Err(oob());
-        }
-        let mut lanes = Vec::with_capacity(phys_rows * cell_cols);
-        let mut cell_cols_v = Vec::with_capacity(phys_rows * cell_cols);
-        for r in 0..phys_rows {
-            for c in 0..cell_cols {
-                lanes.push(row0 + r);
-                cell_cols_v.push(col0 + c);
-            }
-        }
-        let pairs = sp.read_packed_half_cells(op.dtype, &lanes, &cell_cols_v)?;
-        let mut flat = Vec::with_capacity(phys_rows * phys_cols);
-        for (lo, hi) in pairs {
-            flat.push(lo);
-            flat.push(hi);
-        }
-        Array2::from_shape_vec((phys_rows, phys_cols), flat).map_err(|_| {
-            InterpreterError::new(
-                "tcgen05_mma_shape",
-                "mma operand shape does not match m/n/k",
-            )
-        })?
-    } else {
-        if col0 + phys_cols > TMEM_COLS {
-            return Err(oob());
-        }
-        sp.read_cell_block(op.dtype, row0, row0 + phys_rows, col0, col0 + phys_cols)?
-            .to_f32_compute()
-            .into_shape_with_order((phys_rows, phys_cols))
-            .unwrap()
-    };
-    Ok(if transpose { mat.t().to_owned() } else { mat })
-}
-
-fn read_mma_operand(
-    ctx: &WarpContext,
-    operand: &MmaOperand,
-    rows: usize,
-    cols: usize,
-    transpose: bool,
-    cta_id: usize,
-) -> IResult<Array2<f32>> {
-    match operand {
-        MmaOperand::Slice(sl) => read_operand(ctx, sl, transpose, cta_id),
-        MmaOperand::Tmem(op) => read_tmem_operand(ctx, op, rows, cols, transpose, cta_id),
-    }
-}
-
-/// Value-side mirror of `mma_operand_regions`: read the operand box from
-/// EVERY CTA in `cta_ids` (row-concatenated in cta order; one CTA for
-/// cta_group=1).
-fn read_mma_operand_ctas(
-    ctx: &WarpContext,
-    operand: &MmaOperand,
-    rows_per_cta: usize,
-    k_cols: usize,
-    transpose: bool,
-    cta_ids: &[usize],
-) -> IResult<Array2<f32>> {
-    let halves: Vec<Array2<f32>> = cta_ids
-        .iter()
-        .map(|&c| read_mma_operand(ctx, operand, rows_per_cta, k_cols, transpose, c))
-        .collect::<IResult<_>>()?;
-    if halves.len() == 1 {
-        return Ok(halves.into_iter().next().unwrap());
-    }
-    let views: Vec<_> = halves.iter().map(|h| h.view()).collect();
-    ndarray::concatenate(ndarray::Axis(0), &views)
-        .map_err(|_| InterpreterError::new("tcgen05_mma_shape", "mma operand pair concat failed"))
-}
-
-/// Base column and rows-per-CTA of the in-place accumulator window. The dst
-/// operand carries the absolute physical (lane, col); lane must be 0 (the
-/// full-datapath layouts are lane-anchored).
-fn inplace_geometry(
-    ctx: &WarpContext,
-    dst: &TmemOperand,
-    cta_group: u8,
-    lane_align: u8,
-) -> IResult<(usize, usize)> {
-    let (row, col) = eval_tmem_operand(ctx, dst, "mma dst")?;
-    if row != 0 {
-        return Err(InterpreterError::new(
-            "tcgen05_mma_dst_offset",
-            "mma dst row offset must be 0",
-        ));
-    }
-    if lane_align != 0 {
-        return Err(InterpreterError::new(
-            "tcgen05_mma_lane_align",
-            "tcgen05_mma lane_align is only valid for the cta_group=1 m=64 (Layout F) accumulator",
-        ));
-    }
-    // Layout D: the whole accumulator (m rows); Layout A: 128 rows per CTA.
-    let rows_per_cta = if cta_group == 1 { TMEM_ROWS } else { 128 };
-    Ok((col, rows_per_cta))
-}
-
-/// Non-contiguous Layout F/B (and transposed / non-rank-2 contiguous operands): take the
-/// full product, then write each closed-form `mma_blocks` rectangle into TMEM. The block
-/// coordinates ARE the layout — no per-element placement table.
-#[allow(clippy::too_many_arguments)]
-fn accumulate_blocks(
-    ctx: &mut WarpContext,
-    dst: &TmemOperand,
-    product: &Array2<f32>,
-    m: usize,
-    n: usize,
-    cta_group: u8,
-    accum: bool,
-    cta_ids: &[usize],
-    lane_align: u8,
-) -> IResult<()> {
-    let (row, dst_col) = eval_tmem_operand(ctx, dst, "mma dst")?;
-    if row != 0 {
-        return Err(InterpreterError::new(
-            "tcgen05_mma_dst_offset",
-            "mma dst row offset must be 0",
-        ));
-    }
-    let first = cta_ids.first().ok_or_else(|| {
-        InterpreterError::new(
-            "tcgen05_mma_unsupported",
-            "tcgen05_mma has no destination CTA",
-        )
-    })?;
-    let scratchpad = ctx.state.values.tmem.by_cta.get(first).ok_or_else(|| {
-        InterpreterError::new(
-            "missing_tmem_scratchpad",
-            "tcgen05_mma writes a missing TMEM scratchpad",
-        )
-    })?;
-    let (n_lanes, n_cols) = scratchpad.data.dim();
-    for &cta_id in cta_ids.iter().skip(1) {
-        if !ctx.state.values.tmem.by_cta.contains_key(&cta_id) {
-            return Err(InterpreterError::new(
-                "missing_tmem_scratchpad",
-                "tcgen05_mma writes a missing TMEM scratchpad",
-            ));
-        }
-    }
-    let blocks = mma_blocks(m, n, cta_group, lane_align, dst_col, n_lanes, n_cols)?;
-
-    if dst.dtype == DType::F32 {
-        let timer = super::super::runner::prof_now();
-        for block in &blocks {
-            let cta_id = cta_ids[block.cta_idx];
-            let sp = ctx
-                .state
-                .values
-                .tmem
-                .by_cta
-                .get_mut(&cta_id)
-                .ok_or_else(|| {
-                    InterpreterError::new(
-                        "missing_tmem_scratchpad",
-                        "tcgen05_mma writes a missing TMEM scratchpad",
-                    )
-                })?;
-            if !sp.accumulate_f32_cell_block_from(
-                dst.dtype,
-                block.lane_start,
-                block.rows,
-                block.col_start,
-                block.cols,
-                product,
-                block.m_lo,
-                block.n_lo,
-                accum,
-            )? {
-                break;
-            }
-        }
-        super::super::runner::prof_end("MMA:direct_tmem_accumulate", timer);
-        return Ok(());
-    }
-
-    Err(InterpreterError::new(
-        "tcgen05_mma_dtype",
-        "tcgen05_mma dst dtype must be f32",
-    ))
 }
 
 #[cfg(test)]
@@ -2158,107 +1651,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn apply_block_scales_fp8_per_row_matches_legacy() {
-        // nblocks=1 (fp8): one scale over the whole k-row, identical to the
-        // pre-generalization per-row loop.
-        let mut buf = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]; // 2 rows x k=3
-        apply_block_scales(&mut buf, &[2.0, 0.5], 3, 1);
-        assert_eq!(buf, vec![2.0, 4.0, 6.0, 2.0, 2.5, 3.0]);
-    }
-
-    #[test]
-    fn apply_block_scales_nvfp4_per_16block() {
-        // nblocks=2: row split into two blocks of width 2; block 0 of row 0 x4,
-        // block 1 x1; row 1 blocks x0.5 and x8.
-        let mut buf = vec![1.0f32, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]; // 2 rows x k=4
-        apply_block_scales(&mut buf, &[4.0, 1.0, 0.5, 8.0], 4, 2);
-        assert_eq!(buf, vec![4.0, 4.0, 1.0, 1.0, 0.5, 0.5, 8.0, 8.0]);
-        // scale == 1.0 is a no-op (skips the inner loop), value unchanged
-    }
-
-    #[test]
-    fn mma_blocks_model_m64_lane_align_halves() {
-        // Layout F: four lane-runs of 16 at stride 32, plus the lane-align offset.
-        let low = mma_blocks(64, 8, 1, 0, 6, TMEM_ROWS, TMEM_COLS).unwrap();
-        assert_eq!(low.len(), 4);
-        for (g, b) in low.iter().enumerate() {
-            assert_eq!(b.cta_idx, 0);
-            assert_eq!(b.m_lo, g * 16);
-            assert_eq!(b.rows, 16);
-            assert_eq!((b.n_lo, b.cols), (0, 8));
-            assert_eq!(b.col_start, 6); // absolute dst col
-            assert_eq!(b.lane_start, 32 * g); // lane_align 0
-        }
-
-        let high = mma_blocks(64, 8, 1, 16, 6, TMEM_ROWS, TMEM_COLS).unwrap();
-        assert_eq!(high[0].lane_start, 16);
-        assert_eq!(high[3].lane_start, 112); // 96 + lane_align 16
-    }
-
-    #[test]
-    fn mma_blocks_model_cta2_m128_layout_b() {
-        // m split across the CTA pair; n split in half into the upper 64 lanes.
-        let blocks = mma_blocks(128, 32, 2, 0, 3, TMEM_ROWS, TMEM_COLS).unwrap();
-        assert_eq!(blocks.len(), 4);
-        let has = |cta, m_lo, n_lo, lane_start| {
-            blocks.iter().any(|b| {
-                b.cta_idx == cta
-                    && b.m_lo == m_lo
-                    && b.n_lo == n_lo
-                    && b.lane_start == lane_start
-                    && b.rows == 64
-                    && b.cols == 16
-                    && b.col_start == 3
-            })
-        };
-        assert!(has(0, 0, 0, 0)); // cta0, n first half -> lanes [0,64)
-        assert!(has(0, 0, 16, 64)); // cta0, n second half -> lanes [64,128)
-        assert!(has(1, 64, 0, 0)); // cta1, n first half
-        assert!(has(1, 64, 16, 64)); // cta1, n second half
-    }
-
-    #[test]
-    fn mma_blocks_model_cta2_m256_layout_a_pair_split() {
-        let blocks = mma_blocks(256, 32, 2, 0, 12, TMEM_ROWS, TMEM_COLS).unwrap();
-        assert_eq!(blocks.len(), 2);
-        assert_eq!(
-            (blocks[0].cta_idx, blocks[0].m_lo, blocks[0].rows),
-            (0, 0, 128)
-        );
-        assert_eq!(
-            (blocks[0].lane_start, blocks[0].col_start, blocks[0].cols),
-            (0, 12, 32)
-        );
-        assert_eq!(
-            (blocks[1].cta_idx, blocks[1].m_lo, blocks[1].lane_start),
-            (1, 128, 0)
-        );
-        assert_eq!(blocks[1].col_start, 12); // absolute dst col
-    }
-
-    #[test]
-    fn mma_blocks_reject_lane_align_for_full_datapath_layouts() {
-        for (m, cta_group) in [(128, 1), (128, 2), (256, 2)] {
-            let err = mma_blocks(m, 32, cta_group, 16, 0, 128, 512).unwrap_err();
-            assert_eq!(err.code, "tcgen05_mma_lane_align");
-        }
-    }
-
-    #[test]
-    fn mma_blocks_reject_tmem_bounds() {
-        // Layout F at lane_align 16: the top run reaches lane 128 > 127.
-        let err = mma_blocks(64, 8, 1, 16, 0, 127, TMEM_COLS).unwrap_err();
-        assert_eq!(err.code, "tcgen05_mma_out_of_range");
-        // col_start 500 + 32 cols overruns the 512-column grid.
-        let err = mma_blocks(128, 32, 1, 0, 500, TMEM_ROWS, TMEM_COLS).unwrap_err();
-        assert_eq!(err.code, "tcgen05_mma_out_of_range");
-    }
-
-    #[test]
-    fn check_mma_operand_shapes_fails_closed() {
-        let a = Array2::<f32>::zeros((128, 16));
-        let b = Array2::<f32>::zeros((64, 16));
-        let err = check_mma_operand_shapes(&a, &b, 128, 128, 16).unwrap_err();
-        assert_eq!(err.code, "tcgen05_mma_shape");
+    fn e8m0_fnu_decodes_finite_range_and_nan_slot() {
+        assert_eq!(decode_e8m0_fnu(0), 2.0f32.powi(-127));
+        assert_eq!(decode_e8m0_fnu(127), 1.0);
+        assert_eq!(decode_e8m0_fnu(254), 2.0f32.powi(127));
+        assert!(decode_e8m0_fnu(255).is_nan());
     }
 }

@@ -23,6 +23,32 @@ def test_flash_attention4_builds_all_bench_configs(entry):
     assert len(kernel.args) == 4
 
 
+def test_flash_attention4_only_mma_operands_use_smem_layout():
+    kernel = build_flash_attention4(FlashAttention4Config(seq_len=1024, launch_shape=(1,)))
+
+    def walk(stmts):
+        for stmt in stmts:
+            yield stmt
+            if stmt.kind in {"if", "for_loop", "loop", "for_each_task", "scheduler_impl"}:
+                yield from walk(stmt.body)
+
+    swizzled = {
+        stmt.tensor.id
+        for stmt in kernel.body
+        if stmt.kind == "tensor_def" and stmt.tensor.layout is not None
+    }
+    mma_operands = set()
+    for stmt in walk(kernel.body):
+        if stmt.kind != "tcgen05_mma":
+            continue
+        if stmt.a.kind == "smem":
+            mma_operands.add(stmt.a.tile.tensor.id)
+        mma_operands.add(stmt.b.tensor.id)
+
+    assert swizzled
+    assert swizzled <= mma_operands
+
+
 # Resident protocol tier: every kv-head config at seq <= 2048 plus one s4096
 # representative (~2 min total). Per-shape cost scales x4 per seq doubling
 # (value/trace/check alike), so the s4096/s8192 tiers are NOT resident — the
@@ -36,8 +62,7 @@ _PROTOCOL_TIER = [c for c in CONFIGS if c["seq_len"] <= 2048] + [
 # The s4096 representative is minutes on its own; the rest of the tier is
 # seconds, so only it carries `slow`.
 _TIER_PARAMS = [
-    pytest.param(c, marks=pytest.mark.slow) if c["seq_len"] >= 4096 else c
-    for c in _PROTOCOL_TIER
+    pytest.param(c, marks=pytest.mark.slow) if c["seq_len"] >= 4096 else c for c in _PROTOCOL_TIER
 ]
 
 

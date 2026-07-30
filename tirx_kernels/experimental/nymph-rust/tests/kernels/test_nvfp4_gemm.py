@@ -23,9 +23,9 @@ _E2M1 = np.array(
 
 
 def _pack_fp4(codes: np.ndarray) -> np.ndarray:
-    """(R, K) e2m1 nibble codes -> (R, K//2) u8: element 2i in the low nibble,
-    2i+1 in the high nibble."""
-    return (codes[:, 0::2] | (codes[:, 1::2] << 4)).astype(np.uint8)
+    """(R, K) e2m1 nibble codes -> (R, K//2) u8: element 2i in the high nibble,
+    2i+1 in the low nibble."""
+    return ((codes[:, 0::2] << 4) | codes[:, 1::2]).astype(np.uint8)
 
 
 def _round_bf16(x: np.ndarray) -> np.ndarray:
@@ -35,11 +35,14 @@ def _round_bf16(x: np.ndarray) -> np.ndarray:
 
 
 def _pack_sf(scale_p: np.ndarray) -> np.ndarray:
-    """(R, K//16) power-of-two exponents -> the kernel's ``f8e4m3`` (R, K//16)
-    args, passed as the exact POWER-OF-TWO f32 values (the interpreter coerces
-    an f8e4m3 arg from float32 and rounds to e4m3, so a power of two round-trips
-    bit-exactly)."""
-    return (2.0**scale_p).astype(np.float32)
+    """Encode logical scales in the plain physical ``(R//128,K//64,32,16)`` view."""
+    rows, scale_k = scale_p.shape
+    values = (2.0**scale_p).astype(np.float32)
+    return (
+        values.reshape(rows // 128, 4, 32, scale_k // 4, 4)
+        .transpose(0, 3, 2, 1, 4)
+        .reshape(rows // 128, scale_k // 4, 32, 16)
+    )
 
 
 def _prepare(m: int, n: int, k: int, alpha: float, seed: int):

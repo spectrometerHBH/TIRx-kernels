@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Literal, NamedTuple
+from typing import Literal
 
 from .nymph_rs import (
     _SCALAR_GMEM_DTYPES,
+    BlockScaleSpec,
     BreakIf,
     ClcQueryCancel,
     ClcTryCancel,
@@ -43,6 +44,7 @@ from .nymph_rs import (
     MBarrierInit,
     MBarrierWait,
     MemorySpace,
+    MmaAOperand,
     NamedBarrier,
     RegAdd,
     RegBitwise,
@@ -73,6 +75,7 @@ from .nymph_rs import (
     SetMaxNReg,
     Shape,
     ShuffleSync,
+    SmemTile,
     StMatrix,
     Stmt,
     StoreScalar,
@@ -89,10 +92,11 @@ from .nymph_rs import (
     TensorSlice,
     TmaLoad,
     TmaStore,
+    TmemAddr,
     TmemAlloc,
     TmemDealloc,
-    TmemOperand,
     TmemRelinquish,
+    TmemTensor,
     Var,
     VarBinding,
     WarpMma,
@@ -101,6 +105,11 @@ from .nymph_rs import (
 )
 
 Tcgen05LdStShape = Literal["32x32b", "16x32bx2", "16x64b", "16x128b", "16x256b"]
+Tcgen05CpShape = Literal["128x256b", "4x256b", "128x128b", "64x128b", "32x128b"]
+Tcgen05CpMulticast = Literal["none", "warp2_02_13", "warp2_01_23", "warp4"]
+MmaElemFormat = Literal["f16", "bf16", "f8_e4m3", "f4_e2m1"]
+ScaleFormat = Literal["e8m0_fnu", "e4m3_fn"]
+TmemAForm = Literal["flat", "bank_batched"]
 MatrixShape = Literal["m8n8"]
 MatrixDType = Literal["b16"]
 SchedulerPolicy = Literal["grid_stride", "clc", "atomic_steal", "custom"]
@@ -109,67 +118,10 @@ RegUnaryOp = Literal["exp2", "log2", "rcp", "neg"]
 RegReduceOp = Literal["max", "sum"]
 RegCondScope = Literal["warp", "warpgroup"]
 
+
 # Single source of the GMEM-scalar tensor-dtype -> ScalarDType mapping lives in
 # ir.py (`_SCALAR_GMEM_DTYPES`); the builder reuses it for the default scalar
 # dtype of a `ScalarDef(initial=TensorSlice)`.
-
-_PACKED_HALF_DTYPES = (DType.F16, DType.BF16)
-
-
-class TmemBand(NamedTuple):
-    """A pure-Python TMEM column-band descriptor (NOT in the IR): one region of the
-    shared 128-lane x 512-column TMEM, addressed by its absolute physical base lane
-    + 32-bit-cell column plus the dtype its cells are (un)packed as. This replaces
-    the old TMEM `Tensor`+`TmemLayout` — the IR carries flat `TmemOperand`s, so the
-    band only exists to keep a kernel's column plan named and traceable. `lane0` is
-    the band's base lane: 0 for the full-datapath lane-anchored layouts, 64 for a
-    lower-half 64-row layout (lane = row + 64)."""
-
-    col0: int
-    dtype: DType
-    lane0: int = 0
-
-    def at(self, row: ScalarValue = 0, col: ScalarValue = 0) -> TmemOperand:
-        """The operand at absolute physical (lane0 + row, col0 + col) — `col` in
-        32-bit cells (the tcgen05.ld/st/cp and MMA-dst addressing unit)."""
-        return TmemOperand(self.lane0 + row, self.col0 + col, self.dtype)
-
-    def elem(self, row: ScalarValue = 0, col: ScalarValue = 0) -> TmemOperand:
-        """The operand at logical ELEMENT (row, col) of the band — f16/bf16 pack
-        two elements per 32-bit cell (low half first), f32/i32/u32 one per cell.
-        This is the old TMEM-tensor slice-offset unit (MMA A/B operands)."""
-        return self.at(row, col // 2 if self.dtype in _PACKED_HALF_DTYPES else col)
-
-
-class SfTmemBand(NamedTuple):
-    """A block scale-factor TMEM band (pure Python, NOT in the IR): `rows` logical
-    scaled rows (may exceed 128 — e.g. the 256-row SFB) of `nblocks` scale blocks
-    each, folded onto the physical 128 lanes at base column `col0`. The folding is
-    canon's sf_tmem_layout / the interpreter's SF rule: logical (row, block) sits
-    at physical ``lane = row % 128``, ``col = col0 + (row // 128) * nblocks +
-    block``. nvfp4 uses dtype=f8e4m3 (one raw scale byte per cell); fp8 blockwise
-    uses dtype=u32 with nblocks=1 (one packed 4-byte scale cell per row, so the
-    rule degenerates to ``col = col0 + row // 128``)."""
-
-    col0: int
-    rows: int
-    nblocks: int
-    dtype: DType = DType.F8E4M3
-
-    @property
-    def n_cols(self) -> int:
-        """The folded physical column span: ceil(rows / 128) super-blocks of
-        `nblocks` columns each."""
-        return ((self.rows + 127) // 128) * self.nblocks
-
-    def cell(self, row: int, block: int) -> tuple[int, int]:
-        """The folded physical (lane, col) of logical (row, block)."""
-        return (row % 128, self.col0 + (row // 128) * self.nblocks + block)
-
-    def at(self, col: ScalarValue = 0) -> TmemOperand:
-        """The MMA sfa/sfb / tcgen05.cp operand: lane-anchored at row 0, at the
-        band's physical base column (+ `col` cells, e.g. a per-stage offset)."""
-        return TmemOperand(0, self.col0 + col, self.dtype)
 
 
 class TaskToken:
@@ -237,17 +189,9 @@ class IRBuilder:
         return product
 
     def arg(
-        self,
-        *,
-        space: MemorySpace,
-        dtype: DType,
-        shape: Shape,
-        layout: Layout | None = None,
-        byte_offset: int | None = None,
+        self, *, space: MemorySpace, dtype: DType, shape: Shape, byte_offset: int | None = None
     ) -> Tensor:
-        tensor = Tensor(
-            space=space, dtype=dtype, shape=shape, layout=layout, byte_offset=byte_offset
-        )
+        tensor = Tensor(space=space, dtype=dtype, shape=shape, byte_offset=byte_offset)
         self._args.append(tensor)
         return tensor
 
@@ -259,18 +203,48 @@ class IRBuilder:
         shape: Shape,
         layout: Layout | None = None,
         byte_offset: int | None = None,
-        reg_frag: tuple[str, int | None] | None = None,
     ) -> Tensor:
         tensor = Tensor(
-            space=space,
-            dtype=dtype,
-            shape=shape,
-            layout=layout,
-            byte_offset=byte_offset,
-            reg_frag=reg_frag,
+            space=space, dtype=dtype, shape=shape, layout=layout, byte_offset=byte_offset
         )
         self._append(TensorDef(tensor))
         return tensor
+
+    def tmem_tensor(self, start_col: int) -> TmemTensor:
+        """Create an idless logical TMEM view at an explicit physical column.
+
+        This does not allocate storage; ``tmem_alloc`` remains a separate
+        physical lifecycle statement.
+        """
+        return TmemTensor(start_col)
+
+    def smem_tile(
+        self,
+        tensor: Tensor,
+        *,
+        prefix_indices: tuple[ScalarValue, ...],
+        row_offset: ScalarValue,
+        col_offset: ScalarValue,
+        rows: int,
+        cols: int,
+    ) -> SmemTile:
+        """Create a physical two-dimensional SMEM tile without shape inference."""
+        return SmemTile(
+            tensor=tensor,
+            prefix_indices=prefix_indices,
+            row_offset=row_offset,
+            col_offset=col_offset,
+            rows=rows,
+            cols=cols,
+        )
+
+    def mma_a_smem(self, tile: SmemTile) -> MmaAOperand:
+        """Tag an explicit SMEM tile as an MMA A operand."""
+        return MmaAOperand.smem(tile)
+
+    def mma_a_tmem(self, addr: TmemAddr, *, form: TmemAForm) -> MmaAOperand:
+        """Tag an explicit TMEM address and physical form as an MMA A operand."""
+        return MmaAOperand.tmem(addr, form)
 
     def tmem_alloc(
         self, base_col: int, n_cols: int, addr_byte_offset: int, cta_group: Literal[1, 2] = 1
@@ -754,76 +728,53 @@ class IRBuilder:
 
     def tcgen05_mma(
         self,
-        dst: TmemOperand,
-        a: Tensor | TensorSlice | TmemOperand,
-        b: Tensor | TensorSlice | TmemOperand,
+        dst: TmemAddr,
+        a: MmaAOperand,
+        b: SmemTile,
         *,
-        m: int,
-        n: int,
-        k: int = 16,
-        accum: ScalarValue = 0,
-        trans_a: bool = False,
-        trans_b: bool = False,
-        cta_group: Literal[1, 2] = 1,
-        sfa: TmemOperand | None = None,
-        sfb: TmemOperand | None = None,
-        sf_byte: int = 0,
-        sf_e4m3: bool = False,
-        sf_block: int = 0,
-        a_fp4: bool = False,
-        b_fp4: bool = False,
-        lane_align: int = 0,
+        mma_m: int,
+        mma_n: int,
+        format: MmaElemFormat,
+        block_scale: BlockScaleSpec | None,
+        accum: ScalarValue,
+        trans_a: bool,
+        trans_b: bool,
+        ws: bool,
+        cta_group: Literal[1, 2],
     ) -> None:
-        """``dst``/``sfa``/``sfb`` are absolute physical TMEM operands
-        (``TmemOperand`` or a ``(row, col, dtype)`` tuple); ``a``/``b`` are SMEM
-        tiles or TMEM operands. A dense f16/bf16 MMA carries k = the full
-        k-tile (validate reads it as an ordered run of k/16 atomic MMAs, exactly
-        canon's one-issue full-K ``gemm_async``). ``accum`` is a RUNTIME scalar
-        (0 = overwrite, nonzero = accumulate) so a merged k-tile loop can carry
-        canon's accum cell; a Python bool/int literal folds to the compile-time
-        form. ``sfa``/``sfb`` make this a block-scaled MMA: nvfp4 (e4m3 decode,
-        ``sf_e4m3=True, sf_block=16``) holds one scale byte per 16 contiguous
-        k-elements; fp8 (UE8M0, default) one scale per operand row with
-        ``sf_byte`` selecting the packed byte."""
-        if isinstance(a, Tensor):
-            a = a[...]
-        if isinstance(b, Tensor):
-            b = b[...]
+        """Append one explicit dense or block-scaled tcgen05 MMA."""
         if isinstance(accum, bool):
             accum = int(accum)
-        stmt = Tcgen05Mma(
-            dst=dst,
-            a=a,
-            b=b,
-            m=m,
-            n=n,
-            k=k,
-            accum=accum,
-            trans_a=trans_a,
-            trans_b=trans_b,
-            cta_group=cta_group,
-            sfa=sfa,
-            sfb=sfb,
-            sf_byte=sf_byte,
-            sf_e4m3=sf_e4m3,
-            sf_block=sf_block,
-            a_fp4=a_fp4,
-            b_fp4=b_fp4,
-            lane_align=lane_align,
+        self._append(
+            Tcgen05Mma(
+                dst=dst,
+                a=a,
+                b=b,
+                mma_m=mma_m,
+                mma_n=mma_n,
+                format=format,
+                block_scale=block_scale,
+                accum=accum,
+                trans_a=trans_a,
+                trans_b=trans_b,
+                ws=ws,
+                cta_group=cta_group,
+            )
         )
-        self._append(stmt)
 
     def tcgen05_cp(
-        self, dst: TmemOperand, src: Tensor | TensorSlice, *, cta_group: Literal[1, 2] = 1
+        self,
+        dst: TmemAddr,
+        src: SmemTile,
+        *,
+        shape: Tcgen05CpShape,
+        multicast: Tcgen05CpMulticast,
+        cta_group: Literal[1, 2],
     ) -> None:
-        """``tcgen05.cp`` — bulk-copy packed u32 scale cells (or raw e4m3 scale
-        bytes for nvfp4) from SMEM into TMEM at the absolute physical base
-        ``dst``. With ``cta_group=2`` the leader's single issue drives both
-        CTAs: each CTA copies from its own SMEM into its own TMEM (row r ->
-        lane r % 128, col base + r // 128)."""
-        if isinstance(src, Tensor):
-            src = src[...]
-        self._append(Tcgen05Cp(dst=dst, src=src, cta_group=cta_group))
+        """Append one physical SMEM-to-TMEM tcgen05.cp instruction."""
+        self._append(
+            Tcgen05Cp(dst=dst, src=src, shape=shape, multicast=multicast, cta_group=cta_group)
+        )
 
     def tcgen05_commit(
         self,
@@ -841,14 +792,12 @@ class IRBuilder:
     def tcgen05_ld(
         self,
         dst: Tensor | TensorSlice,
-        src: TmemOperand,
+        src: TmemAddr,
         *,
         shape: Tcgen05LdStShape = "32x32b",
         num: Literal[1, 2, 4, 8, 16, 32, 64, 128] = 1,
     ) -> None:
-        """``tcgen05.ld`` — TMEM -> REG datapath read. ``src`` is the absolute
-        physical TMEM base address (``TmemOperand(row, col, dtype)``); ``dst``
-        the REG fragment."""
+        """``tcgen05.ld`` — explicit TMEM address to REG datapath read."""
         if isinstance(dst, Tensor):
             dst = dst[...]
         stmt = Tcgen05Ld(dst=dst, src=src, shape=shape, num=num)
@@ -859,7 +808,7 @@ class IRBuilder:
 
     def tcgen05_st(
         self,
-        dst: TmemOperand,
+        dst: TmemAddr,
         src: Tensor | TensorSlice,
         *,
         shape: Tcgen05LdStShape = "32x32b",

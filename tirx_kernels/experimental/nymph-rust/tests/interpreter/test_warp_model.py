@@ -62,12 +62,27 @@ def test_single_thread_issue_ops_reject_multi_lane_masks():
 
     # tcgen05_mma from a full warp: same build-time rejection.
     b = builder("gate_mma", num_warps=4, smem_size_bytes=8192)
-    acc = nr.TmemOperand(0, 0, nr.DType.F32)
+    acc = b.tmem_tensor(0).at(0, 0)
     a = b.tensor(space=nr.MemorySpace.SMEM, dtype=nr.DType.F16, shape=(128, 16), byte_offset=0)
     bb = b.tensor(space=nr.MemorySpace.SMEM, dtype=nr.DType.F16, shape=(16, 16), byte_offset=4096)
+    a_tile = b.smem_tile(a, prefix_indices=(), row_offset=0, col_offset=0, rows=128, cols=16)
+    b_tile = b.smem_tile(bb, prefix_indices=(), row_offset=0, col_offset=0, rows=16, cols=16)
     with b.if_warp(0):
         b.tmem_alloc(0, 32, addr_byte_offset=0)
-        b.tcgen05_mma(acc, a, bb, m=128, n=16, k=16)
+        b.tcgen05_mma(
+            acc,
+            b.mma_a_smem(a_tile),
+            b_tile,
+            mma_m=128,
+            mma_n=16,
+            format="f16",
+            block_scale=None,
+            accum=False,
+            trans_a=False,
+            trans_b=False,
+            ws=False,
+            cta_group=1,
+        )
     with pytest.raises(ValueError, match="single_issue_scope"):
         b.build()
 

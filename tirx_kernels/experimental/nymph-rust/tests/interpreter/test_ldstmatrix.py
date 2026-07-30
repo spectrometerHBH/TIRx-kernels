@@ -23,12 +23,12 @@ def _source_values(num):
 def _ldmatrix_kernel(num, trans):
     rows = 8 * num
     nbytes = rows * 8 * 2
-    b = builder(f"ldmatrix_x{num}_{'t' if trans else 'n'}", smem_size_bytes=nbytes)
+    b = builder(f"ldmatrix_x{num}_{'t' if trans else 'n'}", smem_size_bytes=nbytes + 8)
     source = gmem_arg(b, dtype=nr.DType.U16, shape=(rows, 8))
     out = gmem_arg(b, dtype=nr.DType.U32, shape=(32, num))
     smem = smem_tensor(b, dtype=nr.DType.U16, shape=(rows, 8), byte_offset=0)
     frag = reg_tensor(b, dtype=nr.DType.U32, shape=(num,))
-    mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
+    mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=nbytes)
 
     with b.if_warp(0), b.if_elected():
         b.mbarrier_init(mbar, count=1)
@@ -64,12 +64,12 @@ def test_ldmatrix_m8n8_b16_matches_ptx_fragment_mapping():
 def _ldmatrix_b16_dst_kernel(num, trans):
     rows = 8 * num
     nbytes = rows * 8 * 2
-    b = builder(f"ldmatrix_b16dst_x{num}_{'t' if trans else 'n'}", smem_size_bytes=nbytes)
+    b = builder(f"ldmatrix_b16dst_x{num}_{'t' if trans else 'n'}", smem_size_bytes=nbytes + 8)
     source = gmem_arg(b, dtype=nr.DType.U16, shape=(rows, 8))
     out = gmem_arg(b, dtype=nr.DType.BF16, shape=(32, 2 * num))
     smem = smem_tensor(b, dtype=nr.DType.U16, shape=(rows, 8), byte_offset=0)
     frag = reg_tensor(b, dtype=nr.DType.BF16, shape=(2 * num,))
-    mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
+    mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=nbytes)
 
     with b.if_warp(0), b.if_elected():
         b.mbarrier_init(mbar, count=1)

@@ -23,9 +23,11 @@ commit 76600421 (codegen-side rejections + sf_block validation).
    value model. Consequence: a read-after-issue-before-wait sees NEW data in
    sim (old data on HW) — that bug class is only caught by trace-mode
    `invalidate_block` + the protocol checker's async windows.
-2. **expect-tx must precede complete-tx** (sim rejects negative tx); HW tx-count
-   is signed and tolerates complete-before-expect — a real CLC race exists on
-   GPU that sim cannot reproduce (codegen.rs comment documents it).
+2. **Signed mbarrier transaction balance**: `expect_tx` subtracts expected
+   bytes; TMA/CLC completion adds actual bytes. Both simulator and checker
+   allow either instruction to happen first, so the intermediate balance may
+   be negative or positive. The phase completes only when that balance and
+   pending arrivals are both exactly zero.
 3. **CLC round-robin oracle** (trusted seam): `ClcQueryCancel` returns
    canonical round-robin tasks. Holds for ANY order: each task exactly once,
    termination. The oracle is parameterized (`check_protocol(...,
@@ -39,8 +41,9 @@ commit 76600421 (codegen-side rejections + sf_block validation).
 5. **Accumulation order**: MMA via OpenBLAS sgemm (BLAS blocking order), not
    the HW's fixed tensor-core order. Exact for exact arithmetic; f32-rounding-
    level differences otherwise. Hardware fixtures use exact small integers.
-6. **elect = fixed lane 0**; PTX elect.sync picks deterministically but does
-   not promise lane 0 (low risk).
+6. **Election sugar = explicit lane 0**: `if_elected` builds the ordinary IR
+   predicate `lane_id == 0`. It is not a PTX `elect.sync` operation, and
+   codegen prints the predicate unchanged.
 7. **sim⇄GPU bit-exactness is measured, not assumed**:
    `tests/gpu/test_gpu_sim_parity.py` runs one kernel + one input set through
    BOTH the value simulator and the tirx codegen + `tvm.compile` on a real GPU
@@ -52,8 +55,8 @@ commit 76600421 (codegen-side rejections + sf_block validation).
 
 ## Codegen emission guards: the zero-inference rule
 
-**Codegen never synthesizes an emission guard from the statically-computed
-thread scope. Every guard in the emitted source comes from the IR.**
+**Codegen never synthesizes or rewrites an emission guard. Every condition
+and every nesting edge in the emitted source comes from the IR.**
 
 Hardware single-issue ops — `tma_load` / `tma_store` /
 `cp_async_bulk_s2cluster` (the TMA issue family), `tcgen05_mma` /
@@ -70,10 +73,8 @@ a subset, so it cannot reintroduce double-issue.
 
 - **Validator (`single_issue_scope`)**: a single-issue op outside such a
   branch fails `Kernel::validate` at build; `emit_single_issue` in codegen
-  hard-errors as the second line of defense. (Before the rule, codegen wrapped
-  these ops in a scope-inferred `elect_sync` / `tid_in_wg == 0` — exactly the
-  inference the rule bans; a kernel that forgot the elected branch compiled
-  fine and issued 32 duplicate TMA/MMAs or double-inited on GPU.)
+  hard-errors as the second line of defense. Codegen emits the operation at
+  its exact IR location and never wraps it in a new branch.
 - **Per-thread ops emit per-thread**: `mbarrier.arrive` /
   `expect_tx` / `arrive_expect_tx`, `store_scalar`, and async-proxy fences —
   the interpreter applies them once per executing lane, so an inferred guard
@@ -84,71 +85,84 @@ a subset, so it cannot reintroduce double-issue.
   (CTA-wide `cta_sync` at function scope, warp-collective forms, `Elected`
   recognition for the single-issue arms) — analysis of explicit IR conditions,
   never invention of new predicates.
-- The `if_elected` sugar lowers to `if T.ptx.elect_sync():` (canon's guard),
-  narrowed to `if T.cuda.thread_rank() == 0:` when the body is loop-free and
-  provably exactly CTA thread 0 — the same one thread either way (an emission
-  spelling, not a guard change).
+- The condition of every `Stmt::If` is printed literally. Thus
+  `if_elected`'s `lane_id == 0` remains `if lane_id == 0:`; it is never
+  replaced by `T.ptx.elect_sync()` or `T.cuda.thread_rank() == 0`.
+- Structural identity is part of the contract: sibling IR `If`s remain
+  siblings, nested `If`s remain nested, and statement order is preserved.
+  Codegen does not chain top-level branches, synthesize a warpgroup parent,
+  merge equal predicates, hoist bodies, or re-nest statements.
 - Negative coverage: `tests/test_compile_gate.py::test_single_issue_scope_negative`
-  (build rejected without an elected branch, passes with one, exactly one
-  `elect_sync` in the output) and
+  (build rejected without an explicit single-lane branch and passes with one)
+  and
   `src/ir/validate.rs::tests::single_issue_scope_rule` (function scope /
   full-warp rejected, `if_elected` and `tid_in_wg == 0` accepted).
 
-Historical note: the pre-rule inferred guards also *coalesced* adjacent
-single-issue ops under one guard (a Blackwell tcgen05-issue-stream
-reconvergence hazard). The shipped kernels already place each whole issue
-burst (init group, TMA stream, MMA burst) under ONE explicit elected branch,
-so the hardware-visible issue pattern is unchanged.
+Historical inferred-guard and top-level-`If` chaining passes have been deleted.
+If a kernel needs a shared guard or a nested decision tree, the kernel author
+must build that exact tree in IR.
 
 
 ## tcgen05.mma (§9.7.17.10.9, Table 42 §9.7.17.2.1, Tables 45-47, 54-55, 59-60)
 
-Modeled: kind::f16 (cg1 m∈{64,128}, cg2 m∈{128,256}, Layouts A/B/D/F — B200
-fixtures), mxf8f6f4 (k=32, UE8M0), mxf4nvf4 (k=64, e4m3 block-16, cg2 m=256),
-k=128/256 as explicit IR-level k-tile folding.
+The IR is physical and self-contained:
 
-Envelope gaps → **fixed in audit batch** (validate fail-closed):
-- k×dtype coupling: dense no-sf ⇒ k any positive multiple of 16 (one IR MMA
-  with k=16q means the q atomic k=16 MMAs accumulated in issue order — canon's
-  one-issue full-K gemm_async, lowered by TVM to the atom sequence); UE8M0 sf
-  ⇒ k∈{32,128,256}; fp4 ⇒ k∈{64,128,256}
-- cg1 m=64 ⇒ no scale modes (mxf* cg1 is M=128 only)
-- fp4 ⇒ (cg1,m=128)|(cg2,m=256), and no trans (Table 54); trace mode aligned
-- B operand must be SMEM (PTX residency table); A-in-TMEM kept (GDN state)
-- mixed-dtype exception narrowed to f32×f32 (tf32 path)
-- lane_align!=0 ⇒ only (cg1, m=64); sf_e4m3 ⇒ sf_byte==0
+- `dst` is a `TmemAddr`: `(row, TmemTensor.start_col + col)`.
+- A is either one explicit `SmemTile` or a TMEM address plus
+  `Flat`/`BankBatched` form; B is an explicit `SmemTile`.
+- `mma_m`, `mma_n`, element format (`f16`, `bf16`, `f8_e4m3`, or
+  `f4_e2m1`), `accum`, transpose flags, `ws`, and `cta_group` are instruction
+  fields.
+- A block-scaled form additionally carries explicit SFA/SFB TMEM addresses,
+  scale format, `sf_per_mma`, and `sf_reuse`.
 
-Known abstractions: SF held 1 byte/cell, 128-lane flat, no 4x-subpartition
-duplication (HW packs 4 e4m3/u32 cell + duplicates; value-equal, TMEM column
-footprint ~4x — column-budget reasoning does not match HW); tf32 operands
-computed as full f32 (HW truncates RZ — exact only for tf32-representable
-inputs); issue granularity counted once (PTX is single-thread issue).
+`tcgen05_layout.rs` is the single physical-geometry resolver used by
+validation, interpreter, checker regions, and codegen. It derives the
+instruction K extent from the operand tiles and format, selects the permitted
+datapath for the explicit `mma_m`/CTA-group/`ws` combination, and computes
+the exact D, optional TMEM-A, and scale-factor footprints. Unsupported
+format/shape/residency/transpose combinations fail closed in that resolver.
+There is no descriptor cache and no tensor-id or use-order inference.
 
-SILENT (documented, NOT yet rejected — do not rely on):
-- in-place accum=true on unwritten cells: in-place path treats as 0.0,
-  fallback path errors `missing_tmem_value` (audit batch aligns to error)
-- cg2 odd-CTA issue is silently dropped; PTX allows EITHER CTA of the pair to
-  issue. Kernels must issue from the leader (cta_rank==0) — enforced by
-  convention only.
-- no peer-active gate on mma (commit has one)
+Codegen declares non-owning D/A/SFA/SFB buffers immediately beside this
+statement, at the exact address carried by the IR, using the resolved canonical
+layouts. One IR statement emits exactly one `Tx.gemm_async` with explicit
+`mma_m`, `mma_n`, `cta_group`, transpose, accumulation, and
+weight-stationary arguments. TVM owns the lower-level descriptor encoding and
+atomic instruction decomposition; Nymph does not move, merge, hoist, or split
+the IR statement.
+
+The interpreter consumes the same resolution, including canonical packed
+scale-factor cells and their lane replicas. Every CTA whose explicit IR
+control flow reaches an MMA executes it. If issue must be restricted to one
+CTA, that condition must be written around the statement in the kernel; there
+is no `leader_routed` metadata or implicit odd-CTA no-op.
 
 Rejected today, HW-legal (completeness backlog, deliberate for now):
-f8f6f4 dense (no-sf f8), i8, mxf4+UE8M0 (block32), D=f16, B=f32-SMEM tf32,
-n-granularity finer than current (cg1 m=128 step 8; cg2 step 16), .ws, .sp,
-disable_output_lane, K=96 (sm_103a).
+i8, mxf4+UE8M0 (block32), D=f16, `.sp`,
+disable_output_lane, and K=96 (sm_103a). Other unsupported combinations are
+reported by the shared resolver rather than silently approximated.
 
 ## tcgen05.cp (§9.7.17.9.2) — SF staging copy
 
-This op is a value-level abstraction of canon's `Tx.copy_async` SF datapath,
-NOT a raw PTX tcgen05.cp: HW shapes (.128x256b/.4x256b/...), .warpx4,
-decompression formats are all inexpressible. Modeled: u32 (UE8M0, lane-major
-flat stream) and e4m3 (nvfp4, super-block folded) with numel-equal src/dst.
+The IR carries the physical interface needed by TIRx: destination
+`TmemAddr`, explicit two-dimensional source `SmemTile`, `cta_group`, shape
+(`128x256b`, `4x256b`, `128x128b`, `64x128b`, or `32x128b`), and multicast
+(`none`, `warp2_02_13`, `warp2_01_23`, or `warp4`). The shared resolver
+validates the legal shape/multicast pairing, source atom divisibility, packing
+into 32-bit TMEM cells, and the exact destination lane/column footprint.
 
-Envelope gaps → **fixed in audit batch**: dst/src dtype must be equal
-(was: e4m3→u32 dst silently wrote bytes into word cells); src layout
-constraints (u32 ⇒ 1-D; e4m3 ⇒ dst cols % src last-dim == 0); issuer check
-(full warp or single elected lane, aligned with mma); peer-active gate for
-cta_group=2.
+One IR statement creates one statement-local, non-owning TMEM destination
+view and emits exactly one `Tx.copy_async` with the same shape, multicast, and
+CTA group. It does not infer shape from tensor dimensions, unroll a copy into
+multiple statements, or cache/relocate a destination view. The optional PTX
+`dst_fmt/src_fmt` decompression qualifiers are not represented yet and
+therefore are not silently selected.
+
+Scale-factor sources are plain row-major SMEM tensors whose physical shape and
+absolute byte offset are explicit. The CP statement names the exact tail tile
+it reads; codegen and the interpreter consume that tile directly without a
+scale-specific owning layout or usage-derived alias.
 
 ## tcgen05.ld / tcgen05.st (§9.7.17.8, Tables 52-53)
 
@@ -165,8 +179,8 @@ HW UB); wait::ld/st get full-warp cohort checks.
 Known limitations: 16x32bx2 fixes immHalfSplitoff=num (arbitrary splitoff
 inexpressible); f16/bf16 packed path models mat-D packing (lo|hi<<16 per
 word) — NOT verified against HW pack::16b wording, no f16 fixture (marked
-suspect); REG slice declares reg_size f16 elems while 2*reg_size are moved
-(validate accepts by declaration; OOB caught only at runtime — wart).
+suspect). Direct codegen requires two f16/bf16 REG elements per physical b32
+register, an even static slice offset, and fails closed otherwise.
 
 ## tcgen05.commit (§9.7.17.12.1) / wait (§9.7.17.8.5)
 
@@ -183,21 +197,19 @@ PERMIT: `relinquish_alloc_permit` flips a per-CTA flag (idempotent — giving
 the permit up twice is a no-op); a later `tcgen05.alloc` targeting a
 relinquished CTA errors `tmem_alloc_after_relinquish` (PTX §9.7.17.7.1).
 
-The IR deliberately admits only what the codegen lowers — the generated code
-carries ONE base-0 TMEM view fed by a single alloc — so validate walk 4
-additionally rejects (**fixed in audit batch**): `base_col != 0`, a second
-concurrently-live alloc, a lifecycle op whose cta_group differs from the
-kernel-level group (cluster-size derived, mirroring the codegen per-op
-checks of commit 76600421), and any alloc after a relinquish. Codegen
-re-checks base_col/cta_group per op (it is reachable without validate);
-before this batch it dropped both fields via `..`, emitting one alloc for
-any number of IR bands. Walk 4 also rejects lifecycle ops (alloc/dealloc/
-relinquish) nested inside a `ForLoop`/`Loop`/`If`(runtime-value predicate)/
-`ForEachTask`/`SchedulerImpl` body — a loop-carried or subset-cohort
-lifecycle is only safe under a path-sensitive analysis the IR does not
-have yet (a `for_loop(stop=2)` alloc passed the one-pass walk but
-double-allocated on iteration two; a `If(lane==1){ … }` alloc executed
-for a subset of threads and only the protocol check reported it missing).
+The IR deliberately admits only what codegen lowers, so validate walk 4
+rejects `base_col != 0`, a second concurrently-live allocation, a lifecycle op
+whose CTA group differs from the kernel-level group, and any allocation after
+relinquish. It also rejects lifecycle operations inside a re-executing body or
+a runtime-value conditional; a statically classified warp/lane dispatch
+`If` remains legal. Codegen re-checks the fields it consumes.
+
+TMEM data is not represented by one kernel-wide buffer. `TmemTensor` stores
+only an absolute `start_col`; each `TmemAddr` adds its explicit row and column.
+Every data operation resolves its own footprint and emits a statement-local,
+non-owning `decl_buffer` or a direct PTX address. `TmemAlloc` owns only the
+physical column-band lifecycle and the four-byte shared-memory address cell
+used by alloc/dealloc.
 
 The protocol checker's `tmem_lifecycle_order` pass proves the lifetime
 against ALL legal interleavings, not the sampled one, over explicit
@@ -220,75 +232,93 @@ happens-before-after its own alloc. Missing edges fail
 `tmem_lifecycle_hb_missing`; an access with an ordering edge but no
 observed completion fails `tmem_lifecycle_use_not_drained`.
 
-## tcgen05.ld / tcgen05.st codegen support set
+## Dynamic shared-memory ownership
 
-The interpreter models all five shapes. The CODEGEN lowers:
+All owning shared-memory objects are views into one unconditional
+`T.SMEMPool()`. SMEM tensors carry absolute `byte_offset`; mbarriers carry an
+absolute 8-byte-aligned offset and occupy `stages * 8` bytes; `TmemAlloc`
+carries the absolute 4-byte-aligned offset of its `tmem_addr` cell. Codegen
+moves the pool base to each exact IR offset, allocates a `shared.dyn` view, and
+commits once with `kernel.smem_size_bytes`, the complete physical extent
+including explicit padding and metadata. It does not derive a metadata tail
+from tensor ids or emission order, and it does not emit an owning
+`T.alloc_buffer(scope="shared")`/`T.alloc_shared` path.
 
-- `tcgen05.ld` with **shape=32x32b, row=static 0, dtype=f32** — the single
-  (128, cols) f32 base-0 view window `Tx.wg.copy_async` encodes.
-- `tcgen05.ld` with **shape=16x64b/16x128b/16x256b, row=static 0, dtype=f32**
-  — the M=64 atom path: the dst fragment is declared as a flat local plus a
-  `(64, K)` `tcgen05_atom_layout` view (`{name}_atom`), and the read emits
-  `Tx.wg.copy_async(frag_atom[:, :], tmem[0:64, col:col+K])`. `num` must
-  match the fragment width (4·num f32 regs for 16x256b); row=16 (the M=128
-  second issue) and 16-bit reads stay fail-closed.
-- `tcgen05.st` with **shape=32x32b, row=static 0**, dtype f32 or packed
-  f16/bf16 — `Tx.wg.copy_async(tmem window, frag)`. The 16-bit dsts ride the
-  `tmem_f16`/`tmem_bf16` dense-packed views (two elements per 32-bit cell;
-  the element window doubles the cell column). The `.16x*b` st atoms stay
-  fail-closed (no atom-layout src fragment).
-- `tcgen05.wait::st` — `T.ptx.tcgen05.wait.st()`.
+Scale factors use ordinary layoutless tensor IR. Their dtype, physical shape,
+absolute `byte_offset`, and any same-offset aliases describe the storage
+completely: FP8 uses plain raw/post shapes over the same bytes, while NVFP4
+uses the explicit `(M_super, K_outer, 32, 16)` physical shape. Only a
+statement-local non-owning `T.decl_buffer(layout=...)` is created for a
+`Tcgen05Cp`/`Tcgen05Mma` call; it never changes the owning tensor.
 
-The warp-matrix and reg-ALU families lower too (the GDN datapath):
-`LdMatrix`/`StMatrix` (m8n8.xN.b16 → `T.ptx.ldmatrix/stmatrix` with
-per-thread SMEM row addresses and flat-view register handles — the dst/src
-fragment is either num u32/i32 packed words or a 2·num f16/bf16 fragment
-whose consecutive pairs ARE the words; the b16 form rides the `_flat_u32`
-reinterpret view, bit-exact in the interpreter via the same pack/decode), `WarpMma`
-(m16n8k8/m16n8k16 → `T.ptx.mma.legacy`, accumulator reused as C/D), and the
-reg elementwise family (`RegFill/RegAdd/RegSub/RegMul/RegFma/RegUnary/
-RegCvt`) — `Tx.wg.*` tile ops at warpgroup-full scope, per-thread scalar
-form on the flat views under narrowed branches (the `Tx.wg.*` dispatches
-require the full launch intra). Fail-closed: rm rounding, int arith dtypes,
-non-f32 unary dsts, mixed-dtype operands (use RegCvt), RegUnary on 16-bit
-dsts. A `tcgen05.mma` with a TMEM B operand also fails closed (PTX + the
-TIRx schedule read B from SMEM only).
+## Direct datapath and register codegen
+
+These operations do not pass through a logical warpgroup-tile abstraction:
+
+- Every validated `Tcgen05Ld` emits one
+  `T.ptx.tcgen05.ld(T.uint32(taddr), ...)` carrying the IR shape, `num`, and
+  register tuple; every `Tcgen05St` analogously emits one
+  `T.ptx.tcgen05.st(...)`. Wait statements emit the corresponding
+  `T.ptx.tcgen05.wait.ld/st()` call. The TMEM address is the exact
+  `start_col + col` and row encoded by the IR; codegen does not build a global
+  TMEM data buffer.
+- `LdMatrix` and `StMatrix` emit one `T.ptx.ldmatrix` or
+  `T.ptx.stmatrix` using the explicit SMEM row address and packed REG handles.
+  Supported b16 fragments are either `num` u32/i32 words or `2*num`
+  f16/bf16 elements viewed as those words.
+- `WarpMma` m16n8k8/m16n8k16 emits the non-legacy
+  `T.ptx.mma(...)` intrinsic with the explicit A/B/C/D register fragments.
+- A REG `TensorDef` emits exactly `T.alloc_local(IR_shape, IR_dtype)`.
+  `RegLoad`/`RegStore` lower to `Tx.copy` over the exact IR slices;
+  `RegCvt` lowers to `Tx.thread.cast`; supported fill/add/sub/mul/fma/unary
+  operations lower to the matching `Tx.thread.*` call. Unsupported dtype,
+  shape, rounding, or operation combinations fail closed rather than changing
+  the register representation.
+
+The interpreter retains the matching per-lane datapath mappings. Direct PTX
+emission is a codegen rule, not permission to skip its validator or hardware
+fixtures.
 
 ## mbarrier (§9.7.14.16)
 
 Core algebra (init/arrive/expect_tx/complete_tx/phase completion/reset/parity
-flip) matches PTX item-for-item; UB cases (over-arrive, tx underflow,
-uninitialized, double init) all fail closed.
+flip) uses a signed transaction balance: `expect_tx` subtracts expected bytes
+and engine completion adds actual bytes. Either may execute first, producing a
+negative or positive intermediate value; returning to exactly zero completes
+the transaction side of the phase. Parity flips only when pending arrivals are
+also zero. Invalid byte counts, over-arrive, uninitialized access, and double
+init fail closed.
 
 Envelope gaps → **fixed in audit batch**: init count ≤ 2^20-1; wait phase
 required (was: sim used current parity while codegen emitted constant 0 —
 latent divergence, no current kernel triggered it).
 
-SILENT / deferred (load-bearing, needs kernel rework):
-- **peer (remote_coord) wait is HW-illegal** (mbarrier ops are .shared::cta
-  only) yet sim models it and the fp16/bf16 + nvfp4 GEMMs use it for the
-  leader's wait on the peer CTA's `smem_full`/`sf_full`; codegen silently
-  DROPS it (correctness there rests on the leader-routing argument: both
-  CTAs' TMA tx is routed to the LEADER's physical barrier copy, so the
-  leader's local wait observes everything). Do not add new uses. Tracked
-  for kernel rework.
-- MBar.arrive_count is a dead field (declared, never consumed).
+`MBarRef` is the complete address authority for every operation that contains
+it. `remote_coord=None` names the local CTA's cell; a coordinate names that
+exact peer cell. Arrive/arrive-expect use the intrinsic's explicit remote
+operand, while expect, wait, TMA completion, and commit use the corresponding
+mapped shared pointer. Codegen and interpreter do not infer an address from
+mbar id, tensor id, producer/consumer role, or statement order. There is no
+`leader_routed` flag and a remote coordinate is never silently dropped.
+Where an operation has an explicit multicast mask, only that mask may expand
+the set of completion targets.
+
+`MBar.arrive_count` remains declaration metadata; executable arrival counts
+come from the operation and active lanes.
 
 ## TMA / bulk copy (§9.7.9.26)
 
 Modeled: routing rules (cg2 unicast mbar ∈ {dst,peer}; cg2 multicast parity
-routing — matches PTX), OOB clamp/zero-fill/squash, reduce_add (f32) with
-checker TmaReduce events, commit/wait groups as counters (never block;
-.read-vs-not distinction unmodeled). A float reduce_add is order-dependent, so
-it is IR-level OPT-IN: validate rejects `TmaStore.reduce_add` on a non-integer
-dst unless `allow_nondet_reduce` is set (the checker's
+routing — matches PTX), including one complete-tx contribution per multicast
+destination even when multiple destinations resolve to the same explicit
+remote mbar cell; OOB clamp/zero-fill/squash; reduce_add (f32) with checker
+TmaReduce events; commit/wait groups as counters (never block; .read-vs-not
+distinction unmodeled). A float reduce_add is order-dependent, so it is
+IR-level OPT-IN: validate rejects `TmaStore.reduce_add` on a non-integer dst
+unless `allow_nondet_reduce` is set (the checker's
 `nondeterministic_reduction` warning still fires with the flag).
 
 SILENT / known divergences:
-- **cg2 multicast to a SHARED (leader) mbar**: sim dedups tx per unique cell
-  (completes once); HW signals each destination (2x bytes on the shared
-  barrier). Validate now REJECTS this combination (audit batch); kernels
-  already avoid it (nvfp4 SFB reads the full band per CTA instead).
 - CpAsyncBulkS2Cluster: bytes==numel×dtype_bytes, %16, dst≠self — all added
   in audit batch (op is sim-only; codegen rejects it).
 - cache_hint: free-form string → enum-checked in audit batch.
@@ -317,7 +347,7 @@ index bounds; NamedBarrier/WgSync cross-kind barrier_id dedup.
 Known abstractions: ClusterBarrierArrive/Wait modeled one-shot (HW auto-
 reinits; reentry rejected); ClusterBarrierWait in an elected context is
 codegen-fail-loud (single-lane cluster wait deadlocks on HW — sim does not
-expose this); WarpSync not emitted by codegen (warp lockstep assumption);
+expose this); `WarpSync` emits `T.cuda.warp_sync()`;
 CLC handle's 16B async-proxy write not modeled (race checker can't see it).
 
 ## Happens-before join points (per-op strength)
@@ -378,18 +408,18 @@ waiting any one of those barriers suffices.
 
 **Modeled WEAK** (over-report direction, by the ledger discipline):
 
-- `elect` — no IR op; `if_elected` lowers to a plain `If`. Hardware
-  `elect.sync` synchronizes its membermask, but no convergence is credited
-  (a kernel needing the ordering writes `warp_sync`).
+- lane-0 selection — no election IR op; `if_elected` is a plain
+  `If(lane_id == 0)` and codegen preserves it literally. No hardware
+  `elect.sync` is introduced and no convergence is credited (a kernel needing
+  the ordering writes `warp_sync`).
 - `tcgen05.wait::ld/st` — drains the EXECUTING thread's own loads/stores
   (§9.7.17.8.5, per-thread); orders nothing across lanes.
 - `tcgen05.commit` / `tcgen05.mma` — single-thread issues; no convergence.
 
 **Seams to keep in view**:
 
-- `WarpSync` is checker/simulator vocabulary that codegen does not lower to
-  `bar.warp.sync`, so a proof leaning on it compiles to code that relies on
-  the warp launching converged.
+- `WarpSync` is an explicit IR convergence point and lowers to
+  `T.cuda.warp_sync()`; codegen never inserts one from inferred scope.
 - The value simulator lands async-engine effects at issue, which is why the
   engine's real timing envelope is owned entirely by the checker's
   async-window passes (`async_group_lifetime`, `tcgen05_async_hazard`)
@@ -420,6 +450,12 @@ Deferred: re-try after drained is idempotent in sim, UB on HW (reject later).
 ## sim-only ops (codegen rejects — validated/simulated but not compilable)
 
 GmemAtomicAdd / GmemWaitEq (value-keyed release/acquire; checker models
-ordering), WarpMma, RegUnary, CpAsyncBulkS2Cluster, TmaStore.reduce_add
-(no TIRx lowering). If a kernel needs these on GPU, the IR must grow a
-lowering first — sim-green means nothing for silicon here.
+ordering), CpAsyncBulkS2Cluster, TmaStore.reduce_add, Fence Memory/View,
+RegMax/RegMin/RegBitwise/RegReduce, and the specialized register
+reduction/rescale family have no TIRx lowering. If a kernel needs these on
+GPU, the IR must grow a lowering first — sim-green means nothing for silicon
+here.
+
+WarpMma, RegUnary, Tcgen05Ld/Tcgen05St, LdMatrix/StMatrix, RegCvt, and
+RegLoad/RegStore are not sim-only: the supported forms lower directly as
+described above and unsupported forms fail closed.

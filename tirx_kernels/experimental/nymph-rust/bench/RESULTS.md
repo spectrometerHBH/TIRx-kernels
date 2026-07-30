@@ -1,62 +1,34 @@
-# nymph GEMM bench baseline (canon = tir / nymph = tirx)
+# Nymph GEMM benchmark record
 
-The current known-good baseline. Ratio = `tir / tirx` = canon_time / nymph_time;
-**>1 means nymph is faster**. Target: ≥ 0.99 on every shape.
+Current explicit-physical-IR baseline, measured on 2026-07-27 UTC with the
+bench-suite orchestrator:
 
-Method: `python bench/run_suite.py --max-shape 16384 --rounds 5` (bench-suite
-orchestrator — auto GPU selection, proton timer, cold cache, correctness gate
-on both impls). Full per-round data + artifacts live in the (gitignored,
-machine-local) `.bench-suite/runs/*.json`; this file is the portable record.
-History of this file is in git.
+```bash
+python bench/run_suite.py --max-shape 4096 --rounds 5 \
+  --filter nymph_fp16_bf16_gemm --label nymph-physical-ir-final-fp16-bf16
+python bench/run_suite.py --max-shape 4096 --rounds 5 \
+  --filter nymph_nvfp4_gemm --label nymph-physical-ir-final-nvfp4
+```
 
-## 2026-07-24 @ warp-model replay (Stage 3)
+The portable run records are `.bench-suite/runs/23.json` and
+`.bench-suite/runs/26.json`. Every row passed the bench-suite correctness gate
+for both implementations. `ratio = tir / tirx`; a ratio above one means Nymph
+is faster.
 
-B200 ×7, orchestrator, rounds=5 (re-runs at rounds=10 noted). Per-round spread
-in brackets. The 2026-07-21 (#18 Role-model branch) column is the prior
-baseline; canon itself measures faster today on the small shapes, so
-same-shape ratios drift a few tenths of a percent between days.
+| kernel | shape | dynamic SMEM (bytes) | launch | cluster | warps | correctness | canon (us) | Nymph (us) | ratio | per-round ratio |
+|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|
+| BF16 | 1024³ | 221340 | (128,) | (2,) | 8 | pass | 6.8804 | 7.4808 | 0.9197 | 0.9175–0.9210 |
+| BF16 | 2048³ | 180380 | (128,) | (2,) | 8 | pass | 16.3449 | 16.8448 | 0.9703 | 0.9701–0.9706 |
+| BF16 | 4096³ | 229508 | (256,) | (2,) | 12 | pass | 93.1003 | 94.5566 | 0.9846 | 0.9820–0.9890 |
+| FP16 | 1024³ | 221340 | (128,) | (2,) | 8 | pass | 6.7993 | 7.3926 | 0.9197 | 0.9190–0.9207 |
+| FP16 | 2048³ | 180380 | (128,) | (2,) | 8 | pass | 16.5819 | 17.0798 | 0.9708 | 0.9701–0.9725 |
+| FP16 | 4096³ | 229508 | (256,) | (2,) | 12 | pass | 95.3724 | 96.8302 | 0.9849 | 0.9710–0.9979 |
+| NVFP4 | 1024³ | 131196 | (64,) | (2,) | 8 | pass | 5.4366 | 6.6354 | 0.8193 | 0.8151–0.8234 |
+| NVFP4 | 2048³ | 211092 | (128,) | (2,) | 8 | pass | 8.4814 | 11.6321 | 0.7291 | 0.7281–0.7308 |
+| NVFP4 | 4096³ | 211092 | (148,) | (2,) | 8 | pass | 29.5446 | 51.2410 | 0.5766 | 0.5763–0.5767 |
 
-| kernel | shape | ratio | spread | prior (#18) | canon (us) | nymph (us) |
-|---|---|---|---|---|---|---|
-| nvfp4 | 1024 | 0.988 | 0.983-0.990 | 1.013 | 5.2 | 5.3 |
-| nvfp4 | 2048 | 0.991 | 0.989-0.994 | 0.987 | 8.5 | 8.6 |
-| nvfp4 | 4096 | 1.020 | 1.019-1.021 | 1.017 | 29.6 | 29.0 |
-| nvfp4 | 8192 | 1.027 | 1.006-1.042 | 1.013 | 186.0 | 181.2 |
-| nvfp4 | 16384 | 1.002 | 0.996-1.009 | 1.030 | 1530.6 | 1527.9 |
-| fp16 | 1024 | 1.019 | 1.018-1.020 | 1.017 | 7.0 | 6.8 |
-| fp16 | 2048 | 1.011 | 1.011-1.012 | 1.011 | 16.5 | 16.4 |
-| fp16 | 4096 | 1.006 | 1.003-1.011 | 0.993 | 96.7 | 96.1 |
-| fp16 | 8192 | 0.981 → **1.005**¹ | 0.950-1.064 | 0.999 | 736.4 | 732.6 |
-| fp16 | 16384 | 1.033 | 0.991-1.083 | 0.995 | 6032.8 | 5837.6 |
-| bf16 | 1024 | 1.018 | 1.017-1.019 | 1.017 | 6.8 | 6.7 |
-| bf16 | 2048 | 1.011 | 1.011-1.012 | 1.011 | 16.4 | 16.3 |
-| bf16 | 4096 | 0.995 → **1.002**¹ | 0.983-1.019 | 0.999 | 93.8 | 93.6 |
-| bf16 | 8192 | 0.995 → **1.002**¹ | 0.938-1.064 | 0.994 | 692.9 | 691.4 |
-| bf16 | 16384 | 1.006 | 0.940-1.048 | 0.997 | 5720.2 | 5683.4 |
-
-¹ The big squares are noise-dominated at rounds=5 (spread > ±0.03); the
-rounds=10 re-measurement is the cleaner read (fp16 8192 1.005, bf16 4096
-1.002, bf16 8192 1.002).
-
-Verdict: **14/15 shapes ≥ 0.99**, fp16/bf16 1024 ≥ 1.01 (1.019 / 1.018).
-The one borderline shape:
-
-- **nvfp4 1024 = 0.988–0.989** (0.983-0.990 across rounds=5 and rounds=10).
-  Same-day A/B against the #18 kernel itself (identical emission family,
-  interleaved timing, GPU 3): #18 5.24-5.25us (0.990-0.993), this replay
-  5.27-5.28us (0.984-0.988). The ~0.4% residual is the producer's guard
-  nesting (`if elect_sync(): if cbx==0:` vs canon's `if cbx==0: if elect_sync():`)
-  that the warp-model's single-thread checker mandates — #18 wrote the
-  expect_tx on all 32 lanes and let codegen elect; this branch's value model
-  counts per-thread arrivals, so the op must sit inside an elected region in
-  the IR, which flips the nesting. The GPU-side "regression" from 0.83 was
-  separately root-caused to the codegen emitting `thread_rank()==0` for the
-  warp-0 MMA loop guard (now `elect_sync()` for loop bodies — see the
-  codegen commit) and is fully fixed.
-
-Watch item: fp16 8192/bf16 8192 and the 16384s swing ±0.05 round-to-round;
-treat anything inside that band as noise (same as #18's record).
-
-Refresh policy: re-run the command above after any perf-relevant change and
-replace this table (one table, no diary). Diagnosis methodology:
-`docs/perf-methodology.md`.
+The explicit physical IR is slower than the canonical implementation in all
+nine rows, most visibly for NVFP4. The physical representation and kernel
+schedule remain unchanged based on these measurements, as required. Run 26
+automatically discarded two interfered attempts for NVFP4 4096³ and reports
+the clean third attempt.

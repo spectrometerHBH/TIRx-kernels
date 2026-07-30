@@ -20,21 +20,36 @@ see `docs/ir.md`, `docs/interpreter.md`, `docs/interpreter-semantics.md`, and
 ### Codegen (TIRx emission)
 - `src/ir/codegen.rs` — lowers the warp-model IR to a TVMScript
   (`tvm.script.tirx`) source string, exposed as `nr.kernel_to_tirx_source`.
-  Thread dispatch re-derives from the `If`-condition stack (no Role nodes): the
-  thread scope comes from `static_thread_filter` (full-CTA / one warp / one
-  warpgroup / ≤1-lane-per-warp), `if_elected` emits `T.ptx.elect_sync()`
-  (`T.cuda.thread_rank() == 0` for the warp-0 prologue elect). Control flow is
-  emitted 1:1: sibling IR `If`s stay siblings, nested `If`s stay nested, and
-  codegen never merges or re-nests role branches. TMEM is emitted as one base-0
-  `tmem` decl_buffer (+ folded SF views), full-K `Tx.gemm_async` with a runtime
-  `accum` scalar, leader-routed TMA barriers, `ScalarLet` → `T.let`, CLC
-  try/query-cancel, split cluster barrier, `ForLoop(unroll=False)` →
-  `T.serial(N, unroll=False)`, and one unconditional dynamic `T.SMEMPool()`
-  whose tensor, mbarrier, and TMEM-address views use explicit IR byte offsets.
+  Thread scope is classified from the `If` stack only for validation; emission
+  preserves every IR predicate and block literally. In particular,
+  `lane_id == 0` is never replaced by `elect_sync()` or
+  `thread_rank() == 0`. Sibling IR `If`s stay siblings, nested `If`s stay
+  nested, and source order is unchanged.
+  REG tensors are plain per-thread `T.alloc_local` arrays; register transfers
+  use `Tx.copy`, and supported register arithmetic/conversion uses
+  `Tx.thread.*`. `tcgen05.ld/st`, `ldmatrix/stmatrix`, and warp `mma.sync`
+  lower directly to their `T.ptx.*` calls (the warp MMA uses the non-legacy
+  `T.ptx.mma` intrinsic).
+  Each explicit `Tcgen05Mma` creates only its statement-local, non-owning TMEM
+  operand views and emits exactly one `Tx.gemm_async`; each explicit
+  `Tcgen05Cp` similarly emits one `Tx.copy_async`. `TmemTensor` itself carries
+  only an absolute `start_col`; row/column address, MMA geometry, operand form,
+  scale metadata, CP shape, and multicast are carried by the operation.
+  `MBarRef.remote_coord` is the exact cluster-CTA address for the operation
+  that holds it—there is no mbar-id role inference or `leader_routed` path.
+  `ScalarLet` → `T.let`, CLC try/query-cancel, split cluster barrier, and
+  `ForLoop(unroll=False)` → `T.serial(N, unroll=False)`.
+  All owned shared-memory objects use one unconditional dynamic
+  `T.SMEMPool()`: tensors, mbarriers, and the optional TMEM-address cell retain
+  their explicit absolute byte offsets, followed by
+  `pool.commit(size=smem_size_bytes)`. Scale factors are ordinary layoutless
+  tensors whose dtype, physical shape, absolute byte offset, and explicit
+  aliases fully describe their bytes; no scale-specific layout IR exists.
   Fail-closed exhaustiveness: every `Stmt` variant has a lowering arm or an
   explicit `Err`.
-  Compile-gated by `tests/test_compile_gate.py` (bootstrap / fp16 / nvfp4 all
-  `tvm.compile(tir_pipeline="tirx")`).
+  `tests/test_compile_gate.py` requires bootstrap, fp8 blockwise, nvfp4, GDN,
+  and fp16/bf16 1024³/4096³ to pass through TVMScript parsing and
+  `tvm.compile(tir_pipeline="tirx")`.
 
 ### Interpreter
 File layout mirrors the Python package; the **modularity contract is preserved**:
@@ -86,6 +101,10 @@ Design points:
   cooperative-sync rendezvous / tmem-collective / tcgen05 peer-active blocks use
   `WakeCondition::Polled` (re-run each round; their re-runs are naturally idempotent,
   and a cooperative re-poll is an O(1) count lookup).
+- **Signed mbarrier transaction balance** — `expect_tx` subtracts expected
+  bytes and async completion adds actual bytes. Either may occur first; a phase
+  flips only when both the signed byte balance and pending-arrival count are
+  exactly zero.
 - **Typed values** — `ValueArray1/2` stores each tensor/register in a container chosen
   for value-losslessness: f16/bf16/f32 are **f32-backed** (f16/bf16 rounded on write,
   then held exactly), integers/bool use their **native fixed-width** type. The MMA reads
@@ -99,8 +118,9 @@ Design points:
 ## Correctness
 
 Seven kernels are built on the warp-model IR: bootstrap_gemm, fp16_bf16_gemm,
-nvfp4_gemm (all three also lowered by the TIRx codegen through the compile
-gate), fp8_blockwise_gemm, gdn_prefill, flash_attention4, flash_bwd_sm100.
+nvfp4_gemm, fp8_blockwise_gemm, gdn_prefill, flash_attention4, and
+flash_bwd_sm100. The compile gate currently covers bootstrap, fp16/bf16,
+nvfp4, fp8 blockwise, and GDN.
 
 The fp16/bf16 GEMM (CLC scheduler + overlap epilogue, per-shape GEMM_CONFIGS)
 runs end-to-end and is **cell-exact**:
@@ -119,14 +139,14 @@ codegen + `tvm.compile` on a B200 — nvfp4 1024³ and fp16 1024³ (the CLC +
 overlap path) match sim bit-for-bit.
 
 **GPU perf vs canon** (`bench/RESULTS.md`, orchestrator, rounds=5, B200):
-fp16/bf16 1024 = 1.018-1.019, nvfp4 2048-16384 = 0.99-1.03; the full table and
-the nvfp4 1024 borderline analysis live in `bench/RESULTS.md`. The fp16 1024
-R2UR spot check (ncu): nymph 768 vs canon 1792 executed R2UR — the R2UR
-convergence forms (rolled k-loop, runtime accum cell, T.let decode chain,
-ring induction counters) all reach silicon.
+the final explicit-physical-IR runs cover 1024³, 2048³, and 4096³. Nymph/canon
+ratios are 0.9197-0.9849 for fp16/bf16 and 0.5766-0.8193 for nvfp4; every row
+passes correctness, but Nymph is slower in all nine rows. The full launch,
+dynamic-SMEM, timing, and per-round data live in `bench/RESULTS.md`; the kernel
+schedule was not changed in response to these measurements.
 
 Test coverage: `cargo test` (lib unit tests — IR, the typed value layer + dtype
-coercion, engine loop — plus 11 Rust-internal integration tests in
+coercion, engine loop — plus 15 Rust-internal integration tests in
 `interpreter_runner.rs` for state the Python API can't observe: mbar-cell parity,
 no-partial-values-on-failure, internal commit cells) + `tests/` (Python: `ir/`
 binding/validation/structure, `interpreter/` per-op value behavior — incl.

@@ -1,49 +1,13 @@
-"""Chunked Gated Delta Net (GDN) prefill expressed in Nymph IR.
+"""Chunked Gated Delta Net (GDN) prefill expressed in Nymph IR."""
 
-Instruction-faithful port of the FlashInfer Blackwell SM100 CuteDSL chunked GDN
-prefill kernel (``~/flashinfer/.../blackwell/gated_delta_net_chunked.py``),
-reproducing its exact 12-warp specialization and per-``cute.gemm``/``cute.copy``
-instruction selection (PTX/SASS evidence + per-call-site table in
-``docs/kernels/gdn_prefill/INSTR.md``). 12 warps (gated_delta_net_chunked.py:232-239):
-CG0=0-3 (T-pairwise, kk_epi, qk_epi, inverse), CG1=4-7 (new_v, kv_update, qkv),
-MMA=8, TMA=9, gate/beta=10, epilogue=11. The 7 GEMMs lower to
-``tcgen05.mma.cta_group::1.kind::f16`` (UTCHMMA); M=64 read-backs to
-``tcgen05.ld.16x256b`` (the CUTLASS scatter datapath, mirrored cell-for-cell by
-nymph's ``tcgen05_ld(shape="16x256b")``) and M=128 to ``.32x32b``; bulk transfers
-to TMA (UTMALDG/UTMASTG).
-
-The **WY inverse is the flashinfer hierarchical blockwise inverse using the
-warp-level ``mma.sync`` (SM80 HMMA, the ``mma_sync`` IR node) + ``ldmatrix``** —
-GJ-invert the 8 diagonal 8×8 blocks (forward substitution), then merge 8→16→32→64
-filling each lower off-diagonal ``newC = -Qinv·C·Pinv`` via two ``mma_sync`` +
-``ldmatrix``-loaded operands, ``stmatrix``-stored result. The 7-GEMM epilogue
-operand staging (readback→SMEM) uses ``stmatrix`` (STSM) — each ``.16x256b``
-tile is the mma m8n8 fragment. GEMM3/4 read the recurrent state ``S`` as ``B``
-(``S^T`` via ``trans_b``) from an fp16 SMEM copy (``s_s``) staged at the chunk top —
-``tcgen05.mma`` reads its B operand from SMEM ONLY (PTX + TIRx), so the TMEM-B
-form (flashinfer's TMEM state_inp band on the B side) is unrealizable. See
-``docs/kernels/gdn_prefill/INSTR.md``.
-
-Algorithm = FLA ``chunk_gated_delta_rule`` fwd (validated cell-for-cell against
-the recurrent reference, ``tests/kernels/_gdn_oracle.py``). Per chunk (BT=64):
-the gate warp applies ``log2`` to the raw gate then an inclusive warp prefix-sum
-(flashinfer parity), so gcs=Σ log2(gate) and T[i,j]=exp2(gcs[i]-gcs[j])=Π gate;
-the 7 GEMMs and the gating/inverse/epilogue glue (see ``docs/kernels/gdn_prefill/INSTR.md``
-and the project memory for the full op map). State S[K,V] carried in TMEM.
-"""
-
-# Per-warp execution model audit (mirrors the fp16/fa4 pattern): mbarrier.init
-# and every once-per-execution issue (tma_load / tcgen05_mma / tcgen05_commit)
-# run from a single elected thread; mbarrier.arrive is per-thread, so the
-# warpgroup/warp-wide arrive sites scale their barrier counts to the number of arriving lanes
-# size (each thread signs off its own rows/reads — see bar_spec).
+# Per-warp execution model audit (mirrors the fp16/fa4 pattern).
 
 from __future__ import annotations
 
 import itertools
 from dataclasses import dataclass
 
-from ..builder import IRBuilder, TmemBand
+from ..builder import IRBuilder
 from ..nymph_rs import (
     DType,
     FenceKind,
@@ -52,7 +16,10 @@ from ..nymph_rs import (
     LaunchShape,
     MBarKind,
     MemorySpace,
+    SmemSwizzleLayout,
+    Swizzle,
     TensorSlice,
+    TmemTensor,
 )
 
 HQK = 4
@@ -95,15 +62,10 @@ class GdnPrefillConfig:
     scale: float = 1.0 / (K_DIM**0.5)
     launch_shape: LaunchShape | None = None
     varlen: bool = False  # True: cu_seqlens arg, runtime per-tile chunk count, OOB-masked tails
-    # head config (flashinfer parametrizes these): num_k_heads = min(num_q,num_v) is derived
-    # (k/v paired into the kv head); max(num_q,num_v) must be a multiple of the min — both
-    # GVA (num_v≥num_q) and GQA (num_q>num_v) are supported. head_dim is fixed at 128 /
-    # block_size BT=64 (the only flashinfer-tested values, baked into the TMEM/readback).
+    # head config (flashinfer parametrizes these).
     num_q_heads: int = 4
     num_v_heads: int = 8
-    # io dtype: "bfloat16" or "float16" (flashinfer tests both). Drives every 16-bit
-    # operand (q/k/v/out, the GEMM operands, the WY-inverse mma.sync); accumulators stay
-    # f32. mma.sync is first-class for both via its ab_dtype.
+    # io dtype: "bfloat16" or "float16" (flashinfer tests both).
     io_dtype: str = "bfloat16"
 
 
@@ -115,13 +77,7 @@ def gdn_prefill_task_config(num_seqs: int, seqlen: int) -> GdnPrefillConfig:
     return GdnPrefillConfig(num_seqs=num_seqs, seqlen=seqlen)
 
 
-# Bench-suite perf configs (the CONFIGS contract, bench/nymph_bench_guide.md):
-# the 6 core regression shapes (BENCH_CONFIGS mirrors these for the wave1 dev
-# loop, default 4q8v heads) + the flashinfer official-bench representative
-# subset: its 8 head configs (h_qk, h_v) from benchmarks/bench_gdn_prefill.py
-# (Qwen3.5-family TP variants + symmetric heads, d=128) crossed with 5 seqlen
-# shapes (1x2048 / 1x8192 / 1x65536 / 8192x8 / 2048+6144 varlen mix).
-# (num_q_heads, num_v_heads) = (h_qk, h_v); num_k_heads = min is derived.
+# Bench-suite perf configs (the CONFIGS contract, bench/nymph_bench_guide.md).
 _FI_HEADS = [(2, 8), (4, 16), (8, 32), (16, 64), (16, 32), (16, 48), (16, 16), (32, 32)]
 _FI_SEQ_SHAPES = [
     ({"num_seqs": 1, "seqlen": 2048}, "1x2048"),
@@ -143,18 +99,9 @@ CONFIGS = [
     for seq, sl in _FI_SEQ_SHAPES
 ]
 
-# Build + protocol-check coverage lives in the tests (CONFIGS_SUPPORTED /
-# HEAD_CONFIGS / VARLEN_CONFIGS below) — fixed-length chunk counts 1/2/4/8/16/32
-# crossed with batch sizes, including num_work = num_seqs·NEFF > SM_COUNT so the
-# persistent grid-stride runs MULTIPLE tiles per CTA. The per-chunk barriers/buffers
-# carry across tiles via cumulative pipeline-state counters (gc / gc_pos = CUTLASS
-# PipelineState, never per-tile reset), with the chunk_free handoff spanning tile
-# boundaries.
+# Build + protocol-check coverage lives in the tests.
 
-# Build + protocol-check coverage (tests only — the bench CONFIGS above includes
-# 1024-chunk shapes whose protocol trace would take hours; this is the original
-# fixed-length corpus): chunk counts 1/2/4/8/16/32 crossed with batch sizes,
-# including num_work = num_seqs·NEFF > SM_COUNT (multi-tile/CTA, phase-carry).
+# Build + protocol-check coverage.
 PROTOCOL_CONFIGS = [
     {"num_seqs": ns, "seqlen": T, "label": f"ns{ns}_t{T}"}
     for ns, T in [
@@ -178,26 +125,18 @@ PROTOCOL_CONFIGS = [
     ]
 ]
 
-# Cheaper fixed-length shapes for the cell-exact value sweep: the two smallest
-# (1- and 2-chunk) keep the dev-loop gate fast — the full-shape protocol sweep
-# runs in the value-sim's own extended tier, not on every dev iteration.
+# Cheaper fixed-length shapes for the cell-exact value sweep.
 CONFIGS_SUPPORTED = [
     {"num_seqs": ns, "seqlen": T, "label": f"ns{ns}_t{T}"} for ns, T in [(1, 64), (1, 128)]
 ]
 
 # Head configs = flashinfer test_prefill_delta_rule.py num_q/k/v_heads (head_dim=128).
-# num_k_heads = min(num_q,num_v) is derived (k/v paired into the kv head). Listed as
-# (num_q_heads, num_v_heads): GVA (num_v≥num_q) AND GQA (num_q>num_v) — the kernel
-# iterates max(num_q,num_v) effective heads. num_work = num_eff·num_seqs may exceed
-# SM_COUNT (multi-tile). Covers ALL 8 flashinfer configs: (1,1,1)(4,1,1)(3,3,3)(6,2,2)
-# (1,1,2)(2,2,4)(16,16,32)(16,16,64) -> (num_q,num_v) below + default (4,8).
 HEAD_CONFIGS = [
     {"num_q_heads": q, "num_v_heads": v, "label": f"h{q}q{v}v"}
     for q, v in [(1, 1), (4, 1), (3, 3), (6, 2), (1, 2), (2, 4), (16, 32), (16, 64), (4, 8)]
 ]
 
-# Varlen (cu_seqlens) batches: mixed lengths, non-BT-multiple tails, sub-BT and
-# multi-chunk sequences, packed back-to-back.
+# Varlen (cu_seqlens) batches.
 VARLEN_CONFIGS = [
     {"seqlens": s, "label": "v_" + "_".join(map(str, s))}
     for s in [
@@ -245,12 +184,7 @@ VARLEN_CONFIGS = [
 def build_gdn_prefill(config: GdnPrefillConfig = GdnPrefillConfig()) -> Kernel:
     NS, T = config.num_seqs, config.seqlen
     _validate_config(config)
-    # Head model (flashinfer gated_delta_net_chunked.py:405-472): iterate NEFF =
-    # max(h_q,h_v) effective heads. gate/beta/out/state are per effective head `eh`; the
-    # state recurrence is per eh. Only the q/k/v LOADS use shared-vs-unique heads — k/v are
-    # paired into the kv head HK = min(h_q,h_v), with HR = NEFF//HK heads per group:
-    #   GVA (h_v≥h_q): q,k load eh//HR (shared);  v loads eh (unique)
-    #   GQA (h_q>h_v): q loads eh (unique);        k,v load eh//HR (shared)
+    # Head model (flashinfer gated_delta_net_chunked.py:405-472).
     H_Q, H_V = config.num_q_heads, config.num_v_heads
     HK = min(H_Q, H_V)  # num_k_heads (k/v are paired into the kv head)
     NEFF = max(H_Q, H_V)  # effective / output heads (= num_o_heads)
@@ -276,18 +210,17 @@ def build_gdn_prefill(config: GdnPrefillConfig = GdnPrefillConfig()) -> Kernel:
         state=K_DIM * V_DIM * 2,  # fp16 SMEM S_prev copy (GEMM3/4's B operand)
         dcs=BT * BT * 2,  # DC scratch for the hierarchical-inverse merges (mma.sync)
     )
+    mma_smem_names = {"k", "q", "v", "vnewt", "attn", "tmpt", "state"}
     off, offs = 0, {}
     for name, nbytes in sizes.items():
+        if name in mma_smem_names:
+            off = _align(off, 1024)
         offs[name] = off
         off += nbytes
     # A_inv aliases NV (vnewt): flashinfer's sAinv holds A_inv then overwrites with NV.
-    # Disjoint lifetimes here — A_inv (CG0 inverse → GEMM5 A operand) is dead before
-    # _read128_vnew writes NV into vnewt; ainv (8KB) fits in vnewt (16KB).
     offs["ainv"] = offs["vnewt"]
 
-    # mbarrier.arrive is PER-THREAD: each producer thread arrives once after its
-    # own rows/reads land, so a completed phase proves every arriving lane finished
-    # without a producer-side sync (the fa4 audit pattern). Counts = number of arriving lanes.
+    # mbarrier.arrive is PER-THREAD.
     CG0_T = 128  # CG0 arrives are warpgroup-wide (warps 0-3)
     CG1_T = 128  # CG1 arrives are warpgroup-wide (warps 4-7)
     GATE_T = 32  # gate warp arrives warp-wide (each lane signs off its gcs/beta lanes)
@@ -295,9 +228,7 @@ def build_gdn_prefill(config: GdnPrefillConfig = GdnPrefillConfig()) -> Kernel:
     KSTAGES = 2  # K is double-buffered (flashinfer smem_k_stages=2): prefetch next chunk
     bar_spec = {
         "tk": (MBarKind.TMA, 1, KSTAGES),  # K full (2 stages)
-        # K empty: armed by the MMA PIPELINE (tcgen05_commit after GEMM7) — a
-        # thread arrive right after the issue would release the stage while the
-        # engine may still be reading it (the fp16 gemm operand-release rule).
+        # K empty: armed by the MMA PIPELINE (tcgen05_commit after GEMM7).
         "k_free": (MBarKind.TCGEN05, 1, KSTAGES),
         "tq": (MBarKind.TMA, 1),
         "tv": (MBarKind.TMA, 1),
@@ -356,9 +287,6 @@ def build_gdn_prefill(config: GdnPrefillConfig = GdnPrefillConfig()) -> Kernel:
 
     def task_geom(task):
         # per-tile (seq, head) geometry: token base + chunk count + the q/k/v load heads.
-        # eh = effective head (gate/beta/out/state); shared = eh//HR = the kv-group head.
-        # For varlen tok_base/chunk-count are RUNTIME (k.scalar from cu_seqlens, usable as
-        # the for_loop bound); for fixed-length they are compile-time.
         work = task.field("work")
         seq = work // NEFF
         eh = work % NEFF
@@ -374,42 +302,34 @@ def build_gdn_prefill(config: GdnPrefillConfig = GdnPrefillConfig()) -> Kernel:
             return seq, eh, q_head, k_head, v_head, base, nch, slen
         return seq, eh, q_head, k_head, v_head, seq * config.seqlen, n_chunks, config.seqlen
 
-    def sm(name, dt, shape):
-        return k.tensor(space=MemorySpace.SMEM, dtype=dt, shape=shape, byte_offset=offs[name])
+    def sm(name, dt, shape, *, mma_operand=False):
+        layout = SmemSwizzleLayout(Swizzle.B128) if mma_operand else None
+        return k.tensor(
+            space=MemorySpace.SMEM, dtype=dt, shape=shape, byte_offset=offs[name], layout=layout
+        )
 
-    # K double-buffered: single [2, BT, K_DIM] ring; the stage is the LEADING dim
-    # (kstg = c%2) — the TMA/MMA slices take full (BT, K_DIM) tiles per stage.
-    # (A row-folded [2*BT, K_DIM] buffer cannot be TMA-loaded: the half-row slice
-    # breaks the shared-chain stride rule on every MMA-compatible layout.)
-    k_s = sm("k", iod, (2, BT, K_DIM))
-    q_s = sm("q", iod, (BT, K_DIM))
-    v_s = sm("v", iod, (BT, V_DIM))
-    vnewt_s = sm("vnewt", iod, (V_DIM, BT))
-    ainv_s = sm("ainv", iod, (BT, BT))
-    attn_s = sm("attn", iod, (BT, BT))
-    tmpt_s = sm("tmpt", iod, (V_DIM, BT))
+    # K double-buffered: single [2, BT, K_DIM] ring; the stage is the LEADING dim (kstg = c%2).
+    k_s = sm("k", iod, (2, BT, K_DIM), mma_operand=True)
+    q_s = sm("q", iod, (BT, K_DIM), mma_operand=True)
+    v_s = sm("v", iod, (BT, V_DIM), mma_operand=True)
+    vnewt_s = sm("vnewt", iod, (V_DIM, BT), mma_operand=True)
+    ainv_s = sm("ainv", iod, (BT, BT), mma_operand=True)
+    attn_s = sm("attn", iod, (BT, BT), mma_operand=True)
+    tmpt_s = sm("tmpt", iod, (V_DIM, BT), mma_operand=True)
     out_s = sm("out", iod, (BT, V_DIM))
     m_s = sm("m", DType.F32, (BT, BT))
     dcs_s = sm("dcs", iod, (BT, BT))  # hierarchical-inverse DC scratch
     gcs_s = sm("gcs", DType.F32, (BT, NEFF))
     beta_s = sm("beta", DType.F32, (BT, NEFF))
-    s_s = sm("state", iod, (K_DIM, V_DIM))  # fp16 SMEM S_prev copy (GEMM3/4 B)
+    s_s = sm("state", iod, (K_DIM, V_DIM), mma_operand=True)  # fp16 SMEM S_prev copy (GEMM3/4 B)
 
-    # TMEM column plan matching flashinfer's separate allocations (gated_delta_net_chunked.py
-    # :319-330), as pure-Python bands over the flat physical (lane, 32-bit-cell) space:
-    # state S (f32), q_state acc (GEMM4/6), shared_acc (GEMM1/2/3/5). The fp16
-    # operand bands flashinfer stages in TMEM (state_inp / shared_inp) live in
-    # SMEM here instead: tcgen05.mma reads its B operand from SMEM ONLY, so the
-    # TMEM-B form is unrealizable (s_s / tmpt_s / vnewt_s carry those tiles).
-    # The m=64 accumulators anchor at lane 0 (the m=64 MMA's Layout F scatters the
-    # 64 rows over four 16-lane runs, lane_align=0); fp16/bf16 bands pack 2 per cell.
-    s_tmem = TmemBand(col0=0, dtype=DType.F32)  # (128, V_DIM) f32: 0-127
-    qstate_tmem = TmemBand(col0=192, dtype=DType.F32)  # (64, V_DIM) f32: 192-319
-    # shared_acc = 2 stages of 64 cols (flashinfer 64-col × 2): kk→stage0, qk→stage1
-    # (pipeline); the V-output GEMMs (ks/nv, [BT,V_DIM]) use the contiguous union view.
-    acc_s0 = TmemBand(col0=320, dtype=DType.F32)  # (64, BT) f32, stage 0: 320-383
-    acc_s1 = TmemBand(col0=384, dtype=DType.F32)  # (64, BT) f32, stage 1: 384-447
-    acc_tmem = TmemBand(col0=320, dtype=DType.F32)  # (64, V_DIM) f32, union view (ks/nv)
+    # TMEM column plan matching flashinfer's separate allocations.
+    s_tmem = k.tmem_tensor(0)  # (128, V_DIM) f32: 0-127
+    qstate_tmem = k.tmem_tensor(192)  # (64, V_DIM) f32: 192-319
+    # shared_acc = 2 stages of 64 cols (flashinfer 64-col × 2): kk→stage0, qk→stage1 (pipeline).
+    acc_s0 = k.tmem_tensor(320)  # (64, BT) f32, stage 0: 320-383
+    acc_s1 = k.tmem_tensor(384)  # (64, BT) f32, stage 1: 384-447
+    acc_tmem = k.tmem_tensor(320)  # (64, V_DIM) f32, union view (ks/nv)
 
     def reg(dt, shape):
         return k.tensor(space=MemorySpace.REG, dtype=dt, shape=shape)
@@ -424,7 +344,7 @@ def build_gdn_prefill(config: GdnPrefillConfig = GdnPrefillConfig()) -> Kernel:
     frag = reg(DType.F32, (32,))  # .16x256b.x8 readback = 32 regs
     frag32 = reg(DType.F32, (64,))  # .32x32b readback (state, thread=row, 64 cols)
     zrow = reg(DType.F32, (V_DIM,))
-    # hierarchical-inverse (mma.sync) fragments
+    # hierarchical-inverse (mma.sync) fragments.
     imm_a = reg(DType.U32, (2,))  # A = Qinv (m16k8 packed-bf16, m-broadcast)
     imm_b = reg(DType.U32, (1,))  # B = C / Pinv
     imm_acc = reg(DType.F32, (4,))  # mma accumulator
@@ -433,10 +353,7 @@ def build_gdn_prefill(config: GdnPrefillConfig = GdnPrefillConfig()) -> Kernel:
     sttile2 = reg(iod, (2,))  # second tile (vnew gated/ungated emit two stmatrix tiles)
     v_frag = reg(iod, (64,))  # delta's ldmatrix v fragment (2 blk × 16 packed b16x2 words)
     sinp_reg = reg(iod, (64,))  # bf16 cvt slots for the s_s state staging (one half at a time)
-    # Per-chunk gating fragments (Wave-3 C1: compute exp2 ONCE per chunk, not per
-    # epilogue). t_frag = CG0's T-pairwise row (32 els, reused by kk_epi AND qk_epi);
-    # t_row/t_beta = its 2 row values; dexp2/kgate2 = CG1's per-row gate factors
-    # (delta/ointer consume dexp2, vnew consumes kgate2).
+    # Per-chunk gating fragments.
     t_frag = reg(DType.F32, (32,))
     t_row = reg(DType.F32, (2,))
     t_beta = reg(DType.F32, (2,))
@@ -453,16 +370,14 @@ def build_gdn_prefill(config: GdnPrefillConfig = GdnPrefillConfig()) -> Kernel:
     sched = k.scheduler(k.task_space(grid=(num_work,), fields=("work",)))
 
     with k.if_warp(0):
-        # tmem_alloc is warp-collective (full warp 0); mbarrier.init is
-        # per-thread, so exactly one elected thread runs every init.
+        # tmem_alloc is warp-collective (full warp 0).
         k.tmem_alloc(0, N_COLS_TMEM, addr_byte_offset=tmem_addr_offset, cta_group=1)
         with k.if_elected():
             for nm, spec in bar_spec.items():
                 stg = spec[2] if len(spec) > 2 else 1
                 for s in range(stg):
                     k.mbarrier_init(bars[nm], count=spec[1], stage=s)
-    # No implicit barrier between top-level statements: this sync IS the
-    # publish of the TMEM alloc + mbarrier cells to every stream.
+    # No implicit barrier between top-level statements.
     k.cta_sync()
 
     _emit(
@@ -554,47 +469,47 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
         dst, a, b, m, n, kk, done, accum0=False, trans_a=False, trans_b=False, a_stg=0, b_stg=0
     ):
         # cute.gemm -> tcgen05.mma.cta_group::1.kind::f16 (UTCHMMA); MMA warp issues+commits.
-        # trans_a/trans_b read the operand transposed (tile [k, m] / [k, n]): GEMM3/4
-        # take the TMEM state S as B=S^T; GEMM7 takes k_s as A=Kᵀ via the MMA transpose.
-        # a_stg/b_stg = the K double-buffer stage (c%2) — k_s carries it as a
-        # LEADING dim, so its operand slice selects the stage, not a row offset.
-        # TMEM operands (flat physical addresses): the per-issue element offsets
-        # fold into the band's `elem` address. B operands are SMEM-only (tcgen05.mma).
         for g in range(kk // 16):
             a_off, a_sh = ((g * 16, 0), (16, m)) if trans_a else ((0, g * 16), (m, 16))
             b_off, b_sh = ((g * 16, 0), (16, n)) if trans_b else ((0, g * 16), (n, 16))
-            a_op = (
-                a.elem(*a_off)
-                if isinstance(a, TmemBand)
-                else _sl(a, (a_stg, *a_off), (1, *a_sh))
-                if a is k_s
-                else _sl(a, a_off, a_sh)
-            )
-            b_op = (
-                b.elem(*b_off)
-                if isinstance(b, TmemBand)
-                else _sl(b, (b_stg, *b_off), (1, *b_sh))
-                if b is k_s
-                else _sl(b, b_off, b_sh)
+            if isinstance(a, TmemTensor):
+                a_op = k.mma_a_tmem(a.at(*a_off), form="flat")
+            else:
+                a_tile = k.smem_tile(
+                    a,
+                    prefix_indices=(a_stg,) if a is k_s else (),
+                    row_offset=a_off[0],
+                    col_offset=a_off[1],
+                    rows=a_sh[0],
+                    cols=a_sh[1],
+                )
+                a_op = k.mma_a_smem(a_tile)
+            b_op = k.smem_tile(
+                b,
+                prefix_indices=(b_stg,) if b is k_s else (),
+                row_offset=b_off[0],
+                col_offset=b_off[1],
+                rows=b_sh[0],
+                cols=b_sh[1],
             )
             k.tcgen05_mma(
                 dst.at(0, 0),
                 a_op,
                 b_op,
-                m=m,
-                n=n,
-                k=16,
+                mma_m=m,
+                mma_n=n,
+                format="f16" if iod == DType.F16 else "bf16",
+                block_scale=None,
                 accum=(accum0 or g != 0),
                 trans_a=trans_a,
                 trans_b=trans_b,
+                ws=False,
+                cta_group=1,
             )
         k.tcgen05_commit(bars[done])
 
     def rss(dst_s, fac_neg_beta, mask_strict, tid, lane, warp, dst_bf16=False, acc=None):
-        # kk_epi / qk_epi (CG0): read M=64 acc via tcgen05.ld.16x256b, scale by the
-        # T-pairwise factor exp2(gcs[i]-gcs[j]) and (-beta[i] | scale), mask, store.
-        # Wave-3 C1: T and -beta come from the per-chunk fragments built once before
-        # kk_epi (t_frag/t_beta) — no per-element gcs/beta SMEM reads or exp2 here.
+        # kk_epi / qk_epi (CG0).
         k.tcgen05_ld(
             frag, (acc if acc is not None else acc_tmem).at(0, 0), shape="16x256b", num=LD_NUM
         )
@@ -611,8 +526,7 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                     else:
                         k.reg_mul(r1, r1, float(scale))
                     if dst_bf16:
-                        # W_qkv (attn_s) is a GEMM6 operand → stage the m8n8 tile via
-                        # stmatrix (STSM), matching flashinfer's qk_epi r2s store.
+                        # W_qkv (attn_s) is a GEMM6 operand → stage the m8n8 tile via stmatrix.
                         k.reg_cvt(_sl(sttile, (v0p,), (1,)), r1)
                         if v0p == 1:
                             _stm(k, dst_s, 8 * va + 16 * warp, 8 * vb, sttile, lane, trans=False)
@@ -631,9 +545,7 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                         k.reg_store(_sl(dst_s, (tid, j), (1, 1)), r3)
         k.wg_sync(barrier_id=10)
 
-    # ============== TMA-load warp (9): cp.async.bulk.tensor (UTMALDG) ==============
-    # Single-thread TMA producer stream: arrive_expect_tx is per-thread (one arm
-    # per load) and tma_load requires a single-thread mask.
+    # ============== TMA-load warp (9).
     with k.if_warp(TMA_WARP):
         # fi's register budgets (CK:241-243): support warps squeeze to 24.
         k.set_maxnreg(24)
@@ -645,8 +557,7 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                 seq, eh, q_head, k_head, v_head, tok_base, NCH, slen = task_geom(task)
                 with k.for_loop(stop=NCH) as c:  # runtime chunk loop (varlen num_chunks)
                     gtok = tok_base + c * BT
-                    # K (double-buffered): stage gc%2; wait that stage is free (chunk gc-2's
-                    # GEMM7 freed it) then load — overlaps the previous chunk's compute.
+                    # K (double-buffered): stage gc%2.
                     kstg, kocc = gc % 2, gc // 2
                     k.mbarrier_wait(bars["k_free"], stage=kstg, phase=(kocc + 1) % 2)
                     k.mbarrier_arrive_expect_tx(bars["tk"], bytes=BT * K_DIM * 2, stage=kstg)
@@ -659,8 +570,7 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                         shape=(1, BT, K_DIM),
                         gmem_shape=(BT, 1, K_DIM),
                     )
-                    # q, v (single-buffered): gated by chunk_free (chunk gc-1 freed the buffers —
-                    # gc>0 so the wait spans tile boundaries, handing buffers off across tasks).
+                    # q, v (single-buffered): gated by chunk_free.
                     with k.if_(gc > 0):
                         k.mbarrier_wait(bars["chunk_free"], phase=(gc - 1) % 2)
                     for nm, dst, src, hd, cols in (
@@ -678,7 +588,7 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                         )
                     k.scalar_store(gc, gc + 1)  # advance the pipeline state
 
-    # ============== gate/beta warp (10): load gate/beta + cumsum -> gate_ready ==============
+    # ============== gate/beta warp (10): load gate/beta + cumsum -> gate_ready ==============.
     with k.if_warp(GATE_WARP):
         k.set_maxnreg(24)  # fi's support-warp budget (CK:241-243)
         lane = k.lane_id()
@@ -689,12 +599,9 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                 gtok = tok_base + c * BT
                 with k.if_(gc > 0):
                     k.mbarrier_wait(bars["chunk_free"], phase=ph(gc - 1))
-                # TMA issue is single-thread: arrive_expect_tx is per-thread (one
-                # arm per load) and tma_load needs a single-thread mask.
+                # TMA issue is single-thread.
                 with k.if_elected():
-                    # Full (BT, HV) tile: a per-head column slice is not a legal
-                    # TMA box (a strided f32 column fails the 16B inner-box
-                    # rule) — load the whole tile, read column `eh` out of it.
+                    # Full (BT, HV) tile.
                     k.mbarrier_arrive_expect_tx(bars["tg"], bytes=BT * NEFF * 4)
                     k.tma_load(
                         gcs_s,
@@ -723,15 +630,14 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                             k.reg_fill(r1, 1.0)
                             k.reg_store(_sl(gcs_s, (i, eh), (1, 1)), r1)
                     k.warp_sync()
-                # gate warp: raw gate a -> log2(a) in place (flashinfer @1896), then the
-                # inclusive cumsum gcs[i]=Σ log2(a[l]) -> T[i,j]=exp2(gcs[i]-gcs[j])=Πa.
+                # gate warp: raw gate a -> log2(a) in place.
                 for half in range(2):
                     i = lane + half * 32
                     k.reg_load(r1, _sl(gcs_s, (i, eh), (1, 1)))
                     k.reg_unary(r1, r1, op="log2")
                     k.reg_store(_sl(gcs_s, (i, eh), (1, 1)), r1)
                 k.warp_sync()
-                # inclusive cumsum over BT=64, 32 lanes x 2 elems (Hillis-Steele)
+                # inclusive cumsum over BT=64, 32 lanes x 2 elems (Hillis-Steele).
                 for step in range(6):
                     ov = 1 << step
                     for half in range(2):
@@ -762,15 +668,11 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                 k.mbarrier_arrive(bars["gate_ready1"])
                 k.scalar_store(gc, gc + 1)  # advance pipeline state
 
-    # ============== MMA warp (8): issues all 7 GEMMs (UTCHMMA) ==============
-    # Single-thread MMA issuer stream: tcgen05_mma/tcgen05_commit require a
-    # single-thread mask; the k_free arrive is one arrival (count=1).
+    # ============== MMA warp (8).
     with k.if_warp(MMA_WARP):
         k.set_maxnreg(24)  # fi's support-warp budget (CK:241-243)
         with k.if_elected():
-            # gc = every-chunk pipeline state; gc_pos = the GEMM3/4 pipeline (used only on
-            # chunk>0 — S_prev exists), advancing on its own cadence (= flashinfer's separate
-            # per-pipeline PipelineState). Both carried across the persistent tile loop.
+            # gc = every-chunk pipeline state; gc_pos = the GEMM3/4 pipeline.
             gc = k.scalar(initial=0)
             gc_pos = k.scalar(initial=0)
             with k.for_each_task(sched) as task:
@@ -830,15 +732,13 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                         trans_a=True,
                         a_stg=kstg,
                     )  # GEMM7 dS
-                    # GEMM7 was the last K[c] consumer → free this K stage for chunk
-                    # gc+2. tcgen05_commit (not a thread arrive): the stage may only
-                    # be released once the engine's reads of it actually completed.
+                    # GEMM7 was the last K[c] consumer → free this K stage for chunk gc+2.
                     k.tcgen05_commit(bars["k_free"], stage=gc % 2)
                     k.scalar_store(gc, gc + 1)
                     with k.if_(c > 0):
                         k.scalar_store(gc_pos, gc_pos + 1)
 
-    # ============== compute group 0 (warps 0-3): kk_epi, qk_epi, WY inverse ==============
+    # ============== compute group 0 (warps 0-3): kk_epi, qk_epi, WY inverse ==============.
     with k.if_warpgroup(0):
         # fi's register budgets (CK:241-243, setmaxregister at role top): CG0 224.
         k.set_maxnreg(224)
@@ -852,9 +752,7 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                 with k.if_(gc > 0):
                     k.mbarrier_wait(bars["chunk_free"], phase=ph(gc - 1))
                 k.mbarrier_wait(bars["gate_ready0"], phase=ph(gc))
-                # Wave-3 C1: build the per-chunk gating fragments ONCE — kk_epi and
-                # qk_epi both consume them (the old rss recomputed T per call):
-                # t_frag[r] = exp2(gcs[row]-gcs[col]) (T-pairwise), t_beta = -beta[row].
+                # Wave-3 C1: build the per-chunk gating fragments ONCE.
                 for va in range(2):
                     row = (lane // 4) + 8 * va + 16 * warp
                     k.reg_load(r2, _sl(beta_s, (row, eh), (1, 1)))
@@ -869,22 +767,17 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                             k.reg_sub(r1, _sl(t_row, (va,), (1,)), r2)
                             k.reg_unary(r1, r1, op="exp2")
                             k.reg_store(_sl(t_frag, (r,), (1,)), r1)
-                # kk_epi: W_kk -> M_kk
+                # kk_epi: W_kk -> M_kk.
                 k.mbarrier_wait(bars["d_kk"], phase=ph(gc))
                 rss(m_s, True, True, tid, lane, warp, acc=acc_s0)
                 k.mbarrier_arrive(bars["f_kk"])
-                # qk_epi: W_qk -> W_qkv (attn_s) — done BEFORE the inverse so qkv_ready
-                # fires GEMM6 early while the inverse overlaps (flashinfer @2431-2464).
+                # qk_epi: W_qk -> W_qkv (attn_s).
                 k.mbarrier_wait(bars["d_qk"], phase=ph(gc))
                 rss(attn_s, False, False, tid, lane, warp, dst_bf16=True, acc=acc_s1)
                 k.mbarrier_arrive(bars["f_qk"])
                 fence_pub(10)
                 k.mbarrier_arrive(bars["qkv_ready"])
-                # ===== WY inverse: A_inv = (I+M)⁻¹ — flashinfer's hierarchical blockwise
-                # inverse using the warp-level mma.sync (SM80 HMMA) + ldmatrix. m_s already
-                # holds M = -beta·KKT·T = -L (negated strict-lower, diag 0).
-                # Stage 1 (GJ): invert the 8 diagonal 8×8 blocks (f32 forward-sub on m_s,
-                # NO extra negation since m_s is already -L). thread = col j of its block.
+                # ===== WY inverse: A_inv = (I+M)⁻¹.
                 for r_ in range(1, 8):
                     with k.if_((tid < BT) & ((tid % 8) < r_)):
                         base = (tid // 8) * 8
@@ -902,7 +795,7 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                         k.reg_add(r1, r1, racc)
                         k.reg_store(_sl(m_s, (base + r_, base + jc), (1, 1)), r1)
                     k.wg_sync(barrier_id=10)
-                # cvt m_s -> ainv_s (bf16) with unit diagonal (the matrix for the merges)
+                # cvt m_s -> ainv_s (bf16) with unit diagonal (the matrix for the merges).
                 with k.if_(tid < BT):
                     for c in range(BT):
                         k.reg_load(r1, _sl(m_s, (tid, c), (1, 1)))
@@ -923,16 +816,11 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                     k.reg_store(_sl(imm_a, (1,), (1,)), _sl(imm_a, (0,), (1,)))
 
                 def _ldB(src, R, C):
-                    # trans=True: the mma's B operand must hold B[k][n] = tile[k][n]
-                    # in the raw PTX .col layout (word = tile[2t+h][g]); a trans
-                    # ldmatrix delivers exactly that, so the mma computes A@tile.
-                    # (non-trans yields B := tile in the N×K fragment → A@tileᵀ.)
+                    # trans=True loads raw tile[k,n] coordinates into the MMA B fragment.
                     k.ldmatrix(imm_b, _sl(src, (R + lane % 8, C), (1, 8)), num=1, trans=True)
 
                 def _store8(dst, R, C, neg):
-                    # The accumulator's top 8×8 (ri 0,1) IS one m8n8 tile in the mma
-                    # C/D layout (row=lane//4, col=2(lane%4)+ri) — exactly stmatrix's
-                    # fragment, so stage it back via stmatrix (STSM), matching flashinfer.
+                    # The accumulator's top 8×8.
                     for ri in range(2):
                         if neg:
                             k.reg_mul(_sl(imm_acc, (ri,), (1,)), _sl(imm_acc, (ri,), (1,)), -1.0)
@@ -980,7 +868,7 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                 fence_pub(10)
                 _merge(0, 0, 32, 0)
                 k.wg_sync(barrier_id=10)
-                # fold beta[j] into A_inv columns (for GEMM5 VNEW = A_inv·diagβ @ vᵀ)
+                # fold beta[j] into A_inv columns (for GEMM5 VNEW = A_inv·diagβ @ vᵀ).
                 with k.if_(tid < BT):
                     for j in range(BT):
                         k.reg_load(r2, _sl(beta_s, (j, eh), (1, 1)))
@@ -993,10 +881,9 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                 k.mbarrier_arrive(bars["ainv_ready"])
                 k.scalar_store(gc, gc + 1)  # advance pipeline state
 
-    # ============== compute group 1 (warps 4-7): new_v, qkv, kv_update ==============
+    # ============== compute group 1 (warps 4-7): new_v, qkv, kv_update ==============.
     with k.if_warpgroup(1):
-        # fi's register budgets (CK:241-243): CG1 256 — the epilogue fragments
-        # (64-wide f32 readbacks) only fit registers under this budget.
+        # fi's register budgets (CK:241-243): CG1 256.
         k.set_maxnreg(256)
         tid = k.tid_in_wg()
         lane = tid % 32
@@ -1014,29 +901,21 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                 k.mbarrier_wait(bars["gate_ready1"], phase=ph(gc))
                 k.mbarrier_wait(bars["tv"], phase=ph(gc))  # CG1 reads v_s (delta)
                 k.reg_load(glast, _sl(gcs_s, (BT - 1, eh), (1, 1)))
-                # Wave-3 C1: per-row gate factors ONCE per chunk (delta/ointer consume
-                # dexp2 = exp2(gcs[row]); vnew consumes kgate2 = exp2(glast-gcs[row])) —
-                # the helpers no longer re-load gcs and re-exp2 per element.
+                # Wave-3 C1: per-row gate factors ONCE per chunk.
                 for va in range(2):
                     row = (lane // 4) + 8 * va + 16 * warp
                     k.reg_load(r2, _sl(gcs_s, (row, eh), (1, 1)))
                     k.reg_unary(_sl(dexp2, (va,), (1,)), r2, op="exp2")
                     k.reg_sub(r1, glast, r2)
                     k.reg_unary(_sl(kgate2, (va,), (1,)), r1, op="exp2")
-                # delta operand (deltaT -> tmpt_s) + o_inter (-> out_s)
+                # delta operand (deltaT -> tmpt_s) + o_inter (-> out_s).
                 with k.if_(c > 0):
-                    # s_s = fp16 SMEM copy of the UNDECAYED S_prev, the GEMM3/4 B
-                    # operand (tcgen05.mma reads B from SMEM only — flashinfer's
-                    # TMEM state_inp band is unrealizable as a B). Then decay the
-                    # main state s_tmem -> Phi*S_prev for GEMM7 — both at the chunk
-                    # TOP (flashinfer @3345-3399 stage-then-decay), so GEMM3/4 read
-                    # a stable copy. thread tid holds S row k=tid (.32x32b).
+                    # s_s = fp16 SMEM copy of the UNDECAYED S_prev, the GEMM3/4 B operand.
                     k.reg_unary(r1, glast, op="exp2")  # Phi = exp2(glast) (gcs log2-units)
                     for half in range(2):
                         k.tcgen05_ld(frag32, s_tmem.at(0, half * 64), shape="32x32b", num=64)
                         k.tcgen05_wait_ld()
-                        # Wave-3 C1: whole-row tile ops instead of the 64-iteration
-                        # per-element cvt+store (same values, same cvt-before-decay order).
+                        # Apply the chunk gate to the whole 64-element row at once.
                         k.reg_cvt(_sl(sinp_reg, (0,), (64,)), _sl(frag32, (0,), (64,)))
                         k.reg_store(
                             _sl(s_s, (tid, half * 64), (1, 64)), _sl(sinp_reg, (0,), (64,))
@@ -1044,8 +923,7 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                         k.reg_mul(_sl(frag32, (0,), (64,)), _sl(frag32, (0,), (64,)), r1)
                         k.tcgen05_st(s_tmem.at(0, half * 64), frag32, num=64)  # decayed main state
                     k.tcgen05_wait_st()
-                    # publish the generic s_s stores to the MMA's async proxy
-                    # (the tcgen05.st state_inp staging needed no such fence).
+                    # publish the generic s_s stores to the MMA's async proxy.
                     k.fence(kind=FenceKind.ASYNC_PROXY, scope=FenceScope.CTA)
                     k.wg_sync(barrier_id=11)
                     k.mbarrier_arrive(bars["sT_ready"])  # s_s ready for GEMM3/4
@@ -1087,14 +965,12 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                     k.wg_sync(barrier_id=11)
                     k.mbarrier_arrive(bars["f_qs"])
                 with k.if_(c.eq(0)):
-                    # chunk 0: S=0 → o_inter=0 (the o_frag register fragment, Wave-3
-                    # C2 — was an out_s SMEM zero-fill); GEMM5 reads v_s directly
-                    # (delta=v), so no v transpose needed here.
+                    # chunk 0: S=0 → o_inter=0.
                     k.reg_fill(_sl(frag32, (0,), (64,)), 0.0)
                     k.wg_sync(barrier_id=11)
                 fence_pub(11)
                 k.mbarrier_arrive(bars["delta_ready"])
-                # new_v_epi: VNEW -> vnewt_s (ungated) + tmpt_s (kgate-scaled, for GEMM7)
+                # new_v_epi: VNEW -> vnewt_s (ungated) + tmpt_s (kgate-scaled, for GEMM7).
                 k.mbarrier_wait(bars["d_nv"], phase=ph(gc))
                 _read128_vnew(
                     k,
@@ -1114,14 +990,12 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                 )
                 k.wg_sync(barrier_id=11)
                 k.mbarrier_arrive(bars["f_nv"])
-                # NV (vnewt_s) is GEMM6's B and vnew_gated (tmpt_s) GEMM7's B —
-                # both already SMEM (tcgen05.mma reads B from SMEM only).
+                # NV (vnewt_s) is GEMM6's B and vnew_gated (tmpt_s) GEMM7's B.
                 fence_pub(11)
                 k.mbarrier_arrive(bars["vnew_ready"])
-                # GEMM7 reads K directly (A=Kᵀ via the MMA transpose) and tmpt_s
-                # (vnew_gated, B); both ready now. State already decayed at chunk top.
+                # GEMM7 reads K directly (A=Kᵀ via the MMA transpose) and tmpt_s (vnew_gated, B).
                 k.mbarrier_arrive(bars["ktvng_ready"])
-                # qkv_epilogue: O_intra -> o = o_inter + O_intra -> out_s
+                # qkv_epilogue: O_intra -> o = o_inter + O_intra -> out_s.
                 k.mbarrier_wait(bars["d_oi"], phase=ph(gc))
                 _read128_store_out(k, acc_tmem, out_s, frag, rb16, sttile, lane, warp, frag32)
                 k.wg_sync(barrier_id=11)
@@ -1134,9 +1008,7 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                 k.scalar_store(gc, gc + 1)
                 with k.if_(c > 0):
                     k.scalar_store(gc_pos, gc_pos + 1)
-            # store the FINAL state S -> state_g ONCE, after the chunk loop, via scalar
-            # reg->GMEM (st.global) — matching flashinfer _store_final_state's autovec_copy
-            # (NOT per-chunk, NOT TMA). thread tid = state row dk; .32x32b is thread=row.
+            # store the FINAL state S -> state_g ONCE, after the chunk loop, via scalar reg->GMEM.
             work = task.field("work")
             seq = work // NEFF
             eh = work % NEFF
@@ -1145,7 +1017,7 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                 k.tcgen05_wait_ld()
                 k.reg_store(_sl(state_g, (seq, eh, tid, half * 64), (1, 1, 1, 64)), frag32)
 
-    # ============== epilogue warp (11): output store (UTMASTG) ==============
+    # ============== epilogue warp (11): output store (UTMASTG) ==============.
     with k.if_warp(EPI_WARP):
         k.set_maxnreg(24)  # fi's support-warp budget (CK:241-243)
         if not config.varlen:
@@ -1170,9 +1042,7 @@ def _emit(k, config, n_chunks, sched, task_geom, args, sm, tm, rg, bars):
                         )  # out_s freed for next chunk's o_inter
                         k.scalar_store(gc, gc + 1)
         else:
-            # varlen: the partial last chunk's OOB rows must NOT be stored (they'd overrun
-            # into the next packed sequence). Full-warp scalar store, predicated to valid
-            # rows (global pos < seqlen_b); boundary-tile checklist guidance.
+            # varlen: the partial last chunk's OOB rows must NOT be stored.
             gc = k.scalar(initial=0)
             with k.for_each_task(sched) as task:
                 seq, eh, q_head, k_head, v_head, tok_base, NCH, slen = task_geom(task)
@@ -1204,9 +1074,7 @@ def _read128(k, acc, frag):
 
 
 def _stm(k, dst, row_base, col_base, sttile, lane, trans):
-    # stmatrix one m8n8 tile (sttile = 2 bf16 = 1 word) → dst. The .16x256b readback's
-    # per-(va,vb) tile IS the mma m8n8 C/D fragment (row=lane//4, col=2(lane%4)+v0p),
-    # so stmatrix stages it reg→SMEM (STSM), matching flashinfer's epilogue r2s stores.
+    # stmatrix one m8n8 tile (sttile = 2 bf16 = 1 word) → dst.
     if trans:  # transposed store dst[col, row] (stmatrix.trans writes row=mma_col,col=mma_row)
         k.stmatrix(_sl(dst, (col_base + lane % 8, row_base), (1, 8)), sttile, num=1, trans=True)
     else:
@@ -1214,9 +1082,7 @@ def _stm(k, dst, row_base, col_base, sttile, lane, trans):
 
 
 def _read128_store_out(k, acc, dst_s, frag, rb16, sttile, lane, warp, o_frag):
-    # o[row,col] = O_intra[row,col] + o_inter (in the o_frag register fragment,
-    # Wave-3 C2 — was an out_s SMEM round trip). bf16 add, then stmatrix the
-    # tile back (STSM).
+    # o[row,col] = O_intra[row,col] + o_inter.
     for blk, va, vb, v0p in _read128(k, acc, frag):
         r = v0p + 2 * va + 4 * vb
         k.reg_cvt(rb16, _sl(frag, (r,), (1,)))  # O_intra → bf16
@@ -1230,12 +1096,6 @@ def _read128_delta(
     k, acc, tmpt_s, v_s, gcs_s, frag, rb16b, sttile, r1, lane, warp, eh, dexp2, v_frag
 ):
     # delta[i,dv] = v[i,dv] - exp2(gcs[i])·KH[i,dv]; store deltaᵀ → tmpt_s[dv,i] (stmatrix.trans).
-    # dexp[i] comes from the per-chunk dexp2 fragment (Wave-3 C1), not per-element exp2.
-    # Wave-3 (i): v is ldmatrix-loaded ONCE per (blk, va) as packed b16x2 fragments
-    # (was per-element SMEM pair loads). The non-trans fragment coordinate
-    # (row=lane//4, col=2*(lane%4)+v0p) IS the epilogue tile coordinate, so
-    # v_frag[32*blk + 16*va + 2*vb + v0p] holds v[i,dv] — consecutive pairs ARE
-    # the x4 words (each x4 group covers vb tiles 4*half..4*half+3).
     for blk, va, vb, v0p in _read128(k, acc, frag):
         r = v0p + 2 * va + 4 * vb
         if vb == 0 and v0p == 0:
@@ -1263,10 +1123,6 @@ def _read128_delta(
 
 def _read128_ointer(k, acc, out_s, gcs_s, scale, frag, r1, sttile, lane, warp, eh, dexp2, o_frag):
     # o_inter[i,dv] = exp2(gcs[i])·scale·QS[i,dv]; dexp[i] from the dexp2 fragment.
-    # Wave-3 C2: keep o_inter in the (chunk-top-dead) frag32 register fragment
-    # (o_frag) instead of staging through out_s SMEM — store_out then adds it
-    # register-side, eliminating the whole o_inter SMEM round trip (ointer's
-    # 32 _stm + store_out's 64 per-element loads per chunk).
     for blk, va, vb, v0p in _read128(k, acc, frag):
         r = v0p + 2 * va + 4 * vb
         k.reg_mul(r1, _sl(dexp2, (va,), (1,)), _sl(frag, (r,), (1,)))
@@ -1277,9 +1133,7 @@ def _read128_ointer(k, acc, out_s, gcs_s, scale, frag, r1, sttile, lane, warp, e
 def _read128_vnew(
     k, acc, vnewt_s, vng_s, gcs_s, glast, frag, sttile, sttile2, r1, lane, warp, eh, kgate2
 ):
-    # VNEW readback → vnewt_s[dv,i]=vnew (ungated, GEMM6) AND vng_s[dv,i]=vnew·exp2(glast-gcs[i])
-    # (gated, GEMM7); both transposed → stmatrix.trans (one m8n8 tile per (va,vb)).
-    # kgate[i] comes from the per-chunk kgate2 fragment (Wave-3 C1), not per-element exp2.
+    # VNEW readback → vnewt_s[dv,i]=vnew.
     for blk, va, vb, v0p in _read128(k, acc, frag):
         r = v0p + 2 * va + 4 * vb
         k.reg_cvt(_sl(sttile, (v0p,), (1,)), _sl(frag, (r,), (1,)))  # ungated
@@ -1303,42 +1157,14 @@ def _validate_config(config: GdnPrefillConfig) -> None:
         )
     if not config.varlen and config.seqlen % BT != 0:
         raise ValueError(f"gdn_prefill fixed-length requires seqlen a multiple of {BT}")
-    # Varlen (cu_seqlens) path: the chunk loop is a runtime for_loop with per-tile
-    # num_chunks_b = ceil_div(seqlen_b, BT) loaded from cu_seqlens (k.scalar). Arbitrary
-    # lengths supported — the partial last chunk's OOB tokens are masked to no-ops (gate=1,
-    # beta=0; K/Q/V additionally TMA-OOB-zero-filled) and the epilogue stores only valid
-    # rows. cu_seqlens is the i32[NS+1] arg, passed at interpret time.
+    # Varlen (cu_seqlens) path.
 
 
-# ---------------------------------------------------------------------------
-# Bench-suite interface (see bench/nymph_bench_guide.md). Lives IN the kernel
-# file, mirroring canon's single-file structure: pure data at module level;
-# bench-only deps (tvm / torch / flashinfer) imported lazily so the nymph_rs
-# package stays importable without them (CPU-only value sim, wheel installs).
-#
-# The baseline is the flashinfer Blackwell SM100 CuTeDSL kernel this file ports
-# (``flashinfer.gdn_prefill.chunk_gated_delta_rule`` -> ``chunk_gated_delta_rule_sm100``
-# -> ``GatedDeltaNetChunkedKernel``), imported read-only. Both impls go through
-# the identical ``bench()`` call, and the nymph side is correctness-gated
-# against the flashinfer output (cosine >= 0.999 on out AND state) BEFORE any
-# timing — a ratio of two kernels computing different results fails loudly.
-# ---------------------------------------------------------------------------
+# Bench-suite interface (see bench/nymph_bench_guide.md).
 
 KERNEL_META = {"name": "nymph_gdn_prefill", "category": "experimental", "compute_capability": 10}
 
-# Representative shapes, picked from the coverage CONFIGS / VARLEN_CONFIGS above
-# (labels match those lists). Rationale:
-#   ns1_t64    — 1 chunk, single seq: per-tile fixed cost floor (CONFIGS (1,64)).
-#   ns1_t512   — 8 chunks, single seq: mid chunk-loop throughput (CONFIGS (1,512)).
-#   ns1_t2048  — 32 chunks, single seq: long-seq steady state (CONFIGS (1,2048)).
-#   ns20_t192  — batch 20 x 3 chunks, num_work=160 ~ SM_COUNT (CONFIGS (20,192)).
-#   ns48_t64   — num_work=384 > SM_COUNT: persistent multi-tile/CTA (CONFIGS (48,64)).
-#   v_70_130   — varlen with non-BT-multiple tails (VARLEN_CONFIGS [70,130]); the
-#                flashinfer kernel is natively varlen (cu_seqlens is its only
-#                interface), so the baseline covers this shape unchanged.
-# The bench CLI (`_get_bench_configs`) prefers BENCH_CONFIGS over CONFIGS —
-# keep them the same object so every orchestrator-visible label resolves. The
-# 6 core regression shapes are CONFIGS[:6] (the wave1 dev loop's corpus).
+# Representative shapes, picked from the coverage CONFIGS / VARLEN_CONFIGS above.
 BENCH_CONFIGS = CONFIGS
 
 _CORRECTNESS_COSINE = 0.999
@@ -1362,16 +1188,7 @@ def _bench_inputs(
     num_q_heads: int = HQK,
     num_v_heads: int = HV,
 ) -> dict:
-    """One input set shared by BOTH impls, on GPU, in the sim tests' distributions.
-
-    q/k/v ~ N(0, 0.2^2) cast to the io dtype; the RAW gate exp(g) in (0,1) —
-    both kernels apply log2 to it internally (flashinfer parity, see the module
-    docstring) — and beta = sigmoid(.) stay f32; cu_seqlens is i32. Layouts are
-    the shared flashinfer/nymph ones: q (T, num_q_heads, D), k (T, num_k_heads, D)
-    with num_k_heads=min(num_q,num_v), v (T, num_v_heads, D), and gate/beta
-    (T, NEFF) per effective head NEFF=max(num_q,num_v) — the default (4q, 8v)
-    GVA head config gives the historical (T, 4) / (T, 8) shapes.
-    """
+    """One input set shared by BOTH impls, on GPU, in the sim tests' distributions."""
     import torch
 
     dt = {"bfloat16": torch.bfloat16, "float16": torch.float16}[io_dtype]
@@ -1393,14 +1210,7 @@ def _bench_inputs(
 
 
 def _flashinfer_callable(data: dict, num_seqs: int, neff: int = HV):
-    """The flashinfer CuTeDSL baseline as a pure-launch closure + its outputs.
-
-    First call compiles the CuTeDSL kernel (flashinfer caches it per static
-    config); that call happens HERE, outside any timed region. use_cp=False
-    pins the SM100 chunked path (the one being ported). Outputs are NaN-filled
-    so a silently-unwritten region trips the cosine gate. out/state are per
-    effective head (neff = max(num_q_heads, num_v_heads)).
-    """
+    """The flashinfer CuTeDSL baseline as a pure-launch closure + its outputs."""
     import torch
     from flashinfer.gdn_prefill import chunk_gated_delta_rule
 
@@ -1426,19 +1236,7 @@ def _flashinfer_callable(data: dict, num_seqs: int, neff: int = HV):
 def _compile_nymph(
     seq_lens: list[int], io_dtype: str = "bfloat16", num_q_heads: int = HQK, num_v_heads: int = HV
 ):
-    """kernel_to_tirx_source -> tvm.compile, mirroring nvfp4's _compile_nymph.
-
-    Uniform BT-multiple lengths build the fixed-length kernel; anything else
-    builds the varlen (cu_seqlens) kernel sized by max length. Head config
-    (num_q_heads, num_v_heads) is forwarded to GdnPrefillConfig (num_k_heads
-    = min, NEFF = max derived inside).
-
-    Raises whatever the codegen/compile pipeline raises. TODAY this fails
-    closed inside kernel_to_tirx_source: the gdn IR uses flash/gdn-datapath
-    nodes with no TIRx lowering yet (RegUnary, RegFill, RegAdd/RegSub/RegFma,
-    Tcgen05St/Tcgen05WaitSt, LdMatrix/StMatrix, WarpMma) — the "sim-only ops"
-    of LIMITATIONS.md. That is the Wave-2 gap, not a bench bug.
-    """
+    """kernel_to_tirx_source -> tvm.compile, mirroring nvfp4's _compile_nymph."""
     import importlib.util
     import os
     import tempfile
@@ -1476,15 +1274,7 @@ def _compile_nymph(
 
 
 def _nymph_callable(ex, config: GdnPrefillConfig, data: dict, seq_lens: list[int]):
-    """Pure-launch closure over preallocated nymph outputs (packed layout).
-
-    Fixed-length: the compiled fn takes (q, k, v, gate, beta, out, state).
-    Varlen: it additionally takes cu_seqlens, and the GMEM tensors carry the
-    static padded shape (num_seqs*maxlen tokens) the kernel was built with —
-    the packed rows sit at their cu_seqlens offsets (padding content is
-    irrelevant; the kernel masks OOB). state is (num_seqs, HV, K, V) — the
-    ORACLE layout, i.e. flashinfer's [N,H,V,K] transposed.
-    """
+    """Pure-launch closure over preallocated nymph outputs (packed layout)."""
     import torch
 
     io_dt = data["q"].dtype
@@ -1538,17 +1328,7 @@ def run_bench(
     timer=None,
     **kwargs,
 ):
-    """Bench the flashinfer CuTeDSL baseline vs nymph with the bench-suite's
-    exact methodology — correctness gate BEFORE timing.
-
-    Both impls see the identical input tensors; nymph must match the
-    flashinfer output at cosine >= 0.999 (out AND state, state compared in
-    flashinfer's [N,H,V,K] layout) or this raises AssertionError. flashinfer
-    ("tir") and nymph ("tirx") are both ``funcs`` impls — the nymph GEMM
-    kernels' form, so the bench-suite reports the tir/tirx ratio per config.
-    Head config (num_q_heads, num_v_heads) matches the flashinfer bench's
-    (h_qk, h_v) parametrization (num_k_heads = min, NEFF = max derived).
-    """
+    """Bench the flashinfer CuTeDSL baseline vs nymph with the bench-suite's exact methodology."""
     import torch
 
     from tvm.tirx.bench import bench
@@ -1582,11 +1362,7 @@ def run_bench(
 def run_flashinfer_bench(
     num_seqs=None, seqlen=None, seqlens=None, *, warmup=None, repeat=None, timer=None, **kwargs
 ):
-    """Baseline-only runner: time the flashinfer CuTeDSL kernel on one shape
-    with the exact bench() methodology (proton/cold-cache/rounds — same call,
-    single-impl funcs). This is the Wave-1 fallback for while the nymph side
-    cannot compile (see _compile_nymph); run_bench is the permanent interface.
-    """
+    """Baseline-only runner."""
     from tvm.tirx.bench import bench
 
     seq_lens = _bench_seqlens(num_seqs, seqlen, seqlens)

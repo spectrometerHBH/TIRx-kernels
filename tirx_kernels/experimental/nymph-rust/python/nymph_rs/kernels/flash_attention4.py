@@ -1,13 +1,4 @@
-"""FlashAttention4-shaped protocol kernel expressed in Nymph IR.
-
-The kernel keeps the tirx-kernels FA4 stream shape under the per-warp
-execution model: one custom scheduler stream (warp 15, lane 0) broadcasts task
-metadata through a two-stage SMEM mailbox, and six consumer streams drain each
-task (TMA load, MMA, two softmax warpgroups, correction epilogue, TMA store).
-mbarrier.arrive is per-thread, so the mailbox mbarrier count is derived from
-the consumer composition below as one arrival per mailbox-reading thread —
-adding a consumer cannot silently leave task_empty with an obsolete count.
-"""
+"""FlashAttention4-shaped protocol kernel expressed in Nymph IR."""
 
 from __future__ import annotations
 
@@ -16,7 +7,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-from ..builder import IRBuilder, TmemBand
+from ..builder import IRBuilder
 from ..nymph_rs import (
     DType,
     FenceKind,
@@ -31,6 +22,7 @@ from ..nymph_rs import (
     Swizzle,
     Tensor,
     TensorSlice,
+    TmemTensor,
 )
 
 BLK_M = 128
@@ -45,9 +37,7 @@ N_COLS_TMEM = 512
 SOFTMAX_CHUNK_CELLS = 32
 SOFTMAX_NUM_CHUNKS = BLK_N // SOFTMAX_CHUNK_CELLS
 P_STORE_CELLS = SOFTMAX_CHUNK_CELLS // 2
-# The PV MMA role starts after the first 6 k-groups are stored to p_tmem. This
-# matches the baseline overlap point: 6 groups * MMA_K cells covers the first
-# three 32-cell softmax chunks, so p_first_ready fires after chunk index 2.
+# The PV MMA role starts after the first 6 k-groups are stored to p_tmem.
 PV_SPLIT_GROUPS = 6
 P_FIRST_READY_CHUNKS = (PV_SPLIT_GROUPS * MMA_K) // SOFTMAX_CHUNK_CELLS
 O_CHUNK_CELLS = 16
@@ -56,11 +46,7 @@ F32_BYTES = 4
 I32_BYTES = 4
 TASK_BROADCAST_STAGES = 2
 WARPGROUP_THREADS = 128
-# (role, streams, mailbox-reading threads per stream). mbarrier.arrive is
-# per-thread under the per-warp execution model: single-thread streams
-# contribute one task_empty arrival per slot; warpgroup streams let every
-# thread arrive after its own mailbox read, so the scheduler cannot overwrite
-# a slot a lagging warp of the group is still reading.
+# (role, streams, mailbox-reading threads per stream).
 TASK_CONSUMER_ROLES = (
     ("tma_load", 1, 1),
     ("mma", 1, 1),
@@ -227,21 +213,17 @@ def build_flash_attention4(config: FlashAttention4Config = FlashAttention4Config
         shape=(config.batch_size, config.seq_len, config.num_qo_heads, config.head_dim),
     )
 
-    smem_layout = SmemSwizzleLayout(Swizzle.B128)
-    q_smem = tuple(
-        _smem_tile(k, q_offset + stage * q_tile_bytes, smem_layout) for stage in range(2)
-    )
+    mma_layout = SmemSwizzleLayout(Swizzle.B128)
+    q_smem = tuple(_smem_tile(k, q_offset + stage * q_tile_bytes, mma_layout) for stage in range(2))
     k_smem = tuple(
-        _smem_tile(k, kv_offset + stage * kv_tile_bytes, smem_layout) for stage in range(3)
+        _smem_tile(k, kv_offset + stage * kv_tile_bytes, mma_layout) for stage in range(3)
     )
-    # FA4 aliases K_smem and V_smem; the protocol checker sees the same SMEM bytes
-    # through different tensor ids because the byte_offset is identical.
+    # FA4 aliases K_smem and V_smem.
     v_smem = tuple(
-        _smem_tile(k, kv_offset + stage * kv_tile_bytes, smem_layout) for stage in range(3)
+        _smem_tile(k, kv_offset + stage * kv_tile_bytes, mma_layout) for stage in range(3)
     )
     o_smem = tuple(
-        _smem_tile(k, o_offset + stage * o_tile_bytes, smem_layout)
-        for stage in range(TMEM_PIPE_DEPTH)
+        _smem_tile(k, o_offset + stage * o_tile_bytes, None) for stage in range(TMEM_PIPE_DEPTH)
     )
     s_scale = k.tensor(
         space=MemorySpace.SMEM, dtype=DType.F32, shape=(4, BLK_M), byte_offset=scale_offset
@@ -252,23 +234,14 @@ def build_flash_attention4(config: FlashAttention4Config = FlashAttention4Config
         shape=(TASK_BROADCAST_STAGES, TASK_BROADCAST_FIELDS),
         byte_offset=task_offset,
     )
-    # TMEM column plan: pure-Python bands over the 512-cell alloc (TMEM is not
-    # a tensor; every use is a flat absolute physical TmemOperand, so the bands
-    # only keep the column plan named). S stages at cols 0/128, O at 256/384.
-    s_tmem = tuple(
-        TmemBand(col0=stage * BLK_N, dtype=DType.F32) for stage in range(SMEM_PIPE_DEPTH_Q)
-    )
+    # TMEM column plan.
+    s_tmem = tuple(k.tmem_tensor(stage * BLK_N) for stage in range(SMEM_PIPE_DEPTH_Q))
     o_tmem = tuple(
-        TmemBand(col0=BLK_N * SMEM_PIPE_DEPTH_Q + stage * BLK_N, dtype=DType.F32)
-        for stage in range(TMEM_PIPE_DEPTH)
+        k.tmem_tensor(BLK_N * SMEM_PIPE_DEPTH_Q + stage * BLK_N) for stage in range(TMEM_PIPE_DEPTH)
     )
-    # TmemBand col0 is a physical 32-bit cell column. This matches baseline
-    # P_region's f16 logical col_start=MMA_N and stride=TMEM_STAGE_STRIDE * 2
-    # as physical starts 64 and 192 (f16 packs 2 elements per cell, so the
-    # 128-wide P tile spans 64 cells, aliased over the S stage's cols).
+    # start_col is a physical 32-bit cell column.
     p_tmem = tuple(
-        TmemBand(col0=(BLK_N // 2) + stage * BLK_N, dtype=DType.F16)
-        for stage in range(SMEM_PIPE_DEPTH_Q)
+        k.tmem_tensor((BLK_N // 2) + stage * BLK_N) for stage in range(SMEM_PIPE_DEPTH_Q)
     )
 
     s_frags = tuple(
@@ -350,12 +323,10 @@ def build_flash_attention4(config: FlashAttention4Config = FlashAttention4Config
     scheduler = k.scheduler(task_space, policy="custom")
 
     with k.if_warp(0):
-        # tmem_alloc is warp-collective (exactly one full warp); mbarrier.init
-        # is per-thread, so a single elected thread runs every init.
+        # tmem_alloc is warp-collective (exactly one full warp).
         k.tmem_alloc(0, N_COLS_TMEM, addr_byte_offset=tmem_addr_offset, cta_group=config.cta_group)
         with k.if_elected():
-            # count=1 barriers: armed by the TMA engine (tx bytes), a tcgen05
-            # commit, or a single-thread stream's lone arrive.
+            # count=1 barriers.
             for mbar in [*q_full, *q_empty]:
                 _init_stages(k, mbar, stages=1, count=1)
             _init_stages(k, k_full, stages=SMEM_PIPE_DEPTH_KV, count=1)
@@ -364,10 +335,7 @@ def build_flash_attention4(config: FlashAttention4Config = FlashAttention4Config
             _init_stages(k, v_empty, stages=SMEM_PIPE_DEPTH_KV, count=1)
             for mbar in [s_ready, o_ready, corr_epi_empty, task_full]:
                 _init_stages(k, mbar, stages=2, count=1)
-            # Warpgroup-published barriers: the producing warpgroup's threads
-            # each arrive once after their own per-row work (tcgen05_st rows /
-            # s_scale lanes / o_smem rows), so a completed phase proves all
-            # 128 rows landed without any wg_sync on the producer side.
+            # Warpgroup-published barriers.
             for mbar in [
                 p_first_ready,
                 p_second_ready,
@@ -377,20 +345,15 @@ def build_flash_attention4(config: FlashAttention4Config = FlashAttention4Config
                 corr_epi_full,
             ]:
                 _init_stages(k, mbar, stages=2, count=WARPGROUP_THREADS)
-            # p_o_rescale gates each PV MMA on BOTH the softmax warpgroup's
-            # P-store and the correction warpgroup's O-rescale: 128 + 128.
+            # p_o_rescale waits for both the softmax P-store and correction O-rescale arrivals.
             _init_stages(k, p_o_rescale, stages=2, count=2 * WARPGROUP_THREADS)
             _init_stages(k, task_empty, stages=TASK_BROADCAST_STAGES, count=TASK_CONSUMER_COUNT)
 
-    # No implicit barrier between top-level statements: this fence + sync IS
-    # the publish of the TMEM alloc and mbarrier cells to every stream.
+    # No implicit barrier between top-level statements.
     k.fence(kind=FenceKind.ASYNC_PROXY, scope=FenceScope.CTA)
     k.cta_sync()
 
-    # Warpgroup 3 hosts the four single-warp streams (MMA / TMA load / TMA
-    # store / scheduler); one warpgroup-wide setmaxnreg replaces the old
-    # per-role maxnreg=48 annotations (set_maxnreg must statically cover a
-    # whole warpgroup, which the single-warp branches below cannot).
+    # Warpgroup 3 hosts the four single-warp streams (MMA / TMA load / TMA store / scheduler).
     with k.if_warpgroup(3):
         k.set_maxnreg(48)
 
@@ -547,9 +510,7 @@ def _emit_scheduler_role(
     num_kv_blocks: int,
     seq_q_per_tile: int,
 ) -> None:
-    # Single-thread scheduler stream: sched_next must sit in a statically
-    # single-warp branch, and the mailbox stores + task_full arrive are
-    # per-thread, so exactly one thread runs the whole loop.
+    # Single-thread scheduler stream.
     with k.if_warp(15), k.if_elected():
         sched_iter = k.scalar(initial=0, dtype=ScalarDType.I32)
         pipe_base = k.scalar(initial=0, dtype=ScalarDType.I32)
@@ -612,12 +573,7 @@ def _emit_scheduler_role(
 def _persistent_task_loop(
     k: IRBuilder, task_smem: Tensor, task_full: MBar, task_empty: MBar
 ) -> Iterator[tuple[object, object, object, tuple[object, object, object], object, object, object]]:
-    """Consume scheduler mailbox entries until the sentinel task id is seen.
-
-    Every executing thread reads the slot and arrives task_empty once
-    (per-thread arrive), so TASK_CONSUMER_ROLES must account one arrival per
-    mailbox-reading thread of every consumer stream.
-    """
+    """Consume scheduler mailbox entries until the sentinel task id is seen."""
     consumer_iter = k.scalar(initial=0, dtype=ScalarDType.I32)
     with k.loop():
         stage = _task_broadcast_stage(consumer_iter)
@@ -722,9 +678,7 @@ def _emit_tma_load_role(
     kv_tile_bytes: int,
     seq_q_per_tile: int,
 ) -> None:
-    # Single-thread TMA producer stream (lane 0 of warp 13): mbarrier waits
-    # are fine from one thread, arrive_expect_tx is per-thread (one arm per
-    # load), and tma_load requires a single-thread mask.
+    # Single-thread TMA producer stream (lane 0 of warp 13).
     with k.if_warp(13), k.if_elected():
         with _persistent_task_loop(k, task_smem, task_full, task_empty) as (
             _task_id,
@@ -811,9 +765,9 @@ def _emit_mma_role(
     q_smem: tuple[Tensor, Tensor],
     k_smem: tuple[Tensor, Tensor, Tensor],
     v_smem: tuple[Tensor, Tensor, Tensor],
-    s_tmem: tuple[TmemBand, TmemBand],
-    p_tmem: tuple[TmemBand, TmemBand],
-    o_tmem: tuple[TmemBand, TmemBand],
+    s_tmem: tuple[TmemTensor, TmemTensor],
+    p_tmem: tuple[TmemTensor, TmemTensor],
+    o_tmem: tuple[TmemTensor, TmemTensor],
     q_full: tuple[MBar, MBar],
     q_empty: tuple[MBar, MBar],
     k_full: MBar,
@@ -829,10 +783,7 @@ def _emit_mma_role(
     num_kv_blocks: int,
     seq_q_per_tile: int,
 ) -> None:
-    # Single-thread MMA issuer stream (lane 0 of warp 12): tcgen05_mma and
-    # tcgen05_commit require a single-thread mask, and the k/v/q release
-    # arrives are per-thread (each buffer's empty barrier counts exactly one
-    # arrival per k-tile).
+    # Single-thread MMA issuer stream (lane 0 of warp 12).
     with k.if_warp(12), k.if_elected():
         with _persistent_task_loop(k, task_smem, task_full, task_empty) as (
             _task_id,
@@ -909,8 +860,8 @@ def _emit_mma_role(
 def _emit_pv_mma(
     k: IRBuilder,
     config: FlashAttention4Config,
-    o_stage: TmemBand,
-    p_stage: TmemBand,
+    o_stage: TmemTensor,
+    p_stage: TmemTensor,
     v_stage: Tensor,
     k_group: int,
     kv_idx: int,
@@ -918,30 +869,59 @@ def _emit_pv_mma(
     k_offset = k_group * MMA_K
     k.tcgen05_mma(
         o_stage.at(0, 0),
-        p_stage.elem(0, k_offset),
-        v_stage[k_offset : k_offset + MMA_K, :],
-        m=BLK_M,
-        n=HEAD_DIM,
-        k=MMA_K,
+        k.mma_a_tmem(p_stage.at(0, k_offset // 2), form="flat"),
+        k.smem_tile(
+            v_stage, prefix_indices=(), row_offset=k_offset, col_offset=0, rows=MMA_K, cols=HEAD_DIM
+        ),
+        mma_m=BLK_M,
+        mma_n=HEAD_DIM,
+        format="f16",
+        block_scale=None,
         accum=kv_idx != 0 or k_group != 0,
+        trans_a=False,
         trans_b=True,
+        ws=False,
         cta_group=config.cta_group,
     )
 
 
 def _emit_qk_mma(
-    k: IRBuilder, config: FlashAttention4Config, s_stage: TmemBand, q_stage: Tensor, k_stage: Tensor
+    k: IRBuilder,
+    config: FlashAttention4Config,
+    s_stage: TmemTensor,
+    q_stage: Tensor,
+    k_stage: Tensor,
 ) -> None:
     for k_group in range(HEAD_DIM // MMA_K):
         k_offset = k_group * MMA_K
         k.tcgen05_mma(
             s_stage.at(0, 0),
-            q_stage[:, k_offset : k_offset + MMA_K],
-            k_stage[:, k_offset : k_offset + MMA_K],
-            m=BLK_M,
-            n=BLK_N,
-            k=MMA_K,
+            k.mma_a_smem(
+                k.smem_tile(
+                    q_stage,
+                    prefix_indices=(),
+                    row_offset=0,
+                    col_offset=k_offset,
+                    rows=BLK_M,
+                    cols=MMA_K,
+                )
+            ),
+            k.smem_tile(
+                k_stage,
+                prefix_indices=(),
+                row_offset=0,
+                col_offset=k_offset,
+                rows=BLK_N,
+                cols=MMA_K,
+            ),
+            mma_m=BLK_M,
+            mma_n=BLK_N,
+            format="f16",
+            block_scale=None,
             accum=k_group != 0,
+            trans_a=False,
+            trans_b=False,
+            ws=False,
             cta_group=config.cta_group,
         )
 
@@ -952,8 +932,8 @@ def _emit_softmax_roles(
     task_smem: Tensor,
     task_full: MBar,
     task_empty: MBar,
-    s_tmem: tuple[TmemBand, TmemBand],
-    p_tmem: tuple[TmemBand, TmemBand],
+    s_tmem: tuple[TmemTensor, TmemTensor],
+    p_tmem: tuple[TmemTensor, TmemTensor],
     s_scale: Tensor,
     s_frags: tuple[Tensor, ...],
     p_frags: tuple[Tensor, ...],
@@ -981,12 +961,7 @@ def _emit_softmax_roles(
     seq_q_per_tile: int,
 ) -> None:
     scale_log2 = math.log2(math.e) / math.sqrt(config.head_dim)
-    # Softmax warpgroup streams: the body stays warpgroup-wide (tcgen05_ld/st
-    # spread the 128 rows across the group's 128 threads; reg ops are
-    # warp-collective). Every mbarrier_arrive below is per-thread — each
-    # thread signals after ITS row's tcgen05_st / s_scale store — so the
-    # barriers are initialized with count=WARPGROUP_THREADS and a completed
-    # phase proves all 128 rows landed without a producer-side wg_sync.
+    # Softmax warpgroup streams.
     for i_q in range(SMEM_PIPE_DEPTH_Q):
         with k.if_warpgroup(i_q):
             k.set_maxnreg(200)
@@ -1103,7 +1078,7 @@ def _emit_correction_epilogue_role(
     task_smem: Tensor,
     task_full: MBar,
     task_empty: MBar,
-    o_tmem: tuple[TmemBand, TmemBand],
+    o_tmem: tuple[TmemTensor, TmemTensor],
     o_smem: tuple[Tensor, Tensor],
     s_scale: Tensor,
     o_frag: Tensor,
@@ -1121,9 +1096,7 @@ def _emit_correction_epilogue_role(
     num_kv_blocks: int,
     seq_q_per_tile: int,
 ) -> None:
-    # Correction warpgroup stream: same per-thread arrive discipline as the
-    # softmax warpgroups — p_o_rescale / softmax_corr_empty / corr_epi_full
-    # each collect 128 arrivals, one per thread after its own row work.
+    # Correction warpgroup stream: same per-thread arrive discipline as the softmax warpgroups.
     with k.if_warpgroup(2):
         k.set_maxnreg(64)
         with _persistent_task_loop(k, task_smem, task_full, task_empty) as (
@@ -1175,14 +1148,12 @@ def _emit_correction_epilogue_role(
                 k.mbarrier_arrive(corr_epi_full, stage=i_q)
 
 
-def _emit_o_rescale(k: IRBuilder, o_stage: TmemBand, o_frag: Tensor, row_scale: Tensor) -> None:
+def _emit_o_rescale(k: IRBuilder, o_stage: TmemTensor, o_frag: Tensor, row_scale: Tensor) -> None:
     for d_tile in range(HEAD_DIM // O_CHUNK_CELLS):
         col = d_tile * O_CHUNK_CELLS
         k.tcgen05_ld(o_frag, o_stage.at(0, col), num=O_CHUNK_CELLS)
         k.tcgen05_wait_ld()
-        # A register reduction spans one warp; the group-any is only a skip
-        # optimization here (rows that need no rescale carry row_scale == 1.0,
-        # an exact float identity), so warp scope is value-equivalent.
+        # A register reduction spans one warp.
         k.reg_cond_rescale(o_frag, o_frag, row_scale, threshold=1.0, scope="warp")
         k.tcgen05_st(o_stage.at(0, col), o_frag, num=O_CHUNK_CELLS)
     k.tcgen05_wait_st()
@@ -1201,11 +1172,7 @@ def _emit_tma_store_role(
     num_q_blocks: int,
     seq_q_per_tile: int,
 ) -> None:
-    # Single-thread TMA store stream (lane 0 of warp 14). cp_async_bulk
-    # groups are per-stream: the commit and the wait_group_read must run on
-    # the SAME stream that issued the tma_store, so all three live in this
-    # one-thread branch; the correction warpgroup observes the drain through
-    # the corr_epi_empty mbarrier, not through the group.
+    # Single-thread TMA store stream (lane 0 of warp 14). cp_async_bulk groups are per-stream.
     with k.if_warp(14), k.if_elected():
         with _persistent_task_loop(k, task_smem, task_full, task_empty) as (
             _task_id,
@@ -1242,13 +1209,7 @@ def _emit_exp2_emulation(
     frac: Tensor,
     frac_ex2: Tensor,
 ) -> None:
-    """Approximate exp2 in registers with the FA4 polynomial + exponent bit path.
-
-    `rounded = floor(x + 1.5 * 2**23) - 1.5 * 2**23` extracts an integer exponent
-    under fp32 mantissa rounding. The polynomial approximates exp2(frac), and
-    RegCombineIntFracEx2 rebuilds `2**rounded * exp2(frac)` by shifting the
-    integer exponent contribution into the fp32 exponent field.
-    """
+    """Approximate exp2 in registers with the FA4 polynomial + exponent bit path."""
     fp32_round_int = float(2**23 + 2**22)
     k.reg_add(rounded, src_dst, fp32_round_int, rounding="rm")
     k.reg_sub(rounded_back, rounded, fp32_round_int)

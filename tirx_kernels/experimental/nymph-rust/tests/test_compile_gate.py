@@ -11,8 +11,10 @@ import importlib.util
 import nymph_rs as nr
 import pytest
 from nymph_rs.kernels import (
+    Fp8BlockwiseGemmConfig,
     Fp16Bf16GemmConfig,
     build_bootstrap_gemm,
+    build_fp8_blockwise_gemm,
     build_fp16_bf16_gemm,
     build_nvfp4_gemm,
 )
@@ -24,6 +26,10 @@ pytestmark = pytest.mark.codegen
 
 BUILDERS = {
     "bootstrap_gemm": build_bootstrap_gemm,
+    "fp8_blockwise_gemm": lambda: build_fp8_blockwise_gemm(Fp8BlockwiseGemmConfig()),
+    "fp8_blockwise_gemm_swap_odd_epi": lambda: build_fp8_blockwise_gemm(
+        Fp8BlockwiseGemmConfig(m=2400, n=512, k=512, launch_shape=(2,))
+    ),
     "nvfp4_gemm": build_nvfp4_gemm,
     "gdn_prefill": lambda: build_gdn_prefill(GdnPrefillConfig(num_seqs=1, seqlen=128)),
     **{
@@ -60,6 +66,45 @@ def test_empty_if_body_emits_valid_python(tmp_path):
     tvm.compile(mod, tvm.target.Target("cuda"), tir_pipeline="tirx")
 
 
+def test_two_explicit_u32_smem_layouts_remain_distinct_and_parse(tmp_path):
+    b = nr.IRBuilder(
+        "u32_smem_layouts", num_warps=4, smem_size_bytes=8192, launch_shape=(1,), cluster_shape=(1,)
+    )
+    b.arg(space=nr.MemorySpace.GMEM, dtype=nr.DType.U32, shape=(1,))
+    layout = nr.SmemSwizzleLayout(nr.Swizzle.B32)
+    b.tensor(
+        space=nr.MemorySpace.SMEM, dtype=nr.DType.U32, shape=(128, 8), layout=layout, byte_offset=0
+    )
+    b.tensor(
+        space=nr.MemorySpace.SMEM,
+        dtype=nr.DType.U32,
+        shape=(128, 8),
+        layout=layout,
+        byte_offset=4096,
+    )
+
+    src = nr.kernel_to_tirx_source(b.build())
+    assert "ab_smem0_layout =" not in src
+    assert "ab_smem1_layout =" not in src
+    assert (
+        'ab_smem0 = pool.alloc_tcgen05_mma_AB((128, 8), "uint32", '
+        "swizzle_mode=SwizzleMode.SWIZZLE_32B_ATOM, align=1024)"
+    ) in src
+    assert (
+        'ab_smem1 = pool.alloc_tcgen05_mma_AB((128, 8), "uint32", '
+        "swizzle_mode=SwizzleMode.SWIZZLE_32B_ATOM, align=1024)"
+    ) in src
+    assert "task_smem" not in src
+    assert "mma_shared_layout" not in src
+
+    mod_path = tmp_path / "emitted_u32_smem_layouts.py"
+    mod_path.write_text(src)
+    spec = importlib.util.spec_from_file_location("emitted_u32_smem_layouts", mod_path)
+    emitted = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(emitted)
+    assert emitted.main is not None
+
+
 @pytest.mark.parametrize("name", sorted(BUILDERS))
 def test_codegen_compiles(name, tmp_path):
     src = nr.kernel_to_tirx_source(BUILDERS[name]())
@@ -79,13 +124,13 @@ def test_single_issue_scope_negative():
     # inferred elect_sync). The elected form must pass.
     def build(with_elected: bool):
         b = nr.IRBuilder(
-            "si_neg", num_warps=4, smem_size_bytes=8192, launch_shape=(1,), cluster_shape=(1,)
+            "si_neg", num_warps=4, smem_size_bytes=8200, launch_shape=(1,), cluster_shape=(1,)
         )
         src_g = b.arg(space=nr.MemorySpace.GMEM, dtype=nr.DType.BF16, shape=(64, 64))
         dst_s = b.tensor(
             space=nr.MemorySpace.SMEM, dtype=nr.DType.BF16, shape=(64, 64), byte_offset=0
         )
-        mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0, stages=1)
+        mbar = b.mbar(kind=nr.MBarKind.TMA, byte_offset=8192, stages=1)
         with b.if_warp(0):
             if with_elected:
                 with b.if_elected():
@@ -104,7 +149,9 @@ def test_single_issue_scope_negative():
         build(with_elected=False)
     k = build(with_elected=True)
     src = nr.kernel_to_tirx_source(k)
-    # exactly one elect guard in the output — the IR's own if_elected (the
-    # loop-free warp-0 spelling narrows to thread_rank, same single thread).
-    guards = src.count("if T.ptx.elect_sync():") + src.count("if T.cuda.thread_rank() == 0:")
-    assert guards == 1, src
+    # The IR's own nested predicate is printed literally. Codegen must not
+    # substitute either hardware spelling or move it out of the warp branch.
+    assert src.count("if lane_id == 0:") == 1, src
+    assert "if warp_id == 0:\n        if lane_id == 0:" in src
+    assert "if T.ptx.elect_sync():" not in src
+    assert "if T.cuda.thread_rank() == 0:" not in src

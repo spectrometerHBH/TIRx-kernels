@@ -1,7 +1,6 @@
-"""Minimal single-tile/single-k cta_group=2 fp16 GEMM in nymph IR — the codegen bootstrap target.
-M=256 (128/CTA), N=128, K=64. No scheduler warp, no ring, no persistent loop, direct reg->gmem epilogue."""
+"""Minimal single-tile/single-k cta_group=2 fp16 GEMM in nymph IR — the codegen bootstrap target."""
 
-from nymph_rs.builder import IRBuilder, TmemBand
+from nymph_rs.builder import IRBuilder
 from nymph_rs.nymph_rs import (
     DType,
     FenceKind,
@@ -41,7 +40,7 @@ def build_bootstrap_gemm(M=256, N=128, K=64, dtype=DType.F16):
         space=MemorySpace.SMEM, dtype=dtype, shape=(BLK_N, K), layout=sw, byte_offset=a_tb
     )
     # TMEM: the f32 accumulator band at physical col 0 (the alloc covers cols 0..N).
-    accum = TmemBand(col0=0, dtype=DType.F32)
+    accum = k.tmem_tensor(0)
     accum_frag = k.tensor(space=MemorySpace.REG, dtype=DType.F32, shape=(8,))
     out_frag = k.tensor(space=MemorySpace.REG, dtype=dtype, shape=(8,))
     smem_full = k.mbar(kind=MBarKind.TMA, byte_offset=smem_full_off, stages=1)
@@ -49,23 +48,18 @@ def build_bootstrap_gemm(M=256, N=128, K=64, dtype=DType.F16):
     smem_full_cta0 = k.mbar_ref(smem_full, remote_coord=0)
     cr = k.ctaid_in_cluster()
     with k.if_warp(0):
-        # tmem_alloc is warp-collective (full warp 0); mbarrier.init is
-        # per-thread, so one elected thread runs the inits.
+        # tmem_alloc is warp-collective (full warp 0).
         k.tmem_alloc(0, N, addr_byte_offset=tmem_addr_off, cta_group=CTA_GROUP)
         with k.if_elected():
             k.mbarrier_init(smem_full, count=1)
             k.mbarrier_init(mma_done, count=1)
-    # Prologue seal (canon's `fence.mbarrier_init` + cluster barrier): the inits
-    # and the TMEM alloc must be complete before any role touches a barrier or
-    # the shared TMEM — the checker's lifecycle proof needs this happens-before
-    # edge, not just the sampled epoch order.
+    # Prologue seal (canon's `fence.mbarrier_init` + cluster barrier).
     k.fence(kind=FenceKind.MBARRIER_INIT)
     k.cluster_sync()
     with k.if_warp(4):  # loader
         a_m = cr * BLK_M
         b_n = cr * BLK_N
-        # Single-thread issue: one elected lane drives the whole TMA burst
-        # (the arrive + both loads), exactly canon's elected loader.
+        # Single-thread issue.
         with k.if_elected():
             k.tma_load(
                 a_s,
@@ -83,26 +77,33 @@ def build_bootstrap_gemm(M=256, N=128, K=64, dtype=DType.F16):
                 shape=(BLK_N, K),
                 cta_group=CTA_GROUP,
             )
-            # Canonical fp16 ordering: issue the copies first, then CTA 0 arms
-            # their complete cluster transaction count on the same remote ref.
+            # Canonical fp16 ordering.
             with k.if_(cr.eq(0)):
                 k.mbarrier_arrive_expect_tx(smem_full_cta0, bytes=CTA_GROUP * (a_tb + b_tb))
     with k.if_warp(5):  # MMA (leader)
         with k.if_(cr.eq(0)):
             k.mbarrier_wait(smem_full, phase=0)
-            # tcgen05.mma/commit are strictly single-thread issue: one elected
-            # lane runs the MMA burst (canon's `if elect_sync(): gemm; commit`).
+            # tcgen05.mma/commit are strictly single-thread issue.
             with k.if_elected():
-                # ONE full-K MMA over the whole K extent — the IR's dense k is an
-                # ordered run of k/16 atomic MMAs (canon's one-issue full-K gemm_async).
+                # ONE full-K MMA over the whole K extent.
                 k.tcgen05_mma(
                     accum.at(0, 0),
-                    a_s[:, :],
-                    b_s[:, :],
-                    m=M,
-                    n=N,
-                    k=K,
+                    k.mma_a_smem(
+                        k.smem_tile(
+                            a_s, prefix_indices=(), row_offset=0, col_offset=0, rows=BLK_M, cols=K
+                        )
+                    ),
+                    k.smem_tile(
+                        b_s, prefix_indices=(), row_offset=0, col_offset=0, rows=BLK_N, cols=K
+                    ),
+                    mma_m=M,
+                    mma_n=N,
+                    format="f16" if dtype == DType.F16 else "bf16",
+                    block_scale=None,
                     accum=False,
+                    trans_a=False,
+                    trans_b=False,
+                    ws=False,
                     cta_group=CTA_GROUP,
                 )
                 k.tcgen05_commit(mma_done, cta_group=CTA_GROUP, multicast_cta_mask=0b11)
@@ -117,9 +118,7 @@ def build_bootstrap_gemm(M=256, N=128, K=64, dtype=DType.F16):
                 TensorSlice(tensor=c_g, offsets=(cr * BLK_M + k.tid_in_wg(), col), shape=(1, 8)),
                 out_frag,
             )
-    # Cluster-wide barrier before freeing TMEM (canon's `cluster_sync()` right
-    # before relinquish + dealloc): both CTAs' MMA writes and epilogue TMEM
-    # reads must be done before either CTA frees the shared band.
+    # Cluster-wide barrier before freeing TMEM.
     k.cluster_sync()
     with k.if_warp(0):
         k.tmem_relinquish(CTA_GROUP)

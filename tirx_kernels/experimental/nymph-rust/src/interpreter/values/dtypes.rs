@@ -115,7 +115,7 @@ pub fn round_e4m3_scalar(x: f32) -> f32 {
 /// Decode one float4 e2m1 nibble to f32: 1 sign + 2 exp (bias 1) + 1 mantissa,
 /// no inf / NaN. The 8 magnitudes {0, .5, 1, 1.5, 2, 3, 4, 6} are all exact in
 /// f32 (subnormal m=1 -> .5; normals 2^(e-1)*(1+m/2)). Operands arrive packed
-/// 2 nibbles per byte: element 2i is the low nibble, 2i+1 the high nibble.
+/// 2 nibbles per byte: element 2i is the high nibble, 2i+1 the low nibble.
 #[inline]
 pub fn decode_e2m1(nibble: u8) -> f32 {
     const MAG: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];

@@ -5,6 +5,14 @@ The ground-truth numbers live in `bench/RESULTS.md` — record every
 measurement there (or in a commit message referenced from there), never only
 in chat.
 
+Current structural rule: codegen is a literal IR emitter. It preserves every
+`If` condition, sibling/nested relationship, and statement order; it never
+substitutes `elect_sync()`/`thread_rank()` for `lane_id == 0`, folds adjacent
+guards, or builds an if/else dispatch chain. Historical measurements below
+that mention those transforms remain evidence about older code, not a tuning
+technique available in the current codegen. A desired control-flow form must
+be authored explicitly in the kernel IR and reviewed as an algorithm change.
+
 ## 1. Measuring
 
 ```bash
@@ -40,10 +48,12 @@ diff against canon (method established in commit 9ef5a61a / 034ae826):
      `shuffle_sync` outside elected regions) — see the producer comment in
      fp16_bf16_gemm.py. NOTE (2026-07): the `T.let` form landed and did NOT
      move the count — the placement failure is whole-function; see §3.
-   - **BSSY/BSYNC pairs**: per-op guard `if` blocks reconverging; fixed by
-     elect_sync guards + adjacent same-guard folding in codegen.
-   - **UTMACMDFLUSH 4x**: epilogue commit_group not single-thread-guarded;
-     fixed by scope-aware guards.
+   - **BSSY/BSYNC pairs**: per-op guard `if` blocks reconverging. Historical
+     experiments used inferred election guards and folding; those transforms
+     are deleted. Current diagnosis must trace the explicit IR branches.
+   - **UTMACMDFLUSH 4x**: historically attributed to epilogue
+     `commit_group` guard placement. Current guard placement must be changed
+     in the kernel IR, never inferred from codegen scope.
    - **IMAD/ISETP excess**: index math in vector registers; same fix class
      as R2UR.
    - **LDL/STL**: register spills — shrink live fragments (epilogue tile
@@ -105,6 +115,12 @@ diff against canon (method established in commit 9ef5a61a / 034ae826):
   S2R -704, LDCU -640.
 
 ## 5. fp16 1024: CUDA-level convergence and the R2UR flip (2026-07-19)
+
+This section records a historical convergence experiment. In particular, the
+codegen-created dispatch chain and election spelling used at that point are
+not present in the current implementation. The numerical/SASS measurements
+remain useful evidence; reproducing the structural variants now requires an
+explicit IR kernel change and review.
 
 The R2UR placement failure is a **whole-function static-complexity threshold**,
 now proven directly (§3 had it as a hypothesis):
@@ -174,11 +190,13 @@ Applied in order (R2UR lines / total SASS lines, nvrtc+nvdisasm A/B):
 
 Final real-pipeline state: **1100 SASS / 3 R2UR** vs canon 1155/4. Threshold
 for this content measured by padding: flips back between 1104 (4) and 1240 (74).
-Runtime confirmation (ncu, single launch each): executed R2UR 13,504 -> 768
+Historical runtime confirmation (ncu, single launch each): executed R2UR 13,504 -> 768
 (canon 1,792), total instructions 310,063 -> 279,092 (canon 267,352, +16.0% ->
 +4.4%). Bench (rounds=10, same-day baseline comparison): **fp16 1024 0.981 ->
 1.019, bf16 1024 0.981 -> 1.018** (target ≥0.99), fp16/bf16 2048 ~1.01,
-4096 ~1.00, 8192 ~0.99-1.00, nvfp4 unchanged (bench/RESULTS.md).
+4096 ~1.00, 8192 ~0.99-1.00, nvfp4 unchanged. These are retained as
+historical wave data; the current explicit-physical-IR baseline supersedes
+them and is recorded in `bench/RESULTS.md`.
 
 ### 5.3 What changed in the tree (and what it cost)
 
@@ -186,16 +204,18 @@ Runtime confirmation (ncu, single launch each): executed R2UR 13,504 -> 768
   `T.serial(N, unroll=False)` -> `#pragma unroll 1`), `Tcgen05Mma.accum:
   ScalarValue` (runtime accum predicate, canon's accum cell), `ScalarLet`
   (the `T.let` SSA binding), CLC try/query-cancel, split cluster barrier,
-  explicit dynamic-SMEM offsets, `cache_hint`/`prefetch_tensormap`, `reg_frag`.
+  explicit dynamic-SMEM offsets, `cache_hint`/`prefetch_tensormap`. The old
+  `reg_frag`/warpgroup-tile representation has since been removed: REG tensors
+  now preserve their IR shape through `T.alloc_local`.
 - codegen: control-flow structure is emitted 1:1 from IR; codegen does not
   synthesize warpgroup parents, merge equal predicates, or re-nest sibling
-  role branches. `commit_group` emits unguarded (canon's actual
+  role branches, and it prints each predicate literally. `commit_group` emits
+  unguarded (canon's actual
   shape — the 2026-05 guarded form was a deliberate UTMACMDFLUSH trade, now
-  reverted for size); mbarrier-init at function scope guards with
-  `T.cuda.thread_rank() == 0` and coalesces into one block; `if_elected`
-  emits `T.ptx.elect_sync()` (`thread_rank()==0` only for the loop-free
-  prologue elect — a warp-0 WORKER loop gets elect_sync: the thread_rank
-  form there regressed nvfp4 1024 from 1.00 to 0.83 on GPU).
+  reverted for size). Mbarrier init is legal only beneath an explicit
+  single-lane IR branch; codegen neither inserts nor coalesces that branch.
+  `if_elected` is builder sugar for `lane_id == 0`, which remains
+  `lane_id == 0` in the emitted source.
 - builder (fp16_bf16_gemm): scheduler done-flag + phase cells; MMA single
   merged k-loop + per-task accum cell + `unroll=False`; prologue inits grouped
   before the alloc + proxy fence on both paths; `_init_stages` flat (so the
@@ -213,8 +233,9 @@ Runtime confirmation (ncu, single launch each): executed R2UR 13,504 -> 768
   checker's ordering assumptions were validated on it); epilogue/producer keep
   the query-at-bottom loop rotation (flip-neutral, less churn than canon's
   query-at-top rotation); no `warp_sync` after the tcgen05.alloc (SMEM
-  visibility is already forced by the later cluster barriers); `If` has no
-  else, so the chain is a codegen transform, not an IR-author-level construct.
+  visibility is already forced by the later cluster barriers). The historical
+  codegen-created dispatch chain described in §5.2 has been removed; current
+  codegen cannot create an `else` edge absent from the IR.
 
 ## 4. Rules of engagement
 
