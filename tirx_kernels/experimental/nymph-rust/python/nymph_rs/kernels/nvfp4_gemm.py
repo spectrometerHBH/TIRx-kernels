@@ -837,7 +837,6 @@ def run_bench(M, N, K, *, warmup=None, repeat=None, timer=None, **kwargs):
     alpha_f = float(alpha)
     # Same math on both sides.
     nymph = _compile_nymph(M, N, K, alpha_f)
-    at = torch.tensor([alpha_f], device="cuda", dtype=torch.float)
     # Reinterpret FlashInfer's contiguous 2-D scale bytes as the physical 4-D GMEM view.
     Ae = Asf.view(torch.float8_e4m3fn).view(M // 128, K // 64, 32, 16)
     Be = Bsf.view(torch.float8_e4m3fn).view(N // 128, K // 64, 32, 16)
@@ -847,7 +846,7 @@ def run_bench(M, N, K, *, warmup=None, repeat=None, timer=None, **kwargs):
     # cuBLASLt nvfp4 as a first-class impl (canon's inline ext, pure async launch).
     cublaslt_ext = _load_cublaslt_nvfp4_ext()
     funcs = {
-        "tir": lambda: canon(A, B, Asf, Bsf, at, oc),
+        "tir": lambda: canon(A, B, Asf, Bsf, alpha_f, oc),
         "tirx": lambda: nymph(A, B, Ae, Be, on),
         "cublaslt": lambda: cublaslt_ext.nvfp4_cublaslt(A, B, Asf, Bsf, alpha_f, obl, M, N, K),
     }
