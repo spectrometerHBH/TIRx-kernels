@@ -306,40 +306,6 @@ def _mqa_fp4_wrelu_reduce_src(num_heads: int) -> str:
     )
 
 
-def _mqa_fp4_tmem_load_src(num_heads: int, *, split_x32: bool) -> str:
-    """Load one MQA accumulator row without re-encoding an already-flat TMEM address."""
-    if num_heads not in (32, 64):
-        raise ValueError(f"Unsupported FP4 MQA TMEM load width: {num_heads}")
-
-    mode = "split_x32" if split_x32 else "wide"
-
-    def emit_load(width: int, dst_base: int, addr_expr: str) -> str:
-        registers = ", ".join(f"%{i}" for i in range(width))
-        outputs = ", ".join(
-            f'"=r"(reinterpret_cast<uint32_t*>(dst)[{dst_base + i}])' for i in range(width)
-        )
-        return (
-            "    asm volatile(\n"
-            f'        "tcgen05.ld.sync.aligned.32x32b.x{width}.b32 '
-            f'{{{registers}}}, [%{width}];\\n"\n'
-            f"        : {outputs}\n"
-            f'        : "r"({addr_expr})\n'
-            "    );\n"
-            '    asm volatile("tcgen05.wait::ld.sync.aligned;" ::);\n'
-        )
-
-    if split_x32 and num_heads == 64:
-        body = emit_load(32, 0, "tmem_addr") + emit_load(32, 32, "tmem_addr + 32")
-    else:
-        body = emit_load(num_heads, 0, "tmem_addr")
-    return (
-        f"__forceinline__ __device__ void tvm_builtin_mqa_fp4_tmem_load_{num_heads}_{mode}("
-        "float* dst, uint32_t tmem_addr) {\n"
-        f"{body}"
-        "}"
-    )
-
-
 def get_kernel(**kwargs: Any):
     from tvm.backend.cuda.operator.tile_primitive.gemm_async.tcgen05 import (
         sf_smem_layout,
@@ -405,7 +371,6 @@ def get_kernel(**kwargs: Any):
         128, SF_K=num_sfkv // 32, sf_per_mma=sf_cp_K, pipe_depth=num_kv_stages
     )
     split_tmem_load = config.logits_dtype == "float32" and not config.compressed_logits
-    tmem_load_mode = "split_x32" if split_tmem_load else "wide"
     tmem_layout = TileLayout(S[(128, num_tmem_cols) : (1 @ TLane, 1 @ TCol)])
     logits_tir_dtype = "float32" if config.logits_dtype == "float32" else "bfloat16"
 
@@ -893,18 +858,31 @@ __forceinline__ __device__ void tirx_mqa_sf_warp_transpose(uint32_t* smem_ptr) {
                             tmem_addr: T.uint32 = tmem_stage_idx * T.uint32(umma_n) + T.uint32(
                                 q_inner_i * num_heads
                             )
-                            # REGION E: the address is already a flat TMEM column. Calling
-                            # the generic (base,row,col) helper would mask/repack it again.
-                            T.evaluate(
-                                cuda_func_call(
-                                    f"tvm_builtin_mqa_fp4_tmem_load_{num_heads}_{tmem_load_mode}",
-                                    T.address_of(accum[0]),
+                            # REGION E: use the already-flat TMEM column as the intrinsic's
+                            # base address so row=col=0 remains an identity mapping.
+                            if split_tmem_load and num_heads == 64:
+                                T.ptx.tcgen05.ld(
                                     tmem_addr,
-                                    source_code=_mqa_fp4_tmem_load_src(
-                                        num_heads, split_x32=split_tmem_load
-                                    ),
+                                    *[accum[i] for i in range(32)],
+                                    shape="32x32b",
+                                    num=32,
                                 )
-                            )
+                                T.ptx.tcgen05.wait.ld()
+                                T.ptx.tcgen05.ld(
+                                    tmem_addr + T.uint32(32),
+                                    *[accum[i] for i in range(32, 64)],
+                                    shape="32x32b",
+                                    num=32,
+                                )
+                                T.ptx.tcgen05.wait.ld()
+                            else:
+                                T.ptx.tcgen05.ld(
+                                    tmem_addr,
+                                    *[accum[i] for i in range(num_heads)],
+                                    shape="32x32b",
+                                    num=num_heads,
+                                )
+                                T.ptx.tcgen05.wait.ld()
                             if q_inner_i == block_q - 1:
                                 tmem_pipe.empty.arrive(tmem_stage_idx)
                             # Weighted-ReLU reduce via inline CUDA (see _mqa_fp4_wrelu_reduce_src).
