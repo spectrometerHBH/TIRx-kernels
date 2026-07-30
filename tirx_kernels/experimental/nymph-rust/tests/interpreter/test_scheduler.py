@@ -62,13 +62,13 @@ def test_sched_next_loop_break_runs_canonical_dynamic_scheduler():
 
 
 def test_clc_shaped_scheduler_broadcast_consumer_pipeline_completes():
-    b = builder("clc_shaped_scheduler_broadcast", smem_size_bytes=8)
+    b = builder("clc_shaped_scheduler_broadcast", smem_size_bytes=16)
     source = gmem_arg(b, shape=(2,))
     out = gmem_arg(b, shape=(2,))
     task_smem = smem_tensor(b, dtype=nr.DType.I32, shape=(2,), byte_offset=0)
     data_reg = reg_tensor(b)
-    full = b.mbar(kind=nr.MBarKind.THREAD, stages=2)
-    empty = b.mbar(kind=nr.MBarKind.THREAD, stages=2)
+    full = b.mbar(kind=nr.MBarKind.THREAD, byte_offset=0, stages=2)
+    empty = b.mbar(kind=nr.MBarKind.THREAD, byte_offset=0, stages=2)
     sched = b.scheduler(b.task_space(grid=(2,), fields=("task",)), policy="custom")
 
     def add_one(var):

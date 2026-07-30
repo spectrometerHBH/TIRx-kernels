@@ -36,7 +36,7 @@ ports:
   to bf16 in the epilogue;
 - the per-shape tuning knobs (canon's TIRX_CONFIGS): ``cta_n`` / ``epi_tile`` /
   ``smem_depth`` / ``d_depth`` / ``l2_group_size`` / ``load_cache_hint`` /
-  ``epilogue`` (overlap | no_overlap | stmatrix) / ``smem_pool`` / ``maxnreg_*``,
+  ``epilogue`` (overlap | no_overlap | stmatrix) / ``maxnreg_*``,
   resolved through GEMM_CONFIGS (below) exactly like canon's per-shape table.
 
 Sub-value physical-layout details (SMEM swizzles, the e2m1 nibble packing, the
@@ -169,34 +169,17 @@ class NvFp4GemmConfig:
     #                  store STSM, matching canon's epilogue exactly. Used by the latency-bound
     #                  small squares (1024/2048) where the epilogue store is the residual.
     epilogue: str = "overlap"
-    # SMEM allocation form (canon's `T.SMEMPool()`). Two emitted shapes over the SAME
-    # physical SMEM layout (the IR's byte offsets are unchanged):
-    #   False (default, the big-shape path) — each SMEM data buffer (A/B/SFA/SFB/D) is
-    #          its own static `T.alloc_buffer(scope="shared")`. TVM sizes the kernel's
-    #          STATIC shared footprint as the sum of those extents (ncu at 1024/2048:
-    #          176 KB static SMEM + 87 regs/thread).
-    #   True  — canon's dynamic pool: ONE `T.SMEMPool()` (`alloc_buffer([0], "uint8",
-    #          scope="shared.dyn")`) that every data buffer aliases into via
-    #          `pool.alloc(..., byte_offset=<the IR offset>)`. The buffers become
-    #          `shared.dyn`, so the static footprint drops (canon emits 159 KB DYNAMIC),
-    #          which also relieves the register pressure toward canon's 40 regs/thread.
-    #          The mbar/tmem_addr buffers stay `T.alloc_shared` (tiny). The physical
-    #          layout is byte-identical to the static form (same offsets), so the value
-    #          sim + protocol are unaffected — this is purely the allocation FORM. Gated
-    #          to the small squares (1024/2048) via GEMM_CONFIGS; the big shapes keep the
-    #          byte-identical static path.
-    smem_pool: bool = False
     # Per-warpgroup register budget (canon's INVARIANT-I1b per-role `setmaxnreg`). The ncu
     # 1024 diff shows nymph at 86 regs/thread vs canon's 40 — but SMEM caps occupancy at
     # 1 cluster/SM (Block Limit Shared Mem = 1 < Block Limit Registers = 2), so cutting regs
     # cannot raise occupancy; this is a TEST knob to measure whether forcing fewer registers
     # moves the latency-bound 1024 anyway. `maxnreg_epilogue` sets the wg1 (epilogue/consumer)
     # warpgroup budget via `setmaxnreg`; None = no setmaxnreg (the default codegen budget).
-    # `maxnreg_producer` sets the wg0 (TMA+MMA producer) budget via a standalone CTA-scope
-    # `setmaxnreg` emitted before the warp-level branches — so all 4 wg0 warps issue the
-    # collective op. Pairs with `maxnreg_epilogue`: the consumer `setmaxnreg.dec` releases
-    # registers the producer `setmaxnreg.inc` claims (canon's INVARIANT-I1b producer-drop /
-    # consumer-raise rebalance). None = no producer setmaxnreg.
+    # `maxnreg_producer` sets the wg0 (TMA+MMA producer) budget at the start of the explicit
+    # producer-warpgroup IR branch, before its nested warp roles — so all 4 wg0 warps issue
+    # the collective op. Pairs with `maxnreg_epilogue`: the consumer `setmaxnreg.dec`
+    # releases registers the producer `setmaxnreg.inc` claims (canon's INVARIANT-I1b
+    # producer-drop / consumer-raise rebalance). None = no producer setmaxnreg.
     maxnreg_epilogue: int | None = None
     maxnreg_producer: int | None = None
 
@@ -265,7 +248,6 @@ GEMM_CONFIGS = {
         # N static T.alloc_buffer(scope="shared"). The static SMEM footprint drops to 0
         # (the whole 176 KB window becomes shared.dyn), giving the latency-bound 1024 more
         # occupancy headroom. Measured (tir-bench, clean B200): 0.961 -> 0.980.
-        "smem_pool": True,
         # Shallower SMEM pipe (4 vs the default 5 stages). With the pool form in place the
         # 32-byte-per-tile-shallower ring is a real occupancy lever at this latency-bound
         # square (the pipe is never the bottleneck at K=1024 / 4 k-tiles). Measured on top
@@ -300,7 +282,7 @@ GEMM_CONFIGS = {
     # 2048: l2_group_size=4 matches canon's TIRX_CONFIGS[2048] L2_GROUP_SIZE=4 (the earlier
     # l2_group_size=2 was the peak under the OLD data-asymmetric bench; under the fair bench the
     # canon-matching 4-row band benches ~0.991 vs 2's ~0.987). + canon's dynamic SMEM pool
-    # (smem_pool) and evict_normal load hint. Keeps smem_depth=5 (depth 4 was 0.989).
+    # and evict_normal load hint. Keeps smem_depth=5 (depth 4 was 0.989).
     # maxnreg_epilogue=96 — canon's INVARIANT-I1b per-role setmaxnreg on the epilogue/consumer
     # warpgroup (same lever as 1024), picked by a nymph-vs-nymph head-to-head bench (median
     # +0.33%, 16/16 reps >= default; 96 vs 128 a tie, so 96 = canon's budget).
@@ -314,7 +296,6 @@ GEMM_CONFIGS = {
     (2048, 2048, 2048): {
         "l2_group_size": 4,
         "load_cache_hint": "evict_normal",
-        "smem_pool": True,
         "maxnreg_epilogue": 96,
         "epi_tile": 32,
     },
@@ -428,7 +409,22 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     sfa_off = b_off + smem_depth * b_tile_bytes
     sfb_off = sfa_off + smem_depth * sfa_tile_bytes
     d_off = sfb_off + smem_depth * sfb_tile_bytes
-    smem_size_bytes = d_off + d_depth * d_tile_bytes
+    data_end = d_off + d_depth * d_tile_bytes
+    metadata_cursor = (data_end + 7) // 8 * 8
+    smem_full_off = metadata_cursor
+    metadata_cursor += smem_depth * 8
+    sf_full_off = metadata_cursor
+    metadata_cursor += smem_depth * 8
+    smem_empty_off = metadata_cursor
+    metadata_cursor += smem_depth * 8
+    tmem_full_off = metadata_cursor
+    metadata_cursor += ACC_DEPTH * 8
+    tmem_empty_off = metadata_cursor
+    metadata_cursor += ACC_DEPTH * 8
+    tmem_fin_off = metadata_cursor
+    metadata_cursor += 8
+    tmem_addr_off = (metadata_cursor + 3) // 4 * 4
+    smem_size_bytes = tmem_addr_off + 4
 
     k = IRBuilder(
         "nymph_nvfp4_gemm",
@@ -436,9 +432,6 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
         smem_size_bytes=smem_size_bytes,
         launch_shape=launch_shape,
         cluster_shape=(cta_group,),
-        # Canon's dynamic T.SMEMPool() allocation form for the small-shape variant
-        # (1024/2048), gated via GEMM_CONFIGS; the big shapes keep the static form.
-        smem_pool=config.smem_pool,
     )
     # Operands are packed fp4: uint8[rows, K//2] (two e2m1 per byte), exactly the
     # TIRx A_packed/B_packed storage. Scales are e4m3 (one byte per 16-K block),
@@ -537,33 +530,23 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
         reg_frag=("16x256b", accum_frag.id) if stmatrix_epi else None,
     )
 
-    # leader_routed: both CTAs' TMA completions (A/B on smem_full, SFA/SFB on
-    # sf_full) signal the LEADER CTA's copy (the canonical cta_group=2 pattern).
-    smem_full = k.mbar(kind=MBarKind.TMA, stages=smem_depth, leader_routed=True)
+    smem_full = k.mbar(kind=MBarKind.TMA, byte_offset=smem_full_off, stages=smem_depth)
+    smem_full_leader = k.mbar_ref(smem_full, remote_coord=0)
     # Separate SF-load completion barrier (canon's `scale_full_bar`, distinct from
     # the A/B `tile_full_bar`). Canon waits BOTH in the MMA before the cp/gemm; the
     # scale and tile loads land on different barriers. Mirror canon exactly — one
     # barrier for A/B, one for SFA/SFB — so the MMA orders against each.
-    sf_full = k.mbar(kind=MBarKind.TMA, stages=smem_depth, leader_routed=True)
-    smem_empty = k.mbar(kind=MBarKind.TCGEN05, stages=smem_depth)
-    tmem_full = k.mbar(kind=MBarKind.TCGEN05, stages=ACC_DEPTH)
+    sf_full = k.mbar(kind=MBarKind.TMA, byte_offset=sf_full_off, stages=smem_depth)
+    sf_full_leader = k.mbar_ref(sf_full, remote_coord=0)
+    smem_empty = k.mbar(kind=MBarKind.TCGEN05, byte_offset=smem_empty_off, stages=smem_depth)
+    tmem_full = k.mbar(kind=MBarKind.TCGEN05, byte_offset=tmem_full_off, stages=ACC_DEPTH)
     # tmem_empty: one elected thread per CTA's epilogue arrives (count=CTA_GROUP),
     # AFTER a warpgroup_sync that proves every warp's tcgen05.ld retired — the
     # sync is what lets the single arrive stand for all 128 threads' TMEM reads
     # (the checker's cross-warp publication rule; canon's all-thread arrive pays
     # 2*128 arrivals for the same proof).
-    tmem_empty = k.mbar(kind=MBarKind.THREAD, stages=ACC_DEPTH)
+    tmem_empty = k.mbar(kind=MBarKind.THREAD, byte_offset=tmem_empty_off, stages=ACC_DEPTH)
     tmem_empty_leader = k.mbar_ref(tmem_empty, remote_coord=0)
-    # The cluster MMA reads the PEER CTA's A/B/SF tiles too (cta_group=2,
-    # multicast_cta_mask=0b11): the leader's tcgen05_cp/tcgen05_mma read
-    # smem:cta1 as well as its own. So the leader must wait the PEER's
-    # smem_full before issuing — exactly like the fp16/bf16 port — or the
-    # peer CTA's TMA load has no happens-before edge to the leader's
-    # operand read (the tcgen05_operand_overwrite_before_drain race).
-    peer_smem_full = k.mbar_ref(smem_full, remote_coord=1)
-    # The SF cp also reads the PEER CTA's SF SMEM (cta_group=2), so the leader orders
-    # against the peer's SF load via the peer's sf_full too (symmetric with peer_smem_full).
-    peer_sf_full = k.mbar_ref(sf_full, remote_coord=1)
     # tmem_fin: canon's exact lightweight 2-CTA teardown handshake (its `tmem_finished`).
     # Issued by the epilogue warp (warp 4): each CTA's warp-4/lane-0 arrives at the PEER
     # CTA's barrier, then waits its OWN — so BOTH CTAs' epilogues finished their TMEM
@@ -572,7 +555,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     # `cluster_sync` is needlessly heavy — it forces all 8 warps to converge at one PC,
     # and warp 0 is the MMA/loader, not the epilogue, so it wouldn't even order against
     # the epilogue's TMEM reads). Mirrors the proven fp16 overlap port's tmem_fin.
-    tmem_fin = k.mbar(kind=MBarKind.THREAD, stages=1)
+    tmem_fin = k.mbar(kind=MBarKind.THREAD, byte_offset=tmem_fin_off, stages=1)
 
     cta_id = k.cta_id()
     cta_rank = k.ctaid_in_cluster()
@@ -618,7 +601,7 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     with k.if_warp(0):
         # tmem_alloc is warp-collective (full warp 0); mbarrier.init is
         # per-thread, so one elected thread runs the inits.
-        k.tmem_alloc(0, N_COLS_TMEM, cta_group)
+        k.tmem_alloc(0, N_COLS_TMEM, addr_byte_offset=tmem_addr_off, cta_group=cta_group)
         with k.if_elected():
             for s in range(smem_depth):
                 k.mbarrier_init(smem_full, count=1, stage=s)
@@ -645,238 +628,241 @@ def build_nvfp4_gemm(config: NvFp4GemmConfig = NvFp4GemmConfig()) -> Kernel:
     # `setmaxnreg.dec` is on its branch below; the wg0 (TMA+MMA producer) `setmaxnreg.inc`
     # is emitted HERE (before the warp-level branches diverge) so all 4 wg0 warps issue
     # the collective op together. Gated to the small-shape variant via the config; the
-    # big shapes leave both None (no setmaxnreg, byte-identical static path).
-    if config.maxnreg_producer is not None:
-        with k.if_warpgroup(0):
+    # big shapes leave both None.
+    with k.if_warpgroup(0):
+        if config.maxnreg_producer is not None:
             k.set_maxnreg(config.maxnreg_producer)
 
-    # ---- TMA producer (wg0/warp2 — canon's WarpRole.TMA) ----
-    # The try_wait runs on the whole warp (all 32 lanes poll the barrier
-    # together); the single-issue ops (expect_tx, tma_load) ride ONE elected
-    # lane. This is canon's producer shape (whole-warp loop, per-op elect).
-    with k.if_warp(2):
-        with k.for_each_task(task_scheduler) as task:
-            # `let` SSA binding (canon's while-loop `T.let` decode chain), replacing
-            # the shuffle_sync broadcast: the immutable binding keeps the whole
-            # local_iter -> stage/occ chain on ptxas's uniform datapath WITHOUT the
-            # SHFL instruction (ncu: the shuffle form still paid vector math + R2UR
-            # on the g2cluster lines). Value-model-identical: task_id is CTA-uniform,
-            # so the per-lane eval agrees with the old broadcast.
-            local_iter = k.let((task.task_id - task_start) // task_step)
-            m_idx, n_idx = work_coords(task.task_id, cta_rank)
-            a_m = m_idx * CTA_M  # this CTA's own M tile
-            b_n = n_idx * mma_n + cta_rank * cta_n  # this CTA's half of the N band
-            sf_n = n_idx * mma_n  # the FULL N band's B scales (rank-independent)
-            # Rolled k-loop (canon's T.serial) — a Python range unrolls in the IR, which
-            # ~doubles the emitted CUDA tcgen05 ops vs canon and breaks multi-k-tile.
-            with k.for_loop(stop=k_tiles) as t:
-                seq = local_iter * k_tiles + t
-                stage = seq % smem_depth
-                occ = seq // smem_depth
-                k.mbarrier_wait(smem_empty, stage=stage, phase=(occ + 1) % 2)
-                with k.if_elected():
-                    # canon's split arrive: A/B tx -> smem_full (tile_full_bar),
-                    # SFA/SFB tx -> sf_full (scale_full_bar). Two barriers, each
-                    # with its own expect_tx.
-                    k.mbarrier_arrive_expect_tx(smem_full, bytes=ab_bytes, stage=stage)
-                    k.mbarrier_arrive_expect_tx(sf_full, bytes=sf_bytes, stage=stage)
-                    kb = t * BLK_K_BYTES  # packed-fp4 byte column
-                    # canon tags every g2c load with the L2 `evict_normal` policy (its
-                    # `_tma_g2c_args`): a tile read once per k-tile should not pin an L2
-                    # line the next tile evicts anyway. Bounding the L2 cache-policy
-                    # traffic on the LOADS is the lever that stops the full-cube
-                    # (8192/16384) launch fault — the operand bands no longer saturate
-                    # L2 until a TMA reads a stale tensormap and the launch traps.
-                    # Pairs with the epilogue store's `evict_first` (write-once
-                    # output). Applied to A/B and SFA/SFB alike.
-                    k.tma_load(
-                        TensorSlice(
-                            tensor=a_smem, offsets=(stage, 0, 0), shape=(1, blk_m, BLK_K_BYTES)
-                        ),
-                        a_gmem,
-                        mbar=smem_full,
-                        coords=(a_m, kb),
-                        shape=(1, blk_m, BLK_K_BYTES),
-                        gmem_shape=(blk_m, BLK_K_BYTES),
-                        mbar_stage=stage,
-                        cache_hint=load_cache_hint,
-                        cta_group=cta_group,
-                    )
-                    k.tma_load(
-                        TensorSlice(
-                            tensor=b_smem, offsets=(stage, 0, 0), shape=(1, blk_n, BLK_K_BYTES)
-                        ),
-                        b_gmem,
-                        mbar=smem_full,
-                        coords=(b_n, kb),
-                        shape=(1, blk_n, BLK_K_BYTES),
-                        gmem_shape=(blk_n, BLK_K_BYTES),
-                        mbar_stage=stage,
-                        cache_hint=load_cache_hint,
-                        cta_group=cta_group,
-                    )
-                    # SFA: this CTA's M rows; SFB: the full N band. e4m3 (rows, SF_CTA_K)
-                    # straight from the (rows, K//16) GMEM at this k-tile's column band,
-                    # exactly canon's SFA_in/SFB_in slice.
-                    sf_k = t * SF_CTA_K
-                    k.tma_load(
-                        TensorSlice(
-                            tensor=sfa_smem, offsets=(stage, 0, 0), shape=(1, blk_m, SF_CTA_K)
-                        ),
-                        sfa_gmem,
-                        mbar=sf_full,
-                        coords=(a_m, sf_k),
-                        shape=(1, blk_m, SF_CTA_K),
-                        gmem_shape=(blk_m, SF_CTA_K),
-                        mbar_stage=stage,
-                        cache_hint=load_cache_hint,
-                        cta_group=cta_group,
-                    )
-                    # SFB: the FULL MMA_N-wide N band (rank-independent sf_n), so both
-                    # CTAs hold the same full-band scales (canon's SFB_N==MMA_N path).
-                    # The B operand is still N-split (b_n), but its scales are not.
-                    #
-                    # NOTE on multicast: canon halves this band's load traffic by
-                    # having each CTA read only its cta_rank-indexed half and MULTICAST
-                    # it to both CTAs (cta_mask=pair_mask). The codegen + builder
-                    # support that (multicast_cta_mask on tma_load, generalized
-                    # leader-routing of the SF barrier), but it is NOT wired here: a
-                    # `multicast::cluster` copy's transaction count completes once PER
-                    # multicast destination on the GPU (canon's SFB_BYTES carries the
-                    # `* CTA_GROUP` factor for exactly this), whereas the value-model's
-                    # transaction accounting completes once per UNIQUE barrier cell
-                    # (`apply_mbar_complete_tx` coalesces duplicate targets — the
-                    # behaviour the `tma_multicast_group2_mbar_targets_are_deduplicated`
-                    # interpreter test locks in). On the shared SFA+SFB barrier the two
-                    # models cannot agree on a single IR expect_tx byte count (GPU
-                    # wants the full band, the value model wants the issued half), so
-                    # multicasting SFB here would either desync the GPU pipeline or
-                    # break the bit-exact sim. The full-cube launch fault is instead
-                    # resolved by the L2 `evict_normal` cache hint on the loads above
-                    # (the same lever canon pairs with its multicast); the cubes are
-                    # compute-bound, so the doubled SFB read is not the wall-clock
-                    # bottleneck.
-                    k.tma_load(
-                        TensorSlice(
-                            tensor=sfb_smem, offsets=(stage, 0, 0), shape=(1, mma_n, SF_CTA_K)
-                        ),
-                        sfb_gmem,
-                        mbar=sf_full,
-                        coords=(sf_n, sf_k),
-                        shape=(1, mma_n, SF_CTA_K),
-                        gmem_shape=(mma_n, SF_CTA_K),
-                        mbar_stage=stage,
-                        cache_hint=load_cache_hint,
-                        cta_group=cta_group,
-                    )
-
-    # ---- MMA (wg0/warp0, cluster leader only — canon's WarpRole.MMA) ----
-    # MMA on warp 0 (the same warp that did the tcgen05.alloc), exactly like canon.
-    # No permute warp (canon has none): the TMA lands the e4m3 scales in the
-    # cp-ready layout, the MMA warp copies them SMEM->TMEM and issues ONE
-    # block-scaled gemm over the full CTA_K tile, exactly like canon's execute_mma.
-    # The physical folded SFB SF-TMEM band is (128, SF_CTA_K * SFB_N_CHUNKS) cells:
-    # the MMA_N-wide band's 256 logical rows fold into SFB_N_CHUNKS column
-    # super-blocks (the SfTmemBand rule); the cp dst and the mma sfb operand address
-    # the band's folded physical base col0 (the MMA read region spans the whole
-    # written footprint).
-    # The WHOLE MMA worker loop runs single-issue (canon's `if elect_sync(): while ...`).
-    # The B200 tensor pipe needs the cp/cp/gemm/commit burst issued by one converged
-    # lane — per-op elect guards that reconverge the warp between tcgen05 issues stall
-    # the async stream (a GPU deadlock). tcgen05.mma/cp are single-thread-ISSUE ops,
-    # so the value model computes the MMA from SMEM/TMEM regardless of cohort size.
-    with k.if_warp(0), k.if_elected():
-        with k.for_each_task(task_scheduler) as task:
-            # NO shuffle_sync here: __shfl_sync(0xffffffff) inside this single-lane
-            # elected region is UB on GPU (the mask demands all 32 lanes converge;
-            # reproduced as a flaky launch hang on the fp16 producer). local_iter is
-            # a `let` SSA binding instead — the UB-free uniform mechanism: immutable
-            # and single-assignment, so ptxas keeps the derived stage/phase chain on
-            # the uniform datapath without any SHFL.
-            local_iter = k.let((task.task_id - task_start) // task_step)
-            with k.if_(cta_rank.eq(0)):
-                tmem_idx = local_iter % ACC_DEPTH
-                k.mbarrier_wait(tmem_empty, stage=tmem_idx, phase=(local_iter // ACC_DEPTH + 1) % 2)
-                acc_op = accum.at(0, tmem_idx * mma_n)
-
-                def mma_ktile(t, accum_flag):
-                    # one k-tile: wait the staged loads, cp the e4m3 scales SMEM->TMEM,
-                    # issue ONE block-scaled gemm over CTA_K, free the smem stage.
+        # ---- TMA producer (wg0/warp2 — canon's WarpRole.TMA) ----
+        # The try_wait runs on the whole warp (all 32 lanes poll the barrier
+        # together); the single-issue ops (expect_tx, tma_load) ride ONE elected
+        # lane. This is canon's producer shape (whole-warp loop, per-op elect).
+        with k.if_warp(2):
+            with k.for_each_task(task_scheduler) as task:
+                # `let` SSA binding (canon's while-loop `T.let` decode chain), replacing
+                # the shuffle_sync broadcast: the immutable binding keeps the whole
+                # local_iter -> stage/occ chain on ptxas's uniform datapath WITHOUT the
+                # SHFL instruction (ncu: the shuffle form still paid vector math + R2UR
+                # on the g2cluster lines). Value-model-identical: task_id is CTA-uniform,
+                # so the per-lane eval agrees with the old broadcast.
+                local_iter = k.let((task.task_id - task_start) // task_step)
+                m_idx, n_idx = work_coords(task.task_id, cta_rank)
+                a_m = m_idx * CTA_M  # this CTA's own M tile
+                b_n = n_idx * mma_n + cta_rank * cta_n  # this CTA's half of the N band
+                sf_n = n_idx * mma_n  # the FULL N band's B scales (rank-independent)
+                # Rolled k-loop (canon's T.serial) — a Python range unrolls in the IR, which
+                # ~doubles the emitted CUDA tcgen05 ops vs canon and breaks multi-k-tile.
+                with k.for_loop(stop=k_tiles) as t:
                     seq = local_iter * k_tiles + t
                     stage = seq % smem_depth
                     occ = seq // smem_depth
-                    # smem_full starts EMPTY (parity 0) and is flipped 0->1 only when the
-                    # loader's TMA arrive + all four complete-tx land. mbarrier_wait blocks
-                    # while parity == phase and wakes on the flip, so the consumer must wait
-                    # phase=occ%2 (block at the OLD parity until the load completes). The
-                    # flipped (occ+1)%2 passes vacuously on the first occupancy — the cp/gemm
-                    # then read the SF/operand SMEM before the load lands (the
-                    # tcgen05_operand_overwrite_before_drain race the checker flags).
-                    # canon waits BOTH the scale_full_bar (sf_full) and the tile_full_bar
-                    # (smem_full) before the cp/gemm. Wait sf_full FIRST (canon's order)
-                    # so the SF cp's source is ready, then smem_full for the A/B operands.
-                    k.mbarrier_wait(sf_full, stage=stage, phase=occ % 2)
-                    k.mbarrier_wait(smem_full, stage=stage, phase=occ % 2)
-                    # Also wait the PEER CTA's barriers: the cluster MMA's cp/gemm read
-                    # smem:cta1 too, so the leader must order against the peer's TMA loads
-                    # (both A/B via peer_smem_full and SF via peer_sf_full) before issuing.
-                    k.mbarrier_wait(peer_sf_full, stage=stage, phase=occ % 2)
-                    k.mbarrier_wait(peer_smem_full, stage=stage, phase=occ % 2)
-                    k.tcgen05_cp(
-                        sfa_tmem.at(),
-                        TensorSlice(
-                            tensor=sfa_smem, offsets=(stage, 0, 0), shape=(1, blk_m, SF_CTA_K)
-                        ),
-                        cta_group=cta_group,
-                    )
-                    k.tcgen05_cp(
-                        sfb_tmem.at(),
-                        TensorSlice(
-                            tensor=sfb_smem, offsets=(stage, 0, 0), shape=(1, mma_n, SF_CTA_K)
-                        ),
-                        cta_group=cta_group,
-                    )
-                    # canon's cluster gemm: n = MMA_N (the full 256-wide N band the pair
-                    # computes together), m = MMA_M; each CTA supplies its own blk_n-row
-                    # B half (b_smem holds it) and the 2-CTA MMA writes the per-CTA
-                    # (128, MMA_N) accumulator. ONE block-scaled issue over the full
-                    # CTA_K tile (the IR's dense k = an ordered run of k/16 atomic
-                    # MMAs); SFA (128, SF_CTA_K), SFB (mma_n, SF_CTA_K).
-                    a_op = TensorSlice(
-                        tensor=a_smem, offsets=(stage, 0, 0), shape=(1, blk_m, BLK_K_BYTES)
-                    )
-                    b_op = TensorSlice(
-                        tensor=b_smem, offsets=(stage, 0, 0), shape=(1, blk_n, BLK_K_BYTES)
-                    )
-                    k.tcgen05_mma(
-                        acc_op,
-                        a_op,
-                        b_op,
-                        m=256,
-                        n=mma_n,
-                        k=CTA_K,
-                        accum=accum_flag,
-                        cta_group=cta_group,
-                        sfa=sfa_tmem.at(),
-                        sfb=sfb_tmem.at(),
-                        sf_e4m3=True,
-                        sf_block=SF_BLOCK,
-                        a_fp4=True,
-                        b_fp4=True,
-                    )
-                    k.tcgen05_commit(
-                        smem_empty, stage=stage, cta_group=cta_group, multicast_cta_mask=0b11
-                    )
+                    k.mbarrier_wait(smem_empty, stage=stage, phase=(occ + 1) % 2)
+                    with k.if_elected():
+                        # canon's split arrive: A/B tx -> smem_full (tile_full_bar),
+                        # SFA/SFB tx -> sf_full (scale_full_bar). Two barriers, each
+                        # with its own expect_tx. Both CTAs explicitly target
+                        # CTA 0; CTA 0 owns each full-cluster arrive/expect.
+                        with k.if_(cta_rank.eq(0)):
+                            k.mbarrier_arrive_expect_tx(
+                                smem_full_leader, bytes=cta_group * ab_bytes, stage=stage
+                            )
+                            k.mbarrier_arrive_expect_tx(
+                                sf_full_leader, bytes=cta_group * sf_bytes, stage=stage
+                            )
+                        kb = t * BLK_K_BYTES  # packed-fp4 byte column
+                        # canon tags every g2c load with the L2 `evict_normal` policy (its
+                        # `_tma_g2c_args`): a tile read once per k-tile should not pin an L2
+                        # line the next tile evicts anyway. Bounding the L2 cache-policy
+                        # traffic on the LOADS is the lever that stops the full-cube
+                        # (8192/16384) launch fault — the operand bands no longer saturate
+                        # L2 until a TMA reads a stale tensormap and the launch traps.
+                        # Pairs with the epilogue store's `evict_first` (write-once
+                        # output). Applied to A/B and SFA/SFB alike.
+                        k.tma_load(
+                            TensorSlice(
+                                tensor=a_smem, offsets=(stage, 0, 0), shape=(1, blk_m, BLK_K_BYTES)
+                            ),
+                            a_gmem,
+                            mbar=smem_full_leader,
+                            coords=(a_m, kb),
+                            shape=(1, blk_m, BLK_K_BYTES),
+                            gmem_shape=(blk_m, BLK_K_BYTES),
+                            mbar_stage=stage,
+                            cache_hint=load_cache_hint,
+                            cta_group=cta_group,
+                        )
+                        k.tma_load(
+                            TensorSlice(
+                                tensor=b_smem, offsets=(stage, 0, 0), shape=(1, blk_n, BLK_K_BYTES)
+                            ),
+                            b_gmem,
+                            mbar=smem_full_leader,
+                            coords=(b_n, kb),
+                            shape=(1, blk_n, BLK_K_BYTES),
+                            gmem_shape=(blk_n, BLK_K_BYTES),
+                            mbar_stage=stage,
+                            cache_hint=load_cache_hint,
+                            cta_group=cta_group,
+                        )
+                        # SFA: this CTA's M rows; SFB: the full N band. e4m3 (rows, SF_CTA_K)
+                        # straight from the (rows, K//16) GMEM at this k-tile's column band,
+                        # exactly canon's SFA_in/SFB_in slice.
+                        sf_k = t * SF_CTA_K
+                        k.tma_load(
+                            TensorSlice(
+                                tensor=sfa_smem, offsets=(stage, 0, 0), shape=(1, blk_m, SF_CTA_K)
+                            ),
+                            sfa_gmem,
+                            mbar=sf_full_leader,
+                            coords=(a_m, sf_k),
+                            shape=(1, blk_m, SF_CTA_K),
+                            gmem_shape=(blk_m, SF_CTA_K),
+                            mbar_stage=stage,
+                            cache_hint=load_cache_hint,
+                            cta_group=cta_group,
+                        )
+                        # SFB: the FULL MMA_N-wide N band (rank-independent sf_n), so both
+                        # CTAs hold the same full-band scales (canon's SFB_N==MMA_N path).
+                        # The B operand is still N-split (b_n), but its scales are not.
+                        #
+                        # NOTE on multicast: canon halves this band's load traffic by
+                        # having each CTA read only its cta_rank-indexed half and MULTICAST
+                        # it to both CTAs (cta_mask=pair_mask). The codegen + builder
+                        # support that (multicast_cta_mask on tma_load, generalized
+                        # leader-routing of the SF barrier), but it is NOT wired here: a
+                        # `multicast::cluster` copy's transaction count completes once PER
+                        # multicast destination on the GPU (canon's SFB_BYTES carries the
+                        # `* CTA_GROUP` factor for exactly this), whereas the value-model's
+                        # transaction accounting completes once per UNIQUE barrier cell
+                        # (`apply_mbar_complete_tx` coalesces duplicate targets — the
+                        # behaviour the `tma_multicast_group2_mbar_targets_are_deduplicated`
+                        # interpreter test locks in). On the shared SFA+SFB barrier the two
+                        # models cannot agree on a single IR expect_tx byte count (GPU
+                        # wants the full band, the value model wants the issued half), so
+                        # multicasting SFB here would either desync the GPU pipeline or
+                        # break the bit-exact sim. The full-cube launch fault is instead
+                        # resolved by the L2 `evict_normal` cache hint on the loads above
+                        # (the same lever canon pairs with its multicast); the cubes are
+                        # compute-bound, so the doubled SFB read is not the wall-clock
+                        # bottleneck.
+                        k.tma_load(
+                            TensorSlice(
+                                tensor=sfb_smem, offsets=(stage, 0, 0), shape=(1, mma_n, SF_CTA_K)
+                            ),
+                            sfb_gmem,
+                            mbar=sf_full_leader,
+                            coords=(sf_n, sf_k),
+                            shape=(1, mma_n, SF_CTA_K),
+                            gmem_shape=(mma_n, SF_CTA_K),
+                            mbar_stage=stage,
+                            cache_hint=load_cache_hint,
+                            cta_group=cta_group,
+                        )
 
-                # Peel the first k-tile (accum=False), roll the rest with accum=True
-                # (canon's `accum=0` then `accum=1`). The rolled loop keeps the emitted
-                # CUDA tcgen05 op count at canon's level (a Python range would unroll it).
-                mma_ktile(0, False)
-                with k.for_loop(stop=k_tiles - 1) as ti:
-                    mma_ktile(ti + 1, True)
-                k.tcgen05_commit(
-                    tmem_full, stage=tmem_idx, cta_group=cta_group, multicast_cta_mask=0b11
-                )
+        # ---- MMA (wg0/warp0, cluster leader only — canon's WarpRole.MMA) ----
+        # MMA on warp 0 (the same warp that did the tcgen05.alloc), exactly like canon.
+        # No permute warp (canon has none): the TMA lands the e4m3 scales in the
+        # cp-ready layout, the MMA warp copies them SMEM->TMEM and issues ONE
+        # block-scaled gemm over the full CTA_K tile, exactly like canon's execute_mma.
+        # The physical folded SFB SF-TMEM band is (128, SF_CTA_K * SFB_N_CHUNKS) cells:
+        # the MMA_N-wide band's 256 logical rows fold into SFB_N_CHUNKS column
+        # super-blocks (the SfTmemBand rule); the cp dst and the mma sfb operand address
+        # the band's folded physical base col0 (the MMA read region spans the whole
+        # written footprint).
+        # The WHOLE MMA worker loop runs single-issue (canon's `if elect_sync(): while ...`).
+        # The B200 tensor pipe needs the cp/cp/gemm/commit burst issued by one converged
+        # lane — per-op elect guards that reconverge the warp between tcgen05 issues stall
+        # the async stream (a GPU deadlock). tcgen05.mma/cp are single-thread-ISSUE ops,
+        # so the value model computes the MMA from SMEM/TMEM regardless of cohort size.
+        with k.if_warp(0), k.if_elected():
+            with k.for_each_task(task_scheduler) as task:
+                # NO shuffle_sync here: __shfl_sync(0xffffffff) inside this single-lane
+                # elected region is UB on GPU (the mask demands all 32 lanes converge;
+                # reproduced as a flaky launch hang on the fp16 producer). local_iter is
+                # a `let` SSA binding instead — the UB-free uniform mechanism: immutable
+                # and single-assignment, so ptxas keeps the derived stage/phase chain on
+                # the uniform datapath without any SHFL.
+                local_iter = k.let((task.task_id - task_start) // task_step)
+                with k.if_(cta_rank.eq(0)):
+                    tmem_idx = local_iter % ACC_DEPTH
+                    k.mbarrier_wait(
+                        tmem_empty, stage=tmem_idx, phase=(local_iter // ACC_DEPTH + 1) % 2
+                    )
+                    acc_op = accum.at(0, tmem_idx * mma_n)
+
+                    def mma_ktile(t, accum_flag):
+                        # one k-tile: wait the staged loads, cp the e4m3 scales SMEM->TMEM,
+                        # issue ONE block-scaled gemm over CTA_K, free the smem stage.
+                        seq = local_iter * k_tiles + t
+                        stage = seq % smem_depth
+                        occ = seq // smem_depth
+                        # smem_full starts EMPTY (parity 0) and is flipped 0->1 only when the
+                        # loader's TMA arrive + all four complete-tx land. mbarrier_wait blocks
+                        # while parity == phase and wakes on the flip, so the consumer must wait
+                        # phase=occ%2 (block at the OLD parity until the load completes). The
+                        # flipped (occ+1)%2 passes vacuously on the first occupancy — the cp/gemm
+                        # then read the SF/operand SMEM before the load lands (the
+                        # tcgen05_operand_overwrite_before_drain race the checker flags).
+                        # canon waits BOTH the scale_full_bar (sf_full) and the tile_full_bar
+                        # (smem_full) before the cp/gemm. Wait sf_full FIRST (canon's order)
+                        # so the SF cp's source is ready, then smem_full for the A/B operands.
+                        k.mbarrier_wait(sf_full, stage=stage, phase=occ % 2)
+                        k.mbarrier_wait(smem_full, stage=stage, phase=occ % 2)
+                        k.tcgen05_cp(
+                            sfa_tmem.at(),
+                            TensorSlice(
+                                tensor=sfa_smem, offsets=(stage, 0, 0), shape=(1, blk_m, SF_CTA_K)
+                            ),
+                            cta_group=cta_group,
+                        )
+                        k.tcgen05_cp(
+                            sfb_tmem.at(),
+                            TensorSlice(
+                                tensor=sfb_smem, offsets=(stage, 0, 0), shape=(1, mma_n, SF_CTA_K)
+                            ),
+                            cta_group=cta_group,
+                        )
+                        # canon's cluster gemm: n = MMA_N (the full 256-wide N band the pair
+                        # computes together), m = MMA_M; each CTA supplies its own blk_n-row
+                        # B half (b_smem holds it) and the 2-CTA MMA writes the per-CTA
+                        # (128, MMA_N) accumulator. ONE block-scaled issue over the full
+                        # CTA_K tile (the IR's dense k = an ordered run of k/16 atomic
+                        # MMAs); SFA (128, SF_CTA_K), SFB (mma_n, SF_CTA_K).
+                        a_op = TensorSlice(
+                            tensor=a_smem, offsets=(stage, 0, 0), shape=(1, blk_m, BLK_K_BYTES)
+                        )
+                        b_op = TensorSlice(
+                            tensor=b_smem, offsets=(stage, 0, 0), shape=(1, blk_n, BLK_K_BYTES)
+                        )
+                        k.tcgen05_mma(
+                            acc_op,
+                            a_op,
+                            b_op,
+                            m=256,
+                            n=mma_n,
+                            k=CTA_K,
+                            accum=accum_flag,
+                            cta_group=cta_group,
+                            sfa=sfa_tmem.at(),
+                            sfb=sfb_tmem.at(),
+                            sf_e4m3=True,
+                            sf_block=SF_BLOCK,
+                            a_fp4=True,
+                            b_fp4=True,
+                        )
+                        k.tcgen05_commit(
+                            smem_empty, stage=stage, cta_group=cta_group, multicast_cta_mask=0b11
+                        )
+
+                    # Peel the first k-tile (accum=False), roll the rest with accum=True
+                    # (canon's `accum=0` then `accum=1`). The rolled loop keeps the emitted
+                    # CUDA tcgen05 op count at canon's level (a Python range would unroll it).
+                    mma_ktile(0, False)
+                    with k.for_loop(stop=k_tiles - 1) as ti:
+                        mma_ktile(ti + 1, True)
+                    k.tcgen05_commit(
+                        tmem_full, stage=tmem_idx, cta_group=cta_group, multicast_cta_mask=0b11
+                    )
 
     # ---- epilogue (wg1) ----
     # stmatrix runs the OVERLAP schedule (canon's 1024/2048 are OVERLAP_EPI=True + stmatrix

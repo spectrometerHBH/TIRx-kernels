@@ -14,15 +14,11 @@ pub struct MBar {
     pub id: u32,
     pub kind: MBarKind,
     pub stages: u32,
+    /// Absolute byte offset of the first 8-byte barrier cell in the kernel's
+    /// single dynamic shared-memory pool. The object occupies `stages * 8`
+    /// bytes.
+    pub byte_offset: usize,
     pub arrive_count: Option<u32>,
-    /// Cluster TMA-completion routing, set by the builder: when true, BOTH CTAs'
-    /// TMA loads signal the LEADER CTA's (CTA-0) copy of this barrier (the
-    /// canonical cta_group=2 pattern — the legal substitute for a peer
-    /// `try_wait`, and the prerequisite for multicast loads, whose per-
-    /// destination tx counts must accumulate on the single leader barrier).
-    /// Codegen reads this flag; it never guesses it from the usage structure.
-    /// Validate requires a peer reference and TMA-load/expect_tx-only use.
-    pub leader_routed: bool,
 }
 
 impl PartialEq for MBar {

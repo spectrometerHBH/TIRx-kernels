@@ -69,6 +69,58 @@ def test_smem_tensor_requires_byte_offset_and_rejects_non_smem_offset():
         n.Tensor(space=n.MemorySpace.GMEM, dtype=n.DType.F16, shape=[1], byte_offset=0)
 
 
+def test_mbar_and_tmem_alloc_require_explicit_smem_offsets():
+    with pytest.raises(TypeError, match="byte_offset"):
+        n.MBar(kind=n.MBarKind.THREAD)
+    mbar = n.MBar(kind=n.MBarKind.THREAD, byte_offset=24, stages=2)
+    assert mbar.byte_offset == 24
+    with pytest.raises(TypeError, match="leader_routed"):
+        n.MBar(kind=n.MBarKind.THREAD, byte_offset=24, leader_routed=True)
+
+    with pytest.raises(TypeError, match="addr_byte_offset"):
+        n.TmemAlloc(0, 32)
+    alloc = n.TmemAlloc(0, 32, addr_byte_offset=40)
+    assert alloc.addr_byte_offset == 40
+
+
+def test_mbar_ref_and_statements_expose_the_exact_remote_coord():
+    mbar = n.MBar(kind=n.MBarKind.TMA, byte_offset=24, stages=2)
+    local = n.MBarRef(mbar)
+    remote_zero = n.MBarRef(mbar, remote_coord=0)
+    remote_expr = n.MBarRef(mbar, remote_coord=n.ScopeValue(kind="ctaid_in_cluster") + 1)
+
+    assert local.remote_coord is None
+    assert remote_zero.remote_coord == 0
+    assert remote_expr.remote_coord.op == n.ScalarOp.ADD
+    assert remote_expr.remote_coord.args[1] == 1
+
+    arrive = n.MBarrierArriveExpectTx(remote_zero, bytes=64, stage=1)
+    assert arrive.mbar_id == mbar.id
+    assert arrive.mbar.remote_coord == 0
+
+    src = n.Tensor(space=n.MemorySpace.GMEM, dtype=n.DType.F16, shape=[16, 16])
+    dst = n.Tensor(space=n.MemorySpace.SMEM, dtype=n.DType.F16, shape=[16, 16], byte_offset=0)
+    load = n.TmaLoad(
+        dst=dst[:, :], src=src, mbar=remote_zero, coords=(0, 0), shape=(16, 16), mbar_stage=1
+    )
+    assert load.mbar_id == mbar.id
+    assert load.mbar.remote_coord == 0
+
+
+def test_kernel_and_builder_reject_removed_smem_pool_argument():
+    with pytest.raises(TypeError, match="smem_pool"):
+        n.Kernel(
+            name="old_kernel_api",
+            body=(),
+            num_warps=4,
+            launch_shape=[1],
+            cluster_shape=[1],
+            smem_pool=True,
+        )
+    with pytest.raises(TypeError, match="smem_pool"):
+        n.IRBuilder("old_builder_api", smem_pool=True)
+
+
 def test_valid_kernel_builds_and_validates():
     s = n.Var(binding=n.VarBinding.SCALAR, dtype=n.ScalarDType.I32)
     body = (n.ScalarDef(var=s, initial=0), n.ScalarStore(var=s, value=5), n.CtaSync())

@@ -7,7 +7,12 @@ import pytest
 nr = pytest.importorskip("nymph_rs")
 
 
-DEFAULT_KWARGS = {"num_warps": 4, "smem_size_bytes": 0, "launch_shape": (1,), "cluster_shape": (1,)}
+DEFAULT_KWARGS = {
+    "num_warps": 4,
+    "smem_size_bytes": 1024,
+    "launch_shape": (1,),
+    "cluster_shape": (1,),
+}
 
 
 def builder(name: str, **kwargs):

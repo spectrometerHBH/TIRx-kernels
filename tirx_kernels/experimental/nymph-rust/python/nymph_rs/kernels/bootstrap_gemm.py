@@ -20,10 +20,15 @@ def build_bootstrap_gemm(M=256, N=128, K=64, dtype=DType.F16):
     eb = 2
     a_tb = BLK_M * K * eb
     b_tb = BLK_N * K * eb
+    data_end = a_tb + b_tb
+    smem_full_off = (data_end + 7) // 8 * 8
+    mma_done_off = smem_full_off + 8
+    tmem_addr_off = mma_done_off + 8
+    smem_size_bytes = tmem_addr_off + 4
     k = IRBuilder(
         "nymph_bootstrap_gemm",
         num_warps=8,
-        smem_size_bytes=a_tb + b_tb,
+        smem_size_bytes=smem_size_bytes,
         launch_shape=(CTA_GROUP,),
         cluster_shape=(CTA_GROUP,),
     )
@@ -39,14 +44,14 @@ def build_bootstrap_gemm(M=256, N=128, K=64, dtype=DType.F16):
     accum = TmemBand(col0=0, dtype=DType.F32)
     accum_frag = k.tensor(space=MemorySpace.REG, dtype=DType.F32, shape=(8,))
     out_frag = k.tensor(space=MemorySpace.REG, dtype=dtype, shape=(8,))
-    smem_full = k.mbar(kind=MBarKind.TMA, stages=1, leader_routed=True)
-    mma_done = k.mbar(kind=MBarKind.TCGEN05, stages=1)
-    peer_full = k.mbar_ref(smem_full, remote_coord=1)
+    smem_full = k.mbar(kind=MBarKind.TMA, byte_offset=smem_full_off, stages=1)
+    mma_done = k.mbar(kind=MBarKind.TCGEN05, byte_offset=mma_done_off, stages=1)
+    smem_full_cta0 = k.mbar_ref(smem_full, remote_coord=0)
     cr = k.ctaid_in_cluster()
     with k.if_warp(0):
         # tmem_alloc is warp-collective (full warp 0); mbarrier.init is
         # per-thread, so one elected thread runs the inits.
-        k.tmem_alloc(0, N, CTA_GROUP)
+        k.tmem_alloc(0, N, addr_byte_offset=tmem_addr_off, cta_group=CTA_GROUP)
         with k.if_elected():
             k.mbarrier_init(smem_full, count=1)
             k.mbarrier_init(mma_done, count=1)
@@ -62,17 +67,29 @@ def build_bootstrap_gemm(M=256, N=128, K=64, dtype=DType.F16):
         # Single-thread issue: one elected lane drives the whole TMA burst
         # (the arrive + both loads), exactly canon's elected loader.
         with k.if_elected():
-            k.mbarrier_arrive_expect_tx(smem_full, bytes=a_tb + b_tb)
             k.tma_load(
-                a_s, a_g, mbar=smem_full, coords=(a_m, 0), shape=(BLK_M, K), cta_group=CTA_GROUP
+                a_s,
+                a_g,
+                mbar=smem_full_cta0,
+                coords=(a_m, 0),
+                shape=(BLK_M, K),
+                cta_group=CTA_GROUP,
             )
             k.tma_load(
-                b_s, b_g, mbar=smem_full, coords=(b_n, 0), shape=(BLK_N, K), cta_group=CTA_GROUP
+                b_s,
+                b_g,
+                mbar=smem_full_cta0,
+                coords=(b_n, 0),
+                shape=(BLK_N, K),
+                cta_group=CTA_GROUP,
             )
+            # Canonical fp16 ordering: issue the copies first, then CTA 0 arms
+            # their complete cluster transaction count on the same remote ref.
+            with k.if_(cr.eq(0)):
+                k.mbarrier_arrive_expect_tx(smem_full_cta0, bytes=CTA_GROUP * (a_tb + b_tb))
     with k.if_warp(5):  # MMA (leader)
         with k.if_(cr.eq(0)):
             k.mbarrier_wait(smem_full, phase=0)
-            k.mbarrier_wait(peer_full, phase=0)
             # tcgen05.mma/commit are strictly single-thread issue: one elected
             # lane runs the MMA burst (canon's `if elect_sync(): gemm; commit`).
             with k.if_elected():

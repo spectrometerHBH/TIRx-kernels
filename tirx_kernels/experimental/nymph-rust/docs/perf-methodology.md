@@ -186,11 +186,10 @@ Runtime confirmation (ncu, single launch each): executed R2UR 13,504 -> 768
   `T.serial(N, unroll=False)` -> `#pragma unroll 1`), `Tcgen05Mma.accum:
   ScalarValue` (runtime accum predicate, canon's accum cell), `ScalarLet`
   (the `T.let` SSA binding), CLC try/query-cancel, split cluster barrier,
-  `smem_pool`, `cache_hint`/`prefetch_tensormap`, `reg_frag`.
-- codegen: top-level warp/warpgroup-equality `If`s re-nest into the if/else
-  dispatch chain at emission (`chain_top_level_ifs` — the interpreter always
-  sees the flat list; grouping by warpgroup, disjoint-guard equivalence);
-  `commit_group` emits unguarded (canon's actual
+  explicit dynamic-SMEM offsets, `cache_hint`/`prefetch_tensormap`, `reg_frag`.
+- codegen: control-flow structure is emitted 1:1 from IR; codegen does not
+  synthesize warpgroup parents, merge equal predicates, or re-nest sibling
+  role branches. `commit_group` emits unguarded (canon's actual
   shape — the 2026-05 guarded form was a deliberate UTMACMDFLUSH trade, now
   reverted for size); mbarrier-init at function scope guards with
   `T.cuda.thread_rank() == 0` and coalesces into one block; `if_elected`

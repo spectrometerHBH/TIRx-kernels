@@ -362,6 +362,9 @@ pub enum Stmt {
         base_col: u32,
         n_cols: u32,
         cta_group: u8,
+        /// Absolute byte offset of the 4-byte SMEM cell written by
+        /// `tcgen05.alloc`.
+        addr_byte_offset: usize,
     },
     /// `tcgen05.dealloc` — release the column band `[base_col, base_col +
     /// n_cols)` (must match a live allocation).

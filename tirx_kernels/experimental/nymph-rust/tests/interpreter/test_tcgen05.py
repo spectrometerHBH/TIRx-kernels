@@ -131,7 +131,7 @@ def _tcgen05_role_failure_kernel(op, *, row=0, col=0, elected=False):
     row_v = b.scalar(initial=row, dtype=nr.ScalarDType.I32)
     col_v = b.scalar(initial=col, dtype=nr.ScalarDType.I32)
     with b.if_warp(0):
-        b.tmem_alloc(0, 64)
+        b.tmem_alloc(0, 64, addr_byte_offset=0)
 
     def emit():
         if op == "ld":
@@ -178,7 +178,7 @@ def _tcgen05_datapath_kernel(shape, num, mode):
     chunk_reg = reg_tensor(b, shape=(128,))
 
     with b.if_warp(0):
-        b.tmem_alloc(0, 256)
+        b.tmem_alloc(0, 256, addr_byte_offset=0)
 
     with b.if_warpgroup(0):
         for col in [0, 128]:
@@ -258,12 +258,12 @@ def _mma64_kernel(dtype, lane_align, accum, trans_a, trans_b):
     b_s = smem_tensor(b, dtype=dtype, shape=b_shape, byte_offset=a_bytes)
     dst = tmem_band(dtype=nr.DType.F32)
     frag = reg_tensor(b, dtype=nr.DType.F32, shape=(n,))
-    ma = b.mbar(kind=nr.MBarKind.TMA)
-    mb = b.mbar(kind=nr.MBarKind.TMA)
-    mc = b.mbar(kind=nr.MBarKind.TCGEN05)
+    ma = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
+    mb = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
+    mc = b.mbar(kind=nr.MBarKind.TCGEN05, byte_offset=0)
 
     with b.if_warp(0):
-        b.tmem_alloc(0, 32)
+        b.tmem_alloc(0, 32, addr_byte_offset=0)
         # mbarrier.init is per-thread: exactly one thread initializes each cell.
         with b.if_elected():
             b.mbarrier_init(ma, count=1)
@@ -381,7 +381,7 @@ def _build_mma_failure(*, a_shape=(128, 16), dst_row=0, dst_col=0, lane_align=0,
     dst = nr.TmemOperand(row_v, col_v, nr.DType.F32)
     if allocate:
         with b.if_warp(0):
-            b.tmem_alloc(0, 32)
+            b.tmem_alloc(0, 32, addr_byte_offset=0)
     # tcgen05_mma is a single-thread instruction now; issue it from an elected
     # thread so each pinned validation code is reached (not tcgen05_mma_mask).
     with b.if_warp(0), b.if_elected():
@@ -424,11 +424,11 @@ def _tmem_operand_mma_kernel():
     b_s = smem_tensor(b, dtype=nr.DType.F16, shape=(n, k), byte_offset=0)
     p_frag = reg_tensor(b, dtype=nr.DType.F16, shape=(k,))
     out_frag = reg_tensor(b, dtype=nr.DType.F32, shape=(n,))
-    mb = b.mbar(kind=nr.MBarKind.TMA)
-    mc = b.mbar(kind=nr.MBarKind.TCGEN05)
+    mb = b.mbar(kind=nr.MBarKind.TMA, byte_offset=0)
+    mc = b.mbar(kind=nr.MBarKind.TCGEN05, byte_offset=0)
 
     with b.if_warp(0):
-        b.tmem_alloc(0, 64)
+        b.tmem_alloc(0, 64, addr_byte_offset=0)
         # mbarrier.init is per-thread: one thread initializes each cell.
         with b.if_elected():
             b.mbarrier_init(mb, count=1)
@@ -501,7 +501,7 @@ def _f16_tmem_store_kernel():
     frag = reg_tensor(b, dtype=nr.DType.F16, shape=(2,))
     loaded = reg_tensor(b, dtype=nr.DType.F16, shape=(2,))
     with b.if_warp(0):
-        b.tmem_alloc(0, 32)
+        b.tmem_alloc(0, 32, addr_byte_offset=0)
     with b.if_warp(0):
         b.reg_fill(frag[0], 1.0)
         b.reg_fill(frag[1], 2.0)
@@ -571,11 +571,11 @@ def _mma_cg2_peer_smem_kernel(synced):
     a_smem = smem_tensor(b, dtype=nr.DType.F16, shape=(128, mma_k), byte_offset=0)
     b_smem = smem_tensor(b, dtype=nr.DType.F16, shape=(n // 2, mma_k), byte_offset=a_bytes)
     accum = tmem_band(dtype=nr.DType.F32)
-    ready = b.mbar(kind=nr.MBarKind.THREAD)
-    mma_done = b.mbar(kind=nr.MBarKind.TCGEN05)
+    ready = b.mbar(kind=nr.MBarKind.THREAD, byte_offset=0)
+    mma_done = b.mbar(kind=nr.MBarKind.TCGEN05, byte_offset=0)
     ready_leader = b.mbar_ref(ready, remote_coord=0)  # absolute coord: the leader's cell
     with b.if_warp(0):
-        b.tmem_alloc(0, 32, cta_group=2)
+        b.tmem_alloc(0, 32, addr_byte_offset=0, cta_group=2)
         # mbarrier.init is per-thread: one thread initializes the cell.
         with b.if_elected():
             b.mbarrier_init(ready, count=1)
@@ -644,9 +644,9 @@ def _mma_operand_overwrite_kernel(drain):
     a = smem_tensor(b, dtype=nr.DType.F16, shape=(128, 16), byte_offset=0)
     bb = smem_tensor(b, dtype=nr.DType.F16, shape=(16, 16), byte_offset=128 * 16 * 2)
     acc = tmem_band(dtype=nr.DType.F32)
-    done = b.mbar(kind=nr.MBarKind.TCGEN05)
+    done = b.mbar(kind=nr.MBarKind.TCGEN05, byte_offset=0)
     with b.if_warp(0):
-        b.tmem_alloc(0, 32, cta_group=1)
+        b.tmem_alloc(0, 32, addr_byte_offset=0, cta_group=1)
         # mbarrier.init is per-thread: one thread initializes the cell.
         with b.if_elected():
             b.mbarrier_init(done, count=1)
@@ -694,9 +694,9 @@ def _mma_acc_read_release_kernel(commit_release):
     bb = smem_tensor(b, dtype=nr.DType.F16, shape=(16, 16), byte_offset=128 * 16 * 2)
     acc = tmem_band(dtype=nr.DType.F32)
     frag = reg_tensor(b, dtype=nr.DType.F32, shape=(16,))
-    done = b.mbar(kind=nr.MBarKind.TCGEN05 if commit_release else nr.MBarKind.THREAD)
+    done = b.mbar(kind=nr.MBarKind.TCGEN05 if commit_release else nr.MBarKind.THREAD, byte_offset=0)
     with b.if_warp(0):
-        b.tmem_alloc(0, 32, cta_group=1)
+        b.tmem_alloc(0, 32, addr_byte_offset=0, cta_group=1)
         # mbarrier.init is per-thread: one thread initializes the cell.
         with b.if_elected():
             b.mbarrier_init(done, count=1)
