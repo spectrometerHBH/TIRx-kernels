@@ -304,12 +304,42 @@ def _mqa_fp8_wrelu_reduce_src(num_heads: int) -> str:
     )
 
 
+def _mqa_fp8_tmem_load_src(num_heads: int) -> str:
+    """Load one FP8 MQA accumulator row from an already-flat TMEM column address."""
+    if num_heads not in (32, 64):
+        raise ValueError(f"Unsupported FP8 MQA TMEM load width: {num_heads}")
+
+    def emit_x32(dst_base: int, addr_expr: str) -> str:
+        registers = ", ".join(f"%{i}" for i in range(32))
+        outputs = ", ".join(
+            f'"=r"(reinterpret_cast<uint32_t*>(dst)[{dst_base + i}])' for i in range(32)
+        )
+        return (
+            "    asm volatile(\n"
+            f'        "tcgen05.ld.sync.aligned.32x32b.x32.b32 {{{registers}}}, [%32];\\n"\n'
+            f"        : {outputs}\n"
+            f'        : "r"({addr_expr})\n'
+            "    );\n"
+            '    asm volatile("tcgen05.wait::ld.sync.aligned;" ::);\n'
+        )
+
+    body = emit_x32(0, "tmem_addr")
+    if num_heads == 64:
+        body += emit_x32(32, "tmem_addr + 32")
+    return (
+        f"__forceinline__ __device__ void tvm_builtin_mqa_fp8_tmem_load_{num_heads}("
+        "float* dst, uint32_t tmem_addr) {\n"
+        f"{body}"
+        "}"
+    )
+
+
 def get_kernel(**kwargs: Any):
     from tvm.backend.cuda.operator.tile_primitive.tma_utils import SwizzleMode, mma_shared_layout
     from tvm.script import tirx as T
     from tvm.script.tirx import tile as Tx
     from tvm.tirx.lang.pipeline import Pipeline
-    from tvm.tirx.layout import S, TCol, TileLayout, TLane, wg_local_layout
+    from tvm.tirx.layout import S, TCol, TileLayout, TLane
 
     config = _make_config(**kwargs)
     num_heads = config.num_heads
@@ -665,9 +695,6 @@ def get_kernel(**kwargs: Any):
             math_thread_idx: T.uint32 = warp_idx_u32 * T.uint32(32) + lane_idx_u32
             accum = T.alloc_local((num_heads,), "float32")
             cached_weights = T.alloc_local((block_q, num_heads), "float32")
-            # Per-q-row logits base offset (= q_row * logits_stride): invariant across
-            # the kv loop, so compute once per q block.
-            q_row_offsets = T.alloc_local((block_q,), "uint64")
             q_stage_idx: T.uint32 = T.uint32(0)
             q_phase: T.uint32 = T.uint32(0)
             kv_stage_idx: T.uint32 = T.uint32(0)
@@ -682,10 +709,6 @@ def get_kernel(**kwargs: Any):
                 q_pipe.full.wait(q_stage_idx, q_phase)
                 if num_kv_blocks > T.uint32(0):
                     Tx.warpgroup.copy(cached_weights, smem_weights[q_stage_idx])
-                    for q_off_i in T.unroll(0, block_q):
-                        q_row_offsets[q_off_i] = T.cast(
-                            q_idx * T.uint32(block_q) + T.uint32(q_off_i), "uint64"
-                        ) * T.cast(logits_stride, "uint64")
                     kv_offset: T.uint32 = kv_start + math_thread_idx
                     kv_idx: T.uint32 = T.uint32(0)
                     while kv_idx < num_kv_blocks:
@@ -703,20 +726,16 @@ def get_kernel(**kwargs: Any):
                         tmem_stage_base: T.uint32 = tmem_stage_idx * T.uint32(umma_n)
                         for q_inner_i in T.unroll(0, block_q):
                             tmem_addr: T.uint32 = tmem_stage_base + T.uint32(q_inner_i * num_heads)
-                            # TMEM->register read as 2x tcgen05.ld.32x32b.x32 with a
-                            # fence between (DeepGEMM tmem_load_no_fence shape for 64 heads).
-                            accum_2d = accum.view(128, num_heads, layout=wg_local_layout(num_heads))
-                            tmem_addr_hi: T.uint32 = tmem_addr + T.uint32(num_heads // 2)
-                            Tx.warpgroup.copy_async(
-                                accum_2d[:, 0 : num_heads // 2],
-                                tmem[:, tmem_addr : tmem_addr + num_heads // 2],
+                            # This is already a flat TMEM column. Avoid the generic
+                            # (base,row,col) encoder and issue DeepGEMM's two x32 loads.
+                            T.evaluate(
+                                cuda_func_call(
+                                    f"tvm_builtin_mqa_fp8_tmem_load_{num_heads}",
+                                    T.address_of(accum[0]),
+                                    tmem_addr,
+                                    source_code=_mqa_fp8_tmem_load_src(num_heads),
+                                )
                             )
-                            T.ptx.tcgen05.wait.ld()
-                            Tx.warpgroup.copy_async(
-                                accum_2d[:, num_heads // 2 : num_heads],
-                                tmem[:, tmem_addr_hi : tmem_addr_hi + num_heads // 2],
-                            )
-                            T.ptx.tcgen05.wait.ld()
                             # Weighted-ReLU reduce via inline CUDA (see _mqa_fp8_wrelu_reduce_src).
                             reduced: T.float32 = cuda_func_call(
                                 f"tvm_builtin_mqa_fp8_wrelu_reduce_{num_heads}",
@@ -726,7 +745,11 @@ def get_kernel(**kwargs: Any):
                                 return_type="float32",
                             )
                             result = T.cast(scale_kv * reduced, logits_tir_dtype)
-                            q_offset: T.uint64 = q_row_offsets[q_inner_i]
+                            # Rebuild at the predicated store instead of keeping two u64
+                            # row offsets live across the loop; the latter spills on SM100.
+                            q_offset: T.uint64 = T.cast(
+                                q_idx * T.uint32(block_q) + T.uint32(q_inner_i), "uint64"
+                            ) * T.cast(logits_stride, "uint64")
                             if config.compressed_logits:
                                 # Unconditional store with the column clamped into the
                                 # row's stride padding (a range guard becomes a BSSY/BRA region).
