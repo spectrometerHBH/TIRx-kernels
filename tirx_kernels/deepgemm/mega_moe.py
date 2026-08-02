@@ -1644,13 +1644,13 @@ def get_kernel(
         )
 
     def load_acq_gpu_u64(address):
-        return T.ptx.ld_acquire(address, "uint64", "u64", scope="gpu", space="global")
+        return T.ptxd.ld.acquire.gpu.global_.u64(address)
 
     def load_volatile_u64(address):
         return T.ptx.ld_volatile(address, "uint64", "u64", space="global")
 
     def load_acq_sys_s32(address):
-        return T.ptx.ld_acquire(address, "int32", "s32", scope="sys", space="global")
+        return T.ptxd.ld.acquire.sys.global_.s32(address)
 
     def atomic_add_rel_u32(address, value):
         return T.ptx.atom_scalar(
@@ -1658,7 +1658,7 @@ def get_kernel(
         )
 
     def load_acq_u32(address):
-        return T.ptx.ld_acquire(address, "uint32", "b32", scope="gpu", space="global")
+        return T.ptxd.ld.acquire.gpu.global_.b32(address)
 
     def grid_sync_done_u32(new_value, old_value):
         return T.cast(
