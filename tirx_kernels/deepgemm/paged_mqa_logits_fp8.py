@@ -849,10 +849,10 @@ def get_kernel(**kwargs: Any):
         lane_idx_u32: T.let = lane_id_u32()
 
         if warp_idx == spec_warp_start:
-            T.evaluate(T.ptx.prefetch_tensormap(T.address_of(tensor_map_q)))
-            T.evaluate(T.ptx.prefetch_tensormap(T.address_of(tensor_map_kv)))
-            T.evaluate(T.ptx.prefetch_tensormap(T.address_of(tensor_map_kv_scales)))
-            T.evaluate(T.ptx.prefetch_tensormap(T.address_of(tensor_map_weights)))
+            T.evaluate(T.ptxd.prefetch.tensormap(T.address_of(tensor_map_q)))
+            T.evaluate(T.ptxd.prefetch.tensormap(T.address_of(tensor_map_kv)))
+            T.evaluate(T.ptxd.prefetch.tensormap(T.address_of(tensor_map_kv_scales)))
+            T.evaluate(T.ptxd.prefetch.tensormap(T.address_of(tensor_map_weights)))
 
         T.static_assert(smem_q_size_per_stage % smem_alignment == 0, "Unaligned TMA swizzling")
         T.static_assert(smem_kv_size_per_stage % smem_alignment == 0, "Unaligned TMA swizzling")

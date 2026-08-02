@@ -1740,7 +1740,7 @@ def get_kernel(
         return T.ptx.bar.sync(barrier_idx, num_threads)
 
     def prefetch_tensormap(tensor_map):
-        return T.ptx.prefetch_tensormap(T.address_of(tensor_map))
+        return T.ptxd.prefetch.tensormap(T.address_of(tensor_map))
 
     def lds128(src_ptr, dst_ptr):
         return T.ptx.ld(src_ptr, "uint32", "u32", dst=dst_ptr, space="shared", vec="v4")

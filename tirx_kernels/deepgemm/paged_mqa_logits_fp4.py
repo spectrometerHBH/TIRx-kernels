@@ -854,11 +854,11 @@ def get_kernel(**kwargs: Any):
         lane_idx_u32: T.uint32 = T.cast(lane_idx, "uint32")
 
         if warp_idx_presync == spec_warp_start:
-            T.evaluate(T.ptx.prefetch_tensormap(T.address_of(tensor_map_q)))
-            T.evaluate(T.ptx.prefetch_tensormap(T.address_of(tensor_map_sf_q)))
-            T.evaluate(T.ptx.prefetch_tensormap(T.address_of(tensor_map_weights)))
-            T.evaluate(T.ptx.prefetch_tensormap(T.address_of(tensor_map_kv)))
-            T.evaluate(T.ptx.prefetch_tensormap(T.address_of(tensor_map_sf_kv)))
+            T.evaluate(T.ptxd.prefetch.tensormap(T.address_of(tensor_map_q)))
+            T.evaluate(T.ptxd.prefetch.tensormap(T.address_of(tensor_map_sf_q)))
+            T.evaluate(T.ptxd.prefetch.tensormap(T.address_of(tensor_map_weights)))
+            T.evaluate(T.ptxd.prefetch.tensormap(T.address_of(tensor_map_kv)))
+            T.evaluate(T.ptxd.prefetch.tensormap(T.address_of(tensor_map_sf_kv)))
 
         T.static_assert(
             num_specialized_threads == 128 and num_math_threads % 128 == 0, "Invalid threads"
