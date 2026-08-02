@@ -1859,7 +1859,7 @@ def get_kernel(
         return T.ptx.st(ptr, value, space="shared", ptx_type="u32")
 
     def st_shared_bulk(ptr, num_bytes):
-        return T.ptx.st_bulk(ptr, num_bytes, weak=True, space="shared::cta")
+        return T.ptxd.st_bulk.weak.shared__cta(ptr, T.cast(num_bytes, "uint64"))
 
     def peer_atomic_add_u64(peer_base, byte_offset, value):
         return T.ptxd.atom.sys.global_.add.u64(peer_ptr(peer_base, byte_offset), value)
