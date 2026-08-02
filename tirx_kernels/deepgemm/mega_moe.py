@@ -1948,7 +1948,7 @@ def get_kernel(
     def swiglu_sigmoid_gate(gate_value):
         denom = T.float32(1.0) + T.exp(-gate_value)
         if kernel_fast_math:
-            return gate_value * T.ptx.rcp(denom)
+            return gate_value * T.ptxd.rcp.approx.ftz.f32(denom)
         return gate_value / denom
 
     @T.inline
@@ -1973,7 +1973,8 @@ def get_kernel(
             gate = T.cuda.fmul2_rn(
                 gate,
                 T.cuda.make_float2(
-                    T.ptx.rcp(T.cuda.float2_x(denom)), T.ptx.rcp(T.cuda.float2_y(denom))
+                    T.ptxd.rcp.approx.ftz.f32(T.cuda.float2_x(denom)),
+                    T.ptxd.rcp.approx.ftz.f32(T.cuda.float2_y(denom)),
                 ),
             )
         else:
