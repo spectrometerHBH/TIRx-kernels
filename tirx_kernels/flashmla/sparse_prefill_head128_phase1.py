@@ -469,7 +469,7 @@ def _kernel(
                 new_max = mi
             else:
                 new_max = T.max(cur_pi_max, mi)
-                scale_for_old = T.ptxd.ex2.approx.ftz.f32(mi - new_max)
+                T.ptxd.ex2.approx.ftz.f32(scale_for_old, mi - new_max)
             mi = new_max
             li = li * scale_for_old
 
@@ -490,8 +490,10 @@ def _kernel(
                     T.cuda.uint_as_float(p[s_i * 2]), T.cuda.uint_as_float(p[s_i * 2 + 1])
                 )
                 fma_pair: T.let = T.ptx.fma_f32x2(p_pair, scale_pair, neg_new_max_pair, dps=False)
-                s_x: T.let = T.ptxd.ex2.approx.ftz.f32(T.cuda.float2_x(fma_pair))
-                s_y: T.let = T.ptxd.ex2.approx.ftz.f32(T.cuda.float2_y(fma_pair))
+                s_x: T.float32
+                s_y: T.float32
+                T.ptxd.ex2.approx.ftz.f32(s_x, T.cuda.float2_x(fma_pair))
+                T.ptxd.ex2.approx.ftz.f32(s_y, T.cuda.float2_y(fma_pair))
                 li = li + s_x + s_y
                 s_pack[s_i] = T.cuda.float22bfloat162_rn(s_x, s_y)
 
@@ -557,9 +559,9 @@ def _kernel(
             if have_attn_sink
             else T.float32(-float("inf"))
         )
-        output_scale: T.float32 = T.cuda.fdividef(
-            T.float32(1.0), li + T.ptxd.ex2.approx.ftz.f32(attn_sink_log2 - mi)
-        )
+        sink_exp: T.float32
+        T.ptxd.ex2.approx.ftz.f32(sink_exp, attn_sink_log2 - mi)
+        output_scale: T.float32 = T.cuda.fdividef(T.float32(1.0), li + sink_exp)
         o_epi_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, B_EPI), "float32")
         o_epi = o_epi_frag.local()
         have_valid_indices: T.let = T.ptx.any_sync(T.uint32(0xFFFFFFFF), li != 0.0) != 0

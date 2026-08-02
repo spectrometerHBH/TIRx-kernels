@@ -857,7 +857,7 @@ def _kernel(
                         new_max = mi
                     else:
                         new_max = T.max(cur_pi_max, mi)
-                        scale_for_old = T.ptxd.ex2.approx.ftz.f32(mi - new_max)
+                        T.ptxd.ex2.approx.ftz.f32(scale_for_old, mi - new_max)
                     mi = new_max
 
                     s_frag = T.alloc_buffer(
@@ -871,8 +871,10 @@ def _kernel(
                         soft_pair: T.let = T.ptx.fma_f32x2(
                             p_pair, scale_pair, neg_max_pair, dps=False
                         )
-                        sx: T.let = T.ptxd.ex2.approx.ftz.f32(T.cuda.float2_x(soft_pair))
-                        sy: T.let = T.ptxd.ex2.approx.ftz.f32(T.cuda.float2_y(soft_pair))
+                        sx: T.float32
+                        sy: T.float32
+                        T.ptxd.ex2.approx.ftz.f32(sx, T.cuda.float2_x(soft_pair))
+                        T.ptxd.ex2.approx.ftz.f32(sy, T.cuda.float2_y(soft_pair))
                         cur_sum_pair = T.ptx.add_f32x2(
                             cur_sum_pair, T.cuda.make_float2(sx, sy), rounding="", dps=False
                         )
@@ -952,10 +954,10 @@ def _kernel(
                 # applied here for no-split and is deferred to combine for
                 # split output exactly as in the CUDA source.
                 if is_no_split:
+                    sink_exp: T.float32
+                    T.ptxd.ex2.approx.ftz.f32(sink_exp, attn_sink_log2 - mi)
                     output_scale: T.let = T.if_then_else(
-                        li == 0.0,
-                        0.0,
-                        T.cuda.fdividef(1.0, li + T.ptxd.ex2.approx.ftz.f32(attn_sink_log2 - mi)),
+                        li == 0.0, 0.0, T.cuda.fdividef(1.0, li + sink_exp)
                     )
                     output_scale_pair: T.let = T.cuda.make_float2(output_scale, output_scale)
                     o_epi_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, 64), "float32")
@@ -1970,8 +1972,10 @@ def _sparse_decode_head64_combine_kernel(
         )
     max_lse = T.if_then_else(max_lse == T.float32(-float("inf")), 0.0, max_lse)
     sum_lse: T.float32 = 0.0
+    lse_exp: T.float32
     for lse_i in T.unroll((max_splits + 31) // 32):
-        sum_lse = sum_lse + T.ptxd.ex2.approx.ftz.f32(local_lse[lse_i] - max_lse)
+        T.ptxd.ex2.approx.ftz.f32(lse_exp, local_lse[lse_i] - max_lse)
+        sum_lse = sum_lse + lse_exp
     for reduce_i in T.unroll(5):
         xor_offset: T.let = 16 >> reduce_i
         sum_lse = sum_lse + T.cuda.__shfl_xor_sync(T.uint32(0xFFFFFFFF), sum_lse, xor_offset, 32)
@@ -1986,16 +1990,16 @@ def _sparse_decode_head64_combine_kernel(
     if attn_sink_h is not None:
         sink: T.let = T.cuda.ldg(attn_sink.ptr_to([head_idx]), "float32")
         if global_lse != T.float32(float("inf")):
-            global_lse = global_lse + T.log2(
-                1.0 + T.ptxd.ex2.approx.ftz.f32(sink * LOG_2_E - global_lse)
-            )
+            sink_lse_exp: T.float32
+            T.ptxd.ex2.approx.ftz.f32(sink_lse_exp, sink * LOG_2_E - global_lse)
+            global_lse = global_lse + T.log2(1.0 + sink_lse_exp)
         else:
             global_lse = T.if_then_else(
                 sink == T.float32(-float("inf")), T.float32(float("inf")), sink * LOG_2_E
             )
     for lse_i in T.unroll((max_splits + 31) // 32):
         split_idx: T.let = lse_i * 32 + lane_idx
-        lse_scales[warp_idx, split_idx] = T.ptxd.ex2.approx.ftz.f32(local_lse[lse_i] - global_lse)
+        T.ptxd.ex2.approx.ftz.f32(lse_scales[warp_idx, split_idx], local_lse[lse_i] - global_lse)
     T.cuda.warp_sync()
 
     # combine.cu:123-160.  Keep the unroll-1 split traversal and the

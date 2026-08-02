@@ -871,7 +871,7 @@ def _kernel(
                     new_max = mi
                 else:
                     new_max = T.max(cur_pi_max, mi)
-                    scale_for_old = T.ptxd.ex2.approx.ftz.f32(mi - new_max)
+                    T.ptxd.ex2.approx.ftz.f32(scale_for_old, mi - new_max)
                 mi = new_max
 
                 # S frag: warpgroup-distributed (B_H//2, B_TOPK) tile. Thread idx owns row h = idx%64
@@ -894,8 +894,10 @@ def _kernel(
                     fma_pair: T.let = T.ptx.fma_f32x2(
                         p_pair, scale_pair, neg_new_max_pair, dps=False
                     )
-                    s_x: T.let = T.ptxd.ex2.approx.ftz.f32(T.cuda.float2_x(fma_pair))
-                    s_y: T.let = T.ptxd.ex2.approx.ftz.f32(T.cuda.float2_y(fma_pair))
+                    s_x: T.float32
+                    s_y: T.float32
+                    T.ptxd.ex2.approx.ftz.f32(s_x, T.cuda.float2_x(fma_pair))
+                    T.ptxd.ex2.approx.ftz.f32(s_y, T.cuda.float2_y(fma_pair))
                     s_pair: T.let = T.cuda.make_float2(s_x, s_y)
                     cur_sum_pair = T.ptx.add_f32x2(cur_sum_pair, s_pair, dps=False)
                     s_pack[s_i] = T.cuda.float22bfloat162_rn(s_x, s_y)
@@ -945,9 +947,9 @@ def _kernel(
                     if have_attn_sink
                     else T.float32(-float("inf"))
                 )
-                output_scale: T.let = T.cuda.fdividef(
-                    T.float32(1.0), li + T.ptxd.ex2.approx.ftz.f32(attn_sink_log2 - mi)
-                )
+                sink_exp: T.float32
+                T.ptxd.ex2.approx.ftz.f32(sink_exp, attn_sink_log2 - mi)
+                output_scale: T.let = T.cuda.fdividef(T.float32(1.0), li + sink_exp)
                 rowwise_li_buf[idx_in_warpgroup] = T.if_then_else(li == 0.0, 0.0, output_scale)
                 bar_li_full.arrive(0)
                 cur_lse: T.float32

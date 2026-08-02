@@ -711,7 +711,7 @@ def _kernel(
                         row_max_safe = row_max_old
                         acc_scale = T.float32(1.0)
                     else:
-                        acc_scale = T.ptxd.ex2.approx.ftz.f32(acc_scale_)
+                        T.ptxd.ex2.approx.ftz.f32(acc_scale, acc_scale_)
                 row_max[0] = row_max_new
                 row_max_scaled: T.let = row_max_safe * scale_log2
                 if warp_id == 0:
@@ -757,9 +757,9 @@ def _kernel(
                             or frag_idx < emu_start
                             or apply_mask
                         ):
-                            s_chunk_local[idx] = T.ptxd.ex2.approx.ftz.f32(s_chunk_local[idx])
-                            s_chunk_local[idx + 1] = T.ptxd.ex2.approx.ftz.f32(
-                                s_chunk_local[idx + 1]
+                            T.ptxd.ex2.approx.ftz.f32(s_chunk_local[idx], s_chunk_local[idx])
+                            T.ptxd.ex2.approx.ftz.f32(
+                                s_chunk_local[idx + 1], s_chunk_local[idx + 1]
                             )
                         else:
                             ex2_emulation_2(
@@ -868,8 +868,9 @@ def _kernel(
                 acc_O_row_is_zero_or_nan: T.let = tvm.tirx.any(
                     row_sum[0] == T.float32(0.0), row_sum[0] != row_sum[0]
                 )
-                norm_scale_sm: T.let = T.ptxd.rcp.approx.ftz.f32(
-                    T.Select(acc_O_row_is_zero_or_nan, T.float32(1.0), row_sum[0])
+                norm_scale_sm: T.float32
+                T.ptxd.rcp.approx.ftz.f32(
+                    norm_scale_sm, T.Select(acc_O_row_is_zero_or_nan, T.float32(1.0), row_sum[0])
                 )
                 o_row_f32_sm = T.wg_reg_tile(EPI_LD_SM)
                 o_row_f16_sm = T.wg_reg_tile(EPI_LD_SM, "float16")
@@ -985,8 +986,9 @@ def _kernel(
                     acc_O_mn_row_is_zero_or_nan: T.let = tvm.tirx.any(
                         row_sum == T.float32(0.0), row_sum != row_sum
                     )
-                    norm_scale: T.let = T.ptxd.rcp.approx.ftz.f32(
-                        T.Select(acc_O_mn_row_is_zero_or_nan, T.float32(1.0), row_sum)
+                    norm_scale: T.float32
+                    T.ptxd.rcp.approx.ftz.f32(
+                        norm_scale, T.Select(acc_O_mn_row_is_zero_or_nan, T.float32(1.0), row_sum)
                     )
                     o_row_f32 = T.wg_reg_tile(TMEM_EPI_LD_SIZE)
                     o_row_f16 = T.wg_reg_tile(TMEM_EPI_LD_SIZE, "float16")
