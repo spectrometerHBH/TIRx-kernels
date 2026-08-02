@@ -1629,19 +1629,13 @@ def get_kernel(
         )
 
     def red_or_rel_gpu_u64(address, value):
-        return T.ptx.red_scalar(
-            address, value, sem="release", scope="gpu", space="global", op="or", ptx_type="b64"
-        )
+        return T.ptxd.red.release.gpu.global_.or_.b64(address, value)
 
     def red_add_rel_sys_s32(address, value):
-        return T.ptx.red_scalar(
-            address, value, sem="release", scope="sys", space="global", op="add", ptx_type="s32"
-        )
+        return T.ptxd.red.release.sys.global_.add.s32(address, value)
 
     def red_add_gpu_s32(address, value):
-        return T.ptx.red_scalar(
-            address, value, scope="gpu", space="global", op="add", ptx_type="s32"
-        )
+        return T.ptxd.red.gpu.global_.add.s32(address, value)
 
     def load_acq_gpu_u64(address):
         return T.ptxd.ld.acquire.gpu.global_.u64(address)
@@ -1653,9 +1647,7 @@ def get_kernel(
         return T.ptxd.ld.acquire.sys.global_.s32(address)
 
     def atomic_add_rel_u32(address, value):
-        return T.ptx.atom_scalar(
-            address, value, sem="release", scope="gpu", space="global", op="add", ptx_type="u32"
-        )
+        return T.ptxd.atom.release.gpu.global_.add.u32(address, value)
 
     def load_acq_u32(address):
         return T.ptxd.ld.acquire.gpu.global_.b32(address)
@@ -1870,25 +1862,10 @@ def get_kernel(
         return T.ptx.st_bulk(ptr, num_bytes, weak=True, space="shared::cta")
 
     def peer_atomic_add_u64(peer_base, byte_offset, value):
-        return T.ptx.atom_scalar(
-            peer_ptr(peer_base, byte_offset),
-            value,
-            scope="sys",
-            space="global",
-            op="add",
-            ptx_type="u64",
-        )
+        return T.ptxd.atom.sys.global_.add.u64(peer_ptr(peer_base, byte_offset), value)
 
     def peer_red_add_rel_sys_s32(peer_base, byte_offset, value):
-        return T.ptx.red_scalar(
-            peer_ptr(peer_base, byte_offset),
-            value,
-            sem="release",
-            scope="sys",
-            space="global",
-            op="add",
-            ptx_type="s32",
-        )
+        return T.ptxd.red.release.sys.global_.add.s32(peer_ptr(peer_base, byte_offset), value)
 
     def peer_load_u32(peer_base, byte_offset):
         return T.ptx.ld(peer_ptr(peer_base, byte_offset), "uint32", "u32", space="global")
@@ -1921,9 +1898,7 @@ def get_kernel(
         return T.ptxd.fns.b32(mask, base, offset)
 
     def red_add_gpu_u32(address, value):
-        return T.ptx.red_scalar(
-            address, value, scope="gpu", space="global", op="add", ptx_type="u32"
-        )
+        return T.ptxd.red.gpu.global_.add.u32(address, value)
 
     def cuda_clock64():
         return T.cuda.clock64()
@@ -2089,7 +2064,7 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
         )
 
     def atomic_add_u32(address, value):
-        return T.ptx.atom_scalar(address, value, space="global", op="add", ptx_type="u32")
+        return T.ptxd.atom.global_.add.u32(address, value)
 
     def load_volatile_u32(address):
         return T.ptx.ld_volatile(address, "uint32", "u32", space="global")
@@ -3639,12 +3614,8 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
                     T.uint64(1 << 32), T.cast(smem_expert_count[dispatch_expert_idx], "uint64")
                 )
                 smem_expert_count[dispatch_expert_idx] = T.cast(
-                    T.ptx.atom_scalar(
-                        workspace_expert_send_count.ptr_to([dispatch_expert_idx]),
-                        send_value,
-                        space="global",
-                        op="add",
-                        ptx_type="u64",
+                    T.ptxd.atom.global_.add.u64(
+                        workspace_expert_send_count.ptr_to([dispatch_expert_idx]), send_value
                     ),
                     "int32",
                 )
