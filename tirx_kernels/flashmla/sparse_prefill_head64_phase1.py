@@ -548,7 +548,7 @@ def _kernel(
                 s_pack[s_i] = T.cuda.float22bfloat162_rn(s_x, s_y)
             cur_sum: T.let = T.cuda.float2_x(cur_sum_pair) + T.cuda.float2_y(cur_sum_pair)
             li_tmp: T.float32
-            T.ptx.fma_f32(T.address_of(li_tmp), li, scale_for_old, cur_sum)
+            T.ptxd.fma.rn.f32(li_tmp, li, scale_for_old, cur_sum)
             li = li_tmp
 
             if k > 0:
@@ -595,7 +595,7 @@ def _kernel(
         if idx_in_warpgroup < B_H:
             cur_lse: T.float32
             cur_lse_log: T.let = T.log(li)
-            T.ptx.fma_f32(T.address_of(cur_lse), mi, LN_2, cur_lse_log)
+            T.ptxd.fma.rn.f32(cur_lse, mi, LN_2, cur_lse_log)
             cur_lse = T.if_then_else(
                 cur_lse == T.float32(-float("inf")), T.float32(float("inf")), cur_lse
             )

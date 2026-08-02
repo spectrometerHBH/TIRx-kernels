@@ -903,7 +903,7 @@ def _kernel(
                     s_pack[s_i] = T.cuda.float22bfloat162_rn(s_x, s_y)
                 cur_sum: T.let = T.cuda.float2_x(cur_sum_pair) + T.cuda.float2_y(cur_sum_pair)
                 li_tmp: T.float32
-                T.ptx.fma_f32(T.address_of(li_tmp), li, scale_for_old, cur_sum)
+                T.ptxd.fma.rn.f32(li_tmp, li, scale_for_old, cur_sum)
                 li = li_tmp
 
                 bar_SV_done.wait(0, (wg3_rs & 1) ^ 1)
@@ -953,7 +953,7 @@ def _kernel(
                 rowwise_li_buf[idx_in_warpgroup] = T.if_then_else(li == 0.0, 0.0, output_scale)
                 bar_li_full.arrive(0)
                 cur_lse: T.float32
-                T.ptx.fma_f32(T.address_of(cur_lse), mi, LN_2, T.log(li))
+                T.ptxd.fma.rn.f32(cur_lse, mi, LN_2, T.log(li))
                 cur_lse = T.if_then_else(
                     cur_lse == T.float32(-float("inf")), T.float32(float("inf")), cur_lse
                 )

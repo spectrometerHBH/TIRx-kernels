@@ -1913,9 +1913,6 @@ def get_kernel(
     def cast_into_bf16_and_pack(v0, v1):
         return T.cuda.float22bfloat162_rn(v0, v1)
 
-    def bf16_to_f32(x):
-        return T.ptx.add_rn_f32_bf16(T.float32(0.0), x)
-
     @T.inline
     def activation_pair_store(out, atom_idx, pair_idx, gate0, gate1, up0, up1, weight0, weight1):
         bf16_gate = cast_into_bf16_and_pack(gate0, gate1)
@@ -4984,17 +4981,16 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
                             )
                             lds128(load_ptr, epilogue_bf16_packed.ptr_to([0]))
                             for elem_idx in T.unroll(0, num_elems_per_uint4):
-                                reduced[j * num_elems_per_uint4 + elem_idx, 0] = (
-                                    T.ptx.add_rn_f32_bf16(
-                                        reduced[j * num_elems_per_uint4 + elem_idx, 0],
-                                        bf16x2_lo(epilogue_bf16_packed[elem_idx]),
-                                    )
+                                # d = convert(a) + c, accumulating in place.
+                                T.ptxd.add.rn.f32.bf16(
+                                    reduced[j * num_elems_per_uint4 + elem_idx, 0],
+                                    bf16x2_lo(epilogue_bf16_packed[elem_idx]),
+                                    reduced[j * num_elems_per_uint4 + elem_idx, 0],
                                 )
-                                reduced[j * num_elems_per_uint4 + elem_idx, 1] = (
-                                    T.ptx.add_rn_f32_bf16(
-                                        reduced[j * num_elems_per_uint4 + elem_idx, 1],
-                                        bf16x2_hi(epilogue_bf16_packed[elem_idx]),
-                                    )
+                                T.ptxd.add.rn.f32.bf16(
+                                    reduced[j * num_elems_per_uint4 + elem_idx, 1],
+                                    bf16x2_hi(epilogue_bf16_packed[elem_idx]),
+                                    reduced[j * num_elems_per_uint4 + elem_idx, 1],
                                 )
                         combine_phase = combine_phase ^ load_stage_idx
                         load_stage_idx = load_stage_idx ^ T.int32(1)

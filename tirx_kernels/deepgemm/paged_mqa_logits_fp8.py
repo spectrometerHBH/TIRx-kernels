@@ -764,12 +764,12 @@ def get_kernel(**kwargs: Any):
 
     def fadd_rn_noftz(a, b):
         out = T.alloc_local((1,), "float32")
-        T.evaluate(T.ptx.add_f32(out.ptr_to([0]), a, b, rounding="rn", ftz=False))
+        T.evaluate(T.ptxd.add.rn.f32(out[0], a, b))
         return out[0]
 
     def fmul_rn_noftz(a, b):
         out = T.alloc_local((1,), "float32")
-        T.evaluate(T.ptx.mul_f32(out.ptr_to([0]), a, b, rounding="rn", ftz=False))
+        T.evaluate(T.ptxd.mul.rn.f32(out[0], a, b))
         return out[0]
 
     def cuda_grid_dependency_synchronize():

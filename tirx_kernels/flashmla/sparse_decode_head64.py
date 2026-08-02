@@ -881,7 +881,7 @@ def _kernel(
                         s_pack[s_i] = T.cuda.float22bfloat162_rn(sx, sy)
                     cur_sum: T.let = T.cuda.float2_x(cur_sum_pair) + T.cuda.float2_y(cur_sum_pair)
                     li_next: T.float32
-                    T.ptx.fma_f32(T.address_of(li_next), li, scale_for_old, cur_sum)
+                    T.ptxd.fma.rn.f32(li_next, li, scale_for_old, cur_sum)
                     li = li_next
 
                     Tx.wg.copy(s_smem_gemm[:, :], s_frag[:, :])
@@ -930,7 +930,7 @@ def _kernel(
                 if idx_in_warpgroup < B_H:
                     if is_no_split:
                         cur_lse: T.float32
-                        T.ptx.fma_f32(T.address_of(cur_lse), mi, T.float32(LN_2), T.log(li))
+                        T.ptxd.fma.rn.f32(cur_lse, mi, T.float32(LN_2), T.log(li))
                         lse[
                             batch_idx * stride_lse_b + s_q_idx * stride_lse_s_q + idx_in_warpgroup
                         ] = T.if_then_else(

@@ -538,7 +538,7 @@ def _kernel(
             global_head: T.let = cta_idx * (B_H // 2) + idx_in_warpgroup
             cur_lse: T.float32
             cur_lse_log: T.let = T.log(li)
-            T.ptx.fma_f32(T.address_of(cur_lse), mi, LN_2, cur_lse_log)
+            T.ptxd.fma.rn.f32(cur_lse, mi, LN_2, cur_lse_log)
             cur_lse = T.if_then_else(
                 cur_lse == T.float32(-float("inf")), T.float32(float("inf")), cur_lse
             )
