@@ -1918,7 +1918,7 @@ def get_kernel(
         return T.cuda.reduce_min_sync_u32(mask, value)
 
     def fns_b32(mask, base, offset):
-        return T.ptx.fns_b32(mask, base, offset)
+        return T.ptxd.fns.b32(mask, base, offset)
 
     def red_add_gpu_u32(address, value):
         return T.ptx.red_scalar(
