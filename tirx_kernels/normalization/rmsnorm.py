@@ -9,6 +9,18 @@ from tvm.script.tirx import tile as Tx
 from tvm.tirx.bench import bench
 from tvm.tirx.lang.pipeline import MBarrier, TMABar
 
+
+def _mapa_u64(ptr, rank):
+    """`mapa.u64` into a declared register, returned as an ordinary value.
+
+    PTX has no defining form, so mapa writes a register the caller declares;
+    a one-element local buffer gives both a writable lvalue and an Expr.
+    """
+    mapped = T.alloc_local([1], "uint64")
+    T.evaluate(T.ptxd.mapa.u64(mapped[0], ptr, T.uint32(rank)))
+    return mapped[0]
+
+
 eps = 1e-06
 F16_BYTES = 2
 F32_BYTES = 4
@@ -212,7 +224,7 @@ def tirx_dispatch_rmsnorm(dim: int, batch_size: int, SMEM_PER_CTA=220, MAX_THREA
                 if t_idx < CLUSTER_N:
                     remote_ptr: T.let = T.reinterpret(
                         PointerType(PrimType("float32")),
-                        T.ptx.map_shared_rank(cluster_reduce_smem.ptr_to([0]), t_idx),
+                        _mapa_u64(cluster_reduce_smem.ptr_to([0]), t_idx),
                     )
                     remote_buf = T.decl_buffer([1], "float32", scope="shared", data=remote_ptr)
                     sum_sq = remote_buf[0]
@@ -306,7 +318,7 @@ def tirx_dispatch_rmsnorm(dim: int, batch_size: int, SMEM_PER_CTA=220, MAX_THREA
                 if t_idx < CLUSTER_N:
                     remote_ptr: T.let = T.reinterpret(
                         PointerType(PrimType("float32")),
-                        T.ptx.map_shared_rank(cluster_reduce_smem.ptr_to([0]), t_idx),
+                        _mapa_u64(cluster_reduce_smem.ptr_to([0]), t_idx),
                     )
                     remote_buf = T.decl_buffer([1], "float32", scope="shared", data=remote_ptr)
                     sum_sq = remote_buf[0]
@@ -539,7 +551,7 @@ def tirx_input_DSMEM_write_TMA_wts_GMEM(
                 if t_idx < CLUSTER_N:
                     remote_ptr: T.let = T.reinterpret(
                         PointerType(PrimType("float32")),
-                        T.ptx.map_shared_rank(cluster_reduce_smem.ptr_to([cta_rank]), t_idx),
+                        _mapa_u64(cluster_reduce_smem.ptr_to([cta_rank]), t_idx),
                     )
                     remote_buf = T.decl_buffer([1], "float32", scope="shared", data=remote_ptr)
                     remote_buf[0] = sum_sq_smem[0]

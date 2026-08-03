@@ -235,13 +235,24 @@ void nvfp4_cublaslt(torch::Tensor A, torch::Tensor B, torch::Tensor A_scale,
     return _CUBLASLT_EXT
 
 
+def _mapa_u64(ptr, rank):
+    """`mapa.u64` into a declared register, returned as an ordinary value.
+
+    PTX has no defining form, so mapa writes a register the caller declares;
+    a one-element local buffer gives both a writable lvalue and an Expr.
+    """
+    mapped = T.alloc_local([1], "uint64")
+    T.evaluate(T.ptxd.mapa.u64(mapped[0], ptr, T.uint32(rank)))
+    return mapped[0]
+
+
 def _tma_g2s_args(bar, stage, cta_mask, cta_group):
     """Shared kwargs for the A/B and SF TMA g2s loads; only the mbarrier and
     cta_mask vary."""
     return {
         "dispatch": "tma_auto",
         "cta_group": cta_group,
-        "mbar": T.reinterpret("handle", T.ptx.map_shared_rank(bar.ptr_to([stage]), 0)),
+        "mbar": T.reinterpret("handle", _mapa_u64(bar.ptr_to([stage]), 0)),
         "cta_mask": cta_mask,
         "cache_hint": "evict_normal",
         "prefetch_tensormap": True,

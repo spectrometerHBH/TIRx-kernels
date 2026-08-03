@@ -134,6 +134,19 @@ class GemmRSConfig:
     completion_count: int
 
 
+def _mapa_u64_tx(ptr, rank):
+    """`mapa.u64` into a declared register, returned as an ordinary value.
+
+    PTX has no defining form, so mapa writes a register the caller declares;
+    a one-element local buffer gives both a writable lvalue and an Expr.
+    In this file `Tx` is the full tirx namespace (`from tvm.script import tirx
+    as Tx`), not the tile submodule.
+    """
+    mapped = Tx.alloc_local([1], "uint64")
+    Tx.evaluate(Tx.ptxd.mapa.u64(mapped[0], ptr, Tx.uint32(rank)))
+    return mapped[0]
+
+
 def derive_config(
     M: int = M, N: int = N, K: int = TOTAL_K, world_size: int = WORLD_SIZE, dtype: str = DTYPE
 ) -> GemmRSConfig:
@@ -686,9 +699,7 @@ def test_mma_ss_tma_2sm_persistent(
         )
     )
     packed_ptr: Tx.let[Tx.Var(name="packed_ptr", ty=PointerType(PrimType("uint64")))] = (
-        Tx.reinterpret(
-            PointerType(PrimType("uint64")), Tx.ptx.map_shared_rank(packed_buf.ptr_to([0]), 0)
-        )
+        Tx.reinterpret(PointerType(PrimType("uint64")), _mapa_u64_tx(packed_buf.ptr_to([0]), 0))
     )
     packed_value = Tx.decl_buffer([1], "uint64", data=packed_ptr, scope="shared")
     sch_pipe = Pipeline(
@@ -701,7 +712,7 @@ def test_mma_ss_tma_2sm_persistent(
     )
     tile_scheduler = MixedDynamicTileScheduler(gemm_queue, rs_queue, packed_value, sch_pipe)
     ptr: Tx.let[Tx.Var(name="ptr", ty=PointerType(PrimType("uint64")))] = Tx.reinterpret(
-        PointerType(PrimType("uint64")), Tx.ptx.map_shared_rank(smem_pipe.full.ptr_to([0]), 0)
+        PointerType(PrimType("uint64")), _mapa_u64_tx(smem_pipe.full.ptr_to([0]), 0)
     )
     tma_finished = Tx.decl_buffer([PIPELINE_DEPTH], "uint64", data=ptr, scope="shared")
     phase = 0
