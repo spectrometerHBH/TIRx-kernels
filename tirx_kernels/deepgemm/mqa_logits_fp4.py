@@ -581,7 +581,7 @@ def get_kernel(**kwargs: Any):
         cuda_grid_dependency_synchronize()
 
         if warp_idx == spec_warp_start:
-            T.ptx.setmaxnreg(False, 56)
+            T.ptxd.setmaxnreg.dec.sync.aligned.u32(56)
             if T.ptx.elect_sync():
                 # Ring cursors with subtract-wrap (DeepGEMM RingPipeline): avoids ptxas
                 # magic-number division for `% kNumStages` on these hot paths.
@@ -634,7 +634,7 @@ def get_kernel(**kwargs: Any):
                         q_phase = q_phase ^ T.uint32(1)
             T.cuda.warp_sync()
         elif warp_idx == spec_warp_start + 1:
-            T.ptx.setmaxnreg(False, 56)
+            T.ptxd.setmaxnreg.dec.sync.aligned.u32(56)
             if T.ptx.elect_sync():
                 kv_stage_idx: T.uint32 = T.uint32(0)
                 kv_phase: T.uint32 = T.uint32(0)
@@ -676,7 +676,7 @@ def get_kernel(**kwargs: Any):
                             kv_phase = kv_phase ^ T.uint32(1)
                     q_idx = q_idx + T.uint32(config.num_sms)
         elif warp_idx == spec_warp_start + 2:
-            T.ptx.setmaxnreg(False, 56)
+            T.ptxd.setmaxnreg.dec.sync.aligned.u32(56)
             T.cuda.trap_when_assert_failed(tmem_ptr_in_smem[0] == T.uint32(0))
             desc_i: T.uint32
             # GAP 1: encode the block-scaled instruction descriptor ONCE here; the
@@ -821,7 +821,7 @@ def get_kernel(**kwargs: Any):
                     q_stage_idx = q_stage_idx - T.uint32(num_q_stages)
                     q_phase = q_phase ^ T.uint32(1)
         elif warp_idx == spec_warp_start + 3:
-            T.ptx.setmaxnreg(False, 56)
+            T.ptxd.setmaxnreg.dec.sync.aligned.u32(56)
             # SF-KV transpose worker: overlaps transpose(k+1) with the
             # tcgen05 warp's UTCCP+MMA of block k.
             t_kv_stage: T.uint32 = T.uint32(0)
@@ -847,7 +847,7 @@ def get_kernel(**kwargs: Any):
                         t_kv_phase = t_kv_phase ^ T.uint32(1)
                 t_q_idx = t_q_idx + T.uint32(config.num_sms)
         elif warp_idx < spec_warp_start:
-            T.ptx.setmaxnreg(True, 224)
+            T.ptxd.setmaxnreg.inc.sync.aligned.u32(224)
             accum = T.alloc_local((num_heads,), "float32")
             cached_weights = T.alloc_local((block_q, num_heads), "float32")
             # f32-dense store offsets, hoisted and chained (+block_kv per split) to keep

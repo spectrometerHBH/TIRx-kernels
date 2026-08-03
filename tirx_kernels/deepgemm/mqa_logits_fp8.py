@@ -512,7 +512,7 @@ def get_kernel(**kwargs: Any):
         cuda_grid_dependency_synchronize()
 
         if warp_idx == spec_warp_start:
-            T.ptx.setmaxnreg(False, 56)
+            T.ptxd.setmaxnreg.dec.sync.aligned.u32(56)
             if T.ptx.elect_sync():
                 # Ring cursors with subtract-wrap (DeepGEMM RingPipeline): avoids ptxas
                 # magic-number division for `% kNumStages` on these hot paths.
@@ -553,7 +553,7 @@ def get_kernel(**kwargs: Any):
                         q_phase = q_phase ^ T.uint32(1)
             T.cuda.warp_sync()
         elif warp_idx == spec_warp_start + 1:
-            T.ptx.setmaxnreg(False, 56)
+            T.ptxd.setmaxnreg.dec.sync.aligned.u32(56)
             if T.ptx.elect_sync():
                 kv_stage_idx: T.uint32 = T.uint32(0)
                 kv_phase: T.uint32 = T.uint32(0)
@@ -595,7 +595,7 @@ def get_kernel(**kwargs: Any):
                             kv_phase = kv_phase ^ T.uint32(1)
                     q_idx = q_idx + T.uint32(config.num_sms)
         elif warp_idx == spec_warp_start + 2:
-            T.ptx.setmaxnreg(False, 56)
+            T.ptxd.setmaxnreg.dec.sync.aligned.u32(56)
             T.cuda.trap_when_assert_failed(tmem_ptr_in_smem[0] == T.uint32(0))
             # fp8 (e4m3) views over the 128B-swizzled uint8 SMEM; with descI omitted the
             # tcgen05 dispatch constant-folds the dense instruction descriptor.
@@ -659,9 +659,9 @@ def get_kernel(**kwargs: Any):
                         q_phase = q_phase ^ T.uint32(1)
             T.cuda.warp_sync()
         elif warp_idx == spec_warp_start + 3:
-            T.ptx.setmaxnreg(False, 56)
+            T.ptxd.setmaxnreg.dec.sync.aligned.u32(56)
         elif warp_idx < spec_warp_start:
-            T.ptx.setmaxnreg(True, 224)
+            T.ptxd.setmaxnreg.inc.sync.aligned.u32(224)
             math_thread_idx: T.uint32 = warp_idx_u32 * T.uint32(32) + lane_idx_u32
             accum = T.alloc_local((num_heads,), "float32")
             cached_weights = T.alloc_local((block_q, num_heads), "float32")

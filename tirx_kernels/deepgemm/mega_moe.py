@@ -1785,9 +1785,9 @@ def get_kernel(
 
     def tma_store_wait(num_prior_groups):
         if num_prior_groups == 0:
-            return T.ptx.cp_async.bulk.wait_group(0, read=False)
+            return T.ptxd.cp.async_.bulk.wait_group(0)
         if num_prior_groups == 1:
-            return T.ptx.cp_async.bulk.wait_group(1, read=False)
+            return T.ptxd.cp.async_.bulk.wait_group(1)
         raise ValueError("Unsupported TMA store wait distance")
 
     def tma_store_2d(src, tensormap, coord0, coord1):
@@ -3358,11 +3358,10 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
         @T.inline
         def umma_arrive_multicast_2x1sm(barrier_ptr):
             if T.ptx.elect_sync():
-                T.ptx.tcgen05.commit(
-                    barrier_ptr,
-                    cta_group=kernel_config.num_ctas_per_cluster,
-                    cta_mask=tcgen05_cta_mask,
-                )
+                T.ptxd[
+                    f"tcgen05.commit.cta_group::{kernel_config.num_ctas_per_cluster}"
+                    ".mbarrier::arrive::one.shared::cluster.multicast::cluster.b64"
+                ](barrier_ptr, T.uint16(tcgen05_cta_mask))
 
         @T.inline
         def umma_arrive(barrier_ptr):
@@ -3389,11 +3388,11 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
 
         @T.inline
         def warpgroup_reg_dealloc(num_registers):
-            T.ptx.setmaxnreg(False, num_registers)
+            T.ptxd.setmaxnreg.dec.sync.aligned.u32(num_registers)
 
         @T.inline
         def warpgroup_reg_alloc(num_registers):
-            T.ptx.setmaxnreg(True, num_registers)
+            T.ptxd.setmaxnreg.inc.sync.aligned.u32(num_registers)
 
         @T.inline
         def tma_copy_2d_multicast(dst_ptr, barrier_ptr, tensor_map_ptr, coord0, coord1):

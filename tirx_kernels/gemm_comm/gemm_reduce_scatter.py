@@ -793,7 +793,7 @@ def test_mma_ss_tma_2sm_persistent(
             m_idx = Tx.meta_var(tile_scheduler.fetched_task_idx0[0])
             n_idx = Tx.meta_var(tile_scheduler.fetched_task_idx1[0])
             if (NUM_CONSUMER <= wg_id) & (wg_id < NUM_CONSUMER + 1):
-                Tx.ptx.setmaxnreg(False, 56)
+                Tx.ptxd.setmaxnreg.dec.sync.aligned.u32(56)
                 if warp_id == 3:
                     if Tx.filter(lane_id, Tx.ptx.elect_sync()):
                         for ko in Tx.serial(PIPE_CYCLE):
@@ -997,7 +997,7 @@ def test_mma_ss_tma_2sm_persistent(
                             tmem_pipe.full.arrive(warp_id, cta_group=CTA_GROUP, cta_mask=3)
                         phase_tmem = phase_tmem ^ 1
             if (0 <= wg_id) & (wg_id < NUM_CONSUMER):
-                Tx.ptx.setmaxnreg(True, 224)
+                Tx.ptxd.setmaxnreg.inc.sync.aligned.u32(224)
                 Tx.cuda.trap_when_assert_failed(tmem_addr[0] == 0)
                 tmem_pipe.full.wait(wg_id, phase_tmem)
                 phase_tmem = phase_tmem ^ 1
@@ -1026,7 +1026,7 @@ def test_mma_ss_tma_2sm_persistent(
                             (m_idx * NUM_CONSUMER * CTA_GROUP + wg_id * CTA_GROUP + cbx) * BLK_M,
                         )
                         Tx.ptxd.cp.async_.bulk.commit_group()
-                        Tx.ptx.cp_async.bulk.wait_group(0)
+                        Tx.ptxd.cp.async_.bulk.wait_group(0)
                     Tx.cuda.warpgroup_sync(wg_id)
                 comm_m_idx = Tx.meta_var(m_idx * 2 + wg_id)
                 comm_m_idx_local = Tx.meta_var(comm_m_idx % (LOCAL_M // TILE_M))

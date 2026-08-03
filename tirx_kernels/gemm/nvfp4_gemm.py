@@ -551,7 +551,7 @@ def _kernel(
             # Per-chunk store: R->S (stmatrix) then S->G (TMA). Shared by both schedules.
             @T.inline
             def store_epi_chunk(reg_ldst_16b, linear_n: T.constexpr):
-                T.ptx.cp_async.bulk.wait_group(WB_PIPE_DEPTH - 1, read=True)
+                T.ptxd.cp.async_.bulk.wait_group.read(WB_PIPE_DEPTH - 1)
                 T.cuda.warpgroup_sync(1)
                 regs_to_smem(reg_ldst_16b)
                 T.cuda.warpgroup_sync(1)
@@ -612,7 +612,7 @@ def _kernel(
             epi_cur.advance()
             tile_scheduler.next_tile()
         if tid_in_wg == 0:
-            T.ptx.cp_async.bulk.wait_group(0, read=True)
+            T.ptxd.cp.async_.bulk.wait_group.read(0)
         T.cuda.warpgroup_sync(1)
     if warp_id == int(WarpRole.EPILOGUE):
         if T.ptx.elect_sync():

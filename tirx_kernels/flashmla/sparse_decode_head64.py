@@ -701,7 +701,7 @@ def _kernel(
         # kernel.cuh:134-150.  Scale/exp warpgroup and its 224-register
         # allocation.  The output and S register/shared layouts match the
         # fixed dual-GEMM TMEM datapath used by the CUDA source.
-        T.ptx.setmaxnreg(True, 224)
+        T.ptxd.setmaxnreg.inc.sync.aligned.u32(224)
         rs_buf = PipelineState(NUM_BUFS, phase=0)
         rs_index = PipelineState(NUM_INDEX_BUFS, phase=0)
         p_tmem_win = p_tmem.rearrange("b h t -> (b h) t")
@@ -771,7 +771,7 @@ def _kernel(
 
                 # kernel.cuh:151-159.  Retire prior TMA stores before the
                 # aliased Q/O shared region is reused for this batch.
-                T.ptx.cp_async.bulk.wait_group(0, read=True)
+                T.ptxd.cp.async_.bulk.wait_group.read(0)
                 bar_last_store_done.arrive(0)
                 mi: T.float32 = MAX_INIT_VAL
                 li: T.float32 = 0.0
@@ -1083,7 +1083,7 @@ def _kernel(
         # kernel.cuh:427-430.  The producer/MMA warpgroup deliberately
         # gives registers back, then recomputes the synchronized canonical
         # warp id; retaining the earlier value is known to spill registers.
-        T.ptx.setmaxnreg(False, 72)
+        T.ptxd.setmaxnreg.dec.sync.aligned.u32(72)
         wg1_warp_idx: T.let = T.tvm_warp_shuffle(
             T.uint32(0xFFFFFFFF), T.cuda.thread_rank() // 32, 0, 32, 32
         )
@@ -1662,7 +1662,7 @@ def _kernel(
     else:
         # kernel.cuh:747-759.  The dequant warpgroup keeps 208 registers
         # and assigns exactly eight threads per token group.
-        T.ptx.setmaxnreg(True, 208)
+        T.ptxd.setmaxnreg.inc.sync.aligned.u32(208)
         rs_buf = PipelineState(NUM_BUFS, phase=0)
         rs_index = PipelineState(NUM_INDEX_BUFS, phase=0)
         group_idx: T.let = idx_in_warpgroup // 8

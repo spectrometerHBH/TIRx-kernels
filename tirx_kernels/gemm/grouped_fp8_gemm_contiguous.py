@@ -501,7 +501,7 @@ def _kernel(
                 stage = store_iter % TMEM_DEPTH
                 if store_iter >= TMEM_DEPTH:
                     if warp_id == 0:
-                        T.ptx.cp_async.bulk.wait_group(TMEM_DEPTH - 1)
+                        T.ptxd.cp.async_.bulk.wait_group(TMEM_DEPTH - 1)
                     T.cuda.warpgroup_sync(10)
                 if SWAP_AB:
                     for atom_m in T.unroll(2):
@@ -556,7 +556,7 @@ def _kernel(
             epilogue()
             tile_scheduler.next_tile()
         if tid_in_wg == 0:
-            T.ptx.cp_async.bulk.wait_group(0)
+            T.ptxd.cp.async_.bulk.wait_group(0)
         T.cuda.warpgroup_sync(10)
     # The epilogue warpgroup and every CTA sharing the allocation must finish first.
     if CTA_GROUP > 1:

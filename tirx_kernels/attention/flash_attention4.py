@@ -351,7 +351,7 @@ def _kernel(
         kv_head_idx = T.meta_var(scheduler.head_idx)
         m_start = T.meta_var(m_block_idx * SEQ_Q_PER_TILE * SMEM_PIPE_DEPTH_Q)
         if wg_id == 3:
-            T.ptx.setmaxnreg(False, 48)
+            T.ptxd.setmaxnreg.dec.sync.aligned.u32(48)
             if warp_id == 1:
 
                 @T.inline
@@ -458,9 +458,13 @@ def _kernel(
                             dispatch="tma_auto",
                         )
                     T.ptxd.cp.async_.bulk.commit_group()
-                for i_q in T.unroll(SMEM_PIPE_DEPTH_Q):
-                    T.ptx.cp_async.bulk.wait_group(1 - i_q)
-                    corr_epi.empty.arrive(i_q)
+                # Drain the stores stage by stage. The wait count lives in the
+                # instruction text, so it has to be a literal rather than a loop
+                # variable -- written out per stage for SMEM_PIPE_DEPTH_Q == 2.
+                T.ptxd.cp.async_.bulk.wait_group(1)
+                corr_epi.empty.arrive(0)
+                T.ptxd.cp.async_.bulk.wait_group(0)
+                corr_epi.empty.arrive(1)
                 iket.range_end(tma_store_token)
                 phase_tmem ^= 1
             if warp_id == 0:
@@ -588,7 +592,7 @@ def _kernel(
                             q_load.empty.arrive(i_q)
                 phase_q_load ^= 1
         elif wg_id < 2:
-            T.ptx.setmaxnreg(True, 200)
+            T.ptxd.setmaxnreg.inc.sync.aligned.u32(200)
             scale_log2 = T.meta_var(math.log2(math.e) / math.sqrt(HEAD_DIM))
             rescale_threshold = T.meta_var(8.0)
             row_max: T.f32[1]
@@ -907,7 +911,7 @@ def _kernel(
                 else:
                     T.ptxd.bar.arrive(T.uint32(1 + wg_id), 256)
         if wg_id == 2:
-            T.ptx.setmaxnreg(False, 64)
+            T.ptxd.setmaxnreg.dec.sync.aligned.u32(64)
             if STATS_BAR_PAIRWISE:
                 T.ptxd.bar.sync(T.uint32(1 + 0 * 4 + warp_id), 64)
             else:

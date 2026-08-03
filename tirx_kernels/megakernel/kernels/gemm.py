@@ -43,13 +43,17 @@ class BarTMA2MMA(Barriers):
 class BarMMA2LD(Barriers):
     @T.inline
     def arrive(self, idx):
-        T.ptx.tcgen05.commit(self.mbar.ptr_to([idx]), cta_group=KernelConfig.CTA_GROUP)
+        T.ptxd[
+            f"tcgen05.commit.cta_group::{KernelConfig.CTA_GROUP}.mbarrier::arrive::one.shared::cluster.b64"
+        ](self.mbar.ptr_to([idx]))
 
 
 class BarMMA2TMA(Barriers):
     @T.inline
     def arrive(self, idx):
-        T.ptx.tcgen05.commit(self.mbar.ptr_to([idx]), cta_group=KernelConfig.CTA_GROUP)
+        T.ptxd[
+            f"tcgen05.commit.cta_group::{KernelConfig.CTA_GROUP}.mbarrier::arrive::one.shared::cluster.b64"
+        ](self.mbar.ptr_to([idx]))
 
 
 class BarLD2MMA(Barriers):
@@ -266,7 +270,7 @@ class GemmTile(Tile):
             self.stage = (self.tile_idx * self.MMA_M // self.EPI_TILE + ko) % self.TMEM_PIPE_DEPTH
             if ko >= self.TMEM_PIPE_DEPTH:
                 if (lane_id == 0) & (warp_id == 0):
-                    T.ptx.cp_async.bulk.wait_group(self.TMEM_PIPE_DEPTH - 1)
+                    T.ptxd.cp.async_.bulk.wait_group(self.TMEM_PIPE_DEPTH - 1)
                 T.cuda.warpgroup_sync(10)
             for ki in T.unroll(self.EPI_TILE // self.TMEM_LD_SIZE):
                 reg_wg = self.reg.view(
@@ -328,7 +332,7 @@ class GemmTile(Tile):
                     )
                 T.ptxd.cp.async_.bulk.commit_group()
         if tid_in_wg:
-            T.ptx.cp_async.bulk.wait_group(0)
+            T.ptxd.cp.async_.bulk.wait_group(0)
         T.cuda.warpgroup_sync(10)
         self.tile_idx += 1
         if warp_id == 0:

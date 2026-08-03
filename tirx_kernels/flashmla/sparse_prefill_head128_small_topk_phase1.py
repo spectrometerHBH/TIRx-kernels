@@ -384,13 +384,13 @@ def _kernel(
     if warpgroup_idx == 0:
         # CUDA phase1.cuh:192-396. Q fetching and O write-back warpgroup.
         q_o_token = iket.range_start("h128-small-q-load-output")
-        T.ptx.setmaxnreg(True, 160)
+        T.ptxd.setmaxnreg.inc.sync.aligned.u32(160)
 
         @T.inline
         def issue_q_copy(q_s_q_idx, q_outer_loop_phase):
             if warp_idx == 0:
                 if T.ptx.elect_sync():
-                    T.ptx.cp_async.bulk.wait_group(0)
+                    T.ptxd.cp.async_.bulk.wait_group(0)
                     # Q's head-dim halves interleave per 64-elem chunk, matching the cp fold.
                     q_tma = q.rearrange(
                         "s h (half chunk inner) -> inner h half chunk s",
@@ -503,7 +503,7 @@ def _kernel(
         if last_valid != 0:
             if warp_idx == 0:
                 if T.ptx.elect_sync():
-                    T.ptx.cp_async.bulk.wait_group(0)
+                    T.ptxd.cp.async_.bulk.wait_group(0)
             T.ptxd.bar.sync(T.uint32(BAR_WG0_SYNC), 128)
             perform_o_copy_out(last_s_q_idx, last_outer_loop_phase, True)
 
@@ -514,7 +514,7 @@ def _kernel(
     elif warpgroup_idx == 1:
         # CUDA phase1.cuh:397-451. Prefill KV gather producer.
         kv_gather_token = iket.range_start("h128-small-kv-load")
-        T.ptx.setmaxnreg(False, 80)
+        T.ptxd.setmaxnreg.dec.sync.aligned.u32(80)
         # Source uses canonical_warp_idx() here, not canonical_warp_idx_sync().
         wg1_warp_idx: T.let = thread_idx // 32 - 4
         if T.ptx.elect_sync():
@@ -594,7 +594,7 @@ def _kernel(
 
     elif warpgroup_idx == 2:
         # CUDA phase1.cuh:533-787. UMMA, valid-mask loading, and CLC producer.
-        T.ptx.setmaxnreg(False, 80)
+        T.ptxd.setmaxnreg.dec.sync.aligned.u32(80)
 
         if (warp_idx == 8) & (cta_idx == 0):
             mma_token = iket.range_start("h128-small-qk-pv-issue")
@@ -632,8 +632,8 @@ def _kernel(
                             qk_accumulate = T.uint32(1)
                             bar_QK_done.arrive(0, cta_group=2, cta_mask=3)
                             if k == umma_num_k_blocks - 1:
-                                T.ptx.tcgen05.commit(
-                                    bar_tQ_empty.ptr_to([0]), cta_group=2, cta_mask=0
+                                T.ptxd.tcgen05.commit.cta_group__2.mbarrier__arrive__one.shared__cluster.b64(
+                                    bar_tQ_empty.ptr_to([0])
                                 )
 
                         if k > 0:
@@ -776,7 +776,7 @@ def _kernel(
     else:
         # CUDA phase1.cuh:788-921. Scale/exp warpgroup.
         softmax_token = iket.range_start("h128-small-softmax")
-        T.ptx.setmaxnreg(True, 160)
+        T.ptxd.setmaxnreg.inc.sync.aligned.u32(160)
         local_warp_idx: T.let = warp_idx - 12
         wg3_job_valid: T.int32 = 1
         wg3_job_block_idx: T.int32 = block_idx

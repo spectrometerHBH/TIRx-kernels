@@ -1329,7 +1329,7 @@ def get_kernel(**kwargs: Any):
 
         if warp_idx == tma_warp_0:
             # TMA warp 0: loads Q + SFQ + weights (shared) and KV/SFKV for group 0.
-            T.ptx.setmaxnreg(False, num_specialized_registers)
+            T.ptxd.setmaxnreg.dec.sync.aligned.u32(num_specialized_registers)
             current_q_atom_idx: T.uint32 = start_q_atom_idx
             current_kv_idx: T.uint32 = start_kv_idx
             current_num_kv: T.uint32 = start_num_kv
@@ -1470,7 +1470,7 @@ def get_kernel(**kwargs: Any):
                 current_num_kv = scheduler_result[6]
         elif warp_idx == tma_warp_1:
             # TMA warp 1: loads KV/SFKV for group 1 only.
-            T.ptx.setmaxnreg(False, num_specialized_registers)
+            T.ptxd.setmaxnreg.dec.sync.aligned.u32(num_specialized_registers)
             current_q_atom_idx: T.uint32 = start_q_atom_idx
             current_kv_idx: T.uint32 = start_kv_idx
             current_num_kv: T.uint32 = start_num_kv
@@ -1597,7 +1597,7 @@ def get_kernel(**kwargs: Any):
             # One UMMA+UTCCP warp per math warpgroup: waits for its group's KV
             # stage, copies the scale factors into TMEM, then issues the 2
             # block-scaled tcgen05 MMAs (K=64 each) for its group.
-            T.ptx.setmaxnreg(False, num_specialized_registers)
+            T.ptxd.setmaxnreg.dec.sync.aligned.u32(num_specialized_registers)
             umma_group_idx: T.let = warp_idx_u32 - T.uint32(umma_warp_0)
             current_q_atom_idx: T.uint32 = start_q_atom_idx
             current_kv_idx: T.uint32 = start_kv_idx
@@ -1774,7 +1774,7 @@ def get_kernel(**kwargs: Any):
                             tmem_start_col_of_sfq + umma_group_idx * T.uint32(num_sfq_atom // 32),
                         )
                 if T.ptx.elect_sync():
-                    T.ptx.tcgen05.commit(
+                    T.ptxd.tcgen05.commit.cta_group__1.mbarrier__arrive__one.shared__cluster.b64(
                         smem_barriers.ptr_to(
                             [
                                 full_tmem_barrier_base
@@ -1785,15 +1785,14 @@ def get_kernel(**kwargs: Any):
                     )
                     # Release the KV stage once the MMAs consuming it complete
                     # (Math never reads KV SMEM; the commit tracks it).
-                    T.ptx.tcgen05.commit(
+                    T.ptxd.tcgen05.commit.cta_group__1.mbarrier__arrive__one.shared__cluster.b64(
                         smem_barriers.ptr_to(
                             [
                                 empty_kv_barrier_base
                                 + umma_group_idx * T.uint32(num_kv_stages)
                                 + kv_stage_idx
                             ]
-                        ),
-                        cta_group=1,
+                        )
                     )
 
                 next_q_atom_idx = current_q_atom_idx
@@ -1810,7 +1809,7 @@ def get_kernel(**kwargs: Any):
                 current_kv_idx = scheduler_result[5]
                 current_num_kv = scheduler_result[6]
         elif warp_idx < spec_warp_start:
-            T.ptx.setmaxnreg(True, num_math_registers)
+            T.ptxd.setmaxnreg.inc.sync.aligned.u32(num_math_registers)
             current_q_atom_idx: T.uint32 = start_q_atom_idx
             current_kv_idx: T.uint32 = start_kv_idx
             current_num_kv: T.uint32 = start_num_kv

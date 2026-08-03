@@ -411,7 +411,7 @@ def _kernel(
 
     if warpgroup_idx == 0:
         # CUDA phase1.cuh:150-386.  Scale/exp warpgroup and epilogue.
-        T.ptx.setmaxnreg(True, 144)
+        T.ptxd.setmaxnreg.inc.sync.aligned.u32(144)
         mi: T.float32 = MAX_INIT_VAL
         li: T.float32 = 0.0
         real_mi: T.float32 = T.float32(-float("inf"))
@@ -617,7 +617,7 @@ def _kernel(
     elif warpgroup_idx == 1:
         # CUDA phase1.cuh:387-446.  K producer warpgroup.
         k_gather_token = iket.range_start("h128-k-load")
-        T.ptx.setmaxnreg(False, 96)
+        T.ptxd.setmaxnreg.dec.sync.aligned.u32(96)
         wg1_warp_idx: T.let = warp_idx - 4
         if T.ptx.elect_sync():
             for k in T.serial(0, num_k_blocks, unroll=False):
@@ -691,7 +691,7 @@ def _kernel(
     elif warpgroup_idx == 2:
         # CUDA phase1.cuh:447-489.  V producer warpgroup.
         v_gather_token = iket.range_start("h128-v-load")
-        T.ptx.setmaxnreg(False, 96)
+        T.ptxd.setmaxnreg.dec.sync.aligned.u32(96)
         wg2_warp_idx: T.let = warp_idx - 8
         if T.ptx.elect_sync():
             bar_prologue_utccp.wait(0, 0)
@@ -743,7 +743,7 @@ def _kernel(
 
     else:
         # CUDA phase1.cuh:490-606.  MMA warp and KV-valid loading warp.
-        T.ptx.setmaxnreg(True, 168)
+        T.ptxd.setmaxnreg.inc.sync.aligned.u32(168)
         if (cta_idx == 0) & (warp_idx == 12):
             mma_token = iket.range_start("h128-qk-pv-issue")
             if T.ptx.elect_sync():

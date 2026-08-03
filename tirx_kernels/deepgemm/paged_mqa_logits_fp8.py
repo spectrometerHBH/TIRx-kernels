@@ -1225,7 +1225,7 @@ def get_kernel(**kwargs: Any):
 
         if warp_idx == tma_warp_0:
             # TMA warp 0: loads Q + weights (shared) and KV/scales for group 0.
-            T.ptx.setmaxnreg(False, num_specialized_registers)
+            T.ptxd.setmaxnreg.dec.sync.aligned.u32(num_specialized_registers)
             current_q_atom_idx: T.uint32 = start_q_atom_idx
             current_kv_idx: T.uint32 = start_kv_idx
             current_num_kv: T.uint32 = start_num_kv
@@ -1368,7 +1368,7 @@ def get_kernel(**kwargs: Any):
                 current_num_kv = scheduler_result[6]
         elif warp_idx == tma_warp_1:
             # TMA warp 1: loads KV/scales for group 1 only.
-            T.ptx.setmaxnreg(False, num_specialized_registers)
+            T.ptxd.setmaxnreg.dec.sync.aligned.u32(num_specialized_registers)
             current_q_atom_idx: T.uint32 = start_q_atom_idx
             current_kv_idx: T.uint32 = start_kv_idx
             current_num_kv: T.uint32 = start_num_kv
@@ -1494,7 +1494,7 @@ def get_kernel(**kwargs: Any):
         elif T.Or(warp_idx == umma_warp_0, warp_idx == umma_warp_0 + 1):
             # One UMMA warp per math warpgroup: waits for its group's KV stage,
             # then issues the 4 tcgen05 MMAs (K=32 each) for its group.
-            T.ptx.setmaxnreg(False, num_specialized_registers)
+            T.ptxd.setmaxnreg.dec.sync.aligned.u32(num_specialized_registers)
             umma_group_idx: T.let = warp_idx_u32 - T.uint32(umma_warp_0)
             # TMEM allocation happens off the full-CTA sync path (the ~300-cycle
             # tcgen05.alloc would otherwise hold back the TMA warps' first issue).
@@ -1618,7 +1618,7 @@ def get_kernel(**kwargs: Any):
                             enable_input_d=T.uint32(k),
                         )
                 if T.ptx.elect_sync():
-                    T.ptx.tcgen05.commit(
+                    T.ptxd.tcgen05.commit.cta_group__1.mbarrier__arrive__one.shared__cluster.b64(
                         smem_barriers.ptr_to(
                             [
                                 full_umma_barrier_base
@@ -1641,7 +1641,7 @@ def get_kernel(**kwargs: Any):
                 current_kv_idx = scheduler_result[5]
                 current_num_kv = scheduler_result[6]
         elif warp_idx < spec_warp_start:
-            T.ptx.setmaxnreg(True, num_math_registers)
+            T.ptxd.setmaxnreg.inc.sync.aligned.u32(num_math_registers)
             # Math warps consume TMEM: wait on named barrier 9 for the UMMA
             # warp's tcgen05.alloc (see the UMMA branch).
             T.ptxd.bar.sync(9, T.uint32(num_math_threads + 2 * 32))

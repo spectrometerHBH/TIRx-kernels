@@ -175,7 +175,7 @@ def _kernel(
 
     if wg_id == NUM_CONSUMER:
         # ==================== PRODUCER warpgroup ====================
-        T.ptx.setmaxnreg(False, 56)  # reduce the producer's per-warp register budget
+        T.ptxd.setmaxnreg.dec.sync.aligned.u32(56)  # reduce the producer's per-warp register budget
         if warp_id == 3:
             # -------- LOADER (TMA) --------
             ld = clc_sched.worker("ld_sched")
@@ -285,7 +285,9 @@ def _kernel(
     elif wg_id < NUM_CONSUMER:
         # ==================== CONSUMER / EPILOGUE warpgroup(s) ====================
         if not OVERLAP_EPILOGUE:
-            T.ptx.setmaxnreg(True, 224)  # raise the consumer's per-warp register budget
+            T.ptxd.setmaxnreg.inc.sync.aligned.u32(
+                224
+            )  # raise the consumer's per-warp register budget
         wb = clc_sched.worker("wb_sched")
         wb.init(bx // 2)
         wb_buf = PipelineState(TMEM_PHASE_DEPTH, 0)
@@ -311,7 +313,7 @@ def _kernel(
                     if i == WB_PIPE_DEPTH - 1:
                         tmem_pipe.empty.arrive(slot, remote=0, pred=True)
                     db = T.meta_var(i % NUM_D_TILES)
-                    T.ptx.cp_async.bulk.wait_group(NUM_D_TILES - 1, read=True)
+                    T.ptxd.cp.async_.bulk.wait_group.read(NUM_D_TILES - 1)
                     T.cuda.warpgroup_sync(wg_id + 10)
                     # consumer is wg_id==0 here; literal Dsmem[0,...] keeps STSM dispatch.
                     for jv in T.unroll(EPI_N // 8):
@@ -349,7 +351,7 @@ def _kernel(
                 tmem_pipe.empty.arrive(wg_id, remote=0, pred=True)
                 for i in T.unroll(WB_PIPE_DEPTH):
                     db = T.meta_var(i % NUM_D_TILES)
-                    T.ptx.cp_async.bulk.wait_group(NUM_D_TILES - 1, read=True)
+                    T.ptxd.cp.async_.bulk.wait_group.read(NUM_D_TILES - 1)
                     T.cuda.warpgroup_sync(wg_id + 10)
                     # Store reg->smem in 8-bf16 (128b) sub-slices -> st.128 (one swizzle
                     # chunk each), avoiding the scalar 16b loop / bank conflicts.
@@ -389,7 +391,7 @@ def _kernel(
             wb_buf.advance()
             wb.mark_done_if_drained()
         # Drain any in-flight TMA stores before tmem teardown.
-        T.ptx.cp_async.bulk.wait_group(0)
+        T.ptxd.cp.async_.bulk.wait_group(0)
         if OVERLAP_EPILOGUE:
             # Teardown: warpgroup_sync (all tmem reads done), then warp0 does a 1-arrival
             # cross-CTA mbarrier handshake before dealloc -- lighter than a full cluster_sync.

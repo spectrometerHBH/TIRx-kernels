@@ -355,13 +355,17 @@ class BarTMA2MMA(Barriers):
 class BarMMA2LD(Barriers):
     @T.inline
     def arrive(self, idx):
-        T.ptx.tcgen05.commit(self.mbar.ptr_to([0, idx]), cta_group=CTA_GROUP, cta_mask=3)
+        T.ptxd[
+            f"tcgen05.commit.cta_group::{CTA_GROUP}.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64"
+        ](self.mbar.ptr_to([0, idx]), T.uint16(3))
 
 
 class BarMMA2TMA(Barriers):
     @T.inline
     def arrive(self, idx):
-        T.ptx.tcgen05.commit(self.mbar.ptr_to([idx, 0]), cta_group=CTA_GROUP, cta_mask=3)
+        T.ptxd[
+            f"tcgen05.commit.cta_group::{CTA_GROUP}.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64"
+        ](self.mbar.ptr_to([idx, 0]), T.uint16(3))
 
 
 class BarLD2MMA(Barriers):
@@ -790,7 +794,7 @@ def _build_kernel():
                 n_idx = T.meta_var(tile_scheduler.fetched_task_idx1[0])
 
                 if wg_id == NUM_CONSUMER:
-                    T.ptx.setmaxnreg(False, 56)
+                    T.ptxd.setmaxnreg.dec.sync.aligned.u32(56)
                     if warp_id == 3:
                         # GMEM -> SMEM  (tma)
                         if T.ptx.elect_sync():
@@ -879,7 +883,7 @@ def _build_kernel():
                             phase_tmem[0] = phase_tmem[0] ^ 1
 
                 if wg_id < NUM_CONSUMER:
-                    T.ptx.setmaxnreg(True, 224)
+                    T.ptxd.setmaxnreg.inc.sync.aligned.u32(224)
 
                     reg = T.alloc_buffer((TMEM_LD_SIZE,), "float32", scope="local")
                     reg_wg = reg.view(128, TMEM_LD_SIZE, layout=TileLayout(T.S[(128, TMEM_LD_SIZE) : (1@tid_in_wg, 1)]))
@@ -908,7 +912,7 @@ def _build_kernel():
                             n_st = T.meta_var(n_idx * BLK_N * CTA_GROUP + i * EPI_TILE)
                             Tx.copy_async(out[m_st : m_st + BLK_M, n_st : n_st + EPI_TILE], D_smem[wg_id, :, :], dispatch="tma_auto")
                             T.ptxd.cp.async_.bulk.commit_group()
-                            T.ptx.cp_async.bulk.wait_group(0)
+                            T.ptxd.cp.async_.bulk.wait_group(0)
                         T.cuda.warpgroup_sync(wg_id)
 
                 profiler.end(ProfileEventType.GEMM, tid == 0)

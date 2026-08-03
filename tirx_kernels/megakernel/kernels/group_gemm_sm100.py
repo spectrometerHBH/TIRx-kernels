@@ -147,10 +147,10 @@ class GroupGEMMTile(GemmTile):
             idx[0] += 32
             commit_count[0] += 1
             if commit_count[0] == self.CP_ASYNC_COMMIT_CHUNK:
-                T.ptx.cp_async.commit_group()
+                T.ptxd.cp.async_.commit_group()
                 commit_count[0] = 0
         if commit_count[0] > 0:
-            T.ptx.cp_async.commit_group()
+            T.ptxd.cp.async_.commit_group()
         T.cuda.func_call(
             "tvm_builtin_ptx_cp_async_mbarrier_arrive",
             mbar,
