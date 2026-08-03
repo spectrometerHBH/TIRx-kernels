@@ -29,6 +29,7 @@ import torch
 import tvm
 from tirx_kernels.megakernel import moe
 from tirx_kernels.megakernel.moe import IKET_EVENT_NAMES
+from tvm.support.nvcc import compile_cuda
 from tvm.tirx.cuda.iket import IketProfiler, IketProfileResult
 
 COMMON_EVENTS = frozenset(
@@ -68,6 +69,14 @@ def _sources(root) -> str:
         except RuntimeError:
             pass
     return "\n".join(sources)
+
+
+def _cuda_source(root) -> str:
+    modules = root._collect_from_import_tree(  # pylint: disable=protected-access
+        lambda module: module.kind == "cuda"
+    )
+    assert len(modules) == 1
+    return modules[0].inspect_source("cuda")
 
 
 def _require_sm100() -> None:
@@ -147,6 +156,36 @@ def test_megakernel_moe_official_iket_metadata(scheduler) -> None:
     assert "__iket_meta_info" in source
     declaration_names = set(re.findall(r"__iket_evt_decl_([a-z0-9_]+)_\d+_attrs", source))
     assert declaration_names == {name.replace("-", "_") for name in EXPECTED_EVENTS[scheduler]}
+    assert len(re.findall(r"__iket_evt_decl_[a-z0-9_]+_\d+_attrs", source)) == len(
+        EXPECTED_EVENTS[scheduler]
+    )
+
+    helper_start = source.index("template <unsigned int EventId>")
+    helper_end = source.index('extern "C" __global__', helper_start)
+    helper = source[helper_start:helper_end]
+    assert "activemask" not in helper
+    assert "elect.sync" not in helper
+    assert "__shfl" not in helper
+    assert "st.weak.shared.u32 [%%r], %%t" in helper
+
+
+def test_megakernel_moe_plain_dynamic_cubin_is_annotation_invariant() -> None:
+    _require_sm100()
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
+    sources = []
+    for enable_iket in (False, True):
+        executable = tvm.compile(
+            _module("dynamic", enable_iket), target=target, tir_pipeline="tirx"
+        )
+        source = _cuda_source(executable.mod)
+        assert "iket" not in source.lower()
+        sources.append(source)
+
+    cubins = [
+        compile_cuda(source, target_format="cubin", arch="sm_100a", compiler="nvrtc")
+        for source in sources
+    ]
+    assert cubins[0] == cubins[1]
 
 
 def test_megakernel_moe_external_trace_contract() -> None:
