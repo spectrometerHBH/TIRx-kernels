@@ -1017,7 +1017,7 @@ def _kernel(
                     emit_no_split_epilogue(1)
                     emit_no_split_epilogue(2)
                     emit_no_split_epilogue(3)
-                    T.ptx.cp_async.bulk.commit_group()
+                    T.ptxd.cp.async_.bulk.commit_group()
                 else:
                     output_scale: T.let = T.if_then_else(li == 0.0, 0.0, T.cuda.fdividef(1.0, li))
                     output_scale_pair: T.let = T.cuda.make_float2(output_scale, output_scale)
@@ -1068,7 +1068,7 @@ def _kernel(
                                 o_accum_smem.ptr_to([smem_row, 0]),
                                 T.uint32(D_V * 4),
                             )
-                        T.ptx.cp_async.bulk.commit_group()
+                        T.ptxd.cp.async_.bulk.commit_group()
 
                 # kernel.cuh:116 uses the unaligned spelling because the
                 # elected WG1 producer lanes reach this named barrier via

@@ -333,7 +333,7 @@ def _kernel(
                             prefetch_tensormap=True,  # prefetch the D tensormap
                         )
                     # commit_group collectively reconverges the warpgroup (no post-sync).
-                    T.ptx.cp_async.bulk.commit_group()
+                    T.ptxd.cp.async_.bulk.commit_group()
             else:
                 # No-overlap: load+cast all chunks, free the accumulator, then store. Stage
                 # the tmem->reg f32 load in 16-col sub-chunks so the f32 footprint stays 16
@@ -372,7 +372,7 @@ def _kernel(
                             prefetch_tensormap=True,  # prefetch the D tensormap
                         )
                     # commit_group collectively reconverges the warpgroup (no post-sync).
-                    T.ptx.cp_async.bulk.commit_group()
+                    T.ptxd.cp.async_.bulk.commit_group()
 
         # CLC consumer: capture the current tile, consume the schedule for the next
         # (overlapping it with the MMA-output wait), then store the captured tile.

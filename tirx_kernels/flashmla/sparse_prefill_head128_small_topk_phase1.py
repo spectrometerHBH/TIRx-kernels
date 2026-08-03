@@ -462,7 +462,7 @@ def _kernel(
                         q_smem[:, :],
                         **tma_config(),
                     )
-                    T.ptx.cp_async.bulk.commit_group()
+                    T.ptxd.cp.async_.bulk.commit_group()
 
         wg0_job_valid: T.int32 = 1
         wg0_job_block_idx: T.int32 = block_idx

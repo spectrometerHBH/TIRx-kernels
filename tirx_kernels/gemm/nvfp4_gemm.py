@@ -558,7 +558,7 @@ def _kernel(
                         cache_hint="evict_first",
                         prefetch_tensormap=True,
                     )
-                    T.ptx.cp_async.bulk.commit_group()
+                    T.ptxd.cp.async_.bulk.commit_group()
                 epi_wb_state.advance()
 
             # Fusion vs fission of {load; scale+cast; store}: overlap fuses and reuses

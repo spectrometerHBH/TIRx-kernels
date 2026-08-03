@@ -322,7 +322,7 @@ class GemmTile(Tile):
                         self.output_smem[self.stage, :, :],
                         **tma_config,
                     )
-                T.ptx.cp_async.bulk.commit_group()
+                T.ptxd.cp.async_.bulk.commit_group()
         if tid_in_wg:
             T.ptx.cp_async.bulk.wait_group(0)
         T.cuda.warpgroup_sync(10)

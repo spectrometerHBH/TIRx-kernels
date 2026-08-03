@@ -1781,7 +1781,7 @@ def get_kernel(
         return T.ptxd.fence.mbarrier_init.release.cluster()
 
     def tma_store_arrive():
-        return T.ptx.cp_async.bulk.commit_group()
+        return T.ptxd.cp.async_.bulk.commit_group()
 
     def tma_store_wait(num_prior_groups):
         if num_prior_groups == 0:

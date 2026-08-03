@@ -1013,7 +1013,7 @@ def test_mma_ss_tma_2sm_persistent(
                             n_idx * BLK_N * CTA_GROUP + i * EPI_TILE,
                             (m_idx * NUM_CONSUMER * CTA_GROUP + wg_id * CTA_GROUP + cbx) * BLK_M,
                         )
-                        Tx.ptx.cp_async.bulk.commit_group()
+                        Tx.ptxd.cp.async_.bulk.commit_group()
                         Tx.ptx.cp_async.bulk.wait_group(0)
                     Tx.cuda.warpgroup_sync(wg_id)
                 comm_m_idx = Tx.meta_var(m_idx * 2 + wg_id)

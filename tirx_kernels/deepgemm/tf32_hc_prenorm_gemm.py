@@ -625,7 +625,7 @@ def get_kernel(**kwargs: Any):
                             prefetch_tensormap=True,
                             cache_hint="evict_first",
                         )
-                    T.ptx.cp_async.bulk.commit_group()
+                    T.ptxd.cp.async_.bulk.commit_group()
             tmem_pool.dealloc()  # warp-1-guarded relinquish + tcgen05.dealloc
         else:
             sub_warp_idx: T.uint32 = T.cast(

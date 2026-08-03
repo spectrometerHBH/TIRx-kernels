@@ -891,7 +891,7 @@ def _build_kernel():
                             m_st = T.meta_var((m_idx * NUM_CONSUMER * CTA_GROUP + wg_id * CTA_GROUP + cbx) * BLK_M)
                             n_st = T.meta_var(n_idx * BLK_N * CTA_GROUP + i * EPI_TILE)
                             Tx.copy_async(out[m_st : m_st + BLK_M, n_st : n_st + EPI_TILE], D_smem[wg_id, :, :], dispatch="tma_auto")
-                            T.ptx.cp_async.bulk.commit_group()
+                            T.ptxd.cp.async_.bulk.commit_group()
                             T.ptx.cp_async.bulk.wait_group(0)
                         T.cuda.warpgroup_sync(wg_id)
 

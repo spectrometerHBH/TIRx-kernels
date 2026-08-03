@@ -904,7 +904,9 @@ def _kernel(
                             predicate=is_valid_index,
                             fill_mode="zero",
                         )
-                    T.ptx.cp_async.mbarrier.arrive.noinc(bar_kv_rope_ready.ptr_to([0]))
+                    T.ptxd.cp.async_.mbarrier.arrive.noinc.shared__cta.b64(
+                        bar_kv_rope_ready.ptr_to([0])
+                    )
             iket.range_end(kv_rope_token)
 
 

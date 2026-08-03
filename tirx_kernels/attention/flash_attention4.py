@@ -457,7 +457,7 @@ def _kernel(
                             O_smem_4d[i_q, :, :, :],
                             dispatch="tma_auto",
                         )
-                    T.ptx.cp_async.bulk.commit_group()
+                    T.ptxd.cp.async_.bulk.commit_group()
                 for i_q in T.unroll(SMEM_PIPE_DEPTH_Q):
                     T.ptx.cp_async.bulk.wait_group(1 - i_q)
                     corr_epi.empty.arrive(i_q)

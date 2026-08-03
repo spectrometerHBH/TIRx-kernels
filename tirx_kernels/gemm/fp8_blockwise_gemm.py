@@ -489,7 +489,7 @@ def _kernel(
                             dispatch="tma_auto",
                             prefetch_tensormap=True,
                         )
-                        T.ptx.cp_async.bulk.commit_group()
+                        T.ptxd.cp.async_.bulk.commit_group()
 
         T.cuda.trap_when_assert_failed(tmem_pool.addr == 0)
         while tile_scheduler.valid():
