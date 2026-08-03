@@ -380,7 +380,7 @@ def _kernel(
         if T.ptx.elect_sync():
             bar_prologue_q_nope.init(1)
             bar_prologue_q_rope.init(1)
-            T.ptx.fence.mbarrier_init()
+            T.ptxd.fence.mbarrier_init.release.cluster()
 
             if have_rope:
                 Tx.copy_async(
@@ -412,7 +412,7 @@ def _kernel(
             bar_so_ready.init(128)
             bar_qk_rope_done.init(1)
             bar_kv_rope_ready.init(64)
-            T.ptx.fence.mbarrier_init()
+            T.ptxd.fence.mbarrier_init.release.cluster()
 
         T.ptx.tcgen05.alloc(T.address_of(tmem_start_addr[0]), n_cols=512, cta_group=1)
         T.cuda.trap_when_assert_failed(tmem_start_addr[0] == T.uint32(0))
@@ -431,7 +431,7 @@ def _kernel(
         # S generation, S shared store, conditional O rescale.
         for k in T.serial(0, num_k_blocks, unroll=False):
             softmax_token = iket.range_start("h64-softmax-tile")
-            T.ptx.bar.sync(BAR_WG0_WARP02 + T.bitwise_and(warp_idx, T.int32(1)), 64)
+            T.ptxd.bar.sync(T.uint32(BAR_WG0_WARP02 + T.bitwise_and(warp_idx, T.int32(1))), 64)
             cur_buf: T.int32 = _ring_mod3(k, max_k_blocks)
             cur_phase: T.int32 = _ring_phase_parity(k, max_k_blocks)
             qk_wait_token = iket.range_start("h64-qk-wait")
@@ -480,7 +480,7 @@ def _kernel(
                     p_peer[p_peer_offset : p_peer_offset + 4],
                     dispatch="vec_128b",
                 )
-            T.ptx.bar.sync(BAR_WG0_WARP02 + T.bitwise_and(warp_idx, T.int32(1)), 64)
+            T.ptxd.bar.sync(T.uint32(BAR_WG0_WARP02 + T.bitwise_and(warp_idx, T.int32(1))), 64)
             p_add_pair0: T.uint64
             p_add_pair1: T.uint64
             for exchange_i in T.unroll((B_TOPK // 2) // 4):
@@ -509,7 +509,7 @@ def _kernel(
                 cur_pi_max = T.max(cur_pi_max, p[p_i])
             cur_pi_max = cur_pi_max * sm_scale_div_log2
             rowwise_max_buf[idx_in_warpgroup] = cur_pi_max
-            T.ptx.bar.sync(BAR_WG0_SYNC, 128)
+            T.ptxd.bar.sync(T.uint32(BAR_WG0_SYNC), 128)
             cur_pi_max = T.max(cur_pi_max, rowwise_max_buf[idx_in_warpgroup ^ 64])
             real_mi = T.max(real_mi, cur_pi_max)
             should_scale_o: T.bool = (
@@ -580,7 +580,7 @@ def _kernel(
                     T.ptx.tcgen05.wait.st()
                 T.ptx.tcgen05.fence.before_thread_sync()
 
-            T.ptx.fence.proxy_async("shared::cta")
+            T.ptxd.fence.proxy.async_.shared__cta()
             bar_so_ready.arrive(0)
             iket.range_end(softmax_token)
 
@@ -592,7 +592,7 @@ def _kernel(
             mi = T.float32(-float("inf"))
 
         rowwise_li_buf[idx_in_warpgroup] = li
-        T.ptx.bar.sync(BAR_WG0_SYNC, 128)
+        T.ptxd.bar.sync(T.uint32(BAR_WG0_SYNC), 128)
         li = li + rowwise_li_buf[idx_in_warpgroup ^ 64]
 
         if idx_in_warpgroup < B_H:
@@ -646,8 +646,8 @@ def _kernel(
                     o_smem_win.chunk((None, (D_V // 2) // 64))[:, epi_c * 2 + epi_k],
                     o_epi_bf16_frag[:, :],
                 )
-                T.ptx.fence.proxy_async("shared::cta")
-                T.ptx.bar.sync(BAR_WG0_SYNC, 128)
+                T.ptxd.fence.proxy.async_.shared__cta()
+                T.ptxd.bar.sync(T.uint32(BAR_WG0_SYNC), 128)
                 if warp_idx == 0:
                     if T.ptx.elect_sync():
                         # CUDA phase1.cuh:335-342: first half O TMA store.

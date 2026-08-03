@@ -264,7 +264,7 @@ def _kernel(
     SFB_smem = pool.alloc((SMEM_DEPTH, BLK_SFB), "uint32")
     pool.commit()
     if barrier_leader:
-        T.ptx.fence.mbarrier_init()
+        T.ptxd.fence.mbarrier_init.release.cluster()
     stage: T.int32
     tile_scheduler = ClusterPersistentScheduler2D(
         "tile_scheduler",
@@ -280,7 +280,7 @@ def _kernel(
         T.cuda.cluster_sync()
     else:
         T.cuda.cta_sync()
-    T.evaluate(T.ptx.griddepcontrol.wait())
+    T.evaluate(T.ptxd.griddepcontrol.wait())
     T.cuda.trap_when_assert_failed(tmem_pool.addr == 0)
 
     m_idx = T.meta_var(tile_scheduler.n_idx if SWAP_AB else tile_scheduler.m_idx)
@@ -382,7 +382,7 @@ def _kernel(
                 if k_tile % 4 == 0:
                     Tx.warp.permute_layout(SFA_smem_post[ks, :], SFA_smem[ks, :])
                     Tx.warp.permute_layout(SFB_smem_post[ks, :], SFB_smem[ks, :])
-                    T.ptx.fence.proxy_async("shared::cta")
+                    T.ptxd.fence.proxy.async_.shared__cta()
                 trans_done.arrive(ks, remote=0)
 
             @T.inline
@@ -528,7 +528,7 @@ def _kernel(
                         )
                 if ot == STORE_TILES - 1:
                     tmem_pipe.empty.arrive(tmem_idx, remote=0)
-                T.ptx.fence.proxy_async("shared::cta")
+                T.ptxd.fence.proxy.async_.shared__cta()
                 T.cuda.warpgroup_sync(10)
                 d_m: T.let = m_idx * DG_BLOCK_M + (ot * 16 if SWAP_AB else 0)
                 d_n: T.let = n_idx * DG_BLOCK_N + (0 if SWAP_AB else ot * EPI_TILE)

@@ -145,8 +145,8 @@ class SmemManager:
                 T.ptx.mbarrier.init(self.mbar.ptr_to([i]), 1)
             self.shared_count[0] = 0
         T.tvm_storage_sync("shared")
-        T.ptx.fence.mbarrier_init()
-        T.ptx.fence.proxy_async("shared::cta")
+        T.ptxd.fence.mbarrier_init.release.cluster()
+        T.ptxd.fence.proxy.async_.shared__cta()
 
     def alloc(
         self,
@@ -293,7 +293,7 @@ class SmemManager:
             if warp_id % KernelConfig.WARP_NUMBER == 0:
                 if lane_id < self.chunk_num:
                     T.ptx.mbarrier.try_wait(self.mbar.ptr_to([lane_id]), self.cur_phase[0])
-            T.ptx.bar.sync(6 + wg_id, 128)
+            T.ptxd.bar.sync(T.uint32(6 + wg_id), 128)
 
     @T.inline
     def wait_specific(self, lane_id, buffer, split_idx: int):
@@ -347,7 +347,7 @@ class SmemManager:
                     T.ptx.mbarrier.arrive(self.mbar.ptr_to([lane_id]))
         elif level == "warpgroup":
             self.reg_count[0] = 0
-            T.ptx.bar.sync(6 + wg_id, 128)
+            T.ptxd.bar.sync(T.uint32(6 + wg_id), 128)
             if warp_id % KernelConfig.WARP_NUMBER == 0:
                 if lane_id == 0:
                     self.reg_count[0] = T.cuda.atomic_add(T.address_of(self.shared_count[0]), 1) + 1
@@ -594,7 +594,7 @@ class MegaKernelWrapper:
             state[0] = -1
             while 1:
                 if lane_id == 0:
-                    T.ptx.ld_global_acquire(
+                    T.ptxd.ld.acquire.gpu.global_.b32(
                         state[0], self.evt_etensor_init_complete.sem.ptr_to([0])
                     )
                 if any_sync(

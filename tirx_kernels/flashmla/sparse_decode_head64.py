@@ -689,7 +689,7 @@ def _kernel(
             for index_stage in T.unroll(NUM_INDEX_BUFS):
                 T.ptx.mbarrier.init(bar_valid_ready.ptr_to([index_stage]), 32)
                 T.ptx.mbarrier.init(bar_valid_free.ptr_to([index_stage]), 258)
-            T.ptx.fence.mbarrier_init()
+            T.ptxd.fence.mbarrier_init.release.cluster()
         T.ptx.tcgen05.alloc(T.address_of(tmem_start_addr[0]), n_cols=512, cta_group=1)
         T.cuda.trap_when_assert_failed(tmem_start_addr[0] == T.uint32(0))
         T.ptx.tcgen05.relinquish_alloc_permit(cta_group=1)
@@ -778,7 +778,7 @@ def _kernel(
                 # kernel.cuh:160-299.  P load, dual-warp exchange, mask,
                 # online softmax, S staging, and conditional O rescale.
                 for block_idx in T.serial(start_block, end_block, unroll=False):
-                    T.ptx.bar.sync(BAR_WG0_SYNC, 128)
+                    T.ptxd.bar.sync(T.uint32(BAR_WG0_SYNC), 128)
                     bar_valid_ready.wait(rs_index.stage, rs_index.phase)
                     bar_qk_done.wait(rs_buf.stage, rs_buf.phase)
                     T.ptx.tcgen05.fence.after_thread_sync()
@@ -803,7 +803,9 @@ def _kernel(
                             p_peer[exchange_i * 4 : exchange_i * 4 + 4],
                             dispatch="vec_128b",
                         )
-                    T.ptx.bar.sync(BAR_WG0_WARP02 + T.bitwise_and(warp_idx, T.int32(1)), 64)
+                    T.ptxd.bar.sync(
+                        T.uint32(BAR_WG0_WARP02 + T.bitwise_and(warp_idx, T.int32(1))), 64
+                    )
                     for exchange_i in T.unroll((B_TOPK // 2) // 4):
                         exchange_offset: T.let = exchange_i * 32 * 4 + lane_idx * 4
                         peer_tmp = T.alloc_local((4,), "float32")
@@ -843,7 +845,7 @@ def _kernel(
                         cur_pi_max = T.max(cur_pi_max, p[p_i])
                     cur_pi_max = cur_pi_max * sm_scale_div_log2
                     rowwise_buf[idx_in_warpgroup] = cur_pi_max
-                    T.ptx.bar.sync(BAR_WG0_SYNC, 128)
+                    T.ptxd.bar.sync(T.uint32(BAR_WG0_SYNC), 128)
                     bar_valid_free.arrive(rs_index.stage)
                     cur_pi_max = T.max(cur_pi_max, rowwise_buf[idx_in_warpgroup ^ 64])
                     real_mi = T.max(real_mi, cur_pi_max)
@@ -911,7 +913,7 @@ def _kernel(
                             T.ptx.tcgen05.wait.st()
                         T.ptx.tcgen05.fence.before_thread_sync()
 
-                    T.ptx.fence.proxy_async("shared::cta")
+                    T.ptxd.fence.proxy.async_.shared__cta()
                     bar_so_ready.arrive(rs_buf.stage)
                     if block_idx != end_block - 1:
                         rs_buf.advance()
@@ -923,7 +925,7 @@ def _kernel(
                     li = 0.0
                     mi = T.float32(-float("inf"))
                 rowwise_buf[idx_in_warpgroup] = li
-                T.ptx.bar.sync(BAR_WG0_SYNC, 128)
+                T.ptxd.bar.sync(T.uint32(BAR_WG0_SYNC), 128)
                 li = li + rowwise_buf[idx_in_warpgroup ^ 64]
                 if idx_in_warpgroup < B_H:
                     if is_no_split:
@@ -945,7 +947,7 @@ def _kernel(
                 rs_index.advance()
                 T.ptx.tcgen05.fence.after_thread_sync()
                 if use_pdl and is_last_batch:
-                    T.ptx.griddepcontrol.launch_dependents()
+                    T.ptxd.griddepcontrol.launch_dependents()
 
                 # kernel.cuh:335-421.  Keep no-split TMA output and split
                 # fp32 bulk output as distinct epilogues; attn_sink is only
@@ -985,8 +987,8 @@ def _kernel(
                             o_smem_win.chunk((None, (D_V // 2) // 64))[:, epi_i],
                             o_epi_bf16_frag[:, :],
                         )
-                        T.ptx.fence.proxy_async("shared::cta")
-                        T.ptx.bar.sync(BAR_WG0_SYNC, 128)
+                        T.ptxd.fence.proxy.async_.shared__cta()
+                        T.ptxd.bar.sync(T.uint32(BAR_WG0_SYNC), 128)
                         if warp_idx == 0:
                             if T.ptx.elect_sync() != T.uint32(0):
                                 Tx.copy_async(
@@ -1048,8 +1050,8 @@ def _kernel(
                                 split_local[j * 4 : j * 4 + 4],
                                 dispatch="vec_128b",
                             )
-                    T.ptx.fence.proxy_async("shared::cta")
-                    T.ptx.bar.sync(BAR_WG0_SYNC, 128)
+                    T.ptxd.fence.proxy.async_.shared__cta()
+                    T.ptxd.bar.sync(T.uint32(BAR_WG0_SYNC), 128)
                     if T.ptx.elect_sync() != T.uint32(0):
                         for local_row in T.unroll(B_H // 4):
                             smem_row: T.let = local_row * 4 + warp_idx
@@ -1069,7 +1071,7 @@ def _kernel(
                 # kernel.cuh:116 uses the unaligned spelling because the
                 # elected WG1 producer lanes reach this named barrier via
                 # control flow distinct from the empty-role lanes.
-                T.ptx.barrier.sync(BAR_EVERYONE_SYNC, NUM_THREADS)
+                T.ptxd.barrier.sync(T.uint32(BAR_EVERYONE_SYNC), T.uint32(NUM_THREADS))
                 batch_bar_phase = batch_bar_phase ^ 1
 
         if warp_idx == 0:
@@ -1624,7 +1626,7 @@ def _kernel(
                             ):
                                 process_index_block(block_idx, True)
 
-                    T.ptx.barrier.sync(BAR_EVERYONE_SYNC, NUM_THREADS)
+                    T.ptxd.barrier.sync(T.uint32(BAR_EVERYONE_SYNC), T.uint32(NUM_THREADS))
                     batch_bar_phase = batch_bar_phase ^ 1
 
         # kernel.cuh:431/586/616/653/744.  Election is evaluated only in
@@ -1833,14 +1835,14 @@ def _kernel(
                                 raw_fp8x8,
                                 scales_bf16_bits[scale_idx],
                             )
-                    T.ptx.fence.proxy_async("shared::cta")
+                    T.ptxd.fence.proxy.async_.shared__cta()
                     bar_nope_ready.arrive(rs_buf.stage)
                     bar_raw_free.arrive(rs_buf.stage)
                     bar_valid_free.arrive(rs_index.stage)
                     rs_buf.advance()
                     rs_index.advance()
 
-                T.ptx.barrier.sync(BAR_EVERYONE_SYNC, NUM_THREADS)
+                T.ptxd.barrier.sync(T.uint32(BAR_EVERYONE_SYNC), T.uint32(NUM_THREADS))
                 batch_bar_phase = batch_bar_phase ^ 1
 
 
@@ -1933,7 +1935,7 @@ def _sparse_decode_head64_combine_kernel(
     # combine.cu:58-69.  The PDL consumer wait remains after both early
     # returns, followed by the same four float4 prefetches per lane.
     if use_pdl:
-        T.evaluate(T.ptx.griddepcontrol.wait())
+        T.evaluate(T.ptxd.griddepcontrol.wait())
     oaccum_offset: T.int32 = (
         start_split * stride_o_accum_split
         + query_idx * stride_o_accum_s_q

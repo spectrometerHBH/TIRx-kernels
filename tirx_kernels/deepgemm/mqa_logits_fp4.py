@@ -307,10 +307,7 @@ def _mqa_fp4_wrelu_reduce_src(num_heads: int) -> str:
 
 
 def get_kernel(**kwargs: Any):
-    from tvm.backend.cuda.tile_primitive.gemm_async.tcgen05 import (
-        sf_smem_layout,
-        sf_tmem_layout,
-    )
+    from tvm.backend.cuda.tile_primitive.gemm_async.tcgen05 import sf_smem_layout, sf_tmem_layout
     from tvm.backend.cuda.tile_primitive.tma_utils import SwizzleMode, mma_shared_layout
     from tvm.script import tirx as T
     from tvm.script.tirx import tile as Tx
@@ -375,7 +372,7 @@ def get_kernel(**kwargs: Any):
     logits_tir_dtype = "float32" if config.logits_dtype == "float32" else "bfloat16"
 
     def cuda_grid_dependency_synchronize():
-        T.evaluate(T.ptx.griddepcontrol.wait())
+        T.evaluate(T.ptxd.griddepcontrol.wait())
 
     def emit_sf_transpose(buf, dst, lane, stage_idx, elem_base):
         # DeepGEMM's st.shared.v4 SF transpose, out-of-place into staging
@@ -572,7 +569,7 @@ def get_kernel(**kwargs: Any):
             schedule_result[1] = num_kv_blocks
 
         # Pipeline constructors already ran mbarrier.init; fence + cta_sync publish them.
-        T.ptx.fence.mbarrier_init()
+        T.ptxd.fence.mbarrier_init.release.cluster()
 
         if warp_idx == spec_warp_start + 2:
             T.ptx.tcgen05.alloc(
@@ -746,7 +743,7 @@ def get_kernel(**kwargs: Any):
                 q_pipe.full.wait(q_stage_idx, q_phase)
                 emit_sf_transpose(smem_sf_q, smem_sf_q_t, lane_idx, q_stage_idx, 0)
                 T.cuda.warp_sync()
-                T.ptx.fence.proxy_async("shared::cta")
+                T.ptxd.fence.proxy.async_.shared__cta()
                 # Each tmem_pipe.full arrive commits all prior asynchronous
                 # TCGEN work from this issuer. Wait for the final commit from
                 # the preceding q block before overwriting its SFQ TMEM input.
@@ -840,7 +837,7 @@ def get_kernel(**kwargs: Any):
                     emit_sf_transpose(
                         smem_sf_kv, smem_sf_kv_t, lane_idx, t_kv_stage, num_utccp_aligned_elems
                     )
-                    T.ptx.fence.proxy_async("shared::cta")
+                    T.ptxd.fence.proxy.async_.shared__cta()
                     if T.ptx.elect_sync():
                         sf_ready.arrive(t_kv_stage)
                     t_kv_i = t_kv_i + T.uint32(1)
@@ -870,7 +867,7 @@ def get_kernel(**kwargs: Any):
                     Tx.warpgroup.copy(cached_weights, smem_weights[q_stage_idx])
                     # Publish the generic-proxy weight reads before this
                     # consumer releases the Q stage for a later TMA overwrite.
-                    T.ptx.fence.proxy_async("shared::cta")
+                    T.ptxd.fence.proxy.async_.shared__cta()
                     if not config.compressed_logits and config.logits_dtype == "float32":
                         for tb_i in T.unroll(0, block_q):
                             token_store_off[tb_i] = T.cast(
@@ -950,7 +947,7 @@ def get_kernel(**kwargs: Any):
                 if q_stage_idx >= T.uint32(num_q_stages):
                     q_stage_idx = q_stage_idx - T.uint32(num_q_stages)
                     q_phase = q_phase ^ T.uint32(1)
-            T.ptx.bar.sync(8, num_math_threads)
+            T.ptxd.bar.sync(8, T.uint32(num_math_threads))
             if warp_idx == 0:
                 T.ptx.tcgen05.dealloc(T.uint32(0), n_cols=num_tmem_cols, cta_group=1)
 

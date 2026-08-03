@@ -200,8 +200,8 @@ class GemmTile(Tile):
         cls.mma2tma_bar.init(1)
         cls.ld2mma_bar.init(KernelConfig.CTA_GROUP * 128)
         cls.phase[0] = 0
-        T.ptx.fence.proxy_async("shared::cta")
-        T.ptx.fence.mbarrier_init()
+        T.ptxd.fence.proxy.async_.shared__cta()
+        T.ptxd.fence.mbarrier_init.release.cluster()
         T.tvm_storage_sync("shared")
 
     @classmethod
@@ -292,7 +292,7 @@ class GemmTile(Tile):
             if ko == self.MMA_M // self.EPI_TILE - 1:
                 T.ptx.tcgen05.fence.before_thread_sync()
                 self.ld2mma_bar.arrive(self.tmem_idx)
-            T.ptx.fence.proxy_async("shared::cta")
+            T.ptxd.fence.proxy.async_.shared__cta()
             T.cuda.warpgroup_sync(10)
             if tid_in_wg == 0:
                 m_st = T.meta_var(m_idx * self.M_pad_size + ko * self.EPI_TILE)
@@ -546,7 +546,7 @@ class GemmTile(Tile):
                                 self.mma2tma_bar.wait(ks, self.phase[0])
                                 self.tma2mma_bar.arrive_only(ks)
                             self.phase[0] = self.phase[0] ^ 1
-                T.ptx.bar.sync(13, 64)
+                T.ptxd.bar.sync(13, 64)
             elif warp_id == 0:
 
                 @T.inline
@@ -625,7 +625,7 @@ class GemmTile(Tile):
                 self.phase[0] = self.phase[0] ^ self.PIPE_CIRCLE_NUM & 1
                 if self.PIPE_REMAIN_NUM > 0:
                     self.phase[0] = self.phase[0] ^ 1
-                T.ptx.bar.sync(13, 64)
+                T.ptxd.bar.sync(13, 64)
                 for ks in T.unroll(self.SMEM_PIPE_DEPTH):
                     self.mma2tma_bar.wait(ks, self.phase[0])
                     self.smem_manager.arrive_specific(lane_id, self.B_smem, ks)

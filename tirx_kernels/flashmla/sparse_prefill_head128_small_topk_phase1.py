@@ -358,7 +358,7 @@ def _kernel(
             bar_li_empty.init(128)
             bar_clc_full.init(1)
             bar_clc_empty.init(NUM_WORKER_THREADS)
-            T.ptx.fence.mbarrier_init()
+            T.ptxd.fence.mbarrier_init.release.cluster()
     elif warp_idx == 2:
         T.ptx.tcgen05.alloc(T.address_of(tmem_start_addr[0]), n_cols=512, cta_group=2)
         T.cuda.trap_when_assert_failed(tmem_start_addr[0] == T.uint32(0))
@@ -371,7 +371,7 @@ def _kernel(
             for init_stage in T.unroll(NUM_INDEX_BUFS):
                 T.ptx.mbarrier.init(bar_valid_coord_scales_full.ptr_to([init_stage]), B_TOPK // 8)
                 T.ptx.mbarrier.init(bar_valid_coord_scales_empty.ptr_to([init_stage]), 128)
-            T.ptx.fence.mbarrier_init()
+            T.ptxd.fence.mbarrier_init.release.cluster()
 
     T.cuda.cluster_sync()
 
@@ -427,7 +427,7 @@ def _kernel(
             bar_tOut_full.wait(0, o_outer_loop_phase)
             if is_last_o:
                 if T.ptx.elect_sync():
-                    T.ptx.griddepcontrol.launch_dependents()
+                    T.ptxd.griddepcontrol.launch_dependents()
 
             o_epi_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, B_EPI), "float32")
             o_epi = o_epi_frag.local()
@@ -451,8 +451,8 @@ def _kernel(
                     q_smem_win.chunk((None, (D_V // 2) // B_EPI))[:, epi_k], o_epi_bf16_frag[:, :]
                 )
 
-            T.ptx.fence.proxy_async("shared::cta")
-            T.ptx.bar.sync(BAR_WG0_SYNC, 128)
+            T.ptxd.fence.proxy.async_.shared__cta()
+            T.ptxd.bar.sync(T.uint32(BAR_WG0_SYNC), 128)
             if warp_idx == 0:
                 if T.ptx.elect_sync():
                     Tx.copy_async(
@@ -496,7 +496,7 @@ def _kernel(
             if warp_idx == 0:
                 if T.ptx.elect_sync():
                     T.ptx.cp_async.bulk.wait_group(0)
-            T.ptx.bar.sync(BAR_WG0_SYNC, 128)
+            T.ptxd.bar.sync(T.uint32(BAR_WG0_SYNC), 128)
             perform_o_copy_out(last_s_q_idx, last_outer_loop_phase, True)
 
         if warp_idx == 0:
@@ -735,9 +735,10 @@ def _kernel(
                     while clc_job_valid != 0:
                         if cta_idx == 0:
                             bar_clc_empty.wait(0, clc_outer_loop_phase ^ 1)
-                            T.ptx.clc_try_cancel(
-                                T.address_of(clc_response[0]), bar_clc_full.ptr_to([0])
-                            )
+                            T.ptxd[
+                                "clusterlaunchcontrol.try_cancel.async.shared::cta"
+                                ".mbarrier::complete_tx::bytes.multicast::cluster::all.b128"
+                            ](T.address_of(clc_response[0]), bar_clc_full.ptr_to([0]))
                         bar_clc_full.arrive(0, tx_count=16)
 
                         bar_clc_full.wait(0, clc_outer_loop_phase)
@@ -823,7 +824,7 @@ def _kernel(
                         p_peer[p_peer_offset : p_peer_offset + 4],
                         dispatch="vec_128b",
                     )
-                T.ptx.bar.sync(BAR_WG2_WARP02 + (local_warp_idx & 1), 64)
+                T.ptxd.bar.sync(T.uint32(BAR_WG2_WARP02 + (local_warp_idx & 1)), 64)
                 for exchange_i in T.unroll(WG3_ELEMS_PER_THREAD // 4):
                     exchange_offset = exchange_i * 32 * 4 + lane_idx * 4
                     p_exchange_tmp = T.alloc_local((4,), "uint32")
@@ -860,7 +861,7 @@ def _kernel(
                     cur_pi_max = T.max(cur_pi_max, T.cuda.uint_as_float(p[p_i]))
                 cur_pi_max = cur_pi_max * sm_scale_div_log2
                 rowwise_max_buf[idx_in_warpgroup] = cur_pi_max
-                T.ptx.bar.sync(BAR_WG2_WARP02 + (local_warp_idx & 1), 64)
+                T.ptxd.bar.sync(T.uint32(BAR_WG2_WARP02 + (local_warp_idx & 1)), 64)
                 cur_pi_max = T.max(cur_pi_max, rowwise_max_buf[idx_in_warpgroup ^ 64])
                 real_mi = T.max(real_mi, cur_pi_max)
                 should_scale_o: T.let = (
@@ -927,7 +928,7 @@ def _kernel(
                         T.ptx.tcgen05.wait.st()
                     T.ptx.tcgen05.fence.before_thread_sync()
 
-                T.ptx.fence.proxy_async("shared::cta")
+                T.ptxd.fence.proxy.async_.shared__cta()
                 bar_S_O_full.arrive(0, remote=T.uint32(0))
                 bar_valid_coord_scales_empty.arrive(index_buf_idx)
                 wg3_rs = wg3_rs + 1
@@ -938,7 +939,7 @@ def _kernel(
 
             bar_li_empty.wait(0, wg3_outer_loop_phase ^ 1)
             rowwise_li_buf[idx_in_warpgroup ^ 64] = li
-            T.ptx.bar.sync(BAR_WG2_SYNC, 128)
+            T.ptxd.bar.sync(T.uint32(BAR_WG2_SYNC), 128)
             li = li + rowwise_li_buf[idx_in_warpgroup]
 
             if idx_in_warpgroup < B_H // 2:

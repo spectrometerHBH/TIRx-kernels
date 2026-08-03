@@ -366,7 +366,7 @@ def _kernel(
     tmem_finished.init(1)
     pool.commit()
     if mbar_leader:
-        T.ptx.fence.mbarrier_init()
+        T.ptxd.fence.mbarrier_init.release.cluster()
     tmem_pool = T.TMEMPool(pool, total_cols=512, cta_group=CTA_GROUP, tmem_addr=tmem_addr)
     tmem = tmem_pool.alloc((CTA_M, 512), "float32")
     A_smem = A_smem_packed.view("float4_e2m1fn")
@@ -385,8 +385,8 @@ def _kernel(
     # the existing cluster release/acquire before any other warp consumes the
     # TMEM base address.
     tmem_pool.commit()
-    T.ptx.barrier.cluster.arrive(sem="release", aligned=True)
-    T.ptx.barrier.cluster.wait(acquire=True, aligned=False)
+    T.ptxd.barrier.cluster.arrive.release.aligned()
+    T.ptxd.barrier.cluster.wait.acquire()
     if tid_in_cta < 32:
         T.ptx.tcgen05.relinquish_alloc_permit(cta_group=CTA_GROUP)
     pair_mask: T.int32
@@ -539,7 +539,7 @@ def _kernel(
                 d_n_out: T.int32
                 d_n_out = d_n + linear_n
                 if tid_in_wg == 0:
-                    T.ptx.fence.proxy_async("shared::cta")
+                    T.ptxd.fence.proxy.async_.shared__cta()
                     Tx.copy_async(
                         D[d_m : d_m + CTA_M, d_n_out : d_n_out + EPI_TILE],
                         output_smem[epi_wb_state.stage, 0:CTA_M, 0:EPI_TILE],

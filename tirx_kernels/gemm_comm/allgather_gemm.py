@@ -394,7 +394,7 @@ class Pipeline:
                             T.ptx.mbarrier.init(self.mbar_p2c.ptr_to([i, j]), p2c_thread_count)
                         if not self.p_single_cta or cbx == 0:
                             T.ptx.mbarrier.init(self.mbar_c2p.ptr_to([i, j]), c2p_thread_count)
-        T.ptx.fence.proxy_async("shared::cta")
+        T.ptxd.fence.proxy.async_.shared__cta()
 
     @T.inline
     def advance(self):
@@ -435,7 +435,7 @@ class Semaphore:
     @T.inline
     def semaphore_wait(self, *coord):
         while 1:
-            T.ptx.ld_global_acquire(
+            T.ptxd.ld.acquire.gpu.global_.b64(
                 self.state[0], self.sem.access_ptr("r", offset=self.sem.elem_offset_of(coord))
             )
             if self.state[0] == self.cnt:
@@ -724,11 +724,11 @@ def _build_kernel():
         if (wg_id == 0) & (warp_id == 0):
             T.ptx.tcgen05.alloc(T.address_of(tmem_addr), n_cols=N_COLS, cta_group=CTA_GROUP)
 
-        T.ptx.barrier.cluster.arrive()
-        T.ptx.barrier.cluster.wait()
+        T.ptxd.barrier.cluster.arrive()
+        T.ptxd.barrier.cluster.wait()
         T.cuda.cta_sync()
-        T.ptx.fence.proxy_async("shared::cta")
-        T.ptx.fence.mbarrier_init()
+        T.ptxd.fence.proxy.async_.shared__cta()
+        T.ptxd.fence.mbarrier_init.release.cluster()
         tile_scheduler.init(cbx, bx, rank, warp_id_in_cta, lane_id)
 
         T.cuda.trap_when_assert_failed(tmem_addr == 0)
@@ -872,7 +872,7 @@ def _build_kernel():
                     for i in T.unroll(NUM_CONSUMER * BLK_N // EPI_TILE):
                         Tx.copy(D_smem[wg_id, warp_id * 32 + lane_id, :], reg_fp16[i * EPI_TILE : (i + 1) * EPI_TILE])
                         T.cuda.warpgroup_sync(wg_id)
-                        T.ptx.fence.proxy_async("shared::cta")
+                        T.ptxd.fence.proxy.async_.shared__cta()
                         # st to gmem
                         if lane_id == 0 and warp_id == 0:
                             m_st = T.meta_var((m_idx * NUM_CONSUMER * CTA_GROUP + wg_id * CTA_GROUP + cbx) * BLK_M)
@@ -887,8 +887,8 @@ def _build_kernel():
             tile_scheduler.next_tile(cbx, bx, rank, warp_id_in_cta, lane_id)
 
         # All local and peer-CTA TMEM users must finish before collective deallocation.
-        T.ptx.barrier.cluster.arrive()
-        T.ptx.barrier.cluster.wait()
+        T.ptxd.barrier.cluster.arrive()
+        T.ptxd.barrier.cluster.wait()
 
         # dealloc TMEM
         if (wg_id == 0) & (warp_id == 0):

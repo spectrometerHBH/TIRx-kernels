@@ -286,7 +286,7 @@ class Pipeline:
                             Tx.ptx.mbarrier.init(self.mbar_p2c.ptr_to([i, j]), p2c_thread_count)
                         if not self.p_single_cta or cbx == 0:
                             Tx.ptx.mbarrier.init(self.mbar_c2p.ptr_to([i, j]), c2p_thread_count)
-        Tx.ptx.fence.proxy_async("shared::cta")
+        Tx.ptxd.fence.proxy.async_.shared__cta()
 
     @Tx.inline
     def advance(self):
@@ -721,12 +721,12 @@ def test_mma_ss_tma_2sm_persistent(
     )
     tmem = tmem_pool.alloc((128, N_COLS), "float32")
     tmem_pool.commit()
-    Tx.ptx.barrier.cluster.arrive()
-    Tx.ptx.barrier.cluster.wait()
+    Tx.ptxd.barrier.cluster.arrive()
+    Tx.ptxd.barrier.cluster.wait()
     Tx.cuda.cta_sync()
     Tx.cuda.trap_when_assert_failed(tmem_addr[0] == 0)
-    Tx.ptx.fence.proxy_async("shared::cta")
-    Tx.ptx.fence.mbarrier_init()
+    Tx.ptxd.fence.proxy.async_.shared__cta()
+    Tx.ptxd.fence.mbarrier_init.release.cluster()
     tile_scheduler.init(cbx, bx, rank, warp_id_in_cta, lane_id)
     while tile_scheduler.valid():
         if tile_scheduler.fetched_task_type[0] == TaskType.RS.value:
@@ -992,7 +992,7 @@ def test_mma_ss_tma_2sm_persistent(
                                 i * EPI_TILE + it * 8 + vec
                             ]
                     Tx.cuda.warpgroup_sync(wg_id)
-                    Tx.ptx.fence.proxy_async("shared::cta")
+                    Tx.ptxd.fence.proxy.async_.shared__cta()
                     if (lane_id == 0) & (warp_id == 0):
                         Tx.ptx.cp_async.bulk.tensor.s2g(
                             2,
@@ -1011,8 +1011,8 @@ def test_mma_ss_tma_2sm_persistent(
                 sem.semaphore_notify(signal_rank, tid, comm_m_idx_local, n_idx, rs_queue)
         tile_scheduler.next_tile(cbx, bx, rank, warp_id_in_cta, lane_id)
     # Synchronize every local and peer-CTA TMEM user before collective deallocation.
-    Tx.ptx.barrier.cluster.arrive()
-    Tx.ptx.barrier.cluster.wait()
+    Tx.ptxd.barrier.cluster.arrive()
+    Tx.ptxd.barrier.cluster.wait()
     tmem_pool.dealloc()
 
 

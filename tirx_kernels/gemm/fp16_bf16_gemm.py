@@ -163,13 +163,13 @@ def _kernel(
     tmem = tmem_pool.alloc((128, 512), "float32")
     # TMEMPool.commit/dealloc wraps the tcgen05 alloc/dealloc handshake.
     tmem_pool.commit()
-    T.ptx.fence.proxy_async("shared::cta")
-    T.ptx.fence.mbarrier_init()
+    T.ptxd.fence.proxy.async_.shared__cta()
+    T.ptxd.fence.mbarrier_init.release.cluster()
     # OVERLAP shapes split the prologue cluster barrier: arrive (relaxed) here, then each
     # active role waits(acquire) after its own setup so the latency overlaps it (idle warps
     # skip the wait). No-overlap shapes keep the cheaper fused cluster_sync.
     if OVERLAP_EPILOGUE:
-        T.ptx.barrier.cluster.arrive(sem="relaxed", aligned=True)
+        T.ptxd.barrier.cluster.arrive.relaxed.aligned()
     else:
         T.cuda.cluster_sync()
 
@@ -182,9 +182,7 @@ def _kernel(
             ld.init(bx // 2)
             tma_cur = PipelineState(PIPE_DEPTH, 1)
             if OVERLAP_EPILOGUE:
-                T.ptx.barrier.cluster.wait(
-                    acquire=True, aligned=False
-                )  # split cluster barrier (loader)
+                T.ptxd.barrier.cluster.wait.acquire()  # split cluster barrier (loader)
 
             @T.inline
             def tma_load_stage(k_tile, m_idx, n_idx):
@@ -234,7 +232,7 @@ def _kernel(
         elif warp_id == 2:
             # -------- CLC SCHEDULER --------
             if OVERLAP_EPILOGUE:
-                T.ptx.barrier.cluster.wait(acquire=True, aligned=False)  # split barrier (scheduler)
+                T.ptxd.barrier.cluster.wait.acquire()  # split barrier (scheduler)
             clc_sched.run_scheduler(cbx)
         elif (warp_id < NUM_CONSUMER) & (cbx == 0):
             # -------- MMA (tcgen05) --------
@@ -244,9 +242,7 @@ def _kernel(
             tmem_buf = PipelineState(TMEM_PHASE_DEPTH, 1)
             accum: T.int32
             if OVERLAP_EPILOGUE:
-                T.ptx.barrier.cluster.wait(
-                    acquire=True, aligned=False
-                )  # split cluster barrier (MMA)
+                T.ptxd.barrier.cluster.wait.acquire()  # split cluster barrier (MMA)
 
             @T.inline
             def mma_stage(buf):
@@ -294,9 +290,7 @@ def _kernel(
         wb.init(bx // 2)
         wb_buf = PipelineState(TMEM_PHASE_DEPTH, 0)
         if OVERLAP_EPILOGUE:
-            T.ptx.barrier.cluster.wait(
-                acquire=True, aligned=False
-            )  # split cluster barrier (consumer)
+            T.ptxd.barrier.cluster.wait.acquire()  # split cluster barrier (consumer)
 
         @T.inline
         def writeback(m_idx, n_idx):
@@ -328,7 +322,7 @@ def _kernel(
                     if (warp_id == 0) & (lane_id == 0):
                         # Proxy fence by the single TMA-issuing thread (warpgroup_sync above
                         # made writes CTA-visible; an all-128-thread fence was the dominant stall).
-                        T.ptx.fence.proxy_async("shared::cta")
+                        T.ptxd.fence.proxy.async_.shared__cta()
                         d_m = T.meta_var(((m_idx * 2 + cbx) * NUM_CONSUMER + wg_id) * BLK_M)
                         d_n = T.meta_var(n_idx * MMA_N + i * EPI_N)
                         Tx.copy_async(
@@ -367,7 +361,7 @@ def _kernel(
                     T.cuda.warpgroup_sync(wg_id + 10)
                     if (warp_id == 0) & (lane_id == 0):
                         # Single-thread proxy fence after the CTA sync (see overlap path).
-                        T.ptx.fence.proxy_async("shared::cta")
+                        T.ptxd.fence.proxy.async_.shared__cta()
                         d_m = T.meta_var(((m_idx * 2 + cbx) * NUM_CONSUMER + wg_id) * BLK_M)
                         d_n = T.meta_var(n_idx * MMA_N + i * EPI_N)
                         Tx.copy_async(

@@ -1634,8 +1634,8 @@ def get_kernel(
     def red_add_gpu_s32(address, value):
         return T.ptxd.red.gpu.global_.add.s32(address, value)
 
-    def load_volatile_u64(address):
-        return T.ptx.ld_volatile(address, "uint64", "u64", space="global")
+    def load_volatile_u64(dst, address):
+        return T.ptxd.ld.volatile.global_.u64(dst, address)
 
     # Destination-first, mirroring the PTX these wrap: the caller declares the
     # register and passes it in.
@@ -1733,7 +1733,7 @@ def get_kernel(
         )
 
     def sync_unaligned(barrier_idx, num_threads):
-        return T.ptx.bar.sync(barrier_idx, num_threads)
+        return T.ptxd.bar.sync(T.uint32(barrier_idx), T.uint32(num_threads))
 
     def prefetch_tensormap(tensor_map):
         return T.ptxd.prefetch.tensormap(T.address_of(tensor_map))
@@ -1775,10 +1775,10 @@ def get_kernel(
         return T.ptx.cp_async_bulk_s2g(dst_ptr, src_ptr, num_bytes, cache_hint="evict_normal")
 
     def tma_store_fence():
-        return T.ptx.fence.proxy_async("shared::cta")
+        return T.ptxd.fence.proxy.async_.shared__cta()
 
     def fence_barrier_init():
-        return T.ptx.fence.mbarrier_init()
+        return T.ptxd.fence.mbarrier_init.release.cluster()
 
     def tma_store_arrive():
         return T.ptx.cp_async.bulk.commit_group()
@@ -2051,8 +2051,8 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
     def atomic_add_u32(dst, address, value):
         return T.ptxd.atom.global_.add.u32(dst, address, value)
 
-    def load_volatile_u32(address):
-        return T.ptx.ld_volatile(address, "uint32", "u32", space="global")
+    def load_volatile_u32(dst, address):
+        return T.ptxd.ld.volatile.global_.u32(dst, address)
 
     def symm_rank_offset_arg_expr(symm_rank_offsets, mapped_rank_idx):
         if num_processes == 1:
@@ -2960,7 +2960,7 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
 
         @T.inline
         def workspace_grid_sync(counter_idx, sync_num_threads, sync_barrier_idx, sync_thread_idx):
-            T.ptx.bar.sync(sync_barrier_idx, sync_num_threads)
+            T.ptxd.bar.sync(T.uint32(sync_barrier_idx), T.uint32(sync_num_threads))
             if sync_thread_idx == 0:
                 if sm_idx == 0:
                     atomic_add_rel_u32(
@@ -2979,7 +2979,7 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
                     load_acq_u32(
                         grid_sync_new_value, workspace_grid_sync_count.ptr_to([counter_idx])
                     )
-            T.ptx.bar.sync(sync_barrier_idx, sync_num_threads)
+            T.ptxd.bar.sync(T.uint32(sync_barrier_idx), T.uint32(sync_num_threads))
 
         @T.inline
         def nvlink_barrier(
@@ -3021,7 +3021,7 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
                             + T.cast(barrier_signal_phase * 4, "uint64"),
                             barrier_target,
                         )
-                    T.ptx.bar.sync(sync_barrier_idx, sync_num_threads)
+                    T.ptxd.bar.sync(T.uint32(sync_barrier_idx), T.uint32(sync_num_threads))
                     if sync_thread_idx == 0:
                         red_add_gpu_u32(workspace_nvl_barrier_counter.ptr_to([0]), T.uint32(1))
                         barrier_target = T.int32(num_processes)
@@ -3110,8 +3110,9 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
                         T.cast(T.shift_right(scheduler_cached_status, 32), "int32")
                         != kernel_config.num_sms * num_processes
                     ):
-                        scheduler_cached_status = load_volatile_u64(
-                            workspace_expert_recv_count_sum.ptr_to([dispatch_expert_idx])
+                        load_volatile_u64(
+                            scheduler_cached_status,
+                            workspace_expert_recv_count_sum.ptr_to([dispatch_expert_idx]),
                         )
                 stored_num_tokens_per_expert[expert_lane_idx] = T.cast(
                     T.bitwise_and(scheduler_cached_status, T.uint64(0xFFFFFFFF)), "uint32"
@@ -3293,9 +3294,10 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
                     sched_required_l1_tasks = (task_info_regs[4] + T.uint32(1)) * T.uint32(
                         num_l1_clusters
                     )
-                    sched_l1_count = load_volatile_u32(workspace_l1_task_count.ptr_to([0]))
+                    sched_l1_count = T.uint32(0)
+                    load_volatile_u32(sched_l1_count, workspace_l1_task_count.ptr_to([0]))
                     while sched_l1_count < sched_required_l1_tasks:
-                        sched_l1_count = load_volatile_u32(workspace_l1_task_count.ptr_to([0]))
+                        load_volatile_u32(sched_l1_count, workspace_l1_task_count.ptr_to([0]))
                     sched_task_valid = T.int32(1)
 
         @T.inline
@@ -3500,8 +3502,8 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
 
         # Relaxed arrive — no prior memory effect needs to be released to peers
         # before TMEM alloc + mbarrier init below. Wait still .acquire (default).
-        T.ptx.barrier.cluster.arrive(sem="relaxed", aligned=True)
-        T.ptx.barrier.cluster.wait(acquire=True, aligned=True)
+        T.ptxd.barrier.cluster.arrive.relaxed.aligned()
+        T.ptxd.barrier.cluster.wait.acquire.aligned()
         full_barrier_init_count: T.int32 = 2 * 2
         tmem_empty_barrier_init_count: T.int32 = 2 * kernel_config.num_epilogue_threads
         is_reserved_non_epilogue_warp = (
@@ -3571,8 +3573,8 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
         # `fence_barrier_init` above is `.release.cluster`, so the cluster
         # arrive here doesn't need release semantics. `.wait.acquire` pairs
         # with that release to make mbarrier init visible to other CTAs.
-        T.ptx.barrier.cluster.arrive(sem="relaxed", aligned=True)
-        T.ptx.barrier.cluster.wait(acquire=True, aligned=True)
+        T.ptxd.barrier.cluster.arrive.relaxed.aligned()
+        T.ptxd.barrier.cluster.wait.acquire.aligned()
         if flat_warp_idx < kernel_config.num_dispatch_warps:
             warpgroup_reg_dealloc(num_dispatch_registers)
             dispatch_token_iter = (
@@ -3601,7 +3603,9 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
                     * kernel_config.num_tokens_per_warp
                 )
 
-            T.ptx.bar.sync(dispatch_sync_barrier_idx, kernel_config.num_dispatch_threads)
+            T.ptxd.bar.sync(
+                T.uint32(dispatch_sync_barrier_idx), T.uint32(kernel_config.num_dispatch_threads)
+            )
             dispatch_expert_idx = flat_warp_idx * 32 + lane_idx
             while T.cast(dispatch_expert_idx, "uint32") < T.uint32(num_experts):
                 send_value = T.bitwise_or(
@@ -3615,7 +3619,9 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
                 )
                 smem_expert_count[dispatch_expert_idx] = T.cast(prev_send_count, "int32")
                 dispatch_expert_idx = dispatch_expert_idx + kernel_config.num_dispatch_threads
-            T.ptx.bar.sync(dispatch_sync_barrier_idx, kernel_config.num_dispatch_threads)
+            T.ptxd.bar.sync(
+                T.uint32(dispatch_sync_barrier_idx), T.uint32(kernel_config.num_dispatch_threads)
+            )
 
         if flat_warp_idx < kernel_config.num_dispatch_warps:
             dispatch_token_iter = (
@@ -3717,7 +3723,9 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
                 )
                 dispatch_expert_idx = dispatch_expert_idx + kernel_config.num_dispatch_threads
         if flat_warp_idx < kernel_config.num_dispatch_warps:
-            T.ptx.bar.sync(dispatch_sync_barrier_idx, kernel_config.num_dispatch_threads)
+            T.ptxd.bar.sync(
+                T.uint32(dispatch_sync_barrier_idx), T.uint32(kernel_config.num_dispatch_threads)
+            )
         if flat_warp_idx < kernel_config.num_dispatch_warps:
             dispatch_nvlink_barrier_before_pull(flat_warp_idx * 32 + lane_idx)
             T.evaluate(
@@ -3987,7 +3995,9 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
                     kernel_config.num_dispatch_threads + kernel_config.num_epilogue_threads,
                 )
             )
-            T.ptx.bar.sync(dispatch_sync_barrier_idx, kernel_config.num_dispatch_threads)
+            T.ptxd.bar.sync(
+                T.uint32(dispatch_sync_barrier_idx), T.uint32(kernel_config.num_dispatch_threads)
+            )
             if sm_idx == 0:
                 # SM 0: clear expert send count and schedule task counters
                 dispatch_expert_idx = thread_idx
@@ -4028,7 +4038,10 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
                         pool_block_offset_sum,
                     )
                     pull_pool_block_offset = pool_block_offset_sum[0]
-                    T.ptx.bar.sync(dispatch_sync_barrier_idx, kernel_config.num_dispatch_threads)
+                    T.ptxd.bar.sync(
+                        T.uint32(dispatch_sync_barrier_idx),
+                        T.uint32(kernel_config.num_dispatch_threads),
+                    )
                     if thread_idx == 0:
                         workspace_expert_recv_count_sum[pull_local_expert_idx] = T.uint64(0)
                     if kernel_collect_stats and flat_warp_idx == 1 and lane_idx == 0:
@@ -4633,7 +4646,9 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
                             T.cuda.warp_sync()
                         tma_stage_idx = s % num_tma_store_stages
                         T.evaluate(tma_store_wait(1))
-                        T.ptx.bar.sync(epilogue_wg_sync_barrier_start_idx + epilogue_wg_idx, 128)
+                        T.ptxd.bar.sync(
+                            T.uint32(epilogue_wg_sync_barrier_start_idx + epilogue_wg_idx), 128
+                        )
                         for i in T.unroll(0, num_atoms_per_store):
                             j = s * num_atoms_per_store + i
                             amax_reduction_idx = (
@@ -4714,7 +4729,9 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
                                     T.shift_right(sf_bits_hi, T.uint32(23)), "int8"
                                 )
                         T.cuda.warp_sync()
-                        T.ptx.bar.sync(epilogue_wg_sync_barrier_start_idx + epilogue_wg_idx, 128)
+                        T.ptxd.bar.sync(
+                            T.uint32(epilogue_wg_sync_barrier_start_idx + epilogue_wg_idx), 128
+                        )
                         if (warp_idx_in_wg == 0) & T.ptx.elect_sync() != 0:
                             T.evaluate(tma_store_fence())
                             sm90_tma_store_2d_copy(
@@ -4728,8 +4745,9 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
                             T.evaluate(tma_store_arrive())
                         T.cuda.warp_sync()
                     T.evaluate(tma_store_wait(0))
-                    T.ptx.bar.sync(
-                        epilogue_full_sync_barrier_idx, kernel_config.num_epilogue_threads
+                    T.ptxd.bar.sync(
+                        T.uint32(epilogue_full_sync_barrier_idx),
+                        T.uint32(kernel_config.num_epilogue_threads),
                     )
                     if (epilogue_warp_idx == 0) & T.ptx.elect_sync() != 0:
                         atomic_add_rel_u32(
@@ -4786,8 +4804,9 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
                             )
                             fence_view_async_tmem_load()
                             if i == 0 and s > 0:
-                                T.ptx.bar.sync(
-                                    epilogue_wg_sync_barrier_start_idx + epilogue_wg_idx, 128
+                                T.ptxd.bar.sync(
+                                    T.uint32(epilogue_wg_sync_barrier_start_idx + epilogue_wg_idx),
+                                    128,
                                 )
                             if (
                                 s == wg_block_m // kernel_config.store_block_m - 1
@@ -4828,7 +4847,9 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
                                 ]
                             )
                             sm90_u32x4_stsm_t_copy(epilogue_bf16_packed, smem_ptr)
-                        T.ptx.bar.sync(epilogue_wg_sync_barrier_start_idx + epilogue_wg_idx, 128)
+                        T.ptxd.bar.sync(
+                            T.uint32(epilogue_wg_sync_barrier_start_idx + epilogue_wg_idx), 128
+                        )
                         row_in_atom = (warp_idx_in_wg * 2 + lane_idx // 16) % atom_m
                         bank_group_idx = lane_idx % 8
                         lane_col_offset = (lane_idx % 16) * 8
@@ -4890,8 +4911,9 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
                                     epilogue_bf16_packed[2],
                                     epilogue_bf16_packed[3],
                                 )
-                    T.ptx.bar.sync(
-                        epilogue_full_sync_barrier_idx, kernel_config.num_epilogue_threads
+                    T.ptxd.bar.sync(
+                        T.uint32(epilogue_full_sync_barrier_idx),
+                        T.uint32(kernel_config.num_epilogue_threads),
                     )
             epilogue_thread_idx = epilogue_warp_idx * 32 + lane_idx
             epilogue_nvlink_barrier_before_combine_reduce(epilogue_thread_idx)

@@ -773,7 +773,7 @@ def get_kernel(**kwargs: Any):
         return out[0]
 
     def cuda_grid_dependency_synchronize():
-        T.evaluate(T.ptx.griddepcontrol.wait())
+        T.evaluate(T.ptxd.griddepcontrol.wait())
 
     # Race-safe early L2 warm-up helper (see the block-table prefetch in the
     # kernel prologue).
@@ -1180,7 +1180,7 @@ def get_kernel(**kwargs: Any):
                     mbarrier_init_cta(
                         smem_barriers.ptr_to([empty_q_barrier_base + init_i]), T.uint32(8)
                     )
-                T.ptx.fence.mbarrier_init()
+                T.ptxd.fence.mbarrier_init.release.cluster()
         if warp_idx == tma_warp_1:
             if T.ptx.elect_sync():
                 for init_i in T.unroll(0, num_kv_stages):
@@ -1190,7 +1190,7 @@ def get_kernel(**kwargs: Any):
                     mbarrier_init_cta(
                         smem_barriers.ptr_to([empty_kv_barrier_base + init_i]), T.uint32(4)
                     )
-                T.ptx.fence.mbarrier_init()
+                T.ptxd.fence.mbarrier_init.release.cluster()
         if warp_idx == umma_warp_0:
             if T.ptx.elect_sync():
                 for init_i in T.unroll(0, num_kv_stages):
@@ -1206,7 +1206,7 @@ def get_kernel(**kwargs: Any):
                         ),
                         T.uint32(4),
                     )
-                T.ptx.fence.mbarrier_init()
+                T.ptxd.fence.mbarrier_init.release.cluster()
         if warp_idx == umma_warp_0 + 1:
             if T.ptx.elect_sync():
                 for init_i in T.unroll(0, num_umma_barriers):
@@ -1216,7 +1216,7 @@ def get_kernel(**kwargs: Any):
                     mbarrier_init_cta(
                         smem_barriers.ptr_to([empty_umma_barrier_base + init_i]), T.uint32(4)
                     )
-                T.ptx.fence.mbarrier_init()
+                T.ptxd.fence.mbarrier_init.release.cluster()
         T.cuda.cta_sync()
 
         cuda_grid_dependency_synchronize()
@@ -1503,7 +1503,7 @@ def get_kernel(**kwargs: Any):
                 T.ptx.tcgen05.alloc(
                     T.address_of(tmem_ptr_in_smem[0]), n_cols=num_tmem_cols, cta_group=1
                 )
-            T.ptx.bar.sync(9, num_math_threads + 2 * 32)
+            T.ptxd.bar.sync(9, T.uint32(num_math_threads + 2 * 32))
             current_q_atom_idx: T.uint32 = start_q_atom_idx
             current_kv_idx: T.uint32 = start_kv_idx
             current_num_kv: T.uint32 = start_num_kv
@@ -1642,7 +1642,7 @@ def get_kernel(**kwargs: Any):
             T.ptx.setmaxnreg(True, num_math_registers)
             # Math warps consume TMEM: wait on named barrier 9 for the UMMA
             # warp's tcgen05.alloc (see the UMMA branch).
-            T.ptx.bar.sync(9, num_math_threads + 2 * 32)
+            T.ptxd.bar.sync(9, T.uint32(num_math_threads + 2 * 32))
             current_q_atom_idx: T.uint32 = start_q_atom_idx
             current_kv_idx: T.uint32 = start_kv_idx
             current_num_kv: T.uint32 = start_num_kv
@@ -1959,8 +1959,8 @@ def get_kernel(**kwargs: Any):
                 current_q_atom_idx = scheduler_result[4]
                 current_kv_idx = scheduler_result[5]
                 current_num_kv = scheduler_result[6]
-            T.ptx.griddepcontrol.launch_dependents()
-            T.ptx.bar.sync(8, num_math_threads)
+            T.ptxd.griddepcontrol.launch_dependents()
+            T.ptxd.bar.sync(8, T.uint32(num_math_threads))
             if warp_idx == 0:
                 T.ptx.tcgen05.dealloc(T.uint32(0), n_cols=num_tmem_cols, cta_group=1)
 

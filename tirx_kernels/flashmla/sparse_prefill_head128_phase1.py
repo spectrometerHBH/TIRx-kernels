@@ -362,7 +362,7 @@ def _kernel(
                 T.ptx.mbarrier.init(bar_so_ready.ptr_to([init_stage]), 128 * 2)
                 T.ptx.mbarrier.init(bar_k_valid_ready.ptr_to([init_stage]), 16)
                 T.ptx.mbarrier.init(bar_k_valid_free.ptr_to([init_stage]), 128)
-            T.ptx.fence.mbarrier_init()
+            T.ptxd.fence.mbarrier_init.release.cluster()
 
     T.cuda.cluster_sync()
 
@@ -453,9 +453,9 @@ def _kernel(
             cur_pi_max = cur_pi_max * sm_scale_div_log2
             bar_k_valid_free.arrive(cur_buf)
 
-            T.ptx.bar.sync(BAR_WG0_SYNC, 128)
+            T.ptxd.bar.sync(T.uint32(BAR_WG0_SYNC), 128)
             rowwise_max_buf[idx_in_warpgroup] = cur_pi_max
-            T.ptx.bar.sync(BAR_WG0_SYNC, 128)
+            T.ptxd.bar.sync(T.uint32(BAR_WG0_SYNC), 128)
             cur_pi_max = T.max(cur_pi_max, rowwise_max_buf[idx_in_warpgroup ^ 64])
             real_mi = T.max(real_mi, cur_pi_max)
             should_scale_o: T.bool = (
@@ -522,7 +522,7 @@ def _kernel(
                     T.ptx.tcgen05.wait.st()
                 T.ptx.tcgen05.fence.before_thread_sync()
 
-            T.ptx.fence.proxy_async("shared::cta")
+            T.ptxd.fence.proxy.async_.shared__cta()
             bar_so_ready.arrive(cur_buf, remote=T.uint32(0))
             iket.range_end(softmax_token)
 
@@ -532,7 +532,7 @@ def _kernel(
             mi = T.float32(-float("inf"))
 
         rowwise_li_buf[idx_in_warpgroup] = li
-        T.ptx.bar.sync(BAR_WG0_SYNC, 128)
+        T.ptxd.bar.sync(T.uint32(BAR_WG0_SYNC), 128)
         li = li + rowwise_li_buf[idx_in_warpgroup ^ 64]
 
         if idx_in_warpgroup < B_H // 2:
@@ -584,8 +584,8 @@ def _kernel(
                 o_smem_win.chunk((None, (D_V // 2) // B_EPI))[:, epi_k], o_epi_bf16_frag[:, :]
             )
 
-            T.ptx.fence.proxy_async("shared::cta")
-            T.ptx.bar.sync(BAR_WG0_SYNC, 128)
+            T.ptxd.fence.proxy.async_.shared__cta()
+            T.ptxd.bar.sync(T.uint32(BAR_WG0_SYNC), 128)
             if warp_idx == 0:
                 if T.ptx.elect_sync():
                     Tx.copy_async(

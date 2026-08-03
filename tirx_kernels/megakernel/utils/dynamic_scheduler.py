@@ -61,7 +61,7 @@ class Semaphore(SemaphoreBase):
     def semaphore_wait(self, *coord, level: Literal["cta", "warp"] = "cta", mask=0xFFFFFFFF):
         if level == "cta":
             while 1:
-                T.ptx.ld_global_acquire(
+                T.ptxd.ld.acquire.gpu.global_.b32(
                     self.state[0], self.sem.access_ptr("r", offset=self.sem.elem_offset_of(coord))
                 )
                 if T.cuda.syncthreads_and(self.state[0] == 0):
@@ -74,7 +74,7 @@ class Semaphore(SemaphoreBase):
                 self.state[0] = -1
                 while 1:
                     if lane_id == 0:
-                        T.ptx.ld_global_acquire(
+                        T.ptxd.ld.acquire.gpu.global_.b32(
                             self.state[0],
                             self.sem.access_ptr("r", offset=self.sem.elem_offset_of(coord)),
                         )
@@ -91,7 +91,7 @@ class Semaphore(SemaphoreBase):
         self.state[0] = atomic_add_int32(self.sem.ptr_to(coord), -number, rank, release=release)
         if self.state[0] <= 0:
             while 1:
-                T.ptx.ld_global_acquire(self.state[0], self.sem.ptr_to(coord))
+                T.ptxd.ld.acquire.gpu.global_.b32(self.state[0], self.sem.ptr_to(coord))
                 if gt(self.state[0], 0):
                     self.state[0] = atomic_add_int32(
                         self.sem.ptr_to(coord), -number, rank, release=release
@@ -201,7 +201,7 @@ class MPMCQueue:
                         rank,
                     )
                 if level == "warpgroup":
-                    T.ptx.bar.sync(6 + wg_id, 128)
+                    T.ptxd.bar.sync(T.uint32(6 + wg_id), 128)
                 elif level == "cta":
                     T.tvm_storage_sync("shared")
                 self.tail_r = self.tail_smem[scope_idx]
@@ -307,8 +307,8 @@ class DynamicTileScheduler(TileSchedulerBase):
             self.p2c_dequeue_barrier.init(1)
             self.c2p_dequeue_barrier.init(KernelConfig.NUM_THREADS)
         T.tvm_storage_sync("shared")
-        T.ptx.fence.proxy_async("shared::cta")
-        T.ptx.fence.mbarrier_init()
+        T.ptxd.fence.proxy.async_.shared__cta()
+        T.ptxd.fence.mbarrier_init.release.cluster()
 
     @T.inline
     def next_tile(self):
@@ -365,7 +365,7 @@ class DynamicTileScheduler(TileSchedulerBase):
             elif scope == "warp":
                 T.cuda.warp_sync()
             elif scope == "warpgroup":
-                T.ptx.bar.sync(6 + scope_id, 128)
+                T.ptxd.bar.sync(T.uint32(6 + scope_id), 128)
             elif scope == "cta":
                 T.tvm_storage_sync("shared")
 

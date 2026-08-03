@@ -300,8 +300,8 @@ def _kernel(
     tmem = tmem_pool.alloc((128, N_COLS_TMEM), "float32")
     tmem_pool.move_base_to(0)
     tmem_as_f16 = tmem_pool.alloc((128, N_COLS_TMEM * 2), "float16")
-    T.ptx.fence.proxy_async("shared::cta")
-    T.ptx.fence.mbarrier_init()
+    T.ptxd.fence.proxy.async_.shared__cta()
+    T.ptxd.fence.mbarrier_init.release.cluster()
     T.cuda.cta_sync()
     # S and O share the (128, N_COLS_TMEM) f32 tmem as 2*SMEM_PIPE_DEPTH_Q
     # MMA_N-wide stages: S in the low SMEM_PIPE_DEPTH_Q, O in the high ones
@@ -729,9 +729,9 @@ def _kernel(
                 # and therefore the PV MMA. The reverse (sScale slot reuse)
                 # direction stays on softmax_corr.empty.
                 if STATS_BAR_PAIRWISE:
-                    tvm.backend.cuda.op.ptx_bar_arrive(1 + wg_id * 4 + warp_id, 64)
+                    T.ptxd.bar.arrive(T.uint32(1 + wg_id * 4 + warp_id), 64)
                 else:
-                    tvm.backend.cuda.op.ptx_bar_arrive(1 + wg_id, 256)
+                    T.ptxd.bar.arrive(T.uint32(1 + wg_id), 256)
                 softmax_fma_token = iket.sentinel_token("softmax-fma")
                 if warp_id == 0:
                     softmax_fma_token = iket.range_start("softmax-fma")
@@ -895,7 +895,7 @@ def _kernel(
                                 vec_len=8,
                             )
                 iket.range_end(epi_ld_tmem_token)
-                T.ptx.fence.proxy_async("shared::cta")
+                T.ptxd.fence.proxy.async_.shared__cta()
                 corr_epi.full.arrive(wg_id)
                 p_o_rescale.arrive(wg_id)
                 phase_oepi ^= 1
@@ -903,20 +903,20 @@ def _kernel(
                 if tid_in_wg < BLK_M:
                     sScale[ROW_SUM_BASE + tid_in_wg + wg_id * BLK_M] = row_sum[0]
                 if STATS_BAR_PAIRWISE:
-                    tvm.backend.cuda.op.ptx_bar_arrive(1 + wg_id * 4 + warp_id, 64)
+                    T.ptxd.bar.arrive(T.uint32(1 + wg_id * 4 + warp_id), 64)
                 else:
-                    tvm.backend.cuda.op.ptx_bar_arrive(1 + wg_id, 256)
+                    T.ptxd.bar.arrive(T.uint32(1 + wg_id), 256)
         if wg_id == 2:
             T.ptx.setmaxnreg(False, 64)
             if STATS_BAR_PAIRWISE:
-                tvm.backend.cuda.op.ptx_bar_sync(1 + 0 * 4 + warp_id, 64)
+                T.ptxd.bar.sync(T.uint32(1 + 0 * 4 + warp_id), 64)
             else:
-                tvm.backend.cuda.op.ptx_bar_sync(1 + 0, 256)
+                T.ptxd.bar.sync(T.uint32(1 + 0), 256)
             softmax_corr.empty.arrive(0)
             if STATS_BAR_PAIRWISE:
-                tvm.backend.cuda.op.ptx_bar_sync(1 + 1 * 4 + warp_id, 64)
+                T.ptxd.bar.sync(T.uint32(1 + 1 * 4 + warp_id), 64)
             else:
-                tvm.backend.cuda.op.ptx_bar_sync(1 + 1, 256)
+                T.ptxd.bar.sync(T.uint32(1 + 1), 256)
             phase_q ^= 1
             corr_trip_count: T.let = (
                 get_n_block_max(m_block_idx, is_causal, SEQ_LEN_KV, SEQ_LEN_Q, SEQ_Q_PER_TILE)
@@ -926,9 +926,9 @@ def _kernel(
             for i_kv in T.serial(corr_trip_count - 1, unroll=False):
                 for i_q in T.unroll(2):
                     if STATS_BAR_PAIRWISE:
-                        tvm.backend.cuda.op.ptx_bar_sync(1 + i_q * 4 + warp_id, 64)
+                        T.ptxd.bar.sync(T.uint32(1 + i_q * 4 + warp_id), 64)
                     else:
-                        tvm.backend.cuda.op.ptx_bar_sync(1 + i_q, 256)
+                        T.ptxd.bar.sync(T.uint32(1 + i_q), 256)
                     correction_token = iket.sentinel_token("correction")
                     if warp_id == 0:
                         correction_token = iket.range_start("correction")
@@ -973,9 +973,9 @@ def _kernel(
             if not EPI_ON_SOFTMAX:
                 for i_q in T.unroll(2):
                     if STATS_BAR_PAIRWISE:
-                        tvm.backend.cuda.op.ptx_bar_sync(1 + i_q * 4 + warp_id, 64)
+                        T.ptxd.bar.sync(T.uint32(1 + i_q * 4 + warp_id), 64)
                     else:
-                        tvm.backend.cuda.op.ptx_bar_sync(1 + i_q, 256)
+                        T.ptxd.bar.sync(T.uint32(1 + i_q), 256)
                     row_sum: T.let = sScale[ROW_SUM_BASE + tid_in_wg + i_q * BLK_M]
                     softmax_corr.empty.arrive(i_q)
                     o_ready.wait(i_q, phase_tmem)
@@ -1014,7 +1014,7 @@ def _kernel(
                                 vec_len=8,
                             )
                     iket.range_end(epi_ld_tmem_token)
-                    T.ptx.fence.proxy_async("shared::cta")
+                    T.ptxd.fence.proxy.async_.shared__cta()
                     corr_epi.full.arrive(i_q)
                     p_o_rescale.arrive(i_q)
                 phase_tmem ^= 1

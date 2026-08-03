@@ -765,7 +765,7 @@ def get_kernel(**kwargs: Any):
         return T.shift_left(T.cast(runtime_desc, "uint64"), T.uint64(32))
 
     def cuda_grid_dependency_synchronize():
-        T.evaluate(T.ptx.griddepcontrol.wait())
+        T.evaluate(T.ptxd.griddepcontrol.wait())
 
     def mbarrier_init_cta(barrier_ptr, arrive_count):
         T.evaluate(T.ptx.mbarrier.init(barrier_ptr, arrive_count))
@@ -1281,7 +1281,7 @@ def get_kernel(**kwargs: Any):
                         smem_barriers.ptr_to([empty_q_barrier_base + init_i]),
                         T.uint32(num_math_threads),
                     )
-                T.ptx.fence.mbarrier_init()
+                T.ptxd.fence.mbarrier_init.release.cluster()
         if warp_idx_presync == tma_warp_1:
             if T.ptx.elect_sync():
                 for init_i in T.unroll(0, num_kv_stages):
@@ -1291,7 +1291,7 @@ def get_kernel(**kwargs: Any):
                     mbarrier_init_cta(
                         smem_barriers.ptr_to([empty_kv_barrier_base + init_i]), T.uint32(1)
                     )
-                T.ptx.fence.mbarrier_init()
+                T.ptxd.fence.mbarrier_init.release.cluster()
         if warp_idx_presync == umma_warp_0:
             if T.ptx.elect_sync():
                 for init_i in T.unroll(0, num_kv_stages):
@@ -1307,7 +1307,7 @@ def get_kernel(**kwargs: Any):
                         ),
                         T.uint32(1),
                     )
-                T.ptx.fence.mbarrier_init()
+                T.ptxd.fence.mbarrier_init.release.cluster()
         if warp_idx_presync == umma_warp_0 + 1:
             if T.ptx.elect_sync():
                 for init_i in T.unroll(0, num_tmem_barriers):
@@ -1317,7 +1317,7 @@ def get_kernel(**kwargs: Any):
                     mbarrier_init_cta(
                         smem_barriers.ptr_to([empty_tmem_barrier_base + init_i]), T.uint32(128)
                     )
-                T.ptx.fence.mbarrier_init()
+                T.ptxd.fence.mbarrier_init.release.cluster()
             T.ptx.tcgen05.alloc(
                 T.address_of(tmem_ptr_in_smem[0]), n_cols=num_tmem_cols, cta_group=1
             )
@@ -1674,7 +1674,7 @@ def get_kernel(**kwargs: Any):
                     for sfq_i in T.unroll(0, num_sfq_atom // num_utccp_aligned_elems):
                         sfq_base = T.uint32(sfq_i * num_utccp_aligned_elems)
                         utccp_required_smem_warp_transpose(sfq_stage, sfq_base)
-                        T.ptx.fence.proxy_async("shared::cta")
+                        T.ptxd.fence.proxy.async_.shared__cta()
                         desc_sf = replace_smem_desc_addr(desc_sf, sfq_stage.ptr_to([sfq_base]))
                         if T.ptx.elect_sync():
                             T.ptx.tcgen05.cp(
@@ -1721,7 +1721,7 @@ def get_kernel(**kwargs: Any):
                 for sfkv_i in T.unroll(0, num_sfkv // num_utccp_aligned_elems):
                     sfkv_base = T.uint32(sfkv_i * num_utccp_aligned_elems)
                     utccp_required_smem_warp_transpose(sfkv_stage, sfkv_base)
-                    T.ptx.fence.proxy_async("shared::cta")
+                    T.ptxd.fence.proxy.async_.shared__cta()
                 if T.ptx.elect_sync():
                     for sfkv_i in T.unroll(0, num_sfkv // num_utccp_aligned_elems):
                         sfkv_base = T.uint32(sfkv_i * num_utccp_aligned_elems)
@@ -2082,8 +2082,8 @@ def get_kernel(**kwargs: Any):
                 current_q_atom_idx = scheduler_result[4]
                 current_kv_idx = scheduler_result[5]
                 current_num_kv = scheduler_result[6]
-            T.ptx.griddepcontrol.launch_dependents()
-            T.ptx.bar.sync(8, num_math_threads)
+            T.ptxd.griddepcontrol.launch_dependents()
+            T.ptxd.bar.sync(8, T.uint32(num_math_threads))
             if warp_idx == 0:
                 T.ptx.tcgen05.dealloc(T.uint32(0), n_cols=num_tmem_cols, cta_group=1)
 

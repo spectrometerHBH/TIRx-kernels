@@ -362,10 +362,10 @@ def get_kernel(**kwargs: Any):
         return T.cast(T.ptx.fetch_register(32, "laneid"), "uint32")
 
     def cuda_grid_dependency_synchronize():
-        T.evaluate(T.ptx.griddepcontrol.wait())
+        T.evaluate(T.ptxd.griddepcontrol.wait())
 
     def named_barrier_sync_8(count):
-        T.evaluate(T.ptx.bar.sync(8, count))
+        T.evaluate(T.ptxd.bar.sync(8, T.uint32(count)))
 
     @T.prim_func
     def sm100_fp8_mqa_logits(
@@ -502,7 +502,7 @@ def get_kernel(**kwargs: Any):
             schedule_result[1] = num_kv_blocks
 
         # Pipeline constructors already ran mbarrier.init; fence + cta_sync publish them.
-        T.ptx.fence.mbarrier_init()
+        T.ptxd.fence.mbarrier_init.release.cluster()
         if warp_idx == spec_warp_start + 2:
             T.ptx.tcgen05.alloc(
                 T.address_of(tmem_ptr_in_smem[0]), n_cols=num_tmem_cols, cta_group=1
@@ -689,7 +689,7 @@ def get_kernel(**kwargs: Any):
                     )
                     # Publish the generic-proxy weight reads before this consumer
                     # eventually releases the Q stage for a subsequent TMA overwrite.
-                    T.ptx.fence.proxy_async("shared::cta")
+                    T.ptxd.fence.proxy.async_.shared__cta()
                     kv_offset: T.uint32 = kv_start + math_thread_idx
                     kv_idx: T.uint32 = T.uint32(0)
                     while kv_idx < num_kv_blocks:
@@ -703,7 +703,7 @@ def get_kernel(**kwargs: Any):
                         tmem_pipe.full.wait(tmem_stage_idx, tmem_phase)
                         # Release the kv stage only after the tmem accumulator is
                         # ready, and fence the generic-proxy scale_kv read first.
-                        T.ptx.fence.proxy_async("shared::cta")
+                        T.ptxd.fence.proxy.async_.shared__cta()
                         kv_pipe.empty.arrive(kv_stage_idx)
                         tmem_stage_base: T.uint32 = tmem_stage_idx * T.uint32(umma_n)
                         for q_inner_i in T.unroll(0, block_q):

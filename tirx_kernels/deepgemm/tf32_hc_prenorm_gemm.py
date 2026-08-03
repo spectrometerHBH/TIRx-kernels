@@ -393,7 +393,7 @@ def get_kernel(**kwargs: Any):
     remain_k_blocks = num_k_blocks % num_splits
 
     def cuda_grid_dependency_synchronize():
-        T.evaluate(T.ptx.griddepcontrol.wait())
+        T.evaluate(T.ptxd.griddepcontrol.wait())
 
     def fma_sum_of_squares(acc0, acc1, a_flat, row_w, npairs, sc):
         # Parse-time unrolled packed fma.f32x2 sum-of-squares into the two per-row
@@ -488,7 +488,7 @@ def get_kernel(**kwargs: Any):
         _tmem = tmem_pool.alloc((128, num_tmem_cols), "float32", layout=tmem_layout)
 
         # Make the inited barriers visible before the cta_sync.
-        T.ptx.fence.mbarrier_init()
+        T.ptxd.fence.mbarrier_init.release.cluster()
         tmem_pool.commit()  # warp-2-guarded tcgen05.alloc (self-guards via thread_rank)
         T.cuda.cta_sync()
 
@@ -602,8 +602,8 @@ def get_kernel(**kwargs: Any):
                     Tx.copy(smem_cd_mma[m_row, i * 4 : (i + 1) * 4], d_frag[:])
                 T.cuda.warp_sync()
 
-            T.ptx.fence.proxy_async("shared::cta")
-            T.ptx.bar.sync(0, num_mma_threads)
+            T.ptxd.fence.proxy.async_.shared__cta()
+            T.ptxd.bar.sync(0, T.uint32(num_mma_threads))
             if warp_idx == 0:
                 if T.ptx.elect_sync():
                     # D store via TMA (writes only the valid region of boundary tiles).
