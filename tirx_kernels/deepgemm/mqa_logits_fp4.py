@@ -572,8 +572,8 @@ def get_kernel(**kwargs: Any):
         T.ptxd.fence.mbarrier_init.release.cluster()
 
         if warp_idx == spec_warp_start + 2:
-            T.ptx.tcgen05.alloc(
-                T.address_of(tmem_ptr_in_smem[0]), n_cols=num_tmem_cols, cta_group=1
+            T.ptxd.tcgen05.alloc.cta_group__1.sync.aligned.shared__cta.b32(
+                T.address_of(tmem_ptr_in_smem[0]), T.uint32(num_tmem_cols)
             )
         T.cuda.cta_sync()
 
@@ -892,13 +892,13 @@ def get_kernel(**kwargs: Any):
                                 accum_2d[:, 0 : num_heads // 2],
                                 tmem[:, tmem_addr : tmem_addr + num_heads // 2],
                             )
-                            T.ptx.tcgen05.wait.ld()
+                            T.ptxd.tcgen05.wait__ld.sync.aligned()
                             tmem_addr_hi: T.uint32 = tmem_addr + T.uint32(num_heads // 2)
                             Tx.warpgroup.copy_async(
                                 accum_2d[:, num_heads // 2 : num_heads],
                                 tmem[:, tmem_addr_hi : tmem_addr_hi + num_heads // 2],
                             )
-                            T.ptx.tcgen05.wait.ld()
+                            T.ptxd.tcgen05.wait__ld.sync.aligned()
                             if q_inner_i == block_q - 1:
                                 tmem_pipe.empty.arrive(tmem_stage_idx)
                             # Weighted-ReLU reduce via inline CUDA (see _mqa_fp4_wrelu_reduce_src).
@@ -949,7 +949,9 @@ def get_kernel(**kwargs: Any):
                     q_phase = q_phase ^ T.uint32(1)
             T.ptxd.bar.sync(8, T.uint32(num_math_threads))
             if warp_idx == 0:
-                T.ptx.tcgen05.dealloc(T.uint32(0), n_cols=num_tmem_cols, cta_group=1)
+                T.ptxd.tcgen05.dealloc.cta_group__1.sync.aligned.b32(
+                    T.uint32(0), T.uint32(num_tmem_cols)
+                )
 
     return sm100_fp4_mqa_logits.with_attr(
         "tirx.kernel_launch_params",

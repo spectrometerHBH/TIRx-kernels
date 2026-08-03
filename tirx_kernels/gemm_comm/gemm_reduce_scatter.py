@@ -872,7 +872,7 @@ def test_mma_ss_tma_2sm_persistent(
                 elif (warp_id < 2) & (cbx == 0):
                     if Tx.filter(lane_id, Tx.ptx.elect_sync()):
                         tmem_pipe.empty.wait(warp_id, phase_tmem)
-                        Tx.ptx.tcgen05.fence.after_thread_sync()
+                        Tx.ptxd.tcgen05.fence__after_thread_sync()
                         for ko in Tx.serial(PIPE_CYCLE):
                             for ks in Tx.unroll(PIPELINE_DEPTH):
                                 stage = ko * PIPELINE_DEPTH + ks
@@ -978,11 +978,11 @@ def test_mma_ss_tma_2sm_persistent(
                 Tx.cuda.trap_when_assert_failed(tmem_addr[0] == 0)
                 tmem_pipe.full.wait(wg_id, phase_tmem)
                 phase_tmem = phase_tmem ^ 1
-                Tx.ptx.tcgen05.fence.after_thread_sync()
+                Tx.ptxd.tcgen05.fence__after_thread_sync()
                 for i in Tx.unroll(MMA_N // TMEM_LD_SIZE):
                     col_st = Tx.meta_var(wg_id * MMA_N + i * TMEM_LD_SIZE)
                     Tx.wg.copy_async(reg_wg[:, :], tmem[:, col_st : col_st + TMEM_LD_SIZE])
-                    Tx.ptx.tcgen05.wait.ld()
+                    Tx.ptxd.tcgen05.wait__ld.sync.aligned()
                     Tx.thread.cast(reg_fp16[i * TMEM_LD_SIZE : (i + 1) * TMEM_LD_SIZE], reg)
                 tmem_pipe.empty.arrive(wg_id, remote=0)
                 for i in Tx.unroll(NUM_CONSUMER * BLK_N // EPI_TILE):

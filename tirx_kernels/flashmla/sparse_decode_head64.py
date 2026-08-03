@@ -690,9 +690,11 @@ def _kernel(
                 T.ptx.mbarrier.init(bar_valid_ready.ptr_to([index_stage]), 32)
                 T.ptx.mbarrier.init(bar_valid_free.ptr_to([index_stage]), 258)
             T.ptxd.fence.mbarrier_init.release.cluster()
-        T.ptx.tcgen05.alloc(T.address_of(tmem_start_addr[0]), n_cols=512, cta_group=1)
+        T.ptxd.tcgen05.alloc.cta_group__1.sync.aligned.shared__cta.b32(
+            T.address_of(tmem_start_addr[0]), T.uint32(512)
+        )
         T.cuda.trap_when_assert_failed(tmem_start_addr[0] == T.uint32(0))
-        T.ptx.tcgen05.relinquish_alloc_permit(cta_group=1)
+        T.ptxd.tcgen05.relinquish_alloc_permit.cta_group__1.sync.aligned()
     T.cuda.cta_sync()
 
     if warpgroup_idx == 0:
@@ -781,7 +783,7 @@ def _kernel(
                     T.ptxd.bar.sync(T.uint32(BAR_WG0_SYNC), 128)
                     bar_valid_ready.wait(rs_index.stage, rs_index.phase)
                     bar_qk_done.wait(rs_buf.stage, rs_buf.phase)
-                    T.ptx.tcgen05.fence.after_thread_sync()
+                    T.ptxd.tcgen05.fence__after_thread_sync()
 
                     p_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, B_TOPK // 2), "float32")
                     p_peer_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, B_TOPK // 2), "float32")
@@ -793,8 +795,8 @@ def _kernel(
                     else:
                         Tx.wg.copy_async(p_peer_frag[:, :], p_tmem_win.chunk((None, 2))[:, 0])
                         Tx.wg.copy_async(p_frag[:, :], p_tmem_win.chunk((None, 2))[:, 1])
-                    T.ptx.tcgen05.wait.ld()
-                    T.ptx.tcgen05.fence.before_thread_sync()
+                    T.ptxd.tcgen05.wait__ld.sync.aligned()
+                    T.ptxd.tcgen05.fence__before_thread_sync()
 
                     for exchange_i in T.unroll((B_TOPK // 2) // 4):
                         exchange_offset: T.let = exchange_i * 32 * 4 + lane_idx * 4
@@ -886,7 +888,7 @@ def _kernel(
                     Tx.wg.copy(s_smem_gemm[:, :], s_frag[:, :])
                     if T.And(block_idx != start_block, should_scale_o):
                         scale_for_old_pair: T.let = T.cuda.make_float2(scale_for_old, scale_for_old)
-                        T.ptx.tcgen05.fence.after_thread_sync()
+                        T.ptxd.tcgen05.fence__after_thread_sync()
                         o_rescale_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, 64), "float32")
                         o_rescale = o_rescale_frag.local()
                         for o_chunk in T.unroll((D_V // 2) // 64):
@@ -894,7 +896,7 @@ def _kernel(
                                 o_rescale_frag[:, :],
                                 o_win.chunk((None, (D_V // 2) // 64))[:, o_chunk],
                             )
-                            T.ptx.tcgen05.wait.ld()
+                            T.ptxd.tcgen05.wait__ld.sync.aligned()
                             scaled_pair: T.uint64
                             for scale_i in T.unroll(64 // 2):
                                 T.ptxd.mul.f32x2(
@@ -910,8 +912,8 @@ def _kernel(
                                 o_win.chunk((None, (D_V // 2) // 64))[:, o_chunk],
                                 o_rescale_frag[:, :],
                             )
-                            T.ptx.tcgen05.wait.st()
-                        T.ptx.tcgen05.fence.before_thread_sync()
+                            T.ptxd.tcgen05.wait__st.sync.aligned()
+                        T.ptxd.tcgen05.fence__before_thread_sync()
 
                     T.ptxd.fence.proxy.async_.shared__cta()
                     bar_so_ready.arrive(rs_buf.stage)
@@ -945,7 +947,7 @@ def _kernel(
                 bar_sv_done.wait(rs_buf.stage, rs_buf.phase)
                 rs_buf.advance()
                 rs_index.advance()
-                T.ptx.tcgen05.fence.after_thread_sync()
+                T.ptxd.tcgen05.fence__after_thread_sync()
                 if use_pdl and is_last_batch:
                     T.ptxd.griddepcontrol.launch_dependents()
 
@@ -969,7 +971,7 @@ def _kernel(
                         Tx.wg.copy_async(
                             o_epi_frag[:, :], o_win.chunk((None, (D_V // 2) // 64))[:, epi_i]
                         )
-                        T.ptx.tcgen05.wait.ld()
+                        T.ptxd.tcgen05.wait__ld.sync.aligned()
                         scaled_pair: T.uint64
                         for scale_i in T.unroll(64 // 2):
                             T.ptxd.mul.f32x2(
@@ -1025,7 +1027,7 @@ def _kernel(
                         Tx.wg.copy_async(
                             split_frag[:, :], o_win.chunk((None, (D_V // 2) // 64))[:, epi_i]
                         )
-                        T.ptx.tcgen05.wait.ld()
+                        T.ptxd.tcgen05.wait__ld.sync.aligned()
                         scaled_pair: T.uint64
                         for scale_i in T.unroll(64 // 2):
                             T.ptxd.mul.f32x2(
@@ -1075,7 +1077,7 @@ def _kernel(
                 batch_bar_phase = batch_bar_phase ^ 1
 
         if warp_idx == 0:
-            T.ptx.tcgen05.dealloc(T.uint32(0), n_cols=512, cta_group=1)
+            T.ptxd.tcgen05.dealloc.cta_group__1.sync.aligned.b32(T.uint32(0), T.uint32(512))
 
     elif warpgroup_idx == 1:
         # kernel.cuh:427-430.  The producer/MMA warpgroup deliberately
@@ -1212,7 +1214,7 @@ def _kernel(
                             )
                         bar_q_tma.arrive(0, tx_count=B_H * d_qk * BF16_BYTES)
                         bar_q_tma.wait(0, batch_bar_phase)
-                        T.ptx.tcgen05.fence.after_thread_sync()
+                        T.ptxd.tcgen05.fence__after_thread_sync()
                         Tx.copy_async(
                             q_sw128_tmem_cp[:, :, :, :],
                             q_sw128.view(B_H, 4, 2, 64)[:, :, :, :],
@@ -1223,7 +1225,7 @@ def _kernel(
                             Tx.copy_async(q_tail_tmem_cp[:, :], q_sw64[:, :])
                         bar_q_utccp.arrive(0)
                         bar_q_utccp.wait(0, batch_bar_phase)
-                        T.ptx.tcgen05.fence.after_thread_sync()
+                        T.ptxd.tcgen05.fence__after_thread_sync()
 
                         # kernel.cuh:529-584.  MODEL_TYPE only selects how the
                         # shared K latent is interpreted; both instances issue
@@ -1231,7 +1233,7 @@ def _kernel(
                         for block_idx in T.serial(start_block, end_block, unroll=False):
                             if is_v32:
                                 bar_rope_ready.wait(rs_buf.stage, rs_buf.phase)
-                                T.ptx.tcgen05.fence.after_thread_sync()
+                                T.ptxd.tcgen05.fence__after_thread_sync()
                                 Tx.gemm_async(
                                     p_tmem[:, :, :],
                                     q_tail_tmem[:, :, :],
@@ -1239,7 +1241,7 @@ def _kernel(
                                     **_mma_config(accum=T.uint32(0)),
                                 )
                                 bar_nope_ready.wait(rs_buf.stage, rs_buf.phase)
-                                T.ptx.tcgen05.fence.after_thread_sync()
+                                T.ptxd.tcgen05.fence__after_thread_sync()
                                 Tx.gemm_async(
                                     p_tmem[:, :, :],
                                     q_sw128_tmem[:, :, :],
@@ -1249,7 +1251,7 @@ def _kernel(
                             else:
                                 bar_rope_ready.wait(rs_buf.stage, rs_buf.phase)
                                 bar_nope_ready.wait(rs_buf.stage, rs_buf.phase)
-                                T.ptx.tcgen05.fence.after_thread_sync()
+                                T.ptxd.tcgen05.fence__after_thread_sync()
                                 Tx.gemm_async(
                                     p_tmem[:, :, :],
                                     q_sw128_tmem[:, :, :],
@@ -1259,7 +1261,7 @@ def _kernel(
                             bar_qk_done.arrive(rs_buf.stage)
 
                             bar_so_ready.wait(rs_buf.stage, rs_buf.phase)
-                            T.ptx.tcgen05.fence.after_thread_sync()
+                            T.ptxd.tcgen05.fence__after_thread_sync()
                             mma_o_accum: T.let = T.if_then_else(
                                 block_idx == start_block, T.uint32(0), T.uint32(1)
                             )

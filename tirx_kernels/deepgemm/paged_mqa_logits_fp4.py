@@ -1318,8 +1318,8 @@ def get_kernel(**kwargs: Any):
                         smem_barriers.ptr_to([empty_tmem_barrier_base + init_i]), T.uint32(128)
                     )
                 T.ptxd.fence.mbarrier_init.release.cluster()
-            T.ptx.tcgen05.alloc(
-                T.address_of(tmem_ptr_in_smem[0]), n_cols=num_tmem_cols, cta_group=1
+            T.ptxd.tcgen05.alloc.cta_group__1.sync.aligned.shared__cta.b32(
+                T.address_of(tmem_ptr_in_smem[0]), T.uint32(num_tmem_cols)
             )
         T.cuda.cta_sync()
 
@@ -1749,7 +1749,7 @@ def get_kernel(**kwargs: Any):
                     ),
                     tmem_phase ^ T.uint32(1),
                 )
-                T.ptx.tcgen05.fence.after_thread_sync()
+                T.ptxd.tcgen05.fence__after_thread_sync()
                 tmem_addr: T.uint32 = umma_group_idx * T.uint32(
                     umma_n * num_tmem_stages
                 ) + tmem_stage_idx * T.uint32(umma_n)
@@ -1955,12 +1955,12 @@ def get_kernel(**kwargs: Any):
                             shape="32x32b",
                             num=64,
                         )
-                    T.ptx.tcgen05.wait.ld()
+                    T.ptxd.tcgen05.wait__ld.sync.aligned()
                     if q_inner_i == num_iters_c - 1:
                         # Release the TMEM stage right after the last TMEM load
                         # so the next MMA can start while the FMA chain and the
                         # store are still running.
-                        T.ptx.tcgen05.fence.before_thread_sync()
+                        T.ptxd.tcgen05.fence__before_thread_sync()
                         mbarrier_arrive(
                             smem_barriers.ptr_to(
                                 [
@@ -2056,7 +2056,7 @@ def get_kernel(**kwargs: Any):
                     ),
                     tmem_phase,
                 )
-                T.ptx.tcgen05.fence.after_thread_sync()
+                T.ptxd.tcgen05.fence__after_thread_sync()
                 if config.varlen:
                     if is_paired_atom:
                         reduce_and_store(next_n_atom, kv_offset, tmem_stage_idx)
@@ -2085,7 +2085,9 @@ def get_kernel(**kwargs: Any):
             T.ptxd.griddepcontrol.launch_dependents()
             T.ptxd.bar.sync(8, T.uint32(num_math_threads))
             if warp_idx == 0:
-                T.ptx.tcgen05.dealloc(T.uint32(0), n_cols=num_tmem_cols, cta_group=1)
+                T.ptxd.tcgen05.dealloc.cta_group__1.sync.aligned.b32(
+                    T.uint32(0), T.uint32(num_tmem_cols)
+                )
 
     return sm100_fp4_paged_mqa_logits.with_attr(
         "tirx.kernel_launch_params",

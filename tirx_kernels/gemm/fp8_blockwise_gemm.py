@@ -456,7 +456,7 @@ def _kernel(
                     for atom_m in T.unroll(2):
                         col_st: T.let = ot * 16 + atom_m * 8
                         Tx.wg.copy_async(swap_frag[:, :], acc[tmem_idx, :, col_st : col_st + 8])
-                        T.ptx.tcgen05.wait.ld()
+                        T.ptxd.tcgen05.wait__ld.sync.aligned()
                         Tx.wg.cast(swap_bf16, swap_frag)
                         rs = T.meta_var(atom_m * 8)
                         Tx.wg.copy(
@@ -469,7 +469,7 @@ def _kernel(
                         Dreg = T.wg_reg_tile(TMEM_LD_SIZE)
                         acc_n = T.meta_var(ot * EPI_TILE + ki * TMEM_LD_SIZE)
                         Tx.wg.copy_async(Dreg, acc[tmem_idx, :, acc_n : acc_n + TMEM_LD_SIZE])
-                        T.ptx.tcgen05.wait.ld()
+                        T.ptxd.tcgen05.wait__ld.sync.aligned()
                         Dreg_bf16 = T.wg_reg_tile(TMEM_LD_SIZE, dtype="bfloat16")
                         Tx.wg.cast(Dreg_bf16, Dreg)
                         Tx.wg.copy(

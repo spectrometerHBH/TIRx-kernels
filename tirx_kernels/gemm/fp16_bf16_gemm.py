@@ -306,7 +306,7 @@ def _kernel(
                     Dreg = T.wg_reg_tile(EPI_N)
                     tn = T.meta_var(tmem_base + i * EPI_N)
                     Tx.wg.copy_async(Dreg, tmem[:, tn : tn + EPI_N])
-                    T.ptx.tcgen05.wait.ld()
+                    T.ptxd.tcgen05.wait__ld.sync.aligned()
                     Tx.wg.cast(Dreg_16b, Dreg)
                     if i == WB_PIPE_DEPTH - 1:
                         tmem_pipe.empty.arrive(slot, remote=0, pred=True)
@@ -344,7 +344,7 @@ def _kernel(
                     Dreg = T.wg_reg_tile(NOL)
                     tn = T.meta_var(tmem_base + i * NOL)
                     Tx.wg.copy_async(Dreg, tmem[:, tn : tn + NOL])
-                    T.ptx.tcgen05.wait.ld()
+                    T.ptxd.tcgen05.wait__ld.sync.aligned()
                     Tx.wg.cast(Dreg_16b[:, i * NOL : (i + 1) * NOL], Dreg)
                 tmem_pipe.empty.arrive(wg_id, remote=0, pred=True)
                 for i in T.unroll(WB_PIPE_DEPTH):

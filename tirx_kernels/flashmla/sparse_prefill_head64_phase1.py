@@ -414,9 +414,11 @@ def _kernel(
             bar_kv_rope_ready.init(64)
             T.ptxd.fence.mbarrier_init.release.cluster()
 
-        T.ptx.tcgen05.alloc(T.address_of(tmem_start_addr[0]), n_cols=512, cta_group=1)
+        T.ptxd.tcgen05.alloc.cta_group__1.sync.aligned.shared__cta.b32(
+            T.address_of(tmem_start_addr[0]), T.uint32(512)
+        )
         T.cuda.trap_when_assert_failed(tmem_start_addr[0] == T.uint32(0))
-        T.ptx.tcgen05.relinquish_alloc_permit(cta_group=1)
+        T.ptxd.tcgen05.relinquish_alloc_permit.cta_group__1.sync.aligned()
         iket.range_end(prologue_token)
 
     T.cuda.cta_sync()
@@ -438,7 +440,7 @@ def _kernel(
             bar_qk_nope_done.wait(cur_buf, cur_phase)
             iket.range_end(qk_wait_token)
             bar_k_valid_ready.wait(cur_buf, cur_phase)
-            T.ptx.tcgen05.fence.after_thread_sync()
+            T.ptxd.tcgen05.fence__after_thread_sync()
 
             # CUDA common_subroutine.h:75-134 retrieve_mask_and_reduce_p.
             p_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, (B_TOPK // 2)), "float32")
@@ -456,8 +458,8 @@ def _kernel(
                 load_p(p_frag, p_peer_frag)
             else:
                 load_p(p_peer_frag, p_frag)
-            T.ptx.tcgen05.wait.ld()
-            T.ptx.tcgen05.fence.before_thread_sync()
+            T.ptxd.tcgen05.wait__ld.sync.aligned()
+            T.ptxd.tcgen05.fence__before_thread_sync()
             bar_p_free.arrive(0)
 
             valid_word_offset: T.int32 = T.if_then_else(warp_idx >= 2, (B_TOPK // 2) // 32, 0)
@@ -564,7 +566,7 @@ def _kernel(
             # CUDA phase1.cuh:229-232 S store (vectorized by the reg copy path).
             Tx.wg.copy(s_smem_gemm[:, :], s_frag[:, :])
             if (k > 0) & should_scale_o:
-                T.ptx.tcgen05.fence.after_thread_sync()
+                T.ptxd.tcgen05.fence__after_thread_sync()
                 # CUDA common_subroutine.h:147-168 rescale_O.
                 o_rescale_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, 32), "float32")
                 o_rescale = o_rescale_frag.local()
@@ -572,13 +574,13 @@ def _kernel(
                     Tx.wg.copy_async(
                         o_rescale_frag[:, :], o_win.chunk((None, (D_V // 2) // 32))[:, chunk_idx]
                     )
-                    T.ptx.tcgen05.wait.ld()
+                    T.ptxd.tcgen05.wait__ld.sync.aligned()
                     Tx.wg.mul(o_rescale_frag[:, :], o_rescale_frag[:, :], scale_for_old)
                     Tx.wg.copy_async(
                         o_win.chunk((None, (D_V // 2) // 32))[:, chunk_idx], o_rescale_frag[:, :]
                     )
-                    T.ptx.tcgen05.wait.st()
-                T.ptx.tcgen05.fence.before_thread_sync()
+                    T.ptxd.tcgen05.wait__st.sync.aligned()
+                T.ptxd.tcgen05.fence__before_thread_sync()
 
             T.ptxd.fence.proxy.async_.shared__cta()
             bar_so_ready.arrive(0)
@@ -609,7 +611,7 @@ def _kernel(
         last_buf: T.int32 = _ring_mod3(last_k, max_k_blocks)
         last_phase: T.int32 = _ring_phase_parity(last_k, max_k_blocks)
         bar_sv_done.wait(last_buf, last_phase)
-        T.ptx.tcgen05.fence.after_thread_sync()
+        T.ptxd.tcgen05.fence__after_thread_sync()
 
         attn_sink_log2: T.let = (
             T.cuda.ldg(attn_sink.ptr_to([idx_in_warpgroup % B_H]), "float32") * LOG_2_E
@@ -639,7 +641,7 @@ def _kernel(
                         o_epi_frag[:, :],
                         o_win.chunk((None, (D_V // 2) // 64))[:, epi_c * 2 + epi_k],
                     )
-                    T.ptx.tcgen05.wait.ld()
+                    T.ptxd.tcgen05.wait__ld.sync.aligned()
                 Tx.wg.mul(o_epi_frag[:, :], o_epi_frag[:, :], output_scale)
                 Tx.wg.cast(o_epi_bf16_frag[:, :], o_epi_frag[:, :])
                 Tx.wg.copy(
@@ -668,7 +670,7 @@ def _kernel(
                         )
 
         if warp_idx == 0:
-            T.ptx.tcgen05.dealloc(T.uint32(0), n_cols=512, cta_group=1)
+            T.ptxd.tcgen05.dealloc.cta_group__1.sync.aligned.b32(T.uint32(0), T.uint32(512))
         iket.range_end(epilogue_token)
 
     elif warpgroup_idx == 1:
@@ -751,14 +753,14 @@ def _kernel(
                 if have_rope:
                     bar_prologue_q_rope.arrive(0, tx_count=B_H * (d_qk - D_V) * BF16_BYTES)
                     bar_prologue_q_rope.wait(0, 0)
-                    T.ptx.tcgen05.fence.after_thread_sync()
+                    T.ptxd.tcgen05.fence__after_thread_sync()
                     q_rope_tmem_cp = q_rope_tmem_bmm.rearrange("b h k -> h (b k)")
                     Tx.copy_async(q_rope_tmem_cp[:, :], q_rope[:, :])
                     bar_prologue_utccp_rope.arrive(0)
 
                 bar_prologue_q_nope.arrive(0, tx_count=B_H * D_V * BF16_BYTES)
                 bar_prologue_q_nope.wait(0, 0)
-                T.ptx.tcgen05.fence.after_thread_sync()
+                T.ptxd.tcgen05.fence__after_thread_sync()
                 q_nope_tmem_cp = q_nope_tmem_bmm.rearrange("b h (dc di) -> h dc b di", di=64)
                 Tx.copy_async(
                     q_nope_tmem_cp[:, :, :, :],
@@ -776,11 +778,11 @@ def _kernel(
                         cur_buf: T.int32 = _ring_mod3(k, max_k_blocks)
                         cur_phase: T.int32 = _ring_phase_parity(k, max_k_blocks)
                         bar_p_free.wait(0, T.bitwise_xor(T.bitwise_and(k, T.int32(1)), T.int32(1)))
-                        T.ptx.tcgen05.fence.after_thread_sync()
+                        T.ptxd.tcgen05.fence__after_thread_sync()
 
                         if have_rope:
                             bar_kv_rope_ready.wait(0, T.bitwise_and(k, T.int32(1)))
-                            T.ptx.tcgen05.fence.after_thread_sync()
+                            T.ptxd.tcgen05.fence__after_thread_sync()
                             # CUDA phase1.cuh:489 Q RoPE x K RoPE MMA.
                             mma_p_accumulate = T.uint32(0)
                             Tx.gemm_async(
@@ -802,7 +804,7 @@ def _kernel(
                             else:
                                 bar_kv_nope_ready_part1.arrive(cur_buf, tx_count=tx_bytes)
                                 bar_kv_nope_ready_part1.wait(cur_buf, cur_phase)
-                            T.ptx.tcgen05.fence.after_thread_sync()
+                            T.ptxd.tcgen05.fence__after_thread_sync()
                             # CUDA phase1.cuh:505-506 Q NoPE x K NoPE MMA.
                             clear_nope_accum: T.let = (not have_rope) & (kv_nope_part_idx == 0)
                             mma_p_accumulate = T.if_then_else(
@@ -821,7 +823,7 @@ def _kernel(
                     if k > 0:
                         cur_buf_prev: T.int32 = _ring_mod3(k - 1, max_k_blocks)
                         bar_so_ready.wait(0, T.bitwise_and(k - 1, T.int32(1)))
-                        T.ptx.tcgen05.fence.after_thread_sync()
+                        T.ptxd.tcgen05.fence__after_thread_sync()
                         # CUDA phase1.cuh:521-523 S(i-1) x V(i-1) MMA.
                         mma_o_accumulate = T.if_then_else(k == 1, T.uint32(0), T.uint32(1))
 

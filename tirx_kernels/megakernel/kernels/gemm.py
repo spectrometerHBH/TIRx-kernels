@@ -193,7 +193,9 @@ class GemmTile(Tile):
         cls._alloc_buffer_class_member(smem_manager)
         cls.tile_idx = 0
         if warp_id == 0:
-            T.ptx.tcgen05.alloc(T.address_of(cls.tmem_addr[0]), n_cols=cls.N_COLS, cta_group=1)
+            T.ptxd.tcgen05.alloc.cta_group__1.sync.aligned.shared__cta.b32(
+                T.address_of(cls.tmem_addr[0]), T.uint32(cls.N_COLS)
+            )
             T.cuda.warp_sync()
         cls.tma2mma_bar.init(cls.TMA2MMA_ARRIVE_COUNT)
         cls.mma2ld_bar.init(1)
@@ -210,8 +212,10 @@ class GemmTile(Tile):
         warp_id = T.warp_id([KernelConfig.WG_NUMBER * KernelConfig.WARP_NUMBER])
         T.tvm_storage_sync("shared")
         if warp_id == 0:
-            T.ptx.tcgen05.relinquish_alloc_permit(cta_group=1)
-            T.ptx.tcgen05.dealloc(cls.tmem_addr[0], n_cols=cls.N_COLS, cta_group=1)
+            T.ptxd.tcgen05.relinquish_alloc_permit.cta_group__1.sync.aligned()
+            T.ptxd.tcgen05.dealloc.cta_group__1.sync.aligned.b32(
+                cls.tmem_addr[0], T.uint32(cls.N_COLS)
+            )
         T.tvm_storage_sync("shared")
 
     @T.inline
@@ -253,7 +257,7 @@ class GemmTile(Tile):
         self.tmem_idx = self.tile_idx % self.TMEM_PIPE_DEPTH
         self.tmem_phase = self.tile_idx // self.TMEM_PIPE_DEPTH & 1
         self.mma2ld_bar.wait(self.tmem_idx, self.tmem_phase)
-        T.ptx.tcgen05.fence.after_thread_sync()
+        T.ptxd.tcgen05.fence__after_thread_sync()
         for ko in T.unroll(self.MMA_M // self.EPI_TILE):
             self.stage = (self.tile_idx * self.MMA_M // self.EPI_TILE + ko) % self.TMEM_PIPE_DEPTH
             if ko >= self.TMEM_PIPE_DEPTH:
@@ -270,7 +274,7 @@ class GemmTile(Tile):
                     self.tmem_idx * self.M_pad_size + ko * self.EPI_TILE + ki * self.TMEM_LD_SIZE
                 )
                 Tx.wg.copy_async(reg_wg, self.tmem[:, col_st : col_st + self.TMEM_LD_SIZE])
-                T.ptx.tcgen05.wait.ld()
+                T.ptxd.tcgen05.wait__ld.sync.aligned()
                 st = T.meta_var(ki * self.TMEM_LD_SIZE)
                 if self.out_type == "float16":
                     reg_wg_fp16 = self.reg_fp16.view(
@@ -290,7 +294,7 @@ class GemmTile(Tile):
                         reg_wg.permute(1, 0),
                     )
             if ko == self.MMA_M // self.EPI_TILE - 1:
-                T.ptx.tcgen05.fence.before_thread_sync()
+                T.ptxd.tcgen05.fence__before_thread_sync()
                 self.ld2mma_bar.arrive(self.tmem_idx)
             T.ptxd.fence.proxy.async_.shared__cta()
             T.cuda.warpgroup_sync(10)
@@ -579,7 +583,7 @@ class GemmTile(Tile):
                     self.tmem_idx = self.tile_idx % self.TMEM_PIPE_DEPTH
                     self.tmem_phase = self.tile_idx // self.TMEM_PIPE_DEPTH & 1
                     self.ld2mma_bar.wait(self.tmem_idx, self.tmem_phase)
-                    T.ptx.tcgen05.fence.after_thread_sync()
+                    T.ptxd.tcgen05.fence__after_thread_sync()
                     if self.use_cp_async_input:
                         self.wait_complete = False
                     else:

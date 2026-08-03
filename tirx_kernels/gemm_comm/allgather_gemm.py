@@ -722,7 +722,7 @@ def _build_kernel():
 
         # alloc TMEM
         if (wg_id == 0) & (warp_id == 0):
-            T.ptx.tcgen05.alloc(T.address_of(tmem_addr), n_cols=N_COLS, cta_group=CTA_GROUP)
+            T.ptxd[f"tcgen05.alloc.cta_group::{CTA_GROUP}.sync.aligned.shared::cta.b32"](T.address_of(tmem_addr), T.uint32(N_COLS))
 
         T.ptxd.barrier.cluster.arrive()
         T.ptxd.barrier.cluster.wait()
@@ -797,7 +797,7 @@ def _build_kernel():
                     elif warp_id < 2 and cbx == 0:
                         if T.ptx.elect_sync():
                             ld2mma.wait(0, warp_id, phase_tmem[0])
-                            T.ptx.tcgen05.fence.after_thread_sync()
+                            T.ptxd.tcgen05.fence__after_thread_sync()
 
                             @T.inline
                             def mma(is_remain, ks):
@@ -858,12 +858,12 @@ def _build_kernel():
 
                     mma2ld.wait(0, wg_id, phase_tmem[0])
                     phase_tmem[0] = phase_tmem[0] ^ 1
-                    T.ptx.tcgen05.fence.after_thread_sync()
+                    T.ptxd.tcgen05.fence__after_thread_sync()
                     # TMEM -> RF (ld)
                     for i in T.unroll(MMA_N // TMEM_LD_SIZE): # load (MMA_M // 2, MMA_N)
                         col_st = T.meta_var(wg_id * MMA_N + i * TMEM_LD_SIZE)
                         Tx.wg.copy_async(reg_wg[:, :], tmem[:, col_st : col_st + TMEM_LD_SIZE])
-                        T.ptx.tcgen05.wait.ld()
+                        T.ptxd.tcgen05.wait__ld.sync.aligned()
                         Tx.cast(reg_fp16[i * TMEM_LD_SIZE : (i + 1) * TMEM_LD_SIZE], reg[:])
 
                     # the tmem can be overwritten by the next tile
@@ -892,8 +892,8 @@ def _build_kernel():
 
         # dealloc TMEM
         if (wg_id == 0) & (warp_id == 0):
-            T.ptx.tcgen05.relinquish_alloc_permit(cta_group=CTA_GROUP)
-            T.ptx.tcgen05.dealloc(tmem_addr, n_cols=N_COLS, cta_group=CTA_GROUP)
+            T.ptxd[f"tcgen05.relinquish_alloc_permit.cta_group::{CTA_GROUP}.sync.aligned"]()
+            T.ptxd[f"tcgen05.dealloc.cta_group::{CTA_GROUP}.sync.aligned.b32"](tmem_addr, T.uint32(N_COLS))
 
     # fmt: on
 

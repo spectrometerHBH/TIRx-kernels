@@ -262,7 +262,7 @@ class GroupGEMMTile(GemmTile):
             # flush previous tma
             # wait for the completion of all the mma of the same tile
             self.mma2ld_bar.wait(self.tmem_idx, self.tmem_phase)
-            T.ptx.tcgen05.fence.after_thread_sync()
+            T.ptxd.tcgen05.fence__after_thread_sync()
 
             for ko in T.unroll(self.MMA_M // self.EPI_TILE):
                 self.stage = (
@@ -281,7 +281,7 @@ class GroupGEMMTile(GemmTile):
                         + ki * self.TMEM_LD_SIZE
                     )
                     Tx.wg.copy_async(reg_wg, self.tmem[:, col_st : col_st + self.TMEM_LD_SIZE])
-                    T.ptx.tcgen05.wait.ld()
+                    T.ptxd.tcgen05.wait__ld.sync.aligned()
                     st = T.meta_var(ki * self.TMEM_LD_SIZE)
                     Tx.wg.copy(
                         self.output_smem[self.stage, st : st + self.TMEM_LD_SIZE, 0:128],
@@ -289,7 +289,7 @@ class GroupGEMMTile(GemmTile):
                     )
                 # the tmem can be overwritten
                 if ko == self.MMA_M // self.EPI_TILE - 1:
-                    T.ptx.tcgen05.fence.before_thread_sync()
+                    T.ptxd.tcgen05.fence__before_thread_sync()
                     self.ld2mma_bar.arrive(self.tmem_idx)
 
                 T.ptxd.fence.proxy.async_.shared__cta()

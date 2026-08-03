@@ -379,9 +379,11 @@ def _kernel(
                 ),
             )
 
-        T.ptx.tcgen05.alloc(T.address_of(tmem_start_addr[0]), n_cols=512, cta_group=2)
+        T.ptxd.tcgen05.alloc.cta_group__2.sync.aligned.shared__cta.b32(
+            T.address_of(tmem_start_addr[0]), T.uint32(512)
+        )
         T.cuda.trap_when_assert_failed(tmem_start_addr[0] == T.uint32(0))
-        T.ptx.tcgen05.relinquish_alloc_permit(cta_group=2)
+        T.ptxd.tcgen05.relinquish_alloc_permit.cta_group__2.sync.aligned()
         iket.range_end(prologue_token)
 
     T.cuda.cta_sync()
@@ -416,15 +418,15 @@ def _kernel(
             qk_wait_token = iket.range_start("h128-qk-wait")
             bar_qk_done.wait(cur_buf, cur_phase)
             iket.range_end(qk_wait_token)
-            T.ptx.tcgen05.fence.after_thread_sync()
+            T.ptxd.tcgen05.fence__after_thread_sync()
 
             p_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, P_TMEM_COLS), "uint32")
             Tx.wg.copy_async(
                 p_frag[:, :], tmem_p.rearrange("h (b t) -> (b h) t", b=2).with_dtype("uint32")[:, :]
             )
             p = p_frag.local()
-            T.ptx.tcgen05.wait.ld()
-            T.ptx.tcgen05.fence.before_thread_sync()
+            T.ptxd.tcgen05.wait__ld.sync.aligned()
+            T.ptxd.tcgen05.fence__before_thread_sync()
             bar_p_free.arrive(cur_buf, remote=T.uint32(0))
 
             bar_k_valid_ready.wait(cur_buf, cur_phase)
@@ -508,19 +510,19 @@ def _kernel(
             Tx.wg.copy(s_smem_gemm[:, :], s_frag[:, :])
 
             if (k > 0) & should_scale_o:
-                T.ptx.tcgen05.fence.after_thread_sync()
+                T.ptxd.tcgen05.fence__after_thread_sync()
                 o_rescale_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, 32), "float32")
                 for chunk_idx in T.unroll((D_V // 2) // 32):
                     Tx.wg.copy_async(
                         o_rescale_frag[:, :], o_win.chunk((None, (D_V // 2) // 32))[:, chunk_idx]
                     )
-                    T.ptx.tcgen05.wait.ld()
+                    T.ptxd.tcgen05.wait__ld.sync.aligned()
                     Tx.wg.mul(o_rescale_frag[:, :], o_rescale_frag[:, :], scale_for_old)
                     Tx.wg.copy_async(
                         o_win.chunk((None, (D_V // 2) // 32))[:, chunk_idx], o_rescale_frag[:, :]
                     )
-                    T.ptx.tcgen05.wait.st()
-                T.ptx.tcgen05.fence.before_thread_sync()
+                    T.ptxd.tcgen05.wait__st.sync.aligned()
+                T.ptxd.tcgen05.fence__before_thread_sync()
 
             T.ptxd.fence.proxy.async_.shared__cta()
             bar_so_ready.arrive(cur_buf, remote=T.uint32(0))
@@ -550,7 +552,7 @@ def _kernel(
         last_buf: T.let = last_k % NUM_BUFS
         last_phase: T.let = (last_k // NUM_BUFS) & 1
         bar_sv_done.wait(last_buf, last_phase)
-        T.ptx.tcgen05.fence.after_thread_sync()
+        T.ptxd.tcgen05.fence__after_thread_sync()
 
         attn_sink_log2: T.let = (
             T.cuda.ldg(
@@ -577,7 +579,7 @@ def _kernel(
                 Tx.wg.copy_async(
                     o_epi_frag[:, :], o_win.chunk((None, (D_V // 2) // B_EPI))[:, epi_k]
                 )
-                T.ptx.tcgen05.wait.ld()
+                T.ptxd.tcgen05.wait__ld.sync.aligned()
             Tx.wg.mul(o_epi_frag[:, :], o_epi_frag[:, :], output_scale)
             Tx.wg.cast(o_epi_bf16_frag[:, :], o_epi_frag[:, :])
             Tx.wg.copy(
@@ -603,7 +605,7 @@ def _kernel(
                     )
 
         if warp_idx == 0:
-            T.ptx.tcgen05.dealloc(T.uint32(0), n_cols=512, cta_group=2)
+            T.ptxd.tcgen05.dealloc.cta_group__2.sync.aligned.b32(T.uint32(0), T.uint32(512))
         iket.range_end(epilogue_token)
 
     elif warpgroup_idx == 1:
@@ -738,7 +740,7 @@ def _kernel(
             if T.ptx.elect_sync():
                 bar_prologue_q.arrive(0, tx_count=B_H * d_qk * BF16_BYTES)
                 bar_prologue_q.wait(0, 0)
-                T.ptx.tcgen05.fence.after_thread_sync()
+                T.ptxd.tcgen05.fence__after_thread_sync()
                 Tx.copy_async(
                     q_tmem[:, :],
                     q_full[:, d_sq : d_sq + D_TQ],
@@ -759,7 +761,7 @@ def _kernel(
                             prev_buf: T.let = (k - 1) % NUM_BUFS
                             prev_phase: T.let = ((k - 1) // NUM_BUFS) & 1
                             bar_p_free.wait(prev_buf, prev_phase)
-                        T.ptx.tcgen05.fence.after_thread_sync()
+                        T.ptxd.tcgen05.fence__after_thread_sync()
 
                         mma_p_accumulate = T.uint32(0)
                         if d_sq > 0:
@@ -777,7 +779,7 @@ def _kernel(
                             cur_buf, tx_count=B_TOPK * (d_qk - d_sq) * BF16_BYTES
                         )
                         bar_k_part1_ready.wait(cur_buf, cur_phase)
-                        T.ptx.tcgen05.fence.after_thread_sync()
+                        T.ptxd.tcgen05.fence__after_thread_sync()
 
                         Tx.gemm_async(
                             tmem_p[:, :],
@@ -797,7 +799,7 @@ def _kernel(
                             cur_buf_prev, tx_count=(B_TOPK // 2) * D_V * BF16_BYTES
                         )
                         bar_v_part0_ready.wait(cur_buf_prev, cur_phase_prev)
-                        T.ptx.tcgen05.fence.after_thread_sync()
+                        T.ptxd.tcgen05.fence__after_thread_sync()
                         mma_o_accumulate = T.if_then_else(k == 1, T.uint32(0), T.uint32(1))
                         Tx.gemm_async(
                             tmem_o_lo[:, :],
@@ -820,7 +822,7 @@ def _kernel(
                             cur_buf_prev, tx_count=(B_TOPK // 2) * D_V * BF16_BYTES
                         )
                         bar_v_part1_ready.wait(cur_buf_prev, cur_phase_prev)
-                        T.ptx.tcgen05.fence.after_thread_sync()
+                        T.ptxd.tcgen05.fence__after_thread_sync()
                         Tx.gemm_async(
                             tmem_o_lo[:, :],
                             s_smem_gemm[:, B_TOPK // 2 : B_TOPK],

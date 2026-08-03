@@ -360,9 +360,11 @@ def _kernel(
             bar_clc_empty.init(NUM_WORKER_THREADS)
             T.ptxd.fence.mbarrier_init.release.cluster()
     elif warp_idx == 2:
-        T.ptx.tcgen05.alloc(T.address_of(tmem_start_addr[0]), n_cols=512, cta_group=2)
+        T.ptxd.tcgen05.alloc.cta_group__2.sync.aligned.shared__cta.b32(
+            T.address_of(tmem_start_addr[0]), T.uint32(512)
+        )
         T.cuda.trap_when_assert_failed(tmem_start_addr[0] == T.uint32(0))
-        T.ptx.tcgen05.relinquish_alloc_permit(cta_group=2)
+        T.ptxd.tcgen05.relinquish_alloc_permit.cta_group__2.sync.aligned()
     elif warp_idx == 3:
         if T.ptx.elect_sync():
             for init_stage in T.unroll(NUM_K_BUFS):
@@ -408,7 +410,7 @@ def _kernel(
                         bar_sQ_full.arrive(0, tx_count=B_H * D_QK * BF16_BYTES)
                         bar_sQ_full.wait(0, q_outer_loop_phase)
                         bar_tQ_empty.wait(0, q_outer_loop_phase ^ 1)
-                        T.ptx.tcgen05.fence.after_thread_sync()
+                        T.ptxd.tcgen05.fence__after_thread_sync()
                         q_tmem_cp = q_tmem_fold.rearrange("b h (dc di) -> h dc b di", di=64)
                         Tx.copy_async(
                             q_tmem_cp[:, :, :, :],
@@ -437,7 +439,7 @@ def _kernel(
                 Tx.wg.copy_async(
                     o_epi_frag[:, :], o_win.chunk((None, (D_V // 2) // B_EPI))[:, epi_k]
                 )
-                T.ptx.tcgen05.wait.ld()
+                T.ptxd.tcgen05.wait__ld.sync.aligned()
                 if epi_k == 0:
                     if is_last_o:
                         bar_tQ_full.wait(0, o_outer_loop_phase)
@@ -500,7 +502,7 @@ def _kernel(
             perform_o_copy_out(last_s_q_idx, last_outer_loop_phase, True)
 
         if warp_idx == 0:
-            T.ptx.tcgen05.dealloc(T.uint32(0), n_cols=512, cta_group=2)
+            T.ptxd.tcgen05.dealloc.cta_group__2.sync.aligned.b32(T.uint32(0), T.uint32(512))
         iket.range_end(q_o_token)
 
     elif warpgroup_idx == 1:
@@ -611,7 +613,7 @@ def _kernel(
                             bar_P_empty.wait(0, p_bar_phase ^ 1)
                             bar_KV_full.arrive(k_buf_idx, tx_count=B_TOPK * D_QK * BF16_BYTES)
                             bar_KV_full.wait(k_buf_idx, k_bar_phase)
-                            T.ptx.tcgen05.fence.after_thread_sync()
+                            T.ptxd.tcgen05.fence__after_thread_sync()
                             qk_accumulate: T.uint32 = 0
                             Tx.gemm_async(
                                 tmem_p[:, :],
@@ -634,7 +636,7 @@ def _kernel(
                             bar_S_O_full.wait(0, prev_s_o_phase)
                             if prev_k == 0:
                                 bar_tOut_empty.wait(0, umma_outer_loop_phase ^ 1)
-                            T.ptx.tcgen05.fence.after_thread_sync()
+                            T.ptxd.tcgen05.fence__after_thread_sync()
                             o_accumulate: T.uint32 = T.if_then_else(
                                 prev_k == 0, T.uint32(0), T.uint32(1)
                             )
@@ -658,7 +660,7 @@ def _kernel(
                         if k != umma_num_k_blocks:
                             umma_rs = umma_rs + 1
 
-                    T.ptx.tcgen05.fence.before_thread_sync()
+                    T.ptxd.tcgen05.fence__before_thread_sync()
                     bar_tOut_full.arrive(0, cta_group=2, cta_mask=3)
 
                     bar_clc_full.wait(0, umma_outer_loop_phase)
@@ -786,7 +788,7 @@ def _kernel(
                 p = p_frag.local().view("uint32")
                 p_peer = p_peer_frag.local().view("uint32")
                 bar_QK_done.wait(0, wg3_rs & 1)
-                T.ptx.tcgen05.fence.after_thread_sync()
+                T.ptxd.tcgen05.fence__after_thread_sync()
 
                 @T.inline
                 def load_p(lo_dst, hi_dst):
@@ -800,8 +802,8 @@ def _kernel(
                     load_p(p_frag, p_peer_frag)
                 else:
                     load_p(p_peer_frag, p_frag)
-                T.ptx.tcgen05.wait.ld()
-                T.ptx.tcgen05.fence.before_thread_sync()
+                T.ptxd.tcgen05.wait__ld.sync.aligned()
+                T.ptxd.tcgen05.fence__before_thread_sync()
                 bar_P_empty.arrive(0, remote=T.uint32(0))
 
                 valid_word_offset: T.let = T.if_then_else(
@@ -912,21 +914,21 @@ def _kernel(
                 Tx.wg.copy(s_smem_gemm[:, :], s_frag[:, :])
 
                 if (k > 0) & should_scale_o:
-                    T.ptx.tcgen05.fence.after_thread_sync()
+                    T.ptxd.tcgen05.fence__after_thread_sync()
                     o_rescale_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, 32), "float32")
                     for chunk_idx in T.unroll((D_V // 2) // 32):
                         Tx.wg.copy_async(
                             o_rescale_frag[:, :],
                             o_win.chunk((None, (D_V // 2) // 32))[:, chunk_idx],
                         )
-                        T.ptx.tcgen05.wait.ld()
+                        T.ptxd.tcgen05.wait__ld.sync.aligned()
                         Tx.wg.mul(o_rescale_frag[:, :], o_rescale_frag[:, :], scale_for_old)
                         Tx.wg.copy_async(
                             o_win.chunk((None, (D_V // 2) // 32))[:, chunk_idx],
                             o_rescale_frag[:, :],
                         )
-                        T.ptx.tcgen05.wait.st()
-                    T.ptx.tcgen05.fence.before_thread_sync()
+                        T.ptxd.tcgen05.wait__st.sync.aligned()
+                    T.ptxd.tcgen05.fence__before_thread_sync()
 
                 T.ptxd.fence.proxy.async_.shared__cta()
                 bar_S_O_full.arrive(0, remote=T.uint32(0))

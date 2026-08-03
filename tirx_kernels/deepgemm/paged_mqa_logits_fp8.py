@@ -1500,8 +1500,8 @@ def get_kernel(**kwargs: Any):
             # TMA warps do not touch TMEM). Matches the CuTeDSL TmemAllocator
             # split: math warp allocs, consumers sync on a sub-CTA barrier.
             if warp_idx == umma_warp_0 + 1:
-                T.ptx.tcgen05.alloc(
-                    T.address_of(tmem_ptr_in_smem[0]), n_cols=num_tmem_cols, cta_group=1
+                T.ptxd.tcgen05.alloc.cta_group__1.sync.aligned.shared__cta.b32(
+                    T.address_of(tmem_ptr_in_smem[0]), T.uint32(num_tmem_cols)
                 )
             T.ptxd.bar.sync(9, T.uint32(num_math_threads + 2 * 32))
             current_q_atom_idx: T.uint32 = start_q_atom_idx
@@ -1590,7 +1590,7 @@ def get_kernel(**kwargs: Any):
                     ),
                     umma_phase ^ T.uint32(1),
                 )
-                T.ptx.tcgen05.fence.after_thread_sync()
+                T.ptxd.tcgen05.fence__after_thread_sync()
                 T.static_assert(head_dim % umma_k == 0, "Invalid head dim")
                 for k in T.unroll(0, head_dim // umma_k):
                     make_smem_desc(
@@ -1797,12 +1797,12 @@ def get_kernel(**kwargs: Any):
                             shape="32x32b",
                             num=64,
                         )
-                    T.ptx.tcgen05.wait.ld()
+                    T.ptxd.tcgen05.wait__ld.sync.aligned()
                     if q_inner_i == num_iters_c - 1:
                         # Release the UMMA stage right after the last TMEM load
                         # so the next MMA can start while the FMA chain and the
                         # store are still running (CuTeDSL order).
-                        T.ptx.tcgen05.fence.before_thread_sync()
+                        T.ptxd.tcgen05.fence__before_thread_sync()
                         # One arrive per math warp in the group (lane 0): the
                         # tcgen05.ld above is warp-collective, so all lanes' TMEM
                         # reads are complete once lane 0's wait.ld returns.
@@ -1920,7 +1920,7 @@ def get_kernel(**kwargs: Any):
                     ),
                     umma_phase,
                 )
-                T.ptx.tcgen05.fence.after_thread_sync()
+                T.ptxd.tcgen05.fence__after_thread_sync()
                 # One arrive per math warp in the group (lane 0); all lanes read
                 # their scales before the UMMA wait above, so the SMEM reads are
                 # complete by the time lane 0 arrives.
@@ -1962,7 +1962,9 @@ def get_kernel(**kwargs: Any):
             T.ptxd.griddepcontrol.launch_dependents()
             T.ptxd.bar.sync(8, T.uint32(num_math_threads))
             if warp_idx == 0:
-                T.ptx.tcgen05.dealloc(T.uint32(0), n_cols=num_tmem_cols, cta_group=1)
+                T.ptxd.tcgen05.dealloc.cta_group__1.sync.aligned.b32(
+                    T.uint32(0), T.uint32(num_tmem_cols)
+                )
 
     return sm100_fp8_paged_mqa_logits.with_attr(
         "tirx.kernel_launch_params",

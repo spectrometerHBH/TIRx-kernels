@@ -413,7 +413,7 @@ def _kernel(
             def mma(ks, sf_off: T.constexpr, copy_sf: T.constexpr):
                 ks_desc: T.int32
                 trans_done.wait(ks, mma_state.phase)
-                T.ptx.tcgen05.fence.after_thread_sync()
+                T.ptxd.tcgen05.fence__after_thread_sync()
                 ks_desc = T.cuda.__shfl_sync(T.uint32(0xFFFFFFFF), ks, 0, 32)
 
                 @T.inline
@@ -458,7 +458,7 @@ def _kernel(
                 tmem_idx = tile_scheduler.tile_idx % TMEM_DEPTH
                 tmem_phase = tile_scheduler.tile_idx // TMEM_DEPTH & 1
                 tmem_pipe.empty.wait(tmem_idx, tmem_phase)
-                T.ptx.tcgen05.fence.after_thread_sync()
+                T.ptxd.tcgen05.fence__after_thread_sync()
                 accum = 0
                 for _ in T.serial(K_TILES // 4):
                     mma(mma_state.stage, 0, True)
@@ -507,7 +507,7 @@ def _kernel(
                     for atom_m in T.unroll(2):
                         col_st: T.let = ot * 16 + atom_m * 8
                         Tx.wg.copy_async(swap_frag[:, :], acc[tmem_idx, :, col_st : col_st + 8])
-                        T.ptx.tcgen05.wait.ld()
+                        T.ptxd.tcgen05.wait__ld.sync.aligned()
                         Tx.wg.cast(swap_bf16, swap_frag)
                         rs = T.meta_var(atom_m * 8)
                         Tx.wg.copy(
@@ -520,7 +520,7 @@ def _kernel(
                         Dreg = T.wg_reg_tile(TMEM_LD_SIZE)
                         acc_n = T.meta_var(ot * EPI_TILE + ki * TMEM_LD_SIZE)
                         Tx.wg.copy_async(Dreg, acc[tmem_idx, :, acc_n : acc_n + TMEM_LD_SIZE])
-                        T.ptx.tcgen05.wait.ld()
+                        T.ptxd.tcgen05.wait__ld.sync.aligned()
                         Dreg_bf16 = T.wg_reg_tile(TMEM_LD_SIZE, dtype="bfloat16")
                         Tx.wg.cast(Dreg_bf16, Dreg)
                         Tx.wg.copy(

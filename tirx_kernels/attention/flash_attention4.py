@@ -781,7 +781,7 @@ def _kernel(
                         P_region[wg_id, 1, :, i * BLK_N // 4 : (i + 1) * BLK_N // 4],
                         p_chunk[:, i * BLK_N // 4 : (i + 1) * BLK_N // 4],
                     )
-                T.ptx.tcgen05.wait.st()
+                T.ptxd.tcgen05.wait__st.sync.aligned()
                 p_o_rescale.arrive(wg_id)
                 for i in T.unroll(4 - P_SPLIT_Q):
                     Tx.wg.copy_async(
@@ -795,7 +795,7 @@ def _kernel(
                     )
                 if warp_id == 0:
                     iket.mark("softmax-phase-2")
-                T.ptx.tcgen05.wait.st()
+                T.ptxd.tcgen05.wait__st.sync.aligned()
                 p_ready_2.arrive(wg_id)
                 if warp_id == 0:
                     iket.mark("softmax-phase-3")
@@ -964,7 +964,7 @@ def _kernel(
                                         ],
                                         o_row,
                                     )
-                            T.ptx.tcgen05.wait.st()
+                            T.ptxd.tcgen05.wait__st.sync.aligned()
                     p_o_rescale.arrive(i_q)
                     softmax_corr.empty.arrive(1 - i_q)
                     iket.range_end(correction_token)

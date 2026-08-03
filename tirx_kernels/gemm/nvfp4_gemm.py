@@ -388,7 +388,7 @@ def _kernel(
     T.ptxd.barrier.cluster.arrive.release.aligned()
     T.ptxd.barrier.cluster.wait.acquire()
     if tid_in_cta < 32:
-        T.ptx.tcgen05.relinquish_alloc_permit(cta_group=CTA_GROUP)
+        T.ptxd[f"tcgen05.relinquish_alloc_permit.cta_group::{CTA_GROUP}.sync.aligned"]()
     pair_mask: T.int32
     pair_mask = 0
     pair_mask = pair_mask | 1 << pair_leader_rank
@@ -560,7 +560,7 @@ def _kernel(
                     linear_n = T.meta_var(no * EPI_TILE)
                     Tx.wg.copy_async(reg_ldst[:, :], tmem[:, linear_n : linear_n + EPI_TILE])
                     if no == MMA_N // EPI_TILE - 1:
-                        T.ptx.tcgen05.wait.ld()
+                        T.ptxd.tcgen05.wait__ld.sync.aligned()
                         if tid_in_wg == 0:
                             tmem_pipe.empty.arrive(
                                 epi_cur.stage, remote=pair_leader_rank, pred=True, count=1
@@ -575,7 +575,7 @@ def _kernel(
                 for no in T.unroll(MMA_N // EPI_TILE):
                     ln = T.meta_var(no * EPI_TILE)
                     Tx.wg.copy_async(reg_all[:, ln : ln + EPI_TILE], tmem[:, ln : ln + EPI_TILE])
-                T.ptx.tcgen05.wait.ld()
+                T.ptxd.tcgen05.wait__ld.sync.aligned()
                 # scale + cast the whole frag
                 Tx.wg.mul(reg_all, reg_all, alpha_local)
                 Tx.wg.cast(reg_all_16b, reg_all)
@@ -604,7 +604,9 @@ def _kernel(
                 count=1,
             )
         T.ptx.mbarrier.try_wait_acquire_cluster(tmem_finished.ptr_to([0]), 0)
-        T.ptx.tcgen05.dealloc(tmem_pool.addr, n_cols=512, cta_group=CTA_GROUP)
+        T.ptxd[f"tcgen05.dealloc.cta_group::{CTA_GROUP}.sync.aligned.b32"](
+            tmem_pool.addr, T.uint32(512)
+        )
 
 
 def tir_ws_kernel(M: int, N: int, K: int):

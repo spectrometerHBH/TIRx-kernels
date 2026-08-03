@@ -594,7 +594,7 @@ def get_kernel(**kwargs: Any):
                 T.ptx.tcgen05.ld(
                     taddr_d, d_frag[0], d_frag[1], d_frag[2], d_frag[3], shape="32x32b", num=4
                 )
-                T.ptx.tcgen05.wait.ld()
+                T.ptxd.tcgen05.wait__ld.sync.aligned()
                 if lane_u32 < T.uint32(16):
                     # Per-thread 4-col slice store; the swizzled layout of
                     # smem_cd_mma computes the address, the 16B chunk emits v4.
@@ -683,7 +683,7 @@ def get_kernel(**kwargs: Any):
                     Tx.warpgroup.cast(a_fp32, a_bf16)
                     fma_sum_of_squares(sqr0, sqr1, a_flat, cast_row_w, cast_pairs, Tx)
                     Tx.warpgroup.copy_async(_tmem[0:block_m, a_col : a_col + block_k], a_fp32)
-                T.ptx.tcgen05.wait.st()
+                T.ptxd.tcgen05.wait__st.sync.aligned()
                 cast_pipe.full.arrive(cast_stage_idx)
                 cast_st = stage_idx + T.uint32(1)
                 if cast_st == T.uint32(num_stages):

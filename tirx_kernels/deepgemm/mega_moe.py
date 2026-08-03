@@ -3380,7 +3380,7 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
 
         @T.inline
         def fence_view_async_tmem_load():
-            T.ptx.tcgen05.wait.ld()
+            T.ptxd.tcgen05.wait__ld.sync.aligned()
 
         @T.inline
         def warpgroup_reg_dealloc(num_registers):
@@ -3565,11 +3565,9 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
                     dispatch_expert_idx = dispatch_expert_idx + 1
             T.evaluate(fence_barrier_init())
         elif flat_warp_idx == kernel_config.num_dispatch_warps - 1:
-            T.ptx.tcgen05.alloc(
-                T.address_of(tmem_ptr_in_smem[0]),
-                n_cols=num_tmem_cols,
-                cta_group=kernel_config.num_ctas_per_cluster,
-            )
+            T.ptxd[
+                f"tcgen05.alloc.cta_group::{kernel_config.num_ctas_per_cluster}.sync.aligned.shared::cta.b32"
+            ](T.address_of(tmem_ptr_in_smem[0]), T.uint32(num_tmem_cols))
         # `fence_barrier_init` above is `.release.cluster`, so the cluster
         # arrive here doesn't need release semantics. `.wait.acquire` pairs
         # with that release to make mbarrier init visible to other CTAs.
@@ -4920,9 +4918,9 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
             # The grid barrier above includes every epilogue thread in both CTAs,
             # so no peer can still be accessing TMEM when warp 0 deallocates it.
             if epilogue_warp_idx == 0:
-                T.ptx.tcgen05.dealloc(
-                    T.uint32(0), n_cols=num_tmem_cols, cta_group=kernel_config.num_ctas_per_cluster
-                )
+                T.ptxd[
+                    f"tcgen05.dealloc.cta_group::{kernel_config.num_ctas_per_cluster}.sync.aligned.b32"
+                ](T.uint32(0), T.uint32(num_tmem_cols))
             T.evaluate(
                 sync_unaligned(
                     dispatch_with_epilogue_sync_barrier_idx,

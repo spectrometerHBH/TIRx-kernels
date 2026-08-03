@@ -504,8 +504,8 @@ def get_kernel(**kwargs: Any):
         # Pipeline constructors already ran mbarrier.init; fence + cta_sync publish them.
         T.ptxd.fence.mbarrier_init.release.cluster()
         if warp_idx == spec_warp_start + 2:
-            T.ptx.tcgen05.alloc(
-                T.address_of(tmem_ptr_in_smem[0]), n_cols=num_tmem_cols, cta_group=1
+            T.ptxd.tcgen05.alloc.cta_group__1.sync.aligned.shared__cta.b32(
+                T.address_of(tmem_ptr_in_smem[0]), T.uint32(num_tmem_cols)
             )
         T.cuda.cta_sync()
 
@@ -716,12 +716,12 @@ def get_kernel(**kwargs: Any):
                                 accum_2d[:, 0 : num_heads // 2],
                                 tmem[:, tmem_addr : tmem_addr + num_heads // 2],
                             )
-                            T.ptx.tcgen05.wait.ld()
+                            T.ptxd.tcgen05.wait__ld.sync.aligned()
                             Tx.warpgroup.copy_async(
                                 accum_2d[:, num_heads // 2 : num_heads],
                                 tmem[:, tmem_addr_hi : tmem_addr_hi + num_heads // 2],
                             )
-                            T.ptx.tcgen05.wait.ld()
+                            T.ptxd.tcgen05.wait__ld.sync.aligned()
                             # Weighted-ReLU reduce via inline CUDA (see _mqa_fp8_wrelu_reduce_src).
                             reduced: T.float32 = cuda_func_call(
                                 f"tvm_builtin_mqa_fp8_wrelu_reduce_{num_heads}",
@@ -763,7 +763,9 @@ def get_kernel(**kwargs: Any):
                     q_phase = q_phase ^ T.uint32(1)
             named_barrier_sync_8(T.uint32(num_math_threads))
             if warp_idx == 0:
-                T.ptx.tcgen05.dealloc(T.uint32(0), n_cols=num_tmem_cols, cta_group=1)
+                T.ptxd.tcgen05.dealloc.cta_group__1.sync.aligned.b32(
+                    T.uint32(0), T.uint32(num_tmem_cols)
+                )
 
     sm100_fp8_mqa_logits = sm100_fp8_mqa_logits.with_attr("tirx.persistent_kernel", True)
 
