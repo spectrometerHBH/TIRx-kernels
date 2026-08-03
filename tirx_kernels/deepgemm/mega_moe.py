@@ -1907,8 +1907,8 @@ def get_kernel(
             T.bitwise_and(T.shift_right(packed, T.uint32(16)), T.uint32(0xFFFF)), "uint16"
         )
 
-    def stmatrix_fp8x4_trans(smem_ptr, local_ptr):
-        return T.ptx.stmatrix(True, 1, ".b8", smem_ptr, local_ptr, shape="m16n8", space="shared")
+    def stmatrix_fp8x4_trans(smem_ptr, word):
+        return T.ptxd.stmatrix.sync.aligned.m16n8.x1.trans.shared.b8(smem_ptr, word)
 
     def cast_into_bf16_and_pack(v0, v1):
         return T.cuda.float22bfloat162_rn(v0, v1)
@@ -3478,20 +3478,17 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
             )
 
         @T.inline
-        def sm100_u8x4_stsm_t_copy(fp8x4_values_ptr, smem_ptr):
-            stmatrix_fp8x4_trans(smem_ptr, fp8x4_values_ptr)
+        def sm100_u8x4_stsm_t_copy(fp8x4_word, smem_ptr):
+            stmatrix_fp8x4_trans(smem_ptr, fp8x4_word)
 
         @T.inline
         def sm90_u32x4_stsm_t_copy(packed_values_buf, smem_ptr):
-            T.ptx.stmatrix(
-                True,
-                4,
-                ".b16",
+            T.ptxd.stmatrix.sync.aligned.m8n8.x4.trans.shared.b16(
                 smem_ptr,
-                packed_values_buf.ptr_to([0]),
-                packed_values_buf.ptr_to([1]),
-                packed_values_buf.ptr_to([2]),
-                packed_values_buf.ptr_to([3]),
+                packed_values_buf[0],
+                packed_values_buf[1],
+                packed_values_buf[2],
+                packed_values_buf[3],
             )
 
         @T.inline
@@ -4701,7 +4698,7 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
                                     (col ^ (row // 2)) * num_bank_group_bytes,
                                 ]
                             )
-                            sm100_u8x4_stsm_t_copy(epilogue_fp8_packed.ptr_to([0]), smem_ptr)
+                            sm100_u8x4_stsm_t_copy(epilogue_fp8_packed[0], smem_ptr)
                             if warp_idx_in_wg % 2 == 0 and lane_idx < 4:
                                 # Factored form of upstream 891d57b: token_base_idx is < BLOCK_M so
                                 # `m_block_idx * BLOCK_M` factors out as `m_block_idx * SF_BLOCK_M`
