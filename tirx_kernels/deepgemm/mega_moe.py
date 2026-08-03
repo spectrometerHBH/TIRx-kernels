@@ -3175,13 +3175,15 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
         def scheduler_release_task_info():
             # `release_task_info`: all epilogue threads (both CTAs) arrive at the
             # leader CTA's empty barrier of the just-consumed stage.
-            T.ptx.mbarrier.arrive(
+            _rem1 = T.alloc_local([1], "uint64")
+            T.ptxd.mapa.shared__cluster.u64(
+                _rem1[0],
                 smem_barriers.ptr_to(
                     [task_info_empty_barrier_base + (sched_stage_idx ^ T.int32(1))]
                 ),
-                remote=0,
-                pred=True,
+                T.uint32(0),
             )
+            T.ptxd.mbarrier.arrive.b64(_rem1[0], T.uint32(1), pred=T.bool(True))
 
         @T.inline
         def producer_create_task(task_block_phase, task_num_clusters, task_shape_n, task_shape_k):
@@ -3305,13 +3307,14 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
             # `publish_task`: lanes 0/1 arrive-and-expect-tx at each CTA's full
             # barrier, then st.async the 32-byte TaskInfo into that CTA's smem.
             if lane_idx < T.int32(2):
-                T.ptx.mbarrier.arrive.expect_tx(
+                _rem_ti = T.alloc_local([1], "uint64")
+                T.ptxd.mapa.shared__cluster.u64(
+                    _rem_ti[0],
                     smem_barriers.ptr_to([task_info_full_barrier_base + sched_stage_idx]),
-                    task_info_bytes,
-                    sem="release",
-                    scope="cluster",
-                    remote=lane_idx,
-                    pred=True,
+                    T.uint32(lane_idx),
+                )
+                T.ptxd.mbarrier.arrive.expect_tx.release.cluster.b64(
+                    _rem_ti[0], T.uint32(task_info_bytes), pred=T.bool(True)
                 )
                 T.evaluate(
                     st_async_cluster_task_info(
@@ -3348,7 +3351,9 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
 
         @T.inline
         def tmem_empty_barrier_arrive_cta0(tmem_empty_barrier_ptr):
-            T.ptx.mbarrier.arrive(tmem_empty_barrier_ptr, remote=0, pred=True)
+            _rem2 = T.alloc_local([1], "uint64")
+            T.ptxd.mapa.shared__cluster.u64(_rem2[0], tmem_empty_barrier_ptr, T.uint32(0))
+            T.ptxd.mbarrier.arrive.b64(_rem2[0], T.uint32(1), pred=T.bool(True))
 
         @T.inline
         def umma_arrive_multicast_2x1sm(barrier_ptr):
@@ -3422,7 +3427,9 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
 
         @T.inline
         def full_barrier_arrive_cta0(full_barrier_ptr):
-            T.ptx.mbarrier.arrive(full_barrier_ptr, remote=0, pred=True)
+            _rem3 = T.alloc_local([1], "uint64")
+            T.ptxd.mapa.shared__cluster.u64(_rem3[0], full_barrier_ptr, T.uint32(0))
+            T.ptxd.mbarrier.arrive.b64(_rem3[0], T.uint32(1), pred=T.bool(True))
 
         @T.inline
         def make_instr_desc_block_scaled():

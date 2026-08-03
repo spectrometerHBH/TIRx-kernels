@@ -750,10 +750,10 @@ def _kernel(
                     gather_nope_part(1, bar_kv_nope_ready_part1)
                 else:
                     tx_bytes = T.uint32(WG1_ROWS_PER_WARP * 4 * (D_V // 2) * BF16_BYTES)
-                    T.ptxd.mbarrier.complete_tx.shared.b64(
+                    T.ptxd.mbarrier.complete_tx.relaxed.cluster.shared.b64(
                         bar_kv_nope_ready_part0.ptr_to([cur_buf]), T.uint32(tx_bytes)
                     )
-                    T.ptxd.mbarrier.complete_tx.shared.b64(
+                    T.ptxd.mbarrier.complete_tx.relaxed.cluster.shared.b64(
                         bar_kv_nope_ready_part1.ptr_to([cur_buf]), T.uint32(tx_bytes)
                     )
         iket.range_end(kv_nope_token)

@@ -555,7 +555,11 @@ def tirx_input_DSMEM_write_TMA_wts_GMEM(
                     )
                     remote_buf = T.decl_buffer([1], "float32", scope="shared", data=remote_ptr)
                     remote_buf[0] = sum_sq_smem[0]
-                    T.ptx.mbarrier.arrive(cluster_bar.ptr_to([0]), remote=t_idx, pred=True)
+                    _rem1 = T.alloc_local([1], "uint64")
+                    T.ptxd.mapa.shared__cluster.u64(
+                        _rem1[0], cluster_bar.ptr_to([0]), T.uint32(t_idx)
+                    )
+                    T.ptxd.mbarrier.arrive.b64(_rem1[0], T.uint32(1), pred=T.bool(True))
             cluster_bar.wait(0, 0)
             if t_idy == 0:
                 if t_idx < CLUSTER_N:

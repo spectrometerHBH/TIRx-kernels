@@ -491,7 +491,9 @@ def _kernel(
             wg0_next_job: T.let = T.ptx.clc_query_cancel(
                 T.address_of(clc_response[0]), use_ld_acquire=True
             )
-            T.ptx.mbarrier.arrive(bar_clc_empty.ptr_to([0]), remote=T.uint32(0), pred=True)
+            _rem1 = T.alloc_local([1], "uint64")
+            T.ptxd.mapa.shared__cluster.u64(_rem1[0], bar_clc_empty.ptr_to([0]), T.uint32(0))
+            T.ptxd.mbarrier.arrive.b64(_rem1[0], T.uint32(1), pred=T.bool(True))
             if wg0_next_job == T.uint32(0xFFFFFFFF):
                 wg0_job_valid = 0
             else:
@@ -580,7 +582,9 @@ def _kernel(
                 wg1_next_job: T.let = T.ptx.clc_query_cancel(
                     T.address_of(clc_response[0]), use_ld_acquire=True
                 )
-                T.ptx.mbarrier.arrive(bar_clc_empty.ptr_to([0]), remote=T.uint32(0), pred=True)
+                _rem2 = T.alloc_local([1], "uint64")
+                T.ptxd.mapa.shared__cluster.u64(_rem2[0], bar_clc_empty.ptr_to([0]), T.uint32(0))
+                T.ptxd.mbarrier.arrive.b64(_rem2[0], T.uint32(1), pred=T.bool(True))
                 if wg1_next_job == T.uint32(0xFFFFFFFF):
                     wg1_job_valid = 0
                 else:
@@ -671,7 +675,11 @@ def _kernel(
                     umma_next_job: T.let = T.ptx.clc_query_cancel(
                         T.address_of(clc_response[0]), use_ld_acquire=True
                     )
-                    T.ptx.mbarrier.arrive(bar_clc_empty.ptr_to([0]), remote=T.uint32(0), pred=True)
+                    _rem3 = T.alloc_local([1], "uint64")
+                    T.ptxd.mapa.shared__cluster.u64(
+                        _rem3[0], bar_clc_empty.ptr_to([0]), T.uint32(0)
+                    )
+                    T.ptxd.mbarrier.arrive.b64(_rem3[0], T.uint32(1), pred=T.bool(True))
                     if umma_next_job == T.uint32(0xFFFFFFFF):
                         umma_job_valid = 0
                     else:
@@ -722,7 +730,11 @@ def _kernel(
                     valid_next_job: T.let = T.ptx.clc_query_cancel(
                         T.address_of(clc_response[0]), use_ld_acquire=True
                     )
-                    T.ptx.mbarrier.arrive(bar_clc_empty.ptr_to([0]), remote=T.uint32(0), pred=True)
+                    _rem4 = T.alloc_local([1], "uint64")
+                    T.ptxd.mapa.shared__cluster.u64(
+                        _rem4[0], bar_clc_empty.ptr_to([0]), T.uint32(0)
+                    )
+                    T.ptxd.mbarrier.arrive.b64(_rem4[0], T.uint32(1), pred=T.bool(True))
                     if valid_next_job == T.uint32(0xFFFFFFFF):
                         valid_job_valid = 0
                     else:
@@ -751,9 +763,11 @@ def _kernel(
                         clc_next_job: T.let = T.ptx.clc_query_cancel(
                             T.address_of(clc_response[0]), use_ld_acquire=True
                         )
-                        T.ptx.mbarrier.arrive(
-                            bar_clc_empty.ptr_to([0]), remote=T.uint32(0), pred=True
+                        _rem5 = T.alloc_local([1], "uint64")
+                        T.ptxd.mapa.shared__cluster.u64(
+                            _rem5[0], bar_clc_empty.ptr_to([0]), T.uint32(0)
                         )
+                        T.ptxd.mbarrier.arrive.b64(_rem5[0], T.uint32(1), pred=T.bool(True))
                         if clc_next_job == T.uint32(0xFFFFFFFF):
                             clc_job_valid = 0
                         clc_outer_loop_phase = clc_outer_loop_phase ^ 1
@@ -972,7 +986,9 @@ def _kernel(
             wg3_next_job: T.let = T.ptx.clc_query_cancel(
                 T.address_of(clc_response[0]), use_ld_acquire=True
             )
-            T.ptx.mbarrier.arrive(bar_clc_empty.ptr_to([0]), remote=T.uint32(0), pred=True)
+            _rem6 = T.alloc_local([1], "uint64")
+            T.ptxd.mapa.shared__cluster.u64(_rem6[0], bar_clc_empty.ptr_to([0]), T.uint32(0))
+            T.ptxd.mbarrier.arrive.b64(_rem6[0], T.uint32(1), pred=T.bool(True))
             if wg3_next_job == T.uint32(0xFFFFFFFF):
                 wg3_job_valid = 0
             else:

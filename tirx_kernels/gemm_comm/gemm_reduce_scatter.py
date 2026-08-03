@@ -456,7 +456,11 @@ def consumer_fetch(
         fetched_task_idx1.ptr_to([0]),
         source_code=unpack_values,
     )
-    Tx.ptx.mbarrier.arrive(sch_pipe.mbar_c2p.ptr_to([sch_pipe.idx, 0]), remote=0, pred=True)
+    _rem1 = Tx.alloc_local([1], "uint64")
+    Tx.ptxd.mapa.shared__cluster.u64(
+        _rem1[0], sch_pipe.mbar_c2p.ptr_to([sch_pipe.idx, 0]), Tx.uint32(0)
+    )
+    Tx.ptxd.mbarrier.arrive.b64(_rem1[0], Tx.uint32(1), pred=Tx.bool(True))
     sch_pipe.p2c_phase = sch_pipe.p2c_phase ^ 1
 
 
@@ -512,12 +516,16 @@ class MixedDynamicTileScheduler:
                     source_code=pack_values,
                 )
                 Tx.cuda.thread_fence()
-                Tx.ptx.mbarrier.arrive(
-                    self.sch_pipe.mbar_p2c.ptr_to([self.sch_pipe.idx, 0]), remote=0, pred=True
+                _rem2 = Tx.alloc_local([1], "uint64")
+                Tx.ptxd.mapa.shared__cluster.u64(
+                    _rem2[0], self.sch_pipe.mbar_p2c.ptr_to([self.sch_pipe.idx, 0]), Tx.uint32(0)
                 )
-                Tx.ptx.mbarrier.arrive(
-                    self.sch_pipe.mbar_p2c.ptr_to([self.sch_pipe.idx, 0]), remote=1, pred=True
+                Tx.ptxd.mbarrier.arrive.b64(_rem2[0], Tx.uint32(1), pred=Tx.bool(True))
+                _rem3 = Tx.alloc_local([1], "uint64")
+                Tx.ptxd.mapa.shared__cluster.u64(
+                    _rem3[0], self.sch_pipe.mbar_p2c.ptr_to([self.sch_pipe.idx, 0]), Tx.uint32(1)
                 )
+                Tx.ptxd.mbarrier.arrive.b64(_rem3[0], Tx.uint32(1), pred=Tx.bool(True))
                 self.sch_pipe.c2p_phase = self.sch_pipe.c2p_phase ^ 1
         consumer_fetch(
             self.sch_pipe,

@@ -665,10 +665,13 @@ def _kernel(
                                     ),
                                 )
                     else:
-                        T.ptx.mbarrier.complete_tx(
-                            bar.ptr_to([cur_buf]),
+                        _rem1 = T.alloc_local([1], "uint64")
+                        T.ptxd.mapa.shared__cluster.u64(
+                            _rem1[0], bar.ptr_to([cur_buf]), T.uint32(0)
+                        )
+                        T.ptxd.mbarrier.complete_tx.relaxed.cluster.b64(
+                            _rem1[0],
                             T.uint32(WG1_ROWS_PER_WARP * 4 * tx_dim * BF16_BYTES),
-                            remote=T.uint32(0),
                             pred=T.uint32(1),
                         )
 

@@ -422,8 +422,12 @@ def _kernel(
             smem_pipe.empty.wait(tma_cur.stage, tma_cur.phase)
             if id_in_pair == 0:
                 tile_bytes = T.meta_var(A_BYTES + B_BYTES)
-                T.ptx.mbarrier.arrive.expect_tx(
-                    tile_full_bar.ptr_to([stage]), tile_bytes, remote=pair_leader_rank, pred=True
+                _rem1 = T.alloc_local([1], "uint64")
+                T.ptxd.mapa.shared__cluster.u64(
+                    _rem1[0], tile_full_bar.ptr_to([stage]), T.uint32(pair_leader_rank)
+                )
+                T.ptxd.mbarrier.arrive.expect_tx.b64(
+                    _rem1[0], T.uint32(tile_bytes), pred=T.bool(True)
                 )
             single_cta_mask: T.int32 = 1 << id_in_pair
             # Barrier pre-mapped to the cluster leader (the g2s primitive maps
@@ -457,8 +461,12 @@ def _kernel(
             smem_pipe.empty.wait(tma_cur.stage, tma_cur.phase)
             if id_in_pair == 0:
                 scale_bytes = T.meta_var(SFA_BYTES + SFB_BYTES)
-                T.ptx.mbarrier.arrive.expect_tx(
-                    scale_full_bar.ptr_to([stage]), scale_bytes, remote=pair_leader_rank, pred=True
+                _rem2 = T.alloc_local([1], "uint64")
+                T.ptxd.mapa.shared__cluster.u64(
+                    _rem2[0], scale_full_bar.ptr_to([stage]), T.uint32(pair_leader_rank)
+                )
+                T.ptxd.mbarrier.arrive.expect_tx.b64(
+                    _rem2[0], T.uint32(scale_bytes), pred=T.bool(True)
                 )
             single_cta_mask: T.int32 = 1 << id_in_pair
             # SFA: each CTA loads its half (single_cta_mask). SFB: multicast to
@@ -608,12 +616,11 @@ def _kernel(
         T.cuda.warpgroup_sync(1)
     if warp_id == int(WarpRole.EPILOGUE):
         if T.ptx.elect_sync():
-            T.ptx.mbarrier.arrive(
-                tmem_finished.ptr_to([0]),
-                remote=pair_leader_rank + 1 - id_in_pair,
-                pred=True,
-                count=1,
+            _rem3 = T.alloc_local([1], "uint64")
+            T.ptxd.mapa.shared__cluster.u64(
+                _rem3[0], tmem_finished.ptr_to([0]), T.uint32(pair_leader_rank + 1 - id_in_pair)
             )
+            T.ptxd.mbarrier.arrive.b64(_rem3[0], T.uint32(1), pred=T.bool(True))
         T.ptx.mbarrier.try_wait_acquire_cluster(tmem_finished.ptr_to([0]), 0)
         T.ptxd[f"tcgen05.dealloc.cta_group::{CTA_GROUP}.sync.aligned.b32"](
             tmem_pool.addr, T.uint32(512)

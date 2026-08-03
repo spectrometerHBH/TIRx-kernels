@@ -55,7 +55,9 @@ class BarMMA2TMA(Barriers):
 class BarLD2MMA(Barriers):
     @T.inline
     def arrive(self, idx):
-        T.ptx.mbarrier.arrive(self.mbar.ptr_to([idx]), remote=0, pred=True)
+        _rem1 = T.alloc_local([1], "uint64")
+        T.ptxd.mapa.shared__cluster.u64(_rem1[0], self.mbar.ptr_to([idx]), T.uint32(0))
+        T.ptxd.mbarrier.arrive.b64(_rem1[0], T.uint32(1), pred=T.bool(True))
 
 
 class GemmTile(Tile):

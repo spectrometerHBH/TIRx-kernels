@@ -367,7 +367,9 @@ class BarMMA2TMA(Barriers):
 class BarLD2MMA(Barriers):
     @T.inline
     def arrive(self, idx):
-        T.ptx.mbarrier.arrive(self.mbar.ptr_to([0, idx]), remote=0, pred=True)
+        _rem1 = T.alloc_local([1], "uint64")
+        T.ptxd.mapa.shared__cluster.u64(_rem1[0], self.mbar.ptr_to([0, idx]), T.uint32(0))
+        T.ptxd.mbarrier.arrive.b64(_rem1[0], T.uint32(1), pred=T.bool(True))
 
 
 @T.meta_class
@@ -563,7 +565,9 @@ def consumer_fetch(
         fetched_task_idx1.ptr_to([0]),
         source_code=unpack_values,
     )
-    T.ptx.mbarrier.arrive(sch_pipe.mbar_c2p.ptr_to([sch_pipe.idx, 0]), remote=0, pred=True)
+    _rem2 = T.alloc_local([1], "uint64")
+    T.ptxd.mapa.shared__cluster.u64(_rem2[0], sch_pipe.mbar_c2p.ptr_to([sch_pipe.idx, 0]), T.uint32(0))
+    T.ptxd.mbarrier.arrive.b64(_rem2[0], T.uint32(1), pred=T.bool(True))
     sch_pipe.p2c_phase = sch_pipe.p2c_phase ^ 1
 # fmt: on
 
@@ -608,8 +612,12 @@ class SingleDynamicTileScheduler:
                     source_code=pack_values,
                 )
                 # T.cuda.thread_fence()
-                T.ptx.mbarrier.arrive(self.sch_pipe.mbar_p2c.ptr_to([self.sch_pipe.idx, 0]), remote=0, pred=True)
-                T.ptx.mbarrier.arrive(self.sch_pipe.mbar_p2c.ptr_to([self.sch_pipe.idx, 0]), remote=1, pred=True)
+                _rem3 = T.alloc_local([1], "uint64")
+                T.ptxd.mapa.shared__cluster.u64(_rem3[0], self.sch_pipe.mbar_p2c.ptr_to([self.sch_pipe.idx, 0]), T.uint32(0))
+                T.ptxd.mbarrier.arrive.b64(_rem3[0], T.uint32(1), pred=T.bool(True))
+                _rem4 = T.alloc_local([1], "uint64")
+                T.ptxd.mapa.shared__cluster.u64(_rem4[0], self.sch_pipe.mbar_p2c.ptr_to([self.sch_pipe.idx, 0]), T.uint32(1))
+                T.ptxd.mbarrier.arrive.b64(_rem4[0], T.uint32(1), pred=T.bool(True))
                 self.sch_pipe.c2p_phase = self.sch_pipe.c2p_phase ^ 1
         if ENABLE_WARP_BROADCAST:
             if lane_id == 0:
