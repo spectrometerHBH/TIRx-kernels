@@ -1513,9 +1513,8 @@ def get_kernel(**kwargs: Any):
             kv_iter_idx: T.uint32 = T.uint32(0)
             q_stage_idx: T.uint32 = T.uint32(0)
             q_phase: T.uint32 = T.uint32(0)
-            tmem_allocated: T.uint32 = T.ptx.ld(
-                tmem_ptr_in_smem.ptr_to([0]), "uint32", "u32", space="shared"
-            )
+            tmem_allocated: T.uint32
+            T.ptxd.ld.shared.u32(tmem_allocated, tmem_ptr_in_smem.ptr_to([0]))
             T.cuda.trap_when_assert_failed(tmem_allocated == T.uint32(0))
             desc_i: T.uint32
             desc_a: T.uint64
@@ -1903,11 +1902,10 @@ def get_kernel(**kwargs: Any):
                     ),
                     kv_phase,
                 )
-                scale_kv: T.float32 = T.ptx.ld(
+                scale_kv: T.float32
+                T.ptxd.ld.shared.f32(
+                    scale_kv,
                     smem_kv_scales.ptr_to([math_warpgroup_idx, kv_stage_idx, math_thread_idx]),
-                    "float32",
-                    "f32",
-                    space="shared",
                 )
                 umma_stage_idx: T.uint32 = umma_iter_idx % T.uint32(num_umma_stages)
                 umma_phase: T.uint32 = (umma_iter_idx // T.uint32(num_umma_stages)) & T.uint32(1)

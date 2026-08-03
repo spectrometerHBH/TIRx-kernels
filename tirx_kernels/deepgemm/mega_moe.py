@@ -1654,8 +1654,10 @@ def get_kernel(
             "uint32",
         )
 
-    def load_f32(address):
-        return T.ptx.ld(address, "float32", "f32", space="global")
+    def load_f32(dst, address):
+        # ptxd destinations are declared registers, so the helper writes into
+        # one the caller owns rather than returning a value.
+        return T.ptxd.ld.global_.f32(dst, address)
 
     def uint32_bits_to_float(bits):
         return T.cuda.uint_as_float(bits)
@@ -1738,11 +1740,13 @@ def get_kernel(
     def prefetch_tensormap(tensor_map):
         return T.ptxd.prefetch.tensormap(T.address_of(tensor_map))
 
-    def lds128(src_ptr, dst_ptr):
-        return T.ptx.ld(src_ptr, "uint32", "u32", dst=dst_ptr, space="shared", vec="v4")
+    def lds128(src_ptr, dst, base=0):
+        return T.ptxd.ld.shared.v4.u32(
+            dst[base], dst[base + 1], dst[base + 2], dst[base + 3], src_ptr
+        )
 
     def sts128(dst_ptr, r0, r1, r2, r3):
-        return T.ptx.st(dst_ptr, r0, r1, r2, r3, space="shared", vec="v4", ptx_type="b32")
+        return T.ptxd.st.shared.v4.b32(dst_ptr, r0, r1, r2, r3)
 
     def mbarrier_arrive_local(barrier_ptr):
         return T.ptxd.mbarrier.arrive.shared.b64(barrier_ptr, T.uint32(1))
@@ -1828,16 +1832,7 @@ def get_kernel(
         )
 
     def stg128_symm(peer_base, byte_offset, r0, r1, r2, r3):
-        return T.ptx.st(
-            peer_ptr(peer_base, byte_offset),
-            r0,
-            r1,
-            r2,
-            r3,
-            space="global",
-            vec="v4",
-            ptx_type="b32",
-        )
+        return T.ptxd.st.global_.v4.b32(peer_ptr(peer_base, byte_offset), r0, r1, r2, r3)
 
     def ptr_to_u64(ptr):
         return T.reinterpret("uint64", ptr)
@@ -1846,13 +1841,13 @@ def get_kernel(
         return T.reinterpret("handle", peer_base + byte_offset)
 
     def peer_store_u32(peer_base, byte_offset, value):
-        return T.ptx.st(peer_ptr(peer_base, byte_offset), value, space="global", ptx_type="u32")
+        return T.ptxd.st.global_.u32(peer_ptr(peer_base, byte_offset), value)
 
     def peer_store_u64(peer_base, byte_offset, value):
-        return T.ptx.st(peer_ptr(peer_base, byte_offset), value, space="global", ptx_type="u64")
+        return T.ptxd.st.global_.u64(peer_ptr(peer_base, byte_offset), value)
 
     def st_shared_u32(ptr, value):
-        return T.ptx.st(ptr, value, space="shared", ptx_type="u32")
+        return T.ptxd.st.shared.u32(ptr, value)
 
     def st_shared_bulk(ptr, num_bytes):
         return T.ptxd.st_bulk.weak.shared__cta(ptr, T.cast(num_bytes, "uint64"))
@@ -1863,11 +1858,11 @@ def get_kernel(
     def peer_red_add_rel_sys_s32(peer_base, byte_offset, value):
         return T.ptxd.red.release.sys.global_.add.s32(peer_ptr(peer_base, byte_offset), value)
 
-    def peer_load_u32(peer_base, byte_offset):
-        return T.ptx.ld(peer_ptr(peer_base, byte_offset), "uint32", "u32", space="global")
+    def peer_load_u32(dst, peer_base, byte_offset):
+        return T.ptxd.ld.global_.u32(dst, peer_ptr(peer_base, byte_offset))
 
-    def peer_load_f32(peer_base, byte_offset):
-        return T.ptx.ld(peer_ptr(peer_base, byte_offset), "float32", "f32", space="global")
+    def peer_load_f32(dst, peer_base, byte_offset):
+        return T.ptxd.ld.global_.f32(dst, peer_ptr(peer_base, byte_offset))
 
     def tma_load_1d_symm(dst_ptr, peer_base, byte_offset, barrier_ptr, num_bytes):
         return T.ptx.cp_async_bulk_g2s_cluster(
@@ -3156,8 +3151,8 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
             barrier_wait(
                 smem_barriers.ptr_to([task_info_full_barrier_base + sched_stage_idx]), sched_phase
             )
-            lds128(smem_task_infos.ptr_to([sched_stage_idx, 0]), task_info_regs.ptr_to([0]))
-            lds128(smem_task_infos.ptr_to([sched_stage_idx, 4]), task_info_regs.ptr_to([4]))
+            lds128(smem_task_infos.ptr_to([sched_stage_idx, 0]), task_info_regs, 0)
+            lds128(smem_task_infos.ptr_to([sched_stage_idx, 4]), task_info_regs, 4)
             sched_advance_pipeline()
 
         @T.inline
@@ -3930,25 +3925,27 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
                 )
                 dispatch_dst_rank_idx = lane_idx
                 while dispatch_dst_rank_idx < hidden // 128:
-                    l1_acts_sf[dispatch_dst_rank_idx, sf_row_idx] = T.cast(
-                        peer_load_u32(
-                            symm_rank_base_expr(
-                                sym_buffer_base,
-                                symm_rank_offsets,
-                                smem_symm_rank_bases,
-                                current_rank_in_expert_idx,
-                            ),
-                            T.uint64(
-                                symm_buffer_layout.input_sf_offset
-                                + (pull_src_token_idx * (hidden // 128) + dispatch_dst_rank_idx) * 4
-                            ),
+                    pulled_sf: T.uint32
+                    peer_load_u32(
+                        pulled_sf,
+                        symm_rank_base_expr(
+                            sym_buffer_base,
+                            symm_rank_offsets,
+                            smem_symm_rank_bases,
+                            current_rank_in_expert_idx,
                         ),
-                        "int32",
+                        T.uint64(
+                            symm_buffer_layout.input_sf_offset
+                            + (pull_src_token_idx * (hidden // 128) + dispatch_dst_rank_idx) * 4
+                        ),
                     )
+                    l1_acts_sf[dispatch_dst_rank_idx, sf_row_idx] = T.cast(pulled_sf, "int32")
                     dispatch_dst_rank_idx = dispatch_dst_rank_idx + 32
                 T.cuda.warp_sync()
                 if T.ptx.elect_sync():
-                    l1_topk_weights[pull_ring_token_idx] = peer_load_f32(
+                    pulled_weight: T.float32
+                    peer_load_f32(
+                        pulled_weight,
                         symm_rank_base_expr(
                             sym_buffer_base,
                             symm_rank_offsets,
@@ -3960,6 +3957,7 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
                             + pull_src_token_topk_idx * 4
                         ),
                     )
+                    l1_topk_weights[pull_ring_token_idx] = pulled_weight
                     store_token_src_metadata(
                         pull_pool_token_idx,
                         current_rank_in_expert_idx,
@@ -4558,7 +4556,7 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
                                             + lane_idx
                                         ]
                                     )
-                                    stored_cached_weight = load_f32(l1_topk_weight_ptr)
+                                    load_f32(stored_cached_weight, l1_topk_weight_ptr)
                                 else:
                                     if T.cast(j * atom_m + lane_idx, "uint32") < T.uint32(
                                         wg_block_m
@@ -4571,7 +4569,7 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
                                                 + lane_idx
                                             ]
                                         )
-                                        stored_cached_weight = load_f32(l1_topk_weight_ptr)
+                                        load_f32(stored_cached_weight, l1_topk_weight_ptr)
                             weights[0] = T.tvm_warp_shuffle(
                                 T.uint32(0xFFFFFFFF),
                                 stored_cached_weight,
@@ -4899,7 +4897,7 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
                                         + (bank_group_idx ^ row_in_atom) * num_bank_group_bytes
                                     ]
                                 )
-                                lds128(smem_ptr, epilogue_bf16_packed.ptr_to([0]))
+                                lds128(smem_ptr, epilogue_bf16_packed)
                                 dst_peer_base = symm_rank_base_expr(
                                     sym_buffer_base,
                                     symm_rank_offsets,
@@ -5008,7 +5006,7 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
                             load_ptr = combine_chunks.ptr_to(
                                 [load_stage_idx, epilogue_warp_idx, j * 32 + lane_idx, 0]
                             )
-                            lds128(load_ptr, epilogue_bf16_packed.ptr_to([0]))
+                            lds128(load_ptr, epilogue_bf16_packed)
                             for elem_idx in T.unroll(0, num_elems_per_uint4):
                                 # d = convert(a) + c, accumulating in place.
                                 T.ptxd.add.rn.f32.bf16(

@@ -990,24 +990,12 @@ def get_kernel(**kwargs: Any):
                 col = (
                     T.bitwise_xor(i_u32, lane_idx_u32 >> T.uint32(3)) * T.uint32(32) + lane_idx_u32
                 )
-                values[i] = T.ptx.ld(
-                    buf1d.ptr_to([T.cast(base_offset + col, "int32")]),
-                    "uint32",
-                    "u32",
-                    space="shared",
-                )
+                T.ptxd.ld.shared.u32(values[i], buf1d.ptr_to([T.cast(base_offset + col, "int32")]))
             T.cuda.warp_sync()
             for i in T.unroll(0, 4):
                 i_u32 = T.uint32(i)
                 col = lane_idx_u32 * T.uint32(4) + T.bitwise_xor(i_u32, lane_idx_u32 >> T.uint32(3))
-                T.evaluate(
-                    T.ptx.st(
-                        buf1d.ptr_to([T.cast(base_offset + col, "int32")]),
-                        values[i],
-                        space="shared",
-                        ptx_type="u32",
-                    )
-                )
+                T.ptxd.st.shared.u32(buf1d.ptr_to([T.cast(base_offset + col, "int32")]), values[i])
 
         @T.inline
         def tma_load_2d_q(dst, barrier_ptr, tensor_map, coord0, coord1):
@@ -1607,9 +1595,8 @@ def get_kernel(**kwargs: Any):
             tmem_iter_idx: T.uint32 = T.uint32(0)
             q_stage_idx: T.uint32 = T.uint32(0)
             q_phase: T.uint32 = T.uint32(0)
-            tmem_allocated: T.uint32 = T.ptx.ld(
-                tmem_ptr_in_smem.ptr_to([0]), "uint32", "u32", space="shared"
-            )
+            tmem_allocated: T.uint32
+            T.ptxd.ld.shared.u32(tmem_allocated, tmem_ptr_in_smem.ptr_to([0]))
             T.cuda.trap_when_assert_failed(tmem_allocated == T.uint32(0))
             desc_i: T.uint32
             desc_sf: T.uint64

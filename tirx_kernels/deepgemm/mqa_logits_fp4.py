@@ -377,28 +377,17 @@ def get_kernel(**kwargs: Any):
     def emit_sf_transpose(buf, dst, lane, stage_idx, elem_base):
         # DeepGEMM's st.shared.v4 SF transpose, out-of-place into staging
         # (no in-place WAR warp_sync; elect.sync covers the cross-lane barrier).
-        v0 = T.ptx.ld(
-            buf.ptr_to([stage_idx, elem_base + 0 * 32 + lane]), "uint32", "u32", space="shared"
-        )
-        v1 = T.ptx.ld(
-            buf.ptr_to([stage_idx, elem_base + 1 * 32 + lane]), "uint32", "u32", space="shared"
-        )
-        v2 = T.ptx.ld(
-            buf.ptr_to([stage_idx, elem_base + 2 * 32 + lane]), "uint32", "u32", space="shared"
-        )
-        v3 = T.ptx.ld(
-            buf.ptr_to([stage_idx, elem_base + 3 * 32 + lane]), "uint32", "u32", space="shared"
-        )
+        # ptxd destinations are declared registers the instruction writes into.
+        # This is a plain Python helper, so each call has to be handed to the
+        # frame explicitly or it is discarded.
+        v = T.alloc_local((4,), "uint32")
+        for i in range(4):
+            T.evaluate(
+                T.ptxd.ld.shared.u32(v[i], buf.ptr_to([stage_idx, elem_base + i * 32 + lane]))
+            )
         T.evaluate(
-            T.ptx.st(
-                dst.ptr_to([stage_idx, elem_base + lane * 4]),
-                v0,
-                v1,
-                v2,
-                v3,
-                vec="v4",
-                ptx_type="u32",
-                space="shared",
+            T.ptxd.st.shared.v4.u32(
+                dst.ptr_to([stage_idx, elem_base + lane * 4]), v[0], v[1], v[2], v[3]
             )
         )
 
@@ -541,7 +530,7 @@ def get_kernel(**kwargs: Any):
         @T.inline
         def store_logits(flat_offset, value):
             if config.logits_dtype == "float32":
-                T.ptx.st(logits_flat.ptr_to([flat_offset]), value, space="global", ptx_type="f32")
+                T.ptxd.st.global_.f32(logits_flat.ptr_to([flat_offset]), value)
             else:
                 logits_flat[flat_offset] = value
 

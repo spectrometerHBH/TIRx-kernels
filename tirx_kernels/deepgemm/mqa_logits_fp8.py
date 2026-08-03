@@ -474,7 +474,7 @@ def get_kernel(**kwargs: Any):
             # Scalar predicated store: per-thread non-contiguous output, so TMA/bulk
             # does not apply; bf16 stays a plain buffer store (predicated @P STG.E.U16).
             if config.logits_dtype == "float32":
-                T.ptx.st(logits_flat.ptr_to([flat_offset]), value, space="global", ptx_type="f32")
+                T.ptxd.st.global_.f32(logits_flat.ptr_to([flat_offset]), value)
             else:
                 logits_flat[flat_offset] = value
 
@@ -694,11 +694,9 @@ def get_kernel(**kwargs: Any):
                     kv_idx: T.uint32 = T.uint32(0)
                     while kv_idx < num_kv_blocks:
                         kv_pipe.full.wait(kv_stage_idx, kv_phase)
-                        scale_kv: T.float32 = T.ptx.ld(
-                            smem_kv_scales.ptr_to([kv_stage_idx, math_thread_idx]),
-                            "float32",
-                            "f32",
-                            space="shared",
+                        scale_kv: T.float32
+                        T.ptxd.ld.shared.f32(
+                            scale_kv, smem_kv_scales.ptr_to([kv_stage_idx, math_thread_idx])
                         )
                         tmem_pipe.full.wait(tmem_stage_idx, tmem_phase)
                         # Release the kv stage only after the tmem accumulator is

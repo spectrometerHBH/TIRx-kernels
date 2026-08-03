@@ -645,15 +645,12 @@ def _kernel(
         # kernel.cuh:80-88 / KU_LDG_256.  Keep one 32-byte operation,
         # including its cache operators and L2 prefetch size; the eighth
         # int32 word is intentionally loaded even though it is reserved.
-        T.ptx.ld_global_nc(
+        T.ptxd["ld.global.nc.L1::no_allocate.L2::evict_normal.L2::256B.v4.u64"](
+            dst[0],
+            dst[1],
+            dst[2],
+            dst[3],
             tile_scheduler_metadata.view("uint64").ptr_to([partition_idx, 0]),
-            "uint64",
-            "u64",
-            dst=dst.ptr_to([0]),
-            vec="v4",
-            l1_evict="L1::no_allocate",
-            l2_evict="L2::evict_normal",
-            prefetch_size="L2::256B",
         )
 
     @T.inline
@@ -667,6 +664,8 @@ def _kernel(
             scaled_lo: T.let = T.Shuffle([rounded], [0]) * scale
             scaled_hi: T.let = T.Shuffle([rounded], [1]) * scale
             packed[pair_i] = T.reinterpret("uint32", T.Shuffle([scaled_lo, scaled_hi], [0, 1]))
+        # Still the legacy op: ptxd would have to take the 128-bit value as an
+        # operand, and the CUDA codegen has no uint128 type to carry it.
         T.ptx.st(smem_addr, src=packed.ptr_to([0]), weak=True, space="shared::cta", ptx_type="b128")
 
     # kernel.cuh:35-67.  Each copy site requests the lowering's ordinary
@@ -1804,25 +1803,22 @@ def _kernel(
                                     T.shift_right(converted_pair, T.uint32(16)), "uint16"
                                 )
 
-                        cur_raw_fp8x8: T.uint64 = T.ptx.ld(
+                        cur_raw_fp8x8: T.uint64
+                        T.ptxd.ld.shared.u64(
+                            cur_raw_fp8x8,
                             cur_raw_nope_base_uint_addr
                             + T.cast(local_row * (128 // 8) * d_nope, "uint32"),
-                            "uint64",
-                            "u64",
-                            space="shared",
                         )
                         for local_col in T.unroll(cols_per_group):
                             raw_fp8x8: T.let = cur_raw_fp8x8
                             if local_col + 1 < cols_per_group:
-                                cur_raw_fp8x8 = T.ptx.ld(
+                                T.ptxd.ld.shared.u64(
+                                    cur_raw_fp8x8,
                                     cur_raw_nope_base_uint_addr
                                     + T.cast(
                                         local_row * (128 // 8) * d_nope + (local_col + 1) * (8 * 8),
                                         "uint32",
                                     ),
-                                    "uint64",
-                                    "u64",
-                                    space="shared",
                                 )
                             scale_idx: T.let = (
                                 local_col // (cols_per_group // 4) if is_v32 else local_col
