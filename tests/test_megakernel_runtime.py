@@ -35,8 +35,8 @@ def test_run_test_all_schedulers_uses_flashinfer_reference_once(monkeypatch):
     validations = []
     synchronizations = []
 
-    def compile_schedulers(schedulers, batch_size, world_size, profiler_on):
-        compiled.append((schedulers, batch_size, world_size, profiler_on))
+    def compile_schedulers(schedulers, batch_size, world_size):
+        compiled.append((schedulers, batch_size, world_size))
         return object(), {scheduler: object() for scheduler in schedulers}
 
     def make_tir_case(*, scheduler, **kwargs):
@@ -79,7 +79,7 @@ def test_run_test_all_schedulers_uses_flashinfer_reference_once(monkeypatch):
 
     moe.run_test(batch_size=512)
 
-    assert compiled == [(moe._SUPPORTED_SCHEDULERS, 512, 1, False)]
+    assert compiled == [(moe._SUPPORTED_SCHEDULERS, 512, 1)]
     assert tir_runs == list(moe._SUPPORTED_SCHEDULERS)
     assert reference_builds["flashinfer"][1] == {"tune": False}
     assert reference_calls == {"flashinfer": 1}
