@@ -485,11 +485,12 @@ def _kernel(
             )
             s_pack = s_frag.local().view("uint32")
             neg_new_max_pair: T.let = T.cuda.make_float2(-new_max, -new_max)
+            fma_pair: T.uint64
             for s_i in T.unroll(P_TMEM_COLS // 2):
                 p_pair: T.let = T.cuda.make_float2(
                     T.cuda.uint_as_float(p[s_i * 2]), T.cuda.uint_as_float(p[s_i * 2 + 1])
                 )
-                fma_pair: T.let = T.ptx.fma_f32x2(p_pair, scale_pair, neg_new_max_pair, dps=False)
+                T.ptxd.fma.rn.f32x2(fma_pair, p_pair, scale_pair, neg_new_max_pair)
                 s_x: T.float32
                 s_y: T.float32
                 T.ptxd.ex2.approx.ftz.f32(s_x, T.cuda.float2_x(fma_pair))

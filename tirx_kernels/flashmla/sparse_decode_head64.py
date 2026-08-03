@@ -812,17 +812,17 @@ def _kernel(
                             p_exchange[warp_idx, exchange_offset : exchange_offset + 4],
                             dispatch="vec_128b",
                         )
-                        pair0: T.let = T.ptx.add_f32x2(
+                        pair0: T.uint64
+                        pair1: T.uint64
+                        T.ptxd.add.f32x2(
+                            pair0,
                             T.cuda.make_float2(p[exchange_i * 4], p[exchange_i * 4 + 1]),
                             T.cuda.make_float2(peer_tmp[0], peer_tmp[1]),
-                            rounding="",
-                            dps=False,
                         )
-                        pair1: T.let = T.ptx.add_f32x2(
+                        T.ptxd.add.f32x2(
+                            pair1,
                             T.cuda.make_float2(p[exchange_i * 4 + 2], p[exchange_i * 4 + 3]),
                             T.cuda.make_float2(peer_tmp[2], peer_tmp[3]),
-                            rounding="",
-                            dps=False,
                         )
                         p[exchange_i * 4] = T.cuda.float2_x(pair0)
                         p[exchange_i * 4 + 1] = T.cuda.float2_y(pair0)
@@ -868,16 +868,13 @@ def _kernel(
                     neg_max_pair: T.let = T.cuda.make_float2(-new_max, -new_max)
                     for s_i in T.unroll((B_TOPK // 2) // 2):
                         p_pair: T.let = T.cuda.make_float2(p[s_i * 2], p[s_i * 2 + 1])
-                        soft_pair: T.let = T.ptx.fma_f32x2(
-                            p_pair, scale_pair, neg_max_pair, dps=False
-                        )
+                        soft_pair: T.uint64
+                        T.ptxd.fma.rn.f32x2(soft_pair, p_pair, scale_pair, neg_max_pair)
                         sx: T.float32
                         sy: T.float32
                         T.ptxd.ex2.approx.ftz.f32(sx, T.cuda.float2_x(soft_pair))
                         T.ptxd.ex2.approx.ftz.f32(sy, T.cuda.float2_y(soft_pair))
-                        cur_sum_pair = T.ptx.add_f32x2(
-                            cur_sum_pair, T.cuda.make_float2(sx, sy), rounding="", dps=False
-                        )
+                        T.ptxd.add.f32x2(cur_sum_pair, cur_sum_pair, T.cuda.make_float2(sx, sy))
                         s_pack[s_i] = T.cuda.float22bfloat162_rn(sx, sy)
                     cur_sum: T.let = T.cuda.float2_x(cur_sum_pair) + T.cuda.float2_y(cur_sum_pair)
                     li_next: T.float32
@@ -896,13 +893,14 @@ def _kernel(
                                 o_win.chunk((None, (D_V // 2) // 64))[:, o_chunk],
                             )
                             T.ptx.tcgen05.wait.ld()
+                            scaled_pair: T.uint64
                             for scale_i in T.unroll(64 // 2):
-                                scaled_pair: T.let = T.ptx.mul_f32x2(
+                                T.ptxd.mul.f32x2(
+                                    scaled_pair,
                                     T.cuda.make_float2(
                                         o_rescale[scale_i * 2], o_rescale[scale_i * 2 + 1]
                                     ),
                                     scale_for_old_pair,
-                                    dps=False,
                                 )
                                 o_rescale[scale_i * 2] = T.cuda.float2_x(scaled_pair)
                                 o_rescale[scale_i * 2 + 1] = T.cuda.float2_y(scaled_pair)
@@ -970,11 +968,12 @@ def _kernel(
                             o_epi_frag[:, :], o_win.chunk((None, (D_V // 2) // 64))[:, epi_i]
                         )
                         T.ptx.tcgen05.wait.ld()
+                        scaled_pair: T.uint64
                         for scale_i in T.unroll(64 // 2):
-                            scaled_pair: T.let = T.ptx.mul_f32x2(
+                            T.ptxd.mul.f32x2(
+                                scaled_pair,
                                 T.cuda.make_float2(o_epi[scale_i * 2], o_epi[scale_i * 2 + 1]),
                                 output_scale_pair,
-                                dps=False,
                             )
                             o_epi[scale_i * 2] = T.cuda.float2_x(scaled_pair)
                             o_epi[scale_i * 2 + 1] = T.cuda.float2_y(scaled_pair)
@@ -1025,13 +1024,14 @@ def _kernel(
                             split_frag[:, :], o_win.chunk((None, (D_V // 2) // 64))[:, epi_i]
                         )
                         T.ptx.tcgen05.wait.ld()
+                        scaled_pair: T.uint64
                         for scale_i in T.unroll(64 // 2):
-                            scaled_pair: T.let = T.ptx.mul_f32x2(
+                            T.ptxd.mul.f32x2(
+                                scaled_pair,
                                 T.cuda.make_float2(
                                     split_local[scale_i * 2], split_local[scale_i * 2 + 1]
                                 ),
                                 output_scale_pair,
-                                dps=False,
                             )
                             split_local[scale_i * 2] = T.cuda.float2_x(scaled_pair)
                             split_local[scale_i * 2 + 1] = T.cuda.float2_y(scaled_pair)

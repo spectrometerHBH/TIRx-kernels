@@ -813,6 +813,8 @@ def _kernel(
                     ) == T.uint32(0)
                     p[p_i] = T.if_then_else(invalid_p_predicate, T.uint32(0xFF800000), p[p_i])
 
+                sum_pair0: T.uint64
+                sum_pair1: T.uint64
                 for exchange_i in T.unroll(WG3_ELEMS_PER_THREAD // 4):
                     exchange_offset = exchange_i * 32 * 4 + lane_idx * 4
                     p_peer_offset: T.let = exchange_i * 4
@@ -838,7 +840,7 @@ def _kernel(
                         T.cuda.uint_as_float(p_exchange_tmp[0]),
                         T.cuda.uint_as_float(p_exchange_tmp[1]),
                     )
-                    sum_pair0: T.let = T.ptx.add_f32x2(p_pair0, peer_pair0, dps=False)
+                    T.ptxd.add.rn.f32x2(sum_pair0, p_pair0, peer_pair0)
                     p[exchange_i * 4] = T.cuda.float_as_uint(T.cuda.float2_x(sum_pair0))
                     p[exchange_i * 4 + 1] = T.cuda.float_as_uint(T.cuda.float2_y(sum_pair0))
                     p_pair1: T.let = T.cuda.make_float2(
@@ -849,7 +851,7 @@ def _kernel(
                         T.cuda.uint_as_float(p_exchange_tmp[2]),
                         T.cuda.uint_as_float(p_exchange_tmp[3]),
                     )
-                    sum_pair1: T.let = T.ptx.add_f32x2(p_pair1, peer_pair1, dps=False)
+                    T.ptxd.add.rn.f32x2(sum_pair1, p_pair1, peer_pair1)
                     p[exchange_i * 4 + 2] = T.cuda.float_as_uint(T.cuda.float2_x(sum_pair1))
                     p[exchange_i * 4 + 3] = T.cuda.float_as_uint(T.cuda.float2_y(sum_pair1))
 
@@ -887,19 +889,18 @@ def _kernel(
                 s_pack = s_frag.local().view("uint32")
                 cur_sum_pair: T.uint64 = T.cuda.make_float2(T.float32(0.0), T.float32(0.0))
                 neg_new_max_pair: T.let = T.cuda.make_float2(-new_max, -new_max)
+                fma_pair: T.uint64
                 for s_i in T.unroll(WG3_ELEMS_PER_THREAD // 2):
                     p_pair: T.let = T.cuda.make_float2(
                         T.cuda.uint_as_float(p[s_i * 2]), T.cuda.uint_as_float(p[s_i * 2 + 1])
                     )
-                    fma_pair: T.let = T.ptx.fma_f32x2(
-                        p_pair, scale_pair, neg_new_max_pair, dps=False
-                    )
+                    T.ptxd.fma.rn.f32x2(fma_pair, p_pair, scale_pair, neg_new_max_pair)
                     s_x: T.float32
                     s_y: T.float32
                     T.ptxd.ex2.approx.ftz.f32(s_x, T.cuda.float2_x(fma_pair))
                     T.ptxd.ex2.approx.ftz.f32(s_y, T.cuda.float2_y(fma_pair))
                     s_pair: T.let = T.cuda.make_float2(s_x, s_y)
-                    cur_sum_pair = T.ptx.add_f32x2(cur_sum_pair, s_pair, dps=False)
+                    T.ptxd.add.rn.f32x2(cur_sum_pair, cur_sum_pair, s_pair)
                     s_pack[s_i] = T.cuda.float22bfloat162_rn(s_x, s_y)
                 cur_sum: T.let = T.cuda.float2_x(cur_sum_pair) + T.cuda.float2_y(cur_sum_pair)
                 li_tmp: T.float32

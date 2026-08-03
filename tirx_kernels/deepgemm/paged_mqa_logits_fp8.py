@@ -759,7 +759,7 @@ def get_kernel(**kwargs: Any):
 
     def fadd2_rn_noftz(a, b):
         out = T.alloc_local((1,), "uint64")
-        T.evaluate(T.ptx.add_f32x2(out.ptr_to([0]), a, b, rounding="rn", ftz=False))
+        T.evaluate(T.ptxd.add.rn.f32x2(out[0], a, b))
         return out[0]
 
     def fadd_rn_noftz(a, b):
