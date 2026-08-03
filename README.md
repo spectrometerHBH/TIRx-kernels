@@ -40,6 +40,16 @@ DeepGEMM ports:
 | `deepgemm_sm100_tf32_hc_prenorm_gemm` | tf32 / bf16 | Prenorm GEMM |
 | `deepgemm_fp8_fp4_mega_moe` | fp8 + fp4 | Fused MoE megakernel (MegaMoE) |
 
+FlashKDA ports (FlashInfer frozen kernels):
+
+| Kernel | dtype | What it is |
+| ------ | ----- | ---------- |
+| `flashkda_bf16_fused_m128` | bf16 | Recurrent KDA prefill, M128 schedule |
+
+Testing/benching against the `flashinfer_frozen_m128` reference requires
+`FLASHKDA_PR_WORKTREE` pointing at the flashinfer-ai/flashinfer#4262 head
+worktree (which contains the frozen m128 kernel).
+
 ## Performance
 
 Per-workload numbers — our kernel time, every reference impl, and the
