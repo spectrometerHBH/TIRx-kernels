@@ -4590,23 +4590,15 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
                                 + j * atom_m,
                                 "uint32",
                             )
-                            T.ptx.tcgen05.ld(
-                                tmem_addr[0],
-                                values[0],
-                                values[1],
-                                values[2],
-                                values[3],
-                                shape="16x256b",
-                                num=1,
+                            T.ptxd["tcgen05.ld.sync.aligned.16x256b.x1.b32"](
+                                values[0], values[1], values[2], values[3], T.uint32(tmem_addr[0])
                             )
-                            T.ptx.tcgen05.ld(
-                                T.bitwise_or(tmem_addr[0], T.uint32(0x00100000)),
+                            T.ptxd["tcgen05.ld.sync.aligned.16x256b.x1.b32"](
                                 values[4],
                                 values[5],
                                 values[6],
                                 values[7],
-                                shape="16x256b",
-                                num=1,
+                                T.uint32(T.bitwise_or(tmem_addr[0], T.uint32(0x00100000))),
                             )
                             fence_view_async_tmem_load()
                             if j == wg_block_m // atom_m - 1:
@@ -4789,23 +4781,15 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
                                 + j * atom_m,
                                 "uint32",
                             )
-                            T.ptx.tcgen05.ld(
-                                tmem_addr[0],
-                                values[0],
-                                values[1],
-                                values[2],
-                                values[3],
-                                shape="16x256b",
-                                num=1,
+                            T.ptxd["tcgen05.ld.sync.aligned.16x256b.x1.b32"](
+                                values[0], values[1], values[2], values[3], T.uint32(tmem_addr[0])
                             )
-                            T.ptx.tcgen05.ld(
-                                T.bitwise_or(tmem_addr[0], T.uint32(0x00100000)),
+                            T.ptxd["tcgen05.ld.sync.aligned.16x256b.x1.b32"](
                                 values[4],
                                 values[5],
                                 values[6],
                                 values[7],
-                                shape="16x256b",
-                                num=1,
+                                T.uint32(T.bitwise_or(tmem_addr[0], T.uint32(0x00100000))),
                             )
                             fence_view_async_tmem_load()
                             if i == 0 and s > 0:

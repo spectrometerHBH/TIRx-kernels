@@ -591,8 +591,8 @@ def get_kernel(**kwargs: Any):
             d_frag = T.alloc_local((4,), "float32")
             for i in T.unroll(block_n // 4):
                 taddr_d: T.uint32 = T.uint32(d_tmem_start_col + i * 4)
-                T.ptx.tcgen05.ld(
-                    taddr_d, d_frag[0], d_frag[1], d_frag[2], d_frag[3], shape="32x32b", num=4
+                T.ptxd["tcgen05.ld.sync.aligned.32x32b.x4.b32"](
+                    d_frag[0], d_frag[1], d_frag[2], d_frag[3], T.uint32(taddr_d)
                 )
                 T.ptxd.tcgen05.wait__ld.sync.aligned()
                 if lane_u32 < T.uint32(16):

@@ -1836,8 +1836,7 @@ def get_kernel(**kwargs: Any):
                         + T.uint32(q_inner_i * num_heads)
                     )
                     if num_heads == 32:
-                        T.ptx.tcgen05.ld(
-                            tmem_addr,
+                        T.ptxd["tcgen05.ld.sync.aligned.32x32b.x32.b32"](
                             accum[0],
                             accum[1],
                             accum[2],
@@ -1870,12 +1869,10 @@ def get_kernel(**kwargs: Any):
                             accum[29],
                             accum[30],
                             accum[31],
-                            shape="32x32b",
-                            num=32,
+                            T.uint32(tmem_addr),
                         )
                     if num_heads == 64:
-                        T.ptx.tcgen05.ld(
-                            tmem_addr,
+                        T.ptxd["tcgen05.ld.sync.aligned.32x32b.x64.b32"](
                             accum[0],
                             accum[1],
                             accum[2],
@@ -1940,8 +1937,7 @@ def get_kernel(**kwargs: Any):
                             accum[61],
                             accum[62],
                             accum[63],
-                            shape="32x32b",
-                            num=64,
+                            T.uint32(tmem_addr),
                         )
                     T.ptxd.tcgen05.wait__ld.sync.aligned()
                     if q_inner_i == num_iters_c - 1:
