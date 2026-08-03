@@ -1745,10 +1745,10 @@ def get_kernel(
         return T.ptx.st(dst_ptr, r0, r1, r2, r3, space="shared", vec="v4", ptx_type="b32")
 
     def mbarrier_arrive_local(barrier_ptr):
-        return T.ptx.mbarrier.arrive(barrier_ptr)
+        return T.ptxd.mbarrier.arrive.shared.b64(barrier_ptr, T.uint32(1))
 
     def mbarrier_arrive_and_set_tx(barrier_ptr, num_bytes):
-        return T.ptx.mbarrier.arrive.expect_tx(barrier_ptr, num_bytes)
+        return T.ptxd.mbarrier.arrive.expect_tx.shared.b64(barrier_ptr, T.uint32(num_bytes))
 
     def mbarrier_wait_phase(barrier_ptr, phase):
         return T.ptx.mbarrier.try_wait(barrier_ptr, phase)
@@ -3416,7 +3416,9 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
 
         @T.inline
         def full_barrier_arrive_and_expect_tx(full_barrier_ptr, transaction_bytes):
-            T.ptx.mbarrier.arrive.expect_tx(full_barrier_ptr, transaction_bytes)
+            T.ptxd.mbarrier.arrive.expect_tx.shared.b64(
+                full_barrier_ptr, T.uint32(transaction_bytes)
+            )
 
         @T.inline
         def full_barrier_arrive_cta0(full_barrier_ptr):
@@ -3520,8 +3522,8 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
         elif flat_warp_idx == 1:
             dispatch_expert_idx = lane_idx
             while dispatch_expert_idx < kernel_config.num_dispatch_warps:
-                T.ptx.mbarrier.init(
-                    smem_barriers.ptr_to([dispatch_barrier_base + dispatch_expert_idx]), 1
+                T.ptxd.mbarrier.init.shared.b64(
+                    smem_barriers.ptr_to([dispatch_barrier_base + dispatch_expert_idx]), T.uint32(1)
                 )
                 dispatch_expert_idx = dispatch_expert_idx + 32
             T.evaluate(fence_barrier_init())
@@ -3529,38 +3531,42 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
             if T.ptx.elect_sync():
                 dispatch_expert_idx = T.int32(0)
                 while dispatch_expert_idx < num_stages:
-                    T.ptx.mbarrier.init(
+                    T.ptxd.mbarrier.init.shared.b64(
                         smem_barriers.ptr_to([full_barrier_base + dispatch_expert_idx]),
-                        full_barrier_init_count,
+                        T.uint32(full_barrier_init_count),
                     )
-                    T.ptx.mbarrier.init(
-                        smem_barriers.ptr_to([empty_barrier_base + dispatch_expert_idx]), 1
+                    T.ptxd.mbarrier.init.shared.b64(
+                        smem_barriers.ptr_to([empty_barrier_base + dispatch_expert_idx]),
+                        T.uint32(1),
                     )
                     dispatch_expert_idx = dispatch_expert_idx + 1
                 dispatch_expert_idx = T.int32(0)
                 while dispatch_expert_idx < num_epilogue_stages:
-                    T.ptx.mbarrier.init(
-                        smem_barriers.ptr_to([tmem_full_barrier_base + dispatch_expert_idx]), 1
+                    T.ptxd.mbarrier.init.shared.b64(
+                        smem_barriers.ptr_to([tmem_full_barrier_base + dispatch_expert_idx]),
+                        T.uint32(1),
                     )
-                    T.ptx.mbarrier.init(
+                    T.ptxd.mbarrier.init.shared.b64(
                         smem_barriers.ptr_to([tmem_empty_barrier_base + dispatch_expert_idx]),
-                        tmem_empty_barrier_init_count,
+                        T.uint32(tmem_empty_barrier_init_count),
                     )
                     dispatch_expert_idx = dispatch_expert_idx + 1
                 dispatch_expert_idx = T.int32(0)
                 while dispatch_expert_idx < kernel_config.num_epilogue_warps * 2:
-                    T.ptx.mbarrier.init(
-                        smem_barriers.ptr_to([combine_barrier_base + dispatch_expert_idx]), 1
+                    T.ptxd.mbarrier.init.shared.b64(
+                        smem_barriers.ptr_to([combine_barrier_base + dispatch_expert_idx]),
+                        T.uint32(1),
                     )
                     dispatch_expert_idx = dispatch_expert_idx + 1
                 dispatch_expert_idx = T.int32(0)
                 while dispatch_expert_idx < num_schedule_stages:
-                    T.ptx.mbarrier.init(
-                        smem_barriers.ptr_to([task_info_full_barrier_base + dispatch_expert_idx]), 1
+                    T.ptxd.mbarrier.init.shared.b64(
+                        smem_barriers.ptr_to([task_info_full_barrier_base + dispatch_expert_idx]),
+                        T.uint32(1),
                     )
-                    T.ptx.mbarrier.init(
+                    T.ptxd.mbarrier.init.shared.b64(
                         smem_barriers.ptr_to([task_info_empty_barrier_base + dispatch_expert_idx]),
-                        num_schedule_consumer_threads,
+                        T.uint32(num_schedule_consumer_threads),
                     )
                     dispatch_expert_idx = dispatch_expert_idx + 1
             T.evaluate(fence_barrier_init())

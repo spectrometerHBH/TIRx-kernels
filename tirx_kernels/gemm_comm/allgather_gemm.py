@@ -331,7 +331,9 @@ class Barriers:
         if initializer:
             for i in T.serial(self.pipe_depth):
                 for j in T.serial(self.pipe_width):
-                    T.ptx.mbarrier.init(self.mbar.ptr_to([i, j]), threads_num_wait)
+                    T.ptxd.mbarrier.init.shared.b64(
+                        self.mbar.ptr_to([i, j]), T.uint32(threads_num_wait)
+                    )
 
     @T.inline
     def wait(self, idx_d, idx_w, phase):
@@ -341,11 +343,13 @@ class Barriers:
 class BarTMA2MMA(Barriers):
     @T.inline
     def arrive(self, idx, expected_bytes):
-        T.ptx.mbarrier.arrive.expect_tx(self.mbar.ptr_to([idx, 0]), expected_bytes)
+        T.ptxd.mbarrier.arrive.expect_tx.shared.b64(
+            self.mbar.ptr_to([idx, 0]), T.uint32(expected_bytes)
+        )
 
     @T.inline
     def arrive_only(self, idx):
-        T.ptx.mbarrier.arrive(self.mbar.ptr_to([idx, 0]))
+        T.ptxd.mbarrier.arrive.shared.b64(self.mbar.ptr_to([idx, 0]), T.uint32(1))
 
 
 class BarMMA2LD(Barriers):
@@ -404,9 +408,13 @@ class Pipeline:
                 for i in T.serial(0, self.pipeline_depth):
                     for j in T.serial(0, self.pipeline_num):
                         if not self.c_single_cta or cbx == 0:
-                            T.ptx.mbarrier.init(self.mbar_p2c.ptr_to([i, j]), p2c_thread_count)
+                            T.ptxd.mbarrier.init.shared.b64(
+                                self.mbar_p2c.ptr_to([i, j]), T.uint32(p2c_thread_count)
+                            )
                         if not self.p_single_cta or cbx == 0:
-                            T.ptx.mbarrier.init(self.mbar_c2p.ptr_to([i, j]), c2p_thread_count)
+                            T.ptxd.mbarrier.init.shared.b64(
+                                self.mbar_c2p.ptr_to([i, j]), T.uint32(c2p_thread_count)
+                            )
         T.ptxd.fence.proxy.async_.shared__cta()
 
     @T.inline

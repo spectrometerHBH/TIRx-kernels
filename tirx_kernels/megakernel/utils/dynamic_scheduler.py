@@ -110,7 +110,7 @@ class SchedulerBarrier(Barriers):
 
     @T.inline
     def arrive(self):
-        T.ptx.mbarrier.arrive(self.mbar.ptr_to([0]))
+        T.ptxd.mbarrier.arrive.shared.b64(self.mbar.ptr_to([0]), T.uint32(1))
 
 
 @T.meta_class

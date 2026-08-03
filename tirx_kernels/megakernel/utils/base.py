@@ -85,10 +85,10 @@ class Barriers:
         self._alloc()
         if self.pipe_depth == 1:
             if tid == 0:
-                T.ptx.mbarrier.init(self.mbar.ptr_to([0]), threads_num_wait)
+                T.ptxd.mbarrier.init.shared.b64(self.mbar.ptr_to([0]), T.uint32(threads_num_wait))
         elif tid == 0:
             for i in T.serial(self.pipe_depth):
-                T.ptx.mbarrier.init(self.mbar.ptr_to([i]), threads_num_wait)
+                T.ptxd.mbarrier.init.shared.b64(self.mbar.ptr_to([i]), T.uint32(threads_num_wait))
 
     @T.inline
     def wait(self, idx, phase):
@@ -142,7 +142,7 @@ class SmemManager:
         self.cur_phase[0] = 1
         if tid == 0:
             for i in T.serial(self.chunk_num):
-                T.ptx.mbarrier.init(self.mbar.ptr_to([i]), 1)
+                T.ptxd.mbarrier.init.shared.b64(self.mbar.ptr_to([i]), T.uint32(1))
             self.shared_count[0] = 0
         T.tvm_storage_sync("shared")
         T.ptxd.fence.mbarrier_init.release.cluster()
@@ -344,7 +344,7 @@ class SmemManager:
             T.tvm_storage_sync("shared")
             if warp_id == 0:
                 if lane_id < self.chunk_num:
-                    T.ptx.mbarrier.arrive(self.mbar.ptr_to([lane_id]))
+                    T.ptxd.mbarrier.arrive.shared.b64(self.mbar.ptr_to([lane_id]), T.uint32(1))
         elif level == "warpgroup":
             self.reg_count[0] = 0
             T.ptxd.bar.sync(T.uint32(6 + wg_id), 128)
@@ -358,7 +358,7 @@ class SmemManager:
                 self.reg_count[0] = T.tvm_warp_shuffle(4294967295, self.reg_count[0], 0, 32, 32)
                 if self.reg_count[0] == KernelConfig.WG_NUMBER:
                     if lane_id < self.chunk_num:
-                        T.ptx.mbarrier.arrive(self.mbar.ptr_to([lane_id]))
+                        T.ptxd.mbarrier.arrive.shared.b64(self.mbar.ptr_to([lane_id]), T.uint32(1))
 
     @T.inline
     def arrive_specific(self, lane_id, buffer, split_idx: int):
@@ -373,17 +373,17 @@ class SmemManager:
             - 1
         ) // self.chunk_size
         if (lane_id >= beg_chunk_id) & (lane_id <= end_chunk_id):
-            T.ptx.mbarrier.arrive(self.mbar.ptr_to([lane_id]))
+            T.ptxd.mbarrier.arrive.shared.b64(self.mbar.ptr_to([lane_id]), T.uint32(1))
 
     @T.inline
     def arrive_unused(self, lane_id, cur_tile: Tile):
         self._assert_cond(len(self.tiles[self.cur_tile_name][1]["shared"]) == 0)
         if (lane_id < self.chunk_num) & (lane_id > self.tiles[str(cur_tile)][0]):
-            T.ptx.mbarrier.arrive(self.mbar.ptr_to([lane_id]))
+            T.ptxd.mbarrier.arrive.shared.b64(self.mbar.ptr_to([lane_id]), T.uint32(1))
 
     @T.inline
     def arrive_chunk(self, chunk_id):
-        T.ptx.mbarrier.arrive(self.mbar.ptr_to([chunk_id]))
+        T.ptxd.mbarrier.arrive.shared.b64(self.mbar.ptr_to([chunk_id]), T.uint32(1))
 
 
 @T.meta_class

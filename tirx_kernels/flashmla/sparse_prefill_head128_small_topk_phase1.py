@@ -368,11 +368,15 @@ def _kernel(
     elif warp_idx == 3:
         if T.ptx.elect_sync():
             for init_stage in T.unroll(NUM_K_BUFS):
-                T.ptx.mbarrier.init(bar_KV_full.ptr_to([init_stage]), 1)
-                T.ptx.mbarrier.init(bar_KV_empty.ptr_to([init_stage]), 1)
+                T.ptxd.mbarrier.init.shared.b64(bar_KV_full.ptr_to([init_stage]), T.uint32(1))
+                T.ptxd.mbarrier.init.shared.b64(bar_KV_empty.ptr_to([init_stage]), T.uint32(1))
             for init_stage in T.unroll(NUM_INDEX_BUFS):
-                T.ptx.mbarrier.init(bar_valid_coord_scales_full.ptr_to([init_stage]), B_TOPK // 8)
-                T.ptx.mbarrier.init(bar_valid_coord_scales_empty.ptr_to([init_stage]), 128)
+                T.ptxd.mbarrier.init.shared.b64(
+                    bar_valid_coord_scales_full.ptr_to([init_stage]), T.uint32(B_TOPK // 8)
+                )
+                T.ptxd.mbarrier.init.shared.b64(
+                    bar_valid_coord_scales_empty.ptr_to([init_stage]), T.uint32(128)
+                )
             T.ptxd.fence.mbarrier_init.release.cluster()
 
     T.cuda.cluster_sync()

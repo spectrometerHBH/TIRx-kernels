@@ -296,9 +296,13 @@ class Pipeline:
                 for i in Tx.serial(0, self.pipeline_depth):
                     for j in Tx.serial(0, self.pipeline_num):
                         if not self.c_single_cta or cbx == 0:
-                            Tx.ptx.mbarrier.init(self.mbar_p2c.ptr_to([i, j]), p2c_thread_count)
+                            Tx.ptxd.mbarrier.init.shared.b64(
+                                self.mbar_p2c.ptr_to([i, j]), Tx.uint32(p2c_thread_count)
+                            )
                         if not self.p_single_cta or cbx == 0:
-                            Tx.ptx.mbarrier.init(self.mbar_c2p.ptr_to([i, j]), c2p_thread_count)
+                            Tx.ptxd.mbarrier.init.shared.b64(
+                                self.mbar_c2p.ptr_to([i, j]), Tx.uint32(c2p_thread_count)
+                            )
         Tx.ptxd.fence.proxy.async_.shared__cta()
 
     @Tx.inline

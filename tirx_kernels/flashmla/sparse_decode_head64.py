@@ -675,20 +675,20 @@ def _kernel(
     # candidates, matching the source's normal-only KV prefetch.
     if warp_idx == 0:
         if T.ptx.elect_sync() != T.uint32(0):
-            T.ptx.mbarrier.init(bar_last_store_done.ptr_to([0]), 128)
-            T.ptx.mbarrier.init(bar_q_tma.ptr_to([0]), 1)
-            T.ptx.mbarrier.init(bar_q_utccp.ptr_to([0]), 1)
+            T.ptxd.mbarrier.init.shared.b64(bar_last_store_done.ptr_to([0]), T.uint32(128))
+            T.ptxd.mbarrier.init.shared.b64(bar_q_tma.ptr_to([0]), T.uint32(1))
+            T.ptxd.mbarrier.init.shared.b64(bar_q_utccp.ptr_to([0]), T.uint32(1))
             for stage in T.unroll(NUM_BUFS):
-                T.ptx.mbarrier.init(bar_rope_ready.ptr_to([stage]), 1)
-                T.ptx.mbarrier.init(bar_nope_ready.ptr_to([stage]), 128)
-                T.ptx.mbarrier.init(bar_raw_ready.ptr_to([stage]), 1)
-                T.ptx.mbarrier.init(bar_raw_free.ptr_to([stage]), 128)
-                T.ptx.mbarrier.init(bar_qk_done.ptr_to([stage]), 1)
-                T.ptx.mbarrier.init(bar_so_ready.ptr_to([stage]), 128)
-                T.ptx.mbarrier.init(bar_sv_done.ptr_to([stage]), 1)
+                T.ptxd.mbarrier.init.shared.b64(bar_rope_ready.ptr_to([stage]), T.uint32(1))
+                T.ptxd.mbarrier.init.shared.b64(bar_nope_ready.ptr_to([stage]), T.uint32(128))
+                T.ptxd.mbarrier.init.shared.b64(bar_raw_ready.ptr_to([stage]), T.uint32(1))
+                T.ptxd.mbarrier.init.shared.b64(bar_raw_free.ptr_to([stage]), T.uint32(128))
+                T.ptxd.mbarrier.init.shared.b64(bar_qk_done.ptr_to([stage]), T.uint32(1))
+                T.ptxd.mbarrier.init.shared.b64(bar_so_ready.ptr_to([stage]), T.uint32(128))
+                T.ptxd.mbarrier.init.shared.b64(bar_sv_done.ptr_to([stage]), T.uint32(1))
             for index_stage in T.unroll(NUM_INDEX_BUFS):
-                T.ptx.mbarrier.init(bar_valid_ready.ptr_to([index_stage]), 32)
-                T.ptx.mbarrier.init(bar_valid_free.ptr_to([index_stage]), 258)
+                T.ptxd.mbarrier.init.shared.b64(bar_valid_ready.ptr_to([index_stage]), T.uint32(32))
+                T.ptxd.mbarrier.init.shared.b64(bar_valid_free.ptr_to([index_stage]), T.uint32(258))
             T.ptxd.fence.mbarrier_init.release.cluster()
         T.ptxd.tcgen05.alloc.cta_group__1.sync.aligned.shared__cta.b32(
             T.address_of(tmem_start_addr[0]), T.uint32(512)

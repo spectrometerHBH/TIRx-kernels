@@ -791,16 +791,18 @@ def get_kernel(**kwargs: Any):
         num_prefetch_lines = 512
 
     def mbarrier_init_cta(barrier_ptr, arrive_count):
-        T.evaluate(T.ptx.mbarrier.init(barrier_ptr, arrive_count))
+        T.evaluate(T.ptxd.mbarrier.init.shared.b64(barrier_ptr, T.uint32(arrive_count)))
 
     def mbarrier_wait_cta(barrier_ptr, phase):
         T.evaluate(T.ptx.mbarrier.try_wait(barrier_ptr, phase))
 
     def mbarrier_arrive_cta(barrier_ptr):
-        T.evaluate(T.ptx.mbarrier.arrive(barrier_ptr))
+        T.evaluate(T.ptxd.mbarrier.arrive.shared.b64(barrier_ptr, T.uint32(1)))
 
     def mbarrier_arrive_expect_tx_cta(barrier_ptr, transaction_bytes):
-        T.evaluate(T.ptx.mbarrier.arrive.expect_tx(barrier_ptr, transaction_bytes))
+        T.evaluate(
+            T.ptxd.mbarrier.arrive.expect_tx.shared.b64(barrier_ptr, T.uint32(transaction_bytes))
+        )
 
     @T.prim_func
     def sm100_fp8_paged_mqa_logits(

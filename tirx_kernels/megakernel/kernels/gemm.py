@@ -31,11 +31,13 @@ from tvm.tirx.layout import tid_in_wg as axis_tid_in_wg
 class BarTMA2MMA(Barriers):
     @T.inline
     def arrive(self, idx, expected_bytes):
-        T.ptx.mbarrier.arrive.expect_tx(self.mbar.ptr_to([idx]), expected_bytes)
+        T.ptxd.mbarrier.arrive.expect_tx.shared.b64(
+            self.mbar.ptr_to([idx]), T.uint32(expected_bytes)
+        )
 
     @T.inline
     def arrive_only(self, idx):
-        T.ptx.mbarrier.arrive(self.mbar.ptr_to([idx]))
+        T.ptxd.mbarrier.arrive.shared.b64(self.mbar.ptr_to([idx]), T.uint32(1))
 
 
 class BarMMA2LD(Barriers):

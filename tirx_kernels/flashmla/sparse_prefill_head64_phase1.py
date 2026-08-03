@@ -402,12 +402,22 @@ def _kernel(
             bar_prologue_utccp_nope.init(1)
             if bar_qk_nope_done.leader:
                 for init_stage in T.unroll(NUM_BUFS):
-                    T.ptx.mbarrier.init(bar_qk_nope_done.ptr_to([init_stage]), 1)
-                    T.ptx.mbarrier.init(bar_sv_done.ptr_to([init_stage]), 1)
-                    T.ptx.mbarrier.init(bar_kv_nope_ready_part0.ptr_to([init_stage]), 1)
-                    T.ptx.mbarrier.init(bar_kv_nope_ready_part1.ptr_to([init_stage]), 1)
-                    T.ptx.mbarrier.init(bar_k_valid_ready.ptr_to([init_stage]), B_TOPK // 8)
-                    T.ptx.mbarrier.init(bar_k_valid_free.ptr_to([init_stage]), 128)
+                    T.ptxd.mbarrier.init.shared.b64(
+                        bar_qk_nope_done.ptr_to([init_stage]), T.uint32(1)
+                    )
+                    T.ptxd.mbarrier.init.shared.b64(bar_sv_done.ptr_to([init_stage]), T.uint32(1))
+                    T.ptxd.mbarrier.init.shared.b64(
+                        bar_kv_nope_ready_part0.ptr_to([init_stage]), T.uint32(1)
+                    )
+                    T.ptxd.mbarrier.init.shared.b64(
+                        bar_kv_nope_ready_part1.ptr_to([init_stage]), T.uint32(1)
+                    )
+                    T.ptxd.mbarrier.init.shared.b64(
+                        bar_k_valid_ready.ptr_to([init_stage]), T.uint32(B_TOPK // 8)
+                    )
+                    T.ptxd.mbarrier.init.shared.b64(
+                        bar_k_valid_free.ptr_to([init_stage]), T.uint32(128)
+                    )
             bar_p_free.init(128)
             bar_so_ready.init(128)
             bar_qk_rope_done.init(1)
@@ -740,8 +750,12 @@ def _kernel(
                     gather_nope_part(1, bar_kv_nope_ready_part1)
                 else:
                     tx_bytes = T.uint32(WG1_ROWS_PER_WARP * 4 * (D_V // 2) * BF16_BYTES)
-                    T.ptx.mbarrier.complete_tx(bar_kv_nope_ready_part0.ptr_to([cur_buf]), tx_bytes)
-                    T.ptx.mbarrier.complete_tx(bar_kv_nope_ready_part1.ptr_to([cur_buf]), tx_bytes)
+                    T.ptxd.mbarrier.complete_tx.shared.b64(
+                        bar_kv_nope_ready_part0.ptr_to([cur_buf]), T.uint32(tx_bytes)
+                    )
+                    T.ptxd.mbarrier.complete_tx.shared.b64(
+                        bar_kv_nope_ready_part1.ptr_to([cur_buf]), T.uint32(tx_bytes)
+                    )
         iket.range_end(kv_nope_token)
 
     else:
