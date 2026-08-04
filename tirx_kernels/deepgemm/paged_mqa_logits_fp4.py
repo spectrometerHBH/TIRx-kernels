@@ -562,9 +562,17 @@ def get_kernel(**kwargs: Any):
     cache_hint_sm90_evict_normal = "evict_normal"
     cache_hint_sm100_evict_normal = "evict_normal"
     cache_policy_evict_normal = T.uint64(1152921504606846976)
-    has_cache_policy_evict_normal = 1
-    tma_unicast_cta_mask = 0
-    tma_no_cta_group_modifier = -1
+    # One ptxd spelling per rank: unicast (no .multicast::cluster), no
+    # .cta_group modifier (the legacy raw form passed -1 to suppress it), with
+    # the evict-normal L2 cache policy as a real operand.
+    tma_g2s_2d = (
+        "cp.async.bulk.tensor.2d.shared::cluster.global"
+        ".mbarrier::complete_tx::bytes.L2::cache_hint"
+    )
+    tma_g2s_3d = (
+        "cp.async.bulk.tensor.3d.shared::cluster.global"
+        ".mbarrier::complete_tx::bytes.L2::cache_hint"
+    )
     q_tma_block_inner = head_dim // 2
     q_tma_swizzle_mode = head_dim // 2
     q_tma_dtype_size = 1
@@ -1004,22 +1012,13 @@ def get_kernel(**kwargs: Any):
             )
             T.static_assert(q_tma_num_inner_atoms == 1, "Unsupported split TMA atom")
             T.evaluate(
-                T.call_intrin(
-                    "",
-                    "tirx.ptx_cp_async_bulk_tensor_g2s_cluster",
-                    2,
+                T.ptxd[tma_g2s_2d](
                     dst,
-                    barrier_ptr,
                     T.address_of(tensor_map),
-                    tma_unicast_cta_mask,
-                    tma_no_cta_group_modifier,
+                    T.cast(coord0, "int32"),
+                    T.cast(coord1, "int32"),
+                    barrier_ptr,
                     cache_policy_evict_normal,
-                    has_cache_policy_evict_normal,
-                    "tile",
-                    0,
-                    0,
-                    coord0,
-                    coord1,
                 )
             )
 
@@ -1030,22 +1029,13 @@ def get_kernel(**kwargs: Any):
             )
             T.static_assert(weights_tma_num_inner_atoms == 1, "Unsupported split TMA atom")
             T.evaluate(
-                T.call_intrin(
-                    "",
-                    "tirx.ptx_cp_async_bulk_tensor_g2s_cluster",
-                    2,
+                T.ptxd[tma_g2s_2d](
                     dst,
-                    barrier_ptr,
                     T.address_of(tensor_map),
-                    tma_unicast_cta_mask,
-                    tma_no_cta_group_modifier,
+                    T.cast(coord0, "int32"),
+                    T.cast(coord1, "int32"),
+                    barrier_ptr,
                     cache_policy_evict_normal,
-                    has_cache_policy_evict_normal,
-                    "tile",
-                    0,
-                    0,
-                    coord0,
-                    coord1,
                 )
             )
 
@@ -1056,23 +1046,14 @@ def get_kernel(**kwargs: Any):
             )
             T.static_assert(kv_tma_num_inner_atoms == 1, "Unsupported split TMA atom")
             T.evaluate(
-                T.call_intrin(
-                    "",
-                    "tirx.ptx_cp_async_bulk_tensor_g2s_cluster",
-                    3,
+                T.ptxd[tma_g2s_3d](
                     dst,
-                    barrier_ptr,
                     T.address_of(tensor_map),
-                    tma_unicast_cta_mask,
-                    tma_no_cta_group_modifier,
+                    T.cast(coord0, "int32"),
+                    T.cast(coord1, "int32"),
+                    T.cast(coord2, "int32"),
+                    barrier_ptr,
                     cache_policy_evict_normal,
-                    has_cache_policy_evict_normal,
-                    "tile",
-                    0,
-                    0,
-                    coord0,
-                    coord1,
-                    coord2,
                 )
             )
 
@@ -1083,22 +1064,13 @@ def get_kernel(**kwargs: Any):
             )
             T.static_assert(sf_q_tma_num_inner_atoms == 1, "Unsupported split TMA atom")
             T.evaluate(
-                T.call_intrin(
-                    "",
-                    "tirx.ptx_cp_async_bulk_tensor_g2s_cluster",
-                    2,
+                T.ptxd[tma_g2s_2d](
                     dst,
-                    barrier_ptr,
                     T.address_of(tensor_map),
-                    tma_unicast_cta_mask,
-                    tma_no_cta_group_modifier,
+                    T.cast(coord0, "int32"),
+                    T.cast(coord1, "int32"),
+                    barrier_ptr,
                     cache_policy_evict_normal,
-                    has_cache_policy_evict_normal,
-                    "tile",
-                    0,
-                    0,
-                    coord0,
-                    coord1,
                 )
             )
 
@@ -1109,22 +1081,13 @@ def get_kernel(**kwargs: Any):
             )
             T.static_assert(sf_kv_tma_num_inner_atoms == 1, "Unsupported split TMA atom")
             T.evaluate(
-                T.call_intrin(
-                    "",
-                    "tirx.ptx_cp_async_bulk_tensor_g2s_cluster",
-                    2,
+                T.ptxd[tma_g2s_2d](
                     dst,
-                    barrier_ptr,
                     T.address_of(tensor_map),
-                    tma_unicast_cta_mask,
-                    tma_no_cta_group_modifier,
+                    T.cast(coord0, "int32"),
+                    T.cast(coord1, "int32"),
+                    barrier_ptr,
                     cache_policy_evict_normal,
-                    has_cache_policy_evict_normal,
-                    "tile",
-                    0,
-                    0,
-                    coord0,
-                    coord1,
                 )
             )
 

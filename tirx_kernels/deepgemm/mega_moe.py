@@ -1795,22 +1795,28 @@ def get_kernel(
         raise ValueError("Unsupported TMA store wait distance")
 
     def tma_store_2d(src, tensormap, coord0, coord1):
-        return T.ptx.cp_async.bulk.tensor.s2g(2, src, T.address_of(tensormap), "", coord0, coord1)
+        return T.ptxd["cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group"](
+            T.address_of(tensormap), coord0, coord1, src
+        )
+
+    # Unicast (cta_mask=1) at cta_group::2 scope with the evict-normal L2
+    # policy; the mbarrier arrives as a precomputed leader-CTA shared address.
+    _sm100_2sm_load_chain = (
+        "cp.async.bulk.tensor.2d.shared::cluster.global"
+        ".mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint"
+    )
+    _evict_normal_policy = T.uint64(1152921504606846976)
 
     def sm100_tma_2sm_load_2d_addr(dst, mbar, tensormap_addr, coord0, coord1):
         mbar_addr = T.cuda.sm100_2sm_leader_smem_addr(mbar)
         T.evaluate(
-            T.ptx.cp_async.bulk.tensor.g2s_cluster(
-                2,
+            T.ptxd[_sm100_2sm_load_chain](
                 dst,
-                mbar_addr,
                 tensormap_addr,
-                1,
-                2,
-                "evict_normal",
                 coord0,
                 coord1,
-                mbar_is_shared_addr=True,
+                mbar_addr,
+                _evict_normal_policy,
             )
         )
 

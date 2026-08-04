@@ -97,6 +97,12 @@ assert SMEM_SIZE <= SM100_SMEM_CAPACITY, "GemmRS shared-memory usage exceeds the
 TMEM_LD_SIZE = 64
 N_COLS = 512
 CTA_GROUP = 2
+# TMA instruction spellings (unicast g2s at cluster scope, plain tile s2g).
+_TMA_G2S_CG2 = (
+    "cp.async.bulk.tensor.2d.shared::cluster.global"
+    f".mbarrier::complete_tx::bytes.cta_group::{CTA_GROUP}"
+)
+_TMA_S2G = "cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group"
 PIPE_CYCLE = K // BLK_K // PIPELINE_DEPTH
 PIPE_REMAIN_NUM = K // BLK_K % PIPELINE_DEPTH
 assert PIPELINE_DEPTH == 4
@@ -800,38 +806,26 @@ def test_mma_ss_tma_2sm_persistent(
                             for ks in Tx.unroll(PIPELINE_DEPTH):
                                 stage = ko * PIPELINE_DEPTH + ks
                                 smem_pipe.empty.wait(ks, phase)
-                                Tx.ptx.cp_async.bulk.tensor.g2s_cluster(
-                                    2,
+                                Tx.ptxd[_TMA_G2S_CG2](
                                     A_smem.ptr_to([ks, 0, 0, 0]),
-                                    tma_finished.ptr_to([ks]),
                                     Tx.address_of(A_tensor_map),
-                                    0,
-                                    2,
-                                    "",
                                     stage * BLK_K,
                                     (m_idx * NUM_CONSUMER * CTA_GROUP + cbx) * BLK_M,
-                                )
-                                Tx.ptx.cp_async.bulk.tensor.g2s_cluster(
-                                    2,
-                                    A_smem.ptr_to([ks, 1, 0, 0]),
                                     tma_finished.ptr_to([ks]),
+                                )
+                                Tx.ptxd[_TMA_G2S_CG2](
+                                    A_smem.ptr_to([ks, 1, 0, 0]),
                                     Tx.address_of(A_tensor_map),
-                                    0,
-                                    2,
-                                    "",
                                     stage * BLK_K,
                                     (m_idx * NUM_CONSUMER * CTA_GROUP + CTA_GROUP + cbx) * BLK_M,
-                                )
-                                Tx.ptx.cp_async.bulk.tensor.g2s_cluster(
-                                    2,
-                                    B_smem.ptr_to([ks, 0, 0]),
                                     tma_finished.ptr_to([ks]),
+                                )
+                                Tx.ptxd[_TMA_G2S_CG2](
+                                    B_smem.ptr_to([ks, 0, 0]),
                                     Tx.address_of(B_tensor_map),
-                                    0,
-                                    2,
-                                    "",
                                     stage * BLK_K,
                                     (n_idx * CTA_GROUP + cbx) * BLK_N,
+                                    tma_finished.ptr_to([ks]),
                                 )
                                 if cbx == 0:
                                     smem_pipe.full.arrive(
@@ -846,38 +840,26 @@ def test_mma_ss_tma_2sm_persistent(
                             for ks in Tx.unroll(PIPE_REMAIN_NUM):
                                 stage = PIPE_CYCLE * PIPELINE_DEPTH + ks
                                 smem_pipe.empty.wait(ks, phase)
-                                Tx.ptx.cp_async.bulk.tensor.g2s_cluster(
-                                    2,
+                                Tx.ptxd[_TMA_G2S_CG2](
                                     A_smem.ptr_to([ks, 0, 0, 0]),
-                                    tma_finished.ptr_to([ks]),
                                     Tx.address_of(A_tensor_map),
-                                    0,
-                                    2,
-                                    "",
                                     stage * BLK_K,
                                     (m_idx * NUM_CONSUMER * CTA_GROUP + cbx) * BLK_M,
-                                )
-                                Tx.ptx.cp_async.bulk.tensor.g2s_cluster(
-                                    2,
-                                    A_smem.ptr_to([ks, 1, 0, 0]),
                                     tma_finished.ptr_to([ks]),
+                                )
+                                Tx.ptxd[_TMA_G2S_CG2](
+                                    A_smem.ptr_to([ks, 1, 0, 0]),
                                     Tx.address_of(A_tensor_map),
-                                    0,
-                                    2,
-                                    "",
                                     stage * BLK_K,
                                     (m_idx * NUM_CONSUMER * CTA_GROUP + CTA_GROUP + cbx) * BLK_M,
-                                )
-                                Tx.ptx.cp_async.bulk.tensor.g2s_cluster(
-                                    2,
-                                    B_smem.ptr_to([ks, 0, 0]),
                                     tma_finished.ptr_to([ks]),
+                                )
+                                Tx.ptxd[_TMA_G2S_CG2](
+                                    B_smem.ptr_to([ks, 0, 0]),
                                     Tx.address_of(B_tensor_map),
-                                    0,
-                                    2,
-                                    "",
                                     stage * BLK_K,
                                     (n_idx * CTA_GROUP + cbx) * BLK_N,
+                                    tma_finished.ptr_to([ks]),
                                 )
                                 if cbx == 0:
                                     smem_pipe.full.arrive(
@@ -1017,13 +999,11 @@ def test_mma_ss_tma_2sm_persistent(
                     Tx.cuda.warpgroup_sync(wg_id)
                     Tx.ptxd.fence.proxy.async_.shared__cta()
                     if (lane_id == 0) & (warp_id == 0):
-                        Tx.ptx.cp_async.bulk.tensor.s2g(
-                            2,
-                            D_smem.ptr_to([wg_id, 0, 0]),
+                        Tx.ptxd[_TMA_S2G](
                             Tx.address_of(D_tensor_map),
-                            "",
                             n_idx * BLK_N * CTA_GROUP + i * EPI_TILE,
                             (m_idx * NUM_CONSUMER * CTA_GROUP + wg_id * CTA_GROUP + cbx) * BLK_M,
+                            D_smem.ptr_to([wg_id, 0, 0]),
                         )
                         Tx.ptxd.cp.async_.bulk.commit_group()
                         Tx.ptxd.cp.async_.bulk.wait_group(0)
