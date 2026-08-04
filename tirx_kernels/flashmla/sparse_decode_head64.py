@@ -664,9 +664,8 @@ def _kernel(
             scaled_lo: T.let = T.Shuffle([rounded], [0]) * scale
             scaled_hi: T.let = T.Shuffle([rounded], [1]) * scale
             packed[pair_i] = T.reinterpret("uint32", T.Shuffle([scaled_lo, scaled_hi], [0, 1]))
-        # Still the legacy op: ptxd would have to take the 128-bit value as an
-        # operand, and the CUDA codegen has no uint128 type to carry it.
-        T.ptx.st(smem_addr, src=packed.ptr_to([0]), weak=True, space="shared::cta", ptx_type="b128")
+        # One 128-bit store: the four packed words are read through a b128 view.
+        T.ptxd.st.weak.shared__cta.b128(smem_addr, packed.view("uint128")[0])
 
     # kernel.cuh:35-67.  Each copy site requests the lowering's ordinary
     # descriptor prefetch.  tma_explicit deduplicates the two normal KV
