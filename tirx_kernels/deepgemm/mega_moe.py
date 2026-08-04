@@ -1767,13 +1767,21 @@ def get_kernel(
         )
         return T.bitwise_or(T.bitwise_and(desc, T.bitwise_not(T.uint64(0x3FFF))), start_addr)
 
+    _bulk_g2s_chain = (
+        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+    )
+    _bulk_s2g_chain = "cp.async.bulk.global.shared::cta.bulk_group.L2::cache_hint"
+    _evict_first_policy = T.uint64(0x12F0000000000000)
+
     def tma_load_1d(dst_ptr, src_ptr, barrier_ptr, num_bytes):
-        return T.ptx.cp_async_bulk_g2s_cluster(
-            dst_ptr, src_ptr, num_bytes, barrier_ptr, cache_hint="evict_first"
+        return T.ptxd[_bulk_g2s_chain](
+            dst_ptr, src_ptr, T.cast(num_bytes, "uint32"), barrier_ptr, _evict_first_policy
         )
 
     def tma_store_1d(dst_ptr, src_ptr, num_bytes):
-        return T.ptx.cp_async_bulk_s2g(dst_ptr, src_ptr, num_bytes, cache_hint="evict_normal")
+        return T.ptxd[_bulk_s2g_chain](
+            dst_ptr, src_ptr, T.cast(num_bytes, "uint32"), _evict_normal_policy
+        )
 
     def tma_store_fence():
         return T.ptxd.fence.proxy.async_.shared__cta()
@@ -1868,12 +1876,12 @@ def get_kernel(
         return T.ptxd.ld.global_.f32(dst, peer_ptr(peer_base, byte_offset))
 
     def tma_load_1d_symm(dst_ptr, peer_base, byte_offset, barrier_ptr, num_bytes):
-        return T.ptx.cp_async_bulk_g2s_cluster(
+        return T.ptxd[_bulk_g2s_chain](
             dst_ptr,
             peer_ptr(peer_base, byte_offset),
-            num_bytes,
+            T.cast(num_bytes, "uint32"),
             barrier_ptr,
-            cache_hint="evict_first",
+            _evict_first_policy,
         )
 
     def ballot_sync(mask, pred):
