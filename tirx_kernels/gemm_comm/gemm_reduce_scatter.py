@@ -103,6 +103,9 @@ _TMA_G2S_CG2 = (
     f".mbarrier::complete_tx::bytes.cta_group::{CTA_GROUP}"
 )
 _TMA_S2G = "cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group"
+# tcgen05.mma spelling: kind::f16 from the (float32, float16, float16) dtypes.
+_MMA_CHAIN = f"tcgen05.mma.cta_group::{CTA_GROUP}.kind::f16"
+_MMA_ZERO_MASKS = [0] * (4 if CTA_GROUP == 1 else 8)
 PIPE_CYCLE = K // BLK_K // PIPELINE_DEPTH
 PIPE_REMAIN_NUM = K // BLK_K % PIPELINE_DEPTH
 assert PIPELINE_DEPTH == 4
@@ -898,30 +901,22 @@ def test_mma_ss_tma_2sm_persistent(
                                         swizzle=SWIZZLE,
                                     )
                                     if stage == 0 and ki == 0:
-                                        Tx.ptx.tcgen05.mma(
-                                            warp_id * MMA_N,
+                                        Tx.ptxd[_MMA_CHAIN](
+                                            Tx.cast(warp_id * MMA_N, "uint32"),
                                             descA,
                                             descB,
                                             descI,
-                                            d_dtype="float32",
-                                            a_dtype=a_type,
-                                            b_dtype=b_type,
-                                            use_a_tmem=False,
-                                            cta_group=CTA_GROUP,
-                                            enable_input_d=0,
+                                            *_MMA_ZERO_MASKS,
+                                            0,
                                         )
                                     else:
-                                        Tx.ptx.tcgen05.mma(
-                                            warp_id * MMA_N,
+                                        Tx.ptxd[_MMA_CHAIN](
+                                            Tx.cast(warp_id * MMA_N, "uint32"),
                                             descA,
                                             descB,
                                             descI,
-                                            d_dtype="float32",
-                                            a_dtype=a_type,
-                                            b_dtype=b_type,
-                                            use_a_tmem=False,
-                                            cta_group=CTA_GROUP,
-                                            enable_input_d=1,
+                                            *_MMA_ZERO_MASKS,
+                                            1,
                                         )
                                 smem_pipe.empty.arrive(ks, cta_group=CTA_GROUP, cta_mask=3)
                             phase = phase ^ 1
@@ -944,30 +939,22 @@ def test_mma_ss_tma_2sm_persistent(
                                         swizzle=SWIZZLE,
                                     )
                                     if PIPE_CYCLE == 0 and ks == 0 and (ki == 0):
-                                        Tx.ptx.tcgen05.mma(
-                                            warp_id * MMA_N,
+                                        Tx.ptxd[_MMA_CHAIN](
+                                            Tx.cast(warp_id * MMA_N, "uint32"),
                                             descA,
                                             descB,
                                             descI,
-                                            d_dtype="float32",
-                                            a_dtype=a_type,
-                                            b_dtype=b_type,
-                                            use_a_tmem=False,
-                                            cta_group=CTA_GROUP,
-                                            enable_input_d=0,
+                                            *_MMA_ZERO_MASKS,
+                                            0,
                                         )
                                     else:
-                                        Tx.ptx.tcgen05.mma(
-                                            warp_id * MMA_N,
+                                        Tx.ptxd[_MMA_CHAIN](
+                                            Tx.cast(warp_id * MMA_N, "uint32"),
                                             descA,
                                             descB,
                                             descI,
-                                            d_dtype="float32",
-                                            a_dtype=a_type,
-                                            b_dtype=b_type,
-                                            use_a_tmem=False,
-                                            cta_group=CTA_GROUP,
-                                            enable_input_d=1,
+                                            *_MMA_ZERO_MASKS,
+                                            1,
                                         )
                                 smem_pipe.empty.arrive(ks, cta_group=CTA_GROUP, cta_mask=3)
                             tmem_pipe.full.arrive(warp_id, cta_group=CTA_GROUP, cta_mask=3)

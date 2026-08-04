@@ -1571,7 +1571,7 @@ def get_kernel(**kwargs: Any):
                     )
                     make_smem_desc(desc_b, smem_q.ptr_to([q_stage_idx, 0, k * umma_k]))
                     if T.ptx.elect_sync():
-                        T.ptx.tcgen05.mma(
+                        T.ptxd["tcgen05.mma.cta_group::1.kind::f8f6f4"](
                             umma_group_idx * T.uint32(umma_n * num_umma_stages)
                             + umma_stage_idx * T.uint32(umma_n),
                             desc_a,
@@ -1581,12 +1581,7 @@ def get_kernel(**kwargs: Any):
                             T.uint32(0),
                             T.uint32(0),
                             T.uint32(0),
-                            d_dtype="float32",
-                            a_dtype="float8_e4m3fn",
-                            b_dtype="float8_e4m3fn",
-                            use_a_tmem=False,
-                            cta_group=1,
-                            enable_input_d=T.uint32(k),
+                            T.uint32(k),
                         )
                 if T.ptx.elect_sync():
                     T.ptxd.tcgen05.commit.cta_group__1.mbarrier__arrive__one.shared__cluster.b64(

@@ -123,6 +123,9 @@ assert SMEM_SIZE <= 232448
 TMEM_LD_SIZE = 64
 N_COLS = 512
 CTA_GROUP = 2
+# tcgen05.mma spelling: kind::f16 from the (float32, DTYPE, DTYPE) dtypes.
+_MMA_CHAIN = f"tcgen05.mma.cta_group::{CTA_GROUP}.kind::f16"
+_MMA_ZERO_MASKS = [0] * (4 if CTA_GROUP == 1 else 8)
 
 PIPE_CYCLE = (K // BLK_K) // PIPELINE_DEPTH
 PIPE_REMAIN_NUM = (K // BLK_K) % PIPELINE_DEPTH
@@ -843,30 +846,22 @@ def _build_kernel():
                                                                             ldo=1, sdo=8 * BLK_K * F16_BYTES // F128_BYTES, swizzle=SWIZZLE)
 
                                     if (stage == 0 and ki == 0) and ((not is_remain) or (is_remain and PIPE_CYCLE == 0)):
-                                        T.ptx.tcgen05.mma(
-                                            warp_id * MMA_N,
+                                        T.ptxd[_MMA_CHAIN](
+                                            T.cast(warp_id * MMA_N, "uint32"),
                                             descA,
                                             descB,
                                             descI,
-                                            d_dtype="float32",
-                                            a_dtype=a_type,
-                                            b_dtype=b_type,
-                                            use_a_tmem=False,
-                                            cta_group=CTA_GROUP,
-                                            enable_input_d=False,
+                                            *_MMA_ZERO_MASKS,
+                                            0,
                                         )
                                     else:
-                                        T.ptx.tcgen05.mma(
-                                            warp_id * MMA_N,
+                                        T.ptxd[_MMA_CHAIN](
+                                            T.cast(warp_id * MMA_N, "uint32"),
                                             descA,
                                             descB,
                                             descI,
-                                            d_dtype="float32",
-                                            a_dtype=a_type,
-                                            b_dtype=b_type,
-                                            use_a_tmem=False,
-                                            cta_group=CTA_GROUP,
-                                            enable_input_d=True,
+                                            *_MMA_ZERO_MASKS,
+                                            1,
                                         )
                                 mma2tma.arrive(ks)
 

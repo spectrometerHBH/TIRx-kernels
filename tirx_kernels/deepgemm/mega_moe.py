@@ -1757,9 +1757,6 @@ def get_kernel(
     def mbarrier_wait_phase(barrier_ptr, phase):
         return T.ptx.mbarrier.try_wait(barrier_ptr, phase)
 
-    def mbarrier_test_wait_phase(barrier_ptr, phase):
-        return T.ptx.mbarrier_test_wait_parity(barrier_ptr, phase, space="shared::cta")
-
     def shared_addr_u32(ptr):
         return T.cuda.cvta_generic_to_shared(ptr)
 
@@ -4383,21 +4380,17 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
                                         * kernel_config.load_block_n,
                                         k_idx * umma_k,
                                     )
-                                    T.ptx.tcgen05.mma.block_scale(
-                                        accum_stage_idx * umma_n,
+                                    # kind::mxf8f6f4/scale_vec::1X from the
+                                    # (f32, e2m1, e4m3, e8m0, e8m0) dtypes; the
+                                    # instruction A slot carries desc_b (B^T*A).
+                                    T.ptxd[f"tcgen05.mma.cta_group::{kernel_config.num_ctas_per_cluster}.kind::mxf8f6f4.block_scale.scale_vec::1X"](
+                                        T.cast(accum_stage_idx * umma_n, "uint32"),
                                         desc_b,
                                         desc_a,
-                                        sfb_tmem.allocated_addr[0],
-                                        sfa_tmem.allocated_addr[0],
                                         runtime_desc_i,
-                                        d_dtype="float32",
-                                        a_dtype="float4_e2m1fn",
-                                        b_dtype="float8_e4m3fn",
-                                        sfa_dtype="float8_e8m0fnu",
-                                        sfb_dtype="float8_e8m0fnu",
-                                        use_a_tmem=False,
-                                        cta_group=kernel_config.num_ctas_per_cluster,
-                                        enable_input_d=T.Or(
+                                        T.cast(sfb_tmem.allocated_addr[0], "uint32"),
+                                        T.cast(sfa_tmem.allocated_addr[0], "uint32"),
+                                        T.Or(
                                             k_block_idx > T.int32(0),
                                             T.Or(umma_k_block_idx > 0, k_idx > 0),
                                         ),
