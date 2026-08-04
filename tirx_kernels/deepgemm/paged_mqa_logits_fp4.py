@@ -566,12 +566,10 @@ def get_kernel(**kwargs: Any):
     # .cta_group modifier (the legacy raw form passed -1 to suppress it), with
     # the evict-normal L2 cache policy as a real operand.
     tma_g2s_2d = (
-        "cp.async.bulk.tensor.2d.shared::cluster.global"
-        ".mbarrier::complete_tx::bytes.L2::cache_hint"
+        "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
     )
     tma_g2s_3d = (
-        "cp.async.bulk.tensor.3d.shared::cluster.global"
-        ".mbarrier::complete_tx::bytes.L2::cache_hint"
+        "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
     )
     q_tma_block_inner = head_dim // 2
     q_tma_swizzle_mode = head_dim // 2
@@ -779,7 +777,7 @@ def get_kernel(**kwargs: Any):
         T.evaluate(T.ptxd.mbarrier.init.shared.b64(barrier_ptr, T.uint32(arrive_count)))
 
     def mbarrier_wait_cta(barrier_ptr, phase):
-        T.evaluate(T.ptx.mbarrier.try_wait(barrier_ptr, phase))
+        T.evaluate(T.cuda.mbarrier_wait(barrier_ptr, phase))
 
     def mbarrier_arrive_cta(barrier_ptr):
         T.evaluate(T.ptxd.mbarrier.arrive.shared.b64(barrier_ptr, T.uint32(1)))
@@ -1093,13 +1091,13 @@ def get_kernel(**kwargs: Any):
 
         @T.inline
         def make_sf_desc(desc_sf, smem_ptr):
-            T.ptx.tcgen05.encode_matrix_descriptor(
+            T.cuda.tcgen05.encode_matrix_descriptor(
                 T.address_of(desc_sf), smem_ptr, ldo=0, sdo=sf_desc_sdo, swizzle=0
             )
 
         @T.inline
         def make_smem_desc(desc, smem_ptr):
-            T.ptx.tcgen05.encode_matrix_descriptor(
+            T.cuda.tcgen05.encode_matrix_descriptor(
                 T.address_of(desc), smem_ptr, ldo=0, sdo=desc_sdo, swizzle=2
             )
 
@@ -1565,7 +1563,7 @@ def get_kernel(**kwargs: Any):
             desc_sf: T.uint64
             desc_a: T.uint64
             desc_b: T.uint64
-            T.ptx.tcgen05.encode_instr_descriptor_block_scaled(
+            T.cuda.tcgen05.encode_instr_descriptor_block_scaled(
                 T.address_of(desc_i),
                 d_dtype="float32",
                 a_dtype="float4_e2m1fn",

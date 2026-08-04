@@ -22,7 +22,7 @@ from typing import Literal
 import tvm
 from tirx_kernels.megakernel.utils.base import SemaphoreBase, TileSchedulerBase
 from tirx_kernels.megakernel.utils.config import JobType, KernelConfig
-from tirx_kernels.megakernel.utils.utils import any_sync, atomic_add_int32, gt, unpack_from_32bit
+from tirx_kernels.megakernel.utils.utils import atomic_add_int32, gt, unpack_from_32bit
 from tvm.script import tirx as T
 
 
@@ -52,7 +52,7 @@ class Semaphore(SemaphoreBase):
                             self.state[0],
                             self.sem.access_ptr("r", offset=self.sem.elem_offset_of(coord)),
                         )
-                    if any_sync(0xFFFFFFFF, self.state[0] == 0):
+                    if T.cuda.any_sync(0xFFFFFFFF, self.state[0] == 0):
                         break
                     T.cuda.nano_sleep(40)
         else:

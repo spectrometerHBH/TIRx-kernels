@@ -885,7 +885,7 @@ def _kernel(
                 cur_pi_max = T.max(cur_pi_max, rowwise_max_buf[idx_in_warpgroup ^ 64])
                 real_mi = T.max(real_mi, cur_pi_max)
                 should_scale_o: T.let = (
-                    T.ptx.any_sync(T.uint32(0xFFFFFFFF), cur_pi_max - mi > 6.0) != 0
+                    T.cuda.any_sync(T.uint32(0xFFFFFFFF), cur_pi_max - mi > 6.0) != 0
                 )
                 new_max: T.float32
                 scale_for_old: T.float32

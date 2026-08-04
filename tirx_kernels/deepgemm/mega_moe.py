@@ -1755,7 +1755,7 @@ def get_kernel(
         return T.ptxd.mbarrier.arrive.expect_tx.shared.b64(barrier_ptr, T.uint32(num_bytes))
 
     def mbarrier_wait_phase(barrier_ptr, phase):
-        return T.ptx.mbarrier.try_wait(barrier_ptr, phase)
+        return T.cuda.mbarrier_wait(barrier_ptr, phase)
 
     def shared_addr_u32(ptr):
         return T.cuda.cvta_generic_to_shared(ptr)
@@ -1816,12 +1816,7 @@ def get_kernel(
         mbar_addr = T.cuda.sm100_2sm_leader_smem_addr(mbar)
         T.evaluate(
             T.ptxd[_sm100_2sm_load_chain](
-                dst,
-                tensormap_addr,
-                coord0,
-                coord1,
-                mbar_addr,
-                _evict_normal_policy,
+                dst, tensormap_addr, coord0, coord1, mbar_addr, _evict_normal_policy
             )
         )
 
@@ -3353,7 +3348,7 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
 
         @T.inline
         def barrier_wait(barrier_ptr, phase):
-            T.ptx.mbarrier.try_wait(barrier_ptr, phase)
+            T.cuda.mbarrier_wait(barrier_ptr, phase)
 
         @T.inline
         def tmem_empty_barrier_arrive_cta0(tmem_empty_barrier_ptr):
@@ -3438,7 +3433,7 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
 
         @T.inline
         def make_instr_desc_block_scaled():
-            T.ptx.tcgen05.encode_instr_descriptor_block_scaled(
+            T.cuda.tcgen05.encode_instr_descriptor_block_scaled(
                 T.address_of(desc_i),
                 d_dtype="float32",
                 a_dtype="float4_e2m1fn",
@@ -3457,19 +3452,19 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
 
         @T.inline
         def make_sf_desc():
-            T.ptx.tcgen05.encode_matrix_descriptor(
+            T.cuda.tcgen05.encode_matrix_descriptor(
                 T.address_of(desc_sf), smem_sfa.ptr_to([0, 0]), ldo=0, sdo=sf_desc_sdo, swizzle=0
             )
 
         @T.inline
         def make_umma_desc_a():
-            T.ptx.tcgen05.encode_matrix_descriptor(
+            T.cuda.tcgen05.encode_matrix_descriptor(
                 T.address_of(desc_a), smem_a_fp8.ptr_to([0, 0, 0]), ldo=0, sdo=a_desc_sdo, swizzle=3
             )
 
         @T.inline
         def make_umma_desc_b():
-            T.ptx.tcgen05.encode_matrix_descriptor(
+            T.cuda.tcgen05.encode_matrix_descriptor(
                 T.address_of(desc_b), smem_b.ptr_to([0, 0, 0]), ldo=0, sdo=b_desc_sdo, swizzle=3
             )
 
@@ -4391,7 +4386,9 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
                                     # kind::mxf8f6f4/scale_vec::1X from the
                                     # (f32, e2m1, e4m3, e8m0, e8m0) dtypes; the
                                     # instruction A slot carries desc_b (B^T*A).
-                                    T.ptxd[f"tcgen05.mma.cta_group::{kernel_config.num_ctas_per_cluster}.kind::mxf8f6f4.block_scale.scale_vec::1X"](
+                                    T.ptxd[
+                                        f"tcgen05.mma.cta_group::{kernel_config.num_ctas_per_cluster}.kind::mxf8f6f4.block_scale.scale_vec::1X"
+                                    ](
                                         T.cast(accum_stage_idx * umma_n, "uint32"),
                                         desc_b,
                                         desc_a,

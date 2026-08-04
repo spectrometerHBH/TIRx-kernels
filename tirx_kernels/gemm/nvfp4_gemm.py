@@ -621,7 +621,7 @@ def _kernel(
                 _rem3[0], tmem_finished.ptr_to([0]), T.uint32(pair_leader_rank + 1 - id_in_pair)
             )
             T.ptxd.mbarrier.arrive.b64(_rem3[0], T.uint32(1), pred=T.bool(True))
-        T.ptx.mbarrier.try_wait_acquire_cluster(tmem_finished.ptr_to([0]), 0)
+        T.cuda.mbarrier_wait_acquire_cluster(tmem_finished.ptr_to([0]), 0)
         T.ptxd[f"tcgen05.dealloc.cta_group::{CTA_GROUP}.sync.aligned.b32"](
             tmem_pool.addr, T.uint32(512)
         )

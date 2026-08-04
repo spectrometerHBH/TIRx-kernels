@@ -340,7 +340,7 @@ class Barriers:
 
     @T.inline
     def wait(self, idx_d, idx_w, phase):
-        T.ptx.mbarrier.try_wait(self.mbar.ptr_to([idx_d, idx_w]), self.init_phase ^ phase)
+        T.cuda.mbarrier_wait(self.mbar.ptr_to([idx_d, idx_w]), self.init_phase ^ phase)
 
 
 class BarTMA2MMA(Barriers):
@@ -437,17 +437,13 @@ class Pipeline:
     def producer_wait(self, pipeline_idx):
         for cbx in T.thread_binding(M_CLUSTER, "clusterCtaIdx.x"):
             if not self.p_single_cta or cbx == 0:
-                T.ptx.mbarrier.try_wait(
-                    self.mbar_c2p.ptr_to([self.idx, pipeline_idx]), self.c2p_phase
-                )
+                T.cuda.mbarrier_wait(self.mbar_c2p.ptr_to([self.idx, pipeline_idx]), self.c2p_phase)
 
     @T.inline
     def consumer_wait(self, pipeline_idx):
         for cbx in T.thread_binding(M_CLUSTER, "clusterCtaIdx.x"):
             if not self.c_single_cta or cbx == 0:
-                T.ptx.mbarrier.try_wait(
-                    self.mbar_p2c.ptr_to([self.idx, pipeline_idx]), self.p2c_phase
-                )
+                T.cuda.mbarrier_wait(self.mbar_p2c.ptr_to([self.idx, pipeline_idx]), self.p2c_phase)
 
 
 def int_var(name: str, scope="local", dtype="int32", align=4):
@@ -743,7 +739,7 @@ def _build_kernel():
         phase[0] = 0
         phase_tmem[0] = 0
         sch_pipe.init(tid == 0, c2p_thread_count=C2P_THREAD_COUNT, p2c_thread_count=1)
-        T.ptx.tcgen05.encode_instr_descriptor(
+        T.cuda.tcgen05.encode_instr_descriptor(
             T.address_of(descI),
             d_dtype="float32",
             a_dtype=a_type,
@@ -840,9 +836,9 @@ def _build_kernel():
                                 # wait tma
                                 tma2mma.wait(ks, 0, phase[0])
                                 for ki in T.unroll(BLK_K // MMA_K):
-                                    T.ptx.tcgen05.encode_matrix_descriptor(T.address_of(descA), A_smem.ptr_to([ks, warp_id, 0, ki * MMA_K]),
+                                    T.cuda.tcgen05.encode_matrix_descriptor(T.address_of(descA), A_smem.ptr_to([ks, warp_id, 0, ki * MMA_K]),
                                                                             ldo=1, sdo=8 * BLK_K * F16_BYTES // F128_BYTES, swizzle=SWIZZLE)
-                                    T.ptx.tcgen05.encode_matrix_descriptor(T.address_of(descB), B_smem.ptr_to([ks, 0, ki * MMA_K]),
+                                    T.cuda.tcgen05.encode_matrix_descriptor(T.address_of(descB), B_smem.ptr_to([ks, 0, ki * MMA_K]),
                                                                             ldo=1, sdo=8 * BLK_K * F16_BYTES // F128_BYTES, swizzle=SWIZZLE)
 
                                     if (stage == 0 and ki == 0) and ((not is_remain) or (is_remain and PIPE_CYCLE == 0)):

@@ -670,7 +670,7 @@ def get_kernel(**kwargs: Any):
             desc_i: T.uint32
             # GAP 1: encode the block-scaled instruction descriptor ONCE here; the
             # gemm_async path rotates the per-ki SF id from this single desc_i.
-            T.ptx.tcgen05.encode_instr_descriptor_block_scaled(
+            T.cuda.tcgen05.encode_instr_descriptor_block_scaled(
                 T.address_of(desc_i),
                 d_dtype="float32",
                 a_dtype="float4_e2m1fn",

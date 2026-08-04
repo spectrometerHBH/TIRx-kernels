@@ -525,7 +525,7 @@ def _kernel(
             cur_pi_max = T.max(cur_pi_max, rowwise_max_buf[idx_in_warpgroup ^ 64])
             real_mi = T.max(real_mi, cur_pi_max)
             should_scale_o: T.bool = (
-                T.ptx.any_sync(T.uint32(0xFFFFFFFF), cur_pi_max - mi > 6.0) != 0
+                T.cuda.any_sync(T.uint32(0xFFFFFFFF), cur_pi_max - mi > 6.0) != 0
             )
             new_max: T.float32
             scale_for_old: T.float32
@@ -638,7 +638,7 @@ def _kernel(
         # O smem viewed the same way as o_tmem: (128, 256) so a (128,64) frag
         # chunk copies straight in (row r = lane-half*64 + h, col = D_V fold).
         o_smem_win = o_smem.rearrange("h (a b c) -> (b h) (a c)", a=2, b=2, c=128)
-        have_valid_indices: T.let = T.ptx.any_sync(T.uint32(0xFFFFFFFF), li != 0.0) != 0
+        have_valid_indices: T.let = T.cuda.any_sync(T.uint32(0xFFFFFFFF), li != 0.0) != 0
         if not have_valid_indices:
             for o_zero_i in T.unroll(64):
                 o_epi[o_zero_i] = 0.0

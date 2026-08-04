@@ -943,7 +943,7 @@ def _kernel(
                         should_rescale = T.Select(acc_scale < T.float32(1.0), 1, 0)
                     else:
                         should_rescale = 0
-                    any_needs_rescale: T.let = T.ptx.any_sync(4294967295, should_rescale)
+                    any_needs_rescale: T.let = T.cuda.any_sync(4294967295, should_rescale)
                     if any_needs_rescale != 0:
                         if tid_in_wg < BLK_M:
                             RESCALE_TILE = T.meta_var(16)

@@ -27,7 +27,7 @@ from tvm.tirx.cuda.iket import IketProfiler
 from tvm.tirx.expr import Var
 
 from .config import IketEvent, KernelConfig
-from .utils import any_sync, f_init_const
+from .utils import f_init_const
 
 
 @T.meta_class
@@ -92,7 +92,7 @@ class Barriers:
 
     @T.inline
     def wait(self, idx, phase):
-        T.ptx.mbarrier.try_wait(self.mbar.ptr_to([idx]), self.init_phase ^ phase)
+        T.cuda.mbarrier_wait(self.mbar.ptr_to([idx]), self.init_phase ^ phase)
 
 
 @T.meta_class
@@ -287,12 +287,12 @@ class SmemManager:
         if level == "cta":
             if warp_id == 0:
                 if lane_id < self.chunk_num:
-                    T.ptx.mbarrier.try_wait(self.mbar.ptr_to([lane_id]), self.cur_phase[0])
+                    T.cuda.mbarrier_wait(self.mbar.ptr_to([lane_id]), self.cur_phase[0])
             T.tvm_storage_sync("shared")
         elif level == "warpgroup":
             if warp_id % KernelConfig.WARP_NUMBER == 0:
                 if lane_id < self.chunk_num:
-                    T.ptx.mbarrier.try_wait(self.mbar.ptr_to([lane_id]), self.cur_phase[0])
+                    T.cuda.mbarrier_wait(self.mbar.ptr_to([lane_id]), self.cur_phase[0])
             T.ptxd.bar.sync(T.uint32(6 + wg_id), 128)
 
     @T.inline
@@ -308,17 +308,17 @@ class SmemManager:
             - 1
         ) // self.chunk_size
         if (lane_id >= beg_chunk_id) & (lane_id <= end_chunk_id):
-            T.ptx.mbarrier.try_wait(self.mbar.ptr_to([lane_id]), self.cur_phase[0])
+            T.cuda.mbarrier_wait(self.mbar.ptr_to([lane_id]), self.cur_phase[0])
 
     @T.inline
     def wait_unused(self, lane_id, cur_tile: Tile):
         self._assert_cond(len(self.tiles[self.cur_tile_name][1]["shared"]) == 0)
         if (lane_id < self.chunk_num) & (lane_id > self.tiles[str(cur_tile)][0]):
-            T.ptx.mbarrier.try_wait(self.mbar.ptr_to([lane_id]), self.cur_phase[0])
+            T.cuda.mbarrier_wait(self.mbar.ptr_to([lane_id]), self.cur_phase[0])
 
     @T.inline
     def wait_chunk(self, chunk_id):
-        T.ptx.mbarrier.try_wait(self.mbar.ptr_to([chunk_id]), self.cur_phase[0])
+        T.cuda.mbarrier_wait(self.mbar.ptr_to([chunk_id]), self.cur_phase[0])
 
     @T.inline
     def wait_specific_one_thread(self, buffer, split_idx: int):
@@ -333,7 +333,7 @@ class SmemManager:
             - 1
         ) // self.chunk_size
         for idx in T.serial(0, end_chunk_id - beg_chunk_id + 1):
-            T.ptx.mbarrier.try_wait(self.mbar.ptr_to([beg_chunk_id + idx]), self.cur_phase[0])
+            T.cuda.mbarrier_wait(self.mbar.ptr_to([beg_chunk_id + idx]), self.cur_phase[0])
 
     @T.inline
     def arrive_all(self, level: Literal["cta", "warpgroup"] = "cta"):
@@ -597,7 +597,7 @@ class MegaKernelWrapper:
                     T.ptxd.ld.acquire.gpu.global_.b32(
                         state[0], self.evt_etensor_init_complete.sem.ptr_to([0])
                     )
-                if any_sync(
+                if T.cuda.any_sync(
                     4294967295,
                     state[0] <= KernelConfig.SM_NUMBER * (SemaphoreBase.base + 1) and state[0] > 0,
                 ):

@@ -325,7 +325,7 @@ class Pipeline:
     def producer_wait(self, pipeline_idx):
         for cbx in Tx.thread_binding(M_CLUSTER, "clusterCtaIdx.x"):
             if not self.p_single_cta or cbx == 0:
-                Tx.ptx.mbarrier.try_wait(
+                Tx.cuda.mbarrier_wait(
                     self.mbar_c2p.ptr_to([self.idx, pipeline_idx]), self.c2p_phase
                 )
 
@@ -333,7 +333,7 @@ class Pipeline:
     def consumer_wait(self, pipeline_idx):
         for cbx in Tx.thread_binding(M_CLUSTER, "clusterCtaIdx.x"):
             if not self.c_single_cta or cbx == 0:
-                Tx.ptx.mbarrier.try_wait(
+                Tx.cuda.mbarrier_wait(
                     self.mbar_p2c.ptr_to([self.idx, pipeline_idx]), self.p2c_phase
                 )
 
@@ -739,7 +739,7 @@ def test_mma_ss_tma_2sm_persistent(
     phase = 0
     phase_tmem = 0
     sch_pipe.init(c2p_thread_count=C2P_THREAD_COUNT, p2c_thread_count=1)
-    Tx.ptx.tcgen05.encode_instr_descriptor(
+    Tx.cuda.tcgen05.encode_instr_descriptor(
         Tx.address_of(descI),
         d_dtype="float32",
         a_dtype=a_type,
@@ -886,14 +886,14 @@ def test_mma_ss_tma_2sm_persistent(
                                 stage = ko * PIPELINE_DEPTH + ks
                                 smem_pipe.full.wait(ks, phase)
                                 for ki in Tx.unroll(BLK_K // MMA_K):
-                                    Tx.ptx.tcgen05.encode_matrix_descriptor(
+                                    Tx.cuda.tcgen05.encode_matrix_descriptor(
                                         Tx.address_of(descA),
                                         A_smem.ptr_to([ks, warp_id, 0, ki * MMA_K]),
                                         ldo=1,
                                         sdo=8 * BLK_K * F16_BYTES // F128_BYTES,
                                         swizzle=SWIZZLE,
                                     )
-                                    Tx.ptx.tcgen05.encode_matrix_descriptor(
+                                    Tx.cuda.tcgen05.encode_matrix_descriptor(
                                         Tx.address_of(descB),
                                         B_smem.ptr_to([ks, 0, ki * MMA_K]),
                                         ldo=1,
@@ -924,14 +924,14 @@ def test_mma_ss_tma_2sm_persistent(
                             for ks in Tx.unroll(PIPE_REMAIN_NUM):
                                 smem_pipe.full.wait(ks, phase)
                                 for ki in Tx.unroll(BLK_K // MMA_K):
-                                    Tx.ptx.tcgen05.encode_matrix_descriptor(
+                                    Tx.cuda.tcgen05.encode_matrix_descriptor(
                                         Tx.address_of(descA),
                                         A_smem.ptr_to([ks, warp_id, 0, ki * MMA_K]),
                                         ldo=1,
                                         sdo=8 * BLK_K * F16_BYTES // F128_BYTES,
                                         swizzle=SWIZZLE,
                                     )
-                                    Tx.ptx.tcgen05.encode_matrix_descriptor(
+                                    Tx.cuda.tcgen05.encode_matrix_descriptor(
                                         Tx.address_of(descB),
                                         B_smem.ptr_to([ks, 0, ki * MMA_K]),
                                         ldo=1,

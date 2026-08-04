@@ -24,7 +24,6 @@ import numpy as np
 from tirx_kernels.megakernel.utils.base import Barriers, SemaphoreBase, TileSchedulerBase
 from tirx_kernels.megakernel.utils.config import IketEvent, JobType, KernelConfig
 from tirx_kernels.megakernel.utils.utils import (
-    any_sync,
     atomic_add_int32,
     gt,
     pack_into_32bit,
@@ -78,7 +77,7 @@ class Semaphore(SemaphoreBase):
                             self.state[0],
                             self.sem.access_ptr("r", offset=self.sem.elem_offset_of(coord)),
                         )
-                    if any_sync(0xFFFFFFFF, self.state[0] == 0):
+                    if T.cuda.any_sync(0xFFFFFFFF, self.state[0] == 0):
                         break
                     T.cuda.nano_sleep(40)
         else:

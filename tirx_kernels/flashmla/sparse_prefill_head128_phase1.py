@@ -467,7 +467,7 @@ def _kernel(
             cur_pi_max = T.max(cur_pi_max, rowwise_max_buf[idx_in_warpgroup ^ 64])
             real_mi = T.max(real_mi, cur_pi_max)
             should_scale_o: T.bool = (
-                T.ptx.any_sync(T.uint32(0xFFFFFFFF), cur_pi_max - mi > 6.0) != 0
+                T.cuda.any_sync(T.uint32(0xFFFFFFFF), cur_pi_max - mi > 6.0) != 0
             )
 
             new_max: T.float32
@@ -573,7 +573,7 @@ def _kernel(
         output_scale: T.float32 = T.cuda.fdividef(T.float32(1.0), li + sink_exp)
         o_epi_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, B_EPI), "float32")
         o_epi = o_epi_frag.local()
-        have_valid_indices: T.let = T.ptx.any_sync(T.uint32(0xFFFFFFFF), li != 0.0) != 0
+        have_valid_indices: T.let = T.cuda.any_sync(T.uint32(0xFFFFFFFF), li != 0.0) != 0
         if not have_valid_indices:
             for o_zero_i in T.unroll(B_EPI):
                 o_epi[o_zero_i] = 0.0
