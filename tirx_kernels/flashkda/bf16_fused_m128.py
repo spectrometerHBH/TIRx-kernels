@@ -694,13 +694,16 @@ CONFIGS = [
 
 BENCH_CONFIGS = [
     # Mirrors benchmarks/bench_recurrent_kda_prefill.py CASES, minus h64_fixed8192
-    # which dispatches to the m64 kernel (out of scope for this module).
+    # which dispatches to the m64 kernel (out of scope for this module).  The PR's
+    # raw FlashKDA peer writes a separate final state, so all benchmark configs do
+    # the same for a like-for-like kernel scope.
     {
         "label": "h96_fixed8192",
         "num_heads": 96,
         "seq_lens": (8192,),
         "packed": False,
         "use_initial_state": True,
+        "store_final_state": True,
         "seed": 10000,
     },
     {
@@ -709,6 +712,7 @@ BENCH_CONFIGS = [
         "seq_lens": _MIXED_SEQ_LENS,
         "packed": True,
         "use_initial_state": True,
+        "store_final_state": True,
         "seed": 10001,
     },
     {
@@ -717,6 +721,7 @@ BENCH_CONFIGS = [
         "seq_lens": (1024,) * 8,
         "packed": True,
         "use_initial_state": True,
+        "store_final_state": True,
         "seed": 10002,
     },
     {
@@ -725,6 +730,7 @@ BENCH_CONFIGS = [
         "seq_lens": _MIXED_SEQ_LENS,
         "packed": True,
         "use_initial_state": True,
+        "store_final_state": True,
         "seed": 10004,
     },
     {
@@ -733,6 +739,7 @@ BENCH_CONFIGS = [
         "seq_lens": (1024,) * 8,
         "packed": True,
         "use_initial_state": True,
+        "store_final_state": True,
         "seed": 10005,
     },
 ]
@@ -3661,13 +3668,30 @@ def run_bench(
     args = _tirx_args(case)
     funcs = {"tirx": lambda: ex(*args)}
 
+    # Produce the expected buffers once.  The FlashKDA peer builder validates
+    # against these outside the timed region before returning its pure launch.
+    ex(*args)
+    torch.cuda.synchronize()
+
     def _frozen_builder():
         _load_frozen_recurrent_kda()  # warm the frozen module outside the timed region
-        return lambda: _frozen_cuda_reference(case)
+        frozen_case = dict(case)
+        if cfg.use_initial_state:
+            frozen_case["initial_state"] = case["initial_state"].clone()
+        return lambda: _frozen_cuda_reference(frozen_case)
 
-    references = {"flashinfer_frozen_m128": _frozen_builder}
+    flashkda_peer: dict[str, Any] = {}
 
-    return bench(
+    def _flashkda_raw_builder():
+        from tirx_kernels.flashkda._flashkda_bench import prepare_flashkda_raw_reference
+
+        peer = prepare_flashkda_raw_reference(case)
+        flashkda_peer["reference"] = peer
+        return peer.launch
+
+    references = {"flashinfer_frozen_m128": _frozen_builder, "flashkda_raw": _flashkda_raw_builder}
+
+    result = bench(
         funcs,
         warmup=warmup,
         repeat=repeat,
@@ -3676,6 +3700,11 @@ def run_bench(
         rounds=_rounds,
         cooldown_s=_cooldown_s,
     )
+    peer = flashkda_peer.get("reference")
+    if peer is not None:
+        result["flashkda_raw_provenance"] = peer.provenance
+        result["flashkda_raw_correctness"] = peer.correctness
+    return result
 
 
 __all__ = [

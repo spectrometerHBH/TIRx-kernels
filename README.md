@@ -78,6 +78,7 @@ them — they are only needed to actually compile/run a kernel:
 | `torch`          | all kernels                        | CUDA build matching your GPU.                          |
 | `deep_gemm`      | FP8 GEMM and `deepgemm_*` baselines | Used for optimized reference kernels. |
 | `flashinfer`     | `nvfp4_gemm` data/baseline, `megakernel_moe` baseline | Used for nvfp4 quantization and reference impls. |
+| `flash_kda`      | `flashkda_bf16_fused_m128` baseline | MoonshotAI/FlashKDA commit `d2ff19a6a0c82f39f796f637ebd1c36090b1268f`, matching flashinfer-ai/flashinfer#4262. |
 | `sglang` (+ CUTLASS DSL) | `deepgemm_sm100_fp8_paged_mqa_logits` reference | `sglang_cutedsl` reference; checkout on `PYTHONPATH`. |
 | `flash_mla`      | `sparse_flashmla_*` / `flash_mla_sparse_fwd` baselines | Reference impls. |
 | NVSHMEM          | `allgather_gemm`, `gemm_reduce_scatter` | Required to compile/run the GemmComm kernels. |
