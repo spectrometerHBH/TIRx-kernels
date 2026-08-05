@@ -659,7 +659,8 @@ def _kernel(
         packed = T.alloc_local((4,), "uint32")
         for pair_i in T.unroll(4):
             raw_pair: T.let = T.cast(T.shift_right(raw, T.cast(pair_i * 16, "uint64")), "uint16")
-            rounded_bits: T.let = T.ptx.cvt(raw_pair, dtype="bf16x2", atype="e4m3x2", rounding="rn")
+            rounded_bits = T.local_scalar("uint32")
+            T.ptxd.cvt.rn.bf16x2.e4m3x2(rounded_bits, raw_pair)
             rounded: T.let = T.reinterpret("bfloat16x2", rounded_bits)
             scaled_lo: T.let = T.Shuffle([rounded], [0]) * scale
             scaled_hi: T.let = T.Shuffle([rounded], [1]) * scale
@@ -1055,7 +1056,7 @@ def _kernel(
                     if T.ptx.elect_sync() != T.uint32(0):
                         for local_row in T.unroll(B_H // 4):
                             smem_row: T.let = local_row * 4 + warp_idx
-                            T.ptx.cp_async_bulk_s2g(
+                            T.ptxd["cp.async.bulk.global.shared::cta.bulk_group"](
                                 o_accum.ptr_to(
                                     [
                                         n_split_idx * stride_o_accum_split
@@ -1545,19 +1546,13 @@ def _kernel(
 
                             if is_v32:
                                 for pair_i in T.unroll(2):
-                                    lo: T.let = T.ptx.cvt(
-                                        scale_f32[pair_i, 1],
-                                        scale_f32[pair_i, 0],
-                                        dtype="ue8m0x2",
-                                        atype="f32",
-                                        rounding="rz",
+                                    lo = T.local_scalar("uint16")
+                                    T.ptxd.cvt.rz.ue8m0x2.f32(
+                                        lo, scale_f32[pair_i, 1], scale_f32[pair_i, 0]
                                     )
-                                    hi: T.let = T.ptx.cvt(
-                                        scale_f32[pair_i, 3],
-                                        scale_f32[pair_i, 2],
-                                        dtype="ue8m0x2",
-                                        atype="f32",
-                                        rounding="rz",
+                                    hi = T.local_scalar("uint16")
+                                    T.ptxd.cvt.rz.ue8m0x2.f32(
+                                        hi, scale_f32[pair_i, 3], scale_f32[pair_i, 2]
                                     )
                                     packed_scale: T.let = T.bitwise_or(
                                         T.cast(lo, "uint32"),
@@ -1762,16 +1757,15 @@ def _kernel(
                                 rs_index.stage, row_idx
                             ]
                             for scale_pair_idx in T.unroll(2):
-                                converted_pair: T.let = T.ptx.cvt(
+                                converted_pair = T.local_scalar("uint32")
+                                T.ptxd.cvt.rn.bf16x2.ue8m0x2(
+                                    converted_pair,
                                     T.cast(
                                         T.shift_right(
                                             packed_scales, T.cast(scale_pair_idx * 16, "uint32")
                                         ),
                                         "uint16",
                                     ),
-                                    dtype="bf16x2",
-                                    atype="ue8m0x2",
-                                    rounding="rn",
                                 )
                                 scales_bf16_bits[scale_pair_idx * 2] = T.cast(
                                     converted_pair, "uint16"
@@ -1784,16 +1778,15 @@ def _kernel(
                                 rs_index.stage, row_idx
                             ]
                             for scale_pair_idx in T.unroll(4):
-                                converted_pair: T.let = T.ptx.cvt(
+                                converted_pair = T.local_scalar("uint32")
+                                T.ptxd.cvt.rn.bf16x2.ue8m0x2(
+                                    converted_pair,
                                     T.cast(
                                         T.shift_right(
                                             packed_scales, T.cast(scale_pair_idx * 16, "uint64")
                                         ),
                                         "uint16",
                                     ),
-                                    dtype="bf16x2",
-                                    atype="ue8m0x2",
-                                    rounding="rn",
                                 )
                                 scales_bf16_bits[scale_pair_idx * 2] = T.cast(
                                     converted_pair, "uint16"
