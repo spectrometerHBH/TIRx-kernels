@@ -3037,10 +3037,8 @@ def prepare_data(**kwargs: Any) -> dict[str, Any]:
 
 def get_kernel(**kwargs: Any):
     cfg = _cfg(**kwargs)
-    return (
-        _kernel.specialize(HQ=cfg.hq, HV=cfg.hv)
-        .with_attr("tirx.kernel_launch_params", list(LAUNCH_TAGS))
-        .with_attr("tirx.cuda_fast_math", False)
+    return _kernel.specialize(HQ=cfg.hq, HV=cfg.hv).with_attr(
+        "tirx.kernel_launch_params", list(LAUNCH_TAGS)
     )
 
 
