@@ -11,6 +11,7 @@ import torch
 from tirx_kernels.flashmla._gemm import tcgen05_config
 from tirx_kernels.flashmla._mask import pack_valid_mask8
 from tirx_kernels.flashmla._tma import leader_mbar, tma_config
+from tvm.backend.cuda.lang.clc import query_cancel_first_ctaid_x
 from tvm.backend.cuda.tile_primitive.tma_utils import SwizzleMode
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
@@ -488,9 +489,8 @@ def _kernel(
             last_outer_loop_phase = wg0_outer_loop_phase
 
             bar_clc_full.wait(0, wg0_outer_loop_phase)
-            wg0_next_job: T.let = T.ptx.clc_query_cancel(
-                T.address_of(clc_response[0]), use_ld_acquire=True
-            )
+            wg0_next_job = T.local_scalar("uint32")
+            query_cancel_first_ctaid_x(wg0_next_job, T.address_of(clc_response[0]))
             _rem1 = T.alloc_local([1], "uint64")
             T.ptxd.mapa.shared__cluster.u64(_rem1[0], bar_clc_empty.ptr_to([0]), T.uint32(0))
             T.ptxd.mbarrier.arrive.b64(_rem1[0], T.uint32(1), pred=T.bool(True))
@@ -579,9 +579,8 @@ def _kernel(
                     wg1_rs = wg1_rs + 1
 
                 bar_clc_full.wait(0, wg1_outer_loop_phase)
-                wg1_next_job: T.let = T.ptx.clc_query_cancel(
-                    T.address_of(clc_response[0]), use_ld_acquire=True
-                )
+                wg1_next_job = T.local_scalar("uint32")
+                query_cancel_first_ctaid_x(wg1_next_job, T.address_of(clc_response[0]))
                 _rem2 = T.alloc_local([1], "uint64")
                 T.ptxd.mapa.shared__cluster.u64(_rem2[0], bar_clc_empty.ptr_to([0]), T.uint32(0))
                 T.ptxd.mbarrier.arrive.b64(_rem2[0], T.uint32(1), pred=T.bool(True))
@@ -672,9 +671,8 @@ def _kernel(
                     bar_tOut_full.arrive(0, cta_group=2, cta_mask=3)
 
                     bar_clc_full.wait(0, umma_outer_loop_phase)
-                    umma_next_job: T.let = T.ptx.clc_query_cancel(
-                        T.address_of(clc_response[0]), use_ld_acquire=True
-                    )
+                    umma_next_job = T.local_scalar("uint32")
+                    query_cancel_first_ctaid_x(umma_next_job, T.address_of(clc_response[0]))
                     _rem3 = T.alloc_local([1], "uint64")
                     T.ptxd.mapa.shared__cluster.u64(
                         _rem3[0], bar_clc_empty.ptr_to([0]), T.uint32(0)
@@ -727,9 +725,8 @@ def _kernel(
                         valid_rs = valid_rs + 1
 
                     bar_clc_full.wait(0, valid_outer_loop_phase)
-                    valid_next_job: T.let = T.ptx.clc_query_cancel(
-                        T.address_of(clc_response[0]), use_ld_acquire=True
-                    )
+                    valid_next_job = T.local_scalar("uint32")
+                    query_cancel_first_ctaid_x(valid_next_job, T.address_of(clc_response[0]))
                     _rem4 = T.alloc_local([1], "uint64")
                     T.ptxd.mapa.shared__cluster.u64(
                         _rem4[0], bar_clc_empty.ptr_to([0]), T.uint32(0)
@@ -760,9 +757,8 @@ def _kernel(
                         bar_clc_full.arrive(0, tx_count=16)
 
                         bar_clc_full.wait(0, clc_outer_loop_phase)
-                        clc_next_job: T.let = T.ptx.clc_query_cancel(
-                            T.address_of(clc_response[0]), use_ld_acquire=True
-                        )
+                        clc_next_job = T.local_scalar("uint32")
+                        query_cancel_first_ctaid_x(clc_next_job, T.address_of(clc_response[0]))
                         _rem5 = T.alloc_local([1], "uint64")
                         T.ptxd.mapa.shared__cluster.u64(
                             _rem5[0], bar_clc_empty.ptr_to([0]), T.uint32(0)
@@ -983,9 +979,8 @@ def _kernel(
                 lse[wg3_s_q_idx, head_idx] = cur_lse
 
             bar_clc_full.wait(0, wg3_outer_loop_phase)
-            wg3_next_job: T.let = T.ptx.clc_query_cancel(
-                T.address_of(clc_response[0]), use_ld_acquire=True
-            )
+            wg3_next_job = T.local_scalar("uint32")
+            query_cancel_first_ctaid_x(wg3_next_job, T.address_of(clc_response[0]))
             _rem6 = T.alloc_local([1], "uint64")
             T.ptxd.mapa.shared__cluster.u64(_rem6[0], bar_clc_empty.ptr_to([0]), T.uint32(0))
             T.ptxd.mbarrier.arrive.b64(_rem6[0], T.uint32(1), pred=T.bool(True))
