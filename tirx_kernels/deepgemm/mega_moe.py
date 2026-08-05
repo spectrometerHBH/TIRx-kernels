@@ -3470,12 +3470,8 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
 
         @T.inline
         def utccp_copy(tmem_addr, sf_desc):
-            T.ptx.tcgen05.cp(
-                tmem_addr,
-                sf_desc,
-                shape="32x128b",
-                cta_group=kernel_config.num_ctas_per_cluster,
-                multicast="warpx4",
+            T.ptxd[f"tcgen05.cp.cta_group::{kernel_config.num_ctas_per_cluster}.32x128b.warpx4"](
+                T.cast(tmem_addr, "uint32"), sf_desc
             )
 
         @T.inline

@@ -1627,14 +1627,14 @@ def get_kernel(**kwargs: Any):
                         T.ptxd.fence.proxy.async_.shared__cta()
                         desc_sf = replace_smem_desc_addr(desc_sf, sfq_stage.ptr_to([sfq_base]))
                         if T.ptx.elect_sync():
-                            T.ptx.tcgen05.cp(
-                                tmem_start_col_of_sfq
-                                + umma_group_idx * T.uint32(num_sfq_atom // 32)
-                                + sfq_i * 4,
+                            T.ptxd["tcgen05.cp.cta_group::1.32x128b.warpx4"](
+                                T.cast(
+                                    tmem_start_col_of_sfq
+                                    + umma_group_idx * T.uint32(num_sfq_atom // 32)
+                                    + sfq_i * 4,
+                                    "uint32",
+                                ),
                                 desc_sf,
-                                shape="32x128b",
-                                cta_group=1,
-                                multicast="warpx4",
                             )
                         T.cuda.warp_sync()
                 q_atom_idx = next_q_atom_idx
@@ -1676,14 +1676,14 @@ def get_kernel(**kwargs: Any):
                     for sfkv_i in T.unroll(0, num_sfkv // num_utccp_aligned_elems):
                         sfkv_base = T.uint32(sfkv_i * num_utccp_aligned_elems)
                         desc_sf = replace_smem_desc_addr(desc_sf, sfkv_stage.ptr_to([sfkv_base]))
-                        T.ptx.tcgen05.cp(
-                            tmem_start_col_of_sfkv
-                            + umma_group_idx * T.uint32(num_sfkv // 32)
-                            + sfkv_i * 4,
+                        T.ptxd["tcgen05.cp.cta_group::1.32x128b.warpx4"](
+                            T.cast(
+                                tmem_start_col_of_sfkv
+                                + umma_group_idx * T.uint32(num_sfkv // 32)
+                                + sfkv_i * 4,
+                                "uint32",
+                            ),
                             desc_sf,
-                            shape="32x128b",
-                            cta_group=1,
-                            multicast="warpx4",
                         )
 
                 tmem_stage_idx: T.uint32 = tmem_iter_idx % T.uint32(num_tmem_stages)
