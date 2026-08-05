@@ -227,7 +227,7 @@ def _kernel(
     T.device_entry()
     T.attr({"tirx.launch_bounds_min_blocks_per_sm": 1})
     cbx, cby = T.cta_id_in_cluster([M_CLUSTER, N_CLUSTER])
-    cluster_rank = T.ptx.fetch_register(32, "cluster_ctarank")
+    cluster_rank = T.cuda.mov_sreg(32, "cluster_ctarank")
     bx = T.cta_id([SM_NUMBER])
     wg_id = T.warpgroup_id([WG_NUMBER])
     warp_id = T.warp_id_in_wg([4])

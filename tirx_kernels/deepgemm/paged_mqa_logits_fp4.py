@@ -684,7 +684,7 @@ def get_kernel(**kwargs: Any):
         )
 
     def lane_id_u32():
-        return T.cast(T.ptx.fetch_register(32, "laneid"), "uint32")
+        return T.cast(T.cuda.mov_sreg(32, "laneid"), "uint32")
 
     # relu-weighted-accumulate of a packed f32x2 pair:
     #   d = fma(a + |a|, w, c)

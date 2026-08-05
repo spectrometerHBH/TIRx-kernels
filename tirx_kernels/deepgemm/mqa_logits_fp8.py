@@ -359,7 +359,7 @@ def get_kernel(**kwargs: Any):
     logits_tir_dtype = "float32" if config.logits_dtype == "float32" else "bfloat16"
 
     def lane_id_u32():
-        return T.cast(T.ptx.fetch_register(32, "laneid"), "uint32")
+        return T.cast(T.cuda.mov_sreg(32, "laneid"), "uint32")
 
     def cuda_grid_dependency_synchronize():
         T.evaluate(T.ptxd.griddepcontrol.wait())
