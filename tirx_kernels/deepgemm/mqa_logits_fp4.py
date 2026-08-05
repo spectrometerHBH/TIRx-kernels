@@ -571,7 +571,7 @@ def get_kernel(**kwargs: Any):
 
         if warp_idx == spec_warp_start:
             T.ptxd.setmaxnreg.dec.sync.aligned.u32(56)
-            if T.ptx.elect_sync():
+            if T.cuda.elect_sync():
                 # Ring cursors with subtract-wrap (DeepGEMM RingPipeline): avoids ptxas
                 # magic-number division for `% kNumStages` on these hot paths.
                 q_stage_idx: T.uint32 = T.uint32(0)
@@ -624,7 +624,7 @@ def get_kernel(**kwargs: Any):
             T.cuda.warp_sync()
         elif warp_idx == spec_warp_start + 1:
             T.ptxd.setmaxnreg.dec.sync.aligned.u32(56)
-            if T.ptx.elect_sync():
+            if T.cuda.elect_sync():
                 kv_stage_idx: T.uint32 = T.uint32(0)
                 kv_phase: T.uint32 = T.uint32(0)
                 q_idx: T.uint32 = sm_idx
@@ -742,7 +742,7 @@ def get_kernel(**kwargs: Any):
                         previous_tmem_iter % T.uint32(num_tmem_stages),
                         (previous_tmem_iter // T.uint32(num_tmem_stages)) & T.uint32(1),
                     )
-                if T.ptx.elect_sync():
+                if T.cuda.elect_sync():
                     Tx.copy_async(sfq_tmem, smem_sf_q_cp[T.cast(q_stage_idx, "int32")], cta_group=1)
                 T.cuda.warp_sync()
                 kv_idx: T.uint32 = T.uint32(0)
@@ -753,7 +753,7 @@ def get_kernel(**kwargs: Any):
                     sf_ready.wait(kv_stage_idx, kv_phase)
                     # cp + MMA share ONE elect scope: drops a redundant elect.sync per
                     # kv-iter and lets the cp overlap the MMA setup.
-                    if T.ptx.elect_sync():
+                    if T.cuda.elect_sync():
                         Tx.copy_async(
                             sfkv_tmem, smem_sf_kv_cp[T.cast(kv_stage_idx, "int32")], cta_group=1
                         )
@@ -796,7 +796,7 @@ def get_kernel(**kwargs: Any):
                             if tmem_stage_idx >= T.uint32(num_tmem_stages):
                                 tmem_stage_idx = tmem_stage_idx - T.uint32(num_tmem_stages)
                                 tmem_phase = tmem_phase ^ T.uint32(1)
-                    if T.ptx.elect_sync():
+                    if T.cuda.elect_sync():
                         kv_pipe.empty.arrive(kv_stage_idx, cta_group=1)
                     kv_idx = kv_idx + T.uint32(1)
                     kv_stage_idx = kv_stage_idx + T.uint32(1)
@@ -827,7 +827,7 @@ def get_kernel(**kwargs: Any):
                         smem_sf_kv, smem_sf_kv_t, lane_idx, t_kv_stage, num_utccp_aligned_elems
                     )
                     T.ptxd.fence.proxy.async_.shared__cta()
-                    if T.ptx.elect_sync():
+                    if T.cuda.elect_sync():
                         sf_ready.arrive(t_kv_stage)
                     t_kv_i = t_kv_i + T.uint32(1)
                     t_kv_stage = t_kv_stage + T.uint32(1)

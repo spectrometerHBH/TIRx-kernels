@@ -345,7 +345,7 @@ def _kernel(
     )
 
     if warp_idx == 1:
-        if T.ptx.elect_sync():
+        if T.cuda.elect_sync():
             bar_sQ_full.init(1)
             bar_tQ_empty.init(1)
             bar_tQ_full.init(1)
@@ -367,7 +367,7 @@ def _kernel(
         T.cuda.trap_when_assert_failed(tmem_start_addr[0] == T.uint32(0))
         T.ptxd.tcgen05.relinquish_alloc_permit.cta_group__2.sync.aligned()
     elif warp_idx == 3:
-        if T.ptx.elect_sync():
+        if T.cuda.elect_sync():
             for init_stage in T.unroll(NUM_K_BUFS):
                 T.ptxd.mbarrier.init.shared.b64(bar_KV_full.ptr_to([init_stage]), T.uint32(1))
                 T.ptxd.mbarrier.init.shared.b64(bar_KV_empty.ptr_to([init_stage]), T.uint32(1))
@@ -390,7 +390,7 @@ def _kernel(
         @T.inline
         def issue_q_copy(q_s_q_idx, q_outer_loop_phase):
             if warp_idx == 0:
-                if T.ptx.elect_sync():
+                if T.cuda.elect_sync():
                     T.ptxd.cp.async_.bulk.wait_group(0)
                     # Q's head-dim halves interleave per 64-elem chunk, matching the cp fold.
                     q_tma = q.rearrange(
@@ -433,7 +433,7 @@ def _kernel(
 
             bar_tOut_full.wait(0, o_outer_loop_phase)
             if is_last_o:
-                if T.ptx.elect_sync():
+                if T.cuda.elect_sync():
                     T.ptxd.griddepcontrol.launch_dependents()
 
             o_epi_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, B_EPI), "float32")
@@ -461,7 +461,7 @@ def _kernel(
             T.ptxd.fence.proxy.async_.shared__cta()
             T.ptxd.bar.sync(T.uint32(BAR_WG0_SYNC), 128)
             if warp_idx == 0:
-                if T.ptx.elect_sync():
+                if T.cuda.elect_sync():
                     Tx.copy_async(
                         out.chunk((None, 2, None))[o_s_q_idx, cta_idx, :],
                         q_smem[:, :],
@@ -502,7 +502,7 @@ def _kernel(
 
         if last_valid != 0:
             if warp_idx == 0:
-                if T.ptx.elect_sync():
+                if T.cuda.elect_sync():
                     T.ptxd.cp.async_.bulk.wait_group(0)
             T.ptxd.bar.sync(T.uint32(BAR_WG0_SYNC), 128)
             perform_o_copy_out(last_s_q_idx, last_outer_loop_phase, True)
@@ -517,7 +517,7 @@ def _kernel(
         T.ptxd.setmaxnreg.dec.sync.aligned.u32(80)
         # Source uses canonical_warp_idx() here, not canonical_warp_idx_sync().
         wg1_warp_idx: T.let = thread_idx // 32 - 4
-        if T.ptx.elect_sync():
+        if T.cuda.elect_sync():
             wg1_job_valid: T.int32 = 1
             wg1_job_block_idx: T.int32 = block_idx
             wg1_outer_loop_phase: T.int32 = 0
@@ -597,7 +597,7 @@ def _kernel(
 
         if (warp_idx == 8) & (cta_idx == 0):
             mma_token = iket.range_start("h128-small-qk-pv-issue")
-            if T.ptx.elect_sync():
+            if T.cuda.elect_sync():
                 umma_job_valid: T.int32 = 1
                 umma_job_block_idx: T.int32 = block_idx
                 umma_outer_loop_phase: T.int32 = 0
@@ -743,7 +743,7 @@ def _kernel(
             clc_token = iket.sentinel_token("h128-small-clc")
             if warp_idx == 10:
                 clc_token = iket.range_start("h128-small-clc")
-            if T.ptx.elect_sync():
+            if T.cuda.elect_sync():
                 if warp_idx == 10:
                     clc_job_valid: T.int32 = 1
                     clc_outer_loop_phase: T.int32 = 0

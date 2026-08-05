@@ -234,7 +234,7 @@ def _kernel(
     tid_in_wg = T.thread_id_in_wg([128])
     lane_id = T.lane_id([32])
     pool = T.SMEMPool()
-    barrier_leader = (wg_id == 0) & (warp_id == 1) & (T.ptx.elect_sync() != T.uint32(0))
+    barrier_leader = (wg_id == 0) & (warp_id == 1) & (T.cuda.elect_sync() != T.uint32(0))
     tmem_pool = T.TMEMPool(
         pool,
         total_cols=512,
@@ -344,7 +344,7 @@ def _kernel(
                     tma_load(k_tile)
                     tma_cur.advance()
 
-            if T.ptx.elect_sync():
+            if T.cuda.elect_sync():
                 while tile_scheduler.valid():
                     tma_iter()
                     tile_scheduler.next_tile()
@@ -417,7 +417,7 @@ def _kernel(
 
             @T.inline
             def mma_iter():
-                if T.ptx.elect_sync():
+                if T.cuda.elect_sync():
                     tmem_idx = tile_scheduler.tile_idx % TMEM_DEPTH
                     tmem_phase = tile_scheduler.tile_idx // TMEM_DEPTH & 1
                     tmem_pipe.empty.wait(tmem_idx, tmem_phase)
@@ -482,7 +482,7 @@ def _kernel(
                 d_m: T.let = m_idx * DG_BLOCK_M + (ot * 16 if SWAP_AB else 0)
                 d_n: T.let = n_idx * DG_BLOCK_N + (0 if SWAP_AB else ot * EPI_TILE)
                 if warp_id == 0:
-                    if T.ptx.elect_sync():
+                    if T.cuda.elect_sync():
                         Tx.copy_async(
                             D[d_m : d_m + D_TILE_M, d_n : d_n + D_TILE_N],
                             D_smem[stage],

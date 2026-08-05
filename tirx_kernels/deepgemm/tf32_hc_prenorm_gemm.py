@@ -508,7 +508,7 @@ def get_kernel(**kwargs: Any):
 
         if warp_idx < num_mma_warps:
             if warp_idx == 0:
-                if T.ptx.elect_sync():
+                if T.cuda.elect_sync():
                     # Loop-carried stage/phase counters (no per-iter div/mod on the uniform path).
                     tma_st: T.uint32 = T.uint32(0)
                     tma_ph: T.uint32 = T.uint32(1)
@@ -573,7 +573,7 @@ def get_kernel(**kwargs: Any):
                         # mirroring the hand's shuffle + IADD descriptor pattern.
                         smem_desc="local_hoist",
                     )
-                    if T.ptx.elect_sync():
+                    if T.cuda.elect_sync():
                         cast_pipe.empty.arrive(cast_stage_idx)
                         smem_pipe.empty.arrive(stage_idx)
                     mma_st = stage_idx + T.uint32(1)
@@ -582,7 +582,7 @@ def get_kernel(**kwargs: Any):
                     mma_cs = cast_stage_idx ^ T.uint32(1)
                     if mma_cs == T.uint32(0):
                         mma_ph = mma_ph ^ T.uint32(1)
-                if T.ptx.elect_sync():
+                if T.cuda.elect_sync():
                     tmem_pipe.arrive(0)
 
             tmem_pipe.wait(0, 0)
@@ -605,7 +605,7 @@ def get_kernel(**kwargs: Any):
             T.ptxd.fence.proxy.async_.shared__cta()
             T.ptxd.bar.sync(0, T.uint32(num_mma_threads))
             if warp_idx == 0:
-                if T.ptx.elect_sync():
+                if T.cuda.elect_sync():
                     # D store via TMA (writes only the valid region of boundary tiles).
                     m0: T.uint32 = m_block_idx * T.uint32(block_m)
                     if num_splits == 1:

@@ -513,7 +513,7 @@ def get_kernel(**kwargs: Any):
 
         if warp_idx == spec_warp_start:
             T.ptxd.setmaxnreg.dec.sync.aligned.u32(56)
-            if T.ptx.elect_sync():
+            if T.cuda.elect_sync():
                 # Ring cursors with subtract-wrap (DeepGEMM RingPipeline): avoids ptxas
                 # magic-number division for `% kNumStages` on these hot paths.
                 q_stage_idx: T.uint32 = T.uint32(0)
@@ -554,7 +554,7 @@ def get_kernel(**kwargs: Any):
             T.cuda.warp_sync()
         elif warp_idx == spec_warp_start + 1:
             T.ptxd.setmaxnreg.dec.sync.aligned.u32(56)
-            if T.ptx.elect_sync():
+            if T.cuda.elect_sync():
                 kv_stage_idx: T.uint32 = T.uint32(0)
                 kv_phase: T.uint32 = T.uint32(0)
                 q_idx: T.uint32 = sm_idx_u32
@@ -603,7 +603,7 @@ def get_kernel(**kwargs: Any):
             smem_kv_fp8 = smem_kv.view("float8_e4m3fn")
             # Whole MMA-warp loop in one elect scope: ring cursors stay elect-lane
             # locals on the uniform datapath (no R2UR per use).
-            if T.ptx.elect_sync():
+            if T.cuda.elect_sync():
                 q_stage_idx: T.uint32 = T.uint32(0)
                 q_phase: T.uint32 = T.uint32(0)
                 kv_stage_idx: T.uint32 = T.uint32(0)

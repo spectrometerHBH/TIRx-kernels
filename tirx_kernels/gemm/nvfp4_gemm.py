@@ -444,7 +444,7 @@ def _kernel(
                 **tile_copy,
             )
 
-        if T.ptx.elect_sync():
+        if T.cuda.elect_sync():
             while tile_scheduler.valid():
                 for k_tile in T.serial(K_TILES):
                     issue_tma_load(k_tile)
@@ -492,7 +492,7 @@ def _kernel(
                     **sfb_copy,
                 )
 
-        if T.ptx.elect_sync():
+        if T.cuda.elect_sync():
             while tile_scheduler.valid():
                 for k_tile in T.serial(K_TILES):
                     issue_scale_tma_load(k_tile)
@@ -520,7 +520,7 @@ def _kernel(
             accum = 1
             smem_pipe.empty.arrive(mma_smem.stage, cta_group=CTA_GROUP, cta_mask=pair_mask)
 
-        if T.ptx.elect_sync():
+        if T.cuda.elect_sync():
             while tile_scheduler.valid():
                 tmem_pipe.empty.wait(mma_tmem.stage, mma_tmem.phase)
                 accum = 0
@@ -615,7 +615,7 @@ def _kernel(
             T.ptxd.cp.async_.bulk.wait_group.read(0)
         T.cuda.warpgroup_sync(1)
     if warp_id == int(WarpRole.EPILOGUE):
-        if T.ptx.elect_sync():
+        if T.cuda.elect_sync():
             _rem3 = T.alloc_local([1], "uint64")
             T.ptxd.mapa.shared__cluster.u64(
                 _rem3[0], tmem_finished.ptr_to([0]), T.uint32(pair_leader_rank + 1 - id_in_pair)

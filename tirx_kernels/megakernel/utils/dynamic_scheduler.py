@@ -281,7 +281,7 @@ class DynamicTileScheduler(TileSchedulerBase):
         warp_id = T.warp_id([KernelConfig.WARP_NUMBER * KernelConfig.WG_NUMBER])
         # fetch from GEMM queue
         if warp_id == self.scheduler_warp:
-            if T.ptx.elect_sync():
+            if T.cuda.elect_sync():
                 self.c2p_dequeue_barrier.wait(0, self.dequeue_phase)
                 self._dequeue_and_store_packed()
                 self.p2c_dequeue_barrier.arrive()

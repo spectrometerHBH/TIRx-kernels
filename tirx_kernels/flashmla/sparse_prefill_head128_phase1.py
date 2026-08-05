@@ -346,7 +346,7 @@ def _kernel(
     # CUDA phase1.cuh:87-146.  Warp 0 owns barrier init, Q TMA launch,
     # and the cta_group::2 TMEM allocation.
     if warp_idx == 0:
-        if T.ptx.elect_sync():
+        if T.cuda.elect_sync():
             bar_prologue_q.init(1)
             bar_prologue_utccp.init(1)
             for init_stage in T.unroll(NUM_BUFS):
@@ -374,7 +374,7 @@ def _kernel(
 
     if warp_idx == 0:
         prologue_token = iket.range_start("h128-q-load")
-        if T.ptx.elect_sync():
+        if T.cuda.elect_sync():
             Tx.copy_async(
                 q_full[:, :],
                 q.chunk((None, 2, None))[s_q_idx, cta_idx, :],
@@ -595,14 +595,14 @@ def _kernel(
             T.ptxd.fence.proxy.async_.shared__cta()
             T.ptxd.bar.sync(T.uint32(BAR_WG0_SYNC), 128)
             if warp_idx == 0:
-                if T.ptx.elect_sync():
+                if T.cuda.elect_sync():
                     Tx.copy_async(
                         out.chunk((None, 2, D_V // B_EPI))[s_q_idx, cta_idx, epi_k],
                         o_smem.chunk((None, D_V // B_EPI))[:, epi_k],
                         **tma_config(),
                     )
             if warp_idx == 1:
-                if T.ptx.elect_sync():
+                if T.cuda.elect_sync():
                     epi_k2: T.let = epi_k + (D_V // B_EPI // 2)
                     Tx.copy_async(
                         out.chunk((None, 2, D_V // B_EPI))[s_q_idx, cta_idx, epi_k2],
@@ -619,7 +619,7 @@ def _kernel(
         k_gather_token = iket.range_start("h128-k-load")
         T.ptxd.setmaxnreg.dec.sync.aligned.u32(96)
         wg1_warp_idx: T.let = warp_idx - 4
-        if T.ptx.elect_sync():
+        if T.cuda.elect_sync():
             for k in T.serial(0, num_k_blocks, unroll=False):
                 indices_int4 = T.alloc_local((WG1_ROWS_PER_WARP, 4), "int32")
                 max_indices: T.int32 = -1
@@ -693,7 +693,7 @@ def _kernel(
         v_gather_token = iket.range_start("h128-v-load")
         T.ptxd.setmaxnreg.dec.sync.aligned.u32(96)
         wg2_warp_idx: T.let = warp_idx - 8
-        if T.ptx.elect_sync():
+        if T.cuda.elect_sync():
             bar_prologue_utccp.wait(0, 0)
             for k in T.serial(0, num_k_blocks, unroll=False):
                 cur_buf: T.let = k % NUM_BUFS
@@ -746,7 +746,7 @@ def _kernel(
         T.ptxd.setmaxnreg.inc.sync.aligned.u32(168)
         if (cta_idx == 0) & (warp_idx == 12):
             mma_token = iket.range_start("h128-qk-pv-issue")
-            if T.ptx.elect_sync():
+            if T.cuda.elect_sync():
                 bar_prologue_q.arrive(0, tx_count=B_H * d_qk * BF16_BYTES)
                 bar_prologue_q.wait(0, 0)
                 T.ptxd.tcgen05.fence__after_thread_sync()

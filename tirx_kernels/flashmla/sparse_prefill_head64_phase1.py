@@ -377,7 +377,7 @@ def _kernel(
     # launch, prologue barrier init, and TMEM allocation.
     if warp_idx == 0:
         prologue_token = iket.range_start("h64-q-load")
-        if T.ptx.elect_sync():
+        if T.cuda.elect_sync():
             bar_prologue_q_nope.init(1)
             bar_prologue_q_rope.init(1)
             T.ptxd.fence.mbarrier_init.release.cluster()
@@ -661,7 +661,7 @@ def _kernel(
                 T.ptxd.fence.proxy.async_.shared__cta()
                 T.ptxd.bar.sync(T.uint32(BAR_WG0_SYNC), 128)
                 if warp_idx == 0:
-                    if T.ptx.elect_sync():
+                    if T.cuda.elect_sync():
                         # CUDA phase1.cuh:335-342: first half O TMA store.
                         epi_chunk_idx: T.let = epi_c * (D_V // 2 // 64) + epi_k
                         Tx.copy_async(
@@ -670,7 +670,7 @@ def _kernel(
                             **tma_config(),
                         )
                 if warp_idx == 1:
-                    if T.ptx.elect_sync():
+                    if T.cuda.elect_sync():
                         # CUDA phase1.cuh:343-350: second half O TMA store.
                         epi_chunk_idx: T.let = epi_c * (D_V // 2 // 64) + (D_V // 64 // 4) + epi_k
                         Tx.copy_async(
@@ -691,7 +691,7 @@ def _kernel(
         # This warp's 16 interleaved NoPE rows: split the 64-row dim into
         # (stripe, warp, row) and pick this warp, merging stripe x row.
         k_nope_warp = k_nope.tile((1, (-1, WG1_NUM_WARPS, 4)))[:, wg1_warp_idx, :]
-        if T.ptx.elect_sync():
+        if T.cuda.elect_sync():
             for k in T.serial(0, num_k_blocks, unroll=False):
                 selected_idx = T.alloc_local((WG1_ROWS_PER_WARP, 4), "int32")
                 max_indices: T.int32 = -1
@@ -763,7 +763,7 @@ def _kernel(
         # source-ordered; materialize tcgen05.cp/gemm_async + cp.async paths later.
         if warp_idx == 8:
             mma_token = iket.range_start("h64-qk-pv-issue")
-            if T.ptx.elect_sync():
+            if T.cuda.elect_sync():
                 if have_rope:
                     bar_prologue_q_rope.arrive(0, tx_count=B_H * (d_qk - D_V) * BF16_BYTES)
                     bar_prologue_q_rope.wait(0, 0)

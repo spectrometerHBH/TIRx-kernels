@@ -673,7 +673,7 @@ def _kernel(
     # descriptors and intentionally does not prefetch src_selector
     # candidates, matching the source's normal-only KV prefetch.
     if warp_idx == 0:
-        if T.ptx.elect_sync() != T.uint32(0):
+        if T.cuda.elect_sync() != T.uint32(0):
             T.ptxd.mbarrier.init.shared.b64(bar_last_store_done.ptr_to([0]), T.uint32(128))
             T.ptxd.mbarrier.init.shared.b64(bar_q_tma.ptr_to([0]), T.uint32(1))
             T.ptxd.mbarrier.init.shared.b64(bar_q_utccp.ptr_to([0]), T.uint32(1))
@@ -991,7 +991,7 @@ def _kernel(
                         T.ptxd.fence.proxy.async_.shared__cta()
                         T.ptxd.bar.sync(T.uint32(BAR_WG0_SYNC), 128)
                         if warp_idx == 0:
-                            if T.ptx.elect_sync() != T.uint32(0):
+                            if T.cuda.elect_sync() != T.uint32(0):
                                 Tx.copy_async(
                                     out_strided[batch_idx, s_q_idx, :, col_base : col_base + 64],
                                     o_smem[:, col_base : col_base + 64],
@@ -1001,7 +1001,7 @@ def _kernel(
                                 )
                         warp1_col_base = T.meta_var(col_base + D_V // 4)
                         if warp_idx == 1:
-                            if T.ptx.elect_sync() != T.uint32(0):
+                            if T.cuda.elect_sync() != T.uint32(0):
                                 Tx.copy_async(
                                     out_strided[
                                         batch_idx, s_q_idx, :, warp1_col_base : warp1_col_base + 64
@@ -1053,7 +1053,7 @@ def _kernel(
                             )
                     T.ptxd.fence.proxy.async_.shared__cta()
                     T.ptxd.bar.sync(T.uint32(BAR_WG0_SYNC), 128)
-                    if T.ptx.elect_sync() != T.uint32(0):
+                    if T.cuda.elect_sync() != T.uint32(0):
                         for local_row in T.unroll(B_H // 4):
                             smem_row: T.let = local_row * 4 + warp_idx
                             T.ptxd["cp.async.bulk.global.shared::cta.bulk_group"](
@@ -1631,13 +1631,13 @@ def _kernel(
         # each producer warp.
         selected_wg1_role: T.int32 = -1
         if wg1_warp_idx == 4:
-            if T.ptx.elect_sync() != T.uint32(0):
+            if T.cuda.elect_sync() != T.uint32(0):
                 selected_wg1_role = 4
         elif wg1_warp_idx == 5:
-            if T.ptx.elect_sync() != T.uint32(0):
+            if T.cuda.elect_sync() != T.uint32(0):
                 selected_wg1_role = 5
         elif wg1_warp_idx == 6:
-            if T.ptx.elect_sync() != T.uint32(0):
+            if T.cuda.elect_sync() != T.uint32(0):
                 selected_wg1_role = 6
         elif wg1_warp_idx == 7:
             selected_wg1_role = 7

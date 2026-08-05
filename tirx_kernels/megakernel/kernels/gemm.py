@@ -395,7 +395,7 @@ class GemmTile(Tile):
                         )
 
                     self._preload_tma_gather4_A(m_idx, lane_id)
-                    if T.ptx.elect_sync():
+                    if T.cuda.elect_sync():
                         k_offset = k_idx * self.TILE_K
                         for ko in T.serial(self.PIPE_CIRCLE_NUM):
                             for ks in T.unroll(self.SMEM_PIPE_DEPTH):
@@ -434,7 +434,7 @@ class GemmTile(Tile):
                             }
                         )
                         self.mma2tma_bar.wait(ks, self.phase[0])
-                        if T.ptx.elect_sync():
+                        if T.cuda.elect_sync():
                             if self.enable_iket:
                                 iket.range_push(IketEvent.TMA)
                             if first_stage:
@@ -443,7 +443,7 @@ class GemmTile(Tile):
                             m_idx, ks, k_st, tid, lane_id, A, self.tma2mma_bar.mbar.ptr_to([ks])
                         )
                         T.cuda.warp_sync()
-                        if T.ptx.elect_sync():
+                        if T.cuda.elect_sync():
                             if not self.prefetch_on and first_stage:
                                 self.smem_manager.wait_specific_one_thread(self.B_smem, ks)
                             if self.prefetch_on:
@@ -485,7 +485,7 @@ class GemmTile(Tile):
                         for ks in T.unroll(self.PIPE_REMAIN_NUM, self.SMEM_PIPE_DEPTH):
                             self.mma2tma_bar.wait(ks, self.phase[0])
                             self.tma2mma_bar.arrive_only(ks)
-                            if T.ptx.elect_sync():
+                            if T.cuda.elect_sync():
                                 self.tma2mma_bar.arrive_only(ks)
                         self.phase[0] = self.phase[0] ^ 1
                 else:
@@ -536,7 +536,7 @@ class GemmTile(Tile):
                             * F16_BYTES,
                         )
 
-                    if T.ptx.elect_sync():
+                    if T.cuda.elect_sync():
                         k_offset = k_idx * self.TILE_K
                         for ko in T.serial(self.PIPE_CIRCLE_NUM):
                             for ks in T.unroll(self.SMEM_PIPE_DEPTH):
@@ -587,7 +587,7 @@ class GemmTile(Tile):
                         iket.range_pop()
                     self.mma2tma_bar.arrive(ks)
 
-                if T.ptx.elect_sync():
+                if T.cuda.elect_sync():
                     self.tmem_idx = self.tile_idx % self.TMEM_PIPE_DEPTH
                     self.tmem_phase = self.tile_idx // self.TMEM_PIPE_DEPTH & 1
                     self.ld2mma_bar.wait(self.tmem_idx, self.tmem_phase)
@@ -659,7 +659,7 @@ class GemmTile(Tile):
                     self.smem_manager.wait_specific(lane_id, self.B_smem, ks)
                     if self.enable_iket:
                         iket.range_push(IketEvent.TMA)
-                    if T.ptx.elect_sync():
+                    if T.cuda.elect_sync():
                         tma_config = T.meta_var(
                             {
                                 "dispatch": "tma_auto",

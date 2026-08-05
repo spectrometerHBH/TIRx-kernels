@@ -1139,7 +1139,7 @@ def get_kernel(**kwargs: Any):
 
         @T.inline
         def issue_tma_q(stage_idx, tma_q_atom_idx):
-            if T.ptx.elect_sync():
+            if T.cuda.elect_sync():
                 q_token_idx: T.uint32 = atom_to_token_idx_expr(tma_q_atom_idx)
                 tma_load_2d_q(
                     smem_q.ptr_to([stage_idx, 0, 0]),
@@ -1223,7 +1223,7 @@ def get_kernel(**kwargs: Any):
                     )
 
         if warp_idx_presync == tma_warp_0:
-            if T.ptx.elect_sync():
+            if T.cuda.elect_sync():
                 for init_i in T.unroll(0, num_q_stages):
                     mbarrier_init_cta(
                         smem_barriers.ptr_to([full_q_barrier_base + init_i]), T.uint32(1)
@@ -1234,7 +1234,7 @@ def get_kernel(**kwargs: Any):
                     )
                 T.ptxd.fence.mbarrier_init.release.cluster()
         if warp_idx_presync == tma_warp_1:
-            if T.ptx.elect_sync():
+            if T.cuda.elect_sync():
                 for init_i in T.unroll(0, num_kv_stages):
                     mbarrier_init_cta(
                         smem_barriers.ptr_to([full_kv_barrier_base + init_i]), T.uint32(1)
@@ -1244,7 +1244,7 @@ def get_kernel(**kwargs: Any):
                     )
                 T.ptxd.fence.mbarrier_init.release.cluster()
         if warp_idx_presync == umma_warp_0:
-            if T.ptx.elect_sync():
+            if T.cuda.elect_sync():
                 for init_i in T.unroll(0, num_kv_stages):
                     mbarrier_init_cta(
                         smem_barriers.ptr_to(
@@ -1260,7 +1260,7 @@ def get_kernel(**kwargs: Any):
                     )
                 T.ptxd.fence.mbarrier_init.release.cluster()
         if warp_idx_presync == umma_warp_0 + 1:
-            if T.ptx.elect_sync():
+            if T.cuda.elect_sync():
                 for init_i in T.unroll(0, num_tmem_barriers):
                     mbarrier_init_cta(
                         smem_barriers.ptr_to([full_tmem_barrier_base + init_i]), T.uint32(1)
@@ -1382,7 +1382,7 @@ def get_kernel(**kwargs: Any):
                     kv_phase ^ T.uint32(1),
                 )
 
-                if T.ptx.elect_sync():
+                if T.cuda.elect_sync():
                     for block_i in T.unroll(0, num_pages_per_tile):
                         tma_load_3d_kv(
                             smem_kv.ptr_to([0, kv_stage_idx, block_i * page_size, 0]),
@@ -1501,7 +1501,7 @@ def get_kernel(**kwargs: Any):
                     kv_phase ^ T.uint32(1),
                 )
 
-                if T.ptx.elect_sync():
+                if T.cuda.elect_sync():
                     for block_i in T.unroll(0, num_pages_per_tile):
                         tma_load_3d_kv(
                             smem_kv.ptr_to([1, kv_stage_idx, block_i * page_size, 0]),
@@ -1626,7 +1626,7 @@ def get_kernel(**kwargs: Any):
                         utccp_required_smem_warp_transpose(sfq_stage, sfq_base)
                         T.ptxd.fence.proxy.async_.shared__cta()
                         desc_sf = replace_smem_desc_addr(desc_sf, sfq_stage.ptr_to([sfq_base]))
-                        if T.ptx.elect_sync():
+                        if T.cuda.elect_sync():
                             T.ptxd["tcgen05.cp.cta_group::1.32x128b.warpx4"](
                                 T.cast(
                                     tmem_start_col_of_sfq
@@ -1672,7 +1672,7 @@ def get_kernel(**kwargs: Any):
                     sfkv_base = T.uint32(sfkv_i * num_utccp_aligned_elems)
                     utccp_required_smem_warp_transpose(sfkv_stage, sfkv_base)
                     T.ptxd.fence.proxy.async_.shared__cta()
-                if T.ptx.elect_sync():
+                if T.cuda.elect_sync():
                     for sfkv_i in T.unroll(0, num_sfkv // num_utccp_aligned_elems):
                         sfkv_base = T.uint32(sfkv_i * num_utccp_aligned_elems)
                         desc_sf = replace_smem_desc_addr(desc_sf, sfkv_stage.ptr_to([sfkv_base]))
@@ -1704,7 +1704,7 @@ def get_kernel(**kwargs: Any):
                     umma_n * num_tmem_stages
                 ) + tmem_stage_idx * T.uint32(umma_n)
                 T.static_assert(head_dim % umma_k == 0, "Invalid head dim")
-                if T.ptx.elect_sync():
+                if T.cuda.elect_sync():
                     for k in T.unroll(0, head_dim // umma_k):
                         runtime_desc_i = make_runtime_instr_desc_with_sf_id(desc_i, k * 2, k * 2)
                         make_smem_desc(
@@ -1721,7 +1721,7 @@ def get_kernel(**kwargs: Any):
                             tmem_start_col_of_sfkv + umma_group_idx * T.uint32(num_sfkv // 32),
                             tmem_start_col_of_sfq + umma_group_idx * T.uint32(num_sfq_atom // 32),
                         )
-                if T.ptx.elect_sync():
+                if T.cuda.elect_sync():
                     T.ptxd.tcgen05.commit.cta_group__1.mbarrier__arrive__one.shared__cluster.b64(
                         smem_barriers.ptr_to(
                             [

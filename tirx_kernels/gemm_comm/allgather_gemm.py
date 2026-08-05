@@ -796,7 +796,7 @@ def _build_kernel():
                     T.ptxd.setmaxnreg.dec.sync.aligned.u32(56)
                     if warp_id == 3:
                         # GMEM -> SMEM  (tma)
-                        if T.ptx.elect_sync():
+                        if T.cuda.elect_sync():
                             n_start = T.meta_var((n_idx * CTA_GROUP + cbx) * BLK_N)
 
                             @T.inline
@@ -827,7 +827,7 @@ def _build_kernel():
                             paritioned_loop(tma_load, skip, tma_load_epilogue)
 
                     elif warp_id < 2 and cbx == 0:
-                        if T.ptx.elect_sync():
+                        if T.cuda.elect_sync():
                             ld2mma.wait(0, warp_id, phase_tmem[0])
                             T.ptxd.tcgen05.fence__after_thread_sync()
 

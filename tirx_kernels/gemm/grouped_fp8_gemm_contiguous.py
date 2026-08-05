@@ -223,7 +223,7 @@ def _kernel(
     tid_in_wg = T.thread_id_in_wg([128])
     lane_id = T.lane_id([32])
     pool = T.SMEMPool()
-    barrier_leader = (wg_id == 0) & (warp_id == 1) & (T.ptx.elect_sync() != T.uint32(0))
+    barrier_leader = (wg_id == 0) & (warp_id == 1) & (T.cuda.elect_sync() != T.uint32(0))
     tmem_pool = T.TMEMPool(
         pool,
         total_cols=512,
@@ -367,7 +367,7 @@ def _kernel(
                     tma_load(k_tile)
                     tma_cur.advance()
 
-            if T.ptx.elect_sync():
+            if T.cuda.elect_sync():
                 while tile_scheduler.valid():
                     tma_iter()
                     tile_scheduler.next_tile()
@@ -441,7 +441,7 @@ def _kernel(
                             cta_group=CTA_GROUP,
                         )
 
-                mma_issue = T.ptx.elect_sync()
+                mma_issue = T.cuda.elect_sync()
                 if mma_issue:
                     if copy_sf:
                         Tx.copy_async(SFA_tmem[tmem_idx], SFA_smem_fp8[ks], cta_group=CTA_GROUP)
@@ -533,7 +533,7 @@ def _kernel(
                 d_m: T.let = m_idx * DG_BLOCK_M + (ot * 16 if SWAP_AB else 0)
                 d_n: T.let = n_idx * DG_BLOCK_N + (0 if SWAP_AB else ot * EPI_TILE)
                 if warp_id == 0:
-                    if T.ptx.elect_sync():
+                    if T.cuda.elect_sync():
                         for d_atom in T.unroll(D_TMA_ISSUES):
                             d_atom_n = T.meta_var(d_atom * D_TMA_TILE_N)
                             Tx.copy_async(

@@ -366,7 +366,7 @@ def _kernel(
                     )
                     tma_q_token = iket.range_start("issue-tma-q")
                     Q_smem_4d = Q_smem.view(SMEM_PIPE_DEPTH_Q, SEQ_Q_PER_TILE, GQA_RATIO, HEAD_DIM)
-                    if T.ptx.elect_sync():
+                    if T.cuda.elect_sync():
                         Tx.copy_async(
                             Q_smem_4d[i_q, :, :, :],
                             Q[
@@ -392,7 +392,7 @@ def _kernel(
                         }
                     )
                     tma_k_token = iket.range_start("issue-tma-k")
-                    if T.ptx.elect_sync():
+                    if T.cuda.elect_sync():
                         Tx.copy_async(
                             K_smem[kv_pipe.stage, :, :],
                             K[batch_idx, i_kv * BLK_N : (i_kv + 1) * BLK_N, kv_head_idx, :],
@@ -413,7 +413,7 @@ def _kernel(
                         }
                     )
                     tma_v_token = iket.range_start("issue-tma-v")
-                    if T.ptx.elect_sync():
+                    if T.cuda.elect_sync():
                         Tx.copy_async(
                             V_smem[kv_pipe.stage, :, :],
                             V[batch_idx, i_kv * BLK_N : (i_kv + 1) * BLK_N, kv_head_idx, :],
@@ -446,7 +446,7 @@ def _kernel(
                         corr_epi.full.wait(i_q, phase_tmem)
                     m_start_global = T.meta_var(m_start + i_q * SEQ_Q_PER_TILE)
                     O_smem_4d = O_smem.view(TMEM_PIPE_DEPTH, SEQ_Q_PER_TILE, GQA_RATIO, HEAD_DIM)
-                    if T.ptx.elect_sync():
+                    if T.cuda.elect_sync():
                         Tx.copy_async(
                             O[
                                 batch_idx,
@@ -480,7 +480,7 @@ def _kernel(
                         dispatch="tcgen05",
                         cta_group=CTA_GROUP,
                     )
-                    if T.ptx.elect_sync():
+                    if T.cuda.elect_sync():
                         s_ready.arrive(q_stage)
 
                 # PV gemm split point, regime-tuned: for causal, 64 cols
@@ -529,7 +529,7 @@ def _kernel(
                         kv_load.full.wait(kv_pipe.stage, kv_pipe.phase)
                     gemm_qk(i_q, kv_pipe.stage)
                     if i_q == 1:
-                        if T.ptx.elect_sync():
+                        if T.cuda.elect_sync():
                             kv_load.empty.arrive(kv_pipe.stage)
                 kv_pipe.advance()
                 mma_trip_count: T.int32
@@ -550,7 +550,7 @@ def _kernel(
                         p_o_rescale.wait(i_q, phase_tmem)
                         gemm_pv(i_q, stage_v, acc)
                         if i_q == 1:
-                            if T.ptx.elect_sync():
+                            if T.cuda.elect_sync():
                                 kv_load.empty.arrive(stage_v)
                         if i_q == 0:
                             kv_load.full.wait(stage_k, phase_k)
@@ -566,10 +566,10 @@ def _kernel(
                         # site never executes.
                         if EARLY_Q_RELEASE:
                             if i_kv == mma_trip_count - 2:
-                                if T.ptx.elect_sync():
+                                if T.cuda.elect_sync():
                                     q_load.empty.arrive(i_q)
                         if i_q == 1:
-                            if T.ptx.elect_sync():
+                            if T.cuda.elect_sync():
                                 kv_load.empty.arrive(stage_k)
                     acc = 1
                     kv_pipe.advance()
@@ -580,15 +580,15 @@ def _kernel(
                     p_o_rescale.wait(i_q, phase_tmem)
                     gemm_pv(i_q, kv_pipe.stage, acc)
                     if i_q == 1:
-                        if T.ptx.elect_sync():
+                        if T.cuda.elect_sync():
                             kv_load.empty.arrive(kv_pipe.stage)
-                    if T.ptx.elect_sync():
+                    if T.cuda.elect_sync():
                         o_ready.arrive(i_q)
                 kv_pipe.advance()
                 phase_tmem ^= 1
                 if not EARLY_Q_RELEASE:
                     for i_q in T.unroll(SMEM_PIPE_DEPTH_Q):
-                        if T.ptx.elect_sync():
+                        if T.cuda.elect_sync():
                             q_load.empty.arrive(i_q)
                 phase_q_load ^= 1
         elif wg_id < 2:

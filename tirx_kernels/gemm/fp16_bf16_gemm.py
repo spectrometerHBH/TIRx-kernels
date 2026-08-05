@@ -221,7 +221,7 @@ def _kernel(
                     tma_cur.advance()
 
             # CLC loader: load the current tile, then consume the schedule for the next.
-            if T.ptx.elect_sync():
+            if T.cuda.elect_sync():
                 while ld.valid():
                     m_idx = T.meta_var(ld.m_idx)
                     n_idx = T.meta_var(ld.n_idx)
@@ -277,7 +277,7 @@ def _kernel(
             # coords (it MMAs whatever the loader staged), so reset() not init().
             mm = clc_sched.worker("mma_sched")
             mm.reset()
-            if T.ptx.elect_sync():
+            if T.cuda.elect_sync():
                 while mm.valid():
                     mm.consume()
                     mma()

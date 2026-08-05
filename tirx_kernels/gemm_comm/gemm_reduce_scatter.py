@@ -804,7 +804,7 @@ def test_mma_ss_tma_2sm_persistent(
             if (NUM_CONSUMER <= wg_id) & (wg_id < NUM_CONSUMER + 1):
                 Tx.ptxd.setmaxnreg.dec.sync.aligned.u32(56)
                 if warp_id == 3:
-                    if Tx.filter(lane_id, Tx.ptx.elect_sync()):
+                    if Tx.filter(lane_id, Tx.cuda.elect_sync()):
                         for ko in Tx.serial(PIPE_CYCLE):
                             for ks in Tx.unroll(PIPELINE_DEPTH):
                                 stage = ko * PIPELINE_DEPTH + ks
@@ -878,7 +878,7 @@ def test_mma_ss_tma_2sm_persistent(
                                     smem_pipe.full.arrive(ks, remote=0)
                             phase = phase ^ 1
                 elif (warp_id < 2) & (cbx == 0):
-                    if Tx.filter(lane_id, Tx.ptx.elect_sync()):
+                    if Tx.filter(lane_id, Tx.cuda.elect_sync()):
                         tmem_pipe.empty.wait(warp_id, phase_tmem)
                         Tx.ptxd.tcgen05.fence__after_thread_sync()
                         for ko in Tx.serial(PIPE_CYCLE):
