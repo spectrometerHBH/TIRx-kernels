@@ -18,7 +18,9 @@
 
 from __future__ import annotations
 
+import argparse
 import math
+from functools import partial
 from unittest import SkipTest
 
 import numpy as np
@@ -35,11 +37,12 @@ from tirx_kernels.megakernel.kernels import (
 )
 from tirx_kernels.megakernel.utils import dynamic_scheduler, static_scheduler
 from tirx_kernels.megakernel.utils.base import MegaKernelWrapper
+from tirx_kernels.megakernel.utils.config import IKET_EVENT_NAMES as _IKET_EVENT_NAMES
 from tirx_kernels.megakernel.utils.config import (
     MEGAKERNEL_MOE_BENCH_CONFIG,
+    IketEvent,
     JobType,
     KernelConfig,
-    ProfileEventType,
 )
 from tirx_kernels.megakernel.utils.dynamic_scheduler import DynamicTileScheduler
 from tirx_kernels.megakernel.utils.static_scheduler import StaticTileScheduler
@@ -50,6 +53,7 @@ from tirx_kernels.megakernel.utils.support import (
 )
 from tirx_kernels.megakernel.utils.utils import ceildiv, f_init_const, get_source
 from tvm.script import tirx as Tx
+from tvm.tirx.cuda import iket
 
 # TODO: fix abnormal slowness of batch-attn on the first tile
 
@@ -60,6 +64,8 @@ _STATIC_QUEUE_SCHEDULERS = ("static", "unfused")
 _TEST_BATCH_SIZES = (1, 128)
 _BENCH_BATCH_SIZES = (1, 8, 32, 128, 512, 1024, 2048, 4096)
 _BENCH_LAUNCH_SLOT_HEADROOM = 1.25
+
+IKET_EVENT_NAMES = _IKET_EVENT_NAMES
 
 CONFIGS = [
     {
@@ -84,8 +90,8 @@ class MegaKernelMOE(MegaKernelWrapper):
     MOE_M_PAD_SIZE = 128
     GATING_BLK_M = 128
 
-    def __init__(self, config, world_size, profiler_on):
-        super().__init__(config, 1, profiler_on)
+    def __init__(self, config, world_size, *, enable_iket=False):
+        super().__init__(config, 1, enable_iket=enable_iket)
         self.world_size = world_size
         self.HIDDEN_SIZE = config.get("HIDDEN_SIZE", None)
         self.INTERMEDIATE_SIZE = config.get("INTERMEDIATE_SIZE", None)
@@ -105,22 +111,22 @@ class MegaKernelMOE(MegaKernelWrapper):
                 self.GATING_BLK_M,
                 use_tma_reduce=True,
             ),
-            ProfileEventType.MOE_GATING,
+            IketEvent.MOE_GATING,
         )
         self.topk_softmax = self._add_tile(
             TopkSoftmaxTile(
                 self.NUM_EXPERTS, batch_size, self.NUM_EXPERTS_PER_TOK, dtype="float32"
             ),
-            ProfileEventType.TOPK_SOFTMAX,
+            IketEvent.TOPK_SOFTMAX,
         )
         numel = self.NUM_EXPERTS_PER_TOK * batch_size
         self.align = self._add_tile(
             MOEAlignTile(self.NUM_EXPERTS, numel, self.MOE_M_PAD_SIZE, pad_sorted_token_ids=True),
-            ProfileEventType.MOE_ALIGN,
+            IketEvent.MOE_ALIGN,
         )
         self.count_and_sort_expert_tokens = self._add_tile(
             CountAndSortExpertTokens(numel, self.HIDDEN_SIZE, self.NUM_EXPERTS_PER_TOK),
-            ProfileEventType.COUNT_AND_SORT,
+            IketEvent.COUNT_AND_SORT,
         )
         self.group_gemm_gate_up_silu = self._add_tile(
             GroupGEMMSiluTile(
@@ -133,7 +139,7 @@ class MegaKernelMOE(MegaKernelWrapper):
                 "float16",
                 low_batch=low_batch,
             ),
-            ProfileEventType.GROUP_GEMM_GATE_UP_SILU,
+            IketEvent.GROUP_GEMM_GATE_UP_SILU,
         )
         self.group_gemm_down = self._add_tile(
             GroupGEMMTileSM100(
@@ -147,7 +153,7 @@ class MegaKernelMOE(MegaKernelWrapper):
                 acc_output=True,
                 low_batch=low_batch,
             ),
-            ProfileEventType.GROUP_GEMM_DOWN,
+            IketEvent.GROUP_GEMM_DOWN,
         )
 
     def set_tiles(self, batch_size, low_batch):
@@ -236,8 +242,8 @@ class MegaKernelMOE(MegaKernelWrapper):
         self.set_events_complete(is_dynamic_sch, Semaphore, etensor_workspace_global)
         self.num_etensors[is_dynamic_sch] = len(self.etensor_and_f_init_pairs)
 
-    def _add_tile(self, tile, profiler_event_type, predicate=True):
-        self.tile_attr[tile] = (profiler_event_type, predicate)
+    def _add_tile(self, tile, iket_event_name, predicate=True):
+        self.tile_attr[tile] = (iket_event_name, predicate)
         subclass = GroupGEMMTileSM100 if isinstance(tile, GemmTile) else tile.__class__
         self.class_list.add(subclass)
         return tile
@@ -269,7 +275,7 @@ class MegaKernelMOE(MegaKernelWrapper):
             A,
             B,
             output,
-            self.profiler,
+            self.iket,
         )
         self.tile_scheduler.notify(
             self.evt_gating, lambda notify_idx: (1, -1, 0), scope="warpgroup", scope_id=0
@@ -454,7 +460,7 @@ class MegaKernelMOE(MegaKernelWrapper):
                 topk_weights_flattened,
                 sorted_token_ids_global,
                 num_valid_tokens_global,
-                self.profiler,
+                self.iket,
             )
         idx = Tx.meta_var(self.tile_scheduler.m_idx if not unfused else 0)
         self.tile_scheduler.notify(
@@ -508,7 +514,7 @@ class MegaKernelMOE(MegaKernelWrapper):
                     topk_weights_flattened,
                     sorted_token_ids_global,
                     num_valid_tokens_global,
-                    self.profiler,
+                    self.iket,
                 )
 
     # fmt: off
@@ -535,7 +541,6 @@ class MegaKernelMOE(MegaKernelWrapper):
         silu_mul_output_global,
         topk_reduce_output_global,
         etensor_workspace_global,
-        profiler_buffer,
         exec_queue,
         exec_task,
         exec_head,
@@ -560,7 +565,6 @@ class MegaKernelMOE(MegaKernelWrapper):
         lane_id = Tx.lane_id([32])
         Tx.alloc_buffer([1], "uint32", scope="local", align=8)
         Tx.alloc_buffer([1], "uint64", scope="local", align=8)
-        self.init_profiler(profiler_buffer)
         buf = Tx.alloc_buffer([KernelConfig.MAX_SMEM_SIZE], "uint8", scope="shared.dyn")
         Tx.attr({"tirx.dyn_smem_bytes": KernelConfig.MAX_SMEM_SIZE})
         # initialize smem manager
@@ -583,7 +587,7 @@ class MegaKernelMOE(MegaKernelWrapper):
         if not is_dynamic_sch:
             self.init_tile_scheduler(False, Scheduler, "moe", exec_queue, self.smem_manager)
         else:
-            self.init_tile_scheduler(True, Scheduler, exec_task, exec_head, exec_tail, self.smem_manager, self.profiler)
+            self.init_tile_scheduler(True, Scheduler, exec_task, exec_head, exec_tail, self.smem_manager, self.iket)
         self.smem_manager.init()
 
         topk_ids_flattened = topk_indices_global.view(-1)
@@ -609,8 +613,6 @@ class MegaKernelMOE(MegaKernelWrapper):
                 Tx.cuda.trap_when_assert_failed(False)
             self.smem_manager.exit_tile_runtime()
             self.tile_scheduler.next_tile()
-        if self.profiler_on:
-            self.profiler.finalize(lane_id == 0)
         self.class_finalize_all()
 
     # fmt: on
@@ -653,7 +655,6 @@ class MegaKernelMOE(MegaKernelWrapper):
 
             # execution queue
             exec_queue_ptr: Tx.handle,
-            profiler_buffer: Tx.Buffer((self.PROFILER_BUFFER_SIZE,), "uint64")
         ):
             Tx.func_attr(
                 {"global_symbol": "main", "target": Tx.target("cuda")}
@@ -702,7 +703,7 @@ class MegaKernelMOE(MegaKernelWrapper):
                     gating_output_global, topk_weights_global, topk_indices_global, sorted_token_ids_global, expert_ids_global, num_valid_tokens, num_tokens_post_pad_global,
                     cumsum_buffer_global, reordered_hidden_state_global, gate_up_output_global, silu_mul_output_global, topk_reduce_output_global,
                     etensor_workspace_global,
-                    profiler_buffer, exec_queue, None, None, None, 1, low_batch, unfused,
+                    exec_queue, None, None, None, 1, low_batch, unfused,
                     False, static_scheduler.Semaphore, static_scheduler.StaticTileScheduler
                 )
 
@@ -753,7 +754,6 @@ class MegaKernelMOE(MegaKernelWrapper):
             queue_tasks_ptr: Tx.handle,
             queue_head_ptr: Tx.handle,
             queue_tail_ptr: Tx.handle,
-            profiler_buffer: Tx.Buffer((self.PROFILER_BUFFER_SIZE,), "uint64")
         ):
             Tx.func_attr(
                 {"global_symbol": "main", "target": Tx.target("cuda")}
@@ -804,7 +804,7 @@ class MegaKernelMOE(MegaKernelWrapper):
                     gating_output_global, topk_weights_global, topk_indices_global, sorted_token_ids_global, expert_ids_global, num_valid_tokens, num_tokens_post_pad_global,
                     cumsum_buffer_global, reordered_hidden_state_global, gate_up_output_global, silu_mul_output_global, topk_reduce_output_global,
                     etensor_workspace_global,
-                    profiler_buffer, None, queue_tasks_global, queue_head_global, queue_tail_global, down_proj_task_size, low_batch, False,
+                    None, queue_tasks_global, queue_head_global, queue_tail_global, down_proj_task_size, low_batch, False,
                     True, dynamic_scheduler.Semaphore, dynamic_scheduler.DynamicTileScheduler
                 )
 
@@ -937,21 +937,19 @@ def _check_scheduler(scheduler: str):
 
 
 def _compile_moe_schedulers(
-    schedulers: tuple[str, ...], batch_size: int, world_size: int, profiler_on: bool
+    schedulers: tuple[str, ...], batch_size: int, world_size: int
 ) -> tuple[MegaKernelMOE, dict[str, tvm.runtime.Module]]:
     if world_size != 1:
         raise SkipTest("tirx-kernels MegaKernelMOE benchmark currently supports world_size=1")
     for scheduler in schedulers:
         _check_scheduler(scheduler)
 
-    key = (schedulers, batch_size, world_size, profiler_on)
+    key = (schedulers, batch_size, world_size)
     cached = _COMPILE_CACHE.get(key)
     if cached is not None:
         return cached
 
-    mk = MegaKernelMOE(
-        config=MEGAKERNEL_MOE_BENCH_CONFIG, world_size=world_size, profiler_on=profiler_on
-    )
+    mk = MegaKernelMOE(config=MEGAKERNEL_MOE_BENCH_CONFIG, world_size=world_size)
     mk._compile_batch_size = batch_size
     libs = {}
     for scheduler in schedulers:
@@ -1008,9 +1006,6 @@ def _make_tir_case(
         "etensor_workspace": tvm.runtime.tensor(
             np.zeros([mk.ETENSOR_WORKSPACE_SIZE], dtype=np.int32), dev
         ),
-        "profiler_buffer": tvm.runtime.tensor(
-            np.zeros([mk.PROFILER_BUFFER_SIZE], dtype=np.uint64), dev
-        ),
         "residual": [],
         "gating_output": [],
         "topk_reduce_output": [],
@@ -1034,7 +1029,6 @@ def _make_tir_case(
         "gate_up_output",
         "silu_mul_output",
         "etensor_workspace",
-        "profiler_buffer",
     ):
         case["graph_reset"].setdefault("zero", []).append(torch.from_dlpack(case[name]))
 
@@ -1099,7 +1093,6 @@ def _make_tir_case(
         case["gate_up_output"],
         case["silu_mul_output"],
         case["etensor_workspace"],
-        case["profiler_buffer"],
         case["residual"][0],
         case["gating_output"][0],
         case["topk_reduce_output"][0],
@@ -1163,7 +1156,6 @@ def _run_tir_case(case):
             case["topk_reduce_output"][idx],
             case["etensor_workspace"],
             case["exec_queue"],
-            case["profiler_buffer"],
         )
     else:
         kernel(
@@ -1189,7 +1181,6 @@ def _run_tir_case(case):
             case["queue_tasks"][idx],
             case["queue_head"][idx],
             case["queue_tail"][idx],
-            case["profiler_buffer"],
         )
     case["cursor"] += 1
     case["last_output"] = case["topk_reduce_output"][idx]
@@ -1396,14 +1387,12 @@ def _validate_tir_matches_reference(case, reference_output):
     }
 
 
-def run_test(
-    batch_size: int, scheduler: str | None = None, world_size: int = 1, profiler_on: bool = False
-):
+def run_test(batch_size: int, scheduler: str | None = None, world_size: int = 1):
     _require_cuda_sm100()
     schedulers = (scheduler,) if scheduler is not None else _SUPPORTED_SCHEDULERS
     for scheduler_name in schedulers:
         _check_scheduler(scheduler_name)
-    mk, libs = _compile_moe_schedulers(tuple(schedulers), batch_size, world_size, profiler_on)
+    mk, libs = _compile_moe_schedulers(tuple(schedulers), batch_size, world_size)
 
     _reset_prepare_data_cache()
     data = dict(prepare_data(batch_size, mk))
@@ -1472,7 +1461,6 @@ def run_bench(
     batch_size: int,
     scheduler: str | None = None,
     world_size: int = 1,
-    profiler_on: bool = False,
     warmup: int | None = None,
     repeat: int | None = None,
     timer: str | None = None,
@@ -1486,7 +1474,7 @@ def run_bench(
     schedulers = (scheduler,) if scheduler is not None else _SUPPORTED_SCHEDULERS
     for scheduler_name in schedulers:
         _check_scheduler(scheduler_name)
-    mk, libs = _compile_moe_schedulers(tuple(schedulers), batch_size, world_size, profiler_on)
+    mk, libs = _compile_moe_schedulers(tuple(schedulers), batch_size, world_size)
 
     _reset_prepare_data_cache()
     data = dict(prepare_data(batch_size, mk))
@@ -1620,3 +1608,80 @@ def run_bench(
     if validation:
         result["metadata"]["validation"] = validation
     return result
+
+
+def _parse_iket_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Profile MegaKernelMOE with NVIDIA IKET")
+    parser.add_argument("--scheduler", choices=_SUPPORTED_SCHEDULERS, default="dynamic")
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="Number of traced MegaKernelMOE launches; setup and compilation stay outside the loop",
+    )
+    parser.add_argument("--output-dir", default="/tmp/megakernel-moe-iket")
+    parser.add_argument(
+        "--postprocess", choices=("perfetto", "json", "html", "none", "all"), default="all"
+    )
+    parser.add_argument("--clobber", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--timeout", type=float, default=600.0)
+    parser.add_argument("--keep", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--max-ts-cnt-per-warp", type=int, default=None)
+    return parser.parse_args()
+
+
+def _profile_iket_workload(args: argparse.Namespace) -> None:
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be positive")
+    if args.repeat <= 0:
+        raise ValueError("--repeat must be positive")
+    _check_scheduler(args.scheduler)
+    _require_cuda_sm100()
+
+    mk = MegaKernelMOE(config=MEGAKERNEL_MOE_BENCH_CONFIG, world_size=1, enable_iket=True)
+    mk._compile_batch_size = args.batch_size
+    executable = iket.IketProfiler().compile(
+        mk.get_module(args.scheduler),
+        target=tvm.target.Target({"kind": "cuda", "arch": "sm_100a"}),
+        tir_pipeline="tirx",
+    )
+
+    _reset_prepare_data_cache()
+    data = dict(prepare_data(args.batch_size, mk))
+    case = _make_tir_case(
+        batch_size=args.batch_size,
+        mk=mk,
+        lib=executable,
+        scheduler=args.scheduler,
+        data=data,
+        launch_slots=args.repeat,
+    )
+    for _ in range(args.repeat):
+        _run_tir_case(case)
+    torch.cuda.synchronize()
+
+
+def _print_iket_result(result: iket.IketProfileResult) -> None:
+    print(f"IKET output directory: {result.output_dir}")
+    for path in (*result.json_traces, *result.perfetto_traces, *result.html_reports):
+        print(f"IKET artifact: {path}")
+
+
+def main() -> None:
+    """Profile MegaKernelMOE when this module is executed directly."""
+    args = _parse_iket_args()
+    result = iket.run(
+        partial(_profile_iket_workload, args),
+        output_dir=args.output_dir,
+        postprocess=args.postprocess,
+        clobber=args.clobber,
+        timeout=args.timeout,
+        keep=args.keep,
+        max_ts_cnt_per_warp=args.max_ts_cnt_per_warp,
+    )
+    _print_iket_result(result)
+
+
+if __name__ == "__main__":
+    main()

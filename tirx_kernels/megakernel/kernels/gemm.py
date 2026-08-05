@@ -18,17 +18,12 @@ from typing import Literal
 
 import tvm
 from tirx_kernels.megakernel.utils.base import Barriers, SmemManager, Tile
-from tirx_kernels.megakernel.utils.config import (
-    F16_BYTES,
-    F32_BYTES,
-    KernelConfig,
-    ProfileEventType,
-)
+from tirx_kernels.megakernel.utils.config import F16_BYTES, F32_BYTES, IketEvent, KernelConfig
 from tirx_kernels.megakernel.utils.utils import ceildiv, mbarrier_try_wait
 from tvm.backend.cuda.tile_primitive.tma_utils import SwizzleMode, mma_shared_layout
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
-from tvm.tirx.bench import CudaProfiler
+from tvm.tirx.cuda.iket import IketProfiler
 from tvm.tirx.layout import S, TCol, TileLayout, TLane
 from tvm.tirx.layout import tid_in_wg as axis_tid_in_wg
 
@@ -94,7 +89,7 @@ class GemmTile(Tile):
         use_tma_reduce=False,
         low_batch=True,
         prefetch_on=False,
-        profiler_on=False,
+        enable_iket=False,
     ):
         super().__init__()
         self.BLK_M = BLK_M
@@ -114,7 +109,7 @@ class GemmTile(Tile):
         self.use_tma_reduce = use_tma_reduce
         self.low_batch = low_batch
         self.prefetch_on = prefetch_on
-        self.profiler_on = profiler_on
+        self.enable_iket = enable_iket
         self.use_cp_async_input = False
         self.use_tma_gather4 = False
         self.TILE_K = ceildiv(ceildiv(self.K, self.split_k_factor), self.BLK_K) * self.BLK_K
@@ -246,7 +241,7 @@ class GemmTile(Tile):
                 T.cuda.trap_when_assert_failed(False)
 
     @T.inline
-    def _consumer_wg(self, m_idx, n_idx, k_idx, A, B, output, profiler: CudaProfiler):
+    def _consumer_wg(self, m_idx, n_idx, k_idx, A, B, output, iket: IketProfiler):
         tid_in_wg = T.thread_id_in_wg([128])
         warp_id = T.warp_id_in_wg([KernelConfig.WARP_NUMBER])
         lane_id = T.lane_id([32])
@@ -332,7 +327,7 @@ class GemmTile(Tile):
             self.smem_manager.arrive_specific(lane_id, self.output_smem, 0)
 
     @T.inline
-    def _run(self, m_idx, n_idx, k_idx, A, B, output, profiler: CudaProfiler = None):
+    def _run(self, m_idx, n_idx, k_idx, A, B, output, iket: IketProfiler = None):
         wg_id = T.warpgroup_id([KernelConfig.WG_NUMBER])
         T.warpgroup_id([KernelConfig.WG_NUMBER])
         warp_id = T.warp_id_in_wg([KernelConfig.WARP_NUMBER])
@@ -361,8 +356,8 @@ class GemmTile(Tile):
                                 "cache_hint": "evict_last" if self.low_batch else "",
                             }
                         )
-                        if self.profiler_on:
-                            profiler.start(ProfileEventType.TMA, lane_id == 0)
+                        if self.enable_iket:
+                            iket.range_push(IketEvent.TMA)
                         if first_stage:
                             self.smem_manager.wait_specific_one_thread(self.A_smem, ks)
                         self._tma_gather4_A(ks, A, m_idx, k_st, A_tma_config, tid, lane_id)
@@ -377,8 +372,8 @@ class GemmTile(Tile):
                             B_tma_config,
                             predicate=tvm.tirx.Not(self.prefetch_on and first_stage),
                         )
-                        if self.profiler_on:
-                            profiler.end(ProfileEventType.TMA, lane_id == 0)
+                        if self.enable_iket:
+                            iket.range_pop()
                         self.tma2mma_bar.arrive(
                             ks,
                             KernelConfig.CTA_GROUP
@@ -428,8 +423,8 @@ class GemmTile(Tile):
                         )
                         self.mma2tma_bar.wait(ks, self.phase[0])
                         if T.ptx.elect_sync():
-                            if self.profiler_on:
-                                profiler.start(ProfileEventType.TMA, lane_id == 0)
+                            if self.enable_iket:
+                                iket.range_push(IketEvent.TMA)
                             if first_stage:
                                 self.smem_manager.wait_specific_one_thread(self.A_smem, ks)
                         self._cp_async_load_A_tile(
@@ -454,8 +449,8 @@ class GemmTile(Tile):
                                 B_tma_config,
                                 predicate=tvm.tirx.Not(self.prefetch_on and first_stage),
                             )
-                            if self.profiler_on:
-                                profiler.end(ProfileEventType.TMA, lane_id == 0)
+                            if self.enable_iket:
+                                iket.range_pop()
                         T.cuda.warp_sync()
 
                     k_offset = k_idx * self.TILE_K
@@ -503,8 +498,8 @@ class GemmTile(Tile):
                                 "oob": "zero",
                             }
                         )
-                        if self.profiler_on:
-                            profiler.start(ProfileEventType.TMA, lane_id == 0)
+                        if self.enable_iket:
+                            iket.range_push(IketEvent.TMA)
                         if first_stage:
                             self.smem_manager.wait_specific_one_thread(self.A_smem, ks)
                         self._tma(ks, A, "A", m_idx * self.M_pad_size, k_st, A_tma_config)
@@ -519,8 +514,8 @@ class GemmTile(Tile):
                             B_tma_config,
                             predicate=tvm.tirx.Not(self.prefetch_on and first_stage),
                         )
-                        if self.profiler_on:
-                            profiler.end(ProfileEventType.TMA, lane_id == 0)
+                        if self.enable_iket:
+                            iket.range_pop()
                         self.tma2mma_bar.arrive(
                             ks,
                             KernelConfig.CTA_GROUP
@@ -562,8 +557,8 @@ class GemmTile(Tile):
 
                 @T.inline
                 def mma_stage(ks, acc):
-                    if self.profiler_on:
-                        profiler.start(ProfileEventType.MMA, lane_id == 0)
+                    if self.enable_iket:
+                        iket.range_push(IketEvent.MMA)
                     Tx.gemm_async(
                         self.tmem[
                             :,
@@ -576,8 +571,8 @@ class GemmTile(Tile):
                         dispatch="tcgen05",
                         cta_group=KernelConfig.CTA_GROUP,
                     )
-                    if self.profiler_on:
-                        profiler.end(ProfileEventType.MMA, lane_id == 0)
+                    if self.enable_iket:
+                        iket.range_pop()
                     self.mma2tma_bar.arrive(ks)
 
                 if T.ptx.elect_sync():
@@ -636,10 +631,10 @@ class GemmTile(Tile):
                     self.smem_manager.arrive_specific(lane_id, self.B_smem, ks)
                     self.smem_manager.arrive_specific(lane_id, self.A_smem, ks)
         if wg_id == 0:
-            self._consumer_wg(m_idx, n_idx, k_idx, A, B, output, profiler)
+            self._consumer_wg(m_idx, n_idx, k_idx, A, B, output, iket)
 
     @T.inline
-    def prefetch(self, m_idx, n_idx, k_idx, A, B, output, profiler: CudaProfiler):
+    def prefetch(self, m_idx, n_idx, k_idx, A, B, output, iket: IketProfiler = None):
         self._alloc_local(m_idx)
         wg_id = T.warpgroup_id([KernelConfig.WG_NUMBER])
         warp_id = T.warp_id_in_wg([KernelConfig.WARP_NUMBER])
@@ -650,8 +645,8 @@ class GemmTile(Tile):
                 for ks in T.unroll(self.SMEM_PIPE_DEPTH):
                     self.stage = ks
                     self.smem_manager.wait_specific(lane_id, self.B_smem, ks)
-                    if self.profiler_on:
-                        profiler.start(ProfileEventType.TMA, lane_id == 0)
+                    if self.enable_iket:
+                        iket.range_push(IketEvent.TMA)
                     if T.ptx.elect_sync():
                         tma_config = T.meta_var(
                             {
@@ -669,13 +664,13 @@ class GemmTile(Tile):
                             self.stage * self.BLK_K + k_offset,
                             tma_config,
                         )
-                    if self.profiler_on:
-                        profiler.end(ProfileEventType.TMA, lane_id == 0)
+                    if self.enable_iket:
+                        iket.range_pop()
 
     @T.inline
-    def run(self, m_idx, n_idx, k_idx, A, B, output, profiler: CudaProfiler = None):
+    def run(self, m_idx, n_idx, k_idx, A, B, output, iket: IketProfiler = None):
         self._alloc_local(m_idx)
-        self._run(m_idx, n_idx, k_idx, A, B, output, profiler)
+        self._run(m_idx, n_idx, k_idx, A, B, output, iket)
         self.smem_manager.advance()
 
     def _cp_async_load_A_tile(self, m_idx, ks, stage_k, tid, lane_id, A, mbar):

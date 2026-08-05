@@ -15,11 +15,11 @@
 # specific language governing permissions and limitations
 # under the License.
 from tirx_kernels.megakernel.utils.base import SmemManager
-from tirx_kernels.megakernel.utils.config import KernelConfig, ProfileEventType
+from tirx_kernels.megakernel.utils.config import IketEvent, KernelConfig
 from tirx_kernels.megakernel.utils.utils import silu
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
-from tvm.tirx.bench import CudaProfiler
+from tvm.tirx.cuda.iket import IketProfiler
 from tvm.tirx.layout import S, TileLayout
 from tvm.tirx.layout import tid_in_wg as axis_tid_in_wg
 
@@ -78,7 +78,7 @@ class GateUpSiluTile(GemmTile):
         self._alloc_buffer(smem_manager)
 
     @T.inline
-    def _consumer_wg(self, m_idx, n_idx, k_idx, A, B, output, profiler: CudaProfiler):
+    def _consumer_wg(self, m_idx, n_idx, k_idx, A, B, output, iket: IketProfiler):
         tid_in_wg = T.thread_id_in_wg([128])
         warp_id = T.warp_id_in_wg([KernelConfig.WARP_NUMBER])
         lane_id = T.lane_id([32])
@@ -111,8 +111,8 @@ class GateUpSiluTile(GemmTile):
                 )
                 Tx.wg.copy_async(reg_wg, self.tmem[:, col_st : col_st + self.TMEM_LD_SIZE])
                 T.ptx.tcgen05.wait.ld()
-                if self.profiler_on:
-                    profiler.start(ProfileEventType.SILU_MUL, lane_id == 0)
+                if self.enable_iket:
+                    iket.range_push(IketEvent.SILU_MUL)
                 for kv in T.unroll(SILU_HANDLE_UNIT):
                     reg[self.off + kv] = T.tvm_warp_shuffle_xor(
                         4294967295, reg[self.off + kv], 16, 32, 32
@@ -128,8 +128,8 @@ class GateUpSiluTile(GemmTile):
                     self.reg_fp16[:],
                     vec=SILU_HANDLE_UNIT,
                 )
-                if self.profiler_on:
-                    profiler.end(ProfileEventType.SILU_MUL, lane_id == 0)
+                if self.enable_iket:
+                    iket.range_pop()
             if ko == self.MMA_M // self.EPI_TILE - 1:
                 T.ptx.tcgen05.fence.before_thread_sync()
                 self.ld2mma_bar.arrive(self.tmem_idx)

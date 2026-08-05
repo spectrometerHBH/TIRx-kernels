@@ -77,6 +77,28 @@ The two config files independently select gate/up and down-projection settings,
 including the down TMA decision.  Set `SGLANG_MOE_CONFIG_DIR` to override the
 packaged configs with a retuned directory for another GPU or Triton version.
 
+## NVIDIA IKET Profiling
+
+The normal correctness and benchmark paths contain no profiling buffer or
+profiling instructions.  To build the IKET-only kernel variant and capture one
+scheduler, run the module directly:
+
+```bash
+python -m tirx_kernels.megakernel.moe \
+  --scheduler dynamic \
+  --batch-size 1 \
+  --repeat 1 \
+  --output-dir /tmp/megakernel-moe-iket
+```
+
+`--scheduler` accepts `static`, `dynamic`, or `unfused` and defaults to
+`dynamic`.  The entry point uses `tvm.tirx.cuda.iket.run`, so NVIDIA's official
+`run-iket` executable and the dependency versions locked by the paired TVM
+checkout are required.  The current profile is `cutlass-4.6.0` with NVRTC
+13.2.78 (runtime API 13.2).  A dependency mismatch is reported as an error;
+the command does not fall back to CUDA timer profiling.  Use the standard
+`tirx_kernels.bench` command for Proton or CUDA-event latency measurements.
+
 ## Forward Pipeline
 
 The logical computation is:

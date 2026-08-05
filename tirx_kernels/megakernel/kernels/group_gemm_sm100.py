@@ -20,7 +20,7 @@ from tirx_kernels.megakernel.utils.base import SmemManager
 from tirx_kernels.megakernel.utils.config import F16_BYTES, F32_BYTES, KernelConfig
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
-from tvm.tirx.bench import CudaProfiler
+from tvm.tirx.cuda.iket import IketProfiler
 from tvm.tirx.layout import S, TileLayout
 from tvm.tirx.layout import tid_in_wg as axis_tid_in_wg
 
@@ -75,7 +75,7 @@ class GroupGEMMTile(GemmTile):
         low_batch=True,
         acc_output=False,
         prefetch_on=False,
-        profiler_on=False,
+        enable_iket=False,
         use_cp_async_input=False,
         use_tma_gather4=False,
     ):
@@ -90,7 +90,7 @@ class GroupGEMMTile(GemmTile):
             out_type="float16" if not acc_output else "float32",
             low_batch=low_batch,
             prefetch_on=prefetch_on,
-            profiler_on=profiler_on,
+            enable_iket=enable_iket,
         )
         self.num_experts = num_experts
         self.top_k = top_k
@@ -236,9 +236,9 @@ class GroupGEMMTile(GemmTile):
         )
 
     @T.inline
-    def _consumer_wg(self, m_idx, n_idx, k_idx, A, B, output, profiler: CudaProfiler):
+    def _consumer_wg(self, m_idx, n_idx, k_idx, A, B, output, iket: IketProfiler):
         if not self.acc_output:
-            GemmTile._consumer_wg(self, m_idx, n_idx, k_idx, A, B, output, profiler)
+            GemmTile._consumer_wg(self, m_idx, n_idx, k_idx, A, B, output, iket)
         else:
             output_flat = output.view(-1)
             tid_in_wg = T.thread_id_in_wg([128])
@@ -363,7 +363,7 @@ class GroupGEMMTile(GemmTile):
         routing_weights,
         sorted_token_ids,
         valid_num_tokens,
-        profiler=None,
+        iket=None,
     ):
         self.set_moe_info(expert_ids, routing_weights, sorted_token_ids)
         self._alloc_local(m_idx)
@@ -379,13 +379,13 @@ class GroupGEMMTile(GemmTile):
         tid = T.thread_id([256])
         if num_tokens_in_block <= 32:
             self.set_BLK_M(32)
-            GemmTile._run(self, m_idx, n_idx, k_idx, A, B, output, profiler)
+            GemmTile._run(self, m_idx, n_idx, k_idx, A, B, output, iket)
         elif num_tokens_in_block <= 64:
             self.set_BLK_M(64)
-            GemmTile._run(self, m_idx, n_idx, k_idx, A, B, output, profiler)
+            GemmTile._run(self, m_idx, n_idx, k_idx, A, B, output, iket)
         else:
             self.set_BLK_M(128)
-            GemmTile._run(self, m_idx, n_idx, k_idx, A, B, output, profiler)
+            GemmTile._run(self, m_idx, n_idx, k_idx, A, B, output, iket)
         self.smem_manager.advance()
 
 
@@ -432,5 +432,5 @@ class GroupGEMMSiluTile(GroupGEMMTile, GateUpSiluTile):
         )
 
     @T.inline
-    def _consumer_wg(self, m_idx, n_idx, k_idx, A, B, output, profiler: CudaProfiler):
-        GateUpSiluTile._consumer_wg(self, m_idx, n_idx, k_idx, A, B, output, profiler)
+    def _consumer_wg(self, m_idx, n_idx, k_idx, A, B, output, iket: IketProfiler):
+        GateUpSiluTile._consumer_wg(self, m_idx, n_idx, k_idx, A, B, output, iket)
