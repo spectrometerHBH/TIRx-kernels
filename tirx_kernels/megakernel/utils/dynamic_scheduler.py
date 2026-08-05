@@ -22,7 +22,7 @@ from typing import Literal
 import numpy as np
 
 from tirx_kernels.megakernel.utils.base import Barriers, SemaphoreBase, TileSchedulerBase
-from tirx_kernels.megakernel.utils.config import JobType, KernelConfig, ProfileEventType
+from tirx_kernels.megakernel.utils.config import IketEvent, JobType, KernelConfig
 from tirx_kernels.megakernel.utils.utils import (
     any_sync,
     atomic_add_int32,
@@ -34,7 +34,7 @@ from tirx_kernels.megakernel.utils.utils import (
     while_ld_global_acquire,
 )
 from tvm.script import tirx as T
-from tvm.tirx.bench import CudaProfiler
+from tvm.tirx.cuda.iket import IketProfiler
 
 # notes: The following applies to decrement=False. The logic for True is similar.
 #        For semaphore with expected count = expected_cnt, we set it actual count = expected_cnt * (base + 1).
@@ -246,14 +246,14 @@ class DynamicTileScheduler(TileSchedulerBase):
         head: T.Buffer,
         tail: T.Buffer,
         smem_manager,
-        profiler: CudaProfiler = None,
+        iket: IketProfiler = None,
         debug=False,
     ):
         self.queue = MPMCQueue(
             capacity=self.MAX_TASKS, tasks=tasks, head=head, tail=tail, smem_manager=smem_manager
         )
-        self.profiler_on = profiler is not None
-        self.profiler = profiler
+        self.enable_iket = iket is not None
+        self.iket = iket
         self.debug = debug
         self.smem_manager = smem_manager
 
@@ -312,12 +312,11 @@ class DynamicTileScheduler(TileSchedulerBase):
 
     @T.inline
     def next_tile(self):
-        lane_id = T.lane_id([32])
-        if self.profiler_on:
-            self.profiler.start(ProfileEventType.FETCH, lane_id == 0)
+        if self.enable_iket:
+            self.iket.range_push(IketEvent.FETCH)
         self._fetch_from_queue()
-        if self.profiler_on:
-            self.profiler.end(ProfileEventType.FETCH, lane_id == 0)
+        if self.enable_iket:
+            self.iket.range_pop()
 
     def get_idx_and_task_type(self):
         return [self.m_idx, self.n_idx, self.k_idx], self.task_type
@@ -476,8 +475,8 @@ class DynamicTileScheduler(TileSchedulerBase):
                 T.cuda.trap_when_assert_failed(notify_num <= max_notify_num_map[scope])
             if idx[1] < notify_num:
                 evt.semaphore_notify(*coord_notify, pre_notify=True, rank=rank)
-            if self.profiler_on:
-                self.profiler.start(ProfileEventType.PUSH, lane_id == 0)
+            if self.enable_iket:
+                self.iket.range_push(IketEvent.PUSH)
             if scope == "thread":
                 if tid == new_scope_id:
                     if push_level == "thread":
@@ -540,8 +539,8 @@ class DynamicTileScheduler(TileSchedulerBase):
                     assert False
             else:
                 assert False
-            if self.profiler_on:
-                self.profiler.end(ProfileEventType.PUSH, lane_id == 0)
+            if self.enable_iket:
+                self.iket.range_pop()
 
     def valid(self):
         return self.task_type != JobType.END.value

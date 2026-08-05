@@ -47,22 +47,30 @@ class JobType(Enum):
     END = 31
 
 
-class ProfileEventType(Enum):
-    FETCH = 5
-    PUSH = 20
-    PREFETCH = 26
-    TMA = 27
-    MMA = 28
-    MOE_GATING = 38
-    TOPK_SOFTMAX = 39
-    MOE_ALIGN = 40
-    COUNT_AND_SORT = 41
-    SILU_MUL = 43
-    GROUP_GEMM_DOWN = 44
-    GROUP_GEMM_GATE_UP_SILU = 51
-    INIT_ETENSOR = 52
-    WAIT_ETENSOR_INIT = 53
-    END = 54
+class IketEvent:
+    """Stable event names emitted by the optional megakernel IKET path."""
+
+    FETCH = "fetch"
+    PUSH = "push"
+    PREFETCH = "prefetch"
+    TMA = "tma"
+    MMA = "mma"
+    MOE_GATING = "moe-gating"
+    TOPK_SOFTMAX = "topk-softmax"
+    MOE_ALIGN = "moe-align"
+    COUNT_AND_SORT = "count-and-sort"
+    SILU_MUL = "silu-mul"
+    GROUP_GEMM_DOWN = "group-gemm-down"
+    GROUP_GEMM_GATE_UP_SILU = "group-gemm-gate-up-silu"
+    INIT_ETENSOR = "init-etensor"
+    WAIT_ETENSOR_INIT = "wait-etensor-init"
+
+
+IKET_EVENT_NAMES = tuple(
+    value
+    for name, value in vars(IketEvent).items()
+    if not name.startswith("_") and isinstance(value, str)
+)
 
 
 MEGAKERNEL_MOE_BENCH_CONFIG = {

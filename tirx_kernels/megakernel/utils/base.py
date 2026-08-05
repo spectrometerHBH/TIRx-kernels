@@ -23,10 +23,10 @@ import tvm
 from tvm.script import ir as I
 from tvm.script import tirx as T
 from tvm.tirx import Expr
-from tvm.tirx.bench import CudaProfiler
+from tvm.tirx.cuda.iket import IketProfiler
 from tvm.tirx.expr import Var
 
-from .config import KernelConfig, ProfileEventType
+from .config import IketEvent, KernelConfig
 from .utils import any_sync, f_init_const
 
 
@@ -490,42 +490,25 @@ class MegaKernelWrapper:
     """Base class for megakernel wrappers."""
 
     ETENSOR_WORKSPACE_SIZE = 1024 * 1024
-    NUM_GROUPS = KernelConfig.WARP_NUMBER * KernelConfig.WG_NUMBER
-    PROFILER_BUFFER_SIZE = int(10000000.0)
-    PROFILER_WRITE_STRIDE = KernelConfig.SM_NUMBER * NUM_GROUPS
 
-    def __init__(self, config: dict = {}, tp_size: int = 1, profiler_on: bool = False):
+    def __init__(self, config: dict = {}, tp_size: int = 1, *, enable_iket: bool = False):
         self.tp_size = tp_size
         self.config = config
-        self.profiler_on = profiler_on
+        self.enable_iket = enable_iket
+        self.iket = IketProfiler() if enable_iket else None
         self.tile_attr = {}
         self.class_list = set()
         self.etensor_and_f_init_pairs = []
         self.num_etensors = {}
         self.etensor_workspace_offset = 0
 
-    def _init_profiler(self, profiler_buffer):
-        if self.profiler_on:
-            self.profiler = CudaProfiler(
-                profiler_buffer, write_stride=self.PROFILER_WRITE_STRIDE, num_groups=self.NUM_GROUPS
-            )
-        else:
-            self.profiler = None
-
     def _init_tile_scheduler(self, scheduler_class: type[TileSchedulerBase], *args):
         self.tile_scheduler: TileSchedulerBase = scheduler_class(*args)
 
-    def _add_tile(self, tile, profiler_event_type, predicate=True):
-        self.tile_attr[tile] = (profiler_event_type, predicate)
+    def _add_tile(self, tile, iket_event_name, predicate=True):
+        self.tile_attr[tile] = (iket_event_name, predicate)
         self.class_list.add(tile.__class__)
         return tile
-
-    @T.inline
-    def init_profiler(self, profiler_buffer):
-        self._init_profiler(profiler_buffer)
-        warp_id = T.warp_id([KernelConfig.WARP_NUMBER * KernelConfig.WG_NUMBER])
-        if self.profiler_on:
-            self.profiler.init(warp_id)
 
     def set_smem_manager(self, smem_max_bytes, chunk_size, ptr: Var):
         self.smem_manager = SmemManager(smem_max_bytes, chunk_size, ptr)
@@ -539,24 +522,22 @@ class MegaKernelWrapper:
 
     @T.inline
     def run_tile(self, tile: Tile, *args, **kwargs):
-        event_type = T.meta_var(self.tile_attr[tile][0])
+        event_name = T.meta_var(self.tile_attr[tile][0])
         self.smem_manager.enter_tile_runtime(tile)
-        lane_id = T.lane_id([32])
-        if self.profiler_on:
-            self.profiler.start(event_type, lane_id == 0)
+        if self.enable_iket:
+            self.iket.range_push(event_name)
         tile.run(*args, **kwargs)
-        if self.profiler_on:
-            self.profiler.end(event_type, lane_id == 0)
+        if self.enable_iket:
+            self.iket.range_pop()
 
     @T.inline
     def run_tile_prefetch(self, tile: Tile, *args):
         self.smem_manager.enter_tile_runtime(tile)
-        lane_id = T.lane_id([32])
-        if self.profiler_on:
-            self.profiler.start(ProfileEventType.PREFETCH, lane_id == 0)
+        if self.enable_iket:
+            self.iket.range_push(IketEvent.PREFETCH)
         tile.prefetch(*args)
-        if self.profiler_on:
-            self.profiler.end(ProfileEventType.PREFETCH, lane_id == 0)
+        if self.enable_iket:
+            self.iket.range_pop()
 
     def add_etensor(self, sem_class, etensor_workspace, shape, f_init):
         size = functools.reduce(lambda x, y: x * y, shape, 1)
@@ -582,7 +563,7 @@ class MegaKernelWrapper:
         else:
             self.evt_etensor_init_complete = None
         self.init_etensor_tile = self._add_tile(
-            InitETensorTile(self.etensor_and_f_init_pairs), ProfileEventType.INIT_ETENSOR
+            InitETensorTile(self.etensor_and_f_init_pairs), IketEvent.INIT_ETENSOR
         )
 
     @T.inline
@@ -607,8 +588,8 @@ class MegaKernelWrapper:
         if not is_dynamic_sch:
             warp_id = T.warp_id([KernelConfig.WARP_NUMBER * KernelConfig.WG_NUMBER])
             lane_id = T.lane_id([32])
-            if self.profiler_on:
-                self.profiler.start(ProfileEventType.WAIT_ETENSOR_INIT, lane_id == 0)
+            if self.enable_iket:
+                self.iket.range_push(IketEvent.WAIT_ETENSOR_INIT)
             state = T.alloc_local([1], "int32")
             state[0] = -1
             while 1:
@@ -627,8 +608,8 @@ class MegaKernelWrapper:
                         )
                     break
                 T.cuda.nano_sleep(40)
-            if self.profiler_on:
-                self.profiler.end(ProfileEventType.WAIT_ETENSOR_INIT, lane_id == 0)
+            if self.enable_iket:
+                self.iket.range_pop()
 
     def reset(self):
         self.tile_attr = {}
