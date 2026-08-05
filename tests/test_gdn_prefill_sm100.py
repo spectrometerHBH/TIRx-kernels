@@ -17,8 +17,10 @@
 
 from pathlib import Path
 
+import tvm
 from tirx_kernels.attention import gdn_prefill_sm100
 from tirx_kernels.bench_suite import run as bench_suite_run
+from tirx_kernels.runner import compile_kernel
 
 WORKLOADS = (
     Path(gdn_prefill_sm100.__file__).parents[1] / "bench_suite" / "workloads_gdn_prefill_sm100.yaml"
@@ -40,6 +42,26 @@ def test_gdn_prefill_sm100_public_contract() -> None:
         "run_bench",
         "run_test",
     }
+
+
+def test_gdn_prefill_sm100_disables_cuda_fast_math(monkeypatch) -> None:
+    kernel = gdn_prefill_sm100.get_kernel(hq=2, hv=8, seq_lens=(2048,))
+    assert not bool(kernel.attrs["tirx.cuda_fast_math"])
+
+    compiled = object()
+    captured = {}
+
+    def fake_compile(mod, *, target, tir_pipeline):
+        captured["mod"] = mod
+        captured["target"] = target
+        captured["tir_pipeline"] = tir_pipeline
+        return compiled
+
+    monkeypatch.setattr(tvm, "compile", fake_compile)
+    assert compile_kernel(kernel) is compiled
+    assert captured["target"].kind.name == "cuda"
+    assert not bool(captured["target"].attrs["fast-math"])
+    assert captured["tir_pipeline"] == "tirx"
 
 
 def test_gdn_prefill_sm100_workloads_exactly_match_configs() -> None:

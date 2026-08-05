@@ -36,7 +36,8 @@ DEFAULT_BENCH_COOLDOWN_S = 1.0
 
 def compile_kernel(func):
     """Compile a single TIR PrimFunc via the tirx pipeline."""
-    target = tvm.target.Target("cuda")
+    use_fast_math = bool(func.attrs.get("tirx.cuda_fast_math", True))
+    target = tvm.target.Target({"kind": "cuda", "fast-math": use_fast_math})
     mod = tvm.IRModule({"main": func})
     return tvm.compile(mod, target=target, tir_pipeline="tirx")
 
