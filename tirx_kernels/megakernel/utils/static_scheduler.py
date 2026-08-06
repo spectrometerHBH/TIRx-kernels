@@ -22,7 +22,7 @@ from typing import Literal
 import tvm
 from tirx_kernels.megakernel.utils.base import SemaphoreBase, TileSchedulerBase
 from tirx_kernels.megakernel.utils.config import JobType, KernelConfig
-from tirx_kernels.megakernel.utils.utils import any_sync, atomic_add_int32, gt, unpack_from_32bit
+from tirx_kernels.megakernel.utils.utils import atomic_add_int32, gt, unpack_from_32bit
 from tvm.script import tirx as T
 
 
@@ -35,7 +35,7 @@ class Semaphore(SemaphoreBase):
     def semaphore_wait(self, *coord, level: Literal["cta", "warp"] = "cta", mask=0xFFFFFFFF):
         if level == "cta":
             while 1:
-                T.ptx.ld_global_acquire(
+                T.ptxd.ld.acquire.gpu.global_.b32(
                     self.state[0], self.sem.access_ptr("r", offset=self.sem.elem_offset_of(coord))
                 )
                 if T.cuda.syncthreads_and(self.state[0] == 0):
@@ -48,11 +48,11 @@ class Semaphore(SemaphoreBase):
                 self.state[0] = -1
                 while 1:
                     if lane_id == 0:
-                        T.ptx.ld_global_acquire(
+                        T.ptxd.ld.acquire.gpu.global_.b32(
                             self.state[0],
                             self.sem.access_ptr("r", offset=self.sem.elem_offset_of(coord)),
                         )
-                    if any_sync(0xFFFFFFFF, self.state[0] == 0):
+                    if T.cuda.any_sync(0xFFFFFFFF, self.state[0] == 0):
                         break
                     T.cuda.nano_sleep(40)
         else:
@@ -66,7 +66,7 @@ class Semaphore(SemaphoreBase):
         )
         if self.state[0] <= 0:
             while 1:
-                T.ptx.ld_global_acquire(self.state[0], self.sem.ptr_to(coord))
+                T.ptxd.ld.acquire.gpu.global_.b32(self.state[0], self.sem.ptr_to(coord))
                 if gt(self.state[0], 0):
                     atomic_add_int32(
                         self.sem.ptr_to(coord), -(self.base + 1), rank, release=release
@@ -170,7 +170,7 @@ class StaticTileScheduler(TileSchedulerBase):
             elif scope == "warp":
                 T.cuda.warp_sync()
             elif scope == "warpgroup":
-                T.ptx.bar.sync(6 + scope_id, 128)
+                T.ptxd.bar.sync(T.uint32(6 + scope_id), 128)
             elif scope == "cta":
                 T.tvm_storage_sync("shared")
 
