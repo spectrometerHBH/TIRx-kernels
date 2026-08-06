@@ -224,7 +224,7 @@ class CountAndSortExpertTokens(Tile):
                     dispatch="ldgsts",
                     direct=True,
                 )
-            T.ptxd.cp.async_.commit_group()
+            T.ptx.cp.async_.commit_group()
             idx[0] += KernelConfig.SM_NUMBER
         cnt[0] = 0
         while idx[0] < self.numel + (self.PIPE_DEPTH - 1) * KernelConfig.SM_NUMBER:
@@ -236,8 +236,8 @@ class CountAndSortExpertTokens(Tile):
                     dispatch="ldgsts",
                     direct=True,
                 )
-            T.ptxd.cp.async_.commit_group()
-            T.ptxd.cp.async_.wait_group(self.PIPE_DEPTH - 1)
+            T.ptx.cp.async_.commit_group()
+            T.ptx.cp.async_.wait_group(self.PIPE_DEPTH - 1)
             rank_post_pad: T.let = self.s_rank_post_pad[cnt[0]]
             pipe_idx = T.meta_var(cnt[0] % self.PIPE_DEPTH)
             if col_idx[0] < self.hidden_size:
