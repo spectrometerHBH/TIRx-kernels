@@ -14,14 +14,14 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""TIRx port of FlashInfer's frozen FlashKDA SM100a BF16 recurrent-KDA prefill
+"""TIRx port of FlashInfer's FlashKDA SM100a BF16 recurrent-KDA prefill
 M128 kernel (flashinfer-ai/flashinfer#4262, head e835e0f5).
 
 Source CUDA: csrc/kda/flashkda_bf16_fused_m128.cu (kernel body at line 504),
 launched by RunM128 in csrc/kda/flashkda_bf16_fused_m128_binding.cu with
 shared launch helpers in csrc/kda/flashkda_binding_common.cuh.
 
-One frozen instance: BF16, head_dim 128, sm_100a, grid = num_seqs * num_heads,
+Target instance: BF16, head_dim 128, sm_100a, grid = num_seqs * num_heads,
 1024 threads, 227328 B dynamic smem, six host-encoded TMA descriptors.
 """
 
@@ -515,7 +515,7 @@ def _make_warp_uniform(val):
     return T.cuda._shfl_sync(T.uint32(0xFFFFFFFF), val, 0, 32)
 
 
-@dataclass(frozen=True)
+@dataclass
 class FlashKDABf16FusedM128Config:
     label: str
     num_heads: int
@@ -672,7 +672,7 @@ def _m128_dispatch_reason(cfg: FlashKDABf16FusedM128Config) -> str:
 _MIXED_SEQ_LENS = (1300, 547, 2048, 963, 271, 3063)
 
 CONFIGS = [
-    # Mirrors tests/kda/test_recurrent_kda_prefill.py::test_frozen_prefill_matches_reference.
+    # Mirrors the recurrent-KDA prefill reference coverage.
     {"label": "fixed_h2_t4", "num_heads": 2, "seq_lens": (4, 4), "packed": False},
     {"label": "packed_h2_3_5", "num_heads": 2, "seq_lens": (3, 5), "packed": True},
     {
@@ -815,7 +815,7 @@ def prepare_data(**kwargs: Any) -> dict[str, Any]:
     out = torch.empty(shape, device=device, dtype=torch.bfloat16)
     out_tx_tile = torch.empty_like(out)
     # Six CUtensorMap descriptors, 128 B each, 64 B aligned (torch storages are
-    # 512 B aligned); the frozen kernel publishes descriptors here.
+    # 512 B aligned); the reference kernel publishes descriptors here.
     descriptor_storage = torch.empty((768,), device=device, dtype=torch.uint8)
     descriptor_storage_tx_tile = torch.empty_like(descriptor_storage)
 
@@ -891,11 +891,11 @@ def _reference_torch(case: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
     return out.to(torch.bfloat16), state
 
 
-def _load_frozen_recurrent_kda():
-    """Import flashinfer.recurrent_kda from the PR head worktree (frozen m128).
+def _load_flashinfer_recurrent_kda():
+    """Import flashinfer.recurrent_kda from the PR head worktree.
 
-    The worktree (flashinfer-ai/flashinfer#4262 head, which contains the frozen
-    m128 kernel) is located via the FLASHKDA_PR_WORKTREE environment variable.
+    The flashinfer-ai/flashinfer#4262 head worktree is located via the
+    FLASHKDA_PR_WORKTREE environment variable.
     Handles the case where an installed flashinfer (main, without kda.py) was
     already imported by purging it and re-importing from the worktree.
     """
@@ -908,8 +908,7 @@ def _load_frozen_recurrent_kda():
         except ImportError as e:
             raise RuntimeError(
                 "flashinfer.kda is unavailable; set FLASHKDA_PR_WORKTREE to the "
-                "flashinfer-ai/flashinfer#4262 head worktree containing the "
-                "frozen m128 kernel"
+                "flashinfer-ai/flashinfer#4262 head worktree containing the m128 kernel"
             ) from e
     if worktree not in sys.path:
         sys.path.insert(0, worktree)
@@ -932,10 +931,10 @@ def _load_frozen_recurrent_kda():
     return recurrent_kda
 
 
-def _frozen_cuda_reference(case: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Run the frozen m128 CUDA kernel via flashinfer.recurrent_kda on the same inputs."""
+def _flashinfer_cuda_reference(case: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Run the m128 CUDA reference via flashinfer.recurrent_kda on the same inputs."""
     cfg: FlashKDABf16FusedM128Config = case["config"]
-    recurrent_kda = _load_frozen_recurrent_kda()
+    recurrent_kda = _load_flashinfer_recurrent_kda()
     batch = 1 if cfg.packed else cfg.num_seqs
     seq_len = cfg.total_tokens if cfg.packed else cfg.seq_lens[0]
 
@@ -3663,13 +3662,13 @@ def run_test(**kwargs: Any) -> None:
                 case[f"final_state{suffix}"], ref_state, rtol=4.01 / 128, atol=5e-3
             )
 
-    frozen_out, frozen_state = _frozen_cuda_reference(case)
+    flashinfer_out, flashinfer_state = _flashinfer_cuda_reference(case)
     for suffix in ("", "_tx_tile"):
-        torch.testing.assert_close(case[f"out{suffix}"], frozen_out, rtol=4.01 / 128, atol=5e-3)
-        if cfg.store_final_state and frozen_state is not None:
+        torch.testing.assert_close(case[f"out{suffix}"], flashinfer_out, rtol=4.01 / 128, atol=5e-3)
+        if cfg.store_final_state and flashinfer_state is not None:
             torch.testing.assert_close(
                 case[f"final_state{suffix}"],
-                frozen_state.reshape(case[f"final_state{suffix}"].shape),
+                flashinfer_state.reshape(case[f"final_state{suffix}"].shape),
                 rtol=4.01 / 128,
                 atol=5e-3,
             )
@@ -3704,12 +3703,12 @@ def run_bench(
         func()
     torch.cuda.synchronize()
 
-    def _frozen_builder():
-        _load_frozen_recurrent_kda()  # warm the frozen module outside the timed region
-        frozen_case = dict(case)
+    def _flashinfer_builder():
+        _load_flashinfer_recurrent_kda()
+        flashinfer_case = dict(case)
         if cfg.use_initial_state:
-            frozen_case["initial_state"] = case["initial_state"].clone()
-        return lambda: _frozen_cuda_reference(frozen_case)
+            flashinfer_case["initial_state"] = case["initial_state"].clone()
+        return lambda: _flashinfer_cuda_reference(flashinfer_case)
 
     flashkda_peer: dict[str, Any] = {}
 
@@ -3720,7 +3719,7 @@ def run_bench(
         flashkda_peer["reference"] = peer
         return peer.launch
 
-    references = {"flashinfer_frozen_m128": _frozen_builder, "flashkda_raw": _flashkda_raw_builder}
+    references = {"flashinfer_m128": _flashinfer_builder, "flashkda_raw": _flashkda_raw_builder}
 
     result = bench(
         funcs,
