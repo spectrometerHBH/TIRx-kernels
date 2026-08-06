@@ -85,19 +85,19 @@ class GateUpSiluTile(GemmTile):
         T.cuda.trap_when_assert_failed(self.tmem_addr[0] == 0)
         if warp_id == 0:
             self.smem_manager.wait_specific(lane_id, self.output_smem, 0)
-        T.ptx.bar.sync(10, 128)
+        T.ptxd.bar.sync(10, 128)
         self.phase[0] = 0
         self.tmem_idx = self.tile_idx % self.TMEM_PIPE_DEPTH
         self.tmem_phase = self.tile_idx // self.TMEM_PIPE_DEPTH & 1
         self.mma2ld_bar.wait(self.tmem_idx, self.tmem_phase)
-        T.ptx.tcgen05.fence.after_thread_sync()
+        T.ptxd.tcgen05.fence__after_thread_sync()
         SILU_HANDLE_UNIT = T.meta_var(self.TMEM_LD_SIZE // 2)
         self.off = T.if_then_else(lane_id < 16, SILU_HANDLE_UNIT, 0)
         for ko in T.unroll(self.MMA_M // self.EPI_TILE):
             self.stage = (self.tile_idx * self.MMA_M // self.EPI_TILE + ko) % self.TMEM_PIPE_DEPTH
             if ko >= self.TMEM_PIPE_DEPTH:
                 if (lane_id == 0) & (warp_id == 0):
-                    T.ptx.cp_async.bulk.wait_group(self.TMEM_PIPE_DEPTH - 1)
+                    T.ptxd.cp.async_.bulk.wait_group(self.TMEM_PIPE_DEPTH - 1)
                 T.cuda.warpgroup_sync(10)
             for ki in T.unroll(self.EPI_TILE // self.TMEM_LD_SIZE):
                 reg_wg = self.reg.view(
@@ -110,7 +110,7 @@ class GateUpSiluTile(GemmTile):
                     self.tmem_idx * self.M_pad_size + ko * self.EPI_TILE + ki * self.TMEM_LD_SIZE
                 )
                 Tx.wg.copy_async(reg_wg, self.tmem[:, col_st : col_st + self.TMEM_LD_SIZE])
-                T.ptx.tcgen05.wait.ld()
+                T.ptxd.tcgen05.wait__ld.sync.aligned()
                 if self.enable_iket:
                     iket.range_push(IketEvent.SILU_MUL)
                 for kv in T.unroll(SILU_HANDLE_UNIT):
@@ -131,9 +131,9 @@ class GateUpSiluTile(GemmTile):
                 if self.enable_iket:
                     iket.range_pop()
             if ko == self.MMA_M // self.EPI_TILE - 1:
-                T.ptx.tcgen05.fence.before_thread_sync()
+                T.ptxd.tcgen05.fence__before_thread_sync()
                 self.ld2mma_bar.arrive(self.tmem_idx)
-            T.ptx.fence.proxy_async("shared::cta")
+            T.ptxd.fence.proxy.async_.shared__cta()
             T.cuda.warpgroup_sync(10)
             if tid_in_wg == 0:
                 m_st = T.meta_var(m_idx * self.M_pad_size + ko * self.EPI_TILE)
@@ -146,9 +146,9 @@ class GateUpSiluTile(GemmTile):
                     self.output_smem[self.stage, :, :],
                     **tma_config,
                 )
-                T.ptx.cp_async.bulk.commit_group()
+                T.ptxd.cp.async_.bulk.commit_group()
         if tid_in_wg == 0:
-            T.ptx.cp_async.bulk.wait_group(0)
+            T.ptxd.cp.async_.bulk.wait_group(0)
         T.cuda.warpgroup_sync(10)
         self.tile_idx += 1
         if warp_id == 0:
