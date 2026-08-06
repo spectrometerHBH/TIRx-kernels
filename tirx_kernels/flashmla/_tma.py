@@ -11,7 +11,7 @@ def leader_mbar(bar_ptr: Any) -> Any:
     # cta_group::2 completion routes to the CTA the mbar names; map to the pair
     # leader (rank 0) so both CTAs' issues aggregate on one barrier.
     mapped = T.alloc_local([1], "uint64")
-    T.evaluate(T.ptxd.mapa.u64(mapped[0], bar_ptr, T.uint32(0)))
+    T.evaluate(T.ptx.mapa.u64(mapped[0], bar_ptr, T.uint32(0)))
     return T.reinterpret("handle", mapped[0])
 
 

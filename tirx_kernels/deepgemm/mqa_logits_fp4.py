@@ -372,21 +372,21 @@ def get_kernel(**kwargs: Any):
     logits_tir_dtype = "float32" if config.logits_dtype == "float32" else "bfloat16"
 
     def cuda_grid_dependency_synchronize():
-        T.evaluate(T.ptxd.griddepcontrol.wait())
+        T.evaluate(T.ptx.griddepcontrol.wait())
 
     def emit_sf_transpose(buf, dst, lane, stage_idx, elem_base):
         # DeepGEMM's st.shared.v4 SF transpose, out-of-place into staging
         # (no in-place WAR warp_sync; elect.sync covers the cross-lane barrier).
-        # ptxd destinations are declared registers the instruction writes into.
+        # ptx destinations are declared registers the instruction writes into.
         # This is a plain Python helper, so each call has to be handed to the
         # frame explicitly or it is discarded.
         v = T.alloc_local((4,), "uint32")
         for i in range(4):
             T.evaluate(
-                T.ptxd.ld.shared.u32(v[i], buf.ptr_to([stage_idx, elem_base + i * 32 + lane]))
+                T.ptx.ld.shared.u32(v[i], buf.ptr_to([stage_idx, elem_base + i * 32 + lane]))
             )
         T.evaluate(
-            T.ptxd.st.shared.v4.u32(
+            T.ptx.st.shared.v4.u32(
                 dst.ptr_to([stage_idx, elem_base + lane * 4]), v[0], v[1], v[2], v[3]
             )
         )
@@ -530,7 +530,7 @@ def get_kernel(**kwargs: Any):
         @T.inline
         def store_logits(flat_offset, value):
             if config.logits_dtype == "float32":
-                T.ptxd.st.global_.f32(logits_flat.ptr_to([flat_offset]), value)
+                T.ptx.st.global_.f32(logits_flat.ptr_to([flat_offset]), value)
             else:
                 logits_flat[flat_offset] = value
 
@@ -558,10 +558,10 @@ def get_kernel(**kwargs: Any):
             schedule_result[1] = num_kv_blocks
 
         # Pipeline constructors already ran mbarrier.init; fence + cta_sync publish them.
-        T.ptxd.fence.mbarrier_init.release.cluster()
+        T.ptx.fence.mbarrier_init.release.cluster()
 
         if warp_idx == spec_warp_start + 2:
-            T.ptxd.tcgen05.alloc.cta_group__1.sync.aligned.shared__cta.b32(
+            T.ptx.tcgen05.alloc.cta_group__1.sync.aligned.shared__cta.b32(
                 T.address_of(tmem_ptr_in_smem[0]), T.uint32(num_tmem_cols)
             )
         T.cuda.cta_sync()
@@ -570,7 +570,7 @@ def get_kernel(**kwargs: Any):
         cuda_grid_dependency_synchronize()
 
         if warp_idx == spec_warp_start:
-            T.ptxd.setmaxnreg.dec.sync.aligned.u32(56)
+            T.ptx.setmaxnreg.dec.sync.aligned.u32(56)
             if T.cuda.elect_sync():
                 # Ring cursors with subtract-wrap (DeepGEMM RingPipeline): avoids ptxas
                 # magic-number division for `% kNumStages` on these hot paths.
@@ -623,7 +623,7 @@ def get_kernel(**kwargs: Any):
                         q_phase = q_phase ^ T.uint32(1)
             T.cuda.warp_sync()
         elif warp_idx == spec_warp_start + 1:
-            T.ptxd.setmaxnreg.dec.sync.aligned.u32(56)
+            T.ptx.setmaxnreg.dec.sync.aligned.u32(56)
             if T.cuda.elect_sync():
                 kv_stage_idx: T.uint32 = T.uint32(0)
                 kv_phase: T.uint32 = T.uint32(0)
@@ -665,7 +665,7 @@ def get_kernel(**kwargs: Any):
                             kv_phase = kv_phase ^ T.uint32(1)
                     q_idx = q_idx + T.uint32(config.num_sms)
         elif warp_idx == spec_warp_start + 2:
-            T.ptxd.setmaxnreg.dec.sync.aligned.u32(56)
+            T.ptx.setmaxnreg.dec.sync.aligned.u32(56)
             T.cuda.trap_when_assert_failed(tmem_ptr_in_smem[0] == T.uint32(0))
             desc_i: T.uint32
             # GAP 1: encode the block-scaled instruction descriptor ONCE here; the
@@ -732,7 +732,7 @@ def get_kernel(**kwargs: Any):
                 q_pipe.full.wait(q_stage_idx, q_phase)
                 emit_sf_transpose(smem_sf_q, smem_sf_q_t, lane_idx, q_stage_idx, 0)
                 T.cuda.warp_sync()
-                T.ptxd.fence.proxy.async_.shared__cta()
+                T.ptx.fence.proxy.async_.shared__cta()
                 # Each tmem_pipe.full arrive commits all prior asynchronous
                 # TCGEN work from this issuer. Wait for the final commit from
                 # the preceding q block before overwriting its SFQ TMEM input.
@@ -810,7 +810,7 @@ def get_kernel(**kwargs: Any):
                     q_stage_idx = q_stage_idx - T.uint32(num_q_stages)
                     q_phase = q_phase ^ T.uint32(1)
         elif warp_idx == spec_warp_start + 3:
-            T.ptxd.setmaxnreg.dec.sync.aligned.u32(56)
+            T.ptx.setmaxnreg.dec.sync.aligned.u32(56)
             # SF-KV transpose worker: overlaps transpose(k+1) with the
             # tcgen05 warp's UTCCP+MMA of block k.
             t_kv_stage: T.uint32 = T.uint32(0)
@@ -826,7 +826,7 @@ def get_kernel(**kwargs: Any):
                     emit_sf_transpose(
                         smem_sf_kv, smem_sf_kv_t, lane_idx, t_kv_stage, num_utccp_aligned_elems
                     )
-                    T.ptxd.fence.proxy.async_.shared__cta()
+                    T.ptx.fence.proxy.async_.shared__cta()
                     if T.cuda.elect_sync():
                         sf_ready.arrive(t_kv_stage)
                     t_kv_i = t_kv_i + T.uint32(1)
@@ -836,7 +836,7 @@ def get_kernel(**kwargs: Any):
                         t_kv_phase = t_kv_phase ^ T.uint32(1)
                 t_q_idx = t_q_idx + T.uint32(config.num_sms)
         elif warp_idx < spec_warp_start:
-            T.ptxd.setmaxnreg.inc.sync.aligned.u32(224)
+            T.ptx.setmaxnreg.inc.sync.aligned.u32(224)
             accum = T.alloc_local((num_heads,), "float32")
             cached_weights = T.alloc_local((block_q, num_heads), "float32")
             # f32-dense store offsets, hoisted and chained (+block_kv per split) to keep
@@ -856,7 +856,7 @@ def get_kernel(**kwargs: Any):
                     Tx.warpgroup.copy(cached_weights, smem_weights[q_stage_idx])
                     # Publish the generic-proxy weight reads before this
                     # consumer releases the Q stage for a later TMA overwrite.
-                    T.ptxd.fence.proxy.async_.shared__cta()
+                    T.ptx.fence.proxy.async_.shared__cta()
                     if not config.compressed_logits and config.logits_dtype == "float32":
                         for tb_i in T.unroll(0, block_q):
                             token_store_off[tb_i] = T.cast(
@@ -881,13 +881,13 @@ def get_kernel(**kwargs: Any):
                                 accum_2d[:, 0 : num_heads // 2],
                                 tmem[:, tmem_addr : tmem_addr + num_heads // 2],
                             )
-                            T.ptxd.tcgen05.wait__ld.sync.aligned()
+                            T.ptx.tcgen05.wait__ld.sync.aligned()
                             tmem_addr_hi: T.uint32 = tmem_addr + T.uint32(num_heads // 2)
                             Tx.warpgroup.copy_async(
                                 accum_2d[:, num_heads // 2 : num_heads],
                                 tmem[:, tmem_addr_hi : tmem_addr_hi + num_heads // 2],
                             )
-                            T.ptxd.tcgen05.wait__ld.sync.aligned()
+                            T.ptx.tcgen05.wait__ld.sync.aligned()
                             if q_inner_i == block_q - 1:
                                 tmem_pipe.empty.arrive(tmem_stage_idx)
                             # Weighted-ReLU reduce via inline CUDA (see _mqa_fp4_wrelu_reduce_src).
@@ -936,9 +936,9 @@ def get_kernel(**kwargs: Any):
                 if q_stage_idx >= T.uint32(num_q_stages):
                     q_stage_idx = q_stage_idx - T.uint32(num_q_stages)
                     q_phase = q_phase ^ T.uint32(1)
-            T.ptxd.bar.sync(8, T.uint32(num_math_threads))
+            T.ptx.bar.sync(8, T.uint32(num_math_threads))
             if warp_idx == 0:
-                T.ptxd.tcgen05.dealloc.cta_group__1.sync.aligned.b32(
+                T.ptx.tcgen05.dealloc.cta_group__1.sync.aligned.b32(
                     T.uint32(0), T.uint32(num_tmem_cols)
                 )
 
