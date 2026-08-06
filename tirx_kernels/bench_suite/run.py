@@ -886,7 +886,15 @@ def collect_kernel_fingerprint() -> dict[str, str | None]:
 
 # Packages used as baselines in workloads.yaml — anything our regression
 # numbers compare against, so the recorded version pins the comparison.
-BASELINE_PACKAGES = ["torch", "deep_gemm", "flashinfer", "flash_attn", "sglang", "cutlass"]
+BASELINE_PACKAGES = [
+    "torch",
+    "deep_gemm",
+    "flashinfer",
+    "flash_kda",
+    "flash_attn",
+    "sglang",
+    "cutlass",
+]
 
 
 def package_provenance(import_name: str) -> dict | None:
