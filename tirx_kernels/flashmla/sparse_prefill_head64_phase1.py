@@ -380,7 +380,7 @@ def _kernel(
         if T.cuda.elect_sync():
             bar_prologue_q_nope.init(1)
             bar_prologue_q_rope.init(1)
-            T.ptxd.fence.mbarrier_init.release.cluster()
+            T.ptx.fence.mbarrier_init.release.cluster()
 
             if have_rope:
                 Tx.copy_async(
@@ -402,33 +402,33 @@ def _kernel(
             bar_prologue_utccp_nope.init(1)
             if bar_qk_nope_done.leader:
                 for init_stage in T.unroll(NUM_BUFS):
-                    T.ptxd.mbarrier.init.shared.b64(
+                    T.ptx.mbarrier.init.shared.b64(
                         bar_qk_nope_done.ptr_to([init_stage]), T.uint32(1)
                     )
-                    T.ptxd.mbarrier.init.shared.b64(bar_sv_done.ptr_to([init_stage]), T.uint32(1))
-                    T.ptxd.mbarrier.init.shared.b64(
+                    T.ptx.mbarrier.init.shared.b64(bar_sv_done.ptr_to([init_stage]), T.uint32(1))
+                    T.ptx.mbarrier.init.shared.b64(
                         bar_kv_nope_ready_part0.ptr_to([init_stage]), T.uint32(1)
                     )
-                    T.ptxd.mbarrier.init.shared.b64(
+                    T.ptx.mbarrier.init.shared.b64(
                         bar_kv_nope_ready_part1.ptr_to([init_stage]), T.uint32(1)
                     )
-                    T.ptxd.mbarrier.init.shared.b64(
+                    T.ptx.mbarrier.init.shared.b64(
                         bar_k_valid_ready.ptr_to([init_stage]), T.uint32(B_TOPK // 8)
                     )
-                    T.ptxd.mbarrier.init.shared.b64(
+                    T.ptx.mbarrier.init.shared.b64(
                         bar_k_valid_free.ptr_to([init_stage]), T.uint32(128)
                     )
             bar_p_free.init(128)
             bar_so_ready.init(128)
             bar_qk_rope_done.init(1)
             bar_kv_rope_ready.init(64)
-            T.ptxd.fence.mbarrier_init.release.cluster()
+            T.ptx.fence.mbarrier_init.release.cluster()
 
-        T.ptxd.tcgen05.alloc.cta_group__1.sync.aligned.shared__cta.b32(
+        T.ptx.tcgen05.alloc.cta_group__1.sync.aligned.shared__cta.b32(
             T.address_of(tmem_start_addr[0]), T.uint32(512)
         )
         T.cuda.trap_when_assert_failed(tmem_start_addr[0] == T.uint32(0))
-        T.ptxd.tcgen05.relinquish_alloc_permit.cta_group__1.sync.aligned()
+        T.ptx.tcgen05.relinquish_alloc_permit.cta_group__1.sync.aligned()
         iket.range_end(prologue_token)
 
     T.cuda.cta_sync()
@@ -443,14 +443,14 @@ def _kernel(
         # S generation, S shared store, conditional O rescale.
         for k in T.serial(0, num_k_blocks, unroll=False):
             softmax_token = iket.range_start("h64-softmax-tile")
-            T.ptxd.bar.sync(T.uint32(BAR_WG0_WARP02 + T.bitwise_and(warp_idx, T.int32(1))), 64)
+            T.ptx.bar.sync(T.uint32(BAR_WG0_WARP02 + T.bitwise_and(warp_idx, T.int32(1))), 64)
             cur_buf: T.int32 = _ring_mod3(k, max_k_blocks)
             cur_phase: T.int32 = _ring_phase_parity(k, max_k_blocks)
             qk_wait_token = iket.range_start("h64-qk-wait")
             bar_qk_nope_done.wait(cur_buf, cur_phase)
             iket.range_end(qk_wait_token)
             bar_k_valid_ready.wait(cur_buf, cur_phase)
-            T.ptxd.tcgen05.fence__after_thread_sync()
+            T.ptx.tcgen05.fence__after_thread_sync()
 
             # CUDA common_subroutine.h:75-134 retrieve_mask_and_reduce_p.
             p_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, (B_TOPK // 2)), "float32")
@@ -468,8 +468,8 @@ def _kernel(
                 load_p(p_frag, p_peer_frag)
             else:
                 load_p(p_peer_frag, p_frag)
-            T.ptxd.tcgen05.wait__ld.sync.aligned()
-            T.ptxd.tcgen05.fence__before_thread_sync()
+            T.ptx.tcgen05.wait__ld.sync.aligned()
+            T.ptx.tcgen05.fence__before_thread_sync()
             bar_p_free.arrive(0)
 
             valid_word_offset: T.int32 = T.if_then_else(warp_idx >= 2, (B_TOPK // 2) // 32, 0)
@@ -492,7 +492,7 @@ def _kernel(
                     p_peer[p_peer_offset : p_peer_offset + 4],
                     dispatch="vec_128b",
                 )
-            T.ptxd.bar.sync(T.uint32(BAR_WG0_WARP02 + T.bitwise_and(warp_idx, T.int32(1))), 64)
+            T.ptx.bar.sync(T.uint32(BAR_WG0_WARP02 + T.bitwise_and(warp_idx, T.int32(1))), 64)
             p_add_pair0: T.uint64
             p_add_pair1: T.uint64
             for exchange_i in T.unroll((B_TOPK // 2) // 4):
@@ -505,12 +505,12 @@ def _kernel(
                 )
                 p_pair0: T.let = T.cuda.make_float2(p[exchange_i * 4], p[exchange_i * 4 + 1])
                 peer_pair0: T.let = T.cuda.make_float2(p_exchange_tmp[0], p_exchange_tmp[1])
-                T.ptxd.add.rn.f32x2(p_add_pair0, p_pair0, peer_pair0)
+                T.ptx.add.rn.f32x2(p_add_pair0, p_pair0, peer_pair0)
                 p[exchange_i * 4] = T.cuda.float2_x(p_add_pair0)
                 p[exchange_i * 4 + 1] = T.cuda.float2_y(p_add_pair0)
                 p_pair1: T.let = T.cuda.make_float2(p[exchange_i * 4 + 2], p[exchange_i * 4 + 3])
                 peer_pair1: T.let = T.cuda.make_float2(p_exchange_tmp[2], p_exchange_tmp[3])
-                T.ptxd.add.rn.f32x2(p_add_pair1, p_pair1, peer_pair1)
+                T.ptx.add.rn.f32x2(p_add_pair1, p_pair1, peer_pair1)
                 p[exchange_i * 4 + 2] = T.cuda.float2_x(p_add_pair1)
                 p[exchange_i * 4 + 3] = T.cuda.float2_y(p_add_pair1)
 
@@ -521,7 +521,7 @@ def _kernel(
                 cur_pi_max = T.max(cur_pi_max, p[p_i])
             cur_pi_max = cur_pi_max * sm_scale_div_log2
             rowwise_max_buf[idx_in_warpgroup] = cur_pi_max
-            T.ptxd.bar.sync(T.uint32(BAR_WG0_SYNC), 128)
+            T.ptx.bar.sync(T.uint32(BAR_WG0_SYNC), 128)
             cur_pi_max = T.max(cur_pi_max, rowwise_max_buf[idx_in_warpgroup ^ 64])
             real_mi = T.max(real_mi, cur_pi_max)
             should_scale_o: T.bool = (
@@ -534,7 +534,7 @@ def _kernel(
                 new_max = mi
             else:
                 new_max = T.max(cur_pi_max, mi)
-                T.ptxd.ex2.approx.ftz.f32(scale_for_old, mi - new_max)
+                T.ptx.ex2.approx.ftz.f32(scale_for_old, mi - new_max)
             mi = new_max
 
             # S frag: warpgroup-distributed (B_H, B_TOPK) tile.
@@ -553,17 +553,17 @@ def _kernel(
             fma_pair: T.uint64
             for s_i in T.unroll((B_TOPK // 2) // 2):
                 p_pair: T.let = T.cuda.make_float2(p[s_i * 2], p[s_i * 2 + 1])
-                T.ptxd.fma.rn.f32x2(fma_pair, p_pair, scale_pair, neg_new_max_pair)
+                T.ptx.fma.rn.f32x2(fma_pair, p_pair, scale_pair, neg_new_max_pair)
                 s_x: T.float32
                 s_y: T.float32
-                T.ptxd.ex2.approx.ftz.f32(s_x, T.cuda.float2_x(fma_pair))
-                T.ptxd.ex2.approx.ftz.f32(s_y, T.cuda.float2_y(fma_pair))
+                T.ptx.ex2.approx.ftz.f32(s_x, T.cuda.float2_x(fma_pair))
+                T.ptx.ex2.approx.ftz.f32(s_y, T.cuda.float2_y(fma_pair))
                 s_pair: T.let = T.cuda.make_float2(s_x, s_y)
-                T.ptxd.add.rn.f32x2(cur_sum_pair, cur_sum_pair, s_pair)
+                T.ptx.add.rn.f32x2(cur_sum_pair, cur_sum_pair, s_pair)
                 s_pack[s_i] = T.cuda.float22bfloat162_rn(s_x, s_y)
             cur_sum: T.let = T.cuda.float2_x(cur_sum_pair) + T.cuda.float2_y(cur_sum_pair)
             li_tmp: T.float32
-            T.ptxd.fma.rn.f32(li_tmp, li, scale_for_old, cur_sum)
+            T.ptx.fma.rn.f32(li_tmp, li, scale_for_old, cur_sum)
             li = li_tmp
 
             if k > 0:
@@ -576,7 +576,7 @@ def _kernel(
             # CUDA phase1.cuh:229-232 S store (vectorized by the reg copy path).
             Tx.wg.copy(s_smem_gemm[:, :], s_frag[:, :])
             if (k > 0) & should_scale_o:
-                T.ptxd.tcgen05.fence__after_thread_sync()
+                T.ptx.tcgen05.fence__after_thread_sync()
                 # CUDA common_subroutine.h:147-168 rescale_O.
                 o_rescale_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, 32), "float32")
                 o_rescale = o_rescale_frag.local()
@@ -584,15 +584,15 @@ def _kernel(
                     Tx.wg.copy_async(
                         o_rescale_frag[:, :], o_win.chunk((None, (D_V // 2) // 32))[:, chunk_idx]
                     )
-                    T.ptxd.tcgen05.wait__ld.sync.aligned()
+                    T.ptx.tcgen05.wait__ld.sync.aligned()
                     Tx.wg.mul(o_rescale_frag[:, :], o_rescale_frag[:, :], scale_for_old)
                     Tx.wg.copy_async(
                         o_win.chunk((None, (D_V // 2) // 32))[:, chunk_idx], o_rescale_frag[:, :]
                     )
-                    T.ptxd.tcgen05.wait__st.sync.aligned()
-                T.ptxd.tcgen05.fence__before_thread_sync()
+                    T.ptx.tcgen05.wait__st.sync.aligned()
+                T.ptx.tcgen05.fence__before_thread_sync()
 
-            T.ptxd.fence.proxy.async_.shared__cta()
+            T.ptx.fence.proxy.async_.shared__cta()
             bar_so_ready.arrive(0)
             iket.range_end(softmax_token)
 
@@ -604,13 +604,13 @@ def _kernel(
             mi = T.float32(-float("inf"))
 
         rowwise_li_buf[idx_in_warpgroup] = li
-        T.ptxd.bar.sync(T.uint32(BAR_WG0_SYNC), 128)
+        T.ptx.bar.sync(T.uint32(BAR_WG0_SYNC), 128)
         li = li + rowwise_li_buf[idx_in_warpgroup ^ 64]
 
         if idx_in_warpgroup < B_H:
             cur_lse: T.float32
             cur_lse_log: T.let = T.log(li)
-            T.ptxd.fma.rn.f32(cur_lse, mi, LN_2, cur_lse_log)
+            T.ptx.fma.rn.f32(cur_lse, mi, LN_2, cur_lse_log)
             cur_lse = T.if_then_else(
                 cur_lse == T.float32(-float("inf")), T.float32(float("inf")), cur_lse
             )
@@ -621,7 +621,7 @@ def _kernel(
         last_buf: T.int32 = _ring_mod3(last_k, max_k_blocks)
         last_phase: T.int32 = _ring_phase_parity(last_k, max_k_blocks)
         bar_sv_done.wait(last_buf, last_phase)
-        T.ptxd.tcgen05.fence__after_thread_sync()
+        T.ptx.tcgen05.fence__after_thread_sync()
 
         attn_sink_log2: T.let = (
             T.cuda.ldg(attn_sink.ptr_to([idx_in_warpgroup % B_H]), "float32") * LOG_2_E
@@ -629,7 +629,7 @@ def _kernel(
             else T.float32(-float("inf"))
         )
         sink_exp: T.float32
-        T.ptxd.ex2.approx.ftz.f32(sink_exp, attn_sink_log2 - mi)
+        T.ptx.ex2.approx.ftz.f32(sink_exp, attn_sink_log2 - mi)
         output_scale: T.float32 = T.cuda.fdividef(T.float32(1.0), li + sink_exp)
 
         o_epi_frag = T.alloc_tcgen05_ldst_frag("32x32b", (128, 64), "float32")
@@ -651,15 +651,15 @@ def _kernel(
                         o_epi_frag[:, :],
                         o_win.chunk((None, (D_V // 2) // 64))[:, epi_c * 2 + epi_k],
                     )
-                    T.ptxd.tcgen05.wait__ld.sync.aligned()
+                    T.ptx.tcgen05.wait__ld.sync.aligned()
                 Tx.wg.mul(o_epi_frag[:, :], o_epi_frag[:, :], output_scale)
                 Tx.wg.cast(o_epi_bf16_frag[:, :], o_epi_frag[:, :])
                 Tx.wg.copy(
                     o_smem_win.chunk((None, (D_V // 2) // 64))[:, epi_c * 2 + epi_k],
                     o_epi_bf16_frag[:, :],
                 )
-                T.ptxd.fence.proxy.async_.shared__cta()
-                T.ptxd.bar.sync(T.uint32(BAR_WG0_SYNC), 128)
+                T.ptx.fence.proxy.async_.shared__cta()
+                T.ptx.bar.sync(T.uint32(BAR_WG0_SYNC), 128)
                 if warp_idx == 0:
                     if T.cuda.elect_sync():
                         # CUDA phase1.cuh:335-342: first half O TMA store.
@@ -680,7 +680,7 @@ def _kernel(
                         )
 
         if warp_idx == 0:
-            T.ptxd.tcgen05.dealloc.cta_group__1.sync.aligned.b32(T.uint32(0), T.uint32(512))
+            T.ptx.tcgen05.dealloc.cta_group__1.sync.aligned.b32(T.uint32(0), T.uint32(512))
         iket.range_end(epilogue_token)
 
     elif warpgroup_idx == 1:
@@ -750,10 +750,10 @@ def _kernel(
                     gather_nope_part(1, bar_kv_nope_ready_part1)
                 else:
                     tx_bytes = T.uint32(WG1_ROWS_PER_WARP * 4 * (D_V // 2) * BF16_BYTES)
-                    T.ptxd.mbarrier.complete_tx.relaxed.cluster.shared__cluster.b64(
+                    T.ptx.mbarrier.complete_tx.relaxed.cluster.shared__cluster.b64(
                         bar_kv_nope_ready_part0.ptr_to([cur_buf]), T.uint32(tx_bytes)
                     )
-                    T.ptxd.mbarrier.complete_tx.relaxed.cluster.shared__cluster.b64(
+                    T.ptx.mbarrier.complete_tx.relaxed.cluster.shared__cluster.b64(
                         bar_kv_nope_ready_part1.ptr_to([cur_buf]), T.uint32(tx_bytes)
                     )
         iket.range_end(kv_nope_token)
@@ -767,14 +767,14 @@ def _kernel(
                 if have_rope:
                     bar_prologue_q_rope.arrive(0, tx_count=B_H * (d_qk - D_V) * BF16_BYTES)
                     bar_prologue_q_rope.wait(0, 0)
-                    T.ptxd.tcgen05.fence__after_thread_sync()
+                    T.ptx.tcgen05.fence__after_thread_sync()
                     q_rope_tmem_cp = q_rope_tmem_bmm.rearrange("b h k -> h (b k)")
                     Tx.copy_async(q_rope_tmem_cp[:, :], q_rope[:, :])
                     bar_prologue_utccp_rope.arrive(0)
 
                 bar_prologue_q_nope.arrive(0, tx_count=B_H * D_V * BF16_BYTES)
                 bar_prologue_q_nope.wait(0, 0)
-                T.ptxd.tcgen05.fence__after_thread_sync()
+                T.ptx.tcgen05.fence__after_thread_sync()
                 q_nope_tmem_cp = q_nope_tmem_bmm.rearrange("b h (dc di) -> h dc b di", di=64)
                 Tx.copy_async(
                     q_nope_tmem_cp[:, :, :, :],
@@ -792,11 +792,11 @@ def _kernel(
                         cur_buf: T.int32 = _ring_mod3(k, max_k_blocks)
                         cur_phase: T.int32 = _ring_phase_parity(k, max_k_blocks)
                         bar_p_free.wait(0, T.bitwise_xor(T.bitwise_and(k, T.int32(1)), T.int32(1)))
-                        T.ptxd.tcgen05.fence__after_thread_sync()
+                        T.ptx.tcgen05.fence__after_thread_sync()
 
                         if have_rope:
                             bar_kv_rope_ready.wait(0, T.bitwise_and(k, T.int32(1)))
-                            T.ptxd.tcgen05.fence__after_thread_sync()
+                            T.ptx.tcgen05.fence__after_thread_sync()
                             # CUDA phase1.cuh:489 Q RoPE x K RoPE MMA.
                             mma_p_accumulate = T.uint32(0)
                             Tx.gemm_async(
@@ -818,7 +818,7 @@ def _kernel(
                             else:
                                 bar_kv_nope_ready_part1.arrive(cur_buf, tx_count=tx_bytes)
                                 bar_kv_nope_ready_part1.wait(cur_buf, cur_phase)
-                            T.ptxd.tcgen05.fence__after_thread_sync()
+                            T.ptx.tcgen05.fence__after_thread_sync()
                             # CUDA phase1.cuh:505-506 Q NoPE x K NoPE MMA.
                             clear_nope_accum: T.let = (not have_rope) & (kv_nope_part_idx == 0)
                             mma_p_accumulate = T.if_then_else(
@@ -837,7 +837,7 @@ def _kernel(
                     if k > 0:
                         cur_buf_prev: T.int32 = _ring_mod3(k - 1, max_k_blocks)
                         bar_so_ready.wait(0, T.bitwise_and(k - 1, T.int32(1)))
-                        T.ptxd.tcgen05.fence__after_thread_sync()
+                        T.ptx.tcgen05.fence__after_thread_sync()
                         # CUDA phase1.cuh:521-523 S(i-1) x V(i-1) MMA.
                         mma_o_accumulate = T.if_then_else(k == 1, T.uint32(0), T.uint32(1))
 
@@ -918,7 +918,7 @@ def _kernel(
                             predicate=is_valid_index,
                             fill_mode="zero",
                         )
-                    T.ptxd.cp.async_.mbarrier.arrive.noinc.shared__cta.b64(
+                    T.ptx.cp.async_.mbarrier.arrive.noinc.shared__cta.b64(
                         bar_kv_rope_ready.ptr_to([0])
                     )
             iket.range_end(kv_rope_token)

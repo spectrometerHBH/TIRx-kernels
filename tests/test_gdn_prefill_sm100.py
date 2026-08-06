@@ -106,7 +106,7 @@ def test_gdn_prefill_sm100_rejects_tile_primitive_execution_apis() -> None:
     assert "T.device_entry()" in source
     assert not {needle for needle in forbidden if needle in source}
     assert '"evict_normal"' not in source
-    # The five TMA copies pass their zero cache policy as the ptxd chain's
+    # The five TMA copies pass their zero cache policy as the ptx chain's
     # trailing positional operand (the legacy kwarg spelling is retired).
     assert source.count("T.uint64(0),") == 5
     assert source.count("_descriptor_copy_payload(o_map, descriptor_o)") == 1
