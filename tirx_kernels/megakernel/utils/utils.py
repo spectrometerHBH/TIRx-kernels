@@ -150,20 +150,6 @@ __forceinline__ __device__ void threadfence_block() {
     )
 
 
-def any_sync(mask, pred):
-    return T.cuda.func_call(
-        "any_sync",
-        mask,
-        pred,
-        source_code="""
-__forceinline__ __device__ int any_sync(unsigned mask, int pred) {
-  return __any_sync(mask, pred);
-}
-""",
-        return_type="int32",
-    )
-
-
 def gt(lhs, rhs):
     return T.cuda.func_call(
         "gt",
