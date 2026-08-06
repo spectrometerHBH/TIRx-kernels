@@ -418,116 +418,117 @@ def _kernel_tx_tile(
 
     # .cu:579-682 Mbarrier init (17 groups, 77 barriers at smem_raw[0..616)).
     if warp == 0:
-        leader = T.ptx.elect_sync()
+        leader = T.cuda.elect_sync()
         if leader:
             # qk_full: 5 barriers, init_count=1
-            T.ptx.mbarrier.init(smem_raw.ptr_to([0]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([8]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([16]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([24]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([32]), 1)
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([0]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([8]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([16]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([24]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([32]), T.uint32(1))
             # gate_raw_full: 5 barriers, init_count=1
-            T.ptx.mbarrier.init(smem_raw.ptr_to([40]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([48]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([56]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([64]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([72]), 1)
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([40]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([48]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([56]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([64]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([72]), T.uint32(1))
             # qk_raw_full: 5 barriers, init_count=1
-            T.ptx.mbarrier.init(smem_raw.ptr_to([80]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([88]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([96]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([104]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([112]), 1)
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([80]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([88]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([96]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([104]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([112]), T.uint32(1))
             # v_full: 5 barriers, init_count=1
-            T.ptx.mbarrier.init(smem_raw.ptr_to([120]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([128]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([136]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([144]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([152]), 1)
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([120]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([128]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([136]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([144]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([152]), T.uint32(1))
             # v_free: 5 barriers, init_count=4
-            T.ptx.mbarrier.init(smem_raw.ptr_to([160]), 4)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([168]), 4)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([176]), 4)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([184]), 4)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([192]), 4)
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([160]), T.uint32(4))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([168]), T.uint32(4))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([176]), T.uint32(4))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([184]), T.uint32(4))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([192]), T.uint32(4))
             # smem_free: 5 barriers, init_count=1
-            T.ptx.mbarrier.init(smem_raw.ptr_to([200]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([208]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([216]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([224]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([232]), 1)
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([200]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([208]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([216]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([224]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([232]), T.uint32(1))
             # raw_inputs_free: 5 barriers, init_count=1
-            T.ptx.mbarrier.init(smem_raw.ptr_to([240]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([248]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([256]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([264]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([272]), 1)
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([240]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([248]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([256]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([264]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([272]), T.uint32(1))
             # state_inp_ready: 5 barriers, init_count=4
-            T.ptx.mbarrier.init(smem_raw.ptr_to([280]), 4)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([288]), 4)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([296]), 4)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([304]), 4)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([312]), 4)
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([280]), T.uint32(4))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([288]), T.uint32(4))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([296]), T.uint32(4))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([304]), T.uint32(4))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([312]), T.uint32(4))
             # old_out_ready: 5 barriers, init_count=1
-            T.ptx.mbarrier.init(smem_raw.ptr_to([320]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([328]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([336]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([344]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([352]), 1)
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([320]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([328]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([336]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([344]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([352]), T.uint32(1))
             # u_inp_ready: 5 barriers, init_count=4
-            T.ptx.mbarrier.init(smem_raw.ptr_to([360]), 4)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([368]), 4)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([376]), 4)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([384]), 4)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([392]), 4)
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([360]), T.uint32(4))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([368]), T.uint32(4))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([376]), T.uint32(4))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([384]), T.uint32(4))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([392]), T.uint32(4))
             # u2_acc_ready: 5 barriers, init_count=1
-            T.ptx.mbarrier.init(smem_raw.ptr_to([400]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([408]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([416]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([424]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([432]), 1)
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([400]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([408]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([416]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([424]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([432]), T.uint32(1))
             # u2_inp_ready: 5 barriers, init_count=4
-            T.ptx.mbarrier.init(smem_raw.ptr_to([440]), 4)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([448]), 4)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([456]), 4)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([464]), 4)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([472]), 4)
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([440]), T.uint32(4))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([448]), T.uint32(4))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([456]), T.uint32(4))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([464]), T.uint32(4))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([472]), T.uint32(4))
             # final_ready: 5 barriers, init_count=1
-            T.ptx.mbarrier.init(smem_raw.ptr_to([480]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([488]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([496]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([504]), 1)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([512]), 1)
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([480]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([488]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([496]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([504]), T.uint32(1))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([512]), T.uint32(1))
             # out_empty: 1 barriers, init_count=1
-            T.ptx.mbarrier.init(smem_raw.ptr_to([520]), 1)
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([520]), T.uint32(1))
             # tmem_dealloc_ready: 1 barriers, init_count=2
-            T.ptx.mbarrier.init(smem_raw.ptr_to([528]), 2)
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([528]), T.uint32(2))
             # prep_diag_ready: 5 barriers, init_count=2
-            T.ptx.mbarrier.init(smem_raw.ptr_to([536]), 2)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([544]), 2)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([552]), 2)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([560]), 2)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([568]), 2)
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([536]), T.uint32(2))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([544]), T.uint32(2))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([552]), T.uint32(2))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([560]), T.uint32(2))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([568]), T.uint32(2))
             # prep_inv16_ready: 5 barriers, init_count=2
-            T.ptx.mbarrier.init(smem_raw.ptr_to([576]), 2)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([584]), 2)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([592]), 2)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([600]), 2)
-            T.ptx.mbarrier.init(smem_raw.ptr_to([608]), 2)
-        T.ptx.fence.mbarrier_init()  # .cu:679 fence.mbarrier_init.release.cluster
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([576]), T.uint32(2))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([584]), T.uint32(2))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([592]), T.uint32(2))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([600]), T.uint32(2))
+            T.ptx.mbarrier.init.shared.b64(smem_raw.ptr_to([608]), T.uint32(2))
+        T.ptx.fence.mbarrier_init.release.cluster()  # .cu:679 fence.mbarrier_init.release.cluster
     T.cuda.cta_sync()  # .cu:682 __syncthreads()
 
     # .cu:684-689 TMEM alloc (256 columns, 256 used).
     if warp == 0:
-        T.ptx.tcgen05.alloc(T.address_of(tmem_addr_storage[0]), n_cols=256, cta_group=1)
+        T.ptx.tcgen05.alloc.cta_group__1.sync.aligned.shared__cta.b32(
+            T.address_of(tmem_addr_storage[0]), T.uint32(256)
+        )
     T.cuda.cta_sync()  # .cu:691 __syncthreads()
-    T.ptx.tcgen05.fence.after_thread_sync()  # .cu:692
+    T.ptx.tcgen05.fence__after_thread_sync()  # .cu:692
 
     # .cu:694-712 mbarrier group bases + taddr read (volatile int load).
     mbar_base: T.int32 = T.cast(smem, "int32")
-    taddr: T.int32 = T.ptx.ld_volatile(
-        T.address_of(tmem_addr_storage[0]), "int32", "s32", space="shared"
-    )
+    taddr: T.int32
+    T.ptx.ld.volatile.shared.s32(taddr, T.address_of(tmem_addr_storage[0]))
 
     # .cu:714-721 Kernel post-init ops (TMEM column offsets).
     tmem_tmem_state: T.int32 = taddr + TMEM_TMEM_STATE_OFFSET
@@ -540,12 +541,12 @@ def _kernel_tx_tile(
 
     # .cu:723-727 Register redistribution: dec phase first (warps 8-11).
     if warp >= 8 and warp <= 11:
-        T.ptx.setmaxnreg(False, 48)
+        T.ptx.setmaxnreg.dec.sync.aligned.u32(48)
 
     # ---- Role dispatch (.cu:729-2550); role bodies transcribed in source order.
     if warp <= 3:
         # ---- Role: compute (.cu:730-963) ----
-        T.ptx.setmaxnreg(True, 168)  # .cu:731
+        T.ptx.setmaxnreg.inc.sync.aligned.u32(168)  # .cu:731
         # .cu:732 compute_main
         task_idx: T.int32 = bid  # .cu:733
         seq_idx: T.int32 = seq_order[task_idx // h]  # .cu:734
@@ -609,7 +610,7 @@ def _kernel_tx_tile(
             _tmem_st_x32_f32(
                 taddr + 64 + tmem_row_base + state_col_block * 32, state_frag
             )  # .cu:821
-        T.ptx.tcgen05.wait.st()  # .cu:823 tcgen05.wait::st.sync.aligned
+        T.ptx.tcgen05.wait__st.sync.aligned()  # .cu:823 tcgen05.wait::st.sync.aligned
         compute_stage: T.uint32 = 0  # .cu:824
         _phase_qk_full: T.uint32 = 0  # .cu:825
         _phase_v_full: T.uint32 = 0  # .cu:826
@@ -633,11 +634,9 @@ def _kernel_tx_tile(
                         _tmem_load_0[_lp * 2 + 0], _tmem_load_0[_lp * 2 + 1 + 0]
                     )
                 # .cu:844-848 (inline tcgen05.st x16 of packed bf16 pairs)
-                T.ptx.tcgen05.st(
-                    taddr + tmem_row_base + state_col_block_1 * 16,
+                T.ptx["tcgen05.st.sync.aligned.32x32b.x16.b32"](
+                    T.cast(taddr + tmem_row_base + state_col_block_1 * 16, "uint32"),
                     *[_tmem_load_0_bf16[_j] for _j in range(16)],
-                    shape="32x32b",
-                    num=16,
                 )
                 state_scale: T.f32[16]
                 for state_half in T.unroll(2):  # .cu:850-859
@@ -659,8 +658,8 @@ def _kernel_tx_tile(
                         _tmem_load_0[state_half * 16 + _ls * 2] = T.cuda.float2_x(_pk)
                         _tmem_load_0[state_half * 16 + _ls * 2 + 1] = T.cuda.float2_y(_pk)
                 _tmem_st_x32_f32(state_addr, _tmem_load_0)  # .cu:860
-            T.ptx.tcgen05.wait.st()  # .cu:862
-            if T.ptx.elect_sync():  # .cu:863-865
+            T.ptx.tcgen05.wait__st.sync.aligned()  # .cu:862
+            if T.cuda.elect_sync():  # .cu:863-865
                 _mbarrier_arrive(
                     smem_raw,
                     T.cast(smem, "int32"),
@@ -716,8 +715,8 @@ def _kernel_tx_tile(
                 _tmem_st_x8_u32(
                     taddr + 224 + tmem_row_base + residual_half * 8, residual_v_bf16
                 )  # .cu:894
-            T.ptx.tcgen05.wait.st()  # .cu:896
-            if T.ptx.elect_sync():  # .cu:897-900
+            T.ptx.tcgen05.wait__st.sync.aligned()  # .cu:896
+            if T.cuda.elect_sync():  # .cu:897-900
                 _mbarrier_arrive(
                     smem_raw, T.cast(smem, "int32"), mbar_base + MBAR_V_FREE_OFF + compute_stage * 8
                 )
@@ -740,14 +739,12 @@ def _kernel_tx_tile(
                     _tmem_load_2[_lp * 2 + 0], _tmem_load_2[_lp * 2 + 1 + 0]
                 )
             # .cu:910-914 (inline tcgen05.st x16)
-            T.ptx.tcgen05.st(
-                taddr + 224 + tmem_row_base,
+            T.ptx["tcgen05.st.sync.aligned.32x32b.x16.b32"](
+                T.cast(taddr + 224 + tmem_row_base, "uint32"),
                 *[_tmem_load_2_bf16[_j] for _j in range(16)],
-                shape="32x32b",
-                num=16,
             )
-            T.ptx.tcgen05.wait.st()  # .cu:915
-            if T.ptx.elect_sync():  # .cu:916-918
+            T.ptx.tcgen05.wait__st.sync.aligned()  # .cu:915
+            if T.cuda.elect_sync():  # .cu:916-918
                 _mbarrier_arrive(
                     smem_raw,
                     T.cast(smem, "int32"),
@@ -798,15 +795,15 @@ def _kernel_tx_tile(
                         _pk[6],
                         _pk[7],
                     )  # .cu:939/952 second uint4
-        T.ptx.bar.sync(10, 128)  # .cu:956 barrier.sync 10, 128
+        T.ptx.bar.sync(T.uint32(10), T.uint32(128))  # .cu:956 barrier.sync 10, 128
         if compute_local_warp == 0:  # .cu:957-961
-            if T.ptx.elect_sync():
+            if T.cuda.elect_sync():
                 _mbarrier_arrive(
                     smem_raw, T.cast(smem, "int32"), mbar_base + MBAR_TMEM_DEALLOC_READY_OFF
                 )
     elif warp >= 4 and warp <= 7:
         # ---- Role: epilogue (.cu:964-1090) ----
-        T.ptx.setmaxnreg(False, 48)  # .cu:965
+        T.ptx.setmaxnreg.dec.sync.aligned.u32(48)  # .cu:965
         # .cu:966 epilogue_main
         task_idx_1: T.int32 = bid  # .cu:967
         seq_idx_1: T.int32 = seq_order[task_idx_1 // h]  # .cu:968
@@ -836,31 +833,27 @@ def _kernel_tx_tile(
             if chunk_is_full != 0:  # .cu:986
                 # .cu:987-993 (inline tcgen05.ld.16x256b.x4, 16 uint32 regs)
                 _tmem_load_4: T.uint32[16]
-                T.ptx.tcgen05.ld(
-                    taddr + 192 + tmem_row_base_1,
+                T.ptx["tcgen05.ld.sync.aligned.16x256b.x4.b32"](
                     *[_tmem_load_4[_j] for _j in range(16)],
-                    shape="16x256b",
-                    num=4,
+                    T.cast(taddr + 192 + tmem_row_base_1, "uint32"),
                 )
                 # .cu:994-1000 (same at TMEM row +16)
                 _tmem_load_5: T.uint32[16]
-                T.ptx.tcgen05.ld(
-                    taddr + 192 + tmem_row_base_1 + 1048576,
+                T.ptx["tcgen05.ld.sync.aligned.16x256b.x4.b32"](
                     *[_tmem_load_5[_j] for _j in range(16)],
-                    shape="16x256b",
-                    num=4,
+                    T.cast(taddr + 192 + tmem_row_base_1 + 1048576, "uint32"),
                 )
-                T.ptx.tcgen05.wait.ld()  # .cu:1001
-                T.ptx.bar.sync(9, 128)  # .cu:1002 barrier.sync 9, 128
+                T.ptx.tcgen05.wait__ld.sync.aligned()  # .cu:1001
+                T.ptx.bar.sync(T.uint32(9), T.uint32(128))  # .cu:1002 barrier.sync 9, 128
                 if epilogue_local_warp == 0:  # .cu:1003-1007
-                    if T.ptx.elect_sync():
+                    if T.cuda.elect_sync():
                         _mbarrier_arrive(
                             smem_raw, T.cast(smem, "int32"), mbar_base + MBAR_OUT_EMPTY_OFF
                         )
                 if epilogue_local_warp == 0:  # .cu:1008-1012
                     if chunk_idx_1 >= 2:
-                        T.ptx.cp_async.bulk.wait_group(1, read=True)
-                T.ptx.bar.sync(9, 128)  # .cu:1013
+                        T.ptx.cp.async_.bulk.wait_group.read(1)
+                T.ptx.bar.sync(T.uint32(9), T.uint32(128))  # .cu:1013
                 out_stage_addr: T.int32 = (
                     smem_out_addr + T.cast(output_stage, "int32") * 8192
                 )  # .cu:1014
@@ -903,9 +896,9 @@ def _kernel_tx_tile(
                             dispatch="ldstmatrix",
                         )
                 _fence_async_shared()  # .cu:1050
-                T.ptx.bar.sync(9, 128)  # .cu:1051
+                T.ptx.bar.sync(T.uint32(9), T.uint32(128))  # .cu:1051
                 if epilogue_local_warp == 0:  # .cu:1052-1057
-                    if T.ptx.elect_sync():
+                    if T.cuda.elect_sync():
                         _tma_store_4d(
                             smem_raw,
                             T.cast(smem, "int32"),
@@ -916,15 +909,15 @@ def _kernel_tx_tile(
                             0,
                             T.cast(smem_out_addr + T.cast(output_stage, "int32") * 8192, "uint32"),
                         )  # .cu:1054
-                    T.ptx.cp_async.bulk.commit_group()  # .cu:1056
+                    T.ptx.cp.async_.bulk.commit_group()  # .cu:1056
                 output_stage = output_stage ^ T.uint32(1)  # .cu:1058
             else:  # .cu:1059-1077 (partial chunk: scalar out stores)
                 _tmem_load_6: T.f32[32]
                 _tmem_ld_x32(_tmem_load_6, taddr + 192 + tmem_row_base_1)  # .cu:1060-1061
-                T.ptx.tcgen05.wait.ld()  # .cu:1062
-                T.ptx.bar.sync(9, 128)  # .cu:1063
+                T.ptx.tcgen05.wait__ld.sync.aligned()  # .cu:1062
+                T.ptx.bar.sync(T.uint32(9), T.uint32(128))  # .cu:1063
                 if epilogue_local_warp == 0:  # .cu:1064-1068
-                    if T.ptx.elect_sync():
+                    if T.cuda.elect_sync():
                         _mbarrier_arrive(
                             smem_raw, T.cast(smem, "int32"), mbar_base + MBAR_OUT_EMPTY_OFF
                         )
@@ -942,10 +935,10 @@ def _kernel_tx_tile(
                 epilogue_stage = T.uint32(0)
                 _phase_final_ready_1 = _phase_final_ready_1 ^ T.uint32(1)
         if epilogue_local_warp == 0:  # .cu:1081-1083
-            T.ptx.cp_async.bulk.wait_group(0, read=False)
-        T.ptx.bar.sync(9, 128)  # .cu:1084
+            T.ptx.cp.async_.bulk.wait_group(0)
+        T.ptx.bar.sync(T.uint32(9), T.uint32(128))  # .cu:1084
         if epilogue_local_warp == 0:  # .cu:1085-1089
-            if T.ptx.elect_sync():
+            if T.cuda.elect_sync():
                 _mbarrier_arrive(
                     smem_raw, T.cast(smem, "int32"), mbar_base + MBAR_TMEM_DEALLOC_READY_OFF
                 )
@@ -996,19 +989,17 @@ def _kernel_tx_tile(
                 tmem_tmem_u_acc, T.cast(_mma_b_lo_1, "int32"), tmem_tmem_state_inp, 0
             )  # .cu:1153-1189
             # .cu:1190 elect_commit2(old_out_ready + stage*8, raw_inputs_free + stage*8)
-            _leader_1190 = T.ptx.elect_sync()
-            T.ptx.tcgen05.commit(
+            _leader_1190 = T.cuda.elect_sync()
+            T.ptx.tcgen05.commit.cta_group__1.mbarrier__arrive__one.shared__cluster.b64(
                 smem_raw.ptr_to(
                     [(mbar_base + MBAR_OLD_OUT_READY_OFF + mma_stage * 8) - T.cast(smem, "int32")]
                 ),
-                cta_group=1,
                 pred=_leader_1190,
             )
-            T.ptx.tcgen05.commit(
+            T.ptx.tcgen05.commit.cta_group__1.mbarrier__arrive__one.shared__cluster.b64(
                 smem_raw.ptr_to(
                     [(mbar_base + MBAR_RAW_INPUTS_FREE_OFF + mma_stage * 8) - T.cast(smem, "int32")]
                 ),
-                cta_group=1,
                 pred=_leader_1190,
             )
             _mbarrier_wait(
@@ -1045,19 +1036,17 @@ def _kernel_tx_tile(
                 tmem_tmem_state_out, T.cast(_mma_b_lo_3, "int32"), tmem_tmem_u2_inp, 1
             )  # .cu:1217-1235
             # .cu:1236 elect_commit2(final_ready + stage*8, smem_free + stage*8)
-            _leader_1236 = T.ptx.elect_sync()
-            T.ptx.tcgen05.commit(
+            _leader_1236 = T.cuda.elect_sync()
+            T.ptx.tcgen05.commit.cta_group__1.mbarrier__arrive__one.shared__cluster.b64(
                 smem_raw.ptr_to(
                     [(mbar_base + MBAR_FINAL_READY_OFF + mma_stage * 8) - T.cast(smem, "int32")]
                 ),
-                cta_group=1,
                 pred=_leader_1236,
             )
-            T.ptx.tcgen05.commit(
+            T.ptx.tcgen05.commit.cta_group__1.mbarrier__arrive__one.shared__cluster.b64(
                 smem_raw.ptr_to(
                     [(mbar_base + MBAR_SMEM_FREE_OFF + mma_stage * 8) - T.cast(smem, "int32")]
                 ),
-                cta_group=1,
                 pred=_leader_1236,
             )
             mma_stage += 1  # .cu:1237
@@ -1075,11 +1064,12 @@ def _kernel_tx_tile(
             _phase_tmem_dealloc_ready_0,
         )  # .cu:1241
         _phase_tmem_dealloc_ready_0 = _phase_tmem_dealloc_ready_0 ^ T.uint32(1)  # .cu:1242
-        _tmem_dealloc_addr: T.int32 = T.ptx.ld_volatile(
-            T.address_of(tmem_addr_storage[0]), "int32", "s32", space="shared"
-        )  # .cu:1243
-        T.ptx.tcgen05.dealloc(_tmem_dealloc_addr, 256, cta_group=1)  # .cu:1244
-        T.ptx.tcgen05.relinquish_alloc_permit(cta_group=1)  # .cu:1245
+        _tmem_dealloc_addr: T.int32  # .cu:1243
+        T.ptx.ld.volatile.shared.s32(_tmem_dealloc_addr, T.address_of(tmem_addr_storage[0]))
+        T.ptx.tcgen05.dealloc.cta_group__1.sync.aligned.b32(
+            T.cast(_tmem_dealloc_addr, "uint32"), T.uint32(256)
+        )  # .cu:1244
+        T.ptx.tcgen05.relinquish_alloc_permit.cta_group__1.sync.aligned()  # .cu:1245
     elif warp == 10:
         # ---- Role: load (.cu:1248-1296) ----
         # .cu:1249 load_main
@@ -1109,7 +1099,7 @@ def _kernel_tx_tile(
             chunk_is_full_1: T.int32 = T.if_then_else(
                 seq_len_3 >= (chunk_idx_2 + 1) * 32, 1, 0
             )  # .cu:1264
-            if T.ptx.elect_sync():  # .cu:1265-1270
+            if T.cuda.elect_sync():  # .cu:1265-1270
                 if chunk_is_full_1 != 0:
                     _mbarrier_arrive_expect_tx(
                         smem_raw.ptr_to(
@@ -1137,17 +1127,16 @@ def _kernel_tx_tile(
                     v_src: T.int64 = (
                         token * T.cast(h, "int64") + T.cast(head_idx_2, "int64")
                     ) * 128 + T.cast(segment * 8, "int64")  # .cu:1279
-                    T.ptx.cp_async(
+                    T.ptx["cp.async.cg.shared.global"](
                         smem_raw.ptr_to([SMEM_SMEM_V_OFF + T.cast(load_stage, "int32") * 41984 + (row * 128 + segment * 8) * 2]),
                         v.ptr_to([v_src]),
                         16,
-                        predicate=token_valid,
-                        fill_mode="zero",
+                        T.cast(T.if_then_else(token_valid != 0, 16, 0), "uint32"),
                     )  # .cu:1280-1281  # fmt: skip
-                T.ptx.cp_async.commit_group()  # .cu:1283
-                T.ptx.cp_async.wait_group(0)  # .cu:1284
-            T.ptx.bar.sync(8, 32)  # .cu:1286 barrier.sync 8, 32
-            if T.ptx.elect_sync():  # .cu:1287-1292
+                T.ptx.cp.async_.commit_group()  # .cu:1283
+                T.ptx.cp.async_.wait_group(0)  # .cu:1284
+            T.ptx.bar.sync(T.uint32(8), T.uint32(32))  # .cu:1286 barrier.sync 8, 32
+            if T.cuda.elect_sync():  # .cu:1287-1292
                 if chunk_is_full_1 == 0:
                     _fence_async_shared()  # .cu:1289
                     _mbarrier_arrive(
@@ -1162,7 +1151,7 @@ def _kernel_tx_tile(
                 _phase_qk_full_2 = _phase_qk_full_2 ^ T.uint32(1)
     elif warp >= 12 and warp <= 31:
         # ---- Role: prep (.cu:1298-2550) ----
-        T.ptx.setmaxnreg(False, 48)  # .cu:1299
+        T.ptx.setmaxnreg.dec.sync.aligned.u32(48)  # .cu:1299
         # .cu:1300 prep_main
         task_idx_4: T.int32 = bid  # .cu:1301
         seq_idx_4: T.int32 = seq_order[task_idx_4 // h]  # .cu:1302
@@ -1182,16 +1171,16 @@ def _kernel_tx_tile(
         if prep_tid == 0:  # .cu:1316-1319
             smem_gate_rate_all[gate_rate_stage_f32] = _expf(A_log[head_idx_3])
         if prep_instance == 0:  # .cu:1320-1332
-            T.ptx.bar.sync(11, 128)
+            T.ptx.bar.sync(T.uint32(11), T.uint32(128))
         elif prep_instance == 1:
-            T.ptx.bar.sync(12, 128)
+            T.ptx.bar.sync(T.uint32(12), T.uint32(128))
         else:
             if prep_instance == 2:
-                T.ptx.bar.sync(13, 128)
+                T.ptx.bar.sync(T.uint32(13), T.uint32(128))
             elif prep_instance == 3:
-                T.ptx.bar.sync(14, 128)
+                T.ptx.bar.sync(T.uint32(14), T.uint32(128))
             else:
-                T.ptx.bar.sync(15, 128)
+                T.ptx.bar.sync(T.uint32(15), T.uint32(128))
         _phase_raw_inputs_free: T.uint32 = 1  # .cu:1333
         _phase_gate_raw_full: T.uint32 = 0  # .cu:1334
         _phase_smem_free: T.uint32 = 1  # .cu:1335
@@ -1215,7 +1204,7 @@ def _kernel_tx_tile(
                     _phase_raw_inputs_free,
                 )  # .cu:1348
                 if prep_local_warp == 0:  # .cu:1349-1357
-                    if T.ptx.elect_sync():
+                    if T.cuda.elect_sync():
                         _mbarrier_arrive_expect_tx(
                             smem_raw.ptr_to([(mbar_base + MBAR_GATE_RAW_FULL_OFF + prep_stage * 8) - T.cast(smem, "int32")]),
                             8704,
@@ -1304,7 +1293,7 @@ def _kernel_tx_tile(
             )  # .cu:1393
             if chunk_is_full_2 != 0:  # .cu:1394-1400
                 if prep_local_warp == 0:
-                    if T.ptx.elect_sync():
+                    if T.cuda.elect_sync():
                         _tma_4d_gmem2smem(
                             smem_raw,
                             T.cast(smem, "int32"),
@@ -1327,27 +1316,26 @@ def _kernel_tx_tile(
                     gate_load_base: T.int64 = (
                         gate_load_token * T.cast(h, "int64") + T.cast(head_idx_3, "int64")
                     ) * 128 + T.cast(gate_load_segment * 8, "int64")  # .cu:1408
-                    T.ptx.cp_async(
+                    T.ptx["cp.async.cg.shared.global"](
                         smem_raw.ptr_to([SMEM_SMEM_G_RAW_OFF + T.cast(prep_stage, "int32") * 41984 + gate_load_item * 16]),
                         g.ptr_to([gate_load_base]),
                         16,
-                        predicate=T.if_then_else(gate_load_token < eos_4, 1, 0),
-                        fill_mode="zero",
+                        T.cast(T.if_then_else(T.if_then_else(gate_load_token < eos_4, 1, 0) != 0, 16, 0), "uint32"),
                     )  # .cu:1409-1410  # fmt: skip
             if chunk_is_full_2 == 0:  # .cu:1413-1429
-                T.ptx.cp_async.commit_group()  # .cu:1414
-                T.ptx.cp_async.wait_group(0)  # .cu:1415
+                T.ptx.cp.async_.commit_group()  # .cu:1414
+                T.ptx.cp.async_.wait_group(0)  # .cu:1415
                 if prep_instance == 0:
-                    T.ptx.bar.sync(11, 128)
+                    T.ptx.bar.sync(T.uint32(11), T.uint32(128))
                 elif prep_instance == 1:
-                    T.ptx.bar.sync(12, 128)
+                    T.ptx.bar.sync(T.uint32(12), T.uint32(128))
                 else:
                     if prep_instance == 2:
-                        T.ptx.bar.sync(13, 128)
+                        T.ptx.bar.sync(T.uint32(13), T.uint32(128))
                     elif prep_instance == 3:
-                        T.ptx.bar.sync(14, 128)
+                        T.ptx.bar.sync(T.uint32(14), T.uint32(128))
                     else:
-                        T.ptx.bar.sync(15, 128)
+                        T.ptx.bar.sync(T.uint32(15), T.uint32(128))
             if prep_local_warp == 2 and lane < 32:  # .cu:1430-1442
                 beta_value: T.f32 = early_beta_value  # .cu:1431
                 if chunk_is_full_2 == 0:  # .cu:1432-1440
@@ -1393,16 +1381,16 @@ def _kernel_tx_tile(
                     prefix_log2 += gate_log2  # .cu:1469
                     smem_gate_all[stage_f32 + gate_row * 128 + gate_col] = prefix_log2  # .cu:1470
             if prep_instance == 0:  # .cu:1473-1485
-                T.ptx.bar.sync(11, 128)
+                T.ptx.bar.sync(T.uint32(11), T.uint32(128))
             elif prep_instance == 1:
-                T.ptx.bar.sync(12, 128)
+                T.ptx.bar.sync(T.uint32(12), T.uint32(128))
             else:
                 if prep_instance == 2:
-                    T.ptx.bar.sync(13, 128)
+                    T.ptx.bar.sync(T.uint32(13), T.uint32(128))
                 elif prep_instance == 3:
-                    T.ptx.bar.sync(14, 128)
+                    T.ptx.bar.sync(T.uint32(14), T.uint32(128))
                 else:
-                    T.ptx.bar.sync(15, 128)
+                    T.ptx.bar.sync(T.uint32(15), T.uint32(128))
             if chunk_is_full_2 != 0:  # .cu:1486-1488
                 _mbarrier_wait(
                     smem_raw,
@@ -1600,16 +1588,16 @@ def _kernel_tx_tile(
                         packed_1_1[word_2],
                     )  # fmt: skip
             if prep_instance == 0:  # .cu:1695-1707
-                T.ptx.bar.sync(11, 128)
+                T.ptx.bar.sync(T.uint32(11), T.uint32(128))
             elif prep_instance == 1:
-                T.ptx.bar.sync(12, 128)
+                T.ptx.bar.sync(T.uint32(12), T.uint32(128))
             else:
                 if prep_instance == 2:
-                    T.ptx.bar.sync(13, 128)
+                    T.ptx.bar.sync(T.uint32(13), T.uint32(128))
                 elif prep_instance == 3:
-                    T.ptx.bar.sync(14, 128)
+                    T.ptx.bar.sync(T.uint32(14), T.uint32(128))
                 else:
-                    T.ptx.bar.sync(15, 128)
+                    T.ptx.bar.sync(T.uint32(15), T.uint32(128))
             pair_row_base: T.int32 = prep_local_warp // 2 * 16  # .cu:1708
             pair_col_base: T.int32 = prep_local_warp % 2 * 16  # .cu:1709
             a_frag = T.alloc_local((4,), "uint32", align=4)  # .cu:1710
@@ -1914,16 +1902,16 @@ def _kernel_tx_tile(
                     dispatch="ldstmatrix",
                 )
             if prep_instance == 0:  # .cu:2052-2064
-                T.ptx.bar.sync(11, 128)
+                T.ptx.bar.sync(T.uint32(11), T.uint32(128))
             elif prep_instance == 1:
-                T.ptx.bar.sync(12, 128)
+                T.ptx.bar.sync(T.uint32(12), T.uint32(128))
             else:
                 if prep_instance == 2:
-                    T.ptx.bar.sync(13, 128)
+                    T.ptx.bar.sync(T.uint32(13), T.uint32(128))
                 elif prep_instance == 3:
-                    T.ptx.bar.sync(14, 128)
+                    T.ptx.bar.sync(T.uint32(14), T.uint32(128))
                 else:
-                    T.ptx.bar.sync(15, 128)
+                    T.ptx.bar.sync(T.uint32(15), T.uint32(128))
             if prep_tid < 128:  # .cu:2065-2069
                 total_log2_1: T.f32 = smem_gt_prefix_all[stage_f32 + prep_tid]  # .cu:2066
                 smem_gt_all[stage_f32 + prep_tid] = _approx_exp2(total_log2_1)  # .cu:2067-2068
@@ -2246,7 +2234,7 @@ def _kernel_tx_tile(
                         packed_0_3[word_6],
                     )  # fmt: skip
             if prep_local_warp < 2:  # .cu:2251-2256
-                if T.ptx.elect_sync():
+                if T.cuda.elect_sync():
                     _mbarrier_arrive(
                         smem_raw,
                         T.cast(smem, "int32"),
@@ -2353,7 +2341,7 @@ def _kernel_tx_tile(
                     o_view[0:8, 0:8],
                     dispatch="ldstmatrix",
                 )
-                if T.ptx.elect_sync():  # .cu:2318-2320
+                if T.cuda.elect_sync():  # .cu:2318-2320
                     _mbarrier_arrive(
                         smem_raw,
                         T.cast(smem, "int32"),
@@ -2577,18 +2565,18 @@ def _kernel_tx_tile(
                         )  # fmt: skip
             _fence_async_shared()  # .cu:2523
             if prep_instance == 0:  # .cu:2524-2536
-                T.ptx.bar.sync(11, 128)
+                T.ptx.bar.sync(T.uint32(11), T.uint32(128))
             elif prep_instance == 1:
-                T.ptx.bar.sync(12, 128)
+                T.ptx.bar.sync(T.uint32(12), T.uint32(128))
             else:
                 if prep_instance == 2:
-                    T.ptx.bar.sync(13, 128)
+                    T.ptx.bar.sync(T.uint32(13), T.uint32(128))
                 elif prep_instance == 3:
-                    T.ptx.bar.sync(14, 128)
+                    T.ptx.bar.sync(T.uint32(14), T.uint32(128))
                 else:
-                    T.ptx.bar.sync(15, 128)
+                    T.ptx.bar.sync(T.uint32(15), T.uint32(128))
             if prep_local_warp == 0:  # .cu:2537-2541
-                if T.ptx.elect_sync():
+                if T.cuda.elect_sync():
                     _mbarrier_arrive(
                         smem_raw,
                         T.cast(smem, "int32"),
