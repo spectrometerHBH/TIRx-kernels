@@ -85,10 +85,10 @@ class Barriers:
         self._alloc()
         if self.pipe_depth == 1:
             if tid == 0:
-                T.ptxd.mbarrier.init.shared.b64(self.mbar.ptr_to([0]), T.uint32(threads_num_wait))
+                T.ptx.mbarrier.init.shared.b64(self.mbar.ptr_to([0]), T.uint32(threads_num_wait))
         elif tid == 0:
             for i in T.serial(self.pipe_depth):
-                T.ptxd.mbarrier.init.shared.b64(self.mbar.ptr_to([i]), T.uint32(threads_num_wait))
+                T.ptx.mbarrier.init.shared.b64(self.mbar.ptr_to([i]), T.uint32(threads_num_wait))
 
     @T.inline
     def wait(self, idx, phase):
@@ -142,11 +142,11 @@ class SmemManager:
         self.cur_phase[0] = 1
         if tid == 0:
             for i in T.serial(self.chunk_num):
-                T.ptxd.mbarrier.init.shared.b64(self.mbar.ptr_to([i]), T.uint32(1))
+                T.ptx.mbarrier.init.shared.b64(self.mbar.ptr_to([i]), T.uint32(1))
             self.shared_count[0] = 0
         T.tvm_storage_sync("shared")
-        T.ptxd.fence.mbarrier_init.release.cluster()
-        T.ptxd.fence.proxy.async_.shared__cta()
+        T.ptx.fence.mbarrier_init.release.cluster()
+        T.ptx.fence.proxy.async_.shared__cta()
 
     def alloc(
         self,
@@ -293,7 +293,7 @@ class SmemManager:
             if warp_id % KernelConfig.WARP_NUMBER == 0:
                 if lane_id < self.chunk_num:
                     T.cuda.mbarrier_wait(self.mbar.ptr_to([lane_id]), self.cur_phase[0])
-            T.ptxd.bar.sync(T.uint32(6 + wg_id), 128)
+            T.ptx.bar.sync(T.uint32(6 + wg_id), 128)
 
     @T.inline
     def wait_specific(self, lane_id, buffer, split_idx: int):
@@ -344,10 +344,10 @@ class SmemManager:
             T.tvm_storage_sync("shared")
             if warp_id == 0:
                 if lane_id < self.chunk_num:
-                    T.ptxd.mbarrier.arrive.shared.b64(self.mbar.ptr_to([lane_id]), T.uint32(1))
+                    T.ptx.mbarrier.arrive.shared.b64(self.mbar.ptr_to([lane_id]), T.uint32(1))
         elif level == "warpgroup":
             self.reg_count[0] = 0
-            T.ptxd.bar.sync(T.uint32(6 + wg_id), 128)
+            T.ptx.bar.sync(T.uint32(6 + wg_id), 128)
             if warp_id % KernelConfig.WARP_NUMBER == 0:
                 if lane_id == 0:
                     self.reg_count[0] = T.cuda.atomic_add(T.address_of(self.shared_count[0]), 1) + 1
@@ -358,7 +358,7 @@ class SmemManager:
                 self.reg_count[0] = T.tvm_warp_shuffle(4294967295, self.reg_count[0], 0, 32, 32)
                 if self.reg_count[0] == KernelConfig.WG_NUMBER:
                     if lane_id < self.chunk_num:
-                        T.ptxd.mbarrier.arrive.shared.b64(self.mbar.ptr_to([lane_id]), T.uint32(1))
+                        T.ptx.mbarrier.arrive.shared.b64(self.mbar.ptr_to([lane_id]), T.uint32(1))
 
     @T.inline
     def arrive_specific(self, lane_id, buffer, split_idx: int):
@@ -373,17 +373,17 @@ class SmemManager:
             - 1
         ) // self.chunk_size
         if (lane_id >= beg_chunk_id) & (lane_id <= end_chunk_id):
-            T.ptxd.mbarrier.arrive.shared.b64(self.mbar.ptr_to([lane_id]), T.uint32(1))
+            T.ptx.mbarrier.arrive.shared.b64(self.mbar.ptr_to([lane_id]), T.uint32(1))
 
     @T.inline
     def arrive_unused(self, lane_id, cur_tile: Tile):
         self._assert_cond(len(self.tiles[self.cur_tile_name][1]["shared"]) == 0)
         if (lane_id < self.chunk_num) & (lane_id > self.tiles[str(cur_tile)][0]):
-            T.ptxd.mbarrier.arrive.shared.b64(self.mbar.ptr_to([lane_id]), T.uint32(1))
+            T.ptx.mbarrier.arrive.shared.b64(self.mbar.ptr_to([lane_id]), T.uint32(1))
 
     @T.inline
     def arrive_chunk(self, chunk_id):
-        T.ptxd.mbarrier.arrive.shared.b64(self.mbar.ptr_to([chunk_id]), T.uint32(1))
+        T.ptx.mbarrier.arrive.shared.b64(self.mbar.ptr_to([chunk_id]), T.uint32(1))
 
 
 @T.meta_class
@@ -594,7 +594,7 @@ class MegaKernelWrapper:
             state[0] = -1
             while 1:
                 if lane_id == 0:
-                    T.ptxd.ld.acquire.gpu.global_.b32(
+                    T.ptx.ld.acquire.gpu.global_.b32(
                         state[0], self.evt_etensor_init_complete.sem.ptr_to([0])
                     )
                 if T.cuda.any_sync(

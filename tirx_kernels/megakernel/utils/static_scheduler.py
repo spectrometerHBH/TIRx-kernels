@@ -35,7 +35,7 @@ class Semaphore(SemaphoreBase):
     def semaphore_wait(self, *coord, level: Literal["cta", "warp"] = "cta", mask=0xFFFFFFFF):
         if level == "cta":
             while 1:
-                T.ptxd.ld.acquire.gpu.global_.b32(
+                T.ptx.ld.acquire.gpu.global_.b32(
                     self.state[0], self.sem.access_ptr("r", offset=self.sem.elem_offset_of(coord))
                 )
                 if T.cuda.syncthreads_and(self.state[0] == 0):
@@ -48,7 +48,7 @@ class Semaphore(SemaphoreBase):
                 self.state[0] = -1
                 while 1:
                     if lane_id == 0:
-                        T.ptxd.ld.acquire.gpu.global_.b32(
+                        T.ptx.ld.acquire.gpu.global_.b32(
                             self.state[0],
                             self.sem.access_ptr("r", offset=self.sem.elem_offset_of(coord)),
                         )
@@ -66,7 +66,7 @@ class Semaphore(SemaphoreBase):
         )
         if self.state[0] <= 0:
             while 1:
-                T.ptxd.ld.acquire.gpu.global_.b32(self.state[0], self.sem.ptr_to(coord))
+                T.ptx.ld.acquire.gpu.global_.b32(self.state[0], self.sem.ptr_to(coord))
                 if gt(self.state[0], 0):
                     atomic_add_int32(
                         self.sem.ptr_to(coord), -(self.base + 1), rank, release=release
@@ -170,7 +170,7 @@ class StaticTileScheduler(TileSchedulerBase):
             elif scope == "warp":
                 T.cuda.warp_sync()
             elif scope == "warpgroup":
-                T.ptxd.bar.sync(T.uint32(6 + scope_id), 128)
+                T.ptx.bar.sync(T.uint32(6 + scope_id), 128)
             elif scope == "cta":
                 T.tvm_storage_sync("shared")
 

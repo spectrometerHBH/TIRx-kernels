@@ -242,7 +242,7 @@ def _mapa_u64(ptr, rank):
     a one-element local buffer gives both a writable lvalue and an Expr.
     """
     mapped = T.alloc_local([1], "uint64")
-    T.evaluate(T.ptxd.mapa.u64(mapped[0], ptr, T.uint32(rank)))
+    T.evaluate(T.ptx.mapa.u64(mapped[0], ptr, T.uint32(rank)))
     return mapped[0]
 
 
@@ -377,7 +377,7 @@ def _kernel(
     tmem_finished.init(1)
     pool.commit()
     if mbar_leader:
-        T.ptxd.fence.mbarrier_init.release.cluster()
+        T.ptx.fence.mbarrier_init.release.cluster()
     tmem_pool = T.TMEMPool(pool, total_cols=512, cta_group=CTA_GROUP, tmem_addr=tmem_addr)
     tmem = tmem_pool.alloc((CTA_M, 512), "float32")
     A_smem = A_smem_packed.view("float4_e2m1fn")
@@ -396,10 +396,10 @@ def _kernel(
     # the existing cluster release/acquire before any other warp consumes the
     # TMEM base address.
     tmem_pool.commit()
-    T.ptxd.barrier.cluster.arrive.release.aligned()
-    T.ptxd.barrier.cluster.wait.acquire()
+    T.ptx.barrier.cluster.arrive.release.aligned()
+    T.ptx.barrier.cluster.wait.acquire()
     if tid_in_cta < 32:
-        T.ptxd[f"tcgen05.relinquish_alloc_permit.cta_group::{CTA_GROUP}.sync.aligned"]()
+        T.ptx[f"tcgen05.relinquish_alloc_permit.cta_group::{CTA_GROUP}.sync.aligned"]()
     pair_mask: T.int32
     pair_mask = 0
     pair_mask = pair_mask | 1 << pair_leader_rank
@@ -423,10 +423,10 @@ def _kernel(
             if id_in_pair == 0:
                 tile_bytes = T.meta_var(A_BYTES + B_BYTES)
                 _rem1 = T.alloc_local([1], "uint64")
-                T.ptxd.mapa.shared__cluster.u64(
+                T.ptx.mapa.shared__cluster.u64(
                     _rem1[0], tile_full_bar.ptr_to([stage]), T.uint32(pair_leader_rank)
                 )
-                T.ptxd.mbarrier.arrive.expect_tx.b64(
+                T.ptx.mbarrier.arrive.expect_tx.b64(
                     _rem1[0], T.uint32(tile_bytes), pred=T.bool(True)
                 )
             single_cta_mask: T.int32 = 1 << id_in_pair
@@ -462,10 +462,10 @@ def _kernel(
             if id_in_pair == 0:
                 scale_bytes = T.meta_var(SFA_BYTES + SFB_BYTES)
                 _rem2 = T.alloc_local([1], "uint64")
-                T.ptxd.mapa.shared__cluster.u64(
+                T.ptx.mapa.shared__cluster.u64(
                     _rem2[0], scale_full_bar.ptr_to([stage]), T.uint32(pair_leader_rank)
                 )
-                T.ptxd.mbarrier.arrive.expect_tx.b64(
+                T.ptx.mbarrier.arrive.expect_tx.b64(
                     _rem2[0], T.uint32(scale_bytes), pred=T.bool(True)
                 )
             single_cta_mask: T.int32 = 1 << id_in_pair
@@ -551,14 +551,14 @@ def _kernel(
             # Per-chunk store: R->S (stmatrix) then S->G (TMA). Shared by both schedules.
             @T.inline
             def store_epi_chunk(reg_ldst_16b, linear_n: T.constexpr):
-                T.ptxd.cp.async_.bulk.wait_group.read(WB_PIPE_DEPTH - 1)
+                T.ptx.cp.async_.bulk.wait_group.read(WB_PIPE_DEPTH - 1)
                 T.cuda.warpgroup_sync(1)
                 regs_to_smem(reg_ldst_16b)
                 T.cuda.warpgroup_sync(1)
                 d_n_out: T.int32
                 d_n_out = d_n + linear_n
                 if tid_in_wg == 0:
-                    T.ptxd.fence.proxy.async_.shared__cta()
+                    T.ptx.fence.proxy.async_.shared__cta()
                     Tx.copy_async(
                         D[d_m : d_m + CTA_M, d_n_out : d_n_out + EPI_TILE],
                         output_smem[epi_wb_state.stage, 0:CTA_M, 0:EPI_TILE],
@@ -566,7 +566,7 @@ def _kernel(
                         cache_hint="evict_first",
                         prefetch_tensormap=True,
                     )
-                    T.ptxd.cp.async_.bulk.commit_group()
+                    T.ptx.cp.async_.bulk.commit_group()
                 epi_wb_state.advance()
 
             # Fusion vs fission of {load; scale+cast; store}: overlap fuses and reuses
@@ -579,7 +579,7 @@ def _kernel(
                     linear_n = T.meta_var(no * EPI_TILE)
                     Tx.wg.copy_async(reg_ldst[:, :], tmem[:, linear_n : linear_n + EPI_TILE])
                     if no == MMA_N // EPI_TILE - 1:
-                        T.ptxd.tcgen05.wait__ld.sync.aligned()
+                        T.ptx.tcgen05.wait__ld.sync.aligned()
                         if tid_in_wg == 0:
                             tmem_pipe.empty.arrive(
                                 epi_cur.stage, remote=pair_leader_rank, pred=True, count=1
@@ -594,7 +594,7 @@ def _kernel(
                 for no in T.unroll(MMA_N // EPI_TILE):
                     ln = T.meta_var(no * EPI_TILE)
                     Tx.wg.copy_async(reg_all[:, ln : ln + EPI_TILE], tmem[:, ln : ln + EPI_TILE])
-                T.ptxd.tcgen05.wait__ld.sync.aligned()
+                T.ptx.tcgen05.wait__ld.sync.aligned()
                 # scale + cast the whole frag
                 Tx.wg.mul(reg_all, reg_all, alpha_local)
                 Tx.wg.cast(reg_all_16b, reg_all)
@@ -612,17 +612,17 @@ def _kernel(
             epi_cur.advance()
             tile_scheduler.next_tile()
         if tid_in_wg == 0:
-            T.ptxd.cp.async_.bulk.wait_group.read(0)
+            T.ptx.cp.async_.bulk.wait_group.read(0)
         T.cuda.warpgroup_sync(1)
     if warp_id == int(WarpRole.EPILOGUE):
         if T.cuda.elect_sync():
             _rem3 = T.alloc_local([1], "uint64")
-            T.ptxd.mapa.shared__cluster.u64(
+            T.ptx.mapa.shared__cluster.u64(
                 _rem3[0], tmem_finished.ptr_to([0]), T.uint32(pair_leader_rank + 1 - id_in_pair)
             )
-            T.ptxd.mbarrier.arrive.b64(_rem3[0], T.uint32(1), pred=T.bool(True))
+            T.ptx.mbarrier.arrive.b64(_rem3[0], T.uint32(1), pred=T.bool(True))
         T.cuda.mbarrier_wait_acquire_cluster(tmem_finished.ptr_to([0]), 0)
-        T.ptxd[f"tcgen05.dealloc.cta_group::{CTA_GROUP}.sync.aligned.b32"](
+        T.ptx[f"tcgen05.dealloc.cta_group::{CTA_GROUP}.sync.aligned.b32"](
             tmem_pool.addr, T.uint32(512)
         )
 
