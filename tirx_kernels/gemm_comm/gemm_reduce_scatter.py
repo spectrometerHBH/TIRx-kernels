@@ -979,10 +979,13 @@ def test_mma_ss_tma_2sm_persistent(
                 tmem_pipe.empty.arrive(wg_id, remote=0)
                 for i in Tx.unroll(NUM_CONSUMER * BLK_N // EPI_TILE):
                     for it in Tx.unroll(EPI_TILE // 8):
-                        for vec in Tx.vectorized(8):
-                            D_smem[wg_id, warp_id * 32 + lane_id, it * 8 + vec] = reg_fp16[
-                                i * EPI_TILE + it * 8 + vec
-                            ]
+                        # Per-thread 8-element slice store; D_smem's swizzled
+                        # layout computes the address and the 16B chunk emits a
+                        # vector store, so the index never vectorizes.
+                        Tx.thread.copy(
+                            D_smem[wg_id, warp_id * 32 + lane_id, it * 8 : it * 8 + 8],
+                            reg_fp16[i * EPI_TILE + it * 8 : i * EPI_TILE + it * 8 + 8],
+                        )
                     Tx.cuda.warpgroup_sync(wg_id)
                     Tx.ptxd.fence.proxy.async_.shared__cta()
                     if (lane_id == 0) & (warp_id == 0):
