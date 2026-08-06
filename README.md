@@ -40,15 +40,15 @@ DeepGEMM ports:
 | `deepgemm_sm100_tf32_hc_prenorm_gemm` | tf32 / bf16 | Prenorm GEMM |
 | `deepgemm_fp8_fp4_mega_moe` | fp8 + fp4 | Fused MoE megakernel (MegaMoE) |
 
-FlashKDA ports (FlashInfer frozen kernels):
+FlashKDA ports (FlashInfer reference kernels):
 
 | Kernel | dtype | What it is |
 | ------ | ----- | ---------- |
 | `flashkda_bf16_fused_m128` | bf16 | Recurrent KDA prefill, M128 schedule |
 
-Testing/benching against the `flashinfer_frozen_m128` reference requires
+Testing/benching against the `flashinfer_m128` reference requires
 `FLASHKDA_PR_WORKTREE` pointing at the flashinfer-ai/flashinfer#4262 head
-worktree (which contains the frozen m128 kernel).
+worktree containing the m128 kernel.
 
 ## Performance
 
@@ -80,6 +80,7 @@ them — they are only needed to actually compile/run a kernel:
 | `deep_gemm`      | FP8 GEMM and `deepgemm_*` baselines | Used for optimized reference kernels. |
 | `flashinfer`     | `nvfp4_gemm` data/baseline, `megakernel_moe` baseline | Used for nvfp4 quantization and reference impls. |
 | `flash-attn` + CUTLASS DSL | `flash_attention_backward_sm100` data/baseline | Current SM100 forward/backward reference. |
+| `flash_kda`      | `flashkda_bf16_fused_m128` baseline | Uses the installed package; results record its package, source, extension, and CUTLASS provenance when available. |
 | `sglang` (+ CUTLASS DSL) | `deepgemm_sm100_fp8_paged_mqa_logits` reference | `sglang_cutedsl` reference; checkout on `PYTHONPATH`. |
 | `flash_mla`      | `sparse_flashmla_*` / `flash_mla_sparse_fwd` baselines | Reference impls. |
 | NVSHMEM          | `allgather_gemm`, `gemm_reduce_scatter` | Required to compile/run the GemmComm kernels. |
