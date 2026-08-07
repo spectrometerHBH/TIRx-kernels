@@ -1,0 +1,10 @@
+# Two-CTA SM100 FlashAttention backward, D=128, 16 heads.
+# The flashattn_sm100 reference is CuTeDSL and cannot be CUDA-graph captured,
+# so these inherit the default proton timer rather than pinning one.
+kernel: flash_attention_backward_sm100
+configs:
+  - {config: b1_s2048_h16_causal, default: true}
+  - {config: b1_s4096_h16_causal, default: true}
+  - {config: b2_s4096_h16_causal, default: true}
+  - {config: b1_s8192_h16_causal, default: true}
+  - {config: b1_s8192_h16_noncausal, default: true}
