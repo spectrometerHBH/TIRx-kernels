@@ -2,8 +2,8 @@
 
 - Timestamp: `14`
 - Label:     `post-refactor`
-- Git:       `{'tir': 'fabb698a', 'tirx-kernels': '6c2af771', 'tirx-bench-ci': None}`
-- Workloads: 113 ok, 0 failed
+- Git:       `{'tir': 'a5ad8a6f', 'tirx-kernels': '05ed5e7a', 'tirx-bench-ci': None}`
+- Workloads: 128 ok, 0 failed
 
 Grouped workloads show one row per config and one timing column per implementation. Single-TIR workloads show ref/ours against the fastest reference implementation.
 
@@ -101,6 +101,16 @@ Grouped workloads show one row per config and one timing column per implementati
 | `s8192_h32kv8` | tir | 771.2404 | flashattn_sm100 | 775.7926 | 1.006 | — |
 | `s8192_h32kv8_causal` | tir | 415.8717 | flashattn_sm100 | 428.5254 | 1.030 | — |
 
+## flashkda_bf16_fused_m128
+
+| config | tirx (µs) | tirx_tx_tile (µs) | flashinfer_m128 (µs) | flashkda_raw (µs) |
+|---|---:|---:|---:|---:|
+| `h64_mixed` | 271.7092 | 270.7707 | 271.9326 | 665.2454 |
+| `h64_uniform` | 296.8516 | 296.7581 | 294.6139 | 479.6891 |
+| `h96_fixed8192` | 506.6730 | 508.3682 | 507.9240 | 1075.9474 |
+| `h96_mixed` | 386.9955 | 387.3481 | 390.8202 | 879.8733 |
+| `h96_uniform` | 438.1874 | 438.9945 | 434.5202 | 706.9835 |
+
 ## fp16_bf16_gemm
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
@@ -127,6 +137,16 @@ Grouped workloads show one row per config and one timing column per implementati
 | `deepgemm_m4096_n576_k7168` | tir | 20.1172 | deepgemm | 19.0448 | 0.947 | — |
 | `deepgemm_m4096_n7168_k16384` | tir | 333.0388 | deepgemm | 330.8140 | 0.993 | — |
 | `deepgemm_m4096_n7168_k2048` | tir | 42.9358 | deepgemm | 42.3531 | 0.986 | — |
+
+## gdn_prefill_sm100
+
+| config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
+|---|---|---:|---|---:|---:|---|
+| `hq16_hv16_s4096+4096` | tirx | 126.2735 | flashinfer_cutedsl | 133.2913 | 1.056 | — |
+| `hq16_hv64_s1x8192` | tirx | 237.5161 | flashinfer_cutedsl | 249.2851 | 1.050 | — |
+| `hq2_hv8_s1x65536` | tirx | 1731.4660 | flashinfer_cutedsl | 1780.3501 | 1.028 | — |
+| `hq32_hv32_s8192x16` | tirx | 1073.9860 | flashinfer_cutedsl | 1114.4388 | 1.038 | — |
+| `hq8_hv32_s1024x8` | tirx | 91.6919 | flashinfer_cutedsl | 96.0701 | 1.048 | — |
 
 ## gemm_reduce_scatter
 
@@ -172,6 +192,16 @@ Grouped workloads show one row per config and one timing column per implementati
 | `2048x2048x2048` | tir | 8.7511 | flashinfer | 7.4529 | 0.852 | cublaslt_nvfp4=7.5843 |
 | `4096x4096x4096` | tir | 29.4367 | cublaslt_nvfp4 | 27.6113 | 0.938 | flashinfer=28.7620 |
 | `8192x8192x8192` | tir | 185.4257 | flashinfer | 176.1684 | 0.950 | cublaslt_nvfp4=179.2211 |
+
+## sparse_flashmla_decode_head64
+
+| config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
+|---|---|---:|---|---:|---:|---|
+| `deepseek_v4_v32_b128_sq2_sk32768_topk2048_p64` | tirx | 136.1541 | flashmla | 143.8920 | 1.057 | — |
+| `model1_b148_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen` | tirx | 74.7784 | flashmla | 78.6782 | 1.052 | — |
+| `model1_b256_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64` | tirx | 104.2346 | flashmla | 108.5470 | 1.041 | — |
+| `model1_b2_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64` | tirx | 16.8124 | flashmla | 21.4671 | 1.277 | — |
+| `v32_b148_sq2_sk32768_topk16384_p64` | tirx | 905.9871 | flashmla | 949.8048 | 1.048 | — |
 
 ## sparse_flashmla_prefill_head128_phase1
 
