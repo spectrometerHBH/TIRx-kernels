@@ -1928,6 +1928,14 @@ CONFIGS = [
         (2, 4096, True),
         (1, 8192, True),
         (1, 8192, False),
+        # flash-attn's own sweep has no fixed config list -- benchmark_attn.py
+        # takes every shape from the command line -- so "the official shape" is
+        # its default: --headdim (128,128), --seqlen 8192, --nheads unset (16
+        # for head_dim <= 192), --total-seqlen 32k giving batch 32k // 8192,
+        # and --causal both. These two rows are that default. We still generate
+        # fp16 where it generates bf16.
+        (4, 8192, True),
+        (4, 8192, False),
     )
 ]
 

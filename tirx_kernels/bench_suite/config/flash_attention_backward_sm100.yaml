@@ -1,25 +1,19 @@
 # Two-CTA SM100 FlashAttention backward, D=128, 16 heads.
 #
-# Held out of the pinned sweep (`default: false`) because the reference these
-# rows bench against, flash_attn.cute's backward, does not return on this host:
-# the forward completes in ~4s, the backward pins the GPU at 100% forever. The
-# deadlock is inside flash-attn's own FlashAttentionBackwardSm100 -- under
-# cuda-gdb 15 of its 16 warps sit in mbarrier try_wait spin loops -- not in the
-# dQ postprocess the traceback names (CUDA launches are async, so the first
-# blocking call after a spinning kernel misreports the culprit). It is
-# independent of shape, mask, head_dim, and 2CTA, and reproduces through the
-# public flash_attn_func + autograd path, on flash-attn 4.0.0b22.dev8 with
-# cutlass-dsl 4.6.1. Both the sweep and the registry correctness manifest call
-# it, so a `default: true` here hangs them rather than failing them. The kernel
-# itself is fine -- its dQ/dK/dV match torch autograd exactly at
-# b1_s2048_h16_causal.
-#
-# Flip these back to `default: true` once the reference works here; nothing else
-# needs to change.
+# These rows were held out of the pinned sweep for a while because the reference
+# they bench against, flash_attn.cute's backward, deadlocked on this host:
+# cutlass-dsl 4.6.1 compiled FlashAttentionBackwardSm100 into a kernel whose
+# warps sat in mbarrier try_wait spin loops forever, so the sweep and the
+# registry correctness manifest hung instead of failing. cutlass-dsl 4.6.0.dev0
+# compiles it correctly and the reference returns in ~4s, so the rows are back.
 kernel: flash_attention_backward_sm100
 configs:
-  - {config: b1_s2048_h16_causal, default: false}
-  - {config: b1_s4096_h16_causal, default: false}
-  - {config: b2_s4096_h16_causal, default: false}
-  - {config: b1_s8192_h16_causal, default: false}
-  - {config: b1_s8192_h16_noncausal, default: false}
+  - {config: b1_s2048_h16_causal, default: true}
+  - {config: b1_s4096_h16_causal, default: true}
+  - {config: b2_s4096_h16_causal, default: true}
+  - {config: b1_s8192_h16_causal, default: true}
+  - {config: b1_s8192_h16_noncausal, default: true}
+  # flash-attn's default benchmark_attn.py shape: hd128, s8192, 32k total
+  # tokens (batch 4), 16 heads, causal and non-causal.
+  - {config: b4_s8192_h16_causal, default: true}
+  - {config: b4_s8192_h16_noncausal, default: true}
