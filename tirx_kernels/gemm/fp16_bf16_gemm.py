@@ -11,7 +11,9 @@ from tvm.tirx.lang.tile_scheduler import ClusterLaunchControlScheduler
 
 
 def prepare_data(dtype, M, N, K):
-    torch_dev = torch.device("cuda")
+    # Pin the ordinal: a bare "cuda" is resolved at each allocation against the
+    # then-current device, so every tensor here must name the same one.
+    torch_dev = torch.device("cuda", torch.cuda.current_device())
     if dtype == "fp16":
         dtype = torch.float16
     elif dtype == "bf16":
@@ -444,7 +446,7 @@ def run_test(dtype, M, N, K, **kwargs):
 
     A, B, C = prepare_data(dtype, M, N, K)
     kernel = tir_kernel(dtype, M, N, K)
-    C_tvm = torch.zeros_like(C, device="cuda")
+    C_tvm = torch.zeros_like(C)
     target = tvm.target.Target("cuda")
     with target:
         ex = compile_kernel(kernel)
