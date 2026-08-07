@@ -1155,6 +1155,7 @@ BASELINE_IMPL_BY_KERNEL = {
     "grouped_fp8_gemm_contiguous": "deepgemm",
     "nvfp4_gemm": "flashinfer",
     "flash_attention4": "flashattn_sm100",
+    "flashkda_bf16_fused_m128": "flashinfer_m128",
     "gdn_prefill_sm100": "flashinfer_cutedsl",
     "deepgemm_sm100_fp8_mqa_logits": "deepgemm",
     "deepgemm_sm100_fp4_mqa_logits": "deepgemm",
