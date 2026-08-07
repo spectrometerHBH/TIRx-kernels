@@ -1,10 +1,14 @@
 # Two-CTA SM100 FlashAttention backward, D=128, 16 heads.
 #
 # Held out of the pinned sweep (`default: false`) because the reference these
-# rows bench against, flash_attn.cute's _flash_attn_bwd, does not return on this
-# host: the forward completes in ~4s, the backward pins the GPU at 100% and was
-# still running after 400s. Not shape- or mask-dependent -- it hangs causal and
-# non-causal alike, down to b1 s256 h1 -- on flash-attn 4.0.0b22.dev8 with
+# rows bench against, flash_attn.cute's backward, does not return on this host:
+# the forward completes in ~4s, the backward pins the GPU at 100% forever. The
+# deadlock is inside flash-attn's own FlashAttentionBackwardSm100 -- under
+# cuda-gdb 15 of its 16 warps sit in mbarrier try_wait spin loops -- not in the
+# dQ postprocess the traceback names (CUDA launches are async, so the first
+# blocking call after a spinning kernel misreports the culprit). It is
+# independent of shape, mask, head_dim, and 2CTA, and reproduces through the
+# public flash_attn_func + autograd path, on flash-attn 4.0.0b22.dev8 with
 # cutlass-dsl 4.6.1. Both the sweep and the registry correctness manifest call
 # it, so a `default: true` here hangs them rather than failing them. The kernel
 # itself is fine -- its dQ/dK/dV match torch autograd exactly at
