@@ -470,11 +470,8 @@ __forceinline__ __device__ unsigned long long tvm_builtin_fma_scale_sub_f32x2(
     _TMA_S2G_REDUCE = (
         "cp.reduce.async.bulk.tensor.{dim}d.global.shared::cta.{redop}.tile.bulk_group"
     )
-    # The destination is this CTA's own shared memory, but the ``shared::cta``
-    # spelling is ambiguous against the tensor form at this arity, so use the
-    # cluster window (identity-mapped for the issuing CTA), as the other
-    # kernels here do.
-    _BULK_G2S_CTA = "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes"
+    # The destination is this CTA's own shared memory.
+    _BULK_G2S_CTA = "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes"
     # shared::cta -> peer CTA's shared::cluster window (DSMEM push).
     _BULK_S2C = "cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes"
     # pair_mask names both CTAs of the pair, so the commit is the multicast form.

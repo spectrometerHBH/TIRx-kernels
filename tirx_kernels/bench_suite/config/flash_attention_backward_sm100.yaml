@@ -1,10 +1,21 @@
 # Two-CTA SM100 FlashAttention backward, D=128, 16 heads.
-# The flashattn_sm100 reference is CuTeDSL and cannot be CUDA-graph captured,
-# so these inherit the default proton timer rather than pinning one.
+#
+# Held out of the pinned sweep (`default: false`) because the reference these
+# rows bench against, flash_attn.cute's _flash_attn_bwd, does not return on this
+# host: the forward completes in ~4s, the backward pins the GPU at 100% and was
+# still running after 400s. Not shape- or mask-dependent -- it hangs causal and
+# non-causal alike, down to b1 s256 h1 -- on flash-attn 4.0.0b22.dev8 with
+# cutlass-dsl 4.6.1. Both the sweep and the registry correctness manifest call
+# it, so a `default: true` here hangs them rather than failing them. The kernel
+# itself is fine -- its dQ/dK/dV match torch autograd exactly at
+# b1_s2048_h16_causal.
+#
+# Flip these back to `default: true` once the reference works here; nothing else
+# needs to change.
 kernel: flash_attention_backward_sm100
 configs:
-  - {config: b1_s2048_h16_causal, default: true}
-  - {config: b1_s4096_h16_causal, default: true}
-  - {config: b2_s4096_h16_causal, default: true}
-  - {config: b1_s8192_h16_causal, default: true}
-  - {config: b1_s8192_h16_noncausal, default: true}
+  - {config: b1_s2048_h16_causal, default: false}
+  - {config: b1_s4096_h16_causal, default: false}
+  - {config: b2_s4096_h16_causal, default: false}
+  - {config: b1_s8192_h16_causal, default: false}
+  - {config: b1_s8192_h16_noncausal, default: false}
