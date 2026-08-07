@@ -485,10 +485,6 @@ def _kernel(
                 perform_o_copy_out(last_s_q_idx, last_outer_loop_phase, False)
             else:
                 bar_tQ_full.wait(0, wg0_outer_loop_phase)
-                # The first iteration has no preceding output-copy path (which
-                # contains this WG-wide rendezvous).  Make every WG0 warp retire
-                # generation 0 before warp 0 can publish generation 1.
-                T.ptx.bar.sync(T.uint32(BAR_WG0_SYNC), 128)
             last_valid = 1
             last_s_q_idx = wg0_s_q_idx
             last_outer_loop_phase = wg0_outer_loop_phase
