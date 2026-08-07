@@ -2190,9 +2190,7 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
     dispatch_with_epilogue_sync_barrier_idx = 1
     epilogue_full_sync_barrier_idx = 2
     epilogue_wg_sync_barrier_start_idx = 3
-    dispatch_with_load_a_sync_barrier_idx = (
-        epilogue_wg_sync_barrier_start_idx + num_epilogue_wgs
-    )
+    dispatch_with_load_a_sync_barrier_idx = epilogue_wg_sync_barrier_start_idx + num_epilogue_wgs
     before_dispatch_pull_barrier_tag = 1
     before_combine_reduce_barrier_tag = 2
     after_workspace_clean_barrier_tag = 3
@@ -4422,9 +4420,7 @@ __forceinline__ __device__ void tvm_builtin_st_async_cluster_task_info(
                                 # scale-factor columns. MMA -> CP is not an
                                 # implicit TCGEN pipeline, so order that reuse
                                 # without draining the outer K-block pipeline.
-                                if umma_k_block_idx + 1 < (
-                                    kernel_config.block_k // umma_block_k
-                                ):
+                                if umma_k_block_idx + 1 < (kernel_config.block_k // umma_block_k):
                                     T.ptx.tcgen05.fence__before_thread_sync()
                         T.cuda.warp_sync()
                         empty_barrier_arrive_current(k_block_idx == num_k_blocks - T.int32(1))
