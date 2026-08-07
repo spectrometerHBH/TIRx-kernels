@@ -2,13 +2,13 @@
   "timestamp": "14",
   "label": "post-refactor",
   "git": {
-    "tir": "fabb698a",
-    "tirx-kernels": "6c2af771",
+    "tir": "a5ad8a6f",
+    "tirx-kernels": "05ed5e7a",
     "tirx-bench-ci": null
   },
   "kernel_tree": {
-    "tir:python/tvm/tirx": "6704a1f00a3482396925130e2e3090e527b130da",
-    "tirx-kernels:tirx_kernels": "bcaf796ab806645f02b3d697f0a58e42e8e5a73c"
+    "tir:python/tvm/tirx": "9ab1d6fc72c44f3db45f817a0ee334ce202aeb38",
+    "tirx-kernels:tirx_kernels": "3e3ddf084b26071a051923c82bad389554558c56"
   },
   "baselines": {
     "torch": {
@@ -31,10 +31,18 @@
       "importable": true,
       "source_dir": "/home/bohanhou/flashinfer",
       "git_dir": "/home/bohanhou/flashinfer",
-      "git_sha": "517cca9c-dirty",
-      "version": "0.6.15",
+      "git_sha": "28ca04eb-dirty",
+      "version": "0.6.17",
       "dist": "flashinfer-python",
       "editable": true
+    },
+    "flash_kda": {
+      "importable": true,
+      "source_dir": "/home/bohanhou/kernel-libs/FlashKDA",
+      "dist": "flash_kda",
+      "version": "0.0.1+1ce47ea",
+      "git_dir": "/home/bohanhou/kernel-libs/FlashKDA",
+      "git_sha": "1ce47ea3"
     },
     "flash_attn": {
       "importable": true,
@@ -54,7 +62,7 @@
     "cutlass": {
       "importable": true,
       "source_dir": "/home/bohanhou/my/lib/python3.11/site-packages/nvidia_cutlass_dsl/dsl_packages/cutlass",
-      "version": "4.6.0"
+      "version": "4.6.1"
     }
   },
   "probe": {
@@ -835,6 +843,86 @@
       }
     },
     {
+      "kernel": "flashkda_bf16_fused_m128",
+      "config": "h64_mixed",
+      "label": "h64_mixed",
+      "status": "ok",
+      "impls": {
+        "tirx": 271.70915976373027,
+        "tirx_tx_tile": 270.77067524115756,
+        "flashinfer_m128": 271.9326138286642,
+        "flashkda_raw": 665.2453969807498
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "flashkda_bf16_fused_m128",
+      "config": "h64_uniform",
+      "label": "h64_uniform",
+      "status": "ok",
+      "impls": {
+        "tirx": 296.85155064969734,
+        "tirx_tx_tile": 296.7580565740309,
+        "flashinfer_m128": 294.61386350869606,
+        "flashkda_raw": 479.68913120969967
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "flashkda_bf16_fused_m128",
+      "config": "h96_fixed8192",
+      "label": "h96_fixed8192",
+      "status": "ok",
+      "impls": {
+        "tirx": 506.6729697639721,
+        "tirx_tx_tile": 508.36823611261065,
+        "flashinfer_m128": 507.92403592872245,
+        "flashkda_raw": 1075.9473775280899
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "flashkda_bf16_fused_m128",
+      "config": "h96_mixed",
+      "label": "h96_mixed",
+      "status": "ok",
+      "impls": {
+        "tirx": 386.9955332404288,
+        "tirx_tx_tile": 387.34809757777487,
+        "flashinfer_m128": 390.8201708375171,
+        "flashkda_raw": 879.8733338600068
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "flashkda_bf16_fused_m128",
+      "config": "h96_uniform",
+      "label": "h96_uniform",
+      "status": "ok",
+      "impls": {
+        "tirx": 438.1873975121878,
+        "tirx_tx_tile": 438.9945019739376,
+        "flashinfer_m128": 434.520228649382,
+        "flashkda_raw": 706.983509090909
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
       "kernel": "fp16_bf16_gemm",
       "config": "bf16_1024x1024x1024",
       "label": "bf16_1024x1024x1024",
@@ -1076,6 +1164,76 @@
       "impls": {
         "tir": 42.93582477461938,
         "deepgemm": 42.35310340128631
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "gdn_prefill_sm100",
+      "config": "hq16_hv16_s4096+4096",
+      "label": "hq16_hv16_s4096+4096",
+      "status": "ok",
+      "impls": {
+        "tirx": 126.2734519246448,
+        "flashinfer_cutedsl": 133.29127759803384
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "gdn_prefill_sm100",
+      "config": "hq16_hv64_s1x8192",
+      "label": "hq16_hv64_s1x8192",
+      "status": "ok",
+      "impls": {
+        "tirx": 237.51611456183608,
+        "flashinfer_cutedsl": 249.28514661836178
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "gdn_prefill_sm100",
+      "config": "hq2_hv8_s1x65536",
+      "label": "hq2_hv8_s1x65536",
+      "status": "ok",
+      "impls": {
+        "tirx": 1731.466036940837,
+        "flashinfer_cutedsl": 1780.3500925925925
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "gdn_prefill_sm100",
+      "config": "hq32_hv32_s8192x16",
+      "label": "hq32_hv32_s8192x16",
+      "status": "ok",
+      "impls": {
+        "tirx": 1073.9860235430158,
+        "flashinfer_cutedsl": 1114.4387799795709
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "gdn_prefill_sm100",
+      "config": "hq8_hv32_s1024x8",
+      "label": "hq8_hv32_s1024x8",
+      "status": "ok",
+      "impls": {
+        "tirx": 91.69185549377033,
+        "flashinfer_cutedsl": 96.0701028340014
       },
       "aggregated": {
         "rounds": 5,
@@ -1459,6 +1617,76 @@
         "tir": 185.42573090873975,
         "flashinfer": 176.16838706021974,
         "cublaslt_nvfp4": 179.221098479299
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "deepseek_v4_v32_b128_sq2_sk32768_topk2048_p64",
+      "label": "deepseek_v4_v32_b128_sq2_sk32768_topk2048_p64",
+      "status": "ok",
+      "impls": {
+        "tirx": 136.154086616097,
+        "flashmla": 143.89199290904622
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "model1_b148_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
+      "label": "model1_b148_sq2_sk16384_topk128_p256_xsk16384_xtopk1024_xp2_xtopklen",
+      "status": "ok",
+      "impls": {
+        "tirx": 74.77840460771893,
+        "flashmla": 78.67824827018174
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "model1_b256_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
+      "label": "model1_b256_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
+      "status": "ok",
+      "impls": {
+        "tirx": 104.23459633822455,
+        "flashmla": 108.54699868753724
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "model1_b2_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
+      "label": "model1_b2_sq2_sk16384_topk128_p256_xsk16384_xtopk512_xp64",
+      "status": "ok",
+      "impls": {
+        "tirx": 16.81239194527279,
+        "flashmla": 21.467072327645813
+      },
+      "aggregated": {
+        "rounds": 5,
+        "method": "mean"
+      }
+    },
+    {
+      "kernel": "sparse_flashmla_decode_head64",
+      "config": "v32_b148_sq2_sk32768_topk16384_p64",
+      "label": "v32_b148_sq2_sk32768_topk16384_p64",
+      "status": "ok",
+      "impls": {
+        "tirx": 905.9870688014219,
+        "flashmla": 949.8047653846154
       },
       "aggregated": {
         "rounds": 5,
