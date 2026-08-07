@@ -1579,7 +1579,7 @@ def get_kernel(**kwargs: Any):
                             T.uint32(0),
                             T.uint32(0),
                             T.uint32(0),
-                            T.uint32(k),
+                            T.ptx.pred(T.uint32(k)),
                         )
                 if T.cuda.elect_sync():
                     T.ptx.tcgen05.commit.cta_group__1.mbarrier__arrive__one.shared__cluster.b64(

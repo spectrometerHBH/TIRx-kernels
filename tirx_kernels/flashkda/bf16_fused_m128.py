@@ -182,7 +182,7 @@ def _mma_qk_8step(taddr_d, b_lo, taddr_a, enable_d):
                 _b_desc,
                 T.uint32(134743184),
                 *_MMA_ZERO_MASKS,
-                enable_d if _i == 0 else 1,
+                T.ptx.pred(enable_d if _i == 0 else 1),
                 pred=leader,
             )
         )
@@ -203,7 +203,7 @@ def _mma_inv_2step(taddr_d, b_lo, taddr_a, enable_d):
                 _b_desc,
                 T.uint32(134743184),
                 *_MMA_ZERO_MASKS,
-                enable_d if _i == 0 else 1,
+                T.ptx.pred(enable_d if _i == 0 else 1),
                 pred=leader,
             )
         )
@@ -224,7 +224,7 @@ def _mma_final_2step(taddr_d, b_lo, taddr_a, enable_d):
                 _b_desc,
                 T.uint32(136905872),
                 *_MMA_ZERO_MASKS,
-                enable_d if _i == 0 else 1,
+                T.ptx.pred(enable_d if _i == 0 else 1),
                 pred=leader,
             )
         )

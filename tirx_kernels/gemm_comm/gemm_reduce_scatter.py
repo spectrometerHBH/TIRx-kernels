@@ -907,7 +907,7 @@ def test_mma_ss_tma_2sm_persistent(
                                             descB,
                                             descI,
                                             *_MMA_ZERO_MASKS,
-                                            0,
+                                            False,
                                         )
                                     else:
                                         Tx.ptx[_MMA_CHAIN](
@@ -916,7 +916,7 @@ def test_mma_ss_tma_2sm_persistent(
                                             descB,
                                             descI,
                                             *_MMA_ZERO_MASKS,
-                                            1,
+                                            True,
                                         )
                                 smem_pipe.empty.arrive(ks, cta_group=CTA_GROUP, cta_mask=3)
                             phase = phase ^ 1
@@ -945,7 +945,7 @@ def test_mma_ss_tma_2sm_persistent(
                                             descB,
                                             descI,
                                             *_MMA_ZERO_MASKS,
-                                            0,
+                                            False,
                                         )
                                     else:
                                         Tx.ptx[_MMA_CHAIN](
@@ -954,7 +954,7 @@ def test_mma_ss_tma_2sm_persistent(
                                             descB,
                                             descI,
                                             *_MMA_ZERO_MASKS,
-                                            1,
+                                            True,
                                         )
                                 smem_pipe.empty.arrive(ks, cta_group=CTA_GROUP, cta_mask=3)
                             tmem_pipe.full.arrive(warp_id, cta_group=CTA_GROUP, cta_mask=3)

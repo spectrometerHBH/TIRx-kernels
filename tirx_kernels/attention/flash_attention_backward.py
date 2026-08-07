@@ -338,7 +338,7 @@ def build_kernel(
             T.uint64(b_desc),
             T.uint32(instruction),
             *_MMA_KEEP_ALL_LANES,
-            accumulate,
+            T.ptx.pred(accumulate),
         )
 
     @T.inline
@@ -360,7 +360,7 @@ def build_kernel(
             T.uint64(b_desc),
             T.uint32(270598160),
             *_MMA_KEEP_ALL_LANES,
-            accumulate,
+            T.ptx.pred(accumulate),
         )
 
     @T.inline

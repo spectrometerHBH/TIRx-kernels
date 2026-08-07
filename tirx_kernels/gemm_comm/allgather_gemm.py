@@ -848,7 +848,7 @@ def _build_kernel():
                                             descB,
                                             descI,
                                             *_MMA_ZERO_MASKS,
-                                            0,
+                                            False,
                                         )
                                     else:
                                         T.ptx[_MMA_CHAIN](
@@ -857,7 +857,7 @@ def _build_kernel():
                                             descB,
                                             descI,
                                             *_MMA_ZERO_MASKS,
-                                            1,
+                                            True,
                                         )
                                 mma2tma.arrive(ks)
 

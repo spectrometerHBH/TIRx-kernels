@@ -947,7 +947,7 @@ def _mma_ss_64x64_k128(tmem_d, a_desc_base, b_desc_base, full_barrier):
                 b_desc_base + phase_off,
                 T.uint32(0x04100010),
                 *_MMA_ZERO_MASKS,
-                0 if kphase == 0 else 1,
+                T.ptx.pred(0 if kphase == 0 else 1),
                 pred=T.cuda.elect_sync(),
             )
         )
@@ -966,7 +966,7 @@ def _mma_ts_128x64_k128(tmem_d, tmem_a, b_desc_base, full_barrier):
                 b_desc_base + phase_off,
                 T.uint32(0x08100010),
                 *_MMA_ZERO_MASKS,
-                0 if kphase == 0 else 1,
+                T.ptx.pred(0 if kphase == 0 else 1),
                 pred=T.cuda.elect_sync(),
             )
         )
@@ -985,7 +985,7 @@ def _mma_ts_128x64_k64(tmem_d, tmem_a, b_desc_base, accumulate):
                 b_desc_base + phase_off,
                 T.uint32(0x08100010),
                 *_MMA_ZERO_MASKS,
-                accumulate if kphase == 0 else 1,
+                T.ptx.pred(accumulate if kphase == 0 else 1),
                 pred=T.cuda.elect_sync(),
             )
         )
@@ -1002,7 +1002,7 @@ def _mma_ts_128x128_k64(tmem_d, tmem_a, b_desc_base, full_barrier):
                 b_desc_base + T.uint64(kphase * 128),
                 T.uint32(0x08210010),
                 *_MMA_ZERO_MASKS,
-                1,
+                True,
                 pred=T.cuda.elect_sync(),
             )
         )
