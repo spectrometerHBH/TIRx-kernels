@@ -20,10 +20,6 @@ from pathlib import Path
 from tirx_kernels.attention import gdn_prefill_sm100
 from tirx_kernels.bench_suite import run as bench_suite_run
 
-WORKLOADS = (
-    Path(gdn_prefill_sm100.__file__).parents[1] / "bench_suite" / "workloads_gdn_prefill_sm100.yaml"
-)
-
 
 def test_gdn_prefill_sm100_public_contract() -> None:
     assert gdn_prefill_sm100.KERNEL_META == {
@@ -44,7 +40,7 @@ def test_gdn_prefill_sm100_public_contract() -> None:
 
 def test_gdn_prefill_sm100_workloads_exactly_match_configs() -> None:
     config_labels = [config["label"] for config in gdn_prefill_sm100.CONFIGS]
-    workloads = bench_suite_run.load_workloads(WORKLOADS)
+    workloads = bench_suite_run.load_kernel_configs("gdn_prefill_sm100")
     workload_labels = [workload["config"] for workload in workloads]
 
     assert len(config_labels) == len(set(config_labels)) == 120

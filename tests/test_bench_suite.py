@@ -53,7 +53,7 @@ def test_finalize_bench_record_rejects_baseline_errors() -> None:
 
 
 def test_default_workloads_include_full_megakernel_moe_sweep() -> None:
-    workloads = run.load_workloads(run.DEFAULT_WORKLOADS)
+    workloads = run.load_config_dir()
     megakernel_moe_workloads = [w for w in workloads if w["kernel"] == "megakernel_moe"]
 
     assert {w["config"] for w in megakernel_moe_workloads} == {
@@ -64,7 +64,7 @@ def test_default_workloads_include_full_megakernel_moe_sweep() -> None:
 
 
 def test_default_workloads_include_manual_tp1_gemm_comm_kineto_profiles() -> None:
-    workloads = run.load_workloads(run.DEFAULT_WORKLOADS)
+    workloads = run.load_config_dir()
     selected = [
         workload
         for workload in workloads
@@ -108,7 +108,7 @@ def test_megakernel_moe_launch_slots_include_runtime_estimate_headroom() -> None
 
 
 def test_default_workloads_do_not_override_standard_timer_budgets() -> None:
-    workloads = run.load_workloads(run.DEFAULT_WORKLOADS)
+    workloads = run.load_config_dir()
 
     for workload in workloads:
         if workload.get("timer") in {"kineto", "megamoe"}:
