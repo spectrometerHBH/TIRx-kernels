@@ -32,10 +32,15 @@ from tvm.script import tirx as Tx
 from tvm.tirx.lang.pipeline import Pipeline as DataPipeline
 from tvm.tirx.layout import wg_local_layout
 
-from ._baselines import create_baseline_suite
-from ._baselines import ratios as baseline_ratios
-from ._model_shapes import GEMM_RS_MODEL_SHAPES, SUPPORTED_WORLD_SIZES, make_configs, shape_set
-from ._runtime import (
+from .utils._baselines import create_baseline_suite
+from .utils._baselines import ratios as baseline_ratios
+from .utils._model_shapes import (
+    GEMM_RS_MODEL_SHAPES,
+    SUPPORTED_WORLD_SIZES,
+    make_configs,
+    shape_set,
+)
+from .utils._runtime import (
     DistributedRuntime,
     barrier_on_compute_stream,
     require_nvls_multicast,
@@ -43,7 +48,7 @@ from ._runtime import (
     symmetric_empty,
     torch_view,
 )
-from ._specialize import load_specialized_module
+from .utils._specialize import load_specialized_module
 
 
 class TaskType(Enum):

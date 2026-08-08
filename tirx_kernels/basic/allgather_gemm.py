@@ -35,15 +35,15 @@ from tvm.script.tirx import tile as Tx
 from tvm.tirx.bench import CudaProfiler
 from tvm.tirx.layout import TCol, TileLayout, TLane, tid_in_wg
 
-from ._baselines import create_baseline_suite
-from ._baselines import ratios as baseline_ratios
-from ._model_shapes import (
+from .utils._baselines import create_baseline_suite
+from .utils._baselines import ratios as baseline_ratios
+from .utils._model_shapes import (
     ALLGATHER_GEMM_MODEL_SHAPES,
     SUPPORTED_WORLD_SIZES,
     make_configs,
     shape_set,
 )
-from ._runtime import (
+from .utils._runtime import (
     DistributedRuntime,
     barrier_on_compute_stream,
     run_distributed,
@@ -52,7 +52,7 @@ from ._runtime import (
     sync_compute_to_communication,
     torch_view,
 )
-from ._specialize import load_specialized_module
+from .utils._specialize import load_specialized_module
 
 
 class TaskType(Enum):

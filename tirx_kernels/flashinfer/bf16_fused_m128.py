@@ -3506,7 +3506,7 @@ def run_bench(
     flashkda_peer: dict[str, Any] = {}
 
     def _flashkda_raw_builder():
-        from tirx_kernels.flashinfer._flashkda_bench import prepare_flashkda_raw_reference
+        from tirx_kernels.flashinfer.utils._flashkda_bench import prepare_flashkda_raw_reference
 
         peer = prepare_flashkda_raw_reference(case)
         flashkda_peer["reference"] = peer

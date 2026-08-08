@@ -12,9 +12,9 @@ from unittest import SkipTest
 
 import torch
 
-from tirx_kernels.flashmla._gemm import tcgen05_config
-from tirx_kernels.flashmla._mask import pack_valid_mask8
-from tirx_kernels.flashmla._tma import tma_config
+from tirx_kernels.flashmla.utils._gemm import tcgen05_config
+from tirx_kernels.flashmla.utils._mask import pack_valid_mask8
+from tirx_kernels.flashmla.utils._tma import tma_config
 from tvm.backend.cuda.tile_primitive.tma_utils import SwizzleMode
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
@@ -995,8 +995,8 @@ def run_bench(
 
     funcs = {"tirx": lambda: ex(*args)}
 
-    from tirx_kernels.flashmla._flashmla_bench import flashmla_reference_builder
-    from tirx_kernels.flashmla._trtllm_gen_bench import (
+    from tirx_kernels.flashmla.utils._flashmla_bench import flashmla_reference_builder
+    from tirx_kernels.flashmla.utils._trtllm_gen_bench import (
         trtllm_gen_config_compatible,
         trtllm_gen_reference_builder,
     )

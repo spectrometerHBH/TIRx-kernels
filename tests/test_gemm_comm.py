@@ -18,7 +18,7 @@ from __future__ import annotations
 import pytest
 
 from tirx_kernels.basic import allgather_gemm, gemm_reduce_scatter
-from tirx_kernels.basic._model_shapes import (
+from tirx_kernels.basic.utils._model_shapes import (
     ALLGATHER_GEMM_MODEL_SHAPES,
     GEMM_RS_MODEL_SHAPES,
     SUPPORTED_WORLD_SIZES,

@@ -15,7 +15,7 @@
 
 from types import SimpleNamespace
 
-from tirx_kernels.flashinfer import _flashkda_bench
+from tirx_kernels.flashinfer.utils import _flashkda_bench
 
 
 def test_raw_peer_accepts_installed_package_version(monkeypatch, tmp_path):

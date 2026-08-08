@@ -14,8 +14,8 @@ from unittest import SkipTest
 
 import torch
 
-from tirx_kernels.flashmla._gemm import tcgen05_config
-from tirx_kernels.flashmla._tma import tma_config
+from tirx_kernels.flashmla.utils._gemm import tcgen05_config
+from tirx_kernels.flashmla.utils._tma import tma_config
 from tvm.backend.cuda.tile_primitive.tma_utils import SwizzleMode
 from tvm.ir import PointerType, PrimType
 from tvm.script import tirx as T
@@ -2818,7 +2818,10 @@ def run_test(**kwargs: Any) -> None:
     case = prepare_data(**kwargs)
     executables = _compile_decode_kernels(**kwargs)
 
-    from tirx_kernels.flashmla._flashmla_bench import _import_flash_mla, run_flashmla_sparse_decode
+    from tirx_kernels.flashmla.utils._flashmla_bench import (
+        _import_flash_mla,
+        run_flashmla_sparse_decode,
+    )
 
     flash_mla = _import_flash_mla()
     sched_meta, _ = flash_mla.get_mla_metadata()
@@ -2865,7 +2868,7 @@ def run_bench(
     def tirx_decode():
         _launch_tirx(case, executables)
 
-    from tirx_kernels.flashmla._flashmla_bench import flashmla_decode_reference_builder
+    from tirx_kernels.flashmla.utils._flashmla_bench import flashmla_decode_reference_builder
 
     return bench(
         {"tirx": tirx_decode},
