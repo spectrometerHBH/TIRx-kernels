@@ -1,3 +1,7 @@
+# This file contains code ported from FlashMLA (https://github.com/deepseek-ai/FlashMLA),
+# copyright (c) 2025 DeepSeek, licensed under the MIT License.
+# See THIRD_PARTY_LICENSES.md for the full license text.
+
 """Shared validity-mask helper for the sparse FlashMLA phase1 kernels."""
 
 from __future__ import annotations
