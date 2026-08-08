@@ -149,7 +149,7 @@ All rights reserved.
     ports under the same applicable terms
 
   `tirx_kernels/flashinfer/__init__.py` and
-  `tirx_kernels/flashinfer/_flashkda_bench.py` are native repository code.
+  `tirx_kernels/flashinfer/utils/_flashkda_bench.py` are native repository code.
 
 ### Apache License, Version 2.0 portions
 
