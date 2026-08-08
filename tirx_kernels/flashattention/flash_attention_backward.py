@@ -1909,7 +1909,7 @@ def setup(data, B, H, S, D):
 
 KERNEL_META = {
     "name": "flash_attention_backward_sm100",
-    "category": "attention",
+    "category": "flashattention",
     "compute_capability": 10,
 }
 

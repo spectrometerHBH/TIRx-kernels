@@ -1,3 +1,14 @@
+<!--
+Copyright (c) 2025, Ted Zadouri, Markus Hoehnerbach, Jay Shah, Tri Dao.
+All rights reserved.
+Modifications Copyright (c) 2026 The TIRX Authors.
+SPDX-License-Identifier: BSD-3-Clause AND Apache-2.0
+
+This design sketch documents the modified TIRx port in
+flash_attention_backward.py. See LICENSE and THIRD_PARTY_LICENSES.md for the
+applicable terms.
+-->
+
 # SM100 FlashAttention-4 backward: schedule sketch
 
 This is a review-oriented sketch of the fp16, head-dimension-128, equal-length

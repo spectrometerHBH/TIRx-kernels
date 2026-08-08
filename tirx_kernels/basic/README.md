@@ -1,11 +1,9 @@
 <!--
-Licensed to the Apache Software Foundation (ASF) under one
-or more contributor license agreements.  See the NOTICE file
-distributed with this work for additional information
-regarding copyright ownership.  The ASF licenses this file
-to you under the Apache License, Version 2.0 (the
-"License"); you may not use this file except in compliance
-with the License.  You may obtain a copy of the License at
+Copyright (c) 2026 The TIRX Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
 
   http://www.apache.org/licenses/LICENSE-2.0
 
@@ -17,9 +15,15 @@ specific language governing permissions and limitations
 under the License.
 -->
 
-# Distributed GEMM kernels
+# Basic kernels
 
-This category contains the SM100, tensor-parallel kernels recovered from the
+Native TIRx kernels with no single upstream project: dense GEMMs
+(`fp16_bf16_gemm`, `nvfp4_gemm`), RMSNorm (`rmsnorm`), and the distributed
+GEMM+collective kernels below.
+
+## Distributed GEMM kernels
+
+The distributed SM100, tensor-parallel kernels were recovered from the
 megakernel performance branch. Both workloads register TP1 and TP4
 specializations for eight model shapes:
 

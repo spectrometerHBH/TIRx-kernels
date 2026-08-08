@@ -523,7 +523,7 @@ def tir_kernel(M: int, N: int, K: int):
     )
 
 
-KERNEL_META = {"name": "fp8_blockwise_gemm", "category": "gemm", "compute_capability": 10}
+KERNEL_META = {"name": "fp8_blockwise_gemm", "category": "deepgemm", "compute_capability": 10}
 CONFIGS = [
     {"M": 4096, "N": 2112, "K": 7168, "label": "deepgemm_m4096_n2112_k7168"},
     {"M": 4096, "N": 576, "K": 7168, "label": "deepgemm_m4096_n576_k7168"},

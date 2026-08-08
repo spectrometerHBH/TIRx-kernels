@@ -19,7 +19,11 @@ from tvm.tirx.bench import bench
 from tvm.tirx.lang.pipeline import MBarrier, Pipeline, PipelineState
 from tvm.tirx.lang.tile_scheduler import ClusterPersistentScheduler2D
 
-KERNEL_META = {"name": "grouped_fp8_gemm_contiguous", "category": "gemm", "compute_capability": 10}
+KERNEL_META = {
+    "name": "grouped_fp8_gemm_contiguous",
+    "category": "deepgemm",
+    "compute_capability": 10,
+}
 CONFIGS = [
     {
         "num_groups": 4,

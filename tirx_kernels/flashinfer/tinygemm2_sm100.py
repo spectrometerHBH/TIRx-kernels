@@ -1,3 +1,24 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 The TIRX Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+# This file is a modified TIRx port of FlashInfer's csrc/tinygemm2_sm100.cu.
+# That generated source records its Loom schedules as exact ports of NVIDIA
+# TensorRT-LLM's TinyGEMM2 kernel.
+# See NOTICE and THIRD_PARTY_LICENSES.md for upstream attribution.
+
 """FlashInfer TinyGEMM2 BF16 kernel port for SM100."""
 
 from __future__ import annotations
@@ -13,7 +34,7 @@ import torch.nn.functional as F
 
 from tvm.script import tirx as T
 
-KERNEL_META = {"name": "tinygemm2_sm100", "category": "gemm", "compute_capability": 10}
+KERNEL_META = {"name": "tinygemm2_sm100", "category": "flashinfer", "compute_capability": 10}
 
 CONFIGS = [
     {"label": "b1_o128_k720", "B": 1, "O": 128, "K": 720},

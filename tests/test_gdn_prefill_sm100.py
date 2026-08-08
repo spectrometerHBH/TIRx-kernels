@@ -1,10 +1,8 @@
-# Licensed to the Apache Software Foundation (ASF) under one
-# or more contributor license agreements.  See the NOTICE file
-# distributed with this work for additional information
-# regarding copyright ownership.  The ASF licenses this file
-# to you under the Apache License, Version 2.0 (the
-# "License"); you may not use this file except in compliance
-# with the License.  You may obtain a copy of the License at
+# Copyright (c) 2026 The TIRX Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
 #   http://www.apache.org/licenses/LICENSE-2.0
 #
@@ -17,14 +15,14 @@
 
 from pathlib import Path
 
-from tirx_kernels.attention import gdn_prefill_sm100
 from tirx_kernels.bench_suite import run as bench_suite_run
+from tirx_kernels.flashinfer import gdn_prefill_sm100
 
 
 def test_gdn_prefill_sm100_public_contract() -> None:
     assert gdn_prefill_sm100.KERNEL_META == {
         "name": "gdn_prefill_sm100",
-        "category": "attention",
+        "category": "flashinfer",
         "compute_capability": 10,
     }
     assert not hasattr(gdn_prefill_sm100, "BENCH_CONFIGS")

@@ -428,7 +428,7 @@ def tir_kernel(dtype: str, M: int, N: int, K: int):
     )
 
 
-KERNEL_META = {"name": "fp16_bf16_gemm", "category": "gemm", "compute_capability": 10}
+KERNEL_META = {"name": "fp16_bf16_gemm", "category": "basic", "compute_capability": 10}
 CONFIGS = [
     {"dtype": d, "M": s, "N": s, "K": s, "label": f"{d}_{s}x{s}x{s}"}
     for d in ["fp16", "bf16"]

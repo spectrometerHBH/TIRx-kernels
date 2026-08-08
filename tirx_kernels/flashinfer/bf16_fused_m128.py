@@ -1,10 +1,9 @@
-# Licensed to the Apache Software Foundation (ASF) under one
-# or more contributor license agreements.  See the NOTICE file
-# distributed with this work for additional information
-# regarding copyright ownership.  The ASF licenses this file
-# to you under the Apache License, Version 2.0 (the
-# "License"); you may not use this file except in compliance
-# with the License.  You may obtain a copy of the License at
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 The TIRX Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
 #   http://www.apache.org/licenses/LICENSE-2.0
 #
@@ -14,6 +13,10 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+
+# This file is a modified TIRx port of FlashInfer's
+# csrc/kda/flashkda_bf16_fused_m128.cu.
+# See NOTICE and THIRD_PARTY_LICENSES.md for upstream attribution.
 """TIRx port of FlashInfer's FlashKDA SM100a BF16 recurrent-KDA prefill
 M128 kernel (flashinfer-ai/flashinfer#4262, head e835e0f5).
 
@@ -701,7 +704,11 @@ BENCH_CONFIGS = [
     },
 ]
 
-KERNEL_META = {"name": "flashkda_bf16_fused_m128", "category": "flashkda", "compute_capability": 10}
+KERNEL_META = {
+    "name": "flashkda_bf16_fused_m128",
+    "category": "flashinfer",
+    "compute_capability": 10,
+}
 
 
 def _cfg(**kwargs: Any) -> FlashKDABf16FusedM128Config:
@@ -3425,7 +3432,7 @@ def run_test(**kwargs: Any) -> None:
     if not torch.cuda.is_available():
         raise SkipTest("CUDA is required for FlashKDA bf16 fused m128")
 
-    from tirx_kernels.flashkda.bf16_fused_m128_tx_tile import bf16_fused_m128_tx_tile
+    from tirx_kernels.flashinfer.bf16_fused_m128_tx_tile import bf16_fused_m128_tx_tile
     from tirx_kernels.runner import compile_kernel
 
     case = prepare_data(**kwargs)
@@ -3469,7 +3476,7 @@ def run_bench(
     if not torch.cuda.is_available():
         raise SkipTest("CUDA is required for FlashKDA bf16 fused m128 benchmark")
 
-    from tirx_kernels.flashkda.bf16_fused_m128_tx_tile import bf16_fused_m128_tx_tile
+    from tirx_kernels.flashinfer.bf16_fused_m128_tx_tile import bf16_fused_m128_tx_tile
     from tirx_kernels.runner import compile_kernel
     from tvm.tirx.bench import bench
 
@@ -3499,7 +3506,7 @@ def run_bench(
     flashkda_peer: dict[str, Any] = {}
 
     def _flashkda_raw_builder():
-        from tirx_kernels.flashkda._flashkda_bench import prepare_flashkda_raw_reference
+        from tirx_kernels.flashinfer._flashkda_bench import prepare_flashkda_raw_reference
 
         peer = prepare_flashkda_raw_reference(case)
         flashkda_peer["reference"] = peer

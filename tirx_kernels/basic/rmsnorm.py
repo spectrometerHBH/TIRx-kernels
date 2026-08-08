@@ -637,7 +637,7 @@ def test(batch_size: int, dim: int = 16384):
     torch.testing.assert_close(output_tirx_dispatch_rmsnorm, output_torch, rtol=0.005, atol=0.005)
 
 
-KERNEL_META = {"name": "rmsnorm", "category": "normalization", "compute_capability": 10}
+KERNEL_META = {"name": "rmsnorm", "category": "basic", "compute_capability": 10}
 CONFIGS = [
     {"hidden_size": hs, "batch_size": bs, "label": f"hs{hs}_bs{bs}"}
     for hs in [128, 4096, 5120, 8192]

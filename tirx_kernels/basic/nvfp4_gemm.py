@@ -681,7 +681,7 @@ TIRX_CONFIGS = {
 }
 
 
-KERNEL_META = {"name": "nvfp4_gemm", "category": "gemm", "compute_capability": 10}
+KERNEL_META = {"name": "nvfp4_gemm", "category": "basic", "compute_capability": 10}
 CONFIGS = [
     {"M": s, "N": s, "K": s, "label": f"{s}x{s}x{s}"} for s in [1024, 2048, 4096, 8192, 16384]
 ]

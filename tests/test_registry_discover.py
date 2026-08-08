@@ -1,10 +1,8 @@
-# Licensed to the Apache Software Foundation (ASF) under one
-# or more contributor license agreements.  See the NOTICE file
-# distributed with this work for additional information
-# regarding copyright ownership.  The ASF licenses this file
-# to you under the Apache License, Version 2.0 (the
-# "License"); you may not use this file except in compliance
-# with the License.  You may obtain a copy of the License at
+# Copyright (c) 2026 The TIRX Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
 #   http://www.apache.org/licenses/LICENSE-2.0
 #
@@ -16,22 +14,21 @@
 # under the License.
 from __future__ import annotations
 
-from tvm import tirx
-
 from tirx_kernels.registry import discover_categories, discover_kernels, load_kernel
+from tvm import tirx
 
 
 def test_discover_categories_includes_kernel_dirs() -> None:
     categories = discover_categories()
-    assert "gemm" in categories
-    assert "attention" in categories
+    assert "basic" in categories
+    assert "flashattention" in categories
     assert "flashmla" in categories
     assert "bench" not in categories
     assert "bench_suite" not in categories
 
 
 def test_discover_kernels_finds_known_gemm() -> None:
-    kernels = discover_kernels(category="gemm")
+    kernels = discover_kernels(category="basic")
     assert "fp16_bf16_gemm" in kernels
     assert "nvfp4_gemm" in kernels
 
@@ -51,7 +48,7 @@ def test_load_kernel_finds_flash_attention_backward() -> None:
 
     assert mod.KERNEL_META == {
         "name": "flash_attention_backward_sm100",
-        "category": "attention",
+        "category": "flashattention",
         "compute_capability": 10,
     }
     assert {config["is_causal"] for config in mod.CONFIGS} == {False, True}

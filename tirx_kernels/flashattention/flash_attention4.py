@@ -1,6 +1,11 @@
+# This file contains code ported from Dao-AILab/flash-attention
+# (flash_attn/cute/flash_fwd_sm100.py), copyright (c) 2022 the respective
+# contributors, licensed under the BSD 3-Clause License.
+# See THIRD_PARTY_LICENSES.md for the full license text.
+
 """FlashAttention-4 TIRx kernel and direct NVIDIA IKET profiling entry point.
 
-Run ``python -m tirx_kernels.attention.flash_attention4`` to profile the
+Run ``python -m tirx_kernels.flashattention.flash_attention4`` to profile the
 annotated kernel.  Correctness and ordinary benchmarks remain exposed through
 ``run_test`` and ``run_bench``.
 """
@@ -1086,7 +1091,7 @@ def prepare_data(batch_size, seq_len_q, seq_len_kv, num_qo_heads, num_kv_heads, 
     return (Q, K, V, O)
 
 
-KERNEL_META = {"name": "flash_attention4", "category": "attention", "compute_capability": 10}
+KERNEL_META = {"name": "flash_attention4", "category": "flashattention", "compute_capability": 10}
 CONFIGS = [
     {
         "batch_size": 1,
