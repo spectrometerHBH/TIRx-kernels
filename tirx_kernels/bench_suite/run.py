@@ -1151,8 +1151,6 @@ def write_run(
 
 BASELINE_IMPL_BY_KERNEL = {
     "fp16_bf16_gemm": "torch-cublas",
-    "fp8_blockwise_gemm": "deepgemm",
-    "grouped_fp8_gemm_contiguous": "deepgemm",
     "nvfp4_gemm": "flashinfer",
     "flash_attention4": "flashattn_sm100",
     "flashkda_bf16_fused_m128": "flashinfer_m128",
@@ -1163,6 +1161,11 @@ BASELINE_IMPL_BY_KERNEL = {
     "deepgemm_sm100_fp4_paged_mqa_logits": "deepgemm",
     "deepgemm_sm100_fp8_paged_mqa_logits": "deepgemm",
     "deepgemm_sm100_tf32_hc_prenorm_gemm": "deepgemm",
+    "deepgemm_sm100_fp8_gemm_1d1d": "deepgemm",
+    "deepgemm_sm100_m_grouped_fp8_gemm_contiguous": "deepgemm",
+    "deepgemm_sm100_m_grouped_fp8_gemm_masked": "deepgemm",
+    "deepgemm_sm100_k_grouped_fp8_gemm_contiguous": "deepgemm",
+    "deepgemm_sm100_fp8_bmm": "deepgemm",
     "flash_mla_sparse_fwd": "flashmla",
     "sparse_flashmla_prefill_head64_phase1": "flashmla",
     "sparse_flashmla_prefill_head128_phase1": "flashmla",
