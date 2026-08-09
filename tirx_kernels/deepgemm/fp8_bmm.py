@@ -110,12 +110,10 @@ def make_desc(*, expr: str, H: int, R: int, D: int, B: int, num_sms: int | None 
 
 
 def get_kernel(**config):
-    from ._sm100_fp8_fp4_gemm_1d1d import build_kernel, make_spec
+    from ._sm100_fp8_fp4_gemm_1d1d import build_kernel
 
     config.pop("label", None)
-    desc = make_desc(**config)
-    spec = make_spec(desc, get_best_config(desc), gran_k_a=128, gran_k_b=128, k_alignment=128)
-    return build_kernel(spec)
+    return build_kernel(_spec_for(config))
 
 
 def _spec_for(config: dict):
@@ -155,7 +153,7 @@ def run_test(**config):
     """Compile, launch and compare against the dequantized-einsum oracle."""
     import torch
 
-    from ._sm100_fp8_fp4_gemm_1d1d_data import calc_diff, max_diff_threshold
+    from ._sm100_fp8_fp4_gemm_1d1d_data import assert_within_threshold, calc_diff
 
     config.pop("label", None)
     data = prepare_data(**config)
@@ -169,46 +167,33 @@ def run_test(**config):
     launch()
     torch.cuda.synchronize()
 
-    diff = calc_diff(data["d"], data["ref"])
-    threshold = max_diff_threshold(data["a_dtype"], data["b_dtype"])
-    if not diff < threshold:
-        raise AssertionError(
-            f"deepgemm_sm100_fp8_bmm {data['expr']} batch={data['batch']} "
-            f"M={data['M']} N={data['N']} K={data['K']}: "
-            f"diff {diff:.3e} >= {threshold:.0e}"
-        )
-    return {"diff": diff, "threshold": threshold}
+    return assert_within_threshold(
+        calc_diff(data["d"], data["ref"]),
+        data,
+        kernel="deepgemm_sm100_fp8_bmm",
+        detail=(f"{data['expr']} batch={data['batch']} M={data['M']} N={data['N']} K={data['K']}"),
+    )
 
 
 def run_bench(*, warmup=None, repeat=None, timer=None, rounds=1, cooldown_s=1.0, **config):
-    from tvm.tirx.bench import bench
-
-    from ._sm100_fp8_fp4_gemm_1d1d_data import deepgemm_launch_bmm
+    from ._sm100_fp8_fp4_gemm_1d1d_data import bench_against_deepgemm, deepgemm_launch_bmm
 
     config.pop("label", None)
     data = prepare_data(**config)
-    tirx_launch = _tirx_launch(data, config)
-
-    def build_reference():
-        launch, _out = deepgemm_launch_bmm(data)
-        return launch
-
-    result = bench(
-        {"tirx": tirx_launch},
-        references={"deepgemm": build_reference},
+    return bench_against_deepgemm(
+        _tirx_launch(data, config),
+        deepgemm_launch_bmm,
+        data,
         warmup=warmup,
         repeat=repeat,
         timer=timer,
         rounds=rounds,
         cooldown_s=cooldown_s,
+        batch=data["batch"],
+        M=data["M"],
+        N=data["N"],
+        K=data["K"],
     )
-    result["batch"], result["M"], result["N"], result["K"] = (
-        data["batch"],
-        data["M"],
-        data["N"],
-        data["K"],
-    )
-    return result
 
 
 __all__ = [

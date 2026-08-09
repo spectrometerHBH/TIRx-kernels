@@ -143,30 +143,21 @@ def make_desc(
 
 def get_kernel(**config):
     """Return the TIRx `PrimFunc` for one config."""
-    from ._sm100_fp8_fp4_gemm_1d1d import build_kernel, make_spec
+    from ._sm100_fp8_fp4_gemm_1d1d import build_kernel
 
     config.pop("label", None)
-    desc = make_desc(**config)
-    # `enumerate_normal` pairs FP4 operands with a 32-element K granularity.
-    gran_k_a = 128
-    gran_k_b = 32 if desc.b_dtype == "fp4" else 128
-    spec = make_spec(
-        desc, get_best_config(desc), gran_k_a=gran_k_a, gran_k_b=gran_k_b, k_alignment=gran_k_a
-    )
-    return build_kernel(spec)
+    return build_kernel(_spec_for(config))
 
 
 def _spec_for(config: dict):
-    """`(GemmSpec, gran_k_a, gran_k_b)` for one config."""
-    from ._sm100_fp8_fp4_gemm_1d1d import make_spec
+    """The `GemmSpec` for one config."""
+    from ._sm100_fp8_fp4_gemm_1d1d import gran_k_for, make_spec
 
     desc = make_desc(**config)
-    gran_k_a = 128
-    gran_k_b = 32 if desc.b_dtype == "fp4" else 128
-    spec = make_spec(
+    gran_k_a, gran_k_b = gran_k_for(desc.b_dtype)
+    return make_spec(
         desc, get_best_config(desc), gran_k_a=gran_k_a, gran_k_b=gran_k_b, k_alignment=gran_k_a
     )
-    return spec, gran_k_a, gran_k_b
 
 
 def prepare_data(*, seed: int = 0, **config):
@@ -180,7 +171,7 @@ def prepare_data(*, seed: int = 0, **config):
 def _tirx_launch(data, config):
     from ._sm100_fp8_fp4_gemm_1d1d import build_launch
 
-    spec, _, _ = _spec_for(config)
+    spec = _spec_for(config)
     return build_launch(
         spec,
         a=data["a"],
@@ -198,7 +189,7 @@ def run_test(**config):
     """Compile, launch and compare against the dequantized-matmul oracle."""
     import torch
 
-    from ._sm100_fp8_fp4_gemm_1d1d_data import calc_diff, max_diff_threshold
+    from ._sm100_fp8_fp4_gemm_1d1d_data import assert_within_threshold, calc_diff
 
     config.pop("label", None)
     data = prepare_data(seed=17, **config)
@@ -211,43 +202,37 @@ def run_test(**config):
     launch()
     torch.cuda.synchronize()
 
-    diff = calc_diff(data["d"], data["ref"])
-    threshold = max_diff_threshold(data["a_dtype"], data["b_dtype"])
-    if not diff < threshold:
-        raise AssertionError(
-            f"deepgemm_sm100_fp8_gemm_1d1d M={data['M']} N={data['N']} K={data['K']} "
+    return assert_within_threshold(
+        calc_diff(data["d"], data["ref"]),
+        data,
+        kernel="deepgemm_sm100_fp8_gemm_1d1d",
+        detail=(
+            f"M={data['M']} N={data['N']} K={data['K']} "
             f"major={data['major_a']}{data['major_b']} b_dtype={data['b_dtype']} "
-            f"cd={data['cd_dtype']} acc={data['accumulate']}: "
-            f"diff {diff:.3e} >= {threshold:.0e}"
-        )
-    return {"diff": diff, "threshold": threshold}
+            f"cd={data['cd_dtype']} acc={data['accumulate']}"
+        ),
+    )
 
 
 def run_bench(*, warmup=None, repeat=None, timer=None, rounds=1, cooldown_s=1.0, **config):
     """Time our launch against `deep_gemm.fp8_fp4_gemm_nt`."""
-    from tvm.tirx.bench import bench
-
-    from ._sm100_fp8_fp4_gemm_1d1d_data import deepgemm_launch_normal
+    from ._sm100_fp8_fp4_gemm_1d1d_data import bench_against_deepgemm, deepgemm_launch_normal
 
     config.pop("label", None)
     data = prepare_data(seed=17, **config)
-    tirx_launch = _tirx_launch(data, config)
-
-    def build_reference():
-        launch, _out = deepgemm_launch_normal(data)
-        return launch
-
-    result = bench(
-        {"tirx": tirx_launch},
-        references={"deepgemm": build_reference},
+    return bench_against_deepgemm(
+        _tirx_launch(data, config),
+        deepgemm_launch_normal,
+        data,
         warmup=warmup,
         repeat=repeat,
         timer=timer,
         rounds=rounds,
         cooldown_s=cooldown_s,
+        M=data["M"],
+        N=data["N"],
+        K=data["K"],
     )
-    result["M"], result["N"], result["K"] = data["M"], data["N"], data["K"]
-    return result
 
 
 __all__ = [

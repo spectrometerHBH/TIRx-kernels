@@ -170,24 +170,17 @@ def make_desc(
 
 
 def get_kernel(**config):
-    from ._sm100_fp8_fp4_gemm_1d1d import build_kernel, make_spec
+    from ._sm100_fp8_fp4_gemm_1d1d import build_kernel
 
     config.pop("label", None)
-    desc = make_desc(**config)
-    gran_k_a = 128
-    gran_k_b = 32 if desc.b_dtype == "fp4" else 128
-    spec = make_spec(
-        desc, get_best_config(desc), gran_k_a=gran_k_a, gran_k_b=gran_k_b, k_alignment=gran_k_a
-    )
-    return build_kernel(spec)
+    return build_kernel(_spec_for(config))
 
 
 def _spec_for(config: dict):
-    from ._sm100_fp8_fp4_gemm_1d1d import make_spec
+    from ._sm100_fp8_fp4_gemm_1d1d import gran_k_for, make_spec
 
     desc = make_desc(**config)
-    gran_k_a = 128
-    gran_k_b = 32 if desc.b_dtype == "fp4" else 128
+    gran_k_a, gran_k_b = gran_k_for(desc.b_dtype)
     return make_spec(
         desc, get_best_config(desc), gran_k_a=gran_k_a, gran_k_b=gran_k_b, k_alignment=gran_k_a
     )
@@ -223,7 +216,7 @@ def run_test(**config):
     """Compile, launch and compare against the dequantized-matmul oracle."""
     import torch
 
-    from ._sm100_fp8_fp4_gemm_1d1d_data import calc_diff, max_diff_threshold, psum_slice_diff
+    from ._sm100_fp8_fp4_gemm_1d1d_data import assert_within_threshold, calc_diff, psum_slice_diff
 
     config.pop("label", None)
     data = prepare_data(**config)
@@ -233,45 +226,50 @@ def run_test(**config):
     torch.cuda.synchronize()
 
     if data["use_psum_layout"]:
-        diff = psum_slice_diff(data["d"], data["ref"], data["grouped_layout"], data["alignment"])
+        diff = psum_slice_diff(
+            data["d"],
+            data["ref"],
+            data["grouped_layout"],
+            data["alignment"],
+            zero_padding=data["ensure_zero_padding"],
+        )
     else:
         diff = calc_diff(data["d"], data["ref"])
-    threshold = max_diff_threshold(data["a_dtype"], data["b_dtype"])
-    if not diff < threshold:
-        raise AssertionError(
-            f"deepgemm_sm100_m_grouped_fp8_gemm_contiguous g={data['num_groups']} "
-            f"M={data['M']} N={data['N']} K={data['K']} "
+    return assert_within_threshold(
+        diff,
+        data,
+        kernel="deepgemm_sm100_m_grouped_fp8_gemm_contiguous",
+        detail=(
+            f"g={data['num_groups']} M={data['M']} N={data['N']} K={data['K']} "
             f"psum={data['use_psum_layout']} zp={data['ensure_zero_padding']} "
-            f"b_dtype={data['b_dtype']}: diff {diff:.3e} >= {threshold:.0e}"
-        )
-    return {"diff": diff, "threshold": threshold, "M": data["M"]}
+            f"b_dtype={data['b_dtype']}"
+        ),
+        M=data["M"],
+    )
 
 
 def run_bench(*, warmup=None, repeat=None, timer=None, rounds=1, cooldown_s=1.0, **config):
-    from tvm.tirx.bench import bench
-
-    from ._sm100_fp8_fp4_gemm_1d1d_data import deepgemm_launch_m_grouped_contiguous
+    from ._sm100_fp8_fp4_gemm_1d1d_data import (
+        bench_against_deepgemm,
+        deepgemm_launch_m_grouped_contiguous,
+    )
 
     config.pop("label", None)
     data = prepare_data(**config)
-    tirx_launch = _tirx_launch(data, config)
-
-    def build_reference():
-        launch, _out = deepgemm_launch_m_grouped_contiguous(data)
-        return launch
-
-    result = bench(
-        {"tirx": tirx_launch},
-        references={"deepgemm": build_reference},
+    return bench_against_deepgemm(
+        _tirx_launch(data, config),
+        deepgemm_launch_m_grouped_contiguous,
+        data,
         warmup=warmup,
         repeat=repeat,
         timer=timer,
         rounds=rounds,
         cooldown_s=cooldown_s,
+        M=data["M"],
+        N=data["N"],
+        K=data["K"],
+        num_groups=data["num_groups"],
     )
-    result["M"], result["N"], result["K"] = data["M"], data["N"], data["K"]
-    result["num_groups"] = data["num_groups"]
-    return result
 
 
 __all__ = [

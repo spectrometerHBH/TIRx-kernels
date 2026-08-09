@@ -33,12 +33,11 @@ on hosts without it.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
-from ._sm100_fp8_fp4_gemm_1d1d import Major, ceil_div
+from ._sm100_fp8_fp4_gemm_1d1d import Major, ceil_div, gran_k_for
 
 __all__ = [
-    "QuantizedOperand",
+    "assert_within_threshold",
+    "bench_against_deepgemm",
     "calc_diff",
     "dequantize",
     "quantize_a",
@@ -94,23 +93,6 @@ def max_diff_threshold(a_dtype: str, b_dtype: str) -> float:
     if a_dtype == "fp4" or b_dtype == "fp4":
         return 0.01
     return 0.001
-
-
-@dataclass
-class QuantizedOperand:
-    """One quantized operand plus the scales the kernel will consume.
-
-    `data` is the FP8 (or packed-FP4) tensor in the layout the TMA descriptor
-    addresses; `sf_raw` is the float32 scale tensor as the quantizer produced it;
-    `sf` is the packed `int32` tensor after DeepGEMM's layout transform.
-    """
-
-    data: object
-    sf_raw: object
-    sf: object
-    dtype: str
-    gran_mn: int
-    gran_k: int
 
 
 def quantize_a(x, *, gran_k: int = 128, dtype: str = "fp8") -> tuple:
@@ -241,8 +223,7 @@ def prepare_normal(
     require_sm100()
     torch.manual_seed(seed)
 
-    gran_k_a = 128
-    gran_k_b = 32 if b_dtype == "fp4" else 128
+    gran_k_a, gran_k_b = gran_k_for(b_dtype)
     is_wgrad = accumulate and cd_dtype == "fp32"
 
     a_bf16 = torch.randn((M, K), device="cuda", dtype=torch.bfloat16)
@@ -370,8 +351,7 @@ def prepare_m_grouped_contiguous(
     aligned_ms = [align_up(m, alignment) for m in actual_ms]
     M = sum(aligned_ms)
 
-    gran_k_a = 128
-    gran_k_b = 32 if b_dtype == "fp4" else 128
+    gran_k_a, gran_k_b = gran_k_for(b_dtype)
     recipe_b = recipe_for(b_dtype, gran_k_b, is_a=False)
 
     a_bf16 = torch.randn((M, K), device="cuda", dtype=torch.bfloat16)
@@ -426,10 +406,6 @@ def prepare_m_grouped_contiguous(
         "d": d,
         "ref": ref,
         "c": None,
-        "spans": spans,
-        # Dequantized operands, kept for diagnostics (which expert did a block use?).
-        "a_ref": a_ref,
-        "b_ref": b_ref,
         "alignment": alignment,
         "use_psum_layout": use_psum_layout,
         "ensure_zero_padding": ensure_zero_padding,
@@ -502,8 +478,7 @@ def prepare_m_grouped_masked(
     expected_m = int(expected_m_per_group * 1.2)
     alignment = get_theoretical_mk_alignment(expected_m)
 
-    gran_k_a = 128
-    gran_k_b = 32 if b_dtype == "fp4" else 128
+    gran_k_a, gran_k_b = gran_k_for(b_dtype)
     recipe_b = recipe_for(b_dtype, gran_k_b, is_a=False)
 
     a_bf16 = torch.randn((num_groups, max_m, K), device="cuda", dtype=torch.bfloat16)
@@ -521,9 +496,17 @@ def prepare_m_grouped_masked(
         b_bf16, gran_k=gran_k_b, dtype=b_dtype, per_block=recipe_b[0] != 1
     )
 
-    a_ref = dequantize(a_q_flat, a_sf_flat, dtype="fp8", gran_k=gran_k_a).view(num_groups, max_m, K)
+    # Only `[g, :masked_m[g]]` is ever compared (`masked_slice_diff`), and
+    # `max_m` is the padded capacity -- typically ~16x the largest count -- so
+    # the oracle covers only the rows that can be read.  The compared values are
+    # unchanged; the rest of `ref` stays zero.
+    used_m = max(counts)
+    a_ref = dequantize(a_q_flat, a_sf_flat, dtype="fp8", gran_k=gran_k_a).view(
+        num_groups, max_m, K
+    )[:, :used_m]
     b_ref = _dequantize_grouped_b(b_q, b_sf, dtype=b_dtype, gran_k=gran_k_b, gran_mn=recipe_b[0])
-    ref = torch.einsum("gmk,gnk->gmn", a_ref.float(), b_ref.float()).to(torch.bfloat16)
+    ref = torch.zeros((num_groups, max_m, N), device="cuda", dtype=torch.bfloat16)
+    ref[:, :used_m] = torch.einsum("gmk,gnk->gmn", a_ref.float(), b_ref.float()).to(torch.bfloat16)
     d = torch.empty((num_groups, max_m, N), device="cuda", dtype=torch.bfloat16)
 
     sfa = transform_sf(a_sf, max_m, K, recipe_for("fp8", gran_k_a, is_a=True), num_groups)
@@ -568,6 +551,47 @@ def prepare_m_grouped_masked(
 # and then returns a no-argument closure that issues exactly one GEMM.  That is
 # what `tvm.tirx.bench.bench` expects from a `references={...}` entry, and it
 # keeps compilation and setup out of the timed region on both sides.
+
+
+def assert_within_threshold(diff, data, *, kernel: str, detail: str, **extra) -> dict:
+    """Raise unless `diff` clears the dtype-derived threshold; else return the row.
+
+    Every entry module compares one number against `max_diff_threshold` and
+    reports the same two keys, so the check lives here and each module supplies
+    only its own identifying `detail`.
+    """
+    threshold = max_diff_threshold(data["a_dtype"], data["b_dtype"])
+    if not diff < threshold:
+        raise AssertionError(f"{kernel} {detail}: diff {diff:.3e} >= {threshold:.0e}")
+    return {"diff": diff, "threshold": threshold, **extra}
+
+
+def bench_against_deepgemm(
+    tirx_launch, reference_launcher, data, *, warmup, repeat, timer, rounds, cooldown_s, **extra
+) -> dict:
+    """Time our launch against the DeepGEMM entry `reference_launcher` wraps.
+
+    The reference is built lazily, so a missing or failing DeepGEMM is reported
+    by `bench` as a baseline error instead of losing our own measurement.
+    `extra` is merged into the result as the shape columns the report prints.
+    """
+    from tvm.tirx.bench import bench
+
+    def build_reference():
+        launch, _out = reference_launcher(data)
+        return launch
+
+    result = bench(
+        {"tirx": tirx_launch},
+        references={"deepgemm": build_reference},
+        warmup=warmup,
+        repeat=repeat,
+        timer=timer,
+        rounds=rounds,
+        cooldown_s=cooldown_s,
+    )
+    result.update(extra)
+    return result
 
 
 def _warm_up(launch) -> None:
@@ -680,12 +704,13 @@ def masked_slice_diff(actual, expected, masked_m) -> float:
     return worst
 
 
-def psum_slice_diff(actual, expected, grouped_layout, alignment) -> float:
+def psum_slice_diff(actual, expected, grouped_layout, alignment, *, zero_padding=False) -> float:
     """Worst per-group diff over the valid rows of a psum-layout output.
 
-    Group `j` occupies `[align(end[j-1], alignment), end[j])`; the gap rows above
-    each group's end are padding and are checked separately by the caller when
-    `ensure_zero_padding` is on.
+    Group `j` occupies `[align(end[j-1], alignment), end[j])`.  The rows between
+    one group's end and the next group's aligned start are padding; with
+    `zero_padding` the kernel promises to write zeros there, so that is asserted
+    here rather than left to a caller.
     """
     from ._sm100_fp8_fp4_gemm_1d1d import align_up
 
@@ -693,9 +718,15 @@ def psum_slice_diff(actual, expected, grouped_layout, alignment) -> float:
     worst = 0.0
     for j, end in enumerate(ends):
         start = 0 if j == 0 else align_up(ends[j - 1], alignment)
-        if end <= start:
-            continue
-        worst = max(worst, calc_diff(actual[start:end], expected[start:end]))
+        if end > start:
+            worst = max(worst, calc_diff(actual[start:end], expected[start:end]))
+        if zero_padding:
+            gap_end = align_up(end, alignment)
+            gap = actual[end:gap_end]
+            if gap.numel() and bool(gap.any()):
+                raise AssertionError(
+                    f"ensure_zero_padding: group {j} rows [{end}, {gap_end}) are not zero"
+                )
     return worst
 
 
@@ -772,8 +803,14 @@ def prepare_bmm(*, expr: str, H: int, R: int, D: int, B: int, seed: int = 0) -> 
         "ref": ref_view,
         "c": None,
         "z": z,
-        "x_fp8": (x_q, x_sf),
-        "y_fp8": (y_q, y_sf),
+        # `fp8_einsum` permutes each SF operand before handing it to `fp8_bmm`,
+        # and permutation is its own inverse here, so passing the already-packed
+        # `int32` scales through the inverse permutation lands them in exactly
+        # the layout `fp8_bmm` wants.  Without this the reference repacks
+        # float32 scales inside the timed region, which the other four entries
+        # deliberately avoid; verified bit-identical to the float32 path.
+        "x_fp8": (x_q, sfa.permute(1, 0, 2)),
+        "y_fp8": (y_q, sfb),
         "a_dtype": "fp8",
         "b_dtype": "fp8",
         "cd_dtype": "bf16",
@@ -793,13 +830,17 @@ def deepgemm_launch_bmm(data, *, out=None):
     out = torch.empty_like(data["z"]) if out is None else out
     expr, x_fp8, y_fp8 = data["expr"], data["x_fp8"], data["y_fp8"]
     accumulate = data["c"] is not None
+    # `(gran_mn_a, gran_mn_b, gran_k)`.  Both MN granularities are 1 because the
+    # scales arrive already packed and the int32 branch of `check_sf_layout`
+    # asserts `gran_mn == 1` -- the same rule the four non-batched entries follow
+    # with their `(1, gran_k)` pairs.
     recipe = data["dg_recipe"]
 
     def launch():
         if accumulate:
             deep_gemm.fp8_einsum(expr, x_fp8, y_fp8, out, out, recipe=recipe)
         else:
-            deep_gemm.fp8_einsum(expr, x_fp8, y_fp8, out)
+            deep_gemm.fp8_einsum(expr, x_fp8, y_fp8, out, recipe=recipe)
 
     _warm_up(launch)
     return launch, out
@@ -832,6 +873,9 @@ def _prepare_bmm_bhd_hdr_bhr(*, H: int, R: int, D: int, B: int, gran_k: int) -> 
     ref = torch.einsum("bhd,hdr->bhr", x_ref.float(), y_ref.float()).to(torch.bfloat16)
     z = torch.empty((B, H, R), device="cuda", dtype=torch.bfloat16)
 
+    sfa = transform_sf(x_sf.permute(1, 0, 2), B, D, (1, gran_k), H)
+    sfb = transform_sf(y_sf.permute(0, 2, 1), R, D, (gran_k, gran_k), H)
+
     return {
         "expr": "bhd,hdr->bhr",
         "batch": H,
@@ -840,14 +884,17 @@ def _prepare_bmm_bhd_hdr_bhr(*, H: int, R: int, D: int, B: int, gran_k: int) -> 
         "K": D,
         "a": x_q.permute(1, 0, 2),
         "b": y_q.permute(0, 2, 1),
-        "sfa": transform_sf(x_sf.permute(1, 0, 2), B, D, (1, gran_k), H),
-        "sfb": transform_sf(y_sf.permute(0, 2, 1), R, D, (gran_k, gran_k), H),
+        "sfa": sfa,
+        "sfb": sfb,
         "d": z.permute(1, 0, 2),
         "ref": ref.permute(1, 0, 2),
         "c": None,
         "z": z,
-        "x_fp8": (x_q, x_sf),
-        "y_fp8": (y_q, y_sf),
+        # See the note in `_prepare_bmm_bhr_hdr_bhd`: the already-packed scales
+        # go through `fp8_einsum`'s inverse permutation so the reference does not
+        # repack float32 scales inside the timed region.
+        "x_fp8": (x_q, sfa.permute(1, 0, 2)),
+        "y_fp8": (y_q, sfb.permute(0, 2, 1)),
         "a_dtype": "fp8",
         "b_dtype": "fp8",
         "cd_dtype": "bf16",
@@ -886,6 +933,9 @@ def _prepare_bmm_bhd_bhr_hdr(*, H: int, R: int, D: int, B: int, gran_k: int) -> 
     ref = z0 + torch.einsum("bhd,bhr->hdr", x_ref, y_ref)
     z = z0.clone()
 
+    sfa = transform_sf(x_sf.permute(1, 2, 0), D, B, (1, gran_k), H)
+    sfb = transform_sf(y_sf.permute(1, 2, 0), R, B, (1, gran_k), H)
+
     return {
         "expr": "bhd,bhr->hdr",
         "batch": H,
@@ -894,15 +944,17 @@ def _prepare_bmm_bhd_bhr_hdr(*, H: int, R: int, D: int, B: int, gran_k: int) -> 
         "K": B,
         "a": x_q.permute(1, 2, 0),
         "b": y_q.permute(1, 2, 0),
-        "sfa": transform_sf(x_sf.permute(1, 2, 0), D, B, (1, gran_k), H),
-        "sfb": transform_sf(y_sf.permute(1, 2, 0), R, B, (1, gran_k), H),
+        "sfa": sfa,
+        "sfb": sfb,
         "d": z,
         "ref": ref,
         "c": z,
         "z": z,
         "z0": z0,
-        "x_fp8": (x_q, x_sf),
-        "y_fp8": (y_q, y_sf),
+        # See the note in `_prepare_bmm_bhr_hdr_bhd`; `(1, 2, 0)` inverts to
+        # `(2, 0, 1)`.
+        "x_fp8": (x_q, sfa.permute(2, 0, 1)),
+        "y_fp8": (y_q, sfb.permute(2, 0, 1)),
         "a_dtype": "fp8",
         "b_dtype": "fp8",
         "cd_dtype": "fp32",
@@ -1085,9 +1137,14 @@ def prepare_k_grouped(
 
 def deepgemm_launch_k_grouped(data, *, out=None):
     """`deep_gemm.k_grouped_fp8_gemm_tn_contiguous`."""
+    import torch
+
     deep_gemm = require_deep_gemm()
     deep_gemm.set_mk_alignment_for_contiguous_layout(data["k_alignment"])
-    out = data["d"] if out is None else out
+    # Its own accumulator: sharing `data["d"]` with our launch would put two
+    # implementations' read-modify-writes on one buffer, which the other four
+    # entries avoid.
+    out = torch.empty_like(data["d"]) if out is None else out
     # DeepGEMM takes the `[sum_k, MN]` storage view, not the transposed one our
     # descriptors address.
     a, sfa, b, sfb = data["a_store"], data["sfa"], data["b_store"], data["sfb"]

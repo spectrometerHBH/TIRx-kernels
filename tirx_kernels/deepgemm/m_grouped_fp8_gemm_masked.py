@@ -104,7 +104,7 @@ def make_desc(
     N: int,
     K: int,
     b_dtype: str = "fp8",
-    seed: int = 0,
+    seed: int = 0,  # absorbed from the config; only `prepare_data` uses it
     num_sms: int | None = None,
 ) -> GemmDesc:
     """Build the descriptor `m_grouped_fp8_fp4_gemm_nt_masked` would build.
@@ -134,25 +134,17 @@ def make_desc(
 
 
 def get_kernel(**config):
-    from ._sm100_fp8_fp4_gemm_1d1d import build_kernel, make_spec
+    from ._sm100_fp8_fp4_gemm_1d1d import build_kernel
 
     config.pop("label", None)
-    config.pop("seed", None)
-    desc = make_desc(**config)
-    gran_k_a = 128
-    gran_k_b = 32 if desc.b_dtype == "fp4" else 128
-    spec = make_spec(
-        desc, get_best_config(desc), gran_k_a=gran_k_a, gran_k_b=gran_k_b, k_alignment=gran_k_a
-    )
-    return build_kernel(spec)
+    return build_kernel(_spec_for(config))
 
 
 def _spec_for(config: dict):
-    from ._sm100_fp8_fp4_gemm_1d1d import make_spec
+    from ._sm100_fp8_fp4_gemm_1d1d import gran_k_for, make_spec
 
-    desc = make_desc(**{k: v for k, v in config.items() if k != "seed"})
-    gran_k_a = 128
-    gran_k_b = 32 if desc.b_dtype == "fp4" else 128
+    desc = make_desc(**config)
+    gran_k_a, gran_k_b = gran_k_for(desc.b_dtype)
     return make_spec(
         desc, get_best_config(desc), gran_k_a=gran_k_a, gran_k_b=gran_k_b, k_alignment=gran_k_a
     )
@@ -189,7 +181,7 @@ def run_test(**config):
     """Compare only the valid rows of each group against the oracle."""
     import torch
 
-    from ._sm100_fp8_fp4_gemm_1d1d_data import masked_slice_diff, max_diff_threshold
+    from ._sm100_fp8_fp4_gemm_1d1d_data import assert_within_threshold, masked_slice_diff
 
     config.pop("label", None)
     data = prepare_data(**config)
@@ -198,42 +190,35 @@ def run_test(**config):
     launch()
     torch.cuda.synchronize()
 
-    diff = masked_slice_diff(data["d"], data["ref"], data["masked_m"])
-    threshold = max_diff_threshold(data["a_dtype"], data["b_dtype"])
-    if not diff < threshold:
-        raise AssertionError(
-            f"deepgemm_sm100_m_grouped_fp8_gemm_masked g={data['num_groups']} "
-            f"N={data['N']} K={data['K']} b_dtype={data['b_dtype']}: "
-            f"diff {diff:.3e} >= {threshold:.0e}"
-        )
-    return {"diff": diff, "threshold": threshold}
+    return assert_within_threshold(
+        masked_slice_diff(data["d"], data["ref"], data["masked_m"]),
+        data,
+        kernel="deepgemm_sm100_m_grouped_fp8_gemm_masked",
+        detail=(f"g={data['num_groups']} N={data['N']} K={data['K']} b_dtype={data['b_dtype']}"),
+    )
 
 
 def run_bench(*, warmup=None, repeat=None, timer=None, rounds=1, cooldown_s=1.0, **config):
-    from tvm.tirx.bench import bench
-
-    from ._sm100_fp8_fp4_gemm_1d1d_data import deepgemm_launch_m_grouped_masked
+    from ._sm100_fp8_fp4_gemm_1d1d_data import (
+        bench_against_deepgemm,
+        deepgemm_launch_m_grouped_masked,
+    )
 
     config.pop("label", None)
     data = prepare_data(**config)
-    tirx_launch = _tirx_launch(data, config)
-
-    def build_reference():
-        launch, _out = deepgemm_launch_m_grouped_masked(data)
-        return launch
-
-    result = bench(
-        {"tirx": tirx_launch},
-        references={"deepgemm": build_reference},
+    return bench_against_deepgemm(
+        _tirx_launch(data, config),
+        deepgemm_launch_m_grouped_masked,
+        data,
         warmup=warmup,
         repeat=repeat,
         timer=timer,
         rounds=rounds,
         cooldown_s=cooldown_s,
+        N=data["N"],
+        K=data["K"],
+        num_groups=data["num_groups"],
     )
-    result["N"], result["K"] = data["N"], data["K"]
-    result["num_groups"] = data["num_groups"]
-    return result
 
 
 __all__ = [

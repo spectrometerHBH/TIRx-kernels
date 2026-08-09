@@ -152,6 +152,17 @@ def get_num_aligned_tmem_cols(num_cols: int) -> int:
     return 512
 
 
+def gran_k_for(b_dtype: str) -> tuple[int, int]:
+    """`(gran_k_a, gran_k_b)` for one B dtype (`enumerate_normal`).
+
+    An FP4 B operand is quantized with a 32-element K granularity, everything
+    else with 128.  Spec construction and data preparation must agree on this
+    or the packed scale factors do not match the descriptor, so both read it
+    from here.
+    """
+    return 128, 32 if b_dtype == "fp4" else 128
+
+
 def get_theoretical_mk_alignment(expected_m: int | None = None) -> int:
     """`HeuristicsRuntime::get_theoretical_mk_alignment_for_contiguous_layout` (runtime.hpp:47).
 
@@ -250,8 +261,6 @@ class LaunchConfig:
     num_sms: int
     num_sms_per_cluster: int
     num_threads: int = NUM_THREADS
-    num_tma_threads: int = 32
-    num_math_threads: int = 128
     num_non_epilogue_threads: int = NUM_NON_EPILOGUE_THREADS
     num_epilogue_threads: int = NUM_EPILOGUE_THREADS
 
@@ -620,17 +629,6 @@ class GemmSpec:
     def smem_tmem_ptr_offset(self) -> int:
         return self.smem_barrier_offset + 8 * (self.num_stages * 3 + NUM_EPILOGUE_STAGES * 2)
 
-    def barrier_offset(self, family: str, index: int) -> int:
-        """Byte offset of one barrier; `family` mirrors the source's names."""
-        base = {
-            "full": 0,
-            "empty": self.num_stages,
-            "with_sf_full": self.num_stages * 2,
-            "tmem_full": self.num_stages * 3,
-            "tmem_empty": self.num_stages * 3 + NUM_EPILOGUE_STAGES,
-        }[family]
-        return self.smem_barrier_offset + 8 * (base + index)
-
 
 def make_spec(
     desc: GemmDesc,
@@ -866,7 +864,7 @@ def _encode_2d(
     encode = tvm.get_global_func("runtime.cuTensorMapEncodeTiled")
     encode(
         desc.ptr,
-        _TVM_DTYPE_NAME[tensor.dtype],
+        _tvm_dtype_name(tensor),
         2,
         ctypes.c_void_p(int(tensor.data_ptr())),
         int(gmem_inner),
@@ -914,7 +912,7 @@ def _encode_3d(
     encode = tvm.get_global_func("runtime.cuTensorMapEncodeTiled")
     encode(
         desc.ptr,
-        _TVM_DTYPE_NAME[tensor.dtype],
+        _tvm_dtype_name(tensor),
         3,
         ctypes.c_void_p(int(tensor.data_ptr())),
         int(gmem_inner),
@@ -993,26 +991,14 @@ def make_tma_cd_desc_3d(tensor, spec: GemmSpec, *, shape_m: int, shape_n: int, b
     )
 
 
-def _torch_dtype_names():
-    import torch
+def _tvm_dtype_name(tensor) -> str:
+    """TVM's name for a torch dtype.
 
-    return {
-        torch.float8_e4m3fn: "float8_e4m3fn",
-        torch.int32: "int32",
-        torch.bfloat16: "bfloat16",
-        torch.float32: "float32",
-        torch.int8: "int8",
-        torch.uint8: "uint8",
-    }
-
-
-class _LazyDtypeNames(dict):
-    def __missing__(self, key):
-        self.update(_torch_dtype_names())
-        return dict.__getitem__(self, key)
-
-
-_TVM_DTYPE_NAME = _LazyDtypeNames()
+    Every dtype this kernel passes to a tensor map is spelled the same by both
+    sides, so the mapping is `str(dtype)` minus the namespace rather than a
+    table that silently `KeyError`s on the next dtype added.
+    """
+    return str(tensor.dtype).removeprefix("torch.")
 
 
 def make_tma_a_desc(tensor, spec: GemmSpec, *, shape_m: int, shape_k: int, num_groups: int = 1):
@@ -1164,54 +1150,16 @@ def build_launch(
         tmap_a = make_tma_a_desc_3d(a, spec, shape_m=shape_m, shape_k=shape_k, batch=num_groups)
         tmap_b = make_tma_b_desc_3d(b, spec, shape_n=shape_n, shape_k=shape_k, batch=num_groups)
         tmap_cd = make_tma_cd_desc_3d(d, spec, shape_m=shape_m, shape_n=shape_n, batch=num_groups)
-        tmap_sfa = make_tma_sf_desc(
-            sfa,
-            shape_mn=shape_m,
-            shape_k=shape_k,
-            block_mn=spec.block_m,
-            gran_k=spec.gran_k_a,
-            num_groups=sf_num_groups_a,
+    else:
+        tmap_a = make_tma_a_desc(
+            a, spec, shape_m=shape_m, shape_k=shape_k, num_groups=1 if a.dim() == 2 else num_groups
         )
-        tmap_sfb = make_tma_sf_desc(
-            sfb,
-            shape_mn=shape_n,
-            shape_k=shape_k,
-            block_mn=spec.block_n,
-            gran_k=spec.gran_k_b,
-            num_groups=sf_num_groups_b,
+        tmap_b = make_tma_b_desc(
+            b, spec, shape_n=shape_n, shape_k=shape_k, num_groups=1 if b.dim() == 2 else num_groups
         )
-        layout_b = (
-            grouped_layout
-            if grouped_layout is not None
-            else __import__("torch").zeros(1, device=d.device, dtype=__import__("torch").int32)
+        tmap_cd = make_tma_cd_desc(
+            d, spec, shape_m=shape_m, shape_n=shape_n, num_groups=1 if d.dim() == 2 else num_groups
         )
-        maps_b = (tmap_a, tmap_b, tmap_sfa, tmap_sfb, tmap_cd)
-        layout_len_b = int(layout_b.numel())
-
-        def launch_batched():
-            executable.mod(
-                layout_b,
-                layout_len_b,
-                shape_m,
-                shape_n,
-                shape_k,
-                maps_b[0].ptr,
-                maps_b[1].ptr,
-                maps_b[2].ptr,
-                maps_b[3].ptr,
-                maps_b[4].ptr,
-            )
-
-        return launch_batched
-    tmap_a = make_tma_a_desc(
-        a, spec, shape_m=shape_m, shape_k=shape_k, num_groups=1 if a.dim() == 2 else num_groups
-    )
-    tmap_b = make_tma_b_desc(
-        b, spec, shape_n=shape_n, shape_k=shape_k, num_groups=1 if b.dim() == 2 else num_groups
-    )
-    tmap_cd = make_tma_cd_desc(
-        d, spec, shape_m=shape_m, shape_n=shape_n, num_groups=1 if d.dim() == 2 else num_groups
-    )
     # The k-grouped scale factors are packed per group, so their row count is
     # `sum(ceil_div(k_i, gran_k * 4))`, not `ceil_div(sum_k, gran_k * 4)`.  The
     # source derives the descriptor's K extent from the tensor itself

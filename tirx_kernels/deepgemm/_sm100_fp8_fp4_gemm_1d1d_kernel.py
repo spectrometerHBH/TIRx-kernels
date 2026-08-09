@@ -23,8 +23,8 @@
 """The kernel body: eight warps, five barrier families, one persistent walk.
 
 Plain TIRx only -- explicit loops, hand-carved shared/tensor memory and `T.ptx`
-intrinsics.  No tile primitive may appear here; `.porting/sm100_fp8_fp4_gemm_1d1d/
-no_tile_primitive_gate.py` enforces that over every specialization.
+intrinsics.  No tile primitive may appear here: no `tirx.tile.*` call and no op
+carrying ``TIRxOpCategory == "tile_primitive"``, in any specialization.
 
 Role map (source `:206`, `:281`, `:432`, `:470`):
 
@@ -41,9 +41,9 @@ warp  role
 
 from __future__ import annotations
 
-from tvm.backend.cuda.tile_primitive.gemm_async.tcgen05 import (
-    _encode_instr_descriptor_block_scaled_uint32,
-    _encode_smem_descriptor_base_uint64,
+from tvm.backend.cuda.cpp.descriptors import (
+    encode_instr_descriptor_block_scaled_uint32,
+    encode_smem_descriptor_base_uint64,
 )
 from tvm.script import tirx as T
 
@@ -55,6 +55,7 @@ from ._sm100_fp8_fp4_gemm_1d1d import (
     NUM_TMA_STORE_STAGES,
     NUM_UTCCP_ALIGNED_ELEMS,
     UMMA_K,
+    UMMA_STEP_N,
     GemmSpec,
     GemmType,
     Major,
@@ -72,7 +73,7 @@ EVICT_NORMAL = 1152921504606846976
 
 #: `timeHint` for `mbarrier.try_wait.parity`, a nanosecond budget after which
 #: the instruction reports "not yet" rather than keep waiting.  Same value the
-#: retired `T.cuda.mbarrier_wait` helper baked into its own spin loop.
+#: `T.cuda.mbarrier_wait` helper bakes into the spin loop it emits.
 TRY_WAIT_TICKS = 0x989680
 
 _TORCH_SMEM_DTYPE = {
@@ -216,11 +217,7 @@ def build_kernel(spec: GemmSpec):
     umma_k_steps = block_k // UMMA_K
     # `kMayHaveTailKBlock` (sm100_fp8_fp4_gemm_1d1d.cuh:338).  When set, the final K
     # block of a group may be partial and only its leading UMMA-K steps are valid.
-    may_have_tail_k = (
-        spec.k_alignment % block_k != 0
-        if spec.gemm_type.is_k_grouped_contiguous
-        else (spec.shape_k == 0 or spec.shape_k % block_k != 0)
-    )
+    may_have_tail_k = spec.may_have_tail_k_block
     num_sms = spec.num_sms
     swap_ab = spec.swap_ab
     with_accumulation = spec.with_accumulation
@@ -244,7 +241,6 @@ def build_kernel(spec: GemmSpec):
     # descriptor's `n_dim_` (`:332`) and the swap-AB store count
     # (`sm100_store_cd_swap_ab.cuh:50`).  Narrowing fewer than all three leaves
     # part of the block unwritten.
-    UMMA_STEP_N = 16
     use_effective_m = spec.swap_ab and is_m_grouped_psum and not spec.ensure_zero_padding
     # `n_dim_` is bits [17,23) of the instruction descriptor.
     UMMA_N_FIELD_MASK = 0xFF81FFFF
@@ -306,32 +302,33 @@ def build_kernel(spec: GemmSpec):
     swizzle_b = SwizzleMode(_swizzle_enum(spec.swizzle_b_mode))
 
     def _operand_layout(is_k_major, load_mn, swizzle_mode, smem_dtype, swizzle_enum, elem):
-        """SMEM shape and descriptor `{sdo, ldo}` for one operand (`mma/sm100.cuh:107`).
+        """SMEM layout and descriptor stride offset for one operand (`mma/sm100.cuh:107`).
 
-        For a K-major operand the swizzle atom runs along K, so the buffer is
-        `(stage, MN, K)` and the descriptor needs only a stride offset.  For an
-        MN-major operand the atom runs along MN, the buffer is `(stage, K, MN)`,
-        and both offsets are live.
+        For a K-major operand the swizzle atom runs along K, so the layout is
+        built over `(stage, MN, K)`; for an MN-major one it runs along MN and
+        the layout is built over `(stage, K, MN)`.  Only `sdo` reaches the
+        descriptor -- every in-scope config leaves the leading offset at zero
+        (see the single-atom checks below) -- but `ldo` is still computed
+        because the 16-byte swizzle swaps the two.
         """
         if is_k_major:
             shape = (stages, load_mn, block_k)
             # `kSwizzleMode * pack == BLOCK_K * sizeof` is asserted upstream, so
             # each block holds exactly one swizzle atom along K.
             sdo = 8 * block_k * elem // 16
-            ldo = 0
         else:
             atom = swizzle_mode // elem if swizzle_mode else load_mn
             shape = (stages, block_k, load_mn)
             sdo = 8 * atom * elem // 16
             ldo = block_k * atom * elem // 16
             if swizzle_mode == 16:
-                sdo, ldo = ldo, sdo
-        return shape, mma_shared_layout(smem_dtype, swizzle_enum, shape), sdo, ldo
+                sdo = ldo
+        return mma_shared_layout(smem_dtype, swizzle_enum, shape), sdo
 
-    a_shape, a_layout, a_desc_sdo, a_desc_ldo = _operand_layout(
+    a_layout, a_desc_sdo = _operand_layout(
         major_a_is_k, load_block_m, spec.swizzle_a_mode, a_smem_dtype, swizzle_a, 1
     )
-    b_shape, b_layout, b_desc_sdo, b_desc_ldo = _operand_layout(
+    b_layout, b_desc_sdo = _operand_layout(
         major_b_is_k, load_block_n, spec.swizzle_b_mode, b_smem_dtype, swizzle_b, 1
     )
     # The MN-major TMA destination for atom `i` sits at `i * BLOCK_K * atom`
@@ -349,10 +346,10 @@ def build_kernel(spec: GemmSpec):
     # and become opaque helpers in the generated CUDA.  Every field but the
     # shared address is a constant at this point; the address is ORed in at
     # run time by `_with_smem_addr`.
-    A_DESC_BASE = _encode_smem_descriptor_base_uint64(0, a_desc_sdo, swizzle_a_enum)
-    B_DESC_BASE = _encode_smem_descriptor_base_uint64(0, b_desc_sdo, swizzle_b_enum)
-    SF_DESC_BASE = _encode_smem_descriptor_base_uint64(0, sf_desc_sdo, 0)
-    INSTR_DESC = _encode_instr_descriptor_block_scaled_uint32(
+    A_DESC_BASE = encode_smem_descriptor_base_uint64(0, a_desc_sdo, swizzle_a_enum)
+    B_DESC_BASE = encode_smem_descriptor_base_uint64(0, b_desc_sdo, swizzle_b_enum)
+    SF_DESC_BASE = encode_smem_descriptor_base_uint64(0, sf_desc_sdo, 0)
+    INSTR_DESC = encode_instr_descriptor_block_scaled_uint32(
         M=umma_m,
         N=umma_n,
         K=UMMA_K,
@@ -418,8 +415,8 @@ def build_kernel(spec: GemmSpec):
     def _swizzled(block_idx, num_m_blocks, num_n_blocks):
         """`get_swizzled_block_idx`: group blocks along the multicast axis.
 
-        Returns `(m_block_idx, n_block_idx)` as expressions; the compiler folds
-        the shared sub-expressions.
+        Returns `(m_block_idx, n_block_idx)` as expressions.  Each caller binds
+        both to locals once and reuses them, as the source does.
         """
         if is_batched:
             if is_multicast_on_a:
@@ -437,6 +434,18 @@ def build_kernel(spec: GemmSpec):
         if is_multicast_on_a:
             return _udiv(in_group, in_group_blocks), first_block + _umod(in_group, in_group_blocks)
         return first_block + _umod(in_group, in_group_blocks), _udiv(in_group, in_group_blocks)
+
+    def _tma_coords(coords, batch):
+        """TMA tensor coordinates, batch index appended for a 3-D descriptor.
+
+        `is_batched` is the only thing that changes the arity of every
+        `cp.async.bulk.tensor` in this kernel, so it is resolved here once
+        rather than by duplicating each call site.
+        """
+        out = [T.cast(c, "int32") for c in coords]
+        if is_batched:
+            out.append(T.cast(batch, "int32"))
+        return out
 
     @T.prim_func
     def sm100_fp8_fp4_gemm_1d1d(
@@ -666,7 +675,6 @@ def build_kernel(spec: GemmSpec):
             if ld_elected == T.uint32(1):
                 ld_stage: T.int32
                 ld_phase: T.int32
-                ld_block: T.int32
                 ld_stage = 0
                 ld_phase = 0
                 ld_it: T.int32
@@ -802,16 +810,18 @@ def build_kernel(spec: GemmSpec):
                             ld_valid = 0
                     if ld_valid == 1:
                         ld_kblocks = _uceil(ld_psum, block_k) if is_k_grouped else num_k_blocks
+                        # One swizzle walk feeds `m_idx`, `n_idx` and the tail-block
+                        # test below, as the source's single `get_swizzled_block_idx`
+                        # call does (`scheduler/gemm.cuh:197`).
+                        ld_m_local, ld_n_local = _swizzled(
+                            ld_nb - ld_cum * num_n_blocks, ld_nmb, num_n_blocks
+                        )
                         m_idx: T.int32
                         n_idx: T.int32
                         m_idx = (
-                            _swizzled(ld_nb - ld_cum * num_n_blocks, ld_nmb, num_n_blocks)[0]
-                            + (_udiv(ld_last, block_m) if is_m_grouped_psum else 0)
+                            ld_m_local + (_udiv(ld_last, block_m) if is_m_grouped_psum else 0)
                         ) * block_m
-                        n_idx = (
-                            _swizzled(ld_nb - ld_cum * num_n_blocks, ld_nmb, num_n_blocks)[1]
-                            * block_n
-                        )
+                        n_idx = ld_n_local * block_n
                         sfa_mn: T.int32
                         sfb_mn: T.int32
                         # The scale factors are indexed by the *whole* block, before
@@ -870,21 +880,18 @@ def build_kernel(spec: GemmSpec):
                         # Each CTA of a cluster loads its own slice; the 2-CTA
                         # behaviour lives here and in the UMMA, not in a multicast
                         # TMA (source `:237-240`).
-                        # `get_aligned_effective_m_in_block` for this block (sketch `:559`).
-                        ld_eff_m: T.int32
-                        ld_eff_m_local: T.int32
-                        ld_eff_m_local = _swizzled(
-                            ld_nb - ld_cum * num_n_blocks, ld_nmb, num_n_blocks
-                        )[0]
-                        ld_eff_m = block_m
-                        with T.If(ld_eff_m_local == ld_nmb - 1), T.Then():
-                            ld_eff_m = (
-                                _uceil(
-                                    ld_psum - (ld_eff_m_local + _udiv(ld_last, block_m)) * block_m,
-                                    UMMA_STEP_N,
+                        if use_effective_m:
+                            # `get_aligned_effective_m_in_block` for this block (sketch `:559`).
+                            ld_eff_m: T.int32
+                            ld_eff_m = block_m
+                            with T.If(ld_m_local == ld_nmb - 1), T.Then():
+                                ld_eff_m = (
+                                    _uceil(
+                                        ld_psum - (ld_m_local + _udiv(ld_last, block_m)) * block_m,
+                                        UMMA_STEP_N,
+                                    )
+                                    * UMMA_STEP_N
                                 )
-                                * UMMA_STEP_N
-                            )
                         if cta_group > 1:
                             if is_multicast_on_a:
                                 m_idx = m_idx + cta_in_cluster * (
@@ -904,84 +911,44 @@ def build_kernel(spec: GemmSpec):
                                     T.cast(T.bitwise_xor(ld_phase, 1), "uint32"),
                                     T.uint32(TRY_WAIT_TICKS),
                                 )
-                            k_idx: T.int32
-                            k_idx = ld_k * block_k
                             k_b: T.int32
                             k_a: T.int32
                             k_b = k_b_idx + ld_k * block_k
                             k_a = k_a_offset + ld_k * block_k
                             for i in T.unroll(0, num_a_atoms):
-                                if is_batched:
-                                    T.evaluate(
-                                        T.ptx[load_chain](
-                                            smem_a.ptr_to([ld_stage, 0, i * a_atom])
+                                T.evaluate(
+                                    T.ptx[load_chain](
+                                        smem_a.ptr_to([ld_stage, 0, i * a_atom])
+                                        if major_a_is_k
+                                        else smem_a.ptr_to([ld_stage, 0, 0]),
+                                        T.address_of(tensor_map_a),
+                                        *_tma_coords(
+                                            (k_a + i * a_atom, m_idx)
                                             if major_a_is_k
-                                            else smem_a.ptr_to([ld_stage, 0, 0]),
-                                            T.address_of(tensor_map_a),
-                                            T.cast(k_a + i * a_atom, "int32")
-                                            if major_a_is_k
-                                            else T.cast(m_idx + i * a_atom, "int32"),
-                                            T.cast(m_idx, "int32")
-                                            if major_a_is_k
-                                            else T.cast(k_idx, "int32"),
-                                            T.cast(ld_grp, "int32"),
-                                            barriers.ptr_to([full_base + ld_stage]),
-                                            T.uint64(EVICT_NORMAL),
-                                        )
+                                            else (m_idx + i * a_atom, k_a),
+                                            ld_grp,
+                                        ),
+                                        barriers.ptr_to([full_base + ld_stage]),
+                                        T.uint64(EVICT_NORMAL),
                                     )
-                                else:
-                                    T.evaluate(
-                                        T.ptx[load_chain](
-                                            smem_a.ptr_to([ld_stage, 0, i * a_atom])
-                                            if major_a_is_k
-                                            else smem_a.ptr_to([ld_stage, 0, 0]),
-                                            T.address_of(tensor_map_a),
-                                            T.cast(k_a + i * a_atom, "int32")
-                                            if major_a_is_k
-                                            else T.cast(m_idx + i * a_atom, "int32"),
-                                            T.cast(m_idx, "int32")
-                                            if major_a_is_k
-                                            else T.cast(k_a, "int32"),
-                                            barriers.ptr_to([full_base + ld_stage]),
-                                            T.uint64(EVICT_NORMAL),
-                                        )
-                                    )
+                                )
                             for i in T.unroll(0, num_b_atoms):
-                                if is_batched:
-                                    T.evaluate(
-                                        T.ptx[load_chain](
-                                            smem_b.ptr_to([ld_stage, 0, i * b_atom])
+                                T.evaluate(
+                                    T.ptx[load_chain](
+                                        smem_b.ptr_to([ld_stage, 0, i * b_atom])
+                                        if major_b_is_k
+                                        else smem_b.ptr_to([ld_stage, 0, 0]),
+                                        T.address_of(tensor_map_b),
+                                        *_tma_coords(
+                                            (k_b + i * b_atom, n_idx)
                                             if major_b_is_k
-                                            else smem_b.ptr_to([ld_stage, 0, 0]),
-                                            T.address_of(tensor_map_b),
-                                            T.cast(k_b + i * b_atom, "int32")
-                                            if major_b_is_k
-                                            else T.cast(n_idx + i * b_atom, "int32"),
-                                            T.cast(n_idx, "int32")
-                                            if major_b_is_k
-                                            else T.cast(k_b, "int32"),
-                                            T.cast(ld_grp, "int32"),
-                                            barriers.ptr_to([full_base + ld_stage]),
-                                            T.uint64(EVICT_NORMAL),
-                                        )
+                                            else (n_idx + i * b_atom, k_b),
+                                            ld_grp,
+                                        ),
+                                        barriers.ptr_to([full_base + ld_stage]),
+                                        T.uint64(EVICT_NORMAL),
                                     )
-                                else:
-                                    T.evaluate(
-                                        T.ptx[load_chain](
-                                            smem_b.ptr_to([ld_stage, 0, i * b_atom])
-                                            if major_b_is_k
-                                            else smem_b.ptr_to([ld_stage, 0, 0]),
-                                            T.address_of(tensor_map_b),
-                                            T.cast(k_b + i * b_atom, "int32")
-                                            if major_b_is_k
-                                            else T.cast(n_idx + i * b_atom, "int32"),
-                                            T.cast(n_idx, "int32")
-                                            if major_b_is_k
-                                            else T.cast(k_b, "int32"),
-                                            barriers.ptr_to([full_base + ld_stage]),
-                                            T.uint64(EVICT_NORMAL),
-                                        )
-                                    )
+                                )
                             arrival: T.int32
                             arrival = arrival_bytes_ab
                             if ld_k % sfa_stages_per_load == 0:
@@ -1028,8 +995,8 @@ def build_kernel(spec: GemmSpec):
                 desc_i: T.uint32
                 # Every descriptor field but the shared address is a build-time
                 # constant, so the bases are folded in Python and only
-                # `addr >> 4` is computed here.  The `# noqa` bases come from
-                # the same bit layout the retired C encoders filled in.
+                # `addr >> 4` is computed here.  The `*_DESC_BASE` constants
+                # come from the same bit layout the runtime C encoders fill in.
                 a_smem_u32: T.uint32
                 b_smem_u32: T.uint32
                 sfa_smem_u32: T.uint32
@@ -1064,7 +1031,6 @@ def build_kernel(spec: GemmSpec):
 
                 mma_stage: T.int32
                 mma_phase: T.int32
-                mma_block: T.int32
                 mma_iter: T.int32
                 mma_stage = 0
                 mma_phase = 0
@@ -1078,7 +1044,6 @@ def build_kernel(spec: GemmSpec):
                 mma_nb: T.int32
                 mma_nxt: T.int32
                 mma_nxtk: T.int32
-                mma_sfk: T.int32
                 mma_kblocks: T.int32
                 mma_vgrp: T.int32
                 mma_kend: T.int32
@@ -1094,7 +1059,6 @@ def build_kernel(spec: GemmSpec):
                 mma_cum = 0
                 mma_last = 0
                 # Scheduler cursor init (`scheduler/gemm.cuh:88`).
-                mma_sfk = 0
                 mma_vgrp = 0
                 mma_kend = 0
                 mma_nxt = 0
@@ -1173,7 +1137,6 @@ def build_kernel(spec: GemmSpec):
                             elif mma_nb < (mma_vgrp + 1) * num_blocks:
                                 mma_done = 1
                             else:
-                                mma_sfk = mma_sfk + (_uceil(mma_psum, sf_k_span))
                                 mma_vgrp = mma_vgrp + 1
                                 if is_k_grouped_psum:
                                     mma_grp = mma_grp + 1
@@ -1207,23 +1170,23 @@ def build_kernel(spec: GemmSpec):
                         if mma_nb >= num_blocks:
                             mma_valid = 0
                     if mma_valid == 1:
-                        # `get_aligned_effective_m_in_block` for this block (sketch `:559`).
-                        mma_eff_m: T.int32
-                        mma_eff_m_local: T.int32
-                        mma_eff_m_local = _swizzled(
-                            mma_nb - mma_cum * num_n_blocks, mma_nmb, num_n_blocks
-                        )[0]
-                        mma_eff_m = block_m
-                        with T.If(mma_eff_m_local == mma_nmb - 1), T.Then():
-                            mma_eff_m = (
-                                _uceil(
-                                    mma_psum
-                                    - (mma_eff_m_local + _udiv(mma_last, block_m)) * block_m,
-                                    UMMA_STEP_N,
-                                )
-                                * UMMA_STEP_N
-                            )
                         if use_effective_m:
+                            # `get_aligned_effective_m_in_block` for this block (sketch `:559`).
+                            mma_eff_m: T.int32
+                            mma_m_local: T.int32
+                            mma_m_local = _swizzled(
+                                mma_nb - mma_cum * num_n_blocks, mma_nmb, num_n_blocks
+                            )[0]
+                            mma_eff_m = block_m
+                            with T.If(mma_m_local == mma_nmb - 1), T.Then():
+                                mma_eff_m = (
+                                    _uceil(
+                                        mma_psum
+                                        - (mma_m_local + _udiv(mma_last, block_m)) * block_m,
+                                        UMMA_STEP_N,
+                                    )
+                                    * UMMA_STEP_N
+                                )
                             desc_i = T.bitwise_or(
                                 T.bitwise_and(desc_i, T.uint32(UMMA_N_FIELD_MASK)),
                                 T.shift_left(T.cast(mma_eff_m // 8, "uint32"), T.uint32(17)),
@@ -1462,7 +1425,6 @@ def build_kernel(spec: GemmSpec):
         elif warp == 2:
             tr_stage: T.int32
             tr_phase: T.int32
-            tr_block: T.int32
             tr_stage = 0
             tr_phase = 0
             tr_it: T.int32
@@ -1475,7 +1437,6 @@ def build_kernel(spec: GemmSpec):
             tr_nb: T.int32
             tr_nxt: T.int32
             tr_nxtk: T.int32
-            tr_sfk: T.int32
             tr_kblocks: T.int32
             tr_vgrp: T.int32
             tr_kend: T.int32
@@ -1485,7 +1446,6 @@ def build_kernel(spec: GemmSpec):
             tr_cum = 0
             tr_last = 0
             # Scheduler cursor init (`scheduler/gemm.cuh:88`).
-            tr_sfk = 0
             tr_vgrp = 0
             tr_kend = 0
             tr_nxt = 0
@@ -1564,7 +1524,6 @@ def build_kernel(spec: GemmSpec):
                         elif tr_nb < (tr_vgrp + 1) * num_blocks:
                             tr_done = 1
                         else:
-                            tr_sfk = tr_sfk + (_uceil(tr_psum, sf_k_span))
                             tr_vgrp = tr_vgrp + 1
                             if is_k_grouped_psum:
                                 tr_grp = tr_grp + 1
@@ -1648,8 +1607,6 @@ def build_kernel(spec: GemmSpec):
         elif warp >= first_epilogue_warp and warp < first_epilogue_warp + num_store_warps:
             ep_warp: T.int32
             ep_warp = warp - first_epilogue_warp
-            ep_block: T.int32
-            ep_iter: T.int32
             tma_stage: T.int32
             ep_it: T.int32
             ep_valid: T.int32
@@ -1661,8 +1618,6 @@ def build_kernel(spec: GemmSpec):
             ep_nb: T.int32
             ep_nxt: T.int32
             ep_nxtk: T.int32
-            ep_sfk: T.int32
-            ep_kblocks: T.int32
             ep_vgrp: T.int32
             ep_kend: T.int32
             ep_it = 0
@@ -1671,12 +1626,10 @@ def build_kernel(spec: GemmSpec):
             ep_cum = 0
             ep_last = 0
             # Scheduler cursor init (`scheduler/gemm.cuh:88`).
-            ep_sfk = 0
             ep_vgrp = 0
             ep_kend = 0
             ep_nxt = 0
             ep_nxtk = 0
-            ep_kblocks = 0
             if is_k_grouped:
                 # Start on the first non-empty group (`get_next_k_group`, `:66`).
                 ep_psum = 0
@@ -1708,7 +1661,6 @@ def build_kernel(spec: GemmSpec):
             else:
                 ep_psum = 0
                 ep_nmb = num_m_blocks
-            ep_iter = 0
             tma_stage = 0
             values = T.alloc_local((8,), "uint32")
             packed = T.alloc_local((4,), "uint32")
@@ -1753,7 +1705,6 @@ def build_kernel(spec: GemmSpec):
                         elif ep_nb < (ep_vgrp + 1) * num_blocks:
                             ep_done = 1
                         else:
-                            ep_sfk = ep_sfk + (_uceil(ep_psum, sf_k_span))
                             ep_vgrp = ep_vgrp + 1
                             if is_k_grouped_psum:
                                 ep_grp = ep_grp + 1
@@ -1787,11 +1738,10 @@ def build_kernel(spec: GemmSpec):
                     if ep_nb >= num_blocks:
                         ep_valid = 0
                 if ep_valid == 1:
-                    ep_kblocks = _uceil(ep_psum, block_k) if is_k_grouped else num_k_blocks
                     accum_stage_e: T.int32
                     accum_phase_e: T.int32
-                    accum_stage_e = ep_iter % NUM_EPILOGUE_STAGES
-                    accum_phase_e = T.bitwise_and(ep_iter // NUM_EPILOGUE_STAGES, 1)
+                    accum_stage_e = ep_it % NUM_EPILOGUE_STAGES
+                    accum_phase_e = T.bitwise_and(ep_it // NUM_EPILOGUE_STAGES, 1)
                     ep_wait: T.uint32
                     ep_wait = T.uint32(0)
                     while ep_wait == T.uint32(0):
@@ -1802,40 +1752,38 @@ def build_kernel(spec: GemmSpec):
                             T.uint32(TRY_WAIT_TICKS),
                         )
                     T.ptx.tcgen05.fence__after_thread_sync()
+                    # One swizzle walk feeds `base_m`, `base_n` and the tail-block test.
+                    ep_m_local, ep_n_local = _swizzled(
+                        ep_nb - ep_cum * num_n_blocks, ep_nmb, num_n_blocks
+                    )
                     base_m: T.int32
                     base_n: T.int32
                     base_m = (
-                        _swizzled(ep_nb - ep_cum * num_n_blocks, ep_nmb, num_n_blocks)[0]
-                        + (_udiv(ep_last, block_m) if is_m_grouped_psum else 0)
+                        ep_m_local + (_udiv(ep_last, block_m) if is_m_grouped_psum else 0)
                     ) * block_m
-                    base_n = (
-                        _swizzled(ep_nb - ep_cum * num_n_blocks, ep_nmb, num_n_blocks)[1] * block_n
-                    )
+                    base_n = ep_n_local * block_n
                     if is_m_grouped_masked or is_k_grouped:
                         base_m = ep_grp * eff_m + base_m
                     tmem_base: T.int32
                     tmem_base = accum_stage_e * umma_n
 
-                    # `get_aligned_effective_m_in_block` for this block (sketch `:559`).
-                    ep_eff_m: T.int32
-                    ep_eff_m_local: T.int32
-                    ep_eff_m_local = _swizzled(ep_nb - ep_cum * num_n_blocks, ep_nmb, num_n_blocks)[
-                        0
-                    ]
-                    ep_eff_m = block_m
-                    with T.If(ep_eff_m_local == ep_nmb - 1), T.Then():
-                        ep_eff_m = (
-                            _uceil(
-                                ep_psum - (ep_eff_m_local + _udiv(ep_last, block_m)) * block_m,
-                                UMMA_STEP_N,
-                            )
-                            * UMMA_STEP_N
-                        )
                     # `num_stores = effective_m / STORE_BLOCK_M` (sketch `:1276`).
                     ep_stores: T.int32
-                    ep_stores = (
-                        _udiv(ep_eff_m, store_block_m) if use_effective_m else num_swap_stores
-                    )
+                    if use_effective_m:
+                        # `get_aligned_effective_m_in_block` for this block (sketch `:559`).
+                        ep_eff_m: T.int32
+                        ep_eff_m = block_m
+                        with T.If(ep_m_local == ep_nmb - 1), T.Then():
+                            ep_eff_m = (
+                                _uceil(
+                                    ep_psum - (ep_m_local + _udiv(ep_last, block_m)) * block_m,
+                                    UMMA_STEP_N,
+                                )
+                                * UMMA_STEP_N
+                            )
+                        ep_stores = _udiv(ep_eff_m, store_block_m)
+                    else:
+                        ep_stores = num_swap_stores
 
                     if swap_ab:
                         for st in T.unroll(0, num_swap_stores):
@@ -1951,55 +1899,30 @@ def build_kernel(spec: GemmSpec):
                                         ep_elected_lane, ep_elected, T.uint32(0xFFFFFFFF)
                                     )
                                     for i in T.unroll(0, num_n_atoms):
-                                        if is_batched:
-                                            T.evaluate(
-                                                T.ptx[
-                                                    reduce_chain
-                                                    if with_accumulation
-                                                    else store_chain
-                                                ](
-                                                    T.address_of(tensor_map_cd),
-                                                    T.cast(
-                                                        base_n + i * store_block_n_atom, "int32"
+                                        T.evaluate(
+                                            T.ptx[
+                                                reduce_chain if with_accumulation else store_chain
+                                            ](
+                                                T.address_of(tensor_map_cd),
+                                                *_tma_coords(
+                                                    (
+                                                        base_n + i * store_block_n_atom,
+                                                        base_m + st * store_block_m,
                                                     ),
-                                                    T.cast(base_m + st * store_block_m, "int32"),
-                                                    T.cast(ep_grp, "int32"),
-                                                    smem_cd_u32.ptr_to(
-                                                        [
-                                                            (
-                                                                tma_stage * cd_stage_bytes
-                                                                + i * store_block_m * swizzle_cd
-                                                            )
-                                                            // 4
-                                                        ]
-                                                    ),
-                                                    pred=ep_elected == T.uint32(1),
-                                                )
+                                                    ep_grp,
+                                                ),
+                                                smem_cd_u32.ptr_to(
+                                                    [
+                                                        (
+                                                            tma_stage * cd_stage_bytes
+                                                            + i * store_block_m * swizzle_cd
+                                                        )
+                                                        // 4
+                                                    ]
+                                                ),
+                                                pred=ep_elected == T.uint32(1),
                                             )
-                                        else:
-                                            T.evaluate(
-                                                T.ptx[
-                                                    reduce_chain
-                                                    if with_accumulation
-                                                    else store_chain
-                                                ](
-                                                    T.address_of(tensor_map_cd),
-                                                    T.cast(
-                                                        base_n + i * store_block_n_atom, "int32"
-                                                    ),
-                                                    T.cast(base_m + st * store_block_m, "int32"),
-                                                    smem_cd_u32.ptr_to(
-                                                        [
-                                                            (
-                                                                tma_stage * cd_stage_bytes
-                                                                + i * store_block_m * swizzle_cd
-                                                            )
-                                                            // 4
-                                                        ]
-                                                    ),
-                                                    pred=ep_elected == T.uint32(1),
-                                                )
-                                            )
+                                        )
                                     T.evaluate(T.ptx.cp.async_.bulk.commit_group())
                                 T.ptx.bar.warp.sync(T.uint32(0xFFFFFFFF))
                                 tma_stage = T.Select(
@@ -2086,37 +2009,25 @@ def build_kernel(spec: GemmSpec):
                                     T.ptx.elect_sync(
                                         ep_elected_lane, ep_elected, T.uint32(0xFFFFFFFF)
                                     )
-                                    if is_batched:
-                                        T.evaluate(
-                                            T.ptx[
-                                                reduce_chain if with_accumulation else store_chain
-                                            ](
-                                                T.address_of(tensor_map_cd),
-                                                T.cast(base_n + st * store_block_n, "int32"),
-                                                T.cast(base_m + w * store_block_m, "int32"),
-                                                T.cast(ep_grp, "int32"),
-                                                smem_cd.ptr_to([tma_stage, 0, 0]),
-                                                pred=ep_elected == T.uint32(1),
-                                            )
+                                    T.evaluate(
+                                        T.ptx[reduce_chain if with_accumulation else store_chain](
+                                            T.address_of(tensor_map_cd),
+                                            *_tma_coords(
+                                                (
+                                                    base_n + st * store_block_n,
+                                                    base_m + w * store_block_m,
+                                                ),
+                                                ep_grp,
+                                            ),
+                                            smem_cd.ptr_to([tma_stage, 0, 0]),
+                                            pred=ep_elected == T.uint32(1),
                                         )
-                                    else:
-                                        T.evaluate(
-                                            T.ptx[
-                                                reduce_chain if with_accumulation else store_chain
-                                            ](
-                                                T.address_of(tensor_map_cd),
-                                                T.cast(base_n + st * store_block_n, "int32"),
-                                                T.cast(base_m + w * store_block_m, "int32"),
-                                                smem_cd.ptr_to([tma_stage, 0, 0]),
-                                                pred=ep_elected == T.uint32(1),
-                                            )
-                                        )
+                                    )
                                     T.evaluate(T.ptx.cp.async_.bulk.commit_group())
                                 T.ptx.bar.warp.sync(T.uint32(0xFFFFFFFF))
                                 tma_stage = T.Select(
                                     tma_stage == NUM_TMA_STORE_STAGES - 1, 0, tma_stage + 1
                                 )
-                    ep_iter = ep_iter + 1
                 ep_it = ep_it + 1
 
         # ===============================================================
