@@ -41,6 +41,10 @@ warp  role
 
 from __future__ import annotations
 
+from tvm.backend.cuda.tile_primitive.gemm_async.tcgen05 import (
+    _encode_instr_descriptor_block_scaled_uint32,
+    _encode_smem_descriptor_base_uint64,
+)
 from tvm.script import tirx as T
 
 from ._sm100_fp8_fp4_gemm_1d1d import (
@@ -65,6 +69,11 @@ EPILOGUE_NAMED_BARRIER = 8
 
 #: `cute::TMA::CacheHintSm100::EVICT_NORMAL`.
 EVICT_NORMAL = 1152921504606846976
+
+#: `timeHint` for `mbarrier.try_wait.parity`, a nanosecond budget after which
+#: the instruction reports "not yet" rather than keep waiting.  Same value the
+#: retired `T.cuda.mbarrier_wait` helper baked into its own spin loop.
+TRY_WAIT_TICKS = 0x989680
 
 _TORCH_SMEM_DTYPE = {
     "fp8": "float8_e4m3fn",
@@ -143,16 +152,34 @@ def build_kernel(spec: GemmSpec):
 
     _validate(spec)
 
-    def _rebase(desc, smem_ptr):
-        """`replace_smem_desc_addr`: rewrite bits [13:0] with `smem_addr >> 4`."""
-        addr = T.cast(
-            T.bitwise_and(
-                T.shift_right(T.cuda.cvta_generic_to_shared(smem_ptr), T.uint32(4)),
-                T.uint32(0x3FFF),
-            ),
-            "uint64",
+    def _u64_const(value):
+        """A `uint64` literal whose top bit may be set.
+
+        `T.uint64` routes a Python int through an int64 conversion, so a value
+        at or above 2**63 does not survive it -- and a descriptor whose swizzle
+        puts `layout_type_` at bits [61,64) is exactly that. Assembling it from
+        two 32-bit halves does; the compiler folds it straight back.
+        """
+        return T.bitwise_or(
+            T.shift_left(T.uint64((value >> 32) & 0xFFFFFFFF), T.uint64(32)),
+            T.uint64(value & 0xFFFFFFFF),
         )
-        return T.bitwise_or(T.bitwise_and(desc, T.bitwise_not(T.uint64(0x3FFF))), addr)
+
+    def _smem_addr_field(addr_u32):
+        """Bits [13:0] of a matrix descriptor: the shared address over 16."""
+        return T.cast(
+            T.bitwise_and(T.shift_right(addr_u32, T.uint32(4)), T.uint32(0x3FFF)), "uint64"
+        )
+
+    def _with_smem_addr(base, addr_u32):
+        """Put an address into a descriptor base whose address field is zero."""
+        return T.bitwise_or(base, _smem_addr_field(addr_u32))
+
+    def _rebase(desc, addr_u32):
+        """`replace_smem_desc_addr`: rewrite bits [13:0] with `smem_addr >> 4`."""
+        return T.bitwise_or(
+            T.bitwise_and(desc, T.bitwise_not(T.uint64(0x3FFF))), _smem_addr_field(addr_u32)
+        )
 
     def _with_sf_id(desc, sfa_id, sfb_id):
         """`make_runtime_instr_desc_with_sf_id`: fields [31:29] and [6:4]."""
@@ -316,6 +343,28 @@ def build_kernel(spec: GemmSpec):
         raise ValueError("MN-major B with multiple swizzle atoms is not supported")
     sf_desc_sdo = 8 * 4 * 4 // 16
 
+    # Matrix / instruction descriptors, folded here rather than built by the
+    # runtime encoders (`encode_matrix_descriptor` /
+    # `encode_instr_descriptor_block_scaled`), which are pure-C bitfield fills
+    # and become opaque helpers in the generated CUDA.  Every field but the
+    # shared address is a constant at this point; the address is ORed in at
+    # run time by `_with_smem_addr`.
+    A_DESC_BASE = _encode_smem_descriptor_base_uint64(0, a_desc_sdo, swizzle_a_enum)
+    B_DESC_BASE = _encode_smem_descriptor_base_uint64(0, b_desc_sdo, swizzle_b_enum)
+    SF_DESC_BASE = _encode_smem_descriptor_base_uint64(0, sf_desc_sdo, 0)
+    INSTR_DESC = _encode_instr_descriptor_block_scaled_uint32(
+        M=umma_m,
+        N=umma_n,
+        K=UMMA_K,
+        d_dtype="float32",
+        a_dtype=umma_a_dtype,
+        b_dtype=umma_b_dtype,
+        sf_dtype="float8_e8m0fnu",
+        trans_a=umma_trans_a,
+        trans_b=umma_trans_b,
+        cta_group=cta_group,
+    )
+
     # Barrier family bases, in 8-byte slots after the SF region.
     full_base, empty_base = 0, stages
     with_sf_base = stages * 2
@@ -415,7 +464,10 @@ def build_kernel(spec: GemmSpec):
             is_leader_cta = True
         thread_idx = T.thread_id([spec.num_non_epilogue_threads + spec.num_epilogue_threads])
         lane_idx = T.lane_id([32])
-        warp = T.cuda._shfl_sync(T.uint32(0xFFFFFFFF), thread_idx // 32, 0, 32)
+        warp: T.int32
+        T.ptx.shfl_sync.idx.b32(
+            warp, thread_idx // 32, T.uint32(0), T.uint32(0x1F), T.uint32(0xFFFFFFFF)
+        )
 
         # ---- shared memory --------------------------------------------------
         smem = T.alloc_buffer([spec.smem_size], "uint8", scope="shared.dyn", align=1024)
@@ -543,7 +595,10 @@ def build_kernel(spec: GemmSpec):
 
         # ---- barrier init and TMEM allocation -------------------------------
         if warp == 1:
-            if T.cuda.elect_sync():
+            init_elected: T.uint32
+            init_elected_lane: T.uint32
+            T.ptx.elect_sync(init_elected_lane, init_elected, T.uint32(0xFFFFFFFF))
+            if init_elected == T.uint32(1):
                 for s in T.unroll(0, stages):
                     T.ptx.mbarrier.init.shared.b64(barriers.ptr_to([full_base + s]), T.uint32(1))
                     T.ptx.mbarrier.init.shared.b64(barriers.ptr_to([empty_base + s]), T.uint32(1))
@@ -568,7 +623,7 @@ def build_kernel(spec: GemmSpec):
             T.ptx.barrier.cluster.arrive.relaxed.aligned()
             T.ptx.barrier.cluster.wait.acquire.aligned()
         else:
-            T.cuda.cta_sync()
+            T.ptx.bar.sync(T.uint32(0))
 
         T.evaluate(T.ptx.griddepcontrol.wait())
 
@@ -605,7 +660,10 @@ def build_kernel(spec: GemmSpec):
         # ===============================================================
 
         if warp == 0:
-            if T.cuda.elect_sync():
+            ld_elected: T.uint32
+            ld_elected_lane: T.uint32
+            T.ptx.elect_sync(ld_elected_lane, ld_elected, T.uint32(0xFFFFFFFF))
+            if ld_elected == T.uint32(1):
                 ld_stage: T.int32
                 ld_phase: T.int32
                 ld_block: T.int32
@@ -837,9 +895,15 @@ def build_kernel(spec: GemmSpec):
                         ld_k: T.int32
                         ld_k = 0
                         while ld_k < ld_kblocks:
-                            T.cuda.mbarrier_wait(
-                                barriers.ptr_to([empty_base + ld_stage]), T.bitwise_xor(ld_phase, 1)
-                            )
+                            ld_wait: T.uint32
+                            ld_wait = T.uint32(0)
+                            while ld_wait == T.uint32(0):
+                                T.ptx.mbarrier.try_wait.parity.acquire.cta.shared__cta.b64(
+                                    ld_wait,
+                                    barriers.ptr_to([empty_base + ld_stage]),
+                                    T.cast(T.bitwise_xor(ld_phase, 1), "uint32"),
+                                    T.uint32(TRY_WAIT_TICKS),
+                                )
                             k_idx: T.int32
                             k_idx = ld_k * block_k
                             k_b: T.int32
@@ -962,44 +1026,25 @@ def build_kernel(spec: GemmSpec):
                 desc_b: T.uint64
                 desc_sf: T.uint64
                 desc_i: T.uint32
-                T.cuda.tcgen05.encode_matrix_descriptor(
-                    T.address_of(desc_a),
-                    smem_a.ptr_to([0, 0, 0]),
-                    ldo=0,
-                    sdo=a_desc_sdo,
-                    swizzle=swizzle_a_enum,
-                )
-                T.cuda.tcgen05.encode_matrix_descriptor(
-                    T.address_of(desc_b),
-                    smem_b.ptr_to([0, 0, 0]),
-                    ldo=0,
-                    sdo=b_desc_sdo,
-                    swizzle=swizzle_b_enum,
-                )
+                # Every descriptor field but the shared address is a build-time
+                # constant, so the bases are folded in Python and only
+                # `addr >> 4` is computed here.  The `# noqa` bases come from
+                # the same bit layout the retired C encoders filled in.
+                a_smem_u32: T.uint32
+                b_smem_u32: T.uint32
+                sfa_smem_u32: T.uint32
+                sfb_smem_u32: T.uint32
+                a_smem_u32 = T.cuda.cvta_generic_to_shared(smem_a.ptr_to([0, 0, 0]))
+                b_smem_u32 = T.cuda.cvta_generic_to_shared(smem_b.ptr_to([0, 0, 0]))
+                sfa_smem_u32 = T.cuda.cvta_generic_to_shared(smem_sfa.ptr_to([0, 0]))
+                sfb_smem_u32 = T.cuda.cvta_generic_to_shared(smem_sfb.ptr_to([0, 0]))
+                desc_a = _with_smem_addr(_u64_const(A_DESC_BASE), a_smem_u32)
+                desc_b = _with_smem_addr(_u64_const(B_DESC_BASE), b_smem_u32)
                 # `make_sf_desc`: unswizzled, stride offset 8*16, leading offset 0.
-                T.cuda.tcgen05.encode_matrix_descriptor(
-                    T.address_of(desc_sf),
-                    smem_sfa.ptr_to([0, 0]),
-                    ldo=0,
-                    sdo=sf_desc_sdo,
-                    swizzle=0,
-                )
-                T.cuda.tcgen05.encode_instr_descriptor_block_scaled(
-                    T.address_of(desc_i),
-                    d_dtype="float32",
-                    a_dtype=umma_a_dtype,
-                    b_dtype=umma_b_dtype,
-                    sfa_dtype="float8_e8m0fnu",
-                    sfb_dtype="float8_e8m0fnu",
-                    sfa_tmem_addr=0,
-                    sfb_tmem_addr=0,
-                    M=umma_m,
-                    N=umma_n,
-                    K=UMMA_K,
-                    trans_a=umma_trans_a,
-                    trans_b=umma_trans_b,
-                    n_cta_groups=cta_group,
-                )
+                desc_sf = _with_smem_addr(_u64_const(SF_DESC_BASE), sfa_smem_u32)
+                # Stays a mutable local: the scale-factor ids and, under
+                # `use_effective_m`, the N field are patched per MMA below.
+                desc_i = T.uint32(INSTR_DESC)
                 # The per-stage descriptor low words live one stage per lane; a warp
                 # shuffle indexes the table instead of recomputing the descriptor.
                 a_desc_lo: T.uint32
@@ -1040,8 +1085,9 @@ def build_kernel(spec: GemmSpec):
                 # `cute::elect_one_sync()` is loop-invariant for this fully-active warp;
                 # nvcc hoists it into a uniform predicate, so hoist it here too rather
                 # than re-executing `elect.sync` twice per K block.
-                mma_elected: T.int32
-                mma_elected = T.cast(T.cuda.elect_sync(), "int32")
+                mma_elected: T.uint32
+                mma_elected_lane: T.uint32
+                T.ptx.elect_sync(mma_elected_lane, mma_elected, T.uint32(0xFFFFFFFF))
                 mma_it = 0
                 mma_valid = 1
                 mma_grp = 0
@@ -1187,10 +1233,15 @@ def build_kernel(spec: GemmSpec):
                         accum_phase: T.int32
                         accum_stage = mma_iter % NUM_EPILOGUE_STAGES
                         accum_phase = T.bitwise_and(mma_iter // NUM_EPILOGUE_STAGES, 1)
-                        T.cuda.mbarrier_wait(
-                            barriers.ptr_to([tmem_empty_base + accum_stage]),
-                            T.bitwise_xor(accum_phase, 1),
-                        )
+                        mma_tmem_wait: T.uint32
+                        mma_tmem_wait = T.uint32(0)
+                        while mma_tmem_wait == T.uint32(0):
+                            T.ptx.mbarrier.try_wait.parity.acquire.cta.shared__cta.b64(
+                                mma_tmem_wait,
+                                barriers.ptr_to([tmem_empty_base + accum_stage]),
+                                T.cast(T.bitwise_xor(accum_phase, 1), "uint32"),
+                                T.uint32(TRY_WAIT_TICKS),
+                            )
                         T.ptx.tcgen05.fence__after_thread_sync()
 
                         mma_k: T.int32
@@ -1206,17 +1257,31 @@ def build_kernel(spec: GemmSpec):
                         while mma_k < mma_k_rounded:
                             for u in T.unroll(0, MMA_K_UNROLL):
                                 with T.If(mma_k < mma_kblocks), T.Then():
-                                    T.cuda.mbarrier_wait(
-                                        barriers.ptr_to([with_sf_base + mma_stage]), mma_phase
-                                    )
+                                    mma_sf_wait: T.uint32
+                                    mma_sf_wait = T.uint32(0)
+                                    while mma_sf_wait == T.uint32(0):
+                                        T.ptx.mbarrier.try_wait.parity.acquire.cta.shared__cta.b64(
+                                            mma_sf_wait,
+                                            barriers.ptr_to([with_sf_base + mma_stage]),
+                                            T.cast(mma_phase, "uint32"),
+                                            T.uint32(TRY_WAIT_TICKS),
+                                        )
                                     T.ptx.tcgen05.fence__after_thread_sync()
                                     a_base_lo: T.uint32
                                     b_base_lo: T.uint32
-                                    a_base_lo = T.tvm_warp_shuffle(
-                                        T.uint32(0xFFFFFFFF), a_desc_lo, mma_stage, 32, 32
+                                    T.ptx.shfl_sync.idx.b32(
+                                        a_base_lo,
+                                        a_desc_lo,
+                                        T.cast(mma_stage, "uint32"),
+                                        T.uint32(0x1F),
+                                        T.uint32(0xFFFFFFFF),
                                     )
-                                    b_base_lo = T.tvm_warp_shuffle(
-                                        T.uint32(0xFFFFFFFF), b_desc_lo, mma_stage, 32, 32
+                                    T.ptx.shfl_sync.idx.b32(
+                                        b_base_lo,
+                                        b_desc_lo,
+                                        T.cast(mma_stage, "uint32"),
+                                        T.uint32(0x1F),
+                                        T.uint32(0xFFFFFFFF),
                                     )
                                     # One elected lane owns the UTCCP and UMMA issues.  Predicating the
                                     # instructions keeps the warp converged; branching on the elected
@@ -1225,9 +1290,9 @@ def build_kernel(spec: GemmSpec):
                                         for c in T.unroll(0, num_sfa_chunks):
                                             desc_sf = _rebase(
                                                 desc_sf,
-                                                smem_sfa.ptr_to(
-                                                    [mma_stage, c * NUM_UTCCP_ALIGNED_ELEMS]
-                                                ),
+                                                sfa_smem_u32
+                                                + T.cast(mma_stage * (sf_block_m * 4), "uint32")
+                                                + T.uint32(c * NUM_UTCCP_ALIGNED_ELEMS * 4),
                                             )
                                             T.evaluate(
                                                 T.ptx[utccp_chain](
@@ -1235,16 +1300,16 @@ def build_kernel(spec: GemmSpec):
                                                         sfa_tmem.allocated_addr[0] + c * 4, "uint32"
                                                     ),
                                                     desc_sf,
-                                                    pred=mma_elected == 1,
+                                                    pred=mma_elected == T.uint32(1),
                                                 )
                                             )
                                     if u % sfb_stages_per_load == 0:
                                         for c in T.unroll(0, num_sfb_chunks):
                                             desc_sf = _rebase(
                                                 desc_sf,
-                                                smem_sfb.ptr_to(
-                                                    [mma_stage, c * NUM_UTCCP_ALIGNED_ELEMS]
-                                                ),
+                                                sfb_smem_u32
+                                                + T.cast(mma_stage * (sf_block_n * 4), "uint32")
+                                                + T.uint32(c * NUM_UTCCP_ALIGNED_ELEMS * 4),
                                             )
                                             T.evaluate(
                                                 T.ptx[utccp_chain](
@@ -1252,7 +1317,7 @@ def build_kernel(spec: GemmSpec):
                                                         sfb_tmem.allocated_addr[0] + c * 4, "uint32"
                                                     ),
                                                     desc_sf,
-                                                    pred=mma_elected == 1,
+                                                    pred=mma_elected == T.uint32(1),
                                                 )
                                             )
                                     for ki in T.unroll(0, umma_k_steps):
@@ -1317,10 +1382,10 @@ def build_kernel(spec: GemmSpec):
                                                         "uint32",
                                                     ),
                                                     T.Or(ki > 0, mma_k > 0),
-                                                    pred=mma_elected == 1,
+                                                    pred=mma_elected == T.uint32(1),
                                                 )
                                             )
-                                    T.cuda.warp_sync()
+                                    T.ptx.bar.warp.sync(T.uint32(0xFFFFFFFF))
                                     # `tcgen05.commit` implies `fence::before_thread_sync`.
                                     # Same here: predicate the commits on the elected lane rather than
                                     # branching, so the warp never diverges inside the K loop.
@@ -1329,14 +1394,14 @@ def build_kernel(spec: GemmSpec):
                                             T.ptx[commit_mc_chain](
                                                 barriers.ptr_to([empty_base + mma_stage]),
                                                 T.uint16((1 << cta_group) - 1),
-                                                pred=mma_elected == 1,
+                                                pred=mma_elected == T.uint32(1),
                                             )
                                         )
                                     else:
                                         T.evaluate(
                                             T.ptx[commit_chain](
                                                 barriers.ptr_to([empty_base + mma_stage]),
-                                                pred=mma_elected == 1,
+                                                pred=mma_elected == T.uint32(1),
                                             )
                                         )
                                     if cta_group > 1:
@@ -1345,7 +1410,8 @@ def build_kernel(spec: GemmSpec):
                                                 barriers.ptr_to([tmem_full_base + accum_stage]),
                                                 T.uint16((1 << cta_group) - 1),
                                                 pred=T.And(
-                                                    mma_elected == 1, mma_k == mma_kblocks - 1
+                                                    mma_elected == T.uint32(1),
+                                                    mma_k == mma_kblocks - 1,
                                                 ),
                                             )
                                         )
@@ -1354,11 +1420,12 @@ def build_kernel(spec: GemmSpec):
                                             T.ptx[commit_chain](
                                                 barriers.ptr_to([tmem_full_base + accum_stage]),
                                                 pred=T.And(
-                                                    mma_elected == 1, mma_k == mma_kblocks - 1
+                                                    mma_elected == T.uint32(1),
+                                                    mma_k == mma_kblocks - 1,
                                                 ),
                                             )
                                         )
-                                    T.cuda.warp_sync()
+                                    T.ptx.bar.warp.sync(T.uint32(0xFFFFFFFF))
                                     mma_stage = T.Select(mma_stage == stages - 1, 0, mma_stage + 1)
                                     mma_phase = T.bitwise_xor(
                                         mma_phase, T.cast(mma_stage == 0, "int32")
@@ -1373,12 +1440,20 @@ def build_kernel(spec: GemmSpec):
                 # barriers can be safely destroyed (source `:426`).
                 if cta_group > 1:
                     if mma_iter > 0:
-                        T.cuda.mbarrier_wait(
-                            barriers.ptr_to(
-                                [tmem_empty_base + (mma_iter - 1) % NUM_EPILOGUE_STAGES]
-                            ),
-                            T.bitwise_and((mma_iter - 1) // NUM_EPILOGUE_STAGES, 1),
-                        )
+                        mma_end_wait: T.uint32
+                        mma_end_wait = T.uint32(0)
+                        while mma_end_wait == T.uint32(0):
+                            T.ptx.mbarrier.try_wait.parity.acquire.cta.shared__cta.b64(
+                                mma_end_wait,
+                                barriers.ptr_to(
+                                    [tmem_empty_base + (mma_iter - 1) % NUM_EPILOGUE_STAGES]
+                                ),
+                                T.cast(
+                                    T.bitwise_and((mma_iter - 1) // NUM_EPILOGUE_STAGES, 1),
+                                    "uint32",
+                                ),
+                                T.uint32(TRY_WAIT_TICKS),
+                            )
 
         # ===============================================================
         # Role 2: scale-factor transposer warp (source `:432`)
@@ -1527,13 +1602,21 @@ def build_kernel(spec: GemmSpec):
                     tr_k: T.int32
                     tr_k = 0
                     while tr_k < tr_kblocks:
-                        T.cuda.mbarrier_wait(barriers.ptr_to([full_base + tr_stage]), tr_phase)
+                        tr_wait: T.uint32
+                        tr_wait = T.uint32(0)
+                        while tr_wait == T.uint32(0):
+                            T.ptx.mbarrier.try_wait.parity.acquire.cta.shared__cta.b64(
+                                tr_wait,
+                                barriers.ptr_to([full_base + tr_stage]),
+                                T.cast(tr_phase, "uint32"),
+                                T.uint32(TRY_WAIT_TICKS),
+                            )
                         if tr_k % sfa_stages_per_load == 0:
                             for c in T.unroll(0, num_sfa_chunks):
                                 base = c * NUM_UTCCP_ALIGNED_ELEMS
                                 for i in T.unroll(0, 4):
                                     sf_vals[i] = smem_sfa[tr_stage, base + i * 32 + lane_idx]
-                                T.cuda.warp_sync()
+                                T.ptx.bar.warp.sync(T.uint32(0xFFFFFFFF))
                                 for i in T.unroll(0, 4):
                                     smem_sfa[tr_stage, base + lane_idx * 4 + i] = sf_vals[i]
                             T.evaluate(T.ptx.fence.proxy.async_.shared__cta())
@@ -1542,7 +1625,7 @@ def build_kernel(spec: GemmSpec):
                                 base = c * NUM_UTCCP_ALIGNED_ELEMS
                                 for i in T.unroll(0, 4):
                                     sf_vals[i] = smem_sfb[tr_stage, base + i * 32 + lane_idx]
-                                T.cuda.warp_sync()
+                                T.ptx.bar.warp.sync(T.uint32(0xFFFFFFFF))
                                 for i in T.unroll(0, 4):
                                     smem_sfb[tr_stage, base + lane_idx * 4 + i] = sf_vals[i]
                             T.evaluate(T.ptx.fence.proxy.async_.shared__cta())
@@ -1709,9 +1792,15 @@ def build_kernel(spec: GemmSpec):
                     accum_phase_e: T.int32
                     accum_stage_e = ep_iter % NUM_EPILOGUE_STAGES
                     accum_phase_e = T.bitwise_and(ep_iter // NUM_EPILOGUE_STAGES, 1)
-                    T.cuda.mbarrier_wait(
-                        barriers.ptr_to([tmem_full_base + accum_stage_e]), accum_phase_e
-                    )
+                    ep_wait: T.uint32
+                    ep_wait = T.uint32(0)
+                    while ep_wait == T.uint32(0):
+                        T.ptx.mbarrier.try_wait.parity.acquire.cta.shared__cta.b64(
+                            ep_wait,
+                            barriers.ptr_to([tmem_full_base + accum_stage_e]),
+                            T.cast(accum_phase_e, "uint32"),
+                            T.uint32(TRY_WAIT_TICKS),
+                        )
                     T.ptx.tcgen05.fence__after_thread_sync()
                     base_m: T.int32
                     base_n: T.int32
@@ -1805,9 +1894,15 @@ def build_kernel(spec: GemmSpec):
                                         )
                                         T.ptx.tcgen05.wait__ld.sync.aligned()
                                         for j in T.unroll(0, 4):
-                                            packed[j] = T.cuda.float22bfloat162_rn(
-                                                T.reinterpret("float32", values[2 * j]),
+                                            # `cvt.rn.bf16x2.f32 d, a, b` packs a
+                                            # into the UPPER half and b into the
+                                            # lower, the reverse of the
+                                            # `make_float2(lo, hi)` helper this
+                                            # replaces -- hence the swap.
+                                            T.ptx.cvt.rn.bf16x2.f32(
+                                                packed[j],
                                                 T.reinterpret("float32", values[2 * j + 1]),
+                                                T.reinterpret("float32", values[2 * j]),
                                             )
                                         row_s: T.int32
                                         col_s: T.int32
@@ -1850,8 +1945,11 @@ def build_kernel(spec: GemmSpec):
                                 if ep_warp == 0:
                                     # The store is issued by one elected lane; predicate rather than
                                     # branch so the epilogue warp stays converged.
-                                    ep_elected: T.int32
-                                    ep_elected = T.cast(T.cuda.elect_sync(), "int32")
+                                    ep_elected: T.uint32
+                                    ep_elected_lane: T.uint32
+                                    T.ptx.elect_sync(
+                                        ep_elected_lane, ep_elected, T.uint32(0xFFFFFFFF)
+                                    )
                                     for i in T.unroll(0, num_n_atoms):
                                         if is_batched:
                                             T.evaluate(
@@ -1875,7 +1973,7 @@ def build_kernel(spec: GemmSpec):
                                                             // 4
                                                         ]
                                                     ),
-                                                    pred=ep_elected == 1,
+                                                    pred=ep_elected == T.uint32(1),
                                                 )
                                             )
                                         else:
@@ -1899,11 +1997,11 @@ def build_kernel(spec: GemmSpec):
                                                             // 4
                                                         ]
                                                     ),
-                                                    pred=ep_elected == 1,
+                                                    pred=ep_elected == T.uint32(1),
                                                 )
                                             )
                                     T.evaluate(T.ptx.cp.async_.bulk.commit_group())
-                                T.cuda.warp_sync()
+                                T.ptx.bar.warp.sync(T.uint32(0xFFFFFFFF))
                                 tma_stage = T.Select(
                                     tma_stage == NUM_TMA_STORE_STAGES - 1, 0, tma_stage + 1
                                 )
@@ -1951,9 +2049,15 @@ def build_kernel(spec: GemmSpec):
                                         )
                                         T.ptx.tcgen05.wait__ld.sync.aligned()
                                         for j in T.unroll(0, 4):
-                                            packed[j] = T.cuda.float22bfloat162_rn(
-                                                T.reinterpret("float32", values[2 * j]),
+                                            # `cvt.rn.bf16x2.f32 d, a, b` packs a
+                                            # into the UPPER half and b into the
+                                            # lower, the reverse of the
+                                            # `make_float2(lo, hi)` helper this
+                                            # replaces -- hence the swap.
+                                            T.ptx.cvt.rn.bf16x2.f32(
+                                                packed[j],
                                                 T.reinterpret("float32", values[2 * j + 1]),
+                                                T.reinterpret("float32", values[2 * j]),
                                             )
                                         for j in T.unroll(0, 4):
                                             smem_cd_u32[cd_word + j] = packed[j]
@@ -1977,8 +2081,11 @@ def build_kernel(spec: GemmSpec):
                                 if ep_warp == 0:
                                     # The store is issued by one elected lane; predicate rather than
                                     # branch so the epilogue warp stays converged.
-                                    ep_elected: T.int32
-                                    ep_elected = T.cast(T.cuda.elect_sync(), "int32")
+                                    ep_elected: T.uint32
+                                    ep_elected_lane: T.uint32
+                                    T.ptx.elect_sync(
+                                        ep_elected_lane, ep_elected, T.uint32(0xFFFFFFFF)
+                                    )
                                     if is_batched:
                                         T.evaluate(
                                             T.ptx[
@@ -1989,7 +2096,7 @@ def build_kernel(spec: GemmSpec):
                                                 T.cast(base_m + w * store_block_m, "int32"),
                                                 T.cast(ep_grp, "int32"),
                                                 smem_cd.ptr_to([tma_stage, 0, 0]),
-                                                pred=ep_elected == 1,
+                                                pred=ep_elected == T.uint32(1),
                                             )
                                         )
                                     else:
@@ -2001,11 +2108,11 @@ def build_kernel(spec: GemmSpec):
                                                 T.cast(base_n + st * store_block_n, "int32"),
                                                 T.cast(base_m + w * store_block_m, "int32"),
                                                 smem_cd.ptr_to([tma_stage, 0, 0]),
-                                                pred=ep_elected == 1,
+                                                pred=ep_elected == T.uint32(1),
                                             )
                                         )
                                     T.evaluate(T.ptx.cp.async_.bulk.commit_group())
-                                T.cuda.warp_sync()
+                                T.ptx.bar.warp.sync(T.uint32(0xFFFFFFFF))
                                 tma_stage = T.Select(
                                     tma_stage == NUM_TMA_STORE_STAGES - 1, 0, tma_stage + 1
                                 )
@@ -2020,7 +2127,7 @@ def build_kernel(spec: GemmSpec):
             T.ptx.barrier.cluster.arrive.relaxed.aligned()
             T.ptx.barrier.cluster.wait.acquire.aligned()
         else:
-            T.cuda.cta_sync()
+            T.ptx.bar.sync(T.uint32(0))
 
         # The allocating warp (2) and the freeing warp (0) deliberately differ.
         if warp == 0:
