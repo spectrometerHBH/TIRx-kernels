@@ -52,7 +52,7 @@ _prmt_5410 = _simple._prmt_5410
 _mul_hi_u32 = _simple._mul_hi_u32
 _mul_lo_s32 = _simple._mul_lo_s32
 _add_s32 = _simple._add_s32
-_lane_id = _simple._lane_id
+_lane_mask = _simple._lane_mask
 _shared_load_u16 = _simple._shared_load_u16
 _shared_load_u32 = _simple._shared_load_u32
 _bf16_to_f32 = _simple._bf16_to_f32
@@ -65,21 +65,6 @@ _store_two_byte_vector = _simple._store_two_byte_vector
 _TMA_G2S_4D = "cp.async.bulk.tensor.4d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
 _TMA_S2G_4D = "cp.async.bulk.tensor.4d.global.shared::cta.tile.bulk_group"
 _BULK_G2S = "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes"
-
-_MBARRIER_ARRIVE_WAIT_SOURCE = r"""__device__ __forceinline__ void
-ssu_mbarrier_arrive_wait(unsigned int bar) {
-  unsigned long long token;
-  asm volatile("mbarrier.arrive.shared::cta.b64 %0, [%1], 1;"
-               : "=l"(token) : "r"(bar) : "memory");
-  unsigned int done;
-  do {
-    asm volatile("{ .reg .pred P; "
-                 "mbarrier.try_wait.shared::cta.b64 P, [%1], %2; "
-                 "selp.b32 %0, 1, 0, P; }"
-                 : "=r"(done) : "r"(bar), "l"(token) : "memory");
-  } while (!done);
-}
-"""
 
 
 def _global_load_nc_u16(buffer, index):
@@ -112,15 +97,19 @@ def _load_weight_nc(buffer, index, dtype: str):
     return _bf16_to_f32(_global_load_nc_u16(buffer, index))
 
 
+@T.inline
 def _mbarrier_arrive_wait(bar_addr):
+    token = T.alloc_local((1,), "uint64")
+    done = T.alloc_local((1,), "uint32")
     T.evaluate(
-        T.cuda.func_call(
-            "ssu_mbarrier_arrive_wait",
-            bar_addr,
-            source_code=_MBARRIER_ARRIVE_WAIT_SOURCE,
-            return_type="void",
-        )
+        T.ptx.mbarrier.arrive.shared__cta.b64(token[0], T.cast(bar_addr, "uint32"), T.uint32(1))
     )
+    while True:
+        T.evaluate(
+            T.ptx.mbarrier.try_wait.shared__cta.b64(done[0], T.cast(bar_addr, "uint32"), token[0])
+        )
+        if done[0] != T.uint32(0):
+            break
 
 
 def _mbarrier_arrive(smem_raw, offset):
@@ -748,8 +737,7 @@ def _selective_state_update_stp_vertical(
 
     batch_i, head = T.cta_id([BATCH, NHEADS])
     lane_axis, warp = T.thread_id([32, 5])
-    lane: T.int32 = _lane_id()
-    T.evaluate(lane_axis)
+    lane: T.int32 = _lane_mask(lane_axis)
     group: T.int32 = head // (nheads_runtime // ngroups_runtime)
 
     state_batch: T.int64

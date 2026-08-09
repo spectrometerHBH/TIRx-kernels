@@ -247,8 +247,10 @@ def selective_state_update_stp_vertical(
     # instruction_selection: mov.u32 from %ctaid.x; extent: one physical CTA coordinate
     head = cta_id(axis="y", extent=nheads)
     # instruction_selection: mov.u32 from %ctaid.y; extent: one physical CTA coordinate
-    lane = thread_id(axis="x", extent=32)
-    # instruction_selection: mov.u32 from %tid.x; extent: one physical lane coordinate
+    raw_lane = thread_id(axis="x", extent=32)
+    # instruction_selection: mov.u32 from %tid.x; extent: one independent physical x coordinate
+    lane = bit_and(raw_lane, 31)
+    # instruction_selection: and.b32 with immediate 31; extent: one source-exact threadIdx.x % warpSize lane mask
     warp = thread_id(axis="y", extent=5)
     # instruction_selection: mov.u32 from %tid.y; extent: one independent physical warp coordinate
     group = head // (nheads // ngroups)
@@ -258,22 +260,25 @@ def selective_state_update_stp_vertical(
         raw_state_batch = copy_g2r(
             state_batch_indices[
                 batch_i * state_batch_indices_stride_batch])
-        # instruction_selection: ld.global.nc.s32 or ld.global.nc.s64; extent: one source slot per thread
+        # instruction_selection: present i32 emits ld.global.nc.s32 followed by cvt.s64.s32; present i64 emits ld.global.nc.s64; extent: one source slot per thread
         state_batch = cast("i64", raw_state_batch)
-        # instruction_selection: cvt.s64.s32 for i32, identity for i64; extent: one slot
+        # instruction_selection: the i32 sign extension above forms the logical b64 slot, while i64 is identity; extent: one source slot
     else:
         state_batch = cast("i64", batch_i)
-        # instruction_selection: cvt.s64.u32; extent: one fallback slot
+        # instruction_selection: cvt.u64.u32; extent: one fallback source slot
+    # instruction_selection: source b64-to-b32 cvt.u32.u64 is hoisted once before all G2S operations in each READ_STATE producer helper branch and reused by every G2S in that helper; extent: four static TT/TF x z helper copies, at most one executed at runtime, and none in FF
 
     if dst_state_batch_indices is present:
         raw_dst_batch = copy_g2r(
             dst_state_batch_indices[
                 batch_i * dst_state_batch_indices_stride_batch])
-        # instruction_selection: ld.global.nc.s32 or ld.global.nc.s64; extent: one destination slot per thread
+        # instruction_selection: present i32 emits ld.global.nc.s32 directly to a b32 TMA coordinate; present i64 emits ld.global.nc.s64; extent: one destination slot per thread
         dst_state_batch = cast("i64", raw_dst_batch)
-        # instruction_selection: cvt.s64.s32 for i32, identity for i64; extent: one slot
+        # instruction_selection: logical i64 pseudo cast only; the present-i32 cast is DCE and present-i64 remains b64 until producer-helper coordinate preparation
     else:
         dst_state_batch = state_batch
+        # instruction_selection: logical b64 alias of the source slot; extent: one null-destination fallback
+    # instruction_selection: present i32 uses its loaded b32 directly; null i32 emits one cvt.u32.u64 in the outer fallback and all S2G operations reuse it; present/null i64 emits one cvt.u32.u64 per WRITE_STATE producer helper branch and reuses it throughout that helper; extent: two static TT x z helper copies for i64, at most one executed at runtime, and none in TF/FF
 
     state_ptr_offset = (
         state_batch * state_stride_batch + head * DIM * DSTATE)
@@ -440,7 +445,7 @@ def selective_state_update_stp_vertical(
                             copy_tmap_s2g(
                                 sState[stage], state_map,
                                 coords=(0, d_write, head, dst_state_batch))
-                            # instruction_selection: cp.async.bulk.tensor.4d.global.shared::cta.tile.bulk_group; extent: one [16,DSTATE] state tile
+                            # instruction_selection: cp.async.bulk.tensor.4d.global.shared::cta.tile.bulk_group consuming the already prepared b32 destination coordinate; extent: one [16,DSTATE] state tile
                             bulk_commit_group()
                             # instruction_selection: cp.async.bulk.commit_group; extent: one store group
                             bulk_wait_group_read_zero()
@@ -481,7 +486,7 @@ def selective_state_update_stp_vertical(
                         copy_tmap_s2g(
                             sState[stage], state_map,
                             coords=(0, d_write, head, dst_state_batch))
-                        # instruction_selection: cp.async.bulk.tensor.4d.global.shared::cta.tile.bulk_group; extent: one final state tile
+                        # instruction_selection: cp.async.bulk.tensor.4d.global.shared::cta.tile.bulk_group consuming the already prepared b32 destination coordinate; extent: one final state tile
                         bulk_commit_group()
                         # instruction_selection: cp.async.bulk.commit_group; extent: one final store group
                         bulk_wait_group_read_zero()

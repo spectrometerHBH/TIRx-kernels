@@ -64,22 +64,11 @@ _mbarrier_expect_tx = _vertical._mbarrier_expect_tx
 _TMA_G2S_4D = "cp.async.bulk.tensor.4d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
 _TMA_S2G_4D = "cp.async.bulk.tensor.4d.global.shared::cta.tile.bulk_group"
 
-_LD_GLOBAL_S32_TO_S64_SOURCE = r"""__device__ __forceinline__ long long
-ssu_ld_global_s32_to_s64(void const* ptr) {
-  long long out;
-  asm("ld.global.s32 %0, [%1];" : "=l"(out) : "l"(ptr) : "memory");
-  return out;
-}
-"""
-
 
 def _global_load_s32_to_s64(buffer, index):
-    return T.cuda.func_call(
-        "ssu_ld_global_s32_to_s64",
-        buffer.ptr_to([index]),
-        source_code=_LD_GLOBAL_S32_TO_S64_SOURCE,
-        return_type="int64",
-    )
+    out = T.alloc_local((1,), "int64")
+    T.evaluate(T.ptx.ld.global_.s32(out[0], buffer.ptr_to([index])))
+    return out[0]
 
 
 def _global_load_s64(buffer, index):

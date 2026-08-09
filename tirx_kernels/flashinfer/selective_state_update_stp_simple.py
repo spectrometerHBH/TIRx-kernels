@@ -36,56 +36,6 @@ FROZEN_FLASHINFER_SOURCE_SHA256 = "c0e13b64bf42f4f8155058dc9f5877f7aca90832f50a1
 _LOG2_E = 1.4426950408889634
 _LN_2 = 0.6931471805599453
 _FLT_LOWEST = -3.4028234663852886e38
-_PRMT_SOURCE = r"""__device__ __forceinline__ unsigned int ssu_prmt_5410(
-    unsigned int a, unsigned int b) {
-  unsigned int out;
-  asm volatile("prmt.b32 %0, %1, %2, 0x5410;"
-               : "=r"(out) : "r"(a), "r"(b));
-  return out;
-}
-"""
-_LG2_SOURCE = r"""__device__ __forceinline__ float ssu_lg2_approx_ftz(float x) {
-  float out;
-  asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(out) : "f"(x));
-  return out;
-}
-"""
-_ABS_SOURCE = r"""__device__ __forceinline__ float ssu_abs_ftz(float x) {
-  float out;
-  asm volatile("abs.ftz.f32 %0, %1;" : "=f"(out) : "f"(x));
-  return out;
-}
-"""
-_DIV_SOURCE = r"""__device__ __forceinline__ float ssu_div_approx_ftz(float a, float b) {
-  float out;
-  asm volatile("div.approx.ftz.f32 %0, %1, %2;"
-               : "=f"(out) : "f"(a), "f"(b));
-  return out;
-}
-"""
-_MUL_HI_U32_SOURCE = r"""__device__ __forceinline__ unsigned int ssu_mul_hi_u32(
-    unsigned int a, unsigned int b) {
-  unsigned int out;
-  asm volatile("mul.hi.u32 %0, %1, %2;" : "=r"(out) : "r"(a), "r"(b));
-  return out;
-}
-"""
-_MUL_LO_S32_SOURCE = r"""__device__ __forceinline__ int ssu_mul_lo_s32(int a, int b) {
-  int out;
-  asm volatile("mul.lo.s32 %0, %1, %2;" : "=r"(out) : "r"(a), "r"(b));
-  return out;
-}
-"""
-_ADD_S32_SOURCE = r"""__device__ __forceinline__ int ssu_add_s32(int a, int b) {
-  int out;
-  asm volatile("add.s32 %0, %1, %2;" : "=r"(out) : "r"(a), "r"(b));
-  return out;
-}
-"""
-_LANE_ID_SOURCE = r"""__device__ __forceinline__ int ssu_lane_id() {
-  return static_cast<int>(threadIdx.x) & 31;
-}
-"""
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -135,7 +85,7 @@ def _min(lhs, rhs):
 
 
 def _abs(value):
-    return T.cuda.func_call("ssu_abs_ftz", value, source_code=_ABS_SOURCE, return_type="float32")
+    return _ptx_unary("abs.ftz.f32", value)
 
 
 def _exp2(value):
@@ -143,15 +93,11 @@ def _exp2(value):
 
 
 def _log2(value):
-    return T.cuda.func_call(
-        "ssu_lg2_approx_ftz", value, source_code=_LG2_SOURCE, return_type="float32"
-    )
+    return _ptx_unary("lg2.approx.ftz.f32", value)
 
 
 def _div(lhs, rhs):
-    return T.cuda.func_call(
-        "ssu_div_approx_ftz", lhs, rhs, source_code=_DIV_SOURCE, return_type="float32"
-    )
+    return _ptx_binary("div.approx.ftz.f32", lhs, rhs)
 
 
 def _rcp(value):
@@ -159,35 +105,25 @@ def _rcp(value):
 
 
 def _prmt_5410(lhs, rhs):
-    return T.cuda.func_call(
-        "ssu_prmt_5410",
-        T.cast(lhs, "uint32"),
-        T.cast(rhs, "uint32"),
-        source_code=_PRMT_SOURCE,
-        return_type="uint32",
+    return _ptx_ternary(
+        "prmt.b32", T.cast(lhs, "uint32"), T.cast(rhs, "uint32"), T.uint32(0x5410), dtype="uint32"
     )
 
 
 def _mul_hi_u32(lhs, rhs):
-    return T.cuda.func_call(
-        "ssu_mul_hi_u32", lhs, rhs, source_code=_MUL_HI_U32_SOURCE, return_type="uint32"
-    )
+    return _ptx_binary("mul.hi.u32", lhs, rhs, dtype="uint32")
 
 
 def _mul_lo_s32(lhs, rhs):
-    return T.cuda.func_call(
-        "ssu_mul_lo_s32", lhs, rhs, source_code=_MUL_LO_S32_SOURCE, return_type="int32"
-    )
+    return _ptx_binary("mul.lo.s32", lhs, rhs, dtype="int32")
 
 
 def _add_s32(lhs, rhs):
-    return T.cuda.func_call(
-        "ssu_add_s32", lhs, rhs, source_code=_ADD_S32_SOURCE, return_type="int32"
-    )
+    return _ptx_binary("add.s32", lhs, rhs, dtype="int32")
 
 
-def _lane_id():
-    return T.cuda.func_call("ssu_lane_id", source_code=_LANE_ID_SOURCE, return_type="int32")
+def _lane_mask(raw_lane):
+    return T.cast(T.bitwise_and(T.cast(raw_lane, "uint32"), T.uint32(31)), "int32")
 
 
 def _global_load_u16(buffer, index):
@@ -544,8 +480,7 @@ def _selective_state_update_stp_simple(
 
     batch_i, head, dim_tile = T.cta_id([BATCH, NHEADS, dim_tiles_runtime])
     lane_axis, warp = T.thread_id([32, 4])
-    lane: T.int32 = _lane_id()
-    T.evaluate(lane_axis)
+    lane: T.int32 = _lane_mask(lane_axis)
     dim_offset: T.int32 = dim_tile * ROWS_PER_BLOCK
     group: T.int32 = head // (nheads_runtime // ngroups_runtime)
     rows_per_warp: T.int32 = (ROWS_PER_BLOCK + 3) // 4
