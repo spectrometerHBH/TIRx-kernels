@@ -1,4 +1,4 @@
-# Copyright (c) 2026 The TIRX Authors
+# Copyright (c) 2026 The TIRx Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,6 +12,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+
 """Kernel registry — auto-discovers kernel modules with KERNEL_META."""
 
 from __future__ import annotations

@@ -1,6 +1,6 @@
 <!--
 Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-Modifications Copyright (c) 2026 The TIRX Authors.
+Modifications Copyright (c) 2026 The TIRx Authors.
 SPDX-License-Identifier: BSD-3-Clause AND Apache-2.0
 
 This design sketch documents a modified TIRx port of FlashInfer's

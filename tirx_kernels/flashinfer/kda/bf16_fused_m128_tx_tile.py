@@ -1,5 +1,4 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-# Copyright (c) 2026 The TIRX Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -7,16 +6,20 @@
 #
 #   http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing,
-# software distributed under the License is distributed on an
-# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-# KIND, either express or implied.  See the License for the
-# specific language governing permissions and limitations
-# under the License.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-# This file is a modified TIRx port of FlashInfer's
-# csrc/kda/flashkda_bf16_fused_m128.cu.
-# See LICENSE, NOTICE, and licenses/ for upstream attribution.
+# Modifications Copyright (c) 2026 The TIRx Authors.
+# Modifications are licensed under the Apache License, Version 2.0.
+#
+# This file is a TIRx port of FlashInfer's
+# csrc/kda/flashkda_bf16_fused_m128.cu (flashinfer-ai/flashinfer @ f2e04400,
+# v0.6.18), as a variant that uses T.warp.copy for the matrix transfers.
+# See LICENSE, NOTICE, and licenses/ for the applicable terms.
+
 """FlashKDA bf16 fused m128 variant using T.warp.copy for matrix transfers."""
 
 from __future__ import annotations
