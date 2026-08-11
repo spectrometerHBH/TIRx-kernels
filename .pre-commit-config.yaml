@@ -24,3 +24,13 @@ repos:
     hooks:
       - id: clang-format
         types_or: [c, c++, cuda]
+
+  # ---------- license headers ----------
+  - repo: local
+    hooks:
+      - id: check-license-headers
+        name: check license headers
+        entry: python tests/lint/check_license_headers.py
+        language: system
+        pass_filenames: false
+        always_run: true
