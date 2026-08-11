@@ -16,7 +16,7 @@
 #
 # TIRx port of DeepGEMM's `sm100_m_grouped_fp8_fp4_gemm_masked_1d1d` host entry
 # (`csrc/jit_kernels/impls/sm100_fp8_fp4_gemm_1d1d.hpp:244`).
-# See NOTICE and THIRD_PARTY_LICENSES.md for upstream attribution.
+# See LICENSE, NOTICE, and licenses/ for upstream attribution.
 
 """M-grouped masked FP8/FP4 GEMM -- `GemmType::MGroupedMasked`.
 

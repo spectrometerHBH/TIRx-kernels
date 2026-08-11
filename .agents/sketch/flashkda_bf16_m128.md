@@ -17,7 +17,7 @@ under the License.
 
 This design sketch documents a modified TIRx port of FlashInfer's
 csrc/kda/flashkda_bf16_fused_m128.cu. See NOTICE and
-THIRD_PARTY_LICENSES.md for upstream attribution.
+licenses/ for upstream attribution.
 -->
 
 # FlashKDA BF16 M128: coarse WASP pipeline sketch

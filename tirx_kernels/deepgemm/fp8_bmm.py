@@ -16,7 +16,7 @@
 #
 # TIRx port of DeepGEMM's `sm100_fp8_bmm` host entry
 # (`csrc/jit_kernels/impls/sm100_fp8_fp4_gemm_1d1d.hpp:393`).
-# See NOTICE and THIRD_PARTY_LICENSES.md for upstream attribution.
+# See LICENSE, NOTICE, and licenses/ for upstream attribution.
 
 """Batched FP8 GEMM -- `GemmType::Batched`.
 

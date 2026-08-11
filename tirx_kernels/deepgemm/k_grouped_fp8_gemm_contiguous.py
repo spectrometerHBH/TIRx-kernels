@@ -16,7 +16,7 @@
 #
 # TIRx port of DeepGEMM's `sm100_k_grouped_fp8_gemm_1d1d` host entry
 # (`csrc/jit_kernels/impls/sm100_fp8_fp4_gemm_1d1d.hpp:313`).
-# See NOTICE and THIRD_PARTY_LICENSES.md for upstream attribution.
+# See LICENSE, NOTICE, and licenses/ for upstream attribution.
 
 """K-grouped contiguous FP8 GEMM -- `KGroupedContiguous[WithPsumLayout]`.
 

@@ -18,7 +18,7 @@ under the License.
 This design sketch documents a TIRx port of DeepGEMM's
 deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_gemm_1d1d.cuh together with the
 scheduler and epilogue helpers it instantiates. See NOTICE and
-THIRD_PARTY_LICENSES.md for upstream attribution.
+licenses/ for upstream attribution.
 -->
 
 # SM100 FP8/FP4 1D1D GEMM: coarse WASP pipeline sketch

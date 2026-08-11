@@ -191,6 +191,7 @@ License 2.0; see [LICENSE](LICENSE). Required Apache attribution notices are
 collected in [NOTICE](NOTICE).
 
 Kernel ports derived from third-party projects (DeepGEMM, FlashMLA,
-flash-attention, FlashInfer) retain their upstream terms and per-file
-attribution headers; see [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)
-for the corresponding copyright notices and license texts.
+flash-attention, FlashInfer) reproduce their upstream file headers verbatim and
+retain their upstream terms. The third-party section at the end of
+[LICENSE](LICENSE) lists which components fall under which license, and
+[`licenses/`](licenses) holds the corresponding license texts.

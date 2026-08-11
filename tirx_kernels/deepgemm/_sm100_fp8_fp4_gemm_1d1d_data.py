@@ -18,7 +18,7 @@
 # `sm100_fp8_fp4_gemm_1d1d`.  The quantization recipes, scale-factor layout
 # transform and accuracy metric mirror `deep_gemm/utils/math.py`,
 # `csrc/apis/layout.hpp` and `deep_gemm/testing/numeric.py`.
-# See NOTICE and THIRD_PARTY_LICENSES.md for upstream attribution.
+# See LICENSE, NOTICE, and licenses/ for upstream attribution.
 
 """Operand construction, scale-factor packing and correctness oracles.
 

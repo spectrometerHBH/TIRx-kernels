@@ -18,7 +18,7 @@ under the License.
 This design sketch documents a modified TIRx port of FlashInfer's
 csrc/tinygemm2_sm100.cu, whose generated Loom schedules are exact ports of
 NVIDIA TensorRT-LLM's TinyGEMM2 kernel. See NOTICE and
-THIRD_PARTY_LICENSES.md for upstream attribution.
+licenses/ for upstream attribution.
 -->
 
 # TinyGEMM2 BF16 SM100: coarse WASP pipeline sketch

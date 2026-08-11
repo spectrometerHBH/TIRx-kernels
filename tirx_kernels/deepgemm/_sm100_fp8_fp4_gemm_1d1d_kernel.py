@@ -18,7 +18,7 @@
 # (deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_gemm_1d1d.cuh) together with
 # `scheduler/gemm.cuh` and `epilogue/sm100_store_cd{,_swap_ab}.cuh`.
 # The structure follows `.agents/sketch/sm100_fp8_fp4_gemm_1d1d.md`.
-# See NOTICE and THIRD_PARTY_LICENSES.md for upstream attribution.
+# See LICENSE, NOTICE, and licenses/ for upstream attribution.
 
 """The kernel body: eight warps, five barrier families, one persistent walk.
 

@@ -1,4 +1,5 @@
-exclude: ^(\.txdev/|\.claude/)
+# licenses/ holds verbatim upstream license texts — never reformat them.
+exclude: ^(\.txdev/|\.claude/|licenses/)
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks

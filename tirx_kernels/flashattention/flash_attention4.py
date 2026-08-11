@@ -1,7 +1,7 @@
 # This file contains code ported from Dao-AILab/flash-attention
 # (flash_attn/cute/flash_fwd_sm100.py), copyright (c) 2022 the respective
 # contributors, licensed under the BSD 3-Clause License.
-# See THIRD_PARTY_LICENSES.md for the full license text.
+# See licenses/ for the full license text.
 
 """FlashAttention-4 TIRx kernel and direct NVIDIA IKET profiling entry point.
 

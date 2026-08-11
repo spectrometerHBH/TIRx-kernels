@@ -19,7 +19,7 @@ csrc/nv_internal/tensorrt_llm/kernels/quantization.cuh
 (cvt_fp16_to_fp4_expert), the SM100 kernel behind
 flashinfer.activation.silu_and_mul_scaled_nvfp4_experts_quantize,
 itself ported from NVIDIA TensorRT-LLM. See NOTICE and
-THIRD_PARTY_LICENSES.md for upstream attribution.
+licenses/ for upstream attribution.
 -->
 
 # silu_and_mul_nvfp4_experts_quantize SM100: coarse WASP pipeline sketch

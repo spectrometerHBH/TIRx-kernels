@@ -19,7 +19,7 @@
 # the reachable helpers it instantiates (`scheduler/gemm.cuh`,
 # `epilogue/sm100_store_cd{,_swap_ab}.cuh`) and the host-side layout heuristic in
 # `csrc/jit_kernels/heuristics/sm100.hpp`.
-# See NOTICE and THIRD_PARTY_LICENSES.md for upstream attribution.
+# See LICENSE, NOTICE, and licenses/ for upstream attribution.
 
 """Shared implementation of DeepGEMM's SM100 FP8/FP4 1D1D GEMM kernel template.
 

@@ -1,6 +1,6 @@
 # This file contains code ported from FlashMLA (https://github.com/deepseek-ai/FlashMLA),
 # copyright (c) 2025 DeepSeek, licensed under the MIT License.
-# See THIRD_PARTY_LICENSES.md for the full license text.
+# See licenses/ for the full license text.
 
 """TIRx entry for FlashMLA's sparse prefill Python API.
 

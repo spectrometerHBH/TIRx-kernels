@@ -5,7 +5,7 @@ SPDX-License-Identifier: BSD-3-Clause AND Apache-2.0
 
 This design sketch documents a modified TIRx port of FlashInfer's
 gated_delta_net_chunked.py. See LICENSE, NOTICE, and
-THIRD_PARTY_LICENSES.md for the applicable terms.
+licenses/ for the applicable terms.
 -->
 
 # TIRx FP16 GDN prefill SM100: coarse WASP pipeline sketch

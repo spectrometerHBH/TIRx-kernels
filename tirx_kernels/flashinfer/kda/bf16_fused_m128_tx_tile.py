@@ -16,7 +16,7 @@
 
 # This file is a modified TIRx port of FlashInfer's
 # csrc/kda/flashkda_bf16_fused_m128.cu.
-# See NOTICE and THIRD_PARTY_LICENSES.md for upstream attribution.
+# See LICENSE, NOTICE, and licenses/ for upstream attribution.
 """FlashKDA bf16 fused m128 variant using T.warp.copy for matrix transfers."""
 
 from __future__ import annotations

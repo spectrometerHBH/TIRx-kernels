@@ -15,7 +15,7 @@
 
 # This file contains code ported from DeepGEMM (https://github.com/deepseek-ai/DeepGEMM),
 # copyright (c) 2025 DeepSeek, licensed under the MIT License.
-# See THIRD_PARTY_LICENSES.md for the full license text.
+# See licenses/ for the full license text.
 
 import ctypes
 from dataclasses import asdict, dataclass

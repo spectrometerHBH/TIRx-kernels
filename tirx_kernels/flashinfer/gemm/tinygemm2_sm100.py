@@ -17,7 +17,7 @@
 # This file is a modified TIRx port of FlashInfer's csrc/tinygemm2_sm100.cu.
 # That generated source records its Loom schedules as exact ports of NVIDIA
 # TensorRT-LLM's TinyGEMM2 kernel.
-# See NOTICE and THIRD_PARTY_LICENSES.md for upstream attribution.
+# See LICENSE, NOTICE, and licenses/ for upstream attribution.
 
 """FlashInfer TinyGEMM2 BF16 kernel port for SM100."""
 

@@ -31,7 +31,7 @@
 #
 # This file is a modified TIRx port of FlashInfer's GDN kernel. FlashInfer's
 # host adapter is used only as an external correctness and benchmark oracle.
-# See LICENSE, NOTICE, and THIRD_PARTY_LICENSES.md for the applicable terms.
+# See LICENSE, NOTICE, and licenses/ for the applicable terms.
 """SM100a FP16 GDN prefill transcribed from FlashInfer's frozen CuTeDSL kernel.
 
 The implementation follows the frozen CuTeDSL source order and preserves its
