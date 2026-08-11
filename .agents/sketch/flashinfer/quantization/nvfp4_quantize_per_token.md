@@ -91,7 +91,7 @@ select / setp                  # selp/setp families
 
 Subroutines (bodies annotated per instruction in the sketch; ABSMAX_8,
 HMAX_REDUCE_F32, FLOAT2_SCALED, E2M1X8, NVFP4_SCALE are the same source
-helpers reviewed in .agents/sketch/nvfp4_quantize.md with identical
+helpers reviewed in .agents/sketch/flashinfer/quantization/nvfp4_quantize.md with identical
 instruction selections and are not repeated):
 
 ```python
@@ -281,7 +281,7 @@ def ROW_SCALES(row_amax, gs_inv):
 # ===========================================================================
 # PROCESS_BLOCK — process_nvfp4_block_half (utils:1870) / _bfloat (:1895) with
 # global_scale = global_encode_scale: the SAME block program reviewed in
-# .agents/sketch/nvfp4_quantize.md (2 loads, ABSMAX_8, HMAX_REDUCE_F32,
+# .agents/sketch/flashinfer/quantization/nvfp4_quantize.md (2 loads, ABSMAX_8, HMAX_REDUCE_F32,
 # NVFP4_SCALE, 8x FLOAT2_SCALED, 2x E2M1X8, shl.b64/or.b64 combine; no stores).
 # Loads at in_row + sf_col*32 bytes; returns (scale_fp8_u8, packed64).
 # ===========================================================================

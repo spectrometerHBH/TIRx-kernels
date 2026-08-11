@@ -40,7 +40,7 @@ ported behind the same compile-time knob; TVM launches do not carry the PDL
 launch attribute, so PDL stays off for test/bench parity on both sides).
 
 The implementation structure follows the reviewer-approved sketch
-``.agents/sketch/mxfp4_quantize.md``; shared instruction-level helpers live in
+``.agents/sketch/flashinfer/quantization/mxfp4_quantize.md``; shared instruction-level helpers live in
 ``tirx_kernels/flashinfer/utils/fp_quant.py``.
 """
 

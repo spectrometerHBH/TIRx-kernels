@@ -413,7 +413,7 @@ def SILU_ONE(g):                      # _silu_f32 (utils:1731): g / (1 + exp(-g)
 
 # ===========================================================================
 # ABSMAX_8, HMAX_REDUCE_F32, FLOAT2_SCALED, E2M1X8, SF_OFFSET — the SAME source
-# helpers reviewed in .agents/sketch/mxfp8_quantize.md / mxfp4_quantize.md
+# helpers reviewed in .agents/sketch/flashinfer/quantization/mxfp8_quantize.md / mxfp4_quantize.md
 # (utils:691/:728, :95/:122, :376/:406, :442, :535/:569) with identical
 # instruction selections; not repeated here.
 # ===========================================================================

@@ -44,7 +44,7 @@ path (env-gated), the ``FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH`` exact-math
 path, and the fp8e4m3 input path.
 
 The implementation structure follows the reviewer-approved sketch
-``.agents/sketch/nvfp4_quantize.md``; shared instruction-level helpers live in
+``.agents/sketch/flashinfer/quantization/nvfp4_quantize.md``; shared instruction-level helpers live in
 ``tirx_kernels/flashinfer/utils/fp_quant.py``.
 """
 

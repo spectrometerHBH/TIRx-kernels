@@ -360,7 +360,7 @@ def PROCESS_BLOCK(row_idx, col_idx):
 # ===========================================================================
 # Subroutines — bodies in source order, one annotation per instruction.
 # ABSMAX_8, HMAX_REDUCE_F32, UE8M0_ENCODE, UE8M0_INV_SCALE are the SAME source
-# helpers reviewed in .agents/sketch/mxfp8_quantize.md (utils:691/:728, :95/
+# helpers reviewed in .agents/sketch/flashinfer/quantization/mxfp8_quantize.md (utils:691/:728, :95/
 # :122, :157, :207) with identical instruction selections; reproduced here in
 # compact form.
 # ===========================================================================

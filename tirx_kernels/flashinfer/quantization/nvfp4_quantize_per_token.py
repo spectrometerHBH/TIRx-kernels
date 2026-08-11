@@ -40,7 +40,7 @@ PDL stays off for test/bench parity on both sides).  Deferred variants:
 dual-scale path (both env-gated).
 
 The implementation structure follows the reviewer-approved sketch
-``.agents/sketch/nvfp4_quantize_per_token.md``; shared instruction-level
+``.agents/sketch/flashinfer/quantization/nvfp4_quantize_per_token.md``; shared instruction-level
 helpers live in ``tirx_kernels/flashinfer/utils/fp_quant.py``.
 """
 
