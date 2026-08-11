@@ -33,7 +33,7 @@ the CUDA kernel as:
   rather than descriptors or instruction hints.
 
 The implementation represented by this sketch is maintained in
-[`tirx_kernels/flashinfer/bf16_fused_m128.py`](../../tirx_kernels/flashinfer/bf16_fused_m128.py).
+[`tirx_kernels/flashinfer/kda/bf16_fused_m128.py`](../../tirx_kernels/flashinfer/kda/bf16_fused_m128.py).
 That module is the source of truth.
 
 ## Pipeline at a glance

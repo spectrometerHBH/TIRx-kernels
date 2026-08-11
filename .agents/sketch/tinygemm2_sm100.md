@@ -25,7 +25,7 @@ THIRD_PARTY_LICENSES.md for upstream attribution.
 
 This non-executable design sketch describes the storage layout, warp roles,
 pipeline, synchronization, and PTX-level operations of
-[`tirx_kernels/flashinfer/tinygemm2_sm100.py`](../../tirx_kernels/flashinfer/tinygemm2_sm100.py).
+[`tirx_kernels/flashinfer/gemm/tinygemm2_sm100.py`](../../tirx_kernels/flashinfer/gemm/tinygemm2_sm100.py).
 That TIRx module is the authoritative implementation.
 
 The four static specializations are `STAGES in {4,8}` crossed with

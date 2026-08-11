@@ -15,7 +15,10 @@
 """Standard kernel interface protocol.
 
 Every kernel module under ``tirx_kernels/<category>/`` that wants to be
-discoverable by the registry must expose:
+discoverable by the registry must expose the members below.  A category may
+group its kernels into further subpackages (``flashinfer/`` buckets its ports
+by the FlashInfer Python entry point they back); the registry walks into those,
+skipping ``utils`` subpackages.
 
 Module-level constants
 ----------------------

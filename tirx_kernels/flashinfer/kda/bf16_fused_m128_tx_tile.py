@@ -17,932 +17,140 @@
 # This file is a modified TIRx port of FlashInfer's
 # csrc/kda/flashkda_bf16_fused_m128.cu.
 # See NOTICE and THIRD_PARTY_LICENSES.md for upstream attribution.
-"""TIRx port of FlashInfer's FlashKDA SM100a BF16 recurrent-KDA prefill
-M128 kernel (flashinfer-ai/flashinfer#4262, head e835e0f5).
-
-Source CUDA: csrc/kda/flashkda_bf16_fused_m128.cu (kernel body at line 504),
-launched by RunM128 in csrc/kda/flashkda_bf16_fused_m128_binding.cu with
-shared launch helpers in csrc/kda/flashkda_binding_common.cuh.
-
-Target instance: BF16, head_dim 128, sm_100a, grid = num_seqs * num_heads,
-1024 threads, 227328 B dynamic smem, six host-encoded TMA descriptors.
-"""
+"""FlashKDA bf16 fused m128 variant using T.warp.copy for matrix transfers."""
 
 from __future__ import annotations
 
 import math
-import os
-import sys
-from dataclasses import dataclass, fields
 from typing import Any
-from unittest import SkipTest
 
-import torch
-
-from tvm.script import tirx as T
-
-D_HEAD = 128
-THREADS = 1024
-SMEM_TOTAL = 227328
-DEFAULT_LOWER_BOUND = -5.0
-
-# .cu:29-106 (#define block, source order).
-TMEM_TMEM_STATE_OFFSET = 64
-TMEM_TMEM_STATE_INP_OFFSET = 0
-TMEM_TMEM_U_ACC_OFFSET = 224
-TMEM_TMEM_U2_INP_OFFSET = 224
-TMEM_TMEM_U2_ACC_OFFSET = 0
-TMEM_TMEM_OUT_OFFSET = 192
-TMEM_TMEM_STATE_OUT_OFFSET = 64
-SMEM_SMEM_QD_OFF = 1024
-SMEM_SMEM_G_RAW_OFF = 1024
-SMEM_SMEM_KD_OFF = 9216
-SMEM_SMEM_Q_RAW_PREFETCH_OFF = 17408
-SMEM_SMEM_FINAL_TRANS_OFF = 17408
-SMEM_SMEM_KR_TRANS_OFF = 17408
-SMEM_SMEM_MQK_TRANS_OFF = 25600
-SMEM_SMEM_INV_OFF = 29696
-SMEM_SMEM_V_OFF = 32384
-SMEM_SMEM_KI_OFF = 17408
-SMEM_SMEM_GATE_OFF = 25600
-SMEM_SMEM_BETA_RAW_OFF = 41984
-SMEM_SMEM_INV_WORK_OFF = 32384
-SMEM_SMEM_OUT_OFF = 210944
-SMEM_SMEM_G_RAW_ALL_OFF = 1024
-SMEM_SMEM_G_RAW_ALL_STAGE_BYTES = 176128
-SMEM_SMEM_RESTORE_FACTOR_ALL_OFF = 41984
-SMEM_SMEM_RESTORE_FACTOR_ALL_STAGE_BYTES = 168452
-SMEM_SMEM_GT_PREFIX_ALL_OFF = 41472
-SMEM_SMEM_GT_PREFIX_ALL_STAGE_BYTES = 168448
-SMEM_SMEM_GT_ALL_OFF = 31744
-SMEM_SMEM_GT_ALL_STAGE_BYTES = 168448
-SMEM_SMEM_PREP_BETA_ALL_OFF = 42500
-SMEM_SMEM_PREP_BETA_ALL_STAGE_BYTES = 168064
-SMEM_SMEM_GATE_RATE_ALL_OFF = 42628
-SMEM_SMEM_GATE_RATE_ALL_STAGE_BYTES = 167940
-SMEM_SMEM_V_ALL_OFF = 32384
-SMEM_SMEM_V_ALL_STAGE_BYTES = 176128
-SMEM_SMEM_GATE_ALL_OFF = 25600
-SMEM_SMEM_GATE_ALL_STAGE_BYTES = 184320
-
-# Mbarrier group byte offsets within the smem barrier area (.cu:695-711).
-MBAR_QK_FULL_OFF = 0
-MBAR_GATE_RAW_FULL_OFF = 40
-MBAR_QK_RAW_FULL_OFF = 80
-MBAR_V_FULL_OFF = 120
-MBAR_V_FREE_OFF = 160
-MBAR_SMEM_FREE_OFF = 200
-MBAR_RAW_INPUTS_FREE_OFF = 240
-MBAR_STATE_INP_READY_OFF = 280
-MBAR_OLD_OUT_READY_OFF = 320
-MBAR_U_INP_READY_OFF = 360
-MBAR_U2_ACC_READY_OFF = 400
-MBAR_U2_INP_READY_OFF = 440
-MBAR_FINAL_READY_OFF = 480
-MBAR_OUT_EMPTY_OFF = 520
-MBAR_TMEM_DEALLOC_READY_OFF = 528
-MBAR_PREP_DIAG_READY_OFF = 536
-MBAR_PREP_INV16_READY_OFF = 576
-SMEM_TMEM_ADDR_STORAGE_OFF = 616
-
-# TMA descriptor byte slots inside descriptor_storage (binding_common.cuh:435-440).
-TMA_SLOT_Q = 0
-TMA_SLOT_K = 128
-TMA_SLOT_V = 256
-TMA_SLOT_G = 384
-TMA_SLOT_BETA = 512
-TMA_SLOT_OUT = 640
-
-LAUNCH_TAGS = ("blockIdx.x", "threadIdx.x", "tirx.use_dyn_shared_memory")
-
-# ---------------------------------------------------------------------------
-# CUDA device helpers, transcribed in source order from
-# csrc/kda/flashkda_bf16_fused_m128.cu:110-496.
-#
-# Helpers whose PTX instruction form has an exact T.ptx/T.cuda wrapper use that
-# wrapper.  Helpers with no exact wrapper (token-returning waits, ticks waits,
-# raw-descriptor MMA, raw tensor-map TMA) keep the verbatim CUDA body behind a
-# target-local T.cuda.func_call inline fallback (see tirx_dsl_improve.md).
-# ---------------------------------------------------------------------------
-
-_FLASHKDA_SRCS = {
-    "flashkda_tensormap_acquire": r"""__device__ __forceinline__ void flashkda_tensormap_acquire(const void *tmap_ptr) {
-    asm volatile(
-        "fence.proxy.tensormap::generic.acquire.gpu [%0], 128;\n"
-        :: "l"(tmap_ptr) : "memory");
-}
-""",
-    "flashkda_tanh_approx": r"""// tanh.approx.f32 (sigmoid via tanh; used throughout the prep role)
-__device__ __forceinline__ float flashkda_tanh_approx(float x) {
-    float y;
-    asm volatile("tanh.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
-    return y;
-}
-""",
-    "flashkda_fmaf_rn": r"""// __fmaf_rn (value form of fma.rn.f32)
-__device__ __forceinline__ float flashkda_fmaf_rn(float a, float b, float c) {
-    return __fmaf_rn(a, b, c);
-}
-""",
-    "flashkda_rsqrtf": r"""// rsqrtf
-__device__ __forceinline__ float flashkda_rsqrtf(float x) {
-    return rsqrtf(x);
-}
-""",
-}
-
-
-# tcgen05.mma spelling: kind::f16 from the (float32, bfloat16, bfloat16) dtypes; the A
-# operand is a uint32 TMEM address (use_a_tmem), which selects the ts form.
-_TCGEN05_MMA_F16 = "tcgen05.mma.cta_group::1.kind::f16"
-# cta_group::1 disable-output-lane mask group: the explicit default {0, 0, 0, 0}.
-_MMA_ZERO_MASKS = (0, 0, 0, 0)
-# Warp-level mma.sync zero-C operand group (the four "f"(0.f) inline-asm literals).
-_MMA_ZERO_C = (T.float32(0.0), T.float32(0.0), T.float32(0.0), T.float32(0.0))
-# TMA spellings: unicast g2s at CTA scope (the sm_100 wrapper emits the explicit default
-# .cta_group::1 suffix for the unqualified inline instruction) and plain tile s2g.
-_TMA_G2S_CTA = (
-    "cp.async.bulk.tensor.{dim}d.shared::cta.global.tile.mbarrier::complete_tx::bytes.cta_group::1"
+from tirx_kernels.flashinfer.kda.bf16_fused_m128 import (
+    _FLASHKDA_SRCS,
+    D_HEAD,
+    LAUNCH_TAGS,
+    MBAR_FINAL_READY_OFF,
+    MBAR_GATE_RAW_FULL_OFF,
+    MBAR_OLD_OUT_READY_OFF,
+    MBAR_OUT_EMPTY_OFF,
+    MBAR_PREP_DIAG_READY_OFF,
+    MBAR_PREP_INV16_READY_OFF,
+    MBAR_QK_FULL_OFF,
+    MBAR_QK_RAW_FULL_OFF,
+    MBAR_RAW_INPUTS_FREE_OFF,
+    MBAR_SMEM_FREE_OFF,
+    MBAR_STATE_INP_READY_OFF,
+    MBAR_TMEM_DEALLOC_READY_OFF,
+    MBAR_U2_ACC_READY_OFF,
+    MBAR_U2_INP_READY_OFF,
+    MBAR_U_INP_READY_OFF,
+    MBAR_V_FREE_OFF,
+    MBAR_V_FULL_OFF,
+    SMEM_SMEM_BETA_RAW_OFF,
+    SMEM_SMEM_FINAL_TRANS_OFF,
+    SMEM_SMEM_G_RAW_ALL_OFF,
+    SMEM_SMEM_G_RAW_ALL_STAGE_BYTES,
+    SMEM_SMEM_G_RAW_OFF,
+    SMEM_SMEM_GATE_ALL_OFF,
+    SMEM_SMEM_GATE_ALL_STAGE_BYTES,
+    SMEM_SMEM_GATE_OFF,
+    SMEM_SMEM_GATE_RATE_ALL_OFF,
+    SMEM_SMEM_GATE_RATE_ALL_STAGE_BYTES,
+    SMEM_SMEM_GT_ALL_OFF,
+    SMEM_SMEM_GT_ALL_STAGE_BYTES,
+    SMEM_SMEM_GT_PREFIX_ALL_OFF,
+    SMEM_SMEM_GT_PREFIX_ALL_STAGE_BYTES,
+    SMEM_SMEM_INV_OFF,
+    SMEM_SMEM_INV_WORK_OFF,
+    SMEM_SMEM_KD_OFF,
+    SMEM_SMEM_KI_OFF,
+    SMEM_SMEM_KR_TRANS_OFF,
+    SMEM_SMEM_MQK_TRANS_OFF,
+    SMEM_SMEM_OUT_OFF,
+    SMEM_SMEM_PREP_BETA_ALL_OFF,
+    SMEM_SMEM_PREP_BETA_ALL_STAGE_BYTES,
+    SMEM_SMEM_Q_RAW_PREFETCH_OFF,
+    SMEM_SMEM_QD_OFF,
+    SMEM_SMEM_RESTORE_FACTOR_ALL_OFF,
+    SMEM_SMEM_RESTORE_FACTOR_ALL_STAGE_BYTES,
+    SMEM_SMEM_V_ALL_OFF,
+    SMEM_SMEM_V_ALL_STAGE_BYTES,
+    SMEM_SMEM_V_OFF,
+    SMEM_TMEM_ADDR_STORAGE_OFF,
+    SMEM_TOTAL,
+    THREADS,
+    TMA_SLOT_BETA,
+    TMA_SLOT_G,
+    TMA_SLOT_K,
+    TMA_SLOT_OUT,
+    TMA_SLOT_Q,
+    TMA_SLOT_V,
+    TMEM_TMEM_OUT_OFFSET,
+    TMEM_TMEM_STATE_INP_OFFSET,
+    TMEM_TMEM_STATE_OFFSET,
+    TMEM_TMEM_STATE_OUT_OFFSET,
+    TMEM_TMEM_U2_ACC_OFFSET,
+    TMEM_TMEM_U2_INP_OFFSET,
+    TMEM_TMEM_U_ACC_OFFSET,
+    _approx_exp2,
+    _cfg,
+    _elect_commit,
+    _expf,
+    _fence_async_shared,
+    _fmaf_rn,
+    _ld_global_v4_u32,
+    _ld_shared_b32,
+    _ld_shared_v4,
+    _make_warp_uniform,
+    _mbarrier_arrive,
+    _mbarrier_arrive_expect_tx,
+    _mbarrier_wait,
+    _mma_final_2step,
+    _mma_inv_2step,
+    _mma_m16n8k8_bf16_zero,
+    _mma_m16n8k16_bf16_acc,
+    _mma_m16n8k16_bf16_acc_off4,
+    _mma_m16n8k16_bf16_zero,
+    _mma_m16n8k16_bf16_zero_off4,
+    _mma_qk_8step,
+    _mul_f32x2_inplace,
+    _rsqrtf,
+    _st_global_v4_u32,
+    _st_shared_b32,
+    _sub_f32x2_inplace,
+    _tanh_approx,
+    _tma_2d_gmem2smem,
+    _tma_3d_gmem2smem,
+    _tma_4d_gmem2smem,
+    _tma_store_4d,
+    _tmem_ld_x32,
+    _tmem_st_x8_u32,
+    _tmem_st_x32_f32,
 )
-_TMA_S2G = "cp.async.bulk.tensor.{dim}d.global.shared::cta.tile.bulk_group"
-
-
-def _mma_qk_8step(taddr_d, b_lo, taddr_a, enable_d):
-    # .cu:1114-1150 and .cu:1153-1189 (same verbatim block, two call sites) ->
-    # 8 native tcgen05.mma issues: b_lo offsets 0,2,4,6,256,258,260,262 (adds 2,2,2,250,2,2,2),
-    # taddr_a +8 per step, dhi=0x40004040, idesc=134743184, step0 enable_d / steps1-7 tied 1,
-    # all @leader-predicated. Native emits the explicit default disable-output-lane {0,0,0,0}.
-    leader = T.cuda.elect_sync()
-    b_lo32 = T.cast(b_lo, "uint32")
-    for _i in range(8):
-        _b_desc = (T.uint64(0x40004040) << T.uint64(32)) | T.cast(
-            b_lo32 + T.uint32((0, 2, 4, 6, 256, 258, 260, 262)[_i]), "uint64"
-        )
-        T.evaluate(
-            T.ptx[_TCGEN05_MMA_F16](
-                T.cast(taddr_d, "uint32"),
-                T.cast(taddr_a + 8 * _i, "uint32"),
-                _b_desc,
-                T.uint32(134743184),
-                *_MMA_ZERO_MASKS,
-                T.ptx.pred(enable_d if _i == 0 else 1),
-                pred=leader,
-            )
-        )
-
-
-def _mma_inv_2step(taddr_d, b_lo, taddr_a, enable_d):
-    # .cu:1194-1212 -> 2 native tcgen05.mma issues (b_lo add 64; dhi=0xC0004010)
-    leader = T.cuda.elect_sync()
-    b_lo32 = T.cast(b_lo, "uint32")
-    for _i in range(2):
-        _b_desc = (T.uint64(0xC0004010) << T.uint64(32)) | T.cast(
-            b_lo32 + T.uint32(64 * _i), "uint64"
-        )
-        T.evaluate(
-            T.ptx[_TCGEN05_MMA_F16](
-                T.cast(taddr_d, "uint32"),
-                T.cast(taddr_a + 8 * _i, "uint32"),
-                _b_desc,
-                T.uint32(134743184),
-                *_MMA_ZERO_MASKS,
-                T.ptx.pred(enable_d if _i == 0 else 1),
-                pred=leader,
-            )
-        )
-
-
-def _mma_final_2step(taddr_d, b_lo, taddr_a, enable_d):
-    # .cu:1217-1235 -> 2 native tcgen05.mma issues (b_lo add 128; dhi=0x40004040)
-    leader = T.cuda.elect_sync()
-    b_lo32 = T.cast(b_lo, "uint32")
-    for _i in range(2):
-        _b_desc = (T.uint64(0x40004040) << T.uint64(32)) | T.cast(
-            b_lo32 + T.uint32(128 * _i), "uint64"
-        )
-        T.evaluate(
-            T.ptx[_TCGEN05_MMA_F16](
-                T.cast(taddr_d, "uint32"),
-                T.cast(taddr_a + 8 * _i, "uint32"),
-                _b_desc,
-                T.uint32(136905872),
-                *_MMA_ZERO_MASKS,
-                T.ptx.pred(enable_d if _i == 0 else 1),
-                pred=leader,
-            )
-        )
-
-
-def _ld_global_v4_u32(dst, ptr):
-    # verbatim plain uint4 load (.cu:783-806/1564-1601 pattern; plain ld.global.v4, NOT .nc)
-    return T.ptx.ld.global_.v4.b32(dst[0], dst[1], dst[2], dst[3], ptr)
-
-
-def _tanh_approx(x):
-    # tanh.approx.f32 (prep-role sigmoid)
-    return T.cuda.func_call(
-        "flashkda_tanh_approx",
-        x,
-        source_code=_FLASHKDA_SRCS["flashkda_tanh_approx"],
-        return_type="float32",
-    )
-
-
-def _expf(x):
-    # .cu:1317 __expf -> ex2.approx.ftz.f32(x * log2(e)) under -use_fast_math
-    _out = T.alloc_local((1,), "float32")
-    T.evaluate(T.ptx.ex2.approx.ftz.f32(_out[0], x * T.float32(1.4426950408889634)))
-    return _out[0]
-
-
-def _rsqrtf(x):
-    # rsqrtf verbatim
-    return T.cuda.func_call(
-        "flashkda_rsqrtf", x, source_code=_FLASHKDA_SRCS["flashkda_rsqrtf"], return_type="float32"
-    )
-
-
-def _fmaf_rn(a, b, c):
-    # __fmaf_rn verbatim (value form)
-    return T.cuda.func_call(
-        "flashkda_fmaf_rn",
-        a,
-        b,
-        c,
-        source_code=_FLASHKDA_SRCS["flashkda_fmaf_rn"],
-        return_type="float32",
-    )
-
-
-def _ld_shared_b32(smem_raw, smem, addr):
-    # ld.shared.b32
-    _out = T.alloc_local((1,), "uint32")
-    T.evaluate(T.ptx.ld.shared.b32(_out[0], smem_raw.ptr_to([addr - smem])))
-    return _out[0]
-
-
-def _ld_shared_v4(smem_raw, smem, dst, addr):
-    # ld.shared.v4.b32 (dst: 4-elem uint32 local array)
-    return T.ptx.ld.shared.v4.b32(dst[0], dst[1], dst[2], dst[3], smem_raw.ptr_to([addr - smem]))
-
-
-def _st_shared_b32(smem_raw, smem, addr, val):
-    # st.shared.b32
-    return T.ptx.st.shared.b32(smem_raw.ptr_to([addr - smem]), val)
-
-
-def _mma_m16n8k16_bf16_zero(acc, a, b):
-    # mma.sync m16n8k16 bf16, zero C (acc/a/b: local arrays) -> native register-fragment
-    # form; the explicit zero C slots feed "f"(0.f) == inline's 0f00000000 literals
-    return T.ptx.mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32(
-        *[acc[i] for i in range(4)],
-        *[a[i] for i in range(4)],
-        *[b[i] for i in range(2)],
-        *_MMA_ZERO_C,
-    )
-
-
-def _mma_m16n8k16_bf16_acc(acc, a, b):
-    # mma.sync m16n8k16 bf16, accumulating C (C aliases acc == inline "+f" tied regs)
-    return T.ptx.mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32(
-        *[acc[i] for i in range(4)],
-        *[a[i] for i in range(4)],
-        *[b[i] for i in range(2)],
-        *[acc[i] for i in range(4)],
-    )
-
-
-def _mma_m16n8k8_bf16_zero(acc, a, b):
-    # mma.sync m16n8k8 bf16, zero C -> native register-fragment form
-    return T.ptx.mma.sync.aligned.m16n8k8.row.col.f32.bf16.bf16.f32(
-        *[acc[i] for i in range(4)],
-        *[a[i] for i in range(2)],
-        *[b[i] for i in range(1)],
-        *_MMA_ZERO_C,
-    )
-
-
-def _mma_m16n8k16_bf16_zero_off4(acc, a, b):
-    # second zero-C mma writing acc[4..7] with b_frag[2..3] (e.g. .cu:1725-1727)
-    return T.ptx.mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32(
-        *[acc[4 + i] for i in range(4)],
-        *[a[i] for i in range(4)],
-        *[b[2 + i] for i in range(2)],
-        *_MMA_ZERO_C,
-    )
-
-
-def _mma_m16n8k16_bf16_acc_off4(acc, a, b):
-    # second accumulating mma writing acc[4..7] with b_frag[2..3]
-    return T.ptx.mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32(
-        *[acc[4 + i] for i in range(4)],
-        *[a[i] for i in range(4)],
-        *[b[2 + i] for i in range(2)],
-        *[acc[4 + i] for i in range(4)],
-    )
-
-
-def _st_global_v4_u32(ptr, a, b, c, d):
-    # verbatim uint4 store (STG.128 shape) used by the final-state store path
-    return T.ptx.st.global_.v4.b32(ptr, a, b, c, d)
-
-
-def _mbarrier_wait(smem_raw, smem, mbar_addr, phase):
-    # .cu:158-171 -> native T.cuda.mbarrier_wait: same LAB_WAIT spin loop with
-    # ticks=0x989680; mbarrier.try_wait.parity.shared::cta defaults to .acquire.cta
-    # (the token/cluster wait variants at .cu:130-156,173-198 had no call sites)
-    return T.cuda.mbarrier_wait(smem_raw.ptr_to([mbar_addr - smem]), phase)
-
-
-def _elect_commit(mbar_addr):
-    # .cu:239-248
-    leader = T.cuda.elect_sync()
-    return T.ptx.tcgen05.commit.cta_group__1.mbarrier__arrive__one.shared__cluster.b64(
-        mbar_addr, pred=leader
-    )
-
-
-def _mbarrier_arrive(smem_raw, smem, mbar_addr):
-    # .cu:251-255 -> native; emits the same mbarrier.arrive.release.cta.shared::cta.b64 _, [addr]
-    return T.ptx.mbarrier.arrive.release.cta.shared__cta.b64(
-        smem_raw.ptr_to([mbar_addr - smem]), T.uint32(1)
-    )
-
-
-def _mbarrier_arrive_expect_tx(mbar_addr, bytes_):
-    # .cu:258-262
-    return T.ptx.mbarrier.arrive.expect_tx.release.cta.shared__cta.b64(mbar_addr, T.uint32(bytes_))
-
-
-def _tmem_ld_x32(dst, tmem_addr):
-    # .cu:265-281
-    return T.ptx["tcgen05.ld.sync.aligned.32x32b.x32.b32"](
-        *[dst[j] for j in range(32)], T.cast(tmem_addr, "uint32")
-    )
-
-
-def _tmem_st_x32_f32(tmem_addr, src):
-    # .cu:297-313
-    return T.ptx["tcgen05.st.sync.aligned.32x32b.x32.b32"](
-        T.cast(tmem_addr, "uint32"), *[src[j] for j in range(32)]
-    )
-
-
-def _approx_exp2(x):
-    # .cu:326-330
-    _out = T.alloc_local((1,), "float32")
-    T.evaluate(T.ptx.ex2.approx.ftz.f32(_out[0], x))
-    return _out[0]
-
-
-def _mul_f32x2_inplace(a, b):
-    # .cu:342-345
-    _out = T.alloc_local((1,), "uint64")
-    T.evaluate(T.ptx.mul.rn.ftz.f32x2(_out[0], a, b))
-    return _out[0]
-
-
-def _sub_f32x2_inplace(a, b):
-    # .cu:352-355
-    _out = T.alloc_local((1,), "uint64")
-    T.evaluate(T.ptx.sub.rn.ftz.f32x2(_out[0], a, b))
-    return _out[0]
-
-
-def _fence_async_shared():
-    # .cu:416-418
-    return T.ptx.fence.proxy.async_.shared__cta()
-
-
-def _tma_3d_gmem2smem(smem_raw, smem, dst, tmap_ptr, x, y, z, mbar_addr):
-    # .cu:430-438 (raw tensor-map pointer form) -> native; on sm_100 the wrapper emits
-    # the explicit default .cta_group::1 suffix for the unqualified inline instruction
-    return T.ptx[_TMA_G2S_CTA.format(dim=3)](
-        smem_raw.ptr_to([dst - smem]),
-        T.reinterpret("uint64", tmap_ptr),
-        x,
-        y,
-        z,
-        smem_raw.ptr_to([mbar_addr - smem]),
-    )
-
-
-def _tma_2d_gmem2smem(smem_raw, smem, dst, tmap_ptr, x, y, mbar_addr):
-    # .cu:441-449 -> native (see _tma_3d_gmem2smem note)
-    return T.ptx[_TMA_G2S_CTA.format(dim=2)](
-        smem_raw.ptr_to([dst - smem]),
-        T.reinterpret("uint64", tmap_ptr),
-        x,
-        y,
-        smem_raw.ptr_to([mbar_addr - smem]),
-    )
-
-
-def _tma_4d_gmem2smem(smem_raw, smem, dst, tmap_ptr, x, y, z, w, mbar_addr):
-    # .cu:452-460 -> native (see _tma_3d_gmem2smem note)
-    return T.ptx[_TMA_G2S_CTA.format(dim=4)](
-        smem_raw.ptr_to([dst - smem]),
-        T.reinterpret("uint64", tmap_ptr),
-        x,
-        y,
-        z,
-        w,
-        smem_raw.ptr_to([mbar_addr - smem]),
-    )
-
-
-def _tma_store_4d(smem_raw, smem, tmap, x, y, z, w, smem_addr):
-    # .cu:463-469 -> native s2g (cp.async.bulk.tensor.4d.global.shared::cta.tile.bulk_group)
-    return T.ptx[_TMA_S2G.format(dim=4)](
-        T.reinterpret("uint64", tmap), x, y, z, w, smem_raw.ptr_to([smem_addr - smem])
-    )
-
-
-def _tmem_st_x8_u32(addr, src):
-    # .cu:480-487
-    return T.ptx["tcgen05.st.sync.aligned.32x32b.x8.b32"](
-        T.cast(addr, "uint32"), *[src[j] for j in range(8)]
-    )
-
-
-def _make_warp_uniform(val):
-    # .cu:490-495
-    return T.cuda._shfl_sync(T.uint32(0xFFFFFFFF), val, 0, 32)
-
-
-@dataclass
-class FlashKDABf16FusedM128Config:
-    label: str
-    num_heads: int
-    seq_lens: tuple[int, ...]
-    packed: bool
-    use_initial_state: bool = False
-    store_final_state: bool = False
-    lower_bound: float = DEFAULT_LOWER_BOUND
-    seed: int = 0
-
-    def validate(self) -> None:
-        if self.num_heads <= 0:
-            raise ValueError("num_heads must be positive")
-        if not self.seq_lens or any(t <= 0 for t in self.seq_lens):
-            raise ValueError("seq_lens must be non-empty and positive")
-        if not math.isfinite(self.lower_bound) or self.lower_bound >= 0.0:
-            raise ValueError("lower_bound must be finite and negative")
-        if self.packed:
-            if sum(self.seq_lens) <= len(self.seq_lens):
-                raise ValueError("packed prefill requires total_tokens > num_seqs")
-        else:
-            if len(set(self.seq_lens)) != 1:
-                raise ValueError("fixed layout requires uniform seq_lens")
-            if self.seq_lens[0] <= 1:
-                raise ValueError("fixed prefill requires T > 1")
-            if len(self.seq_lens) == 1 and self.num_heads == 64:
-                raise ValueError("fixed B=1 H=64 dispatches to the m64 kernel (out of scope)")
-
-    @property
-    def num_seqs(self) -> int:
-        return len(self.seq_lens)
-
-    @property
-    def total_tokens(self) -> int:
-        return sum(self.seq_lens)
-
-    @property
-    def beta_tma_tokens(self) -> int:
-        return max(self.total_tokens, 32)
-
-    @property
-    def beta_tma_heads(self) -> int:
-        return max(self.num_heads, 8)
-
-
-def _cu_tensor_map_encode_tiled(
-    data_ptr: int,
-    rank: int,
-    global_dim: list[int],
-    global_strides: list[int],
-    box_dim: list[int],
-    swizzle: int,
-) -> bytes:
-    """ctypes replication of the host cuTensorMapEncodeTiled calls in
-    flashkda_binding_common.cuh (BF16, interleave/L2/OOB all NONE)."""
-    import ctypes
-
-    libcuda = ctypes.CDLL("libcuda.so.1")
-    tensor_map = (ctypes.c_uint64 * 16)()  # 128 B, opaque
-    dims = (ctypes.c_uint64 * rank)(*global_dim)
-    strides = (ctypes.c_uint64 * (rank - 1))(*global_strides)
-    box = (ctypes.c_uint32 * rank)(*box_dim)
-    elem_strides = (ctypes.c_uint32 * rank)(*([1] * rank))
-    result = libcuda.cuTensorMapEncodeTiled(
-        ctypes.byref(tensor_map),
-        9,  # CU_TENSOR_MAP_DATA_TYPE_BFLOAT16
-        rank,
-        ctypes.c_void_p(data_ptr),
-        dims,
-        strides,
-        box,
-        elem_strides,
-        0,  # CU_TENSOR_MAP_INTERLEAVE_NONE
-        swizzle,
-        0,  # CU_TENSOR_MAP_L2_PROMOTION_NONE
-        0,  # CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
-    )
-    if result != 0:
-        raise RuntimeError(f"cuTensorMapEncodeTiled failed with CUresult={result}")
-    return bytes(tensor_map)
-
-
-_CU_TENSOR_MAP_SWIZZLE_128B = 3
-_CU_TENSOR_MAP_SWIZZLE_NONE = 0
-
-
-def _encode_tma_descriptors(
-    case: dict[str, Any],
-    *,
-    output_key: str = "out",
-    descriptor_storage_key: str = "descriptor_storage",
-) -> None:
-    """Publish the six CUtensorMaps into descriptor_storage (host side of
-    EncodeTmaPointers<128> in flashkda_binding_common.cuh)."""
-    cfg: FlashKDABf16FusedM128Config = case["config"]
-    tokens = cfg.total_tokens
-    h = cfg.num_heads
-    maps = bytearray()
-    # EncodeQkTma(q/k): 4D {64, tokens, H, 2}, strides {H*256, 256, 128},
-    # box {64, 32, 1, 2}, SWIZZLE_128B.
-    for tensor in (case["q"], case["k"]):
-        maps += _cu_tensor_map_encode_tiled(
-            tensor.data_ptr(),
-            4,
-            [64, tokens, h, D_HEAD // 64],
-            [h * D_HEAD * 2, D_HEAD * 2, 64 * 2],
-            [64, 32, 1, 2],
-            _CU_TENSOR_MAP_SWIZZLE_128B,
-        )
-    # EncodeValueTma<128>(v) / EncodeGateTma(g): 3D {128, H, tokens},
-    # strides {256, 256*H}, box {128, 1, 32}, SWIZZLE_NONE.
-    for tensor in (case["v"], case["g"]):
-        maps += _cu_tensor_map_encode_tiled(
-            tensor.data_ptr(),
-            3,
-            [D_HEAD, h, tokens],
-            [D_HEAD * 2, D_HEAD * h * 2],
-            [128, 1, 32],
-            _CU_TENSOR_MAP_SWIZZLE_NONE,
-        )
-    # EncodeBetaTma(beta_tma): 2D {max(H,8), max(tokens,32)}, box {8, 32}.
-    maps += _cu_tensor_map_encode_tiled(
-        case["beta_tma"].data_ptr(),
-        2,
-        [cfg.beta_tma_heads, cfg.beta_tma_tokens],
-        [cfg.beta_tma_heads * 2],
-        [8, 32],
-        _CU_TENSOR_MAP_SWIZZLE_NONE,
-    )
-    # EncodeOutputTma<128>(out): same layout as q/k, SWIZZLE_128B.
-    maps += _cu_tensor_map_encode_tiled(
-        case[output_key].data_ptr(),
-        4,
-        [64, tokens, h, D_HEAD // 64],
-        [h * D_HEAD * 2, D_HEAD * 2, 64 * 2],
-        [64, 32, 1, 2],
-        _CU_TENSOR_MAP_SWIZZLE_128B,
-    )
-    case[descriptor_storage_key].copy_(
-        torch.frombuffer(maps, dtype=torch.uint8).to(case[descriptor_storage_key].device)
-    )
-
-
-def _m128_dispatch_reason(cfg: FlashKDABf16FusedM128Config) -> str:
-    if not cfg.packed and cfg.num_seqs == 1 and cfg.num_heads == 64:
-        return "out_of_scope: fixed B=1 H=64 dispatches to kernel_flashkda_bf16_fused_m64"
-    layout = "packed" if cfg.packed else "fixed"
-    return (
-        f"m128: sm100a BF16 {layout} prefill dispatches to "
-        "kernel_flashkda_bf16_fused_m128 (_select_flash_kda_prefill_variant)"
-    )
-
-
-_MIXED_SEQ_LENS = (1300, 547, 2048, 963, 271, 3063)
-
-CONFIGS = [
-    # Mirrors the recurrent-KDA prefill reference coverage.
-    {"label": "fixed_h2_t4", "num_heads": 2, "seq_lens": (4, 4), "packed": False},
-    {"label": "packed_h2_3_5", "num_heads": 2, "seq_lens": (3, 5), "packed": True},
-    {
-        "label": "fixed_h2_t4_state",
-        "num_heads": 2,
-        "seq_lens": (4, 4),
-        "packed": False,
-        "use_initial_state": True,
-        "store_final_state": True,
-    },
-    {
-        "label": "packed_h2_3_5_state",
-        "num_heads": 2,
-        "seq_lens": (3, 5),
-        "packed": True,
-        "use_initial_state": True,
-        "store_final_state": True,
-    },
-    # Multi-chunk coverage: sequences longer than one 128-token chunk exercise the
-    # 5-stage chunk pipeline; mixed lengths exercise packed boundary handling.
-    {"label": "fixed_h4_t256", "num_heads": 4, "seq_lens": (256, 256), "packed": False},
-    {"label": "packed_h4_chunks", "num_heads": 4, "seq_lens": (200, 264, 128), "packed": True},
-]
-
-BENCH_CONFIGS = [
-    # Mirrors benchmarks/bench_recurrent_kda_prefill.py CASES, minus h64_fixed8192
-    # which dispatches to the m64 kernel (out of scope for this module).  The PR's
-    # raw FlashKDA peer writes a separate final state, so all benchmark configs do
-    # the same for a like-for-like kernel scope.
-    {
-        "label": "h96_fixed8192",
-        "num_heads": 96,
-        "seq_lens": (8192,),
-        "packed": False,
-        "use_initial_state": True,
-        "store_final_state": True,
-        "seed": 10000,
-    },
-    {
-        "label": "h96_mixed",
-        "num_heads": 96,
-        "seq_lens": _MIXED_SEQ_LENS,
-        "packed": True,
-        "use_initial_state": True,
-        "store_final_state": True,
-        "seed": 10001,
-    },
-    {
-        "label": "h96_uniform",
-        "num_heads": 96,
-        "seq_lens": (1024,) * 8,
-        "packed": True,
-        "use_initial_state": True,
-        "store_final_state": True,
-        "seed": 10002,
-    },
-    {
-        "label": "h64_mixed",
-        "num_heads": 64,
-        "seq_lens": _MIXED_SEQ_LENS,
-        "packed": True,
-        "use_initial_state": True,
-        "store_final_state": True,
-        "seed": 10004,
-    },
-    {
-        "label": "h64_uniform",
-        "num_heads": 64,
-        "seq_lens": (1024,) * 8,
-        "packed": True,
-        "use_initial_state": True,
-        "store_final_state": True,
-        "seed": 10005,
-    },
-]
-
-KERNEL_META = {
-    "name": "flashkda_bf16_fused_m128",
-    "category": "flashinfer",
-    "compute_capability": 10,
-}
-
-
-def _cfg(**kwargs: Any) -> FlashKDABf16FusedM128Config:
-    cfg_fields = {field.name for field in fields(FlashKDABf16FusedM128Config)}
-    cfg_kwargs = {key: value for key, value in kwargs.items() if key in cfg_fields}
-    if "seq_lens" in cfg_kwargs:
-        cfg_kwargs["seq_lens"] = tuple(int(t) for t in cfg_kwargs["seq_lens"])
-    if "label" not in cfg_kwargs:
-        cfg_kwargs["label"] = "custom"
-    cfg = FlashKDABf16FusedM128Config(**cfg_kwargs)
-    cfg.validate()
-    return cfg
-
-
-def prepare_data(**kwargs: Any) -> dict[str, Any]:
-    cfg = _cfg(**kwargs)
-    device = kwargs.get("device", "cuda")
-    gen = torch.Generator(device=device)
-    gen.manual_seed(cfg.seed)
-
-    total_tokens = cfg.total_tokens
-    shape = (total_tokens, cfg.num_heads, D_HEAD)
-    q = torch.randn(shape, device=device, dtype=torch.float32, generator=gen).to(torch.bfloat16)
-    k = torch.randn(shape, device=device, dtype=torch.float32, generator=gen).to(torch.bfloat16)
-    v = torch.randn(shape, device=device, dtype=torch.float32, generator=gen).to(torch.bfloat16)
-    g = torch.randn(shape, device=device, dtype=torch.float32, generator=gen).to(torch.bfloat16)
-    beta = torch.randn(
-        (total_tokens, cfg.num_heads), device=device, dtype=torch.float32, generator=gen
-    ).to(torch.bfloat16)
-    A_log = 0.1 * torch.randn((cfg.num_heads,), device=device, dtype=torch.float32, generator=gen)
-    dt_bias = 0.1 * torch.randn(
-        (cfg.num_heads, D_HEAD), device=device, dtype=torch.float32, generator=gen
-    )
-
-    # Host-side beta TMA padding (flashinfer/kda_prefill.py::_beta_tma_source):
-    # [max(tokens, 32), max(H, 8)], zero-filled padding.
-    beta_tma = torch.zeros(
-        (cfg.beta_tma_tokens, cfg.beta_tma_heads), device=device, dtype=torch.bfloat16
-    )
-    beta_tma[:total_tokens, : cfg.num_heads] = beta
-
-    offsets = [0]
-    for seq_len in cfg.seq_lens:
-        offsets.append(offsets[-1] + seq_len)
-    cu_seqlens = torch.tensor(offsets, dtype=torch.int64, device=device)
-    # Packed bench mirrors the PR benchmark: order sequences by descending length
-    # for better tail utilization; correctness configs keep the identity order.
-    if cfg.packed and cfg.total_tokens > 512:
-        order = sorted(range(cfg.num_seqs), key=lambda i: -cfg.seq_lens[i])
-    else:
-        order = list(range(cfg.num_seqs))
-    seq_order = torch.tensor(order, dtype=torch.int32, device=device)
-
-    state_shape = (cfg.num_seqs, cfg.num_heads, D_HEAD, D_HEAD)
-    if cfg.use_initial_state:
-        initial_state = (
-            0.1 * torch.randn(state_shape, device=device, dtype=torch.float32, generator=gen)
-        ).to(torch.bfloat16)
-    else:
-        initial_state = torch.empty(state_shape, device=device, dtype=torch.bfloat16)
-    final_state = torch.empty(state_shape, device=device, dtype=torch.bfloat16)
-    final_state_tx_tile = torch.empty_like(final_state)
-    out = torch.empty(shape, device=device, dtype=torch.bfloat16)
-    out_tx_tile = torch.empty_like(out)
-    # Six CUtensorMap descriptors, 128 B each, 64 B aligned (torch storages are
-    # 512 B aligned); the reference kernel publishes descriptors here.
-    descriptor_storage = torch.empty((768,), device=device, dtype=torch.uint8)
-    descriptor_storage_tx_tile = torch.empty_like(descriptor_storage)
-
-    case = {
-        "config": cfg,
-        "q": q,
-        "k": k,
-        "v": v,
-        "g": g,
-        "beta": beta,
-        "beta_tma": beta_tma,
-        "A_log": A_log,
-        "dt_bias": dt_bias,
-        "cu_seqlens": cu_seqlens,
-        "seq_order": seq_order,
-        "initial_state": initial_state,
-        "out": out,
-        "out_tx_tile": out_tx_tile,
-        "final_state": final_state,
-        "final_state_tx_tile": final_state_tx_tile,
-        "descriptor_storage": descriptor_storage,
-        "descriptor_storage_tx_tile": descriptor_storage_tx_tile,
-        "scale": 1.0 / math.sqrt(D_HEAD),
-        "dispatch_reason": _m128_dispatch_reason(cfg),
-    }
-    if device != "cpu" and torch.device(device).type != "cpu":
-        _encode_tma_descriptors(case)
-        _encode_tma_descriptors(
-            case, output_key="out_tx_tile", descriptor_storage_key="descriptor_storage_tx_tile"
-        )
-    return case
-
-
-def _reference_torch(case: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
-    """Token-serial reference, mirrors tests/kda/test_recurrent_kda_prefill.py::_reference.
-
-    O(total_tokens) python loop; intended for the small correctness configs.
-    """
-    import torch.nn.functional as F
-
-    cfg: FlashKDABf16FusedM128Config = case["config"]
-    scale = case["scale"]
-    q_flat = F.normalize(case["q"].float(), dim=-1)
-    k_flat = F.normalize(case["k"].float(), dim=-1)
-    v_flat = case["v"].float()
-    g_flat = case["g"].float()
-    beta_flat = torch.sigmoid(case["beta"].float())
-    gate = cfg.lower_bound * torch.sigmoid(
-        torch.exp(case["A_log"]).reshape(1, cfg.num_heads, 1)
-        * (g_flat + case["dt_bias"].reshape(1, cfg.num_heads, D_HEAD))
-    )
-    decay = torch.exp(gate)
-    if cfg.use_initial_state:
-        state = case["initial_state"].clone()
-    else:
-        state = torch.zeros(
-            (cfg.num_seqs, cfg.num_heads, D_HEAD, D_HEAD),
-            dtype=torch.bfloat16,
-            device=case["q"].device,
-        )
-    out = torch.empty_like(q_flat)
-    offsets = [0, *torch.cumsum(torch.tensor(cfg.seq_lens), dim=0).tolist()]
-    for sequence in range(cfg.num_seqs):
-        for token in range(offsets[sequence], offsets[sequence + 1]):
-            state_f32 = state[sequence].float()
-            decayed = state_f32 * decay[token].unsqueeze(1)
-            predicted = torch.einsum("hk,hvk->hv", k_flat[token], decayed)
-            residual = beta_flat[token].unsqueeze(-1) * (v_flat[token] - predicted)
-            updated = decayed + residual.unsqueeze(-1) * k_flat[token].unsqueeze(1)
-            state[sequence] = updated.to(torch.bfloat16)
-            projected = torch.einsum("hk,hvk->hv", q_flat[token], state[sequence].float())
-            out[token] = (scale * projected).to(torch.bfloat16)
-    return out.to(torch.bfloat16), state
-
-
-def _load_flashinfer_recurrent_kda():
-    """Import flashinfer.recurrent_kda from the PR head worktree.
-
-    The flashinfer-ai/flashinfer#4262 head worktree is located via the
-    FLASHKDA_PR_WORKTREE environment variable.
-    Handles the case where an installed flashinfer (main, without kda.py) was
-    already imported by purging it and re-importing from the worktree.
-    """
-    worktree = os.environ.get("FLASHKDA_PR_WORKTREE")
-    if worktree is None:
-        try:
-            from flashinfer.kda import recurrent_kda
-
-            return recurrent_kda
-        except ImportError as e:
-            raise RuntimeError(
-                "flashinfer.kda is unavailable; set FLASHKDA_PR_WORKTREE to the "
-                "flashinfer-ai/flashinfer#4262 head worktree containing the m128 kernel"
-            ) from e
-    if worktree not in sys.path:
-        sys.path.insert(0, worktree)
-    import flashinfer
-
-    if not str(getattr(flashinfer, "__file__", "")).startswith(worktree):
-        for mod_name in [
-            m for m in list(sys.modules) if m == "flashinfer" or m.startswith("flashinfer.")
-        ]:
-            del sys.modules[mod_name]
-        import flashinfer
-
-        if not str(getattr(flashinfer, "__file__", "")).startswith(worktree):
-            raise RuntimeError(
-                f"failed to import flashinfer from PR worktree {worktree}; "
-                f"got {getattr(flashinfer, '__file__', None)}"
-            )
-    from flashinfer.kda import recurrent_kda
-
-    return recurrent_kda
-
-
-def _flashinfer_cuda_reference(case: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Run the m128 CUDA reference via flashinfer.recurrent_kda on the same inputs."""
-    cfg: FlashKDABf16FusedM128Config = case["config"]
-    recurrent_kda = _load_flashinfer_recurrent_kda()
-    batch = 1 if cfg.packed else cfg.num_seqs
-    seq_len = cfg.total_tokens if cfg.packed else cfg.seq_lens[0]
-
-    def reshaped(t: torch.Tensor) -> torch.Tensor:
-        return t.reshape(batch, seq_len, cfg.num_heads, -1)
-
-    ref_out, ref_state = recurrent_kda(
-        q=reshaped(case["q"]),
-        k=reshaped(case["k"]),
-        v=reshaped(case["v"]),
-        g=reshaped(case["g"]),
-        beta=case["beta"].reshape(batch, seq_len, cfg.num_heads),
-        A_log=case["A_log"],
-        dt_bias=case["dt_bias"],
-        scale=case["scale"],
-        initial_state=case["initial_state"] if cfg.use_initial_state else None,
-        output_final_state=cfg.store_final_state,
-        use_qk_l2norm_in_kernel=True,
-        use_gate_in_kernel=True,
-        lower_bound=cfg.lower_bound,
-        cu_seqlens=case["cu_seqlens"] if cfg.packed else None,
-        beta_is_logit=True,
-        seq_order=case["seq_order"] if cfg.packed else None,
-    )
-    return ref_out.reshape(cfg.total_tokens, cfg.num_heads, D_HEAD), ref_state
-
-
-def _tirx_args(case: dict[str, Any], *, use_tx_tile: bool = False) -> tuple[Any, ...]:
-    suffix = "_tx_tile" if use_tx_tile else ""
-    return (
-        case["q"].reshape(-1),
-        case["k"].reshape(-1),
-        case["v"].reshape(-1),
-        case["g"].reshape(-1),
-        case["beta"].reshape(-1),
-        case["beta_tma"],
-        case["A_log"],
-        case["dt_bias"].reshape(-1),
-        case["cu_seqlens"],
-        case["seq_order"],
-        case["initial_state"].reshape(-1),
-        case[f"out{suffix}"].reshape(-1),
-        case[f"final_state{suffix}"].reshape(-1),
-        case[f"descriptor_storage{suffix}"],
-    )
+from tvm.script import tirx as T
+from tvm.script.tirx import tile as Tx
+from tvm.tirx.layout import ComposeLayout, S, TileLayout, laneid
+
+# ldmatrix copy-atom layouts:
+# reg atom (8,4,2):(4@laneid,1@laneid,1@m), stacked to x4 in mma-A / mma-B
+# matrix order; smem is the (5,32,128) dual-panel SWIZZLE_128B stage.
+_R_ATOM = TileLayout(S[(8, 4, 2) : (4 @ laneid, 1 @ laneid, 1)])
+_R_X4_A = _R_ATOM.tile(TileLayout(S[(2, 2) : (1, 2)]), (2, 2), (8, 8))
+_R_X4_B = _R_ATOM.tile(TileLayout(S[(2, 2) : (2, 1)]), (2, 2), (8, 8))
+_R_X2 = _R_ATOM.tile(TileLayout(S[(2, 1) : (1, 1)]), (2, 1), (8, 8))
+_D_LAY = ComposeLayout(3, 3, 3, TileLayout(S[(5, 32, 2, 64) : (20992, 64, 2048, 1)]))
+# inv_work stage (32,64) SWIZZLE_128B (+ transposed twin), publish (32,4,16)
+# SWIZZLE_32B (+ twin), final_trans 3-panel SWIZZLE_128B trans, out stage
+# (2,2,64,32) trans.
+_INV_LAY = ComposeLayout(3, 3, 3, TileLayout(S[(5, 32, 64) : (20992, 64, 1)]))
+_INV_LAY_T = ComposeLayout(3, 3, 3, TileLayout(S[(5, 64, 32) : (20992, 1, 64)]))
+_F_LAY = ComposeLayout(3, 1, 3, TileLayout(S[(5, 32, 4, 16) : (20992, 16, 512, 1)]))
+_F_LAY_T = ComposeLayout(3, 1, 3, TileLayout(S[(5, 16, 4, 32) : (20992, 1, 512, 16)]))
+_C_LAY_T = ComposeLayout(3, 3, 3, TileLayout(S[(5, 3, 64, 32) : (20992, 2048, 1, 64)]))
+_A_LAY_T = ComposeLayout(3, 3, 3, TileLayout(S[(2, 2, 64, 32) : (4096, 2048, 1, 64)]))
 
 
 @T.jit
-def _kernel(
+def _kernel_tx_tile(
     q: T.Buffer((total_tokens * h * D_HEAD,), "bfloat16"),
     k: T.Buffer((total_tokens * h * D_HEAD,), "bfloat16"),
     v: T.Buffer((total_tokens * h * D_HEAD,), "bfloat16"),
@@ -1129,6 +337,79 @@ def _kernel(
     smem_gate_addr: T.int32 = T.cast(smem, "int32") + SMEM_SMEM_GATE_OFF
     smem_beta_raw_addr: T.int32 = T.cast(smem, "int32") + SMEM_SMEM_BETA_RAW_OFF
     smem_inv_work_addr: T.int32 = T.cast(smem, "int32") + SMEM_SMEM_INV_WORK_OFF
+
+    smem_qd_st = T.decl_buffer(
+        (5, 32, 128),
+        "bfloat16",
+        data=smem_raw.data,
+        byte_offset=SMEM_SMEM_QD_OFF,
+        scope="shared",
+        layout=_D_LAY,
+    )
+    smem_kd_st = T.decl_buffer(
+        (5, 32, 128),
+        "bfloat16",
+        data=smem_raw.data,
+        byte_offset=SMEM_SMEM_KD_OFF,
+        scope="shared",
+        layout=_D_LAY,
+    )
+    smem_ki_st = T.decl_buffer(
+        (5, 32, 128),
+        "bfloat16",
+        data=smem_raw.data,
+        byte_offset=SMEM_SMEM_KI_OFF,
+        scope="shared",
+        layout=_D_LAY,
+    )
+    smem_inv_w = T.decl_buffer(
+        (5, 32, 64),
+        "bfloat16",
+        data=smem_raw.data,
+        byte_offset=SMEM_SMEM_INV_WORK_OFF,
+        scope="shared",
+        layout=_INV_LAY,
+    )
+    smem_inv_wt = T.decl_buffer(
+        (5, 64, 32),
+        "bfloat16",
+        data=smem_raw.data,
+        byte_offset=SMEM_SMEM_INV_WORK_OFF,
+        scope="shared",
+        layout=_INV_LAY_T,
+    )
+    smem_inv_p = T.decl_buffer(
+        (5, 32, 4, 16),
+        "bfloat16",
+        data=smem_raw.data,
+        byte_offset=SMEM_SMEM_INV_OFF,
+        scope="shared",
+        layout=_F_LAY,
+    )
+    smem_inv_pt = T.decl_buffer(
+        (5, 16, 4, 32),
+        "bfloat16",
+        data=smem_raw.data,
+        byte_offset=SMEM_SMEM_INV_OFF,
+        scope="shared",
+        layout=_F_LAY_T,
+    )
+    smem_fin_tt = T.decl_buffer(
+        (5, 3, 64, 32),
+        "bfloat16",
+        data=smem_raw.data,
+        byte_offset=SMEM_SMEM_FINAL_TRANS_OFF,
+        scope="shared",
+        layout=_C_LAY_T,
+    )
+    smem_out_t = T.decl_buffer(
+        (2, 2, 64, 32),
+        "bfloat16",
+        data=smem_raw.data,
+        byte_offset=SMEM_SMEM_OUT_OFF,
+        scope="shared",
+        layout=_A_LAY_T,
+    )
     smem_out_addr: T.int32 = T.cast(smem, "int32") + SMEM_SMEM_OUT_OFF
     smem_restore_factor_all_addr: T.int32 = T.cast(smem, "int32") + SMEM_SMEM_RESTORE_FACTOR_ALL_OFF
     smem_gt_prefix_all_addr: T.int32 = T.cast(smem, "int32") + SMEM_SMEM_GT_PREFIX_ALL_OFF
@@ -1594,29 +875,29 @@ def _kernel(
                                 T.cuda.uint_as_float(_tmem_load_5[_lp * 2 + 1 + 0]),
                             )
                     for token_group in T.unroll(2):  # .cu:1031-1048
-                        mtx_idx: T.int32 = lane // 8  # .cu:1033
-                        row_addr: T.int32 = lane & 7  # .cu:1034
-                        dim_base: T.int32 = (
-                            epilogue_local_warp * 32 + dim_half * 16 + (mtx_idx & 1) * 8
-                        )  # .cu:1035
-                        token_base: T.int32 = token_group * 16 + mtx_idx // 2 * 8  # .cu:1036
-                        token_addr: T.int32 = token_base + row_addr  # .cu:1037
-                        token_pair: T.int32 = token_addr // 2  # .cu:1038
-                        token_parity: T.int32 = token_addr & 1  # .cu:1039
-                        raw_row: T.int32 = token_pair + dim_base // 64 * 16  # .cu:1040
-                        raw_col: T.int32 = (
-                            dim_base & 63 ^ (token_pair & 3) << 4 ^ token_parity << 3
-                        ) + token_parity * 64  # .cu:1041
-                        stsm_offset: T.int32 = (raw_row * 128 + raw_col) * 2  # .cu:1042
-                        pack_base: T.int32 = token_group * 4  # .cu:1043
+                        out_view = T.decl_buffer(
+                            (16, 16),
+                            "bfloat16",
+                            data=out_packed.data,
+                            byte_offset=token_group * 16,
+                            scope="local",
+                            layout=_R_X4_A,
+                        )
                         # .cu:1044-1047 stmatrix.x4.trans
-                        T.ptx.stmatrix.sync.aligned.m8n8.x4.trans.shared.b16(
-                            smem_raw.ptr_to([T.cast(out_stage_addr, "uint32") - smem + T.cast(stsm_offset, "uint32")]),
-                            out_packed[pack_base],
-                            out_packed[pack_base + 1],
-                            out_packed[pack_base + 2],
-                            out_packed[pack_base + 3],
-                        )  # fmt: skip
+                        Tx.warp.copy(
+                            smem_out_t[
+                                output_stage,
+                                (epilogue_local_warp * 32 + dim_half * 16) // 64,
+                                (epilogue_local_warp * 32 + dim_half * 16) % 64 : (
+                                    epilogue_local_warp * 32 + dim_half * 16
+                                )
+                                % 64
+                                + 16,
+                                token_group * 16 : token_group * 16 + 16,
+                            ],
+                            out_view[0:16, 0:16],
+                            dispatch="ldstmatrix",
+                        )
                 _fence_async_shared()  # .cu:1050
                 T.ptx.bar.sync(T.uint32(9), T.uint32(128))  # .cu:1051
                 if epilogue_local_warp == 0:  # .cu:1052-1057
@@ -2325,141 +1606,115 @@ def _kernel(
             a_frag = T.alloc_local((4,), "uint32", align=4)  # .cu:1710
             b_frag = T.alloc_local((4,), "uint32", align=4)  # .cu:1711
             acc = T.alloc_local((8,), "float32", align=4)  # .cu:1712
+            a_view = T.decl_buffer(
+                (16, 16), "bfloat16", data=a_frag.data, scope="local", layout=_R_X4_A
+            )
+            b_view = T.decl_buffer(
+                (16, 16), "bfloat16", data=b_frag.data, scope="local", layout=_R_X4_B
+            )
             if pair_row_base >= pair_col_base:  # .cu:1713-1990
                 # .cu:1714-1727 chain step 0 (kd a, ki b, 2x zero-C mma)
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    a_frag[0],
-                    a_frag[1],
-                    a_frag[2],
-                    a_frag[3],
-                    smem_raw.ptr_to([(smem_kd_addr + T.cast(prep_stage, "int32") * 41984 + (lane // 16 // 8 * 256 + (pair_row_base + lane % 16) * 8 + (lane // 16 % 8 * 16 ^ ((pair_row_base + lane % 16 & 7) << 4)) // 16) * 16) - T.cast(smem, "int32")]),
-                )  # fmt: skip
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    b_frag[0],
-                    b_frag[1],
-                    b_frag[2],
-                    b_frag[3],
-                    smem_raw.ptr_to([(smem_ki_addr + T.cast(prep_stage, "int32") * 41984 + (lane % 16 // 8 // 8 * 256 + (pair_col_base + 8 * (lane // 16) + lane % 8) * 8 + (lane % 16 // 8 % 8 * 16 ^ ((pair_col_base + 8 * (lane // 16) + lane % 8 & 7) << 4)) // 16) * 16) - T.cast(smem, "int32")]),
-                )  # fmt: skip
+                Tx.warp.copy(
+                    a_view[0:16, 0:16],
+                    smem_kd_st[prep_stage, pair_row_base : pair_row_base + 16, 0 : 0 + 16],
+                    dispatch="ldstmatrix",
+                )
+                Tx.warp.copy(
+                    b_view[0:16, 0:16],
+                    smem_ki_st[prep_stage, pair_col_base : pair_col_base + 16, 0 : 0 + 16],
+                    dispatch="ldstmatrix",
+                )
                 _mma_m16n8k16_bf16_zero(acc, a_frag, b_frag)
                 _mma_m16n8k16_bf16_zero_off4(acc, a_frag, b_frag)
                 # .cu:1728-1741 chain step 1
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    a_frag[0],
-                    a_frag[1],
-                    a_frag[2],
-                    a_frag[3],
-                    smem_raw.ptr_to([(smem_kd_addr + T.cast(prep_stage, "int32") * 41984 + ((lane // 16 // 8 * 256 + (pair_row_base + lane % 16) * 8 + (lane // 16 % 8 * 16 ^ ((pair_row_base + lane % 16 & 7) << 4)) // 16) ^ 2) * 16) - T.cast(smem, "int32")]),
-                )  # fmt: skip
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    b_frag[0],
-                    b_frag[1],
-                    b_frag[2],
-                    b_frag[3],
-                    smem_raw.ptr_to([(smem_ki_addr + T.cast(prep_stage, "int32") * 41984 + (((lane % 16 // 8 // 8 * 256 + (pair_col_base + 8 * (lane // 16) + lane % 8) * 8 + (lane % 16 // 8 % 8 * 16 ^ ((pair_col_base + 8 * (lane // 16) + lane % 8 & 7) << 4)) // 16) + 256 ^ 2) - 256) * 16) - T.cast(smem, "int32")]),
-                )  # fmt: skip
+                Tx.warp.copy(
+                    a_view[0:16, 0:16],
+                    smem_kd_st[prep_stage, pair_row_base : pair_row_base + 16, 16 : 16 + 16],
+                    dispatch="ldstmatrix",
+                )
+                Tx.warp.copy(
+                    b_view[0:16, 0:16],
+                    smem_ki_st[prep_stage, pair_col_base : pair_col_base + 16, 16 : 16 + 16],
+                    dispatch="ldstmatrix",
+                )
                 _mma_m16n8k16_bf16_acc(acc, a_frag, b_frag)
                 _mma_m16n8k16_bf16_acc_off4(acc, a_frag, b_frag)
                 # .cu:1742-1755 chain step 2
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    a_frag[0],
-                    a_frag[1],
-                    a_frag[2],
-                    a_frag[3],
-                    smem_raw.ptr_to([(smem_kd_addr + T.cast(prep_stage, "int32") * 41984 + ((lane // 16 // 8 * 256 + (pair_row_base + lane % 16) * 8 + (lane // 16 % 8 * 16 ^ ((pair_row_base + lane % 16 & 7) << 4)) // 16) ^ 2 ^ 6) * 16) - T.cast(smem, "int32")]),
-                )  # fmt: skip
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    b_frag[0],
-                    b_frag[1],
-                    b_frag[2],
-                    b_frag[3],
-                    smem_raw.ptr_to([(smem_ki_addr + T.cast(prep_stage, "int32") * 41984 + ((((lane % 16 // 8 // 8 * 256 + (pair_col_base + 8 * (lane // 16) + lane % 8) * 8 + (lane % 16 // 8 % 8 * 16 ^ ((pair_col_base + 8 * (lane // 16) + lane % 8 & 7) << 4)) // 16) + 256 ^ 2) - 256 + 256 ^ 6) - 256) * 16) - T.cast(smem, "int32")]),
-                )  # fmt: skip
+                Tx.warp.copy(
+                    a_view[0:16, 0:16],
+                    smem_kd_st[prep_stage, pair_row_base : pair_row_base + 16, 32 : 32 + 16],
+                    dispatch="ldstmatrix",
+                )
+                Tx.warp.copy(
+                    b_view[0:16, 0:16],
+                    smem_ki_st[prep_stage, pair_col_base : pair_col_base + 16, 32 : 32 + 16],
+                    dispatch="ldstmatrix",
+                )
                 _mma_m16n8k16_bf16_acc(acc, a_frag, b_frag)
                 _mma_m16n8k16_bf16_acc_off4(acc, a_frag, b_frag)
                 # .cu:1756-1769 chain step 3
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    a_frag[0],
-                    a_frag[1],
-                    a_frag[2],
-                    a_frag[3],
-                    smem_raw.ptr_to([(smem_kd_addr + T.cast(prep_stage, "int32") * 41984 + ((lane // 16 // 8 * 256 + (pair_row_base + lane % 16) * 8 + (lane // 16 % 8 * 16 ^ ((pair_row_base + lane % 16 & 7) << 4)) // 16) ^ 2 ^ 6 ^ 2) * 16) - T.cast(smem, "int32")]),
-                )  # fmt: skip
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    b_frag[0],
-                    b_frag[1],
-                    b_frag[2],
-                    b_frag[3],
-                    smem_raw.ptr_to([(smem_ki_addr + T.cast(prep_stage, "int32") * 41984 + (((((lane % 16 // 8 // 8 * 256 + (pair_col_base + 8 * (lane // 16) + lane % 8) * 8 + (lane % 16 // 8 % 8 * 16 ^ ((pair_col_base + 8 * (lane // 16) + lane % 8 & 7) << 4)) // 16) + 256 ^ 2) - 256 + 256 ^ 6) - 256 + 256 ^ 2) - 256) * 16) - T.cast(smem, "int32")]),
-                )  # fmt: skip
+                Tx.warp.copy(
+                    a_view[0:16, 0:16],
+                    smem_kd_st[prep_stage, pair_row_base : pair_row_base + 16, 48 : 48 + 16],
+                    dispatch="ldstmatrix",
+                )
+                Tx.warp.copy(
+                    b_view[0:16, 0:16],
+                    smem_ki_st[prep_stage, pair_col_base : pair_col_base + 16, 48 : 48 + 16],
+                    dispatch="ldstmatrix",
+                )
                 _mma_m16n8k16_bf16_acc(acc, a_frag, b_frag)
                 _mma_m16n8k16_bf16_acc_off4(acc, a_frag, b_frag)
                 # .cu:1770-1783 chain step 4
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    a_frag[0],
-                    a_frag[1],
-                    a_frag[2],
-                    a_frag[3],
-                    smem_raw.ptr_to([(smem_kd_addr + T.cast(prep_stage, "int32") * 41984 + (((lane // 16 // 8 * 256 + (pair_row_base + lane % 16) * 8 + (lane // 16 % 8 * 16 ^ ((pair_row_base + lane % 16 & 7) << 4)) // 16) ^ 2 ^ 6 ^ 2 ^ 6) + 256) * 16) - T.cast(smem, "int32")]),
-                )  # fmt: skip
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    b_frag[0],
-                    b_frag[1],
-                    b_frag[2],
-                    b_frag[3],
-                    smem_raw.ptr_to([(smem_ki_addr + T.cast(prep_stage, "int32") * 41984 + ((((((lane % 16 // 8 // 8 * 256 + (pair_col_base + 8 * (lane // 16) + lane % 8) * 8 + (lane % 16 // 8 % 8 * 16 ^ ((pair_col_base + 8 * (lane // 16) + lane % 8 & 7) << 4)) // 16) + 256 ^ 2) - 256 + 256 ^ 6) - 256 + 256 ^ 2) - 256 + 256 ^ 6) + 256 - 256) * 16) - T.cast(smem, "int32")]),
-                )  # fmt: skip
+                Tx.warp.copy(
+                    a_view[0:16, 0:16],
+                    smem_kd_st[prep_stage, pair_row_base : pair_row_base + 16, 64 : 64 + 16],
+                    dispatch="ldstmatrix",
+                )
+                Tx.warp.copy(
+                    b_view[0:16, 0:16],
+                    smem_ki_st[prep_stage, pair_col_base : pair_col_base + 16, 64 : 64 + 16],
+                    dispatch="ldstmatrix",
+                )
                 _mma_m16n8k16_bf16_acc(acc, a_frag, b_frag)
                 _mma_m16n8k16_bf16_acc_off4(acc, a_frag, b_frag)
                 # .cu:1784-1797 chain step 5
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    a_frag[0],
-                    a_frag[1],
-                    a_frag[2],
-                    a_frag[3],
-                    smem_raw.ptr_to([(smem_kd_addr + T.cast(prep_stage, "int32") * 41984 + ((((lane // 16 // 8 * 256 + (pair_row_base + lane % 16) * 8 + (lane // 16 % 8 * 16 ^ ((pair_row_base + lane % 16 & 7) << 4)) // 16) ^ 2 ^ 6 ^ 2 ^ 6) + 256) ^ 2) * 16) - T.cast(smem, "int32")]),
-                )  # fmt: skip
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    b_frag[0],
-                    b_frag[1],
-                    b_frag[2],
-                    b_frag[3],
-                    smem_raw.ptr_to([(smem_ki_addr + T.cast(prep_stage, "int32") * 41984 + (((((((lane % 16 // 8 // 8 * 256 + (pair_col_base + 8 * (lane // 16) + lane % 8) * 8 + (lane % 16 // 8 % 8 * 16 ^ ((pair_col_base + 8 * (lane // 16) + lane % 8 & 7) << 4)) // 16) + 256 ^ 2) - 256 + 256 ^ 6) - 256 + 256 ^ 2) - 256 + 256 ^ 6) + 256 - 256 + 256 ^ 2) - 256) * 16) - T.cast(smem, "int32")]),
-                )  # fmt: skip
+                Tx.warp.copy(
+                    a_view[0:16, 0:16],
+                    smem_kd_st[prep_stage, pair_row_base : pair_row_base + 16, 80 : 80 + 16],
+                    dispatch="ldstmatrix",
+                )
+                Tx.warp.copy(
+                    b_view[0:16, 0:16],
+                    smem_ki_st[prep_stage, pair_col_base : pair_col_base + 16, 80 : 80 + 16],
+                    dispatch="ldstmatrix",
+                )
                 _mma_m16n8k16_bf16_acc(acc, a_frag, b_frag)
                 _mma_m16n8k16_bf16_acc_off4(acc, a_frag, b_frag)
                 # .cu:1798-1811 chain step 6
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    a_frag[0],
-                    a_frag[1],
-                    a_frag[2],
-                    a_frag[3],
-                    smem_raw.ptr_to([(smem_kd_addr + T.cast(prep_stage, "int32") * 41984 + ((((lane // 16 // 8 * 256 + (pair_row_base + lane % 16) * 8 + (lane // 16 % 8 * 16 ^ ((pair_row_base + lane % 16 & 7) << 4)) // 16) ^ 2 ^ 6 ^ 2 ^ 6) + 256) ^ 2 ^ 6) * 16) - T.cast(smem, "int32")]),
-                )  # fmt: skip
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    b_frag[0],
-                    b_frag[1],
-                    b_frag[2],
-                    b_frag[3],
-                    smem_raw.ptr_to([(smem_ki_addr + T.cast(prep_stage, "int32") * 41984 + ((((((((lane % 16 // 8 // 8 * 256 + (pair_col_base + 8 * (lane // 16) + lane % 8) * 8 + (lane % 16 // 8 % 8 * 16 ^ ((pair_col_base + 8 * (lane // 16) + lane % 8 & 7) << 4)) // 16) + 256 ^ 2) - 256 + 256 ^ 6) - 256 + 256 ^ 2) - 256 + 256 ^ 6) + 256 - 256 + 256 ^ 2) - 256 + 256 ^ 6) - 256) * 16) - T.cast(smem, "int32")]),
-                )  # fmt: skip
+                Tx.warp.copy(
+                    a_view[0:16, 0:16],
+                    smem_kd_st[prep_stage, pair_row_base : pair_row_base + 16, 96 : 96 + 16],
+                    dispatch="ldstmatrix",
+                )
+                Tx.warp.copy(
+                    b_view[0:16, 0:16],
+                    smem_ki_st[prep_stage, pair_col_base : pair_col_base + 16, 96 : 96 + 16],
+                    dispatch="ldstmatrix",
+                )
                 _mma_m16n8k16_bf16_acc(acc, a_frag, b_frag)
                 _mma_m16n8k16_bf16_acc_off4(acc, a_frag, b_frag)
                 # .cu:1812-1825 chain step 7
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    a_frag[0],
-                    a_frag[1],
-                    a_frag[2],
-                    a_frag[3],
-                    smem_raw.ptr_to([(smem_kd_addr + T.cast(prep_stage, "int32") * 41984 + ((((lane // 16 // 8 * 256 + (pair_row_base + lane % 16) * 8 + (lane // 16 % 8 * 16 ^ ((pair_row_base + lane % 16 & 7) << 4)) // 16) ^ 2 ^ 6 ^ 2 ^ 6) + 256) ^ 2 ^ 6 ^ 2) * 16) - T.cast(smem, "int32")]),
-                )  # fmt: skip
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    b_frag[0],
-                    b_frag[1],
-                    b_frag[2],
-                    b_frag[3],
-                    smem_raw.ptr_to([(smem_ki_addr + T.cast(prep_stage, "int32") * 41984 + (((((((((lane % 16 // 8 // 8 * 256 + (pair_col_base + 8 * (lane // 16) + lane % 8) * 8 + (lane % 16 // 8 % 8 * 16 ^ ((pair_col_base + 8 * (lane // 16) + lane % 8 & 7) << 4)) // 16) + 256 ^ 2) - 256 + 256 ^ 6) - 256 + 256 ^ 2) - 256 + 256 ^ 6) + 256 - 256 + 256 ^ 2) - 256 + 256 ^ 6) - 256 + 256 ^ 2) - 256) * 16) - T.cast(smem, "int32")]),
-                )  # fmt: skip
+                Tx.warp.copy(
+                    a_view[0:16, 0:16],
+                    smem_kd_st[prep_stage, pair_row_base : pair_row_base + 16, 112 : 112 + 16],
+                    dispatch="ldstmatrix",
+                )
+                Tx.warp.copy(
+                    b_view[0:16, 0:16],
+                    smem_ki_st[prep_stage, pair_col_base : pair_col_base + 16, 112 : 112 + 16],
+                    dispatch="ldstmatrix",
+                )
                 _mma_m16n8k16_bf16_acc(acc, a_frag, b_frag)
                 _mma_m16n8k16_bf16_acc_off4(acc, a_frag, b_frag)
                 row0: T.int32 = pair_row_base + lane // 4  # .cu:1826
@@ -2487,154 +1742,118 @@ def _kernel(
                 if row1 > col0 + 9:  # .cu:1861-1863
                     seed[7] = acc[7] * beta1
                 seed_packed = T.alloc_local((4,), "uint32", align=4)  # .cu:1864
+                seed_view = T.decl_buffer(
+                    (16, 16), "bfloat16", data=seed_packed.data, scope="local", layout=_R_X4_A
+                )
                 for _lp in T.unroll(4):  # .cu:1865-1869
                     seed_packed[_lp] = T.cuda.float22bfloat162_rn(
                         seed[_lp * 2 + 0], seed[_lp * 2 + 1 + 0]
                     )
-                seed_lane_row: T.int32 = lane % 16  # .cu:1870
-                seed_lane_col: T.int32 = lane // 16 * 8  # .cu:1871
-                byte_off: T.int32 = (pair_row_base + seed_lane_row) * 128 + (
-                    pair_col_base + seed_lane_col
-                ) * 2  # .cu:1872
-                swizzled_off: T.int32 = byte_off ^ ((byte_off >> 7 & 7) << 4)  # .cu:1873
-                seed_addr: T.int32 = (
-                    smem_inv_work_addr + T.cast(prep_stage, "int32") * 41984 + swizzled_off
-                )  # .cu:1874
                 # .cu:1875-1878 stmatrix.x4 (seed into inv_work)
-                T.ptx.stmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    smem_raw.ptr_to([(seed_addr) - T.cast(smem, "int32")]),
-                    seed_packed[0],
-                    seed_packed[1],
-                    seed_packed[2],
-                    seed_packed[3],
+                Tx.warp.copy(
+                    smem_inv_w[
+                        prep_stage,
+                        pair_row_base : pair_row_base + 16,
+                        pair_col_base : pair_col_base + 16,
+                    ],
+                    seed_view[0:16, 0:16],
+                    dispatch="ldstmatrix",
                 )
                 # .cu:1879-1990 second chain (qd a-side, ki b-side), same address pattern
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    a_frag[0],
-                    a_frag[1],
-                    a_frag[2],
-                    a_frag[3],
-                    smem_raw.ptr_to([(smem_qd_addr + T.cast(prep_stage, "int32") * 41984 + (lane // 16 // 8 * 256 + (pair_row_base + lane % 16) * 8 + (lane // 16 % 8 * 16 ^ ((pair_row_base + lane % 16 & 7) << 4)) // 16) * 16) - T.cast(smem, "int32")]),
-                )  # fmt: skip
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    b_frag[0],
-                    b_frag[1],
-                    b_frag[2],
-                    b_frag[3],
-                    smem_raw.ptr_to([(smem_ki_addr + T.cast(prep_stage, "int32") * 41984 + (lane % 16 // 8 // 8 * 256 + (pair_col_base + 8 * (lane // 16) + lane % 8) * 8 + (lane % 16 // 8 % 8 * 16 ^ ((pair_col_base + 8 * (lane // 16) + lane % 8 & 7) << 4)) // 16) * 16) - T.cast(smem, "int32")]),
-                )  # fmt: skip
+                Tx.warp.copy(
+                    a_view[0:16, 0:16],
+                    smem_qd_st[prep_stage, pair_row_base : pair_row_base + 16, 0 : 0 + 16],
+                    dispatch="ldstmatrix",
+                )
+                Tx.warp.copy(
+                    b_view[0:16, 0:16],
+                    smem_ki_st[prep_stage, pair_col_base : pair_col_base + 16, 0 : 0 + 16],
+                    dispatch="ldstmatrix",
+                )
                 _mma_m16n8k16_bf16_zero(acc, a_frag, b_frag)
                 _mma_m16n8k16_bf16_zero_off4(acc, a_frag, b_frag)
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    a_frag[0],
-                    a_frag[1],
-                    a_frag[2],
-                    a_frag[3],
-                    smem_raw.ptr_to([(smem_qd_addr + T.cast(prep_stage, "int32") * 41984 + ((lane // 16 // 8 * 256 + (pair_row_base + lane % 16) * 8 + (lane // 16 % 8 * 16 ^ ((pair_row_base + lane % 16 & 7) << 4)) // 16) ^ 2) * 16) - T.cast(smem, "int32")]),
-                )  # fmt: skip
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    b_frag[0],
-                    b_frag[1],
-                    b_frag[2],
-                    b_frag[3],
-                    smem_raw.ptr_to([(smem_ki_addr + T.cast(prep_stage, "int32") * 41984 + (((lane % 16 // 8 // 8 * 256 + (pair_col_base + 8 * (lane // 16) + lane % 8) * 8 + (lane % 16 // 8 % 8 * 16 ^ ((pair_col_base + 8 * (lane // 16) + lane % 8 & 7) << 4)) // 16) + 256 ^ 2) - 256) * 16) - T.cast(smem, "int32")]),
-                )  # fmt: skip
+                Tx.warp.copy(
+                    a_view[0:16, 0:16],
+                    smem_qd_st[prep_stage, pair_row_base : pair_row_base + 16, 16 : 16 + 16],
+                    dispatch="ldstmatrix",
+                )
+                Tx.warp.copy(
+                    b_view[0:16, 0:16],
+                    smem_ki_st[prep_stage, pair_col_base : pair_col_base + 16, 16 : 16 + 16],
+                    dispatch="ldstmatrix",
+                )
                 _mma_m16n8k16_bf16_acc(acc, a_frag, b_frag)
                 _mma_m16n8k16_bf16_acc_off4(acc, a_frag, b_frag)
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    a_frag[0],
-                    a_frag[1],
-                    a_frag[2],
-                    a_frag[3],
-                    smem_raw.ptr_to([(smem_qd_addr + T.cast(prep_stage, "int32") * 41984 + ((lane // 16 // 8 * 256 + (pair_row_base + lane % 16) * 8 + (lane // 16 % 8 * 16 ^ ((pair_row_base + lane % 16 & 7) << 4)) // 16) ^ 2 ^ 6) * 16) - T.cast(smem, "int32")]),
-                )  # fmt: skip
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    b_frag[0],
-                    b_frag[1],
-                    b_frag[2],
-                    b_frag[3],
-                    smem_raw.ptr_to([(smem_ki_addr + T.cast(prep_stage, "int32") * 41984 + ((((lane % 16 // 8 // 8 * 256 + (pair_col_base + 8 * (lane // 16) + lane % 8) * 8 + (lane % 16 // 8 % 8 * 16 ^ ((pair_col_base + 8 * (lane // 16) + lane % 8 & 7) << 4)) // 16) + 256 ^ 2) - 256 + 256 ^ 6) - 256) * 16) - T.cast(smem, "int32")]),
-                )  # fmt: skip
+                Tx.warp.copy(
+                    a_view[0:16, 0:16],
+                    smem_qd_st[prep_stage, pair_row_base : pair_row_base + 16, 32 : 32 + 16],
+                    dispatch="ldstmatrix",
+                )
+                Tx.warp.copy(
+                    b_view[0:16, 0:16],
+                    smem_ki_st[prep_stage, pair_col_base : pair_col_base + 16, 32 : 32 + 16],
+                    dispatch="ldstmatrix",
+                )
                 _mma_m16n8k16_bf16_acc(acc, a_frag, b_frag)
                 _mma_m16n8k16_bf16_acc_off4(acc, a_frag, b_frag)
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    a_frag[0],
-                    a_frag[1],
-                    a_frag[2],
-                    a_frag[3],
-                    smem_raw.ptr_to([(smem_qd_addr + T.cast(prep_stage, "int32") * 41984 + ((lane // 16 // 8 * 256 + (pair_row_base + lane % 16) * 8 + (lane // 16 % 8 * 16 ^ ((pair_row_base + lane % 16 & 7) << 4)) // 16) ^ 2 ^ 6 ^ 2) * 16) - T.cast(smem, "int32")]),
-                )  # fmt: skip
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    b_frag[0],
-                    b_frag[1],
-                    b_frag[2],
-                    b_frag[3],
-                    smem_raw.ptr_to([(smem_ki_addr + T.cast(prep_stage, "int32") * 41984 + (((((lane % 16 // 8 // 8 * 256 + (pair_col_base + 8 * (lane // 16) + lane % 8) * 8 + (lane % 16 // 8 % 8 * 16 ^ ((pair_col_base + 8 * (lane // 16) + lane % 8 & 7) << 4)) // 16) + 256 ^ 2) - 256 + 256 ^ 6) - 256 + 256 ^ 2) - 256) * 16) - T.cast(smem, "int32")]),
-                )  # fmt: skip
+                Tx.warp.copy(
+                    a_view[0:16, 0:16],
+                    smem_qd_st[prep_stage, pair_row_base : pair_row_base + 16, 48 : 48 + 16],
+                    dispatch="ldstmatrix",
+                )
+                Tx.warp.copy(
+                    b_view[0:16, 0:16],
+                    smem_ki_st[prep_stage, pair_col_base : pair_col_base + 16, 48 : 48 + 16],
+                    dispatch="ldstmatrix",
+                )
                 _mma_m16n8k16_bf16_acc(acc, a_frag, b_frag)
                 _mma_m16n8k16_bf16_acc_off4(acc, a_frag, b_frag)
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    a_frag[0],
-                    a_frag[1],
-                    a_frag[2],
-                    a_frag[3],
-                    smem_raw.ptr_to([(smem_qd_addr + T.cast(prep_stage, "int32") * 41984 + (((lane // 16 // 8 * 256 + (pair_row_base + lane % 16) * 8 + (lane // 16 % 8 * 16 ^ ((pair_row_base + lane % 16 & 7) << 4)) // 16) ^ 2 ^ 6 ^ 2 ^ 6) + 256) * 16) - T.cast(smem, "int32")]),
-                )  # fmt: skip
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    b_frag[0],
-                    b_frag[1],
-                    b_frag[2],
-                    b_frag[3],
-                    smem_raw.ptr_to([(smem_ki_addr + T.cast(prep_stage, "int32") * 41984 + ((((((lane % 16 // 8 // 8 * 256 + (pair_col_base + 8 * (lane // 16) + lane % 8) * 8 + (lane % 16 // 8 % 8 * 16 ^ ((pair_col_base + 8 * (lane // 16) + lane % 8 & 7) << 4)) // 16) + 256 ^ 2) - 256 + 256 ^ 6) - 256 + 256 ^ 2) - 256 + 256 ^ 6) + 256 - 256) * 16) - T.cast(smem, "int32")]),
-                )  # fmt: skip
+                Tx.warp.copy(
+                    a_view[0:16, 0:16],
+                    smem_qd_st[prep_stage, pair_row_base : pair_row_base + 16, 64 : 64 + 16],
+                    dispatch="ldstmatrix",
+                )
+                Tx.warp.copy(
+                    b_view[0:16, 0:16],
+                    smem_ki_st[prep_stage, pair_col_base : pair_col_base + 16, 64 : 64 + 16],
+                    dispatch="ldstmatrix",
+                )
                 _mma_m16n8k16_bf16_acc(acc, a_frag, b_frag)
                 _mma_m16n8k16_bf16_acc_off4(acc, a_frag, b_frag)
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    a_frag[0],
-                    a_frag[1],
-                    a_frag[2],
-                    a_frag[3],
-                    smem_raw.ptr_to([(smem_qd_addr + T.cast(prep_stage, "int32") * 41984 + ((((lane // 16 // 8 * 256 + (pair_row_base + lane % 16) * 8 + (lane // 16 % 8 * 16 ^ ((pair_row_base + lane % 16 & 7) << 4)) // 16) ^ 2 ^ 6 ^ 2 ^ 6) + 256) ^ 2) * 16) - T.cast(smem, "int32")]),
-                )  # fmt: skip
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    b_frag[0],
-                    b_frag[1],
-                    b_frag[2],
-                    b_frag[3],
-                    smem_raw.ptr_to([(smem_ki_addr + T.cast(prep_stage, "int32") * 41984 + (((((((lane % 16 // 8 // 8 * 256 + (pair_col_base + 8 * (lane // 16) + lane % 8) * 8 + (lane % 16 // 8 % 8 * 16 ^ ((pair_col_base + 8 * (lane // 16) + lane % 8 & 7) << 4)) // 16) + 256 ^ 2) - 256 + 256 ^ 6) - 256 + 256 ^ 2) - 256 + 256 ^ 6) + 256 - 256 + 256 ^ 2) - 256) * 16) - T.cast(smem, "int32")]),
-                )  # fmt: skip
+                Tx.warp.copy(
+                    a_view[0:16, 0:16],
+                    smem_qd_st[prep_stage, pair_row_base : pair_row_base + 16, 80 : 80 + 16],
+                    dispatch="ldstmatrix",
+                )
+                Tx.warp.copy(
+                    b_view[0:16, 0:16],
+                    smem_ki_st[prep_stage, pair_col_base : pair_col_base + 16, 80 : 80 + 16],
+                    dispatch="ldstmatrix",
+                )
                 _mma_m16n8k16_bf16_acc(acc, a_frag, b_frag)
                 _mma_m16n8k16_bf16_acc_off4(acc, a_frag, b_frag)
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    a_frag[0],
-                    a_frag[1],
-                    a_frag[2],
-                    a_frag[3],
-                    smem_raw.ptr_to([(smem_qd_addr + T.cast(prep_stage, "int32") * 41984 + ((((lane // 16 // 8 * 256 + (pair_row_base + lane % 16) * 8 + (lane // 16 % 8 * 16 ^ ((pair_row_base + lane % 16 & 7) << 4)) // 16) ^ 2 ^ 6 ^ 2 ^ 6) + 256) ^ 2 ^ 6) * 16) - T.cast(smem, "int32")]),
-                )  # fmt: skip
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    b_frag[0],
-                    b_frag[1],
-                    b_frag[2],
-                    b_frag[3],
-                    smem_raw.ptr_to([(smem_ki_addr + T.cast(prep_stage, "int32") * 41984 + ((((((((lane % 16 // 8 // 8 * 256 + (pair_col_base + 8 * (lane // 16) + lane % 8) * 8 + (lane % 16 // 8 % 8 * 16 ^ ((pair_col_base + 8 * (lane // 16) + lane % 8 & 7) << 4)) // 16) + 256 ^ 2) - 256 + 256 ^ 6) - 256 + 256 ^ 2) - 256 + 256 ^ 6) + 256 - 256 + 256 ^ 2) - 256 + 256 ^ 6) - 256) * 16) - T.cast(smem, "int32")]),
-                )  # fmt: skip
+                Tx.warp.copy(
+                    a_view[0:16, 0:16],
+                    smem_qd_st[prep_stage, pair_row_base : pair_row_base + 16, 96 : 96 + 16],
+                    dispatch="ldstmatrix",
+                )
+                Tx.warp.copy(
+                    b_view[0:16, 0:16],
+                    smem_ki_st[prep_stage, pair_col_base : pair_col_base + 16, 96 : 96 + 16],
+                    dispatch="ldstmatrix",
+                )
                 _mma_m16n8k16_bf16_acc(acc, a_frag, b_frag)
                 _mma_m16n8k16_bf16_acc_off4(acc, a_frag, b_frag)
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    a_frag[0],
-                    a_frag[1],
-                    a_frag[2],
-                    a_frag[3],
-                    smem_raw.ptr_to([(smem_qd_addr + T.cast(prep_stage, "int32") * 41984 + ((((lane // 16 // 8 * 256 + (pair_row_base + lane % 16) * 8 + (lane // 16 % 8 * 16 ^ ((pair_row_base + lane % 16 & 7) << 4)) // 16) ^ 2 ^ 6 ^ 2 ^ 6) + 256) ^ 2 ^ 6 ^ 2) * 16) - T.cast(smem, "int32")]),
-                )  # fmt: skip
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    b_frag[0],
-                    b_frag[1],
-                    b_frag[2],
-                    b_frag[3],
-                    smem_raw.ptr_to([(smem_ki_addr + T.cast(prep_stage, "int32") * 41984 + (((((((((lane % 16 // 8 // 8 * 256 + (pair_col_base + 8 * (lane // 16) + lane % 8) * 8 + (lane % 16 // 8 % 8 * 16 ^ ((pair_col_base + 8 * (lane // 16) + lane % 8 & 7) << 4)) // 16) + 256 ^ 2) - 256 + 256 ^ 6) - 256 + 256 ^ 2) - 256 + 256 ^ 6) + 256 - 256 + 256 ^ 2) - 256 + 256 ^ 6) - 256 + 256 ^ 2) - 256) * 16) - T.cast(smem, "int32")]),
-                )  # fmt: skip
+                Tx.warp.copy(
+                    a_view[0:16, 0:16],
+                    smem_qd_st[prep_stage, pair_row_base : pair_row_base + 16, 112 : 112 + 16],
+                    dispatch="ldstmatrix",
+                )
+                Tx.warp.copy(
+                    b_view[0:16, 0:16],
+                    smem_ki_st[prep_stage, pair_col_base : pair_col_base + 16, 112 : 112 + 16],
+                    dispatch="ldstmatrix",
+                )
                 _mma_m16n8k16_bf16_acc(acc, a_frag, b_frag)
                 _mma_m16n8k16_bf16_acc_off4(acc, a_frag, b_frag)
             else:  # .cu:1991-2000
@@ -2666,21 +1885,24 @@ def _kernel(
             for _lp in T.unroll(4):  # .cu:2038-2042
                 mqk_packed[_lp] = T.cuda.float22bfloat162_rn(mqk[_lp * 2 + 0], mqk[_lp * 2 + 1 + 0])
             for publish_pair in T.unroll(2):  # .cu:2043-2051
-                publish_row: T.int32 = pair_col_base + publish_pair * 8 + (lane & 7)  # .cu:2045
-                publish_col: T.int32 = 128 + pair_row_base + lane // 8 * 8  # .cu:2046
-                _pub_base: T.int32 = (
-                    publish_col // 64 * 4096 + publish_row * 128 + publish_col % 64 * 2
+                mqk_pair_view = T.decl_buffer(
+                    (16, 8),
+                    "bfloat16",
+                    data=mqk_packed.data,
+                    byte_offset=publish_pair * 8,
+                    scope="local",
+                    layout=_R_X2,
                 )
-                _pub_addr: T.int32 = (
-                    smem_final_trans_addr
-                    + T.cast(prep_stage, "int32") * 41984
-                    + (_pub_base ^ ((_pub_base >> 7 & 7) << 4))
-                )  # .cu:2047
                 # .cu:2048-2050 stmatrix.x2.trans
-                T.ptx.stmatrix.sync.aligned.m8n8.x2.trans.shared.b16(
-                    smem_raw.ptr_to([(_pub_addr) - T.cast(smem, "int32")]),
-                    mqk_packed[publish_pair * 2],
-                    mqk_packed[publish_pair * 2 + 1],
+                Tx.warp.copy(
+                    smem_fin_tt[
+                        prep_stage,
+                        2,
+                        pair_row_base : pair_row_base + 16,
+                        pair_col_base + publish_pair * 8 : pair_col_base + publish_pair * 8 + 8,
+                    ],
+                    mqk_pair_view[0:16, 0:8],
+                    dispatch="ldstmatrix",
                 )
             if prep_instance == 0:  # .cu:2052-2064
                 T.ptx.bar.sync(T.uint32(11), T.uint32(128))
@@ -3028,30 +2250,6 @@ def _kernel(
                     _phase_prep_diag_ready,
                 )
             if prep_local_warp < 2:  # .cu:2257-2322
-                lane_row: T.int32 = lane & 7  # .cu:2258
-                byte_off_2: T.int32 = (prep_local_warp * 16 + 8 + lane_row) * 128 + (
-                    prep_local_warp * 16 + 8
-                ) * 2  # .cu:2259
-                swizzled_off_3: T.int32 = byte_off_2 ^ ((byte_off_2 >> 7 & 7) << 4)  # .cu:2260
-                d_addr: T.int32 = (
-                    smem_inv_work_addr + T.cast(prep_stage, "int32") * 41984 + swizzled_off_3
-                )  # .cu:2261
-                byte_off_0: T.int32 = (prep_local_warp * 16 + 8 + lane_row) * 128 + (
-                    prep_local_warp * 16 * 2
-                )  # .cu:2262
-                swizzled_off_1_1: T.int32 = byte_off_0 ^ ((byte_off_0 >> 7 & 7) << 4)  # .cu:2263
-                c_addr: T.int32 = (
-                    smem_inv_work_addr + T.cast(prep_stage, "int32") * 41984 + swizzled_off_1_1
-                )  # .cu:2264
-                byte_off_2_1: T.int32 = (prep_local_warp * 16 + lane_row) * 128 + (
-                    prep_local_warp * 16 * 2
-                )  # .cu:2265
-                swizzled_off_3_1: T.int32 = byte_off_2_1 ^ (
-                    (byte_off_2_1 >> 7 & 7) << 4
-                )  # .cu:2266
-                a_addr: T.int32 = (
-                    smem_inv_work_addr + T.cast(prep_stage, "int32") * 41984 + swizzled_off_3_1
-                )  # .cu:2267
                 d_frag = T.alloc_local((2,), "uint32", align=4)  # .cu:2268
                 c_frag = T.alloc_local((1,), "uint32", align=4)  # .cu:2269
                 dc_acc = T.alloc_local((4,), "float32", align=4)  # .cu:2270
@@ -3059,17 +2257,55 @@ def _kernel(
                 inv_a_frag = T.alloc_local((1,), "uint32", align=4)  # .cu:2272
                 o_acc = T.alloc_local((4,), "float32", align=4)  # .cu:2273
                 o_bf16 = T.alloc_local((2,), "uint32", align=4)  # .cu:2274
+                d_view0 = T.decl_buffer(
+                    (8, 8), "bfloat16", data=d_frag.data, scope="local", layout=_R_ATOM
+                )
+                d_view1 = T.decl_buffer(
+                    (8, 8),
+                    "bfloat16",
+                    data=d_frag.data,
+                    byte_offset=4,
+                    scope="local",
+                    layout=_R_ATOM,
+                )
+                c_view = T.decl_buffer(
+                    (8, 8), "bfloat16", data=c_frag.data, scope="local", layout=_R_ATOM
+                )
+                a_view1 = T.decl_buffer(
+                    (8, 8), "bfloat16", data=inv_a_frag.data, scope="local", layout=_R_ATOM
+                )
+                o_view = T.decl_buffer(
+                    (8, 8), "bfloat16", data=o_bf16.data, scope="local", layout=_R_ATOM
+                )
                 # .cu:2275-2278 ldmatrix.x1 d_frag[0]
-                T.ptx.ldmatrix.sync.aligned.m8n8.x1.shared.b16(
-                    d_frag[0], smem_raw.ptr_to([(d_addr) - T.cast(smem, "int32")])
+                Tx.warp.copy(
+                    d_view0[0:8, 0:8],
+                    smem_inv_w[
+                        prep_stage,
+                        prep_local_warp * 16 + 8 : prep_local_warp * 16 + 16,
+                        prep_local_warp * 16 + 8 : prep_local_warp * 16 + 16,
+                    ],
+                    dispatch="ldstmatrix",
                 )
                 # .cu:2279-2282 ldmatrix.x1 d_frag[1] (same address)
-                T.ptx.ldmatrix.sync.aligned.m8n8.x1.shared.b16(
-                    d_frag[1], smem_raw.ptr_to([(d_addr) - T.cast(smem, "int32")])
+                Tx.warp.copy(
+                    d_view1[0:8, 0:8],
+                    smem_inv_w[
+                        prep_stage,
+                        prep_local_warp * 16 + 8 : prep_local_warp * 16 + 16,
+                        prep_local_warp * 16 + 8 : prep_local_warp * 16 + 16,
+                    ],
+                    dispatch="ldstmatrix",
                 )
                 # .cu:2283-2286 ldmatrix.x1.trans c_frag
-                T.ptx.ldmatrix.sync.aligned.m8n8.x1.trans.shared.b16(
-                    c_frag[0], smem_raw.ptr_to([(c_addr) - T.cast(smem, "int32")])
+                Tx.warp.copy(
+                    c_view[0:8, 0:8],
+                    smem_inv_wt[
+                        prep_stage,
+                        prep_local_warp * 16 : prep_local_warp * 16 + 8,
+                        prep_local_warp * 16 + 8 : prep_local_warp * 16 + 16,
+                    ],
+                    dispatch="ldstmatrix",
                 )
                 _mma_m16n8k8_bf16_zero(dc_acc, d_frag, c_frag)  # .cu:2287-2289
                 for _ls in T.unroll(2):  # .cu:2290-2293
@@ -3084,24 +2320,29 @@ def _kernel(
                         dc_acc[_lp * 2 + 0], dc_acc[_lp * 2 + 1 + 0]
                     )
                 # .cu:2299-2302 ldmatrix.x1.trans inv_a_frag
-                T.ptx.ldmatrix.sync.aligned.m8n8.x1.trans.shared.b16(
-                    inv_a_frag[0], smem_raw.ptr_to([(a_addr) - T.cast(smem, "int32")])
+                Tx.warp.copy(
+                    a_view1[0:8, 0:8],
+                    smem_inv_wt[
+                        prep_stage,
+                        prep_local_warp * 16 : prep_local_warp * 16 + 8,
+                        prep_local_warp * 16 : prep_local_warp * 16 + 8,
+                    ],
+                    dispatch="ldstmatrix",
                 )
                 _mma_m16n8k8_bf16_zero(o_acc, dc_bf16, inv_a_frag)  # .cu:2303-2305
                 for _lp in T.unroll(2):  # .cu:2306-2310
                     o_bf16[_lp] = T.cuda.float22bfloat162_rn(
                         o_acc[_lp * 2 + 0], o_acc[_lp * 2 + 1 + 0]
                     )
-                byte_off_4: T.int32 = (prep_local_warp * 16 + 8 + lane_row) * 128 + (
-                    prep_local_warp * 16 * 2
-                )  # .cu:2311
-                swizzled_off_5: T.int32 = byte_off_4 ^ ((byte_off_4 >> 7 & 7) << 4)  # .cu:2312
-                o_addr: T.int32 = (
-                    smem_inv_work_addr + T.cast(prep_stage, "int32") * 41984 + swizzled_off_5
-                )  # .cu:2313
                 # .cu:2314-2317 stmatrix.x1
-                T.ptx.stmatrix.sync.aligned.m8n8.x1.shared.b16(
-                    smem_raw.ptr_to([(o_addr) - T.cast(smem, "int32")]), o_bf16[0]
+                Tx.warp.copy(
+                    smem_inv_w[
+                        prep_stage,
+                        prep_local_warp * 16 + 8 : prep_local_warp * 16 + 16,
+                        prep_local_warp * 16 : prep_local_warp * 16 + 8,
+                    ],
+                    o_view[0:8, 0:8],
+                    dispatch="ldstmatrix",
                 )
                 if T.cuda.elect_sync():  # .cu:2318-2320
                     _mbarrier_arrive(
@@ -3116,27 +2357,6 @@ def _kernel(
                     _phase_prep_inv16_ready,
                 )  # .cu:2321
             if prep_local_warp == 0:  # .cu:2323-2404
-                lane_row_1: T.int32 = lane % 16  # .cu:2324
-                lane_col: T.int32 = lane // 16 * 8  # .cu:2325
-                byte_off_3: T.int32 = (16 + lane_row_1) * 128 + (16 + lane_col) * 2  # .cu:2326
-                swizzled_off_4: T.int32 = byte_off_3 ^ ((byte_off_3 >> 7 & 7) << 4)  # .cu:2327
-                d_addr_1: T.int32 = (
-                    smem_inv_work_addr + T.cast(prep_stage, "int32") * 41984 + swizzled_off_4
-                )  # .cu:2328
-                byte_off_0_1: T.int32 = (16 + lane_row_1) * 128 + lane_col * 2  # .cu:2329
-                swizzled_off_1_2: T.int32 = byte_off_0_1 ^ (
-                    (byte_off_0_1 >> 7 & 7) << 4
-                )  # .cu:2330
-                c_addr_1: T.int32 = (
-                    smem_inv_work_addr + T.cast(prep_stage, "int32") * 41984 + swizzled_off_1_2
-                )  # .cu:2331
-                byte_off_2_2: T.int32 = lane_row_1 * 128 + lane_col * 2  # .cu:2332
-                swizzled_off_3_2: T.int32 = byte_off_2_2 ^ (
-                    (byte_off_2_2 >> 7 & 7) << 4
-                )  # .cu:2333
-                a_addr_1: T.int32 = (
-                    smem_inv_work_addr + T.cast(prep_stage, "int32") * 41984 + swizzled_off_3_2
-                )  # .cu:2334
                 d32_frag = T.alloc_local((4,), "uint32", align=4)  # .cu:2335
                 c32_frag = T.alloc_local((4,), "uint32", align=4)  # .cu:2336
                 dc32_acc = T.alloc_local((8,), "float32", align=4)  # .cu:2337
@@ -3145,37 +2365,38 @@ def _kernel(
                 o32_acc = T.alloc_local((8,), "float32", align=4)  # .cu:2340
                 o32_bf16 = T.alloc_local((4,), "uint32", align=4)  # .cu:2341
                 zero32_bf16 = T.alloc_local((4,), "uint32", align=4)  # .cu:2342
+                d32_view = T.decl_buffer(
+                    (16, 16), "bfloat16", data=d32_frag.data, scope="local", layout=_R_X4_A
+                )
+                c32_view = T.decl_buffer(
+                    (16, 16), "bfloat16", data=c32_frag.data, scope="local", layout=_R_X4_B
+                )
+                a32_view = T.decl_buffer(
+                    (16, 16), "bfloat16", data=a32_frag.data, scope="local", layout=_R_X4_B
+                )
+                o32_view = T.decl_buffer(
+                    (16, 16), "bfloat16", data=o32_bf16.data, scope="local", layout=_R_X4_A
+                )
+                z32_view = T.decl_buffer(
+                    (16, 16), "bfloat16", data=zero32_bf16.data, scope="local", layout=_R_X4_A
+                )
                 # .cu:2343-2346 ldmatrix.x4 d32
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    d32_frag[0],
-                    d32_frag[1],
-                    d32_frag[2],
-                    d32_frag[3],
-                    smem_raw.ptr_to([(d_addr_1) - T.cast(smem, "int32")]),
+                Tx.warp.copy(
+                    d32_view[0:16, 0:16],
+                    smem_inv_w[prep_stage, 16:32, 16:32],
+                    dispatch="ldstmatrix",
                 )
-                _dpb: T.int32 = (
-                    (16 + lane_col) // 16 * 1024 + (16 + lane_row_1) * 32 + (16 + lane_col) % 16 * 2
-                )
-                d_publish_addr: T.int32 = (
-                    smem_inv_addr
-                    + T.cast(prep_stage, "int32") * 41984
-                    + (_dpb ^ ((_dpb >> 7 & 1) << 4))
-                )  # .cu:2347
                 # .cu:2348-2351 stmatrix.x4 d32 publish
-                T.ptx.stmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    smem_raw.ptr_to([(d_publish_addr) - T.cast(smem, "int32")]),
-                    d32_frag[0],
-                    d32_frag[1],
-                    d32_frag[2],
-                    d32_frag[3],
+                Tx.warp.copy(
+                    smem_inv_p[prep_stage, 16:32, 1, 0:16],
+                    d32_view[0:16, 0:16],
+                    dispatch="ldstmatrix",
                 )
                 # .cu:2352-2355 ldmatrix.x4.trans c32
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16(
-                    c32_frag[0],
-                    c32_frag[1],
-                    c32_frag[2],
-                    c32_frag[3],
-                    smem_raw.ptr_to([(c_addr_1) - T.cast(smem, "int32")]),
+                Tx.warp.copy(
+                    c32_view[0:16, 0:16],
+                    smem_inv_wt[prep_stage, 0:16, 16:32],
+                    dispatch="ldstmatrix",
                 )
                 _mma_m16n8k16_bf16_zero(dc32_acc, d32_frag, c32_frag)  # .cu:2356-2358
                 _mma_m16n8k16_bf16_zero_off4(dc32_acc, d32_frag, c32_frag)  # .cu:2359-2361
@@ -3191,26 +2412,14 @@ def _kernel(
                         dc32_acc[_lp * 2 + 0], dc32_acc[_lp * 2 + 1 + 0]
                     )
                 # .cu:2371-2374 ldmatrix.x4.trans a32
-                T.ptx.ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16(
-                    a32_frag[0],
-                    a32_frag[1],
-                    a32_frag[2],
-                    a32_frag[3],
-                    smem_raw.ptr_to([(a_addr_1) - T.cast(smem, "int32")]),
+                Tx.warp.copy(
+                    a32_view[0:16, 0:16], smem_inv_wt[prep_stage, 0:16, 0:16], dispatch="ldstmatrix"
                 )
-                _apb: T.int32 = lane_col // 16 * 1024 + lane_row_1 * 32 + lane_col % 16 * 2
-                a_publish_addr: T.int32 = (
-                    smem_inv_addr
-                    + T.cast(prep_stage, "int32") * 41984
-                    + (_apb ^ ((_apb >> 7 & 1) << 4))
-                )  # .cu:2375
                 # .cu:2376-2379 stmatrix.x4.trans a32 publish
-                T.ptx.stmatrix.sync.aligned.m8n8.x4.trans.shared.b16(
-                    smem_raw.ptr_to([(a_publish_addr) - T.cast(smem, "int32")]),
-                    a32_frag[0],
-                    a32_frag[1],
-                    a32_frag[2],
-                    a32_frag[3],
+                Tx.warp.copy(
+                    smem_inv_pt[prep_stage, 0:16, 0, 0:16],
+                    a32_view[0:16, 0:16],
+                    dispatch="ldstmatrix",
                 )
                 _mma_m16n8k16_bf16_zero(o32_acc, dc32_bf16, a32_frag)  # .cu:2380-2382
                 _mma_m16n8k16_bf16_zero_off4(o32_acc, dc32_bf16, a32_frag)  # .cu:2383-2385
@@ -3218,37 +2427,19 @@ def _kernel(
                     o32_bf16[_lp] = T.cuda.float22bfloat162_rn(
                         o32_acc[_lp * 2 + 0], o32_acc[_lp * 2 + 1 + 0]
                     )
-                _opb: T.int32 = lane_col // 16 * 1024 + (16 + lane_row_1) * 32 + lane_col % 16 * 2
-                o_publish_addr: T.int32 = (
-                    smem_inv_addr
-                    + T.cast(prep_stage, "int32") * 41984
-                    + (_opb ^ ((_opb >> 7 & 1) << 4))
-                )  # .cu:2391
                 # .cu:2392-2395 stmatrix.x4 o32 publish
-                T.ptx.stmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    smem_raw.ptr_to([(o_publish_addr) - T.cast(smem, "int32")]),
-                    o32_bf16[0],
-                    o32_bf16[1],
-                    o32_bf16[2],
-                    o32_bf16[3],
+                Tx.warp.copy(
+                    smem_inv_p[prep_stage, 16:32, 0, 0:16],
+                    o32_view[0:16, 0:16],
+                    dispatch="ldstmatrix",
                 )
                 for zero_word in T.unroll(4):  # .cu:2396-2399
                     zero32_bf16[zero_word] = T.uint32(0)
-                _zpb: T.int32 = (
-                    (16 + lane_col) // 16 * 1024 + lane_row_1 * 32 + (16 + lane_col) % 16 * 2
-                )
-                zero_publish_addr: T.int32 = (
-                    smem_inv_addr
-                    + T.cast(prep_stage, "int32") * 41984
-                    + (_zpb ^ ((_zpb >> 7 & 1) << 4))
-                )  # .cu:2400
                 # .cu:2401-2404 stmatrix.x4 zero publish
-                T.ptx.stmatrix.sync.aligned.m8n8.x4.shared.b16(
-                    smem_raw.ptr_to([(zero_publish_addr) - T.cast(smem, "int32")]),
-                    zero32_bf16[0],
-                    zero32_bf16[1],
-                    zero32_bf16[2],
-                    zero32_bf16[3],
+                Tx.warp.copy(
+                    smem_inv_p[prep_stage, 0:16, 1, 0:16],
+                    z32_view[0:16, 0:16],
+                    dispatch="ldstmatrix",
                 )
             elif prep_local_warp == 1:  # .cu:2405-2522
                 stage_f32_0_1: T.int32 = T.cast(prep_stage, "int32") * 10496  # .cu:2406
@@ -3406,9 +2597,9 @@ def _kernel(
                     _phase_prep_inv16_ready = _phase_prep_inv16_ready ^ T.uint32(1)
 
 
-def bf16_fused_m128(**kwargs: Any):
+def bf16_fused_m128_tx_tile(**kwargs: Any):
     cfg = _cfg(**kwargs)
-    kernel = _kernel.specialize(
+    kernel = _kernel_tx_tile.specialize(
         total_tokens=cfg.total_tokens,
         h=cfg.num_heads,
         num_seqs=cfg.num_seqs,
@@ -3420,123 +2611,8 @@ def bf16_fused_m128(**kwargs: Any):
         store_final_state=cfg.store_final_state,
     )
     return kernel.with_attr("tirx.kernel_launch_params", list(LAUNCH_TAGS)).with_attr(
-        "global_symbol", "bf16_fused_m128"
+        "global_symbol", "bf16_fused_m128_tx_tile"
     )
 
 
-def get_kernel(**kwargs: Any):
-    return bf16_fused_m128(**kwargs)
-
-
-def run_test(**kwargs: Any) -> None:
-    if not torch.cuda.is_available():
-        raise SkipTest("CUDA is required for FlashKDA bf16 fused m128")
-
-    from tirx_kernels.flashinfer.bf16_fused_m128_tx_tile import bf16_fused_m128_tx_tile
-    from tirx_kernels.runner import compile_kernel
-
-    case = prepare_data(**kwargs)
-    cfg: FlashKDABf16FusedM128Config = case["config"]
-    if not case["dispatch_reason"].startswith("m128:"):
-        raise SkipTest(case["dispatch_reason"])
-    executables = (
-        (compile_kernel(bf16_fused_m128(**kwargs)), _tirx_args(case)),
-        (compile_kernel(bf16_fused_m128_tx_tile(**kwargs)), _tirx_args(case, use_tx_tile=True)),
-    )
-    for executable, args in executables:
-        executable(*args)
-    torch.cuda.synchronize()
-
-    ref_out, ref_state = _reference_torch(case)
-    for suffix in ("", "_tx_tile"):
-        torch.testing.assert_close(case[f"out{suffix}"], ref_out, rtol=4.01 / 128, atol=5e-3)
-        if cfg.store_final_state:
-            torch.testing.assert_close(
-                case[f"final_state{suffix}"], ref_state, rtol=4.01 / 128, atol=5e-3
-            )
-
-    flashinfer_out, flashinfer_state = _flashinfer_cuda_reference(case)
-    for suffix in ("", "_tx_tile"):
-        torch.testing.assert_close(case[f"out{suffix}"], flashinfer_out, rtol=4.01 / 128, atol=5e-3)
-        if cfg.store_final_state and flashinfer_state is not None:
-            torch.testing.assert_close(
-                case[f"final_state{suffix}"],
-                flashinfer_state.reshape(case[f"final_state{suffix}"].shape),
-                rtol=4.01 / 128,
-                atol=5e-3,
-            )
-    cfg.validate()
-
-
-def run_bench(
-    *, warmup: int | None = None, repeat: int | None = None, timer: str | None = None, **kwargs: Any
-) -> dict[str, Any]:
-    _rounds = kwargs.pop("rounds", 1)
-    _cooldown_s = kwargs.pop("cooldown_s", 1.0)
-    if not torch.cuda.is_available():
-        raise SkipTest("CUDA is required for FlashKDA bf16 fused m128 benchmark")
-
-    from tirx_kernels.flashinfer.bf16_fused_m128_tx_tile import bf16_fused_m128_tx_tile
-    from tirx_kernels.runner import compile_kernel
-    from tvm.tirx.bench import bench
-
-    case = prepare_data(**kwargs)
-    cfg: FlashKDABf16FusedM128Config = case["config"]
-    if not case["dispatch_reason"].startswith("m128:"):
-        raise SkipTest(case["dispatch_reason"])
-    args = _tirx_args(case)
-    tx_tile_args = _tirx_args(case, use_tx_tile=True)
-    ex = compile_kernel(bf16_fused_m128(**kwargs))
-    tx_tile_ex = compile_kernel(bf16_fused_m128_tx_tile(**kwargs))
-    funcs = {"tirx": lambda: ex(*args), "tirx_tx_tile": lambda: tx_tile_ex(*tx_tile_args)}
-
-    # Produce the expected buffers once.  The FlashKDA peer builder validates
-    # against these outside the timed region before returning its pure launch.
-    for func in funcs.values():
-        func()
-    torch.cuda.synchronize()
-
-    def _flashinfer_builder():
-        _load_flashinfer_recurrent_kda()
-        flashinfer_case = dict(case)
-        if cfg.use_initial_state:
-            flashinfer_case["initial_state"] = case["initial_state"].clone()
-        return lambda: _flashinfer_cuda_reference(flashinfer_case)
-
-    flashkda_peer: dict[str, Any] = {}
-
-    def _flashkda_raw_builder():
-        from tirx_kernels.flashinfer.utils._flashkda_bench import prepare_flashkda_raw_reference
-
-        peer = prepare_flashkda_raw_reference(case)
-        flashkda_peer["reference"] = peer
-        return peer.launch
-
-    references = {"flashinfer_m128": _flashinfer_builder, "flashkda_raw": _flashkda_raw_builder}
-
-    result = bench(
-        funcs,
-        warmup=warmup,
-        repeat=repeat,
-        timer=timer,
-        references=references,
-        rounds=_rounds,
-        cooldown_s=_cooldown_s,
-    )
-    peer = flashkda_peer.get("reference")
-    if peer is not None:
-        result["flashkda_raw_provenance"] = peer.provenance
-        result["flashkda_raw_correctness"] = peer.correctness
-    return result
-
-
-__all__ = [
-    "BENCH_CONFIGS",
-    "CONFIGS",
-    "KERNEL_META",
-    "bf16_fused_m128",
-    "get_kernel",
-    "prepare_data",
-    "run_bench",
-    "run_test",
-]
+__all__ = ["bf16_fused_m128_tx_tile"]

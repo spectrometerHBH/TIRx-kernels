@@ -135,14 +135,14 @@ All rights reserved.
 
 - Upstream: <https://github.com/flashinfer-ai/flashinfer>
 - Applies to:
-  - `tirx_kernels/flashinfer/tinygemm2_sm100.py`, ported from
+  - `tirx_kernels/flashinfer/gemm/tinygemm2_sm100.py`, ported from
     `csrc/tinygemm2_sm100.cu`; that upstream generated source records its Loom
     schedules as exact ports of NVIDIA TensorRT-LLM's TinyGEMM2 kernel
-  - `tirx_kernels/flashinfer/bf16_fused_m128.py` and
-    `tirx_kernels/flashinfer/bf16_fused_m128_tx_tile.py`, ported from
+  - `tirx_kernels/flashinfer/kda/bf16_fused_m128.py` and
+    `tirx_kernels/flashinfer/kda/bf16_fused_m128_tx_tile.py`, ported from
     `csrc/kda/flashkda_bf16_fused_m128.cu` in
     flashinfer-ai/flashinfer#4262
-  - `tirx_kernels/flashinfer/gdn_prefill_sm100.py`, ported from
+  - `tirx_kernels/flashinfer/gdn_prefill/gdn_prefill_sm100.py`, ported from
     `flashinfer/gdn_kernels/blackwell/gated_delta_net_chunked.py`; the
     Apache-licensed `gdn_prefill.py` adapter is used only as an external frozen
     correctness and benchmark oracle
@@ -151,7 +151,7 @@ All rights reserved.
     `.agents/sketch/tinygemm2_sm100.md`, which document the corresponding
     ports under the same applicable terms
 
-  `tirx_kernels/flashinfer/__init__.py` and
+  The `tirx_kernels/flashinfer/**/__init__.py` files and
   `tirx_kernels/flashinfer/utils/_flashkda_bench.py` are native repository code.
 
 ### Apache License, Version 2.0 portions
