@@ -237,6 +237,16 @@ def _store_bf16_bits(buffer, index, bits):
     T.evaluate(T.ptx.st.global_.b16(buffer.ptr_to([index]), bits))
 
 
+def _store_bf16_bits_pred(buffer, index, bits, pred):
+    """``@p st.global.b16`` -- a genuinely predicated store.
+
+    The approved sketch calls the output store "one predicated scalar store per
+    j".  Expressing it as `if cond: store` instead makes ptxas emit a real
+    branch plus a BSYNC reconvergence per CTA, which the source does not have.
+    """
+    T.evaluate(T.ptx.st.global_.b16(buffer.ptr_to([index]), bits, pred=pred))
+
+
 def _load_bf16x4(buffer, index):
     """``ld.global.v4.b16`` -- one 8-byte tile of four bf16."""
     bits = T.alloc_local((4,), "uint16")
@@ -669,9 +679,9 @@ def _recurrent_kda_decode_one_warp(
 
             out_val: T.float32 = _reduce_k_group(_dot8(h_reg, j * 8, q_reg, DOT_REDUCTION_SCHEDULE))
 
-            if is_active != 0:
-                if k_lane == j:
-                    _store_bf16_bits(out, v_base + v_idx, _f32_to_bf16(out_val))
+            _store_bf16_bits_pred(
+                out, v_base + v_idx, _f32_to_bf16(out_val), T.And(is_active != 0, k_lane == j)
+            )
 
         # --- state writeback (recurrent_kda.py:462-469) --------------------
         # The source rebinds h_out to seq_idx at :463.  At NUM_TOKENS == 1 that
