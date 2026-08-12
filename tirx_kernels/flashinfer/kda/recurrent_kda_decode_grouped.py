@@ -808,7 +808,10 @@ def _recurrent_kda_decode_grouped(
     # by T, so q_total == cu[n_seq] there and this loop is empty.
     if T.And(T.And(n == 0, vz == 0), tid < HEAD_DIM):
         covered: T.int32 = _load_i32(cu, NUM_SEQS)
-        for pos in T.serial(covered, q_total):
+        # Do not let nvcc unroll this: `q_total` is a runtime bound and the
+        # loop runs zero times on every spec-mode shape, but a speculative
+        # 33x unroll still cost 52 static STG.E.U16 in the kernel body.
+        for pos in T.serial(covered, q_total, unroll=False):
             for e in range(EPT):
                 _store_bf16_bits(
                     out, (pos * NUM_VALUE_HEADS + hv) * HEAD_DIM + tid + e * NT, T.uint16(0)
