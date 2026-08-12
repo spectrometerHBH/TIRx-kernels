@@ -2,8 +2,8 @@
 
 - Timestamp: `14`
 - Label:     `post-refactor`
-- Git:       `{'tir': 'ea0950ab', 'tirx-kernels': 'afdde9c1', 'tirx-bench-ci': None}`
-- Workloads: 244 ok, 0 failed
+- Git:       `{'tir': 'ea0950ab', 'tirx-kernels': '78a82cf0', 'tirx-bench-ci': None}`
+- Workloads: 258 ok, 0 failed
 
 Grouped workloads show one row per config and one timing column per implementation. Single-TIR workloads show ref/ours against the fastest reference implementation.
 
@@ -303,6 +303,25 @@ Grouped workloads show one row per config and one timing column per implementati
 | `fp16_linear_m128_k1024` | tirx | 2.9066 | flashinfer | 3.0670 | 1.055 | — |
 | `fp16_linear_m16384_k7168` | tirx | 55.8258 | flashinfer | 57.4695 | 1.029 | — |
 | `fp16_linear_m4096_k4096` | tirx | 17.3447 | flashinfer | 19.5163 | 1.125 | — |
+
+## recurrent_kda_decode_grouped
+
+| config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
+|---|---|---:|---|---:|---:|---|
+| `dec_hv12_b4` | tirx | 3.6794 | flashinfer_cutedsl | 3.9005 | 1.060 | — |
+| `dec_hv12_b8` | tirx | 4.3591 | flashinfer_cutedsl | 4.5842 | 1.052 | — |
+| `dec_hv16_b1` | tirx | 3.2386 | flashinfer_cutedsl | 3.5470 | 1.095 | — |
+| `dec_hv16_b4` | tirx | 3.7444 | flashinfer_cutedsl | 4.0615 | 1.085 | — |
+| `ver_t2_hv16_b8` | tirx | 7.5206 | flashinfer_cutedsl | 7.3515 | 0.978 | — |
+| `ver_t4_hv16_b32` | tirx | 30.7565 | flashinfer_cutedsl | 33.8981 | 1.102 | — |
+| `ver_t8_hv12_b16` | tirx | 31.4693 | flashinfer_cutedsl | 31.6676 | 1.006 | — |
+| `ver_t8_hv12_b64` | tirx | 86.6023 | flashinfer_cutedsl | 87.8413 | 1.014 | — |
+| `ver_t8_hv16_b1` | tirx | 15.0374 | flashinfer_cutedsl | 15.1361 | 1.007 | — |
+| `ver_t8_hv16_b128` | tirx | 217.1107 | flashinfer_cutedsl | 220.1044 | 1.014 | — |
+| `ver_t8_hv16_b16` | tirx | 34.1489 | flashinfer_cutedsl | 34.8098 | 1.019 | — |
+| `ver_t8_hv16_b32` | tirx | 63.7828 | flashinfer_cutedsl | 63.6740 | 0.998 | — |
+| `ver_t8_hv16_b4` | tirx | 17.1063 | flashinfer_cutedsl | 16.9473 | 0.991 | — |
+| `ver_t8_hv16_b64` | tirx | 111.1816 | flashinfer_cutedsl | 112.5809 | 1.013 | — |
 
 ## recurrent_kda_decode_one_warp
 
