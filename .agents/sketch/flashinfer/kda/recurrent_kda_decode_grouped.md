@@ -242,8 +242,11 @@ sb0 = reg_tile(bf16, (8, G))
 gv0 = slice(view(state[slot0, hv, v_idx, :], shape=(8, G, KS), stride=(1, KS * 8, 8)), part)
 copy_g2r(gv0, sb0, evict="no_allocate")
 # instruction_selection: ld.global.L1::no_allocate.v4.b32; extent: G x 16B vectors
-cast(s, sb0)
-# instruction_selection: cvt.f32.bf16; extent: 8*G element loop
+if not DEFER_WIDENING:                    # T >= 4
+    cast(s, sb0)
+    # instruction_selection: cvt.f32.bf16; extent: 8*G element loop
+# For T <= 2 the widening is deferred past the barrier instead; see
+# "state widening" below. The load itself does not move in either case.
 
 # ===========================================================================
 # Loop-invariant gate constants
@@ -376,6 +379,33 @@ cta_sync()
 # instruction_selection: bar.sync 0; extent: CTA
 # The ONLY barrier in the kernel. It separates the `d = tid % D` element mapping
 # above from the `(v_idx, part)` granule mapping below.
+
+# ---- state widening, deferred here for T <= 2 ----
+# Nothing in phase A reads `s`, so where the widening sits only decides how much
+# of the load's latency is exposed. Measured on `ver_t2_hv16_b8`, address-ordered
+# SASS, last state-granule LDG -> first widening: 78 -> 95 (distance 17) at the
+# load site, 78 -> 293 (distance 215) here. The CuTe source sits at 91 -> 290,
+# distance 199, and ptxas sinks it below the barrier on its own; it cannot do
+# that for this port because the widening is inline asm, and it hoists the
+# deferred form back above the barrier anyway -- the barrier side is not what
+# the port controls, the distance is.
+#
+# Whether that distance is worth buying depends on how long phase A is, which is
+# why this is conditional rather than unconditional. Full-matrix ratios:
+#
+#           deferred   at load site
+#   T = 1     1.077        0.988      (dec_hv16_b4)
+#   T = 1     1.100        0.995      (dec_hv12_b8)
+#   T = 8     0.965        0.998      (ver_t8_hv16_b1)
+#   T = 8     0.986        1.006      (ver_t8_hv16_b4)
+#
+# At T <= 2 phase A is short and the exposure dominates; at T >= 4 phase A
+# already covers the load and deferring only stretches 4*G register lifetimes
+# across it. The staging registers are declared only on the deferring path --
+# an unconditional declaration cost 18% on the highest-occupancy row.
+if DEFER_WIDENING:                        # T <= 2
+    cast(s, sb0)
+    # instruction_selection: cvt.f32.bf16; extent: 8*G element loop
 
 
 # ===========================================================================
@@ -556,6 +586,7 @@ if (n == 0) & (vz == 0) & (tid < D):
 | --- | --- | --- |
 | `D`, `T`, `KS`, `VSPLIT`, `RATIO`, `GATE_MODE`, `HAS_DT_BIAS`, `BETA_LOGIT`, `USE_L2`, `USE_SRC` | constexpr | the source's `cutlass.Constexpr` list (`:499-510`) |
 | `KC`, `G`, `CPB`, `NT`, `EPT`, `SW` | constexpr | derived from `(D, KS, VSPLIT)` at `:515-521` |
+| `DEFER_WIDENING` | constexpr, port-only | `1 if T <= 2 else 0`. Not a source constant: the source writes the widening at the load site and lets ptxas place it, which this port cannot rely on (its widening is inline asm). Chosen by measurement, see the deferred block. |
 | `n_seq` | constexpr in TIRx, runtime in the source | the source reads it from `grid_dim()`; every TIRx config pins a batch size, so specializing is exact and removes one launch scalar |
 | `q_total`, `g` token stride, state slot stride, `scale`, `lower_bound` | runtime scalars | passed by the host (`:2185-2196`) |
 | `source` stride, `source_indices` stride | dropped | dead under `USE_SRC = 0`; the host even aliases `source = state` (`:2143-2145`) |
