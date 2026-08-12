@@ -3,12 +3,12 @@
   "label": "post-refactor",
   "git": {
     "tir": "ea0950ab",
-    "tirx-kernels": "ffea8502",
+    "tirx-kernels": "ec56224c",
     "tirx-bench-ci": null
   },
   "kernel_tree": {
     "tir:python/tvm/tirx": "4cbcd19685bc44fc81a64ae7708807a6f9bada7b",
-    "tirx-kernels:tirx_kernels": "6cd4951daef716e660d931c733beaefb77f5d770"
+    "tirx-kernels:tirx_kernels": "f1098a5427b0503fd777f1e8236013a520b77409"
   },
   "baselines": {
     "torch": {
@@ -2594,8 +2594,8 @@
       "label": "dec_hv12_b4",
       "status": "ok",
       "impls": {
-        "tirx": 3.703675760062243,
-        "flashinfer_cutedsl": 3.9398910107156033
+        "tirx": 3.6504416104104775,
+        "flashinfer_cutedsl": 3.9219190126523285
       },
       "aggregated": {
         "rounds": 5,
@@ -2608,8 +2608,8 @@
       "label": "dec_hv12_b8",
       "status": "ok",
       "impls": {
-        "tirx": 4.227634826478941,
-        "flashinfer_cutedsl": 4.594758956731637
+        "tirx": 4.258375216340218,
+        "flashinfer_cutedsl": 4.613711138436537
       },
       "aggregated": {
         "rounds": 5,
@@ -2622,8 +2622,8 @@
       "label": "dec_hv16_b1",
       "status": "ok",
       "impls": {
-        "tirx": 3.251122207792654,
-        "flashinfer_cutedsl": 3.562445494234283
+        "tirx": 3.238843675914427,
+        "flashinfer_cutedsl": 3.5627867976997543
       },
       "aggregated": {
         "rounds": 5,
@@ -2636,8 +2636,8 @@
       "label": "dec_hv16_b4",
       "status": "ok",
       "impls": {
-        "tirx": 3.776930548392052,
-        "flashinfer_cutedsl": 4.068874170344796
+        "tirx": 3.7758930700028097,
+        "flashinfer_cutedsl": 4.078077874576345
       },
       "aggregated": {
         "rounds": 5,
@@ -2650,8 +2650,8 @@
       "label": "ver_t2_hv16_b8",
       "status": "ok",
       "impls": {
-        "tirx": 7.115424423553316,
-        "flashinfer_cutedsl": 7.545993750458542
+        "tirx": 6.837621219998657,
+        "flashinfer_cutedsl": 7.342065714437408
       },
       "aggregated": {
         "rounds": 5,
@@ -2664,8 +2664,8 @@
       "label": "ver_t4_hv16_b32",
       "status": "ok",
       "impls": {
-        "tirx": 25.282648593015576,
-        "flashinfer_cutedsl": 33.960823318104964
+        "tirx": 24.71303785423106,
+        "flashinfer_cutedsl": 33.888392143740184
       },
       "aggregated": {
         "rounds": 5,
@@ -2678,8 +2678,8 @@
       "label": "ver_t8_hv12_b16",
       "status": "ok",
       "impls": {
-        "tirx": 22.356512689932302,
-        "flashinfer_cutedsl": 31.129764172542213
+        "tirx": 22.030900675719998,
+        "flashinfer_cutedsl": 31.35296382096456
       },
       "aggregated": {
         "rounds": 5,
@@ -2692,8 +2692,8 @@
       "label": "ver_t8_hv12_b64",
       "status": "ok",
       "impls": {
-        "tirx": 70.5404654125932,
-        "flashinfer_cutedsl": 87.89272623603318
+        "tirx": 65.91840010332494,
+        "flashinfer_cutedsl": 92.41587041159222
       },
       "aggregated": {
         "rounds": 5,
@@ -2706,8 +2706,8 @@
       "label": "ver_t8_hv16_b1",
       "status": "ok",
       "impls": {
-        "tirx": 8.781047702588518,
-        "flashinfer_cutedsl": 14.8168829948922
+        "tirx": 9.030776714313049,
+        "flashinfer_cutedsl": 14.815819035086784
       },
       "aggregated": {
         "rounds": 5,
@@ -2720,8 +2720,8 @@
       "label": "ver_t8_hv16_b128",
       "status": "ok",
       "impls": {
-        "tirx": 167.80471769751477,
-        "flashinfer_cutedsl": 219.8331778682258
+        "tirx": 161.9328744940579,
+        "flashinfer_cutedsl": 219.33161768748658
       },
       "aggregated": {
         "rounds": 5,
@@ -2734,8 +2734,8 @@
       "label": "ver_t8_hv16_b16",
       "status": "ok",
       "impls": {
-        "tirx": 25.994841616298768,
-        "flashinfer_cutedsl": 35.773716103001476
+        "tirx": 26.017330854831492,
+        "flashinfer_cutedsl": 34.95134749109404
       },
       "aggregated": {
         "rounds": 5,
@@ -2748,8 +2748,8 @@
       "label": "ver_t8_hv16_b32",
       "status": "ok",
       "impls": {
-        "tirx": 45.95860916354424,
-        "flashinfer_cutedsl": 64.55442091608283
+        "tirx": 44.59754916822601,
+        "flashinfer_cutedsl": 63.672738997515964
       },
       "aggregated": {
         "rounds": 5,
@@ -2762,8 +2762,8 @@
       "label": "ver_t8_hv16_b4",
       "status": "ok",
       "impls": {
-        "tirx": 10.592648172568492,
-        "flashinfer_cutedsl": 16.528851698089948
+        "tirx": 10.247886679654943,
+        "flashinfer_cutedsl": 16.928763980944666
       },
       "aggregated": {
         "rounds": 5,
@@ -2776,8 +2776,8 @@
       "label": "ver_t8_hv16_b64",
       "status": "ok",
       "impls": {
-        "tirx": 83.60328571134602,
-        "flashinfer_cutedsl": 112.51646386260838
+        "tirx": 83.1183969763617,
+        "flashinfer_cutedsl": 112.71690537963232
       },
       "aggregated": {
         "rounds": 5,
