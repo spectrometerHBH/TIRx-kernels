@@ -117,9 +117,11 @@ The computation vocabulary is deliberately primitive. `vmul`/`vadd` are the
 ```python
 fill(dst, value)
 cast(dst, src, rounding=None)
+cast_f32(dst, src)                            # BF16 -> FP32 widening
 add(dst, lhs, rhs);   vadd(dst, lhs, rhs)     # 8-wide FP32
 mul(dst, lhs, rhs);   vmul(dst, lhs, rhs)     # 8-wide FP32
 sub(dst, lhs, rhs)
+neg(dst, src)
 fma(dst, lhs, rhs, acc)
 exp2(dst, src)
 log1p(dst, src)

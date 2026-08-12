@@ -557,6 +557,92 @@ def _tirx_args(case: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
+def _torch_reference(case: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
+    """FP32 oracle: the same recurrence, written as dense torch.
+
+    Two semantics are easy to get wrong and are what this oracle exists to pin:
+
+    * the recurrent state is carried in **FP32** across the tokens of a row and
+      is only rounded to BF16 on the way to its checkpoint slot -- token ``t+1``
+      consumes the FP32 value, not the round-tripped one (recurrent_kda.py:708
+      writes ``sb1`` while ``s`` keeps its precision);
+    * ``rk`` appears twice in ``deltak = rk * bb * (ve - rk * pred)`` (:681);
+      one factor normalizes the key inside the prediction, the other normalizes
+      the key of the rank-1 update.
+
+    Returns ``(out, state_pool)`` with the pool laid out as the kernel sees it.
+    """
+    spec = case["spec"]
+    dev = case["device"]
+    tokens, heads = spec["NUM_TOKENS"], spec["NUM_VALUE_HEADS"]
+    n_seq, q_total = spec["NUM_SEQS"], spec["Q_TOTAL"]
+    ratio = spec["GQA_RATIO"]
+    mode = spec["GATE_MODE"]
+    lower_bound = case["lower_bound"]
+    scale = case["scale"]
+
+    f32 = torch.float32
+    q = case["q"].reshape(q_total, spec["NUM_HEADS"], HEAD_DIM).to(f32)
+    k = case["k"].reshape(q_total, spec["NUM_HEADS"], HEAD_DIM).to(f32)
+    v = case["v"].reshape(q_total, heads, HEAD_DIM).to(f32)
+    g = case["g"].reshape(q_total, heads, HEAD_DIM).to(f32)
+    beta = case["beta"].reshape(q_total, heads).to(f32)
+    dt_bias = case["dt_bias"].reshape(spec["NUM_HEADS"], HEAD_DIM).to(f32)
+    av = torch.exp(case["a_log"].to(f32))  # [H]
+    cu = case["cu_seqlens"].tolist()
+    idx = case["ssm_state_indices"].reshape(n_seq, tokens)
+
+    pool = _state_view(case["initial_state_raw"], case).to(f32).clone()
+    out = torch.zeros((q_total, heads, HEAD_DIM), device=dev, dtype=f32)
+
+    head_of = torch.arange(heads, device=dev) // ratio  # hv -> h
+
+    for n in range(n_seq):
+        token_base = cu[n]
+        seq_len = cu[n + 1] - token_base
+        # num_accepted_tokens is never supplied by SGLang, so ic collapses to 0.
+        slot0 = int(idx[n, 0])
+        state = pool[max(slot0, 0)].clone()  # [HV, V, K] f32
+
+        for t in range(tokens):
+            slot = int(idx[n, t])
+            in_row = t < seq_len
+            if not in_row:
+                continue  # written by nobody
+            if slot < 0:
+                out[token_base + t] = 0.0  # pad row
+                continue
+
+            p = token_base + t
+            qt, kt = q[p][head_of], k[p][head_of]  # [HV, K]
+            vt, gt, bt = v[p], g[p], beta[p]
+
+            x = gt + dt_bias[head_of]
+            if mode == GATE_MODE_SOFTPLUS:
+                sp = torch.log1p(torch.exp(x))
+                sp = torch.where(x > SOFTPLUS_LINEAR_THRESHOLD, x, sp)
+                gate = -av[head_of].unsqueeze(-1) * sp
+            else:
+                gate = lower_bound * torch.sigmoid(av[head_of].unsqueeze(-1) * x)
+            eg = torch.exp(gate)  # [HV, K]
+
+            rk = torch.rsqrt((kt * kt).sum(-1) + L2_EPS)  # [HV]
+            rq = torch.rsqrt((qt * qt).sum(-1) + L2_EPS) * scale
+
+            state = state * eg.unsqueeze(1)  # decay along K
+            pred = torch.einsum("hvk,hk->hv", state, kt)
+            deltak = rk.unsqueeze(-1) * bt.unsqueeze(-1) * (vt - rk.unsqueeze(-1) * pred)
+            state = state + deltak.unsqueeze(-1) * kt.unsqueeze(1)
+            out[p] = rq.unsqueeze(-1) * torch.einsum("hvk,hk->hv", state, qt)
+
+            # The checkpoint rounds to BF16; the carried state does not.
+            pool[slot] = state.to(torch.bfloat16).to(f32)
+
+    if q_total > cu[n_seq]:
+        out[cu[n_seq] :] = 0.0  # orphan suffix
+    return out.reshape(1, q_total, heads, HEAD_DIM), pool
+
+
 def _flashinfer_reference(case: dict[str, Any]) -> torch.Tensor:
     """Run the FlashInfer CuTe DSL source on the reference state pool.
 
