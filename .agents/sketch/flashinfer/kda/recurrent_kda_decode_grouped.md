@@ -301,7 +301,7 @@ for t in range(T):                # constexpr unroll
         fma(skp, ke, ke, skp)
         # instruction_selection: fma.rn.f32.bf16; extent: scalar
 
-        # ---- gate branch (recurrent_kda.py:612-627) ----
+        # ---- gate branch (recurrent_kda.py:613-627) ----
         add(x, ge, dtb[e])
         # instruction_selection: add.rn.f32.bf16; extent: scalar
         if GATE_MODE == 1:                     # softplus, Kimi Linear
