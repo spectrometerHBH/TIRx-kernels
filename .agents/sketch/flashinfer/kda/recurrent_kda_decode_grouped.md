@@ -242,8 +242,8 @@ sb0 = reg_tile(bf16, (8, G))
 gv0 = slice(view(state[slot0, hv, v_idx, :], shape=(8, G, KS), stride=(1, KS * 8, 8)), part)
 copy_g2r(gv0, sb0, evict="no_allocate")
 # instruction_selection: ld.global.L1::no_allocate.v4.b32; extent: G x 16B vectors
-cast(s, sb0)
-# instruction_selection: cvt.f32.bf16; extent: 8*G element loop
+# The widening to FP32 is NOT written here; it is written after the barrier.
+# See "state widening" below. The load itself does not move.
 
 # ===========================================================================
 # Loop-invariant gate constants
@@ -397,14 +397,38 @@ cta_sync()
 # The ONLY barrier in the kernel. It separates the `d = tid % D` element mapping
 # above from the `(v_idx, part)` granule mapping below.
 
-# The state widening used to be deferred to this point behind a `T <= 2`
-# constexpr, on measured evidence whose mechanism was never explained. Once
-# phase A issues all T tokens' loads up front, the two placements measure the
-# same on every row that motivated the split (ver_t8_hv16_b1 1.636 vs 1.671,
-# ver_t8_hv16_b4 1.664 vs 1.642, ver_t2_hv16_b8 1.086 vs 1.091), so the knob is
-# gone and the widening stays at the load site as in the source. The deferral
-# was a hand-rolled way of moving work off the load's critical path; issuing
-# the loads earlier addresses that directly.
+# ---- state widening, deferred to here ----
+# Nothing in phase A reads `s`, so this placement reaches only scheduling: same
+# op, same extent, same instruction, same data-dependence order as writing it at
+# the load site. ptxas hoists this form partway back anyway, so the two
+# spellings land within a few instructions of each other on every landmark.
+#
+# Load-to-consumer distance in scheduled SASS:
+#
+#            T=1   T=2   T=4   T=8
+#   source    60   199   393   874
+#   deferred  71   216   462   970
+#   at load   19    18    21    16
+#
+# It is worth 15-20% on the T = 1 decode shapes and is within run-to-run noise
+# on every T > 1 shape, so it is unconditional. Measured on full bench_suite
+# matrices, with the tight row cross-checked five times on a clock-verified GPU:
+#
+#                    deferred        at load site
+#   dec_hv16_b4      1.062-1.090     0.855
+#   dec_hv12_b8      1.045-1.087     1.019
+#   dec_hv12_b4      1.064-1.068     0.995
+#   ver_t8_hv16_b1   1.645           1.671
+#   ver_t8_hv16_b4   1.652           1.642
+#   ver_t2_hv16_b8   1.092           1.108
+#
+# This used to sit behind a `T <= 2` constexpr whose mechanism the sketch
+# admitted it could not explain: before phase A issued all T tokens' loads up
+# front, deferring cost 2-3% at T = 8. That cost is gone -- the deferral and the
+# hoisting were two ways of moving work off the load's critical path, and the
+# hoisting subsumes it -- so the boundary is gone too.
+cast(s, sb0)
+# instruction_selection: cvt.f32.bf16; extent: 8*G element loop
 
 # ===========================================================================
 # Phase B: barrier-free sequential recurrence over the T tokens

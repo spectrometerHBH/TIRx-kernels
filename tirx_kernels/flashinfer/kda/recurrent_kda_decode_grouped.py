@@ -617,14 +617,13 @@ def _recurrent_kda_decode_grouped(
         head_row, "int64"
     )
     s_pairs = T.alloc_local((4 * G,), "uint64")  # THE recurrent carry
+    s_words = T.alloc_local((4 * G,), "uint32")  # BF16 pairs, widened after the barrier
     for gi in range(G):
         words = _ld_global_granule_no_alloc(
             state, read_base + T.cast(gi * KS * 8 + part * 8, "int64")
         )
         for pr in range(4):
-            lo = _bf16_to_f32(T.cast(T.bitwise_and(words[pr], T.uint32(0xFFFF)), "uint16"))
-            hi = _bf16_to_f32(T.cast(T.shift_right(words[pr], T.uint32(16)), "uint16"))
-            s_pairs[gi * 4 + pr] = _pack_f32x2(lo, hi)
+            s_words[gi * 4 + pr] = words[pr]
 
     # --- loop-invariant gate constants (recurrent_kda.py:576-586) ----------
     av: T.float32 = T.float32(1.0)
@@ -707,6 +706,21 @@ def _recurrent_kda_decode_grouped(
 
     # The ONLY barrier: it separates the two thread-index mappings.
     T.cuda.cta_sync()
+
+    # Nothing in phase A reads the state, so this placement reaches only
+    # scheduling: same op, same extent, same instruction, same dependence order
+    # as widening at the load site.  It is worth 15-20% on the T = 1 decode
+    # shapes (dec_hv16_b4 0.855 -> 1.06-1.09 measured on a clock-verified GPU)
+    # and is within run-to-run noise on every T > 1 shape, so it is
+    # unconditional.  It used to sit behind a `T <= 2` constexpr because before
+    # phase A issued all T tokens' loads up front it cost 2-3% at T = 8; that
+    # cost is gone, and with it the boundary.
+    for gi in range(G):
+        for pr in range(4):
+            w = s_words[gi * 4 + pr]
+            lo = _bf16_to_f32(T.cast(w, "uint16"))
+            hi = _bf16_to_f32(T.cast(T.shift_right(w, T.uint32(16)), "uint16"))
+            s_pairs[gi * 4 + pr] = _pack_f32x2(lo, hi)
 
     # =======================================================================
     # Phase B: sequential recurrence over the tokens (recurrent_kda.py:645-717)
