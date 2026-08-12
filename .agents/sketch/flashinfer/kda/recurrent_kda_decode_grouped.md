@@ -242,9 +242,8 @@ sb0 = reg_tile(bf16, (8, G))
 gv0 = slice(view(state[slot0, hv, v_idx, :], shape=(8, G, KS), stride=(1, KS * 8, 8)), part)
 copy_g2r(gv0, sb0, evict="no_allocate")
 # instruction_selection: ld.global.L1::no_allocate.v4.b32; extent: G x 16B vectors
-# The widening of `sb0` into `s` is NOT here -- it is deferred past the barrier;
-# see "state widening" below. Nothing in phase A reads `s`, so the load issues
-# now and its latency is covered by all of phase A.
+cast(s, sb0)
+# instruction_selection: cvt.f32.bf16; extent: 8*G element loop
 
 # ===========================================================================
 # Loop-invariant gate constants
@@ -378,29 +377,6 @@ cta_sync()
 # The ONLY barrier in the kernel. It separates the `d = tid % D` element mapping
 # above from the `(v_idx, part)` granule mapping below.
 
-# ---- state widening, deferred to here ----
-# What this buys is DISTANCE from the load, not a particular side of the barrier.
-# Measured on `ver_t2_hv16_b8`, address-ordered SASS, last state-granule LDG ->
-# first widening instruction:
-#
-#   CuTe source                       91 -> 290   distance 199   (after BAR@287)
-#   this port, widening at load site  78 ->  95   distance  17   (before BAR@418)
-#   this port, widening written here  78 -> 293   distance 215   (before BAR@416)
-#
-# The loads do not move in either build; they are already where they belong.
-# ptxas sinks the widening below the barrier for the source but hoists it back
-# above the barrier for this port even though it is written after `cta_sync()`
-# here and appears after `bar.sync` in the emitted PTX -- so inline asm IS
-# reordered across the barrier, and the barrier side is not what the port
-# controls. What the port does control is program order, and moving the widening
-# later takes ptxas's chosen position from 17 instructions after the load to
-# 215, which is what covers the load latency. Why ptxas picks opposite sides for
-# the two builds is not established here.
-#
-# This is a scheduling placement only: same op, same instruction, same extent,
-# and `s` is still read for the first time by pass 1 of token 0 below.
-cast(s, sb0)
-# instruction_selection: cvt.f32.bf16; extent: 8*G element loop
 
 # ===========================================================================
 # Phase B: barrier-free sequential recurrence over the T tokens

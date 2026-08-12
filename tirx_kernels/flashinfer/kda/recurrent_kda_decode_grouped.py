@@ -615,13 +615,14 @@ def _recurrent_kda_decode_grouped(
         head_row, "int64"
     )
     s_pairs = T.alloc_local((4 * G,), "uint64")  # THE recurrent carry
-    s_words = T.alloc_local((4 * G,), "uint32")  # raw BF16 granules; widened below
     for gi in range(G):
         words = _ld_global_granule_no_alloc(
             state, read_base + T.cast(gi * KS * 8 + part * 8, "int64")
         )
         for pr in range(4):
-            s_words[gi * 4 + pr] = words[pr]
+            lo = _bf16_to_f32(T.cast(T.bitwise_and(words[pr], T.uint32(0xFFFF)), "uint16"))
+            hi = _bf16_to_f32(T.cast(T.shift_right(words[pr], T.uint32(16)), "uint16"))
+            s_pairs[gi * 4 + pr] = _pack_f32x2(lo, hi)
 
     # --- loop-invariant gate constants (recurrent_kda.py:576-586) ----------
     av: T.float32 = T.float32(1.0)
@@ -687,22 +688,6 @@ def _recurrent_kda_decode_grouped(
 
     # The ONLY barrier: it separates the two thread-index mappings.
     T.cuda.cta_sync()
-
-    # Widen the state granules only now.  Nothing in phase A depends on them, so
-    # keeping the widening at the load site put a consumer 17 SASS instructions
-    # after the load and left its latency fully exposed; written here, ptxas
-    # schedules it 215 instructions after the load.  What matters is that
-    # distance, not which side of the barrier it lands on: ptxas sinks the
-    # widening below the barrier for the CuTe source (distance 199) but hoists
-    # it back above the barrier here, even though it is written after
-    # ``cta_sync()`` and appears after ``bar.sync`` in the emitted PTX.  The
-    # loads themselves move in neither build.
-    for gi in range(G):
-        for pr in range(4):
-            w = s_words[gi * 4 + pr]
-            lo = _bf16_to_f32(T.cast(w, "uint16"))
-            hi = _bf16_to_f32(T.cast(T.shift_right(w, T.uint32(16)), "uint16"))
-            s_pairs[gi * 4 + pr] = _pack_f32x2(lo, hi)
 
     # =======================================================================
     # Phase B: sequential recurrence over the tokens (recurrent_kda.py:645-717)
@@ -823,10 +808,7 @@ def _recurrent_kda_decode_grouped(
     # by T, so q_total == cu[n_seq] there and this loop is empty.
     if T.And(T.And(n == 0, vz == 0), tid < HEAD_DIM):
         covered: T.int32 = _load_i32(cu, NUM_SEQS)
-        # Do not let nvcc unroll this: `q_total` is a runtime bound and the
-        # loop runs zero times on every spec-mode shape, but a speculative
-        # 33x unroll still cost 52 static STG.E.U16 in the kernel body.
-        for pos in T.serial(covered, q_total, unroll=False):
+        for pos in T.serial(covered, q_total):
             for e in range(EPT):
                 _store_bf16_bits(
                     out, (pos * NUM_VALUE_HEADS + hv) * HEAD_DIM + tid + e * NT, T.uint16(0)
