@@ -169,7 +169,7 @@ SW  = min(D, NT) // 32        # warp partials per reduction    4 | 2
 host_assert(KS == (4 if T == 1 else 2) and VSPLIT == 4)
 host_assert(not (T == 1 and N * HV >= 128))   # else the one-warp kernel wins
 host_assert(HV % RATIO == 0)
-host_assert(state_slot_stride % 8 == 0)       # cute.assume(divby=8), :769-797
+host_assert(state_slot_stride % 8 == 0)       # cute.assume(divby=8), :766-767
 
 # Runtime ABI. `q_total` may exceed `cu[n_seq]` only in the T == 1 decode
 # layout; see the orphan note at the end.
@@ -277,8 +277,8 @@ for t in range(T):                # constexpr unroll
         pidx = 0
     # instruction_selection: setp.lt.s32 + selp.b32; extent: scalar
 
-    ves.append(cast_f32(v[pidx, hv, v_idx]))
-    # instruction_selection: ld.global.b16 + cvt.f32.bf16; extent: scalar
+    ves.append(v[pidx, hv, v_idx])            # stays BF16 until :681
+    # instruction_selection: ld.global.b16; extent: scalar
     bbs.append(cast_f32(beta[pidx, hv]))       # BETA_LOGIT == 0: already sigmoid'd
     # instruction_selection: ld.global.b16 + cvt.f32.bf16; extent: scalar
 
@@ -315,10 +315,14 @@ for t in range(T):                # constexpr unroll
             mul(gate, sp, -av)
             # instruction_selection: mul.f32; extent: scalar
         else:                                  # GATE_MODE == 2, lower bound
-            mul(u, x, av)
+            neg(u, x)
+            # instruction_selection: neg.f32; extent: scalar
+            mul(u, av, u)
             # instruction_selection: mul.f32; extent: scalar
-            mul(u, u, -LOG2_E)
+            mul(u, u, LOG2_E)
             # instruction_selection: mul.f32; extent: scalar
+            # The negation is its own instruction on `x`; it is NOT folded into
+            # a negative LOG2_E constant.
             exp2(u, u)
             # instruction_selection: ex2.approx.ftz.f32; extent: scalar
             add(u, u, 1.0)
@@ -337,27 +341,37 @@ for t in range(T):                # constexpr unroll
         # applied in phase B as a scalar factor, not here.
         copy_r2s(eg, s_eg[t * D + de])
         # instruction_selection: st.shared.b32; extent: scalar
-        copy_r2s(ke, s_kr[t * D + de])
+        # The staging tiles are FP32, so q/k convert here; the L2 partials
+        # above consumed the raw BF16 registers instead.
+        cast_f32(ke_f, ke)
+        # instruction_selection: cvt.f32.bf16; extent: scalar
+        cast_f32(qe_f, qe)
+        # instruction_selection: cvt.f32.bf16; extent: scalar
+        copy_r2s(ke_f, s_kr[t * D + de])
         # instruction_selection: st.shared.b32; extent: scalar
-        copy_r2s(qe, s_qr[t * D + de])
+        copy_r2s(qe_f, s_qr[t * D + de])
         # instruction_selection: st.shared.b32; extent: scalar
 
     # ---- L2 partial reduction (recurrent_kda.py:633-640) ----
     # A full 32-lane butterfly, five rounds, even though only SW warp results
-    # are consumed.
-    for off in (1, 2, 4, 8, 16):  # constexpr
+    # are consumed. The offsets DESCEND: `warp_reduction_sum` halves a group
+    # width, so the emission order is 16, 8, 4, 2, 1. FP32 addition is not
+    # associative and the checkpoint must be exact, so the port must not
+    # reverse this.
+    for off in (16, 8, 4, 2, 1):  # constexpr
         add(sqp, sqp, shuffle_bfly(sqp, off, 31, 0xffffffff))
         # instruction_selection: shfl.sync.bfly.b32 + add.f32; extent: scalar
         add(skp, skp, shuffle_bfly(skp, off, 31, 0xffffffff))
         # instruction_selection: shfl.sync.bfly.b32 + add.f32; extent: scalar
 
     copy_r2s(sqp, s_red[t * 16 + wid],     predicate=(lane == 0) & (wid < SW))
-    # instruction_selection: @p st.shared.b32; extent: scalar
+    # instruction_selection: setp.ne.b32 + branch-guarded st.shared.b32; extent:
+    # scalar  (ptxas if-converts this site to a predicated STS in SASS)
     copy_r2s(skp, s_red[t * 16 + 8 + wid], predicate=(lane == 0) & (wid < SW))
-    # instruction_selection: @p st.shared.b32; extent: scalar
+    # instruction_selection: setp.ne.b32 + branch-guarded st.shared.b32; extent: scalar
 
 cta_sync()
-# instruction_selection: barrier.sync.aligned; extent: CTA
+# instruction_selection: bar.sync 0; extent: CTA
 # The ONLY barrier in the kernel. It separates the `d = tid % D` element mapping
 # above from the `(v_idx, part)` granule mapping below.
 
@@ -377,14 +391,15 @@ for t in range(T):                # constexpr unroll; `s` carries across tokens
         pidx = token_base + t
         ve, bb = ves[t], bbs[t]
 
-        # ---- L2 factors from the staged partials (:657-663) ----
+        # ---- L2 factors from the staged partials (:657-664) ----
         fill(sqt, 0.0); fill(skt, 0.0)
         for w in range(SW):       # constexpr
             copy_s2r(s_red[t * 16 + w], r0)
-            # instruction_selection: ld.shared.v2.b32 when SW == 2 (the two
-            # partials are adjacent), else ld.shared.b32; extent: scalar
+            # instruction_selection: the SW loop is fully vectorized in both
+            # in-scope shapes -- ld.shared.v2.b32 at SW == 2 (T > 1) and
+            # ld.shared.v4.b32 at SW == 4 (T == 1); extent: SW f32
             copy_s2r(s_red[t * 16 + 8 + w], r1)
-            # instruction_selection: ld.shared.v2.b32 / ld.shared.b32; extent: scalar
+            # instruction_selection: ld.shared.v2.b32 / ld.shared.v4.b32; extent: SW f32
             add(sqt, sqt, r0)
             # instruction_selection: add.f32; extent: scalar
             add(skt, skt, r1)
@@ -435,12 +450,13 @@ for t in range(T):                # constexpr unroll; `s` carries across tokens
             add(pred, pred, shuffle_bfly(pred, 1 << off_i, 31, 0xffffffff))
             # instruction_selection: shfl.sync.bfly.b32 + add.f32; extent: scalar
 
-        # ---- delta rule (:682) -- `rk` appears TWICE, once inside and once
+        # ---- delta rule (:681) -- `rk` appears TWICE, once inside and once
         # outside the parenthesis. This is not a typo in the source.
         mul(t1, rk, pred)
         # instruction_selection: mul.f32; extent: scalar
         sub(t1, ve, t1)
-        # instruction_selection: sub.f32; extent: scalar
+        # instruction_selection: sub.rn.f32.bf16; extent: scalar -- `ve` is
+        # never converted; the mixed-precision subtract takes the raw BF16.
         mul(deltak, rk, bb)
         # instruction_selection: mul.f32; extent: scalar
         mul(deltak, deltak, t1)
@@ -486,9 +502,12 @@ for t in range(T):                # constexpr unroll; `s` carries across tokens
         cast(o_bf, o)
         # instruction_selection: cvt.rn.bf16.f32; extent: scalar
         copy_r2g(o_bf, out[pidx, hv, v_idx], predicate=(part == 0))
-        # instruction_selection: @p st.global.b16; extent: scalar
-        # MUST be a predicated store, not a branch around one: inline asm is
-        # opaque to ptxas, so an `if` around it cannot be if-converted and costs
+        # instruction_selection: setp.ne.b32 + branch-guarded st.global.b16;
+        # extent: scalar
+        # DELIBERATE DEVIATION: the source leaves this one branch-guarded and
+        # ptxas does NOT if-convert it. The TIRx port emits `@p st.global.b16`
+        # instead, because inline asm is opaque to ptxas -- an `if` around an asm
+        # store can never be if-converted, and in the one-warp sibling that cost
         # extra BRA/BSYNC plus divergence-induced shuffle bank conflicts.
 
         # ---- BF16 checkpoint write, eviction-hinted (:702-713) ----
@@ -502,12 +521,13 @@ for t in range(T):                # constexpr unroll; `s` carries across tokens
 
     else:
         # Pad rows (slot < 0) still own their output element and must zero it,
-        # because the host allocates `out` uninitialized (:1810, :1848).
+        # because the host allocates `out` uninitialized (:1828-1830, :1848).
         fill(zero_bf, 0.0)
-        # instruction_selection: mov.b16 of an immediate; extent: scalar
+        # instruction_selection: none -- folded into the store's immediate operand
         copy_r2g(zero_bf, out[token_base + t, hv, v_idx],
                  predicate=in_row & (part == 0))
-        # instruction_selection: @p st.global.b16; extent: scalar
+        # instruction_selection: branch-guarded st.global.b16 [addr], 0x0000;
+        # extent: scalar  (ptxas if-converts this site to a predicated STG)
 
 # ===========================================================================
 # Orphan packed suffix (:719-725)
@@ -516,7 +536,7 @@ for t in range(T):                # constexpr unroll; `s` carries across tokens
 # head zeroes them, covering all D columns via `tid + e*NT`.
 #
 # Reachable only in the T == 1 decode layout: spec mode sizes `out` as
-# N*NUM_TOKENS while `cu_seqlens` must step by T (:1658-1661, :1810), so
+# N*NUM_TOKENS while `cu_seqlens` must step by T (:1658-1661, :1822), so
 # `q_total == cu[n_seq]` there and this loop is empty.
 
 if (n == 0) & (vz == 0) & (tid < D):
@@ -535,7 +555,7 @@ if (n == 0) & (vz == 0) & (tid < D):
 | `KC`, `G`, `CPB`, `NT`, `EPT`, `SW` | constexpr | derived from `(D, KS, VSPLIT)` at `:515-521` |
 | `n_seq` | constexpr in TIRx, runtime in the source | the source reads it from `grid_dim()`; every TIRx config pins a batch size, so specializing is exact and removes one launch scalar |
 | `q_total`, `g` token stride, state slot stride, `scale`, `lower_bound` | runtime scalars | passed by the host (`:2185-2196`) |
-| `source` stride, `source_indices` stride | dropped | dead under `USE_SRC = 0`; the host even aliases `source = state` (`:2142`) |
+| `source` stride, `source_indices` stride | dropped | dead under `USE_SRC = 0`; the host even aliases `source = state` (`:2143-2145`) |
 | `stream` | dropped | supplied by the TIRx runtime |
 
 ## TIRx module and benchmark contract
@@ -569,9 +589,9 @@ computation. Per-token multipliers assume the 8 unrolled tokens.
 | `mul.f32x2` | 1024 | 8 tokens x 128 = the four 8-wide multiplies per granule (`s*eg`, `kr*svec`, `kr*deltak`, `qr*svec`) |
 | `add.f32x2` | 704 | 8 tokens x 88 = `pvec` and `ovec` accumulation plus the rank-1 add |
 | `ld.shared.v2.b64` | 384 | 8 tokens x 3G x 2 = the `eg`/`kr`/`qr` 8-wide reads; `kr` is loaded once and reused across both passes |
-| `add.f32` | 272 | the two 7-add trees per token, the butterfly joins, and the L2/eps scalars |
+| `add.f32` | 272 | the two 7-add trees per token, the butterfly joins, the `1.0 +` of the sigmoid, and the L2/eps scalars |
 | `cvt.rn.bf16x2.f32` | 256 | 8 tokens x 4G = the checkpoint cast |
-| `cvt.f32.bf16` | 168 | state load plus the phase-A BF16 operands |
+| `cvt.f32.bf16` | 168 | the initial state granule plus the q/k staging converts and `beta` |
 | `mul.f32` | 105 | gate scalars, `rq`, `deltak` |
 | `shfl.sync.bfly.b32` | 96 | 80 = 8 tokens x 2 reductions x 5 rounds (`warp_reduction_sum`), 16 = 8 tokens x 2 KS joins x 1 round (`KS = 2`) |
 | `ld.global.b16` | 64 | 8 tokens x (q, k, g at `EPT = 2`, plus `v` and `beta`) |
@@ -582,7 +602,9 @@ computation. Per-token multipliers assume the 8 unrolled tokens.
 | `add.rn.f32.bf16` | 16 | 8 tokens x 2 elements: `g + dt_bias` |
 | `rcp.rn.f32` | 16 | 8 tokens x 2 elements: the `GATE_MODE = 2` sigmoid |
 | `rsqrt.approx.f32` | 16 | 8 tokens x 2: the key and query L2 factors |
-| `ld.shared.v2.b32` | 16 | 8 tokens x 2: the `SW = 2` `s_red` pair reads |
+| `ld.shared.v2.b32` | 16 | 8 tokens x 2: the `SW = 2` `s_red` pair reads (the `T = 1` shape uses 2 x `ld.shared.v4.b32` instead, `SW = 4`) |
+| `neg.f32` | 16 | 8 tokens x 2 elements: the `GATE_MODE = 2` sigmoid negation |
+| `sub.rn.f32.bf16` | 8 | one per token: `ve - rk*pred`, consuming the raw BF16 `v` |
 | `ld.global.L1::no_allocate.v4.b32` | 8 | G initial-state granules |
 
 Three selections are load-bearing and easy to get wrong:
@@ -596,8 +618,12 @@ Three selections are load-bearing and easy to get wrong:
    instruction in the whole kernel. In particular `rsqrt.approx.f32` keeps
    denormals, and the `GATE_MODE = 2` sigmoid is `rcp.rn.f32` — a
    correctly-rounded reciprocal, not `rcp.approx.f32` and not `div.rn.f32`.
-3. **Predicated stores.** The output store, the pad-row zero-fill, and the
-   `s_red` publication are all `@p`-predicated in the source's SASS. Wrapping an
-   inline-asm store in an `if` instead is what regressed the one-warp sibling:
-   ptxas cannot if-convert opaque asm, which cost extra `BRA`/`BSYNC` and turned
-   the resulting divergence into shared-memory bank conflicts.
+3. **Guarded stores, and one deliberate deviation.** The source's PTX contains
+   **zero** predicated stores -- all three guarded sites are `setp` plus a branch.
+   ptxas then if-converts two of them (the `s_red` publication and the pad-row
+   zero-fill) into predicated SASS stores, but leaves the `part == 0` output store
+   branch-guarded. The TIRx port emits `@p st.global.b16` at all three sites
+   anyway. That is an intentional improvement, not a transcription: inline asm is
+   opaque to ptxas, so an `if` wrapped around an asm store can never be
+   if-converted, and in the one-warp sibling that cost extra `BRA`/`BSYNC` and
+   turned the resulting divergence into shared-memory bank conflicts.
