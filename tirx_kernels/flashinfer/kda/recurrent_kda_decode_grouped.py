@@ -615,14 +615,13 @@ def _recurrent_kda_decode_grouped(
         head_row, "int64"
     )
     s_pairs = T.alloc_local((4 * G,), "uint64")  # THE recurrent carry
+    s_words = T.alloc_local((4 * G,), "uint32")  # raw BF16 granules; widened below
     for gi in range(G):
         words = _ld_global_granule_no_alloc(
             state, read_base + T.cast(gi * KS * 8 + part * 8, "int64")
         )
         for pr in range(4):
-            lo = _bf16_to_f32(T.cast(T.bitwise_and(words[pr], T.uint32(0xFFFF)), "uint16"))
-            hi = _bf16_to_f32(T.cast(T.shift_right(words[pr], T.uint32(16)), "uint16"))
-            s_pairs[gi * 4 + pr] = _pack_f32x2(lo, hi)
+            s_words[gi * 4 + pr] = words[pr]
 
     # --- loop-invariant gate constants (recurrent_kda.py:576-586) ----------
     av: T.float32 = T.float32(1.0)
@@ -688,6 +687,22 @@ def _recurrent_kda_decode_grouped(
 
     # The ONLY barrier: it separates the two thread-index mappings.
     T.cuda.cta_sync()
+
+    # Widen the state granules only now.  Nothing in phase A depends on them,
+    # so keeping the widening at the load site put a consumer 17 SASS
+    # instructions after the load and left its latency fully exposed; moving it
+    # here puts 215 instructions in between.  ptxas performs the same sink for
+    # the CuTe source, whose widening lands after the barrier at a distance of
+    # 199.  It cannot do so here because the *widening* is inline asm
+    # (``cvt.f32.bf16`` via ``_ptx_un``) and asm may not be reordered across
+    # ``bar.sync``; the loads are already correctly placed and move in neither
+    # build.
+    for gi in range(G):
+        for pr in range(4):
+            w = s_words[gi * 4 + pr]
+            lo = _bf16_to_f32(T.cast(w, "uint16"))
+            hi = _bf16_to_f32(T.cast(T.shift_right(w, T.uint32(16)), "uint16"))
+            s_pairs[gi * 4 + pr] = _pack_f32x2(lo, hi)
 
     # =======================================================================
     # Phase B: sequential recurrence over the tokens (recurrent_kda.py:645-717)

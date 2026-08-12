@@ -242,8 +242,9 @@ sb0 = reg_tile(bf16, (8, G))
 gv0 = slice(view(state[slot0, hv, v_idx, :], shape=(8, G, KS), stride=(1, KS * 8, 8)), part)
 copy_g2r(gv0, sb0, evict="no_allocate")
 # instruction_selection: ld.global.L1::no_allocate.v4.b32; extent: G x 16B vectors
-cast(s, sb0)
-# instruction_selection: cvt.f32.bf16; extent: 8*G element loop
+# The widening of `sb0` into `s` is NOT here -- it is deferred past the barrier;
+# see "state widening" below. Nothing in phase A reads `s`, so the load issues
+# now and its latency is covered by all of phase A.
 
 # ===========================================================================
 # Loop-invariant gate constants
@@ -376,6 +377,21 @@ cta_sync()
 # instruction_selection: bar.sync 0; extent: CTA
 # The ONLY barrier in the kernel. It separates the `d = tid % D` element mapping
 # above from the `(v_idx, part)` granule mapping below.
+
+# ---- state widening, deferred to here ----
+# The source writes this at the load site (:574) and ptxas sinks it below the
+# barrier on its own: in the compiled source the last state-granule LDG sits at
+# SASS index 91 and its first consumer at 290, a distance of 199. The loads
+# themselves do not move in either build -- they are already where they belong,
+# before the barrier. What ptxas cannot sink for this port is the **widening**,
+# because `cvt.f32.bf16` is emitted as inline asm and asm may not be reordered
+# across `bar.sync`. Leaving it at the load site therefore left a consumer 17
+# instructions after the load with its latency fully exposed; written here it
+# reaches a distance of 215. This is a scheduling placement only: same op, same
+# instruction, same extent, and `s` is still read for the first time by pass 1
+# of token 0 below.
+cast(s, sb0)
+# instruction_selection: cvt.f32.bf16; extent: 8*G element loop
 
 # ===========================================================================
 # Phase B: barrier-free sequential recurrence over the T tokens
