@@ -2,8 +2,8 @@
 
 - Timestamp: `14`
 - Label:     `post-refactor`
-- Git:       `{'tir': '664e979c', 'tirx-kernels': '9c6aa361', 'tirx-bench-ci': None}`
-- Workloads: 237 ok, 0 failed
+- Git:       `{'tir': 'ea0950ab', 'tirx-kernels': 'afdde9c1', 'tirx-bench-ci': None}`
+- Workloads: 244 ok, 0 failed
 
 Grouped workloads show one row per config and one timing column per implementation. Single-TIR workloads show ref/ours against the fastest reference implementation.
 
@@ -303,6 +303,18 @@ Grouped workloads show one row per config and one timing column per implementati
 | `fp16_linear_m128_k1024` | tirx | 2.9066 | flashinfer | 3.0670 | 1.055 | — |
 | `fp16_linear_m16384_k7168` | tirx | 55.8258 | flashinfer | 57.4695 | 1.029 | — |
 | `fp16_linear_m4096_k4096` | tirx | 17.3447 | flashinfer | 19.5163 | 1.125 | — |
+
+## recurrent_kda_decode_one_warp
+
+| config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
+|---|---|---:|---|---:|---:|---|
+| `hv12_b16_tr16_lb` | tirx | 5.8498 | flashinfer_cutedsl | 5.9535 | 1.018 | — |
+| `hv12_b64_tr16_lb` | tirx | 13.5677 | flashinfer_cutedsl | 13.9460 | 1.028 | — |
+| `hv16_b128_tr16_lb` | tirx | 27.4293 | flashinfer_cutedsl | 29.3557 | 1.070 | — |
+| `hv16_b16_tr16_lb` | tirx | 6.4754 | flashinfer_cutedsl | 6.5136 | 1.006 | — |
+| `hv16_b32_tr16_lb` | tirx | 10.1665 | flashinfer_cutedsl | 10.3515 | 1.018 | — |
+| `hv16_b64_tr16_lb` | tirx | 15.8909 | flashinfer_cutedsl | 17.0696 | 1.074 | — |
+| `hv16_b8_tr8_lb` | tirx | 5.3561 | flashinfer_cutedsl | 5.4102 | 1.010 | — |
 
 ## selective_state_update_mtp_horizontal
 
