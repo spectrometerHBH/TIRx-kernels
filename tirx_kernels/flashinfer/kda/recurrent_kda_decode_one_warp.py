@@ -271,6 +271,15 @@ def _load_bf16x8(buffer, index):
     return bits
 
 
+def _load_u32x4(buffer, index):
+    """``ld.global.v4.b32`` -- one 16-byte tile, left packed."""
+    words = T.alloc_local((4,), "uint32")
+    T.evaluate(
+        T.ptx.ld.global_.v4.b32(words[0], words[1], words[2], words[3], buffer.ptr_to([index]))
+    )
+    return words
+
+
 def _store_bf16x8_words(buffer, index, words):
     """``st.global.v4.b32`` -- one 16-byte state row."""
     T.evaluate(
@@ -542,11 +551,25 @@ def _recurrent_kda_decode_one_warp(
     read_base = T.cast(init_seq_idx, "int64") * T.cast(STATE_SLOT_STRIDE, "int64") + T.cast(
         state_head_base, "int64"
     )
+    # Issue every row's load before widening any of them.  bench_suite times a
+    # cold L2, so the figure of merit here is how many DRAM misses are in
+    # flight; interleaving the widening with the loads lets each cvt chain sit
+    # on the critical path of the next load.
+    h_words = T.alloc_local((4 * ROWS,), "uint32")
     for j in T.unroll(ROWS):
         v_idx_l: T.int32 = v_offset + v_lane + V_LANES * j
-        h_bits = _load_bf16x8(state, read_base + T.cast(v_idx_l * HEAD_DIM, "int64"))
-        for i in T.unroll(8):
-            h_reg[j * 8 + i] = _bf16_to_f32(h_bits[i])
+        words = _load_u32x4(state, read_base + T.cast(v_idx_l * HEAD_DIM, "int64"))
+        for pr in T.unroll(4):
+            h_words[j * 4 + pr] = words[pr]
+    for j in T.unroll(ROWS):
+        for pr in T.unroll(4):
+            w: T.uint32 = h_words[j * 4 + pr]
+            h_reg[j * 8 + 2 * pr] = _bf16_to_f32(
+                T.cast(T.bitwise_and(w, T.uint32(0xFFFF)), "uint16")
+            )
+            h_reg[j * 8 + 2 * pr + 1] = _bf16_to_f32(
+                T.cast(T.shift_right(w, T.uint32(16)), "uint16")
+            )
 
     # --- per-head gate constants (recurrent_kda.py:302-305) -----------------
     h_K_offset: T.int32 = query_head_idx * HEAD_DIM

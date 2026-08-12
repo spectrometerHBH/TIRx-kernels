@@ -239,12 +239,24 @@ def recurrent_kda_decode_one_warp(
     # Row j of this lane is V row (v_offset + v_lane + V_LANES*j); the K slice
     # is the 8 contiguous elements at 8*k_lane, which is exactly 16 bytes.
     # -----------------------------------------------------------------------
+    # Every row's load is issued before any of them is widened. The source
+    # interleaves the two, and this is the one deliberate deviation from its
+    # order here: same loads, same widening, same values, only the issue point
+    # moves. bench_suite times a cold L2 (it zeroes a 256 MB buffer before every
+    # timed iteration), so the figure of merit is how many DRAM misses are in
+    # flight; interleaved, each cvt chain sits on the critical path of the next
+    # load. Worth 1.7-3.7% -- see the perf notes.
+    #
+    # Only the loads move. Hoisting the dt_bias loads the same way was measured
+    # and rejected: 4 more f32 live across the token loop costs 6.6% on
+    # hv16_b16_tr16_lb, in a kernel that already holds ROWS*8 f32 of state.
     for j in static_range(ROWS):
         v_idx = v_offset + v_lane + V_LANES * j
-        copy_g2r(h_read[v_idx, 8 * k_lane : 8 * k_lane + 8], h_bf16)
+        copy_g2r(h_read[v_idx, 8 * k_lane : 8 * k_lane + 8], h_words[j])
         # instruction_selection: ld.global.v4.b32; extent: one 16-byte tile (8 bf16) per j, ROWS issues
+    for j in static_range(ROWS):
         for i in static_range(8):
-            h_reg[j, i] = cast("f32", h_bf16[i])
+            h_reg[j, i] = cast("f32", h_words[j][i])
             # instruction_selection: cvt.f32.bf16; extent: one scalar, 8 per j
 
     # -----------------------------------------------------------------------
