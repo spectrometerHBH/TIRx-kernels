@@ -653,21 +653,38 @@ def _recurrent_kda_decode_grouped(
     ves = T.alloc_local((NUM_TOKENS,), "uint16")  # stays BF16 until :681
     bbs = T.alloc_local((NUM_TOKENS,), "float32")
 
+    # Issue every token's global loads before consuming any of them.  With a
+    # cold L2 -- which is what bench_suite measures, and what an inference
+    # server sees -- the kernel is bound by how many DRAM misses are in flight,
+    # not by instruction count.  Loading and consuming one token at a time keeps
+    # only EPT*3+2 requests outstanding; hoisting all T tokens keeps T times as
+    # many.
+    q_bits = T.alloc_local((NUM_TOKENS * EPT,), "uint16")
+    k_bits = T.alloc_local((NUM_TOKENS * EPT,), "uint16")
+    g_bits = T.alloc_local((NUM_TOKENS * EPT,), "uint16")
+    b_bits = T.alloc_local((NUM_TOKENS,), "uint16")
     for t in range(NUM_TOKENS):
         slots[t] = _load_i32(ssm_idx, n * NUM_TOKENS + t)
         # Out-of-row tokens clamp to token 0 so the loads stay in bounds; the
         # value is discarded by the `active` predicate in phase B.
         pidx: T.int32 = T.if_then_else(t < seq_len, token_base + t, 0)
         ves[t] = _load_bf16_bits(v, (pidx * NUM_VALUE_HEADS + hv) * HEAD_DIM + v_idx)
-        bbs[t] = _bf16_to_f32(_load_bf16_bits(beta, pidx * NUM_VALUE_HEADS + hv))
+        b_bits[t] = _load_bf16_bits(beta, pidx * NUM_VALUE_HEADS + hv)
+        for e in range(EPT):
+            de_l: T.int32 = d + e * NT
+            q_bits[t * EPT + e] = _load_bf16_bits(q, (pidx * NUM_HEADS + h) * HEAD_DIM + de_l)
+            k_bits[t * EPT + e] = _load_bf16_bits(k, (pidx * NUM_HEADS + h) * HEAD_DIM + de_l)
+            g_bits[t * EPT + e] = _load_bf16_bits(g, pidx * g_stride_q + hv * HEAD_DIM + de_l)
+    for t in range(NUM_TOKENS):
+        bbs[t] = _bf16_to_f32(b_bits[t])
 
         sqp: T.float32 = T.float32(0.0)
         skp: T.float32 = T.float32(0.0)
         for e in range(EPT):
             de: T.int32 = d + e * NT
-            qe = _load_bf16_bits(q, (pidx * NUM_HEADS + h) * HEAD_DIM + de)
-            ke = _load_bf16_bits(k, (pidx * NUM_HEADS + h) * HEAD_DIM + de)
-            ge = _load_bf16_bits(g, pidx * g_stride_q + hv * HEAD_DIM + de)
+            qe = q_bits[t * EPT + e]
+            ke = k_bits[t * EPT + e]
+            ge = g_bits[t * EPT + e]
 
             # The L2 partials consume the raw BF16 registers.
             sqp = _fma_bf16(qe, qe, sqp)

@@ -269,8 +269,18 @@ for e in range(EPT):              # constexpr
 # ===========================================================================
 # Thread mapping here is `d + e*NT`, NOT the (v_idx, part) mapping of phase B.
 
-slots, ves, bbs = [], [], []      # constexpr python lists, one entry per token
+slots, ves = [], []               # constexpr python lists, one entry per token
+q_bits, k_bits, g_bits, b_bits = [], [], [], []
 
+# --- issue: every token's global loads, before any of them is consumed ------
+# The source loads and consumes one token at a time.  Splitting the loop is the
+# one deliberate deviation from its dataflow order: the values, their types and
+# their consumers are unchanged, only the issue point moves.  bench_suite
+# measures a cold L2 (it zeroes a 256 MB buffer before every timed iteration),
+# which is also what an inference server sees, and under a cold L2 this kernel
+# is bound by how many DRAM misses are in flight rather than by instruction
+# count.  Per-token issue keeps 3*EPT+3 requests outstanding; issuing all T
+# tokens keeps T times as many.  Cost is T*(3*EPT+1) BF16 staging registers.
 for t in range(T):                # constexpr unroll
     slots.append(ssm_idx[n, t])
     # instruction_selection: ld.global.b32; extent: scalar
@@ -284,18 +294,28 @@ for t in range(T):                # constexpr unroll
 
     ves.append(v[pidx, hv, v_idx])            # stays BF16 until :681
     # instruction_selection: ld.global.b16; extent: scalar
-    bbs.append(cast_f32(beta[pidx, hv]))       # BETA_LOGIT == 0: already sigmoid'd
-    # instruction_selection: ld.global.b16 + cvt.f32.bf16; extent: scalar
+    b_bits.append(beta[pidx, hv])              # BETA_LOGIT == 0: already sigmoid'd
+    # instruction_selection: ld.global.b16; extent: scalar
+    for e in range(EPT):          # constexpr
+        de = d + e * NT
+        q_bits.append(q[pidx, h,  de])
+        # instruction_selection: ld.global.b16; extent: scalar
+        k_bits.append(k[pidx, h,  de])
+        # instruction_selection: ld.global.b16; extent: scalar
+        g_bits.append(g[pidx, hv, de])
+        # instruction_selection: ld.global.b16; extent: scalar
+
+# --- consume: gate math and the L2 partials, off the staged registers -------
+bbs = []
+for t in range(T):                # constexpr unroll
+    bbs.append(cast_f32(b_bits[t]))
+    # instruction_selection: cvt.f32.bf16; extent: scalar
 
     fill(sqp, 0.0); fill(skp, 0.0)
     for e in range(EPT):          # constexpr
-        de = d + e * NT
-        qe = q[pidx, h,  de]
-        # instruction_selection: ld.global.b16; extent: scalar
-        ke = k[pidx, h,  de]
-        # instruction_selection: ld.global.b16; extent: scalar
-        ge = g[pidx, hv, de]
-        # instruction_selection: ld.global.b16; extent: scalar
+        qe = q_bits[t * EPT + e]
+        ke = k_bits[t * EPT + e]
+        ge = g_bits[t * EPT + e]
 
         # The L2 partials accumulate the BF16 loads directly into FP32.
         fma(sqp, qe, qe, sqp)
