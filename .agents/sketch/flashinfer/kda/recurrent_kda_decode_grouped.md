@@ -242,7 +242,7 @@ sb0 = reg_tile(bf16, (8, G))
 gv0 = slice(view(state[slot0, hv, v_idx, :], shape=(8, G, KS), stride=(1, KS * 8, 8)), part)
 copy_g2r(gv0, sb0, evict="no_allocate")
 # instruction_selection: ld.global.L1::no_allocate.v4.b32; extent: G x 16B vectors
-if not DEFER_WIDENING:                    # T = 8
+if not DEFER_WIDENING:                    # T >= 4
     cast(s, sb0)
     # instruction_selection: cvt.f32.bf16; extent: 8*G element loop
 # Otherwise the widening is written after the barrier; see "state widening"
