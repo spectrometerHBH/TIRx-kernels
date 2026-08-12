@@ -688,15 +688,15 @@ def _recurrent_kda_decode_grouped(
     # The ONLY barrier: it separates the two thread-index mappings.
     T.cuda.cta_sync()
 
-    # Widen the state granules only now.  Nothing in phase A depends on them,
-    # so keeping the widening at the load site put a consumer 17 SASS
-    # instructions after the load and left its latency fully exposed; moving it
-    # here puts 215 instructions in between.  ptxas performs the same sink for
-    # the CuTe source, whose widening lands after the barrier at a distance of
-    # 199.  It cannot do so here because the *widening* is inline asm
-    # (``cvt.f32.bf16`` via ``_ptx_un``) and asm may not be reordered across
-    # ``bar.sync``; the loads are already correctly placed and move in neither
-    # build.
+    # Widen the state granules only now.  Nothing in phase A depends on them, so
+    # keeping the widening at the load site put a consumer 17 SASS instructions
+    # after the load and left its latency fully exposed; written here, ptxas
+    # schedules it 215 instructions after the load.  What matters is that
+    # distance, not which side of the barrier it lands on: ptxas sinks the
+    # widening below the barrier for the CuTe source (distance 199) but hoists
+    # it back above the barrier here, even though it is written after
+    # ``cta_sync()`` and appears after ``bar.sync`` in the emitted PTX.  The
+    # loads themselves move in neither build.
     for gi in range(G):
         for pr in range(4):
             w = s_words[gi * 4 + pr]

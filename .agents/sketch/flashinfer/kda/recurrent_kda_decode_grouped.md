@@ -379,17 +379,26 @@ cta_sync()
 # above from the `(v_idx, part)` granule mapping below.
 
 # ---- state widening, deferred to here ----
-# The source writes this at the load site (:574) and ptxas sinks it below the
-# barrier on its own: in the compiled source the last state-granule LDG sits at
-# SASS index 91 and its first consumer at 290, a distance of 199. The loads
-# themselves do not move in either build -- they are already where they belong,
-# before the barrier. What ptxas cannot sink for this port is the **widening**,
-# because `cvt.f32.bf16` is emitted as inline asm and asm may not be reordered
-# across `bar.sync`. Leaving it at the load site therefore left a consumer 17
-# instructions after the load with its latency fully exposed; written here it
-# reaches a distance of 215. This is a scheduling placement only: same op, same
-# instruction, same extent, and `s` is still read for the first time by pass 1
-# of token 0 below.
+# What this buys is DISTANCE from the load, not a particular side of the barrier.
+# Measured on `ver_t2_hv16_b8`, address-ordered SASS, last state-granule LDG ->
+# first widening instruction:
+#
+#   CuTe source                       91 -> 290   distance 199   (after BAR@287)
+#   this port, widening at load site  78 ->  95   distance  17   (before BAR@418)
+#   this port, widening written here  78 -> 293   distance 215   (before BAR@416)
+#
+# The loads do not move in either build; they are already where they belong.
+# ptxas sinks the widening below the barrier for the source but hoists it back
+# above the barrier for this port even though it is written after `cta_sync()`
+# here and appears after `bar.sync` in the emitted PTX -- so inline asm IS
+# reordered across the barrier, and the barrier side is not what the port
+# controls. What the port does control is program order, and moving the widening
+# later takes ptxas's chosen position from 17 instructions after the load to
+# 215, which is what covers the load latency. Why ptxas picks opposite sides for
+# the two builds is not established here.
+#
+# This is a scheduling placement only: same op, same instruction, same extent,
+# and `s` is still read for the first time by pass 1 of token 0 below.
 cast(s, sb0)
 # instruction_selection: cvt.f32.bf16; extent: 8*G element loop
 
