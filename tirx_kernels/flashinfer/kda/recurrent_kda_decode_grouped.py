@@ -546,8 +546,12 @@ def _recurrent_kda_decode_grouped(
     # TIRX_TRANSCRIBE_START recurrent_kda_decode_grouped
     # --- CTA and thread coordinates (recurrent_kda.py:512-524) -------------
     hv, n, vz = T.cta_id([NUM_VALUE_HEADS, NUM_SEQS, VSPLIT])
-    lane, wid = T.thread_id([32, NUM_WARPS])
-    tid: T.int32 = wid * 32 + lane
+    # A flat NT-thread block, matching the source's block=(NT, 1, 1); a 2-D
+    # [32, NUM_WARPS] block would make every use of `tid` read two special
+    # registers instead of one.
+    tid = T.thread_id([NT])
+    lane: T.int32 = tid % 32
+    wid: T.int32 = tid // 32
     h: T.int32 = hv // RATIO
     v_idx: T.int32 = vz * CPB + tid // KS  # the state column this thread owns
     part: T.int32 = tid % KS  # which K-slice of that column
