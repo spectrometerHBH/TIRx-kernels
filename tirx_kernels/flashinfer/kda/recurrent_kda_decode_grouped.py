@@ -458,6 +458,9 @@ def _specialization(kwargs: dict[str, Any]) -> dict[str, Any]:
         "EPT": tiling["EPT"],
         "SW": tiling["SW"],
         "NUM_WARPS": tiling["NT"] // 32,
+        # Defer the state widening past the barrier only for small T; see the
+        # comment at the deferred block for the measured split.
+        "DEFER_WIDENING": 1 if num_tokens <= 2 else 0,
         "VSPLIT": VSPLIT,
         "GATE_MODE": gate_mode,
         "Q_TOTAL": q_total,
@@ -511,6 +514,7 @@ def _recurrent_kda_decode_grouped(
     EPT: T.constexpr,
     SW: T.constexpr,
     NUM_WARPS: T.constexpr,
+    DEFER_WIDENING: T.constexpr,
     VSPLIT: T.constexpr,
     GATE_MODE: T.constexpr,
     Q_TOTAL: T.constexpr,
@@ -615,14 +619,22 @@ def _recurrent_kda_decode_grouped(
         head_row, "int64"
     )
     s_pairs = T.alloc_local((4 * G,), "uint64")  # THE recurrent carry
+    # Only allocate the staging registers on the path that uses them: leaving
+    # this unconditional cost 4*G idle registers at T >= 4 and regressed
+    # ver_t8_hv12_b64 (3072 CTAs, the most occupancy-sensitive row) by 18%.
+    if DEFER_WIDENING == 1:
+        s_words = T.alloc_local((4 * G,), "uint32")
     for gi in range(G):
         words = _ld_global_granule_no_alloc(
             state, read_base + T.cast(gi * KS * 8 + part * 8, "int64")
         )
         for pr in range(4):
-            lo = _bf16_to_f32(T.cast(T.bitwise_and(words[pr], T.uint32(0xFFFF)), "uint16"))
-            hi = _bf16_to_f32(T.cast(T.shift_right(words[pr], T.uint32(16)), "uint16"))
-            s_pairs[gi * 4 + pr] = _pack_f32x2(lo, hi)
+            if DEFER_WIDENING == 1:
+                s_words[gi * 4 + pr] = words[pr]
+            else:
+                lo = _bf16_to_f32(T.cast(T.bitwise_and(words[pr], T.uint32(0xFFFF)), "uint16"))
+                hi = _bf16_to_f32(T.cast(T.shift_right(words[pr], T.uint32(16)), "uint16"))
+                s_pairs[gi * 4 + pr] = _pack_f32x2(lo, hi)
 
     # --- loop-invariant gate constants (recurrent_kda.py:576-586) ----------
     av: T.float32 = T.float32(1.0)
@@ -688,6 +700,21 @@ def _recurrent_kda_decode_grouped(
 
     # The ONLY barrier: it separates the two thread-index mappings.
     T.cuda.cta_sync()
+
+    if DEFER_WIDENING == 1:
+        # Small T only.  Nothing in phase A reads the state, so widening it at
+        # the load site puts a consumer ~17 SASS instructions after the load and
+        # exposes its latency; written here, ptxas schedules it ~215 later.  At
+        # T = 1 and 2 phase A is short and that exposure dominates, so deferring
+        # is worth 8-10% on decode and 2.5% on T = 2 verify.  At T >= 4 phase A
+        # is long enough to cover the load anyway and the deferral only extends
+        # 4*G register lifetimes, costing 2.4-2.8% on T = 8 -- hence the split.
+        for gi in range(G):
+            for pr in range(4):
+                w = s_words[gi * 4 + pr]
+                lo = _bf16_to_f32(T.cast(w, "uint16"))
+                hi = _bf16_to_f32(T.cast(T.shift_right(w, T.uint32(16)), "uint16"))
+                s_pairs[gi * 4 + pr] = _pack_f32x2(lo, hi)
 
     # =======================================================================
     # Phase B: sequential recurrence over the tokens (recurrent_kda.py:645-717)
