@@ -242,11 +242,8 @@ sb0 = reg_tile(bf16, (8, G))
 gv0 = slice(view(state[slot0, hv, v_idx, :], shape=(8, G, KS), stride=(1, KS * 8, 8)), part)
 copy_g2r(gv0, sb0, evict="no_allocate")
 # instruction_selection: ld.global.L1::no_allocate.v4.b32; extent: G x 16B vectors
-if not DEFER_WIDENING:                    # T >= 4
-    cast(s, sb0)
-    # instruction_selection: cvt.f32.bf16; extent: 8*G element loop
-# Otherwise the widening is written after the barrier; see "state widening"
-# below. The load itself does not move on either path.
+cast(s, sb0)
+# instruction_selection: cvt.f32.bf16; extent: 8*G element loop
 
 # ===========================================================================
 # Loop-invariant gate constants
@@ -400,41 +397,14 @@ cta_sync()
 # The ONLY barrier in the kernel. It separates the `d = tid % D` element mapping
 # above from the `(v_idx, part)` granule mapping below.
 
-# ---- state widening, deferred here when DEFER_WIDENING ----
-# Nothing in phase A reads `s`, so this placement reaches only scheduling: same
-# op, same extent, same instruction, same data-dependence order on both paths.
-# ptxas hoists this form back above the barrier anyway, so the two spellings
-# produce one schedule -- writing it at the end of phase A instead lands within
-# a few instructions of this on every landmark.
-#
-# Load-to-consumer distance in scheduled SASS:
-#
-#            T=1   T=2   T=4   T=8
-#   source    60   199   393   874
-#   deferred  71   216   462   970
-#   at load   19    18    21    16
-#
-# WHY IT IS CONDITIONAL IS NOT EXPLAINED. Deferring reproduces the source's
-# distance at every T, and is register-neutral or cheaper (96 -> 94 at T=1,
-# unchanged at T=2, 4, 8) -- so neither distance nor register pressure accounts
-# for the split. It is here because it is measured, on two independent clean
-# bench_suite matrices:
-#
-#                     deferred   at load site
-#   dec_hv16_b4        1.077       0.988
-#   dec_hv12_b8        1.100       0.995
-#   ver_t8_hv16_b1     0.966       1.002-1.005
-#   ver_t8_hv16_b4     0.969-0.982 0.995-0.996
-#
-# ncu corroborates the direction: deferring costs 3-4% on every T = 8 shape,
-# including ones bench_suite passes.
-#
-# THE BOUNDARY IS PINNED ONLY AT ITS ENDS. T = 1 wants deferral and T = 8 does
-# not; no measured row discriminates between `T <= 1`, `T <= 2` and `T <= 4`.
-# ver_t2_hv16_b8 fails in both builds (its spread is run-to-run drift) and
-# ver_t4_hv16_b32 passes in both. Do not read `T <= 2` as a located boundary.
-cast(s, sb0)
-# instruction_selection: cvt.f32.bf16; extent: 8*G element loop
+# The state widening used to be deferred to this point behind a `T <= 2`
+# constexpr, on measured evidence whose mechanism was never explained. Once
+# phase A issues all T tokens' loads up front, the two placements measure the
+# same on every row that motivated the split (ver_t8_hv16_b1 1.636 vs 1.671,
+# ver_t8_hv16_b4 1.664 vs 1.642, ver_t2_hv16_b8 1.086 vs 1.091), so the knob is
+# gone and the widening stays at the load site as in the source. The deferral
+# was a hand-rolled way of moving work off the load's critical path; issuing
+# the loads earlier addresses that directly.
 
 # ===========================================================================
 # Phase B: barrier-free sequential recurrence over the T tokens
@@ -614,7 +584,6 @@ if (n == 0) & (vz == 0) & (tid < D):
 | --- | --- | --- |
 | `D`, `T`, `KS`, `VSPLIT`, `RATIO`, `GATE_MODE`, `HAS_DT_BIAS`, `BETA_LOGIT`, `USE_L2`, `USE_SRC` | constexpr | the source's `cutlass.Constexpr` list (`:499-510`) |
 | `KC`, `G`, `CPB`, `NT`, `EPT`, `SW` | constexpr | derived from `(D, KS, VSPLIT)` at `:515-521` |
-| `DEFER_WIDENING` | constexpr, port-only | `1 if T <= 2 else 0`. No source counterpart: the source writes the widening at the load site and lets ptxas place it. Measured, not derived -- and its mechanism is unexplained; see the widening block. Pinned only at its ends. |
 | `n_seq` | constexpr in TIRx, runtime in the source | the source reads it from `grid_dim()`; every TIRx config pins a batch size, so specializing is exact and removes one launch scalar |
 | `q_total`, `g` token stride, state slot stride, `scale`, `lower_bound` | runtime scalars | passed by the host (`:2185-2196`) |
 | `source` stride, `source_indices` stride | dropped | dead under `USE_SRC = 0`; the host even aliases `source = state` (`:2143-2145`) |
