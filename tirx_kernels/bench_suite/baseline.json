@@ -3,12 +3,12 @@
   "label": "post-refactor",
   "git": {
     "tir": "ea0950ab",
-    "tirx-kernels": "ec56224c",
+    "tirx-kernels": "b3be0123",
     "tirx-bench-ci": null
   },
   "kernel_tree": {
     "tir:python/tvm/tirx": "4cbcd19685bc44fc81a64ae7708807a6f9bada7b",
-    "tirx-kernels:tirx_kernels": "f1098a5427b0503fd777f1e8236013a520b77409"
+    "tirx-kernels:tirx_kernels": "ba8163542076d30ce12bc983cf424f2bcbbeb396"
   },
   "baselines": {
     "torch": {
@@ -2790,11 +2790,11 @@
       "label": "hv12_b16_tr16_lb",
       "status": "ok",
       "impls": {
-        "tirx": 5.849790862892311,
-        "flashinfer_cutedsl": 5.953518892404526
+        "tirx": 5.695114378452278,
+        "flashinfer_cutedsl": 5.972974484759209
       },
       "aggregated": {
-        "rounds": 15,
+        "rounds": 5,
         "method": "mean"
       }
     },
@@ -2804,11 +2804,11 @@
       "label": "hv12_b64_tr16_lb",
       "status": "ok",
       "impls": {
-        "tirx": 13.567746771127391,
-        "flashinfer_cutedsl": 13.946044750862852
+        "tirx": 12.836577688146386,
+        "flashinfer_cutedsl": 13.868974685205652
       },
       "aggregated": {
-        "rounds": 15,
+        "rounds": 5,
         "method": "mean"
       }
     },
@@ -2818,11 +2818,11 @@
       "label": "hv16_b128_tr16_lb",
       "status": "ok",
       "impls": {
-        "tirx": 27.42927850474232,
-        "flashinfer_cutedsl": 29.355727391415865
+        "tirx": 26.685145709501946,
+        "flashinfer_cutedsl": 29.18576589228665
       },
       "aggregated": {
-        "rounds": 15,
+        "rounds": 5,
         "method": "mean"
       }
     },
@@ -2832,11 +2832,11 @@
       "label": "hv16_b16_tr16_lb",
       "status": "ok",
       "impls": {
-        "tirx": 6.475412025051306,
-        "flashinfer_cutedsl": 6.513564161631469
+        "tirx": 6.347254102290438,
+        "flashinfer_cutedsl": 6.483835513635386
       },
       "aggregated": {
-        "rounds": 15,
+        "rounds": 5,
         "method": "mean"
       }
     },
@@ -2846,11 +2846,11 @@
       "label": "hv16_b32_tr16_lb",
       "status": "ok",
       "impls": {
-        "tirx": 10.166546782718301,
-        "flashinfer_cutedsl": 10.351524484382622
+        "tirx": 9.69739584957777,
+        "flashinfer_cutedsl": 10.239276177315428
       },
       "aggregated": {
-        "rounds": 15,
+        "rounds": 5,
         "method": "mean"
       }
     },
@@ -2860,11 +2860,11 @@
       "label": "hv16_b64_tr16_lb",
       "status": "ok",
       "impls": {
-        "tirx": 15.890942031949107,
-        "flashinfer_cutedsl": 17.069550384272304
+        "tirx": 15.268888603603104,
+        "flashinfer_cutedsl": 16.90398539436306
       },
       "aggregated": {
-        "rounds": 15,
+        "rounds": 5,
         "method": "mean"
       }
     },
@@ -2874,11 +2874,11 @@
       "label": "hv16_b8_tr8_lb",
       "status": "ok",
       "impls": {
-        "tirx": 5.356144879180447,
-        "flashinfer_cutedsl": 5.410168248038516
+        "tirx": 5.247230154049852,
+        "flashinfer_cutedsl": 5.337711133525542
       },
       "aggregated": {
-        "rounds": 15,
+        "rounds": 5,
         "method": "mean"
       }
     },
