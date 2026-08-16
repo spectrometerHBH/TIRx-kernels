@@ -46,12 +46,9 @@ from tirx_kernels.flashinfer.utils.topk_radix import (
     from_ordered_u32,
     ld_shared_pair_u32,
     ld_shared_quad_u32,
-    ld_shared_u16,
     ld_shared_u32,
     ld_shared_u64,
     shfl_down_u32,
-    st_global_u16,
-    st_global_u32,
     st_shared_pair_u32,
     st_shared_quad_u32,
     st_shared_u16,
@@ -257,38 +254,95 @@ def _ld_global_words(buf, elem_index, load_bytes):
 
 
 def _stage_vector(buf, s_ordered, row_in, i, vec, load_bytes, is32, to_ordered, st_key):
-    """LoadToSharedOrdered's vector body (:612-617): one vector load, then
-    ``VEC_SIZE`` monotone key conversions and shared stores."""
+    """LoadToSharedOrdered's vector body (:612-617).
+
+    One vector load, ``VEC_SIZE`` monotone key conversions, then a single shared
+    store as wide as the load.  The source stores element-by-element and lets
+    nvcc coalesce the contiguous group (its PTX shows one ``st.shared.v4.b32``);
+    opaque ``T.ptx`` intrinsics cannot be merged after the fact, so the wide
+    form is requested directly.
+    """
     base = row_in + T.cast(i, "int64")
     if load_bytes == 2:
-        bits = _ld_global_bits(buf, base, False)
-        st_key(s_ordered, i, to_ordered(bits))
+        st_key(s_ordered, i, to_ordered(_ld_global_bits(buf, base, False)))
         return
     words = _ld_global_words(buf, base, load_bytes)
     if is32:
-        for j in range(vec):
-            st_key(s_ordered, i + j, to_ordered(words[j]))
+        keys = [to_ordered(w) for w in words]
     else:
-        for m in range(len(words)):
-            lo = T.cast(T.bitwise_and(words[m], T.uint32(0xFFFF)), "uint16")
-            hi = T.cast(T.shift_right(words[m], T.uint32(16)), "uint16")
-            st_key(s_ordered, i + m * 2, to_ordered(lo))
-            st_key(s_ordered, i + m * 2 + 1, to_ordered(hi))
+        # Each loaded word holds two 16-bit lanes; convert both and repack so the
+        # shared store keeps the same width as the global load.
+        keys = []
+        for word in words:
+            lo = to_ordered(T.cast(T.bitwise_and(word, T.uint32(0xFFFF)), "uint16"))
+            hi = to_ordered(T.cast(T.shift_right(word, T.uint32(16)), "uint16"))
+            keys.append(
+                T.bitwise_or(T.cast(lo, "uint32"), T.shift_left(T.cast(hi, "uint32"), T.uint32(16)))
+            )
+    if len(keys) == 4:
+        st_shared_quad_u32(s_ordered, i, keys[0], keys[1], keys[2], keys[3])
+    elif len(keys) == 2:
+        st_shared_pair_u32(s_ordered, i, keys[0], keys[1])
+    else:
+        st_shared_u32(s_ordered, i, keys[0])
 
 
-def _emit(out_idx, out_val, row_out, i, key, pos, offset, basic, ragged, is32, dtype):
-    """The mode epilogue the collect passes call per selected element (:1339-1375)."""
+@T.inline
+def _emit_pred(out_idx, out_val, row_out, i, key, pos, offset, pred, basic, ragged, is32, dtype):
+    """`_emit` with the store predicated on the instruction (`@p st.global.*`).
+
+    The collect emits sit inside a divergent condition. Writing that condition as
+    a guarded branch costs a branch plus a reconvergence per element; issuing the
+    store predicated instead lets the loop body stay straight-line, which is the
+    form nvcc produces for the source.
+    """
     slot = row_out + T.cast(pos, "int64")
     if basic:
-        st_global_u32(out_idx, slot, T.reinterpret("uint32", i))
+        T.evaluate(
+            T.ptx.st.global_.b32(out_idx.ptr_to([slot]), T.reinterpret("uint32", i), pred=pred)
+        )
         if is32:
-            st_global_u32(out_val, slot, from_ordered_u32(key))
+            T.evaluate(
+                T.ptx.st.global_.b32(out_val.ptr_to([slot]), from_ordered_u32(key), pred=pred)
+            )
         else:
-            st_global_u16(out_val, slot, from_ordered_u16(T.cast(key, "uint16")))
+            T.evaluate(
+                T.ptx.st.global_.b16(
+                    out_val.ptr_to([slot]), from_ordered_u16(T.cast(key, "uint16")), pred=pred
+                )
+            )
     elif ragged:
-        st_global_u32(out_idx, slot, T.reinterpret("uint32", i + offset))
+        T.evaluate(
+            T.ptx.st.global_.b32(
+                out_idx.ptr_to([slot]), T.reinterpret("uint32", i + offset), pred=pred
+            )
+        )
     else:
-        st_global_u32(out_idx, slot, T.reinterpret("uint32", i))
+        T.evaluate(
+            T.ptx.st.global_.b32(out_idx.ptr_to([slot]), T.reinterpret("uint32", i), pred=pred)
+        )
+
+
+@T.inline
+def _emit(out_idx, out_val, row_out, i, key, pos, offset, basic, ragged, is32, dtype):
+    """The mode epilogue the collect passes call per selected element (:1339-1375).
+
+    Native buffer stores, not ``T.ptx.st.global.*``: every call site sits inside a
+    divergent ``if``, and nvcc cannot if-convert a body containing opaque inline
+    asm, so an asm store forces a real branch with BSSY reconvergence where the
+    source predicates the store instead.
+    """
+    slot = row_out + T.cast(pos, "int64")
+    if basic:
+        out_idx[slot] = i
+        if is32:
+            out_val[slot] = T.reinterpret("float32", from_ordered_u32(key))
+        else:
+            out_val[slot] = T.reinterpret(dtype, from_ordered_u16(T.cast(key, "uint16")))
+    elif ragged:
+        out_idx[slot] = i + offset
+    else:
+        out_idx[slot] = i
 
 
 # ---------------------------------------------------------------------------
@@ -349,7 +403,12 @@ def get_kernel(
         return from_ordered_u32(key) if is32 else from_ordered_u16(key)
 
     def ld_key(buf, i):
-        return ld_shared_u32(buf, i) if is32 else ld_shared_u16(buf, i)
+        # Native buffer read, not an opaque `T.ptx.ld.shared.*` asm block: both
+        # lower to the same `ld.shared.b32`/`ld.shared.b16`, but inline asm is a
+        # scheduling barrier, so nvcc cannot hoist several key loads ahead of
+        # their uses the way it does for the source's plain `shared_ordered[i]`.
+        # That difference shows up directly as short-scoreboard stalls.
+        return buf[i]
 
     def st_key(buf, i, v):
         st_shared_u32(buf, i, v) if is32 else st_shared_u16(buf, i, v)
@@ -395,7 +454,10 @@ def get_kernel(
             # --- per-row header (:1221-1247) ------------------------------
             row_start: T.int32 = T.int32(0)
             page_start: T.int32 = T.int32(0)
-            row_len: T.int32 = T.int32(length)
+            # Basic mode's row length is the static kernel stride, so keep it a
+            # Python constant: every hot loop bound then folds to a literal with a
+            # known trip count instead of reloading a scalar local each iteration.
+            row_len = length
             if not basic:
                 if row_starts:
                     row_start = row_starts_g[row_idx]
@@ -404,14 +466,16 @@ def get_kernel(
                         page_start = pt_starts_g[row_idx]
                     else:
                         page_start = row_start
-                row_len = lengths_g[row_idx]
+                row_len_rt: T.int32 = lengths_g[row_idx]
+                row_len = row_len_rt
             row_in: T.int64 = T.cast(row_idx, "int64") * T.int64(length) + T.cast(
                 row_start, "int64"
             )
             row_out: T.int64 = T.cast(row_idx, "int64") * T.int64(k)
 
             # --- mode trivial early-out (:1243-1307) ----------------------
-            take_main: T.int32 = T.int32(1)
+            if not (basic and not basic_trivial):
+                take_main: T.int32 = T.int32(1)
             if basic:
                 if basic_trivial:
                     take_main = T.int32(0)
@@ -444,25 +508,34 @@ def get_kernel(
                             val2 = i2 + offset
                         out_idx[row_out + T.cast(i2, "int64")] = val2
 
-            if take_main == 1:
+            # For Basic with k < length there is no trivial branch at all, so the
+            # guard is compile-time true. Leaving it as a runtime flag wrapped the
+            # entire kernel body in a branch whose reconvergence spans everything.
+            main_guard = True if (basic and not basic_trivial) else (take_main == 1)
+            if main_guard:
                 # === Stage 1: stage the row as monotone keys (:605-623) ====
-                aligned: T.int32 = T.truncdiv(row_len, T.int32(vec)) * T.int32(vec)
+                if basic:
+                    aligned = length // vec * vec
+                else:
+                    aligned_rt: T.int32 = T.truncdiv(row_len, T.int32(vec)) * T.int32(vec)
+                    aligned = aligned_rt
                 for iv in T.serial(tx * vec, aligned, step=BLOCK_THREADS * vec, unroll=2):
                     _stage_vector(
                         inp, s_ordered, row_in, iv, vec, load_bytes, is32, to_ordered, st_key
                     )
-                for it_tail in T.serial(aligned + tx, row_len, step=BLOCK_THREADS):
-                    st_key(
-                        s_ordered,
-                        it_tail,
-                        to_ordered(_ld_global_bits(inp, row_in + T.cast(it_tail, "int64"), is32)),
-                    )
+                # The tail is statically empty whenever Basic's static length is a
+                # multiple of VEC_SIZE; emitting it anyway costs a branch per row.
+                if not (basic and length % vec == 0):
+                    for it_tail in T.serial(aligned + tx, row_len, step=BLOCK_THREADS):
+                        s_ordered[it_tail] = to_ordered(
+                            _ld_global_bits(inp, row_in + T.cast(it_tail, "int64"), is32)
+                        )
                 bar_sync()
 
                 # scalar caches (:669-677)
                 if tx == 0:
                     st_shared_pair_u32(s_scalars, 0, T.uint32(0), T.uint32(k))
-                    st_shared_u32(s_scalars, 4, T.uint32(0))
+                    s_scalars[4] = T.uint32(0)
                 bar_sync()
 
                 # === Stage 2: NUM_ROUNDS radix-select rounds (:690-774) ====
@@ -478,7 +551,7 @@ def get_kernel(
                     remaining_k: T.uint32 = u64_hi(packed)
 
                     for bh in T.serial(tx, RADIX, step=BLOCK_THREADS):
-                        st_shared_u32(s_hist, bh, T.uint32(0))
+                        s_hist[bh] = T.uint32(0)
                     bar_sync()
 
                     for ih in T.serial(tx, row_len, step=BLOCK_THREADS, unroll=2):
@@ -493,7 +566,7 @@ def get_kernel(
                     bar_sync()
 
                     for bs in T.serial(tx, RADIX, step=BLOCK_THREADS):
-                        st_shared_u32(s_suffix, bs, ld_shared_u32(s_hist, bs))
+                        s_suffix[bs] = s_hist[bs]
                     bar_sync()
 
                     # RadixSuffixSum (:389-406)
@@ -501,12 +574,12 @@ def get_kernel(
                         stride: T.int32 = T.shift_left(T.int32(1), step)
                         acc: T.uint32 = T.uint32(0)
                         if tx < RADIX:
-                            acc = ld_shared_u32(s_suffix, tx)
+                            acc = s_suffix[tx]
                             if tx + stride < RADIX:
-                                acc = acc + ld_shared_u32(s_suffix, tx + stride)
+                                acc = acc + s_suffix[tx + stride]
                         bar_sync()
                         if tx < RADIX:
-                            st_shared_u32(s_suffix, tx, acc)
+                            s_suffix[tx] = acc
                         bar_sync()
 
                     # threshold bucket (:753-767)
@@ -514,15 +587,14 @@ def get_kernel(
                         st_shared_pair_u32(s_scalars, 2, T.uint32(0), remaining_k)
                     bar_sync()
                     if tx < RADIX:
-                        count_ge: T.uint32 = ld_shared_u32(s_suffix, tx)
+                        count_ge: T.uint32 = s_suffix[tx]
                         count_gt: T.uint32 = T.uint32(0)
                         if tx + 1 < RADIX:
-                            count_gt = ld_shared_u32(s_suffix, tx + 1)
-                        if count_ge >= remaining_k:
-                            if count_gt < remaining_k:
-                                st_shared_pair_u32(
-                                    s_scalars, 2, T.cast(tx, "uint32"), remaining_k - count_gt
-                                )
+                            count_gt = s_suffix[tx + 1]
+                        if T.And(count_ge >= remaining_k, count_gt < remaining_k):
+                            st_shared_pair_u32(
+                                s_scalars, 2, T.cast(tx, "uint32"), remaining_k - count_gt
+                            )
                     bar_sync()
                     if tx == 0:
                         found = ld_shared_pair_u32(s_scalars, 2)
@@ -543,31 +615,28 @@ def get_kernel(
                     if deterministic:
                         st_shared_pair_u32(s_suffix, 0, T.uint32(0), T.uint32(0))
                     else:
-                        st_shared_u32(s_suffix, 0, T.uint32(0))
+                        s_suffix[0] = T.uint32(0)
                 bar_sync()
                 my_gt: T.uint32 = T.uint32(0)
                 my_eq: T.uint32 = T.uint32(0)
                 for ic in T.serial(tx, row_len, step=BLOCK_THREADS, unroll=2):
                     key2: T.uint32 = T.cast(ld_key(s_ordered, ic), "uint32")
-                    if key2 > pivot:
-                        my_gt = my_gt + T.uint32(1)
+                    my_gt = my_gt + T.Select(key2 > pivot, T.uint32(1), T.uint32(0))
                     if deterministic:
-                        if key2 == pivot:
-                            my_eq = my_eq + T.uint32(1)
+                        my_eq = my_eq + T.Select(key2 == pivot, T.uint32(1), T.uint32(0))
                 for step in T.unroll(5):
                     delta: T.int32 = T.shift_right(T.int32(16), step)
                     my_gt = my_gt + shfl_down_u32(my_gt, delta)
                     if deterministic:
                         my_eq = my_eq + shfl_down_u32(my_eq, delta)
                 lane: T.int32 = T.bitwise_and(tx, T.int32(31))
-                if lane == 0:
-                    if my_gt > T.uint32(0):
-                        T.evaluate(atom_shared_add_u32(s_suffix, 0, my_gt))
-                    if deterministic:
-                        if my_eq > T.uint32(0):
-                            T.evaluate(atom_shared_add_u32(s_suffix, 1, my_eq))
+                if T.And(lane == 0, my_gt > T.uint32(0)):
+                    T.evaluate(atom_shared_add_u32(s_suffix, 0, my_gt))
+                if deterministic:
+                    if T.And(lane == 0, my_eq > T.uint32(0)):
+                        T.evaluate(atom_shared_add_u32(s_suffix, 1, my_eq))
                 bar_sync()
-                gt_count: T.uint32 = ld_shared_u32(s_suffix, 0)
+                gt_count: T.uint32 = s_suffix[0]
 
                 # === Stage 3b: epilogue-scope aux, per row (:1344-1345, :1373)
                 src_base: T.int64 = T.int64(0)
@@ -581,15 +650,15 @@ def get_kernel(
                 if not deterministic:
                     # === Stage 4a: non-deterministic collect (:906-963) ====
                     if tx == 0:
-                        st_shared_u32(s_hist, 0, T.uint32(0))
+                        s_hist[0] = T.uint32(0)
                         if gt_count > T.uint32(0):
-                            st_shared_u32(s_hist, 1, atom_shared_add_u32(s_scalars, 4, gt_count))
+                            s_hist[1] = atom_shared_add_u32(s_scalars, 4, gt_count)
                     bar_sync()
                     for i in T.serial(tx, row_len, step=BLOCK_THREADS, unroll=2):
                         key3: T.uint32 = T.cast(ld_key(s_ordered, i), "uint32")
                         if key3 > pivot:
                             local_pos: T.uint32 = atom_shared_add_u32(s_hist, 0, T.uint32(1))
-                            pos: T.int32 = T.cast(ld_shared_u32(s_hist, 1) + local_pos, "int32")
+                            pos: T.int32 = T.cast(s_hist[1] + local_pos, "int32")
                             _emit(
                                 out_idx,
                                 out_val,
@@ -626,13 +695,13 @@ def get_kernel(
                                 )
                 else:
                     # === Stage 4b: deterministic collect (:1023-1138) ======
-                    eq_count: T.uint32 = ld_shared_u32(s_suffix, 1)
+                    eq_count: T.uint32 = s_suffix[1]
                     if tx == 0:
                         need: T.uint32 = T.uint32(0)
                         if T.uint32(k) > gt_count:
                             need = T.uint32(k) - gt_count
                         st_shared_quad_u32(s_hist, 0, T.uint32(0), T.uint32(0), gt_count, need)
-                        st_shared_u32(s_hist, 4, T.uint32(0))
+                        s_hist[4] = T.uint32(0)
                     bar_sync()
                     plan = ld_shared_quad_u32(s_hist, 0)
                     gt_base: T.uint32 = plan[0]
@@ -646,66 +715,62 @@ def get_kernel(
                         sel: T.uint32 = T.uint32(0)
                         for id1 in T.serial(tx, row_len, step=BLOCK_THREADS):
                             key5: T.uint32 = T.cast(ld_key(s_ordered, id1), "uint32")
-                            if key5 > pivot:
-                                sel = sel + T.uint32(1)
+                            sel = sel + T.Select(key5 > pivot, T.uint32(1), T.uint32(0))
                         # cub BLOCK_SCAN_RAKING_MEMOIZE exclusive sum (:268-270):
                         # place into the padded raking grid, one warp serially
                         # reduces its 32-element segment while memoizing it in
                         # registers, a warp shuffle scan runs over the segment
                         # totals, then the same warp scatters the prefixes back.
                         rake_off: T.int32 = _raking_offset(tx)
-                        st_shared_u32(s_scan, rake_off, sel)
+                        s_scan[rake_off] = sel
                         bar_sync()
                         if tx < RAKING_THREADS:
                             rake_base: T.int32 = tx * RAKING_STRIDE
                             cache = T.alloc_local((RAKING_SEGMENT,), "uint32")
                             total: T.uint32 = T.uint32(0)
                             for j in T.unroll(RAKING_SEGMENT):
-                                cache[j] = ld_shared_u32(s_scan, rake_base + j)
+                                cache[j] = s_scan[rake_base + j]
                                 total = total + cache[j]
                             run: T.uint32 = warp_inclusive_sum_u32(total, tx) - total
                             for j in T.unroll(RAKING_SEGMENT):
-                                st_shared_u32(s_scan, rake_base + j, run)
+                                s_scan[rake_base + j] = run
                                 run = run + cache[j]
                         bar_sync()
-                        pre: T.uint32 = ld_shared_u32(s_scan, rake_off)
-                        if sel > T.uint32(0):
-                            if pre < gt_limit:
-                                emit_pos: T.uint32 = pre
-                                emit_end: T.uint32 = pre + sel
-                                if emit_end > gt_limit:
-                                    emit_end = gt_limit
-                                done: T.int32 = 0
-                                for id3 in T.serial(tx, row_len, step=BLOCK_THREADS):
-                                    if done == 0:
-                                        key6: T.uint32 = T.cast(ld_key(s_ordered, id3), "uint32")
-                                        if key6 > pivot:
-                                            _emit(
-                                                out_idx,
-                                                out_val,
-                                                row_out,
-                                                id3,
-                                                key6,
-                                                T.cast(gt_base + emit_pos, "int32"),
-                                                offset,
-                                                basic,
-                                                ragged,
-                                                is32,
-                                                dtype,
-                                            )
-                                            emit_pos = emit_pos + T.uint32(1)
-                                            if emit_pos == emit_end:
-                                                done = 1
+                        pre: T.uint32 = s_scan[rake_off]
+                        if T.And(sel > T.uint32(0), pre < gt_limit):
+                            emit_pos: T.uint32 = pre
+                            emit_end: T.uint32 = pre + sel
+                            if emit_end > gt_limit:
+                                emit_end = gt_limit
+                            done: T.int32 = 0
+                            for id3 in T.serial(tx, row_len, step=BLOCK_THREADS):
+                                if done == 0:
+                                    key6: T.uint32 = T.cast(ld_key(s_ordered, id3), "uint32")
+                                    if key6 > pivot:
+                                        _emit(
+                                            out_idx,
+                                            out_val,
+                                            row_out,
+                                            id3,
+                                            key6,
+                                            T.cast(gt_base + emit_pos, "int32"),
+                                            offset,
+                                            basic,
+                                            ragged,
+                                            is32,
+                                            dtype,
+                                        )
+                                        emit_pos = emit_pos + T.uint32(1)
+                                        if emit_pos == emit_end:
+                                            done = 1
                         bar_sync()
                     else:
                         sel_gt: T.uint32 = T.uint32(0)
                         sel_eq: T.uint32 = T.uint32(0)
                         for id4 in T.serial(tx, row_len, step=BLOCK_THREADS):
                             key7: T.uint32 = T.cast(ld_key(s_ordered, id4), "uint32")
-                            if key7 > pivot:
-                                sel_gt = sel_gt + T.uint32(1)
-                            if key7 == pivot:
-                                sel_eq = sel_eq + T.uint32(1)
+                            sel_gt = sel_gt + T.Select(key7 > pivot, T.uint32(1), T.uint32(0))
+                            sel_eq = sel_eq + T.Select(key7 == pivot, T.uint32(1), T.uint32(0))
                         # The same raking scan over the {gt, eq} pair (:1122-1125).
                         rake_off2: T.int32 = _raking_offset(tx) * 2
                         st_shared_pair_u32(s_scan, rake_off2, sel_gt, sel_eq)
@@ -730,47 +795,49 @@ def get_kernel(
                                 run_eq = run_eq + cache_eq[j]
                         bar_sync()
                         seg_out = ld_shared_pair_u32(s_scan, rake_off2)
-                        cur_gt: T.uint32 = seg_out[0]
-                        cur_eq: T.uint32 = seg_out[1]
-                        i = tx
-                        while i < row_len:
-                            key8: T.uint32 = T.cast(ld_key(s_ordered, i), "uint32")
-                            emitted: T.int32 = 0
-                            if key8 > pivot:
-                                if cur_gt < gt_limit:
-                                    _emit(
-                                        out_idx,
-                                        out_val,
-                                        row_out,
-                                        i,
-                                        key8,
-                                        T.cast(gt_base + cur_gt, "int32"),
-                                        offset,
-                                        basic,
-                                        ragged,
-                                        is32,
-                                        dtype,
-                                    )
-                                    cur_gt = cur_gt + T.uint32(1)
-                                    emitted = 1
-                            if emitted == 0:
-                                if key8 == pivot:
-                                    if cur_eq < eq_limit:
-                                        _emit(
-                                            out_idx,
-                                            out_val,
-                                            row_out,
-                                            i,
-                                            key8,
-                                            T.cast(eq_base + cur_eq, "int32"),
-                                            offset,
-                                            basic,
-                                            ragged,
-                                            is32,
-                                            dtype,
-                                        )
-                                        cur_eq = cur_eq + T.uint32(1)
-                            i = i + BLOCK_THREADS
+                        # Bind the inline-PTX destinations to scalars before the
+                        # emit loop: read straight from the local buffer and the
+                        # backend re-issues the shared load on every iteration.
+                        seg_gt: T.uint32 = seg_out[0]
+                        seg_eq: T.uint32 = seg_out[1]
+                        cur_gt: T.uint32 = seg_gt
+                        cur_eq: T.uint32 = seg_eq
+                        for i8 in T.serial(tx, row_len, step=BLOCK_THREADS):
+                            key8: T.uint32 = T.cast(ld_key(s_ordered, i8), "uint32")
+                            # Branch, not a predicated store: only `k` of `row_len`
+                            # elements are selected, so ~98% of lanes are inactive
+                            # here and a predicated store would still issue for
+                            # every one of them.
+                            if T.And(key8 > pivot, cur_gt < gt_limit):
+                                _emit(
+                                    out_idx,
+                                    out_val,
+                                    row_out,
+                                    i8,
+                                    key8,
+                                    T.cast(gt_base + cur_gt, "int32"),
+                                    offset,
+                                    basic,
+                                    ragged,
+                                    is32,
+                                    dtype,
+                                )
+                                cur_gt = cur_gt + T.uint32(1)
+                            elif T.And(key8 == pivot, cur_eq < eq_limit):
+                                _emit(
+                                    out_idx,
+                                    out_val,
+                                    row_out,
+                                    i8,
+                                    key8,
+                                    T.cast(eq_base + cur_eq, "int32"),
+                                    offset,
+                                    basic,
+                                    ragged,
+                                    is32,
+                                    dtype,
+                                )
+                                cur_eq = cur_eq + T.uint32(1)
                         bar_sync()
 
                 # === Stage 5: PageTable in-place gather (:1352-1358) =======
