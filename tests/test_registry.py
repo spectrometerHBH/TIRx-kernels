@@ -52,8 +52,8 @@ def test_exact_architectures_are_stored_in_source_index():
         for archs in (("sm_100a",), ("sm_103a",), ("sm_107a",), ("sm_100a", "sm_103a", "sm_107a"))
     }
     assert counts == {
-        ("sm_100a",): 9,
-        ("sm_103a",): 3,
+        ("sm_100a",): 10,
+        ("sm_103a",): 4,
         ("sm_107a",): 2,
         ("sm_100a", "sm_103a", "sm_107a"): 90,
     }
@@ -77,6 +77,8 @@ def test_reference_requirements_are_stored_in_source_index():
     # source project (the Cake VSA route loads a prebuilt cubin via FlashInfer's
     # own tvm-ffi launcher).
     expected_by_kernel = {
+        "blackwell_msa_decode_q1_bf16_query_fp8_kv_xform2_paged_sm103": ("flashinfer-python",),
+        "blackwell_msa_decode_uniform_fp8_qkv_paged_sm100": ("flashinfer-python",),
         "cake_vsa_blk128_compact_sm100": ("flashinfer-python",),
         "cake_vsa_longseq_sm100": ("flashinfer-python",),
         "cake_vsa_longseq_sm103": ("flashinfer-python",),
