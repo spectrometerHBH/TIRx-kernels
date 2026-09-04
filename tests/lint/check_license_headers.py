@@ -136,6 +136,13 @@ FILE_OVERRIDES = {
             'THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"',
         ),
     },
+    "tirx_kernels/flashinfer/gemm/grouped_gemm_masked_rubin.py": {
+        "spdx": "Apache-2.0 AND BSD-3-Clause",
+        "required_text": (
+            "Redistribution and use in source and binary forms",
+            'THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"',
+        ),
+    },
     "tirx_kernels/flashinfer/gemm/dense_blockscaled_gemm_sm107.py": {
         "spdx": "Apache-2.0 AND BSD-3-Clause",
         "required_text": (
@@ -268,6 +275,7 @@ def self_test() -> int:
     gdn = "tirx_kernels/flashinfer/gdn_prefill/gdn_prefill_sm100.py"
     gdn_cp = "tirx_kernels/flashinfer/gdn_prefill/gdn_cp_prefill_sm100.py"
     bmm_fp8_rubin = "tirx_kernels/flashinfer/gemm/bmm_fp8_rubin.py"
+    grouped_gemm_masked_rubin = "tirx_kernels/flashinfer/gemm/grouped_gemm_masked_rubin.py"
     fa4 = dict(project="flash-attention", url="https://github.com/Dao-AILab/flash-attention")
     fa4_fp4 = dict(
         project="flash-attention-fp4", url="https://github.com/hao-ai-lab/flash-attention-fp4"
@@ -433,6 +441,27 @@ def self_test() -> int:
         (
             "bmm_fp8_rubin missing BSD disclaimer",
             bmm_fp8_rubin,
+            bsd_port.format(spdx="Apache-2.0 AND BSD-3-Clause", **fi).replace(
+                'THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"',
+                "missing disclaimer",
+            ),
+            True,
+        ),
+        (
+            "valid grouped_gemm_masked_rubin BSD port",
+            grouped_gemm_masked_rubin,
+            bsd_port.format(spdx="Apache-2.0 AND BSD-3-Clause", **fi),
+            False,
+        ),
+        (
+            "grouped_gemm_masked_rubin tagged plain Apache-2.0",
+            grouped_gemm_masked_rubin,
+            bsd_port.format(spdx="Apache-2.0", **fi),
+            True,
+        ),
+        (
+            "grouped_gemm_masked_rubin missing BSD disclaimer",
+            grouped_gemm_masked_rubin,
             bsd_port.format(spdx="Apache-2.0 AND BSD-3-Clause", **fi).replace(
                 'THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"',
                 "missing disclaimer",
