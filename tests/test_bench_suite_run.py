@@ -201,14 +201,17 @@ def test_default_roster_is_available_on_sm103_and_sm107():
     def kernels(rows):
         return {workload["kernel"] for workload in rows}
 
-    # 262 rows run everywhere; nine single-architecture kernels contribute three default rows
+    # 262 rows run everywhere; ten single-architecture kernels contribute three default rows
     # each: cake_vsa_{blk128_compact,longseq,ultrasparse_bsr}_sm100 (sm_100a), bmm_fp8_rubin and
-    # dense_blockscaled_gemm_sm107 (sm_107a), cake_vsa_longseq_sm103, this Blackwell MSA decode,
-    # fastcu_nvfp4_gemm_gb300 and flash_attention4_fp4 (sm_103a).
+    # dense_blockscaled_gemm_sm107 (sm_107a), and
+    # blackwell_msa_decode_q1_bf16_query_fp8_kv_xform2_paged_sm103,
+    # blackwell_msa_prefill_m64_bf16_gqa16_flat_sm103, cake_vsa_longseq_sm103,
+    # fastcu_nvfp4_gemm_gb300, and flash_attention4_fp4 (sm_103a).
     assert len(sm107) == 268
-    assert len(sm107_incompatible) == 21
+    assert len(sm107_incompatible) == 24
     assert kernels(sm107_incompatible) == {
         "blackwell_msa_decode_q1_bf16_query_fp8_kv_xform2_paged_sm103",
+        "blackwell_msa_prefill_m64_bf16_gqa16_flat_sm103",
         "cake_vsa_blk128_compact_sm100",
         "cake_vsa_longseq_sm100",
         "cake_vsa_longseq_sm103",
@@ -216,7 +219,7 @@ def test_default_roster_is_available_on_sm103_and_sm107():
         "fastcu_nvfp4_gemm_gb300",
         "flash_attention4_fp4",
     }
-    assert len(sm103) == 274
+    assert len(sm103) == 277
     assert len(sm103_incompatible) == 15
     assert kernels(sm103_incompatible) == {
         "bmm_fp8_rubin",
@@ -226,8 +229,9 @@ def test_default_roster_is_available_on_sm103_and_sm107():
         "dense_blockscaled_gemm_sm107",
     }
     assert len(sm100) == 271
-    assert len(sm100_incompatible) == 18
+    assert len(sm100_incompatible) == 21
     assert kernels(sm100_incompatible) == {
+        "blackwell_msa_prefill_m64_bf16_gqa16_flat_sm103",
         "bmm_fp8_rubin",
         "blackwell_msa_decode_q1_bf16_query_fp8_kv_xform2_paged_sm103",
         "cake_vsa_longseq_sm103",
