@@ -126,6 +126,7 @@ Grouped by the FlashInfer Python entry point each port backs.
 - **`flashinfer.msa_ops`:**
   [`blackwell_msa_decode_q1_bf16_query_fp8_kv_xform2_paged_sm103`](tirx_kernels/flashinfer/msa_ops/blackwell_msa_decode_q1_bf16_query_fp8_kv_xform2_paged_sm103.py),
   [`blackwell_msa_decode_uniform_fp8_qkv_paged_sm100`](tirx_kernels/flashinfer/msa_ops/blackwell_msa_decode_uniform_fp8_qkv_paged_sm100.py),
+  [`blackwell_msa_long_prefill_paged_bf16_gqa16_direct_group_sm100`](tirx_kernels/flashinfer/msa_ops/blackwell_msa_long_prefill_paged_bf16_gqa16_direct_group_sm100.py),
   [`blackwell_msa_reverse_prefill_bf16_paged_topk4_qload4_sm103`](tirx_kernels/flashinfer/msa_ops/blackwell_msa_reverse_prefill_bf16_paged_topk4_qload4_sm103.py)
 - **`flashinfer.gemm`:**
   [`tinygemm2_sm100`](tirx_kernels/flashinfer/gemm/tinygemm2_sm100.py),

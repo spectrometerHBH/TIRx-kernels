@@ -65,6 +65,19 @@ minimum/geometric mean from 0.9393x/0.9681x to 0.9552x/0.9816x while preserving
 bitwise correctness. The change helped but did not clear the gate; a separate
 unsigned-index lowering fix was still required.
 
+An independent 16-warp persistent paged-attention pipeline showed the zero-spill
+case more strongly. Both builds used 128 registers, 148,480 dynamic shared bytes,
+one CTA per SM, and zero stack or local traffic; the generated build was already
+slightly shorter at 2,800 static SASS instructions against the reference's 2,808,
+yet paired profiles showed extra uniform address/control instructions and higher
+long-scoreboard exposure. A compact sweep was sharply non-monotonic: levels 2,
+4, 5, and 6 produced targeted minimum/geometric-mean ratios of
+0.9925x/0.9990x, 0.9695x/0.9810x, 0.9699x/0.9822x, and 0.9615x/0.9773x.
+Pinning level 2 with exact environment restoration kept all four targeted rows
+above 0.99x, and the complete ten-row suite cleared at a 0.9904x minimum and
+0.9961x geometric mean; all seven correctness configurations remained bitwise
+identical.
+
 ## Boundary
 
 The sibling kernel of the same source family, which had zero spills at level 10,

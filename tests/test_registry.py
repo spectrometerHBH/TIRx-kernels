@@ -52,7 +52,7 @@ def test_exact_architectures_are_stored_in_source_index():
         for archs in (("sm_100a",), ("sm_103a",), ("sm_107a",), ("sm_100a", "sm_103a", "sm_107a"))
     }
     assert counts == {
-        ("sm_100a",): 10,
+        ("sm_100a",): 11,
         ("sm_103a",): 6,
         ("sm_107a",): 3,
         ("sm_100a", "sm_103a", "sm_107a"): 90,
@@ -79,6 +79,7 @@ def test_reference_requirements_are_stored_in_source_index():
     expected_by_kernel = {
         "blackwell_msa_decode_q1_bf16_query_fp8_kv_xform2_paged_sm103": ("flashinfer-python",),
         "blackwell_msa_decode_uniform_fp8_qkv_paged_sm100": ("flashinfer-python",),
+        "blackwell_msa_long_prefill_paged_bf16_gqa16_direct_group_sm100": ("flashinfer-python",),
         "blackwell_msa_prefill_m64_bf16_gqa16_flat_sm103": ("flashinfer-python",),
         "blackwell_msa_reverse_prefill_bf16_paged_topk4_qload4_sm103": ("flashinfer-python",),
         "cake_vsa_blk128_compact_sm100": ("flashinfer-python",),

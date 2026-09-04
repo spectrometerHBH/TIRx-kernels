@@ -240,9 +240,9 @@ def test_default_roster_is_available_on_sm103_and_sm107():
         "blackwell_msa_decode_q1_bf16_query_fp8_kv_xform2_paged_sm103",
         "cake_vsa_longseq_sm103",
         "dense_blockscaled_gemm_sm107",
+        "grouped_gemm_masked_rubin",
         "fastcu_nvfp4_gemm_gb300",
         "flash_attention4_fp4",
-        "grouped_gemm_masked_rubin",
     }
 
 
