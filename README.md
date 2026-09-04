@@ -132,6 +132,8 @@ Grouped by the FlashInfer Python entry point each port backs.
   [`tinygemm2_sm100`](tirx_kernels/flashinfer/gemm/tinygemm2_sm100.py),
   [`bmm_fp8_rubin`](tirx_kernels/flashinfer/gemm/bmm_fp8_rubin.py),
   [`grouped_gemm_masked_rubin`](tirx_kernels/flashinfer/gemm/grouped_gemm_masked_rubin.py)
+- **`flashinfer.fused_moe`:**
+  [`blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_rubin`](tirx_kernels/flashinfer/fused_moe/blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_rubin.py)
 - **`flashinfer.topk`:**
   [`fast_topk_clusters`](tirx_kernels/flashinfer/topk/fast_topk_clusters.py),
   [`filtered_topk`](tirx_kernels/flashinfer/topk/filtered_topk.py),
